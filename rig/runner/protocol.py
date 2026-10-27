@@ -129,6 +129,10 @@ class Adapter:
                 self.proc.wait(timeout=30)
             except (OSError, subprocess.TimeoutExpired):
                 self.proc.kill()
+                self.proc.wait()
+        for stream in (self.proc.stdin, self.proc.stdout):
+            if stream and not stream.closed:
+                stream.close()
         if self._log is not subprocess.DEVNULL:
             self._log.close()
 

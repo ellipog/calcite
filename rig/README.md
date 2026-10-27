@@ -140,6 +140,23 @@ The generators use SplitMix64 from the given seed. A range value is `min + (max 
 
 Calcite's adapter reports the new probe as unimplemented until Calcite can run it.
 
+## Tests and CI
+
+```sh
+py -I -m unittest discover -s rig/runner/tests -v
+```
+
+The runner's tests use only the standard library and never need the vanilla jar. They cover:
+
+- frames and the result hash
+- blob parts and generators, including SplitMix64's published outputs
+- that every `gen.py` reproduces its committed case file exactly
+- that every case has an expected hash
+- the differences registry and the store
+- the Calcite stub, end to end through `score`
+
+CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs them on Windows and Linux, with the oldest supported Python (3.10) and the newest, then scores Calcite against the committed hashes (`P1.9`).
+
 ## Found so far
 
 - **Deep SNBT overflows the stack.** Vanilla's SNBT parser has no depth limit. From about depth 511 it throws `StackOverflowError`, at a depth that changes with case order and JIT tier. Quarantined, and listed as a [difference](differences/snbt-depth.md).
