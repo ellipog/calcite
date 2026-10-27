@@ -27,7 +27,7 @@ At the last bit, "vanilla" depends on the JVM. On x86-64, HotSpot replaces `Math
 
 | Configuration | JVM flags | Role |
 | --- | --- | --- |
-| `strict-math` | `-XX:+UnlockDiagnosticVMOptions -XX:-UseLibmIntrinsic` | **The reference.** `Math` gives exactly `StrictMath`'s results, which Calx's `std.math` can match. Hashes in `expected/26.3/` |
+| `strict-math` | `-XX:+UnlockDiagnosticVMOptions -XX:-UseLibmIntrinsic` | **The reference.** `Math` gives exactly `StrictMath`'s results, which Calx's `std.java.math` can match. Hashes in `expected/26.3/` |
 | `intrinsics` | HotSpot's defaults | What most servers run. Hashes in `expected/26.3/intrinsics/` |
 
 Calcite is scored against `strict-math`. The scoreboard also says how many cases Calcite would pass against `intrinsics`, and `list` shows how many cases come out differently in the two. That gap is the measured cost of not copying. In 26.3 it shows up in `math` (33 cases), `rng` (17, every one using `nextGaussian`, which calls `Math.log`) and `mth` (2: `Mth.atan2`, whose table is built with `Math.cos`).

@@ -2,7 +2,7 @@
 
     py -I rig/runner/mathcmp.py [--count 500000] [--fn sin ...]
 
-Calx's std.math ports fdlibm, so it matches StrictMath. Vanilla calls Math, which HotSpot
+Calx's std.java.math ports fdlibm, so it matches StrictMath. Vanilla calls Math, which HotSpot
 replaces with CPU-specific intrinsics. Wherever the two differ, Calcite would differ from
 vanilla. This runs both through the vanilla adapter on large sweeps and reports every
 function's mismatch rate, worst ULP distance and examples, plus an exhaustive check of
