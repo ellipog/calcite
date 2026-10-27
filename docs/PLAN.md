@@ -136,11 +136,11 @@ Generate every table from the vanilla jar instead of typing it, so moving to a n
 
 **How**
 
-- **P2.1** Run Mojang's data generator: `java -DbundlerMainClass=net.minecraft.data.Main -jar server-26.3.jar --all --output <dir>`. This was checked on 26.3 with Java 25. The options are `--all`, `--reports`, `--server`, `--dev`, `--validate`, `--input` and `--output`. The bundler unpacks its libraries into the working directory, so run it from the gitignored `oracle/work/`.
-- **P2.2** Write a converter that turns the reports into neutral input for Calx codegen: block states with global IDs and properties, registries, packet IDs per protocol state, the command tree and items.
-- **P2.3** Split what is compiled in (block states, packet IDs) from what is loaded at startup (data packs: worldgen settings, loot tables, tags, recipes), so Calcite reads data packs the way vanilla does.
-- **P2.4** Write the jar fetch step for the build (D30), shared with the rig: read Mojang's version manifest, download the jar and check its SHA-1. Calcite gets its own runtime version in Phase 5.
-- **P2.5** Write the cases for a block-state lookup probe (ID to properties and back), ready for when Calx can run them.
+- **P2.1** Run Mojang's data generator: `java -DbundlerMainClass=net.minecraft.data.Main -jar server-26.3.jar --all --output <dir>`. This was checked on 26.3 with Java 25. The options are `--all`, `--reports`, `--server`, `--dev`, `--validate`, `--input` and `--output`. The bundler unpacks its libraries into the working directory, so run it from the gitignored `oracle/work/`. Done: `oracle/datagen/datagen.py` runs it, fetching the jar first, and drops the generator's timestamped `.cache/` (see [`oracle/datagen/README.md`](../oracle/datagen/README.md)).
+- **P2.2** Write a converter that turns the reports into neutral input for Calx codegen: block states with global IDs and properties, registries, packet IDs per protocol state, the command tree and items. Done: `oracle/datagen/convert.py` writes eight canonical tables, keeping every number's original text. Block states turned out to be pure arithmetic: consecutive IDs per block, mixed radix over the properties in name order. The converter checks all 35,723 states against that rule, and the `block_state` probe confirms it against the live game.
+- **P2.3** Split what is compiled in (block states, packet IDs) from what is loaded at startup (data packs: worldgen settings, loot tables, tags, recipes), so Calcite reads data packs the way vanilla does. Done: D61. What vanilla defines in code is compiled in, including item default components and the code-defined biome parameter lists. What its built-in data pack holds is loaded from the jar at startup.
+- **P2.4** Write the jar fetch step for the build (D30), shared with the rig: read Mojang's version manifest, download the jar and check its SHA-1. Calcite gets its own runtime version in Phase 5. Done: `oracle/fetch.py`, used by the adapter's build and the data generator step. The manifest is read once, to pin a version's URL, size and SHA-1 in the committed `oracle/versions.json`, so builds verify offline (D62).
+- **P2.5** Write the cases for a block-state lookup probe (ID to properties and back), ready for when Calx can run them. Done: 104 cases in `cases/block_state/`, recorded against vanilla and repeatable under every self-check variant. Range cases cover every state and block ID with no game data in the repo. The parser cases found vanilla accepting trailing commas and leading zeros.
 
 **Done when**
 
@@ -388,9 +388,11 @@ calcite/
 │  ├─ api/               # the host API; bindings and reference docs are generated from it
 │  └─ samples/           # the five sample addons
 ├─ oracle/
-│  ├─ jars/              # gitignored: your own server-26.3.jar
+│  ├─ jars/              # gitignored: server-26.3.jar, fetched by fetch.py
 │  ├─ work/              # gitignored: the data generator's working directory
-│  ├─ datagen/           # runs the data generator into generated/26.3/
+│  ├─ datagen/           # runs the data generator into generated/26.3/ and converts it
+│  ├─ fetch.py           # fetches and verifies the jar against versions.json (D62)
+│  ├─ versions.json      # committed: each version's pinned jar URL, size and SHA-1
 │  └─ vanilla-adapter/   # Java 25 harness and agent
 ├─ rig/
 │  ├─ runner/            # Python: dispatch, goldens, diff, scoreboard
