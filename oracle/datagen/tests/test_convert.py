@@ -155,6 +155,14 @@ class Fetch(unittest.TestCase):
         with self.assertRaises(SystemExit):
             fetch.ensure("9.9", download=False)
 
+    def test_local_jar_installed(self):
+        source = Path(self.tmp.name) / "mine.jar"
+        source.write_bytes(self.data)
+        self.assertEqual(fetch.install("9.9", source).read_bytes(), self.data)
+        source.write_bytes(b"something else")
+        with self.assertRaises(SystemExit):
+            fetch.install("9.9", source)
+
     def test_unpinned_version_refused(self):
         with self.assertRaises(SystemExit):
             fetch.ensure("1.0", download=False)

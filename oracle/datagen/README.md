@@ -12,13 +12,14 @@ py -I oracle/datagen/datagen.py            # fetch, generate and convert into ge
 py -I oracle/datagen/datagen.py --check    # regenerate into a scratch folder and compare, byte for byte
 py -I oracle/datagen/convert.py            # convert again from the existing reports only
 py -I oracle/fetch.py [--check]            # fetch and verify the jar on its own
+py -I oracle/fetch.py --jar <path>         # or install a jar you already have, with no network
 ```
 
 `datagen.py` takes `--version` (default `26.3`) and `--java-home`. It finds JDK 25 the same way the [vanilla adapter's build](../vanilla-adapter/README.md#building) does. On Linux, use `python3` for `py`. A full run takes about 12 seconds on Windows.
 
 ## What it does
 
-1. **Fetch.** [`../fetch.py`](../fetch.py) checks `oracle/jars/server-<version>.jar` against the SHA-1 pinned in [`../versions.json`](../versions.json), and downloads it from Mojang if it's missing or wrong (`P2.4`, D62).
+1. **Fetch.** [`../fetch.py`](../fetch.py) checks `oracle/jars/server-<version>.jar` against the SHA-1 pinned in [`../versions.json`](../versions.json), and downloads it from Mojang if it's missing or wrong (`P2.4`, D62). A jar you already have can be installed with `fetch.py --jar <path>`, as long as it's the pinned one.
 2. **Generate.** Runs `java -DbundlerMainClass=net.minecraft.data.Main -jar server-<version>.jar --all --output generated/<version>/datagen` from `oracle/work/`, where the bundler unpacks its libraries. It uses the rig's reference JVM flags (D60). The log goes to `build/datagen/<version>.log`. The old output is deleted first, so nothing stale survives.
 3. **Drop the cache.** The generator's `.cache/` folder records a timestamp per run. It's the only output that changes between runs, and nothing reads it, so it's deleted.
 4. **Convert.** [`convert.py`](convert.py) checks the reports and writes the tables to `generated/<version>/tables/`, replacing the folder whole, so a failed conversion leaves the old tables in place.

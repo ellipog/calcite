@@ -2,6 +2,7 @@
 
     py -I oracle/fetch.py [--version 26.3]           download if missing, then verify
     py -I oracle/fetch.py [--version 26.3] --check   verify only, never download
+    py -I oracle/fetch.py [--version 26.3] --jar P   install a local jar instead, if it matches the pin
     py -I oracle/fetch.py --version X --pin          look X up in Mojang's manifest and pin it
 
 The jar goes to oracle/jars/server-<version>.jar, which is gitignored: nothing from Mojang is ever
@@ -96,17 +97,36 @@ def ensure(version, download=True):
     return jar
 
 
+def install(version, source):
+    """Copies a local jar into place, with no network, if it matches the version's pin."""
+    want = pins().get(version)
+    if want is None:
+        sys.exit(f"fetch: {version} isn't pinned in {VERSIONS}")
+    source = Path(source)
+    if not source.is_file():
+        sys.exit(f"fetch: {source} doesn't exist")
+    if file_sha1(source) != want["sha1"]:
+        sys.exit(f"fetch: {source} doesn't match the pinned SHA-1 {want['sha1']}; it's a different jar")
+    JARS.mkdir(parents=True, exist_ok=True)
+    jar = jar_path(version)
+    tmp = jar.with_suffix(".jar.tmp")
+    tmp.write_bytes(source.read_bytes())
+    os.replace(tmp, jar)
+    return jar
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fetch and verify Mojang's server jar.")
     parser.add_argument("--version", default="26.3")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="only verify the jar that's there")
     mode.add_argument("--pin", action="store_true", help="pin the version from Mojang's manifest")
+    mode.add_argument("--jar", metavar="PATH", help="install a local jar instead of downloading one")
     args = parser.parse_args()
     if args.pin:
         pin(args.version)
         return
-    jar = ensure(args.version, download=not args.check)
+    jar = install(args.version, args.jar) if args.jar else ensure(args.version, download=not args.check)
     print(f"fetch: {jar} matches the pinned SHA-1 {pins()[args.version]['sha1']}")
 
 
