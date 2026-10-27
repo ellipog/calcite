@@ -192,17 +192,20 @@ def _record(args, config):
                 print("\n".join(problems[:20]))
                 continue
             old = store.expected(probe)
-            hashes = {cid: r.digest() for cid, r in records}
+            # Quarantined cases aren't repeatable, so their hashes would change on every record.
+            # Their goldens are still saved, for `diff`.
+            hashes = {cid: r.digest() for cid, r in records if f"{probe}:{cid}" not in quarantine}
             changed = [cid for cid, h in hashes.items() if cid in old and old[cid] != h]
             added = sum(1 for cid in hashes if cid not in old)
             removed = sum(1 for cid in old if cid not in hashes)
             store.save_golden(probe, records)
             store.save_expected(probe, cases[0].probe_version, session.about, hashes)
+            skipped = len(records) - len(hashes)
             print(f"{probe}: recorded {len(hashes)} cases in {time.time() - started:.1f}s"
-                  f" ({added} new, {len(changed)} changed, {removed} removed)")
+                  f" ({added} new, {len(changed)} changed, {removed} removed"
+                  f"{f', {skipped} quarantined' if skipped else ''})")
             for cid in changed[:20]:
-                note = " (quarantined)" if f"{probe}:{cid}" in quarantine else ""
-                print(f"  changed: {probe}:{cid}{note}")
+                print(f"  changed: {probe}:{cid}")
     finally:
         session.close()
     return not failed
