@@ -179,12 +179,15 @@ Build the smallest Calx that can run a tick loop and talk to C, written from zer
 - **P3.10** Debugging support: emit `#line` directives so debuggers and profilers on both platforms show Calx source lines, and make compiler errors readable. Editor syntax highlighting is enough at first.
 - **P3.11** Start performance tracking (D34): run the benchmark per commit and keep the results in `bench/`. Have the emitter add `restrict` where ownership proves there's no aliasing.
 - **P3.12** Write the reference page for every feature as it lands (D40), and move its section out of `CALX_SPEC.md`. Start the guide with a first tutorial once there's enough language to write one.
+- **P3.13** Make the type checker as strict as D63 says: exact-only `T(x)`, named lossy conversions, no implicit optionals, no dropped values, no unused names or shadowing, and parentheses where precedence surprises. Every rule gets a compile-fail test.
+- **P3.14** Make builds fast (D64): a cache of objects keyed by their C text, parallel clang, a prebuilt runtime, lld, and `calx run` reusing an unchanged executable. Track build time per commit next to run time in `bench/`.
 
 **Done when**
 
 - [ ] **G3.1** RNG probes are 100% bit-exact against vanilla
 - [ ] **G3.2** The tick-loop benchmark runs within about 10% of the Rust version on both platforms. If it doesn't, follow D37 before going further.
 - [ ] **G3.3** Every shipped language feature has a reference page, and every example in the docs passes in CI
+- [ ] **G3.4** On the reference machine, `calx run` on a small program takes under half a second from a cold cache and under 50 ms when nothing changed, and changing one module of the benchmark rebuilds it in debug mode in under a second
 
 ## Phase 4: Protocol and a flat world
 
