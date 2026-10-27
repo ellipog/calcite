@@ -221,6 +221,17 @@ Vanilla's `Mth` helpers that use lookup tables or bit tricks, where a natural re
 | `{"fn": "floor"}` with a blob of `f64` arguments | `Mth.floor(double)` of each, as int |
 | `{"fn": "get_seed"}` with a blob of `(x, y, z)` int triples | `Mth.getSeed(x, y, z)` of each, as long |
 
+### `block_state` (v1)
+
+Global block state IDs, the block registry's state layout, the command syntax for block states, and the NBT form chunks and structure templates store them in. A state is printed the way `BlockStateParser.serialize` prints it: `minecraft:oak_stairs[facing=east,half=bottom,shape=straight,waterlogged=false]`, with the properties in name order and no brackets for a block that has none.
+
+| Input | Output |
+| --- | --- |
+| `{"op": "by_id", "from": n, "count": c}` | `states`: the state for each ID from `n`, or null where the ID map has none (the game reads those as air). `defaults`: the IDs in the range that are their block's default state. `round_trip_mismatches`: the IDs whose state doesn't come back to the same ID when printed and parsed, or written to NBT and read back. `count` is 0 to 4,096 |
+| `{"op": "blocks", "from": n, "count": c}` | `blocks`: for each block registry ID from `n`, null if there's no block, or `{name, first_state, state_count, default_state, properties}`. `properties` is the block's properties in the order the game keeps them, each `{name, values}` |
+| `{"op": "parse", "input": s, "nbt": b}` | `BlockStateParser.parseForBlock` on `s`, allowing a `{...}` NBT suffix if `b`: `{id, state, written, given, nbt, cursor}`. `written` is the state's NBT form as SNBT, `given` the properties the input set, `nbt` the suffix as SNBT or null, and `cursor` where parsing stopped. A rejection if the parser throws |
+| `{"op": "from_nbt", "snbt": s}` | `NbtUtils.readBlockState` on the compound `s`: `{id, state, written}`. It never rejects: an unknown block reads as air and a bad property is left at its default |
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

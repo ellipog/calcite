@@ -42,7 +42,8 @@ public final class Main {
                 new TextProbe(),
                 new MathProbe("math"),
                 new MathProbe("strictmath"),
-                new MthProbe())) {
+                new MthProbe(),
+                new BlockStateProbe())) {
             probes.put(probe.name(), probe);
         }
 

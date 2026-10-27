@@ -1,6 +1,6 @@
 """Tests for the rig's runner. Standard library only; no vanilla jar needed.
 
-    py -I -m unittest discover -s rig/runner/tests -t . -v
+    py -I -m unittest discover -s rig/runner/tests -v
 """
 
 import base64
@@ -179,7 +179,7 @@ class CalciteStub(unittest.TestCase):
                              capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("| ping (rig) | 5 | 5 |", out.stdout)
-        self.assertIn("| **All game probes** | 493 | 0 |", out.stdout)
+        self.assertIn("| **All game probes** | 597 | 0 |", out.stdout)
 
 
 if __name__ == "__main__":
