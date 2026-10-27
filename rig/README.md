@@ -91,7 +91,7 @@ Runs an adapter (`--adapter calcite`, the default, or `vanilla`, or a path to an
 | Quarantined | Vanilla itself isn't repeatable here, so it isn't run |
 | Unrecorded | No expected hash yet. Run `record` |
 
-The score is passes over the cases that count: everything except differences, quarantined and unrecorded cases. The full report, with every case's outcome, goes to `build/rig/<platform>/scoreboard-<adapter>.json`. Adapter logs go to `build/rig/<platform>/logs/`.
+The score is passes over the cases that count: everything except differences, quarantined and unrecorded cases. `ping` tests the rig itself, so its row is marked `(rig)` and it isn't part of the total. The full report, with every case's outcome, goes to `build/rig/<platform>/scoreboard-<adapter>.json`. Adapter logs go to `build/rig/<platform>/logs/`.
 
 Scoring vanilla against itself should always give 100%. If it doesn't, something isn't repeatable that the self-check missed.
 

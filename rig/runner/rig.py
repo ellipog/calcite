@@ -276,6 +276,7 @@ def cmd_check(args):
 
 
 OUTCOMES = ("pass", "fail", "difference", "unimplemented", "error", "quarantined", "unrecorded")
+RIG_PROBES = {"ping"}
 
 
 def cmd_score(args):
@@ -330,13 +331,17 @@ def cmd_score(args):
         for case in cases:
             counts[outcomes[case.key]] += 1
         rows.append((probe, len(cases), counts))
-    total = {o: sum(r[2][o] for r in rows) for o in OUTCOMES}
+    # Probes that test the rig itself are shown but don't count toward the game's score.
+    game = [r for r in rows if r[0] not in RIG_PROBES]
+    total = {o: sum(r[2][o] for r in game) for o in OUTCOMES}
 
     header = f"| Probe | Cases | {' | '.join(o.capitalize() for o in OUTCOMES)} | Score |"
     print(f"Scoreboard: {session.adapter.name} against vanilla {args.version} ({store.config}, the reference)\n")
     print(header)
     print("|" + "---|" * (len(OUTCOMES) + 3))
-    for probe, n, counts in rows + [("**All**", sum(r[1] for r in rows), total)]:
+    for probe, n, counts in rows + [("**All game probes**", sum(r[1] for r in game), total)]:
+        if probe in RIG_PROBES:
+            probe += " (rig)"
         scored = n - counts["difference"] - counts["quarantined"] - counts["unrecorded"]
         score = f"{100 * counts['pass'] / scored:.1f}%" if scored else "-"
         print(f"| {probe} | {n} | {' | '.join(str(counts[o]) for o in OUTCOMES)} | {score} |")

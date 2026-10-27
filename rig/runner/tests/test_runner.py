@@ -178,7 +178,8 @@ class CalciteStub(unittest.TestCase):
         out = subprocess.run([sys.executable, "-I", str(RUNNER / "rig.py"), "score"],
                              capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("| ping | 5 | 5 |", out.stdout)
+        self.assertIn("| ping (rig) | 5 | 5 |", out.stdout)
+        self.assertIn("| **All game probes** | 493 | 0 |", out.stdout)
 
 
 if __name__ == "__main__":
