@@ -2,9 +2,10 @@
 
 Usage: py -I build.py [--version 26.3] [--java-home PATH]
 
-Reads the bundler's library list from oracle/jars/server-<version>.jar,
-extracts the inner server jar and its libraries into oracle/work/ (checking
-each SHA-256 against the list), compiles the adapter with JDK 25, and writes
+Fetches oracle/jars/server-<version>.jar if it's missing and checks it against
+its pin (oracle/fetch.py), reads the bundler's library list from it, extracts
+the inner server jar and its libraries into oracle/work/ (checking each
+SHA-256 against the list), compiles the adapter with JDK 25, and writes
 build/<platform>/adapter.json: the command line the rig's runner starts the
 adapter with. Each platform builds into its own folder, so a Windows checkout
 can also be built and run from WSL.
@@ -27,7 +28,10 @@ ORACLE = HERE.parent
 WORK = ORACLE / "work"
 PLATFORM = "windows" if os.name == "nt" else sys.platform
 BUILD = HERE / "build" / PLATFORM
-REQUIRED_JAVA = 25
+
+sys.path.insert(0, str(ORACLE))
+import fetch  # noqa: E402
+from jdk import EXE, REQUIRED_JAVA, find_java_home  # noqa: E402
 
 
 def sha256(path):
@@ -63,9 +67,7 @@ def extract(bundle, member, dest, digest):
 
 
 def unpack(version):
-    jar = ORACLE / "jars" / f"server-{version}.jar"
-    if not jar.is_file():
-        sys.exit(f"build: {jar} is missing. See P1.1 in docs/PLAN.md.")
+    jar = fetch.ensure(version)
     with zipfile.ZipFile(jar) as bundle:
         classpath = []
         for digest, ident, path in read_list(bundle, "META-INF/versions.list"):
@@ -79,35 +81,6 @@ def unpack(version):
     return classpath
 
 
-def find_java_home(explicit):
-    candidates = [explicit, os.environ.get("CALCITE_JAVA_HOME"), os.environ.get("JAVA_HOME")]
-    javac = shutil.which("javac")
-    if javac:
-        candidates.append(str(Path(javac).resolve().parent.parent))
-    # Common install locations, newest first.
-    for pattern in ("~/tools/jdk-25*", "C:/Program Files/Eclipse Adoptium/jdk-25*",
-                    "C:/Program Files/Java/jdk-25*", "/usr/lib/jvm/*25*", "/opt/jdk-25*"):
-        base = Path(pattern.split("*")[0]).expanduser()
-        if base.parent.is_dir():
-            candidates += [str(p) for p in sorted(base.parent.glob(base.name + "*"), reverse=True)]
-    exe = ".exe" if os.name == "nt" else ""
-    for home in candidates:
-        if not home:
-            continue
-        java = Path(home) / "bin" / f"java{exe}"
-        if not java.is_file():
-            continue
-        out = subprocess.run([str(java), "-version"], capture_output=True, text=True).stderr
-        # The first line reads like: openjdk version "25.0.5" 2025-10-21 LTS
-        try:
-            major = int(out.split('"')[1].split(".")[0])
-        except (IndexError, ValueError):
-            continue
-        if major == REQUIRED_JAVA:
-            return Path(home)
-    sys.exit(f"build: no JDK {REQUIRED_JAVA} found. Pass --java-home or set CALCITE_JAVA_HOME.")
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--version", default="26.3")
@@ -116,7 +89,7 @@ def main():
 
     classpath = unpack(args.version)
     java_home = find_java_home(args.java_home)
-    exe = ".exe" if os.name == "nt" else ""
+    exe = EXE
 
     classes = BUILD / "classes"
     if classes.exists():

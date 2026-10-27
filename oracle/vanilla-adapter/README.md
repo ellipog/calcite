@@ -11,7 +11,7 @@ Nothing from the jar is committed. The build reads it from the gitignored `oracl
 
 ## Building
 
-You need the 26.3 server jar in `oracle/jars/server-26.3.jar` (`P1.1`) and JDK 25.
+You need JDK 25. The build gets the 26.3 server jar itself: [`../fetch.py`](../fetch.py) downloads it to `oracle/jars/server-26.3.jar` if it's missing, and checks it against the SHA-1 pinned in [`../versions.json`](../versions.json) either way (`P2.4`, D62).
 
 ```sh
 py -I build.py                         # finds JDK 25 from CALCITE_JAVA_HOME, JAVA_HOME or PATH
@@ -20,10 +20,11 @@ py -I build.py --java-home <jdk-25>    # or name it
 
 The build:
 
-1. Reads `META-INF/versions.list` and `META-INF/libraries.list` from the bundler jar.
-2. Extracts the inner server jar and its 39 libraries into `oracle/work/versions/` and `oracle/work/libraries/`, checking each against the bundler's SHA-256. Files that are already there with the right hash are kept.
-3. Compiles `src/` with `javac --release 25`, with warnings as errors.
-4. Writes `build/<platform>/adapter.json`: the command line the runner starts the adapter with, and the JVM flags for each vanilla configuration the rig records (D60). Each platform gets its own folder, so one checkout can be built from Windows and from WSL.
+1. Fetches the jar if it's missing, and checks its SHA-1 against the pin.
+2. Reads `META-INF/versions.list` and `META-INF/libraries.list` from the bundler jar.
+3. Extracts the inner server jar and its 39 libraries into `oracle/work/versions/` and `oracle/work/libraries/`, checking each against the bundler's SHA-256. Files that are already there with the right hash are kept.
+4. Compiles `src/` with `javac --release 25`, with warnings as errors.
+5. Writes `build/<platform>/adapter.json`: the command line the runner starts the adapter with, and the JVM flags for each vanilla configuration the rig records (D60). Each platform gets its own folder, so one checkout can be built from Windows and from WSL.
 
 | Configuration | JVM flags |
 | --- | --- |
