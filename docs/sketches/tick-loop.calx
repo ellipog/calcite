@@ -1,9 +1,9 @@
 // Sketch 1 of 3: the tick loop.
-// Shows D20's phases: the global phase, the region phase, then message exchange.
+// Shows the phases from D50: inputs, the packet phase, the global phase, the world phase, then exchange.
 // Imagined Calx syntax from Phase 0. Nothing here compiles yet. README.md explains the conventions.
 //
 // The vanilla order it follows is from 26.3: MinecraftServer.runServer, processPacketsAndTick, tickServer
-// and tickChildren, and ServerLevel.tick. The rig judges the order in the end (D20).
+// and tickChildren, and ServerLevel.tick. The rig judges the order in the end (D20, D50).
 
 module calcite.server
 
@@ -66,21 +66,38 @@ fn tick_once(s: mut Server) {
     //    the log. Replaying reads them from the log and ignores the network (D21).
     let inputs: own Inputs = s.log.cut(n, s.net.drain())
 
-    // 1. Global phase. One thread, with exclusive access to the whole world, so anything that may reach
-    //    beyond one region happens here (D20).
-    s.global.tick(n, inputs.global, mut s.regions, s.layout)
-
-    // 2. Region phase. Each iteration owns one region exclusively. Everything else the body touches is
+    // 1. Packet phase. Each iteration owns one region exclusively. Everything else the body touches is
     //    read-only for the whole phase: the snapshot, the layout, and each region's share of the inputs.
     //    The compiler rejects a body that captures anything mutable except r, which is what makes this
-    //    safe without locks and the same at any thread count (D21).
-    let snapshot: own Snapshot = s.global.snapshot(n)     // player directory, game rules, time, config
+    //    safe without locks and the same at any thread count (D21, D49).
+    //    Vanilla handles every packet before anything else in the tick, so this comes first (D50).
+    let before: own Snapshot = s.global.snapshot(n)       // player directory, game rules, time, config
     let routed = inputs.by_region(s.layout)              // packets go to the region that owns the player now
     parallel(s.pool) for r in mut s.regions.values() {
-        r.tick(n, snapshot, routed.for(r.id))
+        r.packet_phase(n, before, routed.for(r.id))
     }
 
-    // 3. Message exchange. One thread again. Every outbox is already in send order, and outboxes are read
+    // 2. Global phase. One thread, with exclusive access to the whole world, so anything that may reach
+    //    beyond one region happens here. Messages the regions just sent to it are handled first: commands
+    //    escalated from the packet phase in input order (D51), then the rest by sender ID and sequence.
+    for r in mut s.regions.values_by_id() {
+        s.global.inbox.take_from(r.id, mut r.outbox, to_global_only: true)
+    }
+    s.global.tick(n, inputs.global, mut s.regions, s.layout)
+
+    // 3. World phase. The rest of the region's tick, with a fresh snapshot, since the global phase
+    //    advanced time and may have changed game rules. Messages the global phase sent are already in
+    //    each region's inbox: it had exclusive access, so it put them there directly.
+    let after: own Snapshot = s.global.snapshot(n)
+    parallel(s.pool) for r in mut s.regions.values() {
+        r.world_phase(n, after)
+    }
+
+    // 4. Console and RCON commands. Vanilla runs them in tickConnection, after every world has ticked, so
+    //    they run here, where nothing else is running and they can touch any region.
+    s.global.console.run(inputs.console, mut s.regions)
+
+    // 5. Message exchange. One thread again. Every outbox is already in send order, and outboxes are read
     //    in ascending sender ID with the global instance first (ID 0), so delivery order is fixed (D20).
     var mail = Mail()
     mail.collect(RegionId.global, s.global.outbox.take())
@@ -88,18 +105,18 @@ fn tick_once(s: mut Server) {
         mail.collect(r.id, r.outbox.take())
     }
 
-    // 3a. Players and entities that crossed into another region's chunks move first, by the layout they
+    // 5a. Players and entities that crossed into another region's chunks move first, by the layout they
     //     crossed under. They're moved, not copied: a handoff owns the entity.
     for h in mail.take_handoffs() {
         s.regions[s.layout.owner(h.world, h.chunk)].adopt(h)
     }
 
-    // 3b. Split and merge. A pure function of the world state at this barrier, so the same input log
+    // 5b. Split and merge. A pure function of the world state at this barrier, so the same input log
     //     always gives the same regions, and new regions get IDs in a fixed order (D22).
     s.layout.rebalance(mut s.regions, n)
 
-    // 3c. Everything else is routed by the new layout, in (sender ID, sequence) order, and handled in
-    //     tick n + 1 (D46).
+    // 5c. Everything else is routed by the new layout, in (sender ID, sequence) order, and handled the next
+    //     time its destination runs: a region's next packet phase, or the next global phase (D50).
     for m in mail.take_messages() {
         match m.to {
             Destination.Global => s.global.inbox.push(m),
@@ -109,12 +126,12 @@ fn tick_once(s: mut Server) {
         }
     }
 
-    // 4. Output. Regions queued their players' packets as they ticked. The network threads encode,
+    // 6. Output. Regions queued their players' packets as they ticked. The network threads encode,
     //    compress and encrypt them off the region threads (D33). Vanilla suspends flushing for the whole
     //    tick and resumes it at the end, so a tick's packets reach each client together. This does the same.
     s.net.flush(n)
 
-    // 5. Housekeeping, as at the end of MinecraftServer.tickServer.
+    // 7. Housekeeping, as at the end of MinecraftServer.tickServer.
     s.global.autosave_countdown(n, mut s.regions)
     s.global.profiler.end_tick(n)
 }
@@ -144,9 +161,9 @@ impl Global {
     // The parts of vanilla's tick that read or write beyond one region. Each world's steps keep the order
     // ServerLevel.tick has them in. What runs here is listed in docs/global-systems.md (P0.4).
     fn tick(g: mut Global, n: i64, inputs: own GlobalInputs, regions: mut Regions, layout: Layout) {
+        // Vanilla ticks the tick rate manager after handling packets, so the packet phase already ran.
         g.tick_rate.tick()                                   // ServerTickRateManager.tick
-        g.handle_inbox(mut regions)                          // messages sent to the global instance last tick
-        g.console.run(inputs.console, mut regions)           // console commands may touch any region
+        g.handle_inbox(mut regions)                          // escalated commands in input order, then messages
         g.functions.tick(mut regions)                        // #minecraft:tick functions
         if g.tick_rate.runs_normally() {
             g.clocks.tick()                                  // world clocks, new in 26.x
@@ -170,9 +187,12 @@ impl Global {
             if g.tick_rate.runs_normally() {
                 w.raids.tick(mut regions)
             }
-            // Vanilla runs these after the chunks tick. Running them here means they see last tick's
-            // chunks. Another one for the rig to judge.
-            w.custom_spawners.tick(mut regions)              // phantoms, patrols, cats, sieges, traders
+            // Phantoms, patrols, cats, sieges and traders are lent per world (D52). With one region in
+            // the world, that region runs them itself, at vanilla's point after its chunks tick. With
+            // several, this decides who and when, and the chosen region spawns at that same point.
+            if layout.regions_in(w.key) > 1 {
+                w.custom_spawners.decide(mut regions, layout)
+            }
             if let fight = w.dragon_fight {
                 fight.tick(mut regions)
             }

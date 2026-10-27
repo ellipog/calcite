@@ -9,7 +9,7 @@ Three pieces of Calcite core, written in imagined Calx before the compiler exist
 
 | Sketch | What it shows | Follows in vanilla 26.3 |
 | --- | --- | --- |
-| [`tick-loop.calx`](tick-loop.calx) | The main loop, and one tick: inputs, the global phase, the region phase, message exchange (D20) | `MinecraftServer.runServer`, `tickServer`, `tickChildren`; the world-wide parts of `ServerLevel.tick` |
+| [`tick-loop.calx`](tick-loop.calx) | The main loop, and one tick: inputs, the packet phase, the global phase, the world phase, the barrier (D50) | `MinecraftServer.runServer`, `tickServer`, `tickChildren`; the world-wide parts of `ServerLevel.tick` |
 | [`region.calx`](region.calx) | One region actor and its tick | The region-local parts of `ServerLevel.tick` and `ServerChunkCache.tickChunks` |
 | [`packet-handler.calx`](packet-handler.calx) | The movement packets, declared for packet codegen, and their handler | `ServerboundMovePlayerPacket`, `ServerGamePacketListenerImpl.handleMovePlayer` |
 
@@ -24,7 +24,7 @@ The same as the samples, plus what core code needs:
 | `x: T` | A read-only view of a `T`. Small plain types are copied instead |
 | `x: mut T` | A mutable view. The caller passes `mut value` |
 | `x: own T` | Ownership moves in. The caller can't use the value afterwards |
-| `checkout e = map[key] else ...` | Takes one element out of a collection until the end of the enclosing block, then puts it back in the same place in the order |
+| `checkout e = map[key] else ...` | Takes one element out of a collection, or an optional field out of a struct, until the end of the enclosing block, then puts it back. A collection element keeps its place in the order |
 | `parallel(pool) for x in mut xs { }` | Runs the body for every element at once, each with exclusive access to its element |
 | `actor struct` | A struct with an inbox and an outbox that the tick loop delivers between |
 | `a?.b` | `b` if `a` has a value |
@@ -46,13 +46,13 @@ The same as the samples, plus what core code needs:
 8. **Java-exact numbers show up everywhere, even in a movement handler.** `float * int` widened to `double` for a comparison, a float literal (`1.0E-5F`) widened to a double, clamping and degree wrapping. Calx has to keep literal types and never convert implicitly, so code like this says exactly what Java does.
 9. **Vanilla's level random is seeded from `System.nanoTime()`.** So vanilla isn't repeatable run to run, and the rig's vanilla adapter has to set the seed (`P1.2`). Calcite records its seeds in the input log header.
 10. **Cross-region effects can keep vanilla's arrival order.** Vanilla handles all packets in one queue in arrival order. Calcite splits them by region, which is fine for anything local, but chat from two regions in the same tick would arrive in region-ID order. Messages caused by a packet carry its input sequence number, and the global instance sorts broadcasts by it.
-11. **Order differences for the rig and the global-systems inventory (`P0.4`):**
+11. **Packets first, in their own phase (D50).** The first draft ran the global phase before the regions, which handled packets after time had advanced, so `/time query` typed by a player would have been one tick off. Writing the inventory (`P0.4`) caught it. The tick is now: packet phase, global phase, world phase, barrier, which keeps vanilla's order. Console commands run at the barrier, where vanilla's `tickConnection` runs them.
+12. **Order differences for the rig and the [global-systems inventory](../global-systems.md):**
     - The scheduled-tick cap (65536 per world per tick) becomes per region.
-    - Custom spawners (phantoms, patrols, cats, sieges, wandering traders) run in the global phase before the regions, not after the chunks tick.
-    - Scheduled block and fluid ticks run at the start of each region's tick, after the world-wide steps, instead of between `tickTime` and raids.
+    - Scheduled block and fluid ticks run at the start of each region's world phase, after the world-wide steps, instead of between `tickTime` and raids.
     - Mob caps count other regions' mobs as of the last barrier.
     - The 300-tick empty-world timer that stops entity ticking is per region.
-12. **One position packet per tick is new in 26.x.** A second one in a tick disconnects the client. Calcite's per-tick packet batches make this natural.
+13. **One position packet per tick is new in 26.x.** A second one in a tick disconnects the client. Calcite's per-tick packet batches make this natural.
 
 ## What Calx needs (for `CALX_SPEC.md` v0)
 
