@@ -1,4 +1,4 @@
-# Calcite
+<img src="assets/logo/calcite-banner.png" alt="Calcite" width="100%">
 
 A Minecraft Java Edition server written from scratch in [Calx](https://github.com/ellipog/calx). It targets 26.3.
 
