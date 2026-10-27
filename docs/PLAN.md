@@ -84,7 +84,7 @@ Settle the language, the tick model and the plugin API on paper before writing a
   - host API only unless the plugin is trusted
   - chunky calls and handles
   - versioning and doc comments on everything
-- **P0.6** Define the Phase 3 tick-loop benchmark in `docs/benchmarks.md`, so the gate is fixed before the compiler exists. It should cover palette-container reads and writes, entity physics in doubles, hash-map work and actor messages.
+- **P0.6** Define the Phase 3 tick-loop benchmark in `calx/docs/benchmarks.md`, so the gate is fixed before the compiler exists. It should cover palette-container reads and writes, entity physics in doubles, hash-map work and actor messages.
 - **P0.7** Keep the decision log current. Every settled question goes in it, numbered in order.
 
 **Done when**
@@ -373,9 +373,11 @@ calx/
 ├─ std/                  # Calx standard library, including Java-compatible collections
 ├─ tests/                # small Calx programs with expected output
 ├─ tools/                # later: language server, VS Code extension
+├─ bench/                # Phase 3: the tick-loop benchmark in Calx and Rust, results per commit
 └─ docs/
    ├─ README.md          # docs index and page order
    ├─ CALX_SPEC.md       # designed but not yet built
+   ├─ benchmarks.md      # Phase 0: the tick-loop benchmark definition
    ├─ reference/         # one page per shipped feature (normative)
    └─ guide/             # learning Calx, in reading order
 
@@ -394,7 +396,6 @@ calcite/
 │  ├─ bot/               # protocol bot, reused as the benchmark swarm
 │  ├─ differences/       # registry of deliberate differences
 │  └─ PROTOCOL.md        # adapter wire format and probe signatures
-├─ bench/                # benchmark definitions, Rust reference, results per commit
 ├─ cases/                # committed: inputs only
 ├─ expected/26.3/        # committed: hash of vanilla's output per case
 ├─ golden/26.3/          # gitignored: full vanilla outputs
@@ -403,7 +404,7 @@ calcite/
    ├─ PLAN.md            # this file
    ├─ decisions.md       # the decision log
    ├─ global-systems.md  # Phase 0: world-wide systems and where each runs
-   ├─ benchmarks.md      # Phase 0: the benchmark definition
+   ├─ sketches/          # Phase 0: the tick loop, a region and a packet handler in imagined Calx
    └─ plugins/           # Phase 7: plugin developer guide
 ```
 
