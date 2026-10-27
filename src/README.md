@@ -18,6 +18,7 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `rig.adapter` | The rig adapter's main: answers `hello`, `run` and `bye` | |
 | `rig.frame`, `rig.json` | The rig's frames, and the JSON in their headers | |
 | `rig.rng` | The `rng` probe | |
+| `rig.collections` | The `collections` probe: Calx's Java-ordered tables against Java's and fastutil's | |
 
 ## Random sources
 

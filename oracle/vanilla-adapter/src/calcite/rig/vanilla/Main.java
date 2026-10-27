@@ -43,7 +43,8 @@ public final class Main {
                 new MathProbe("math"),
                 new MathProbe("strictmath"),
                 new MthProbe(),
-                new BlockStateProbe())) {
+                new BlockStateProbe(),
+                new CollectionsProbe())) {
             probes.put(probe.name(), probe);
         }
 

@@ -232,6 +232,76 @@ Global block state IDs, the block registry's state layout, the command syntax fo
 | `{"op": "parse", "input": s, "nbt": b}` | `BlockStateParser.parseForBlock` on `s`, allowing a `{...}` NBT suffix if `b`: `{id, state, written, given, nbt, cursor}`. `written` is the state's NBT form as SNBT, `given` the properties the input set, `nbt` the suffix as SNBT or null, and `cursor` where parsing stopped. A rejection if the parser throws |
 | `{"op": "from_nbt", "snbt": s}` | `NbtUtils.readBlockState` on the compound `s`: `{id, state, written}`. It never rejects: an unknown block reads as air and a bad property is left at its default |
 
+### `collections` (v1)
+
+Runs a sequence of operations on one of the collections whose order shows in vanilla's behaviour: the order entities tick in, the order a set's blocks are written, ties in a scheduled tick queue. Each result goes into one blob, and so does the iteration order whenever an operation asks for it.
+
+Input:
+
+- `collection`:
+  - `hash_map`, `hash_set`: `java.util.HashMap` and `HashSet`
+  - `linked_hash_map`, `linked_hash_set`: `LinkedHashMap` and `LinkedHashSet`
+  - `tree_map`, `tree_set`: `TreeMap` and `TreeSet`
+  - `open_hash_map`, `open_hash_set`: fastutil's open hash tables, `Int2IntOpenHashMap`, `Long2IntOpenHashMap` or `Object2IntOpenHashMap<String>`, and `IntOpenHashSet`, `LongOpenHashSet` or `ObjectOpenHashSet<String>`
+  - `priority_queue`: `java.util.PriorityQueue`, in natural order
+  - `array_deque`: `ArrayDeque`
+- `key`: `int`, `long` or `string`. Keys in operations are JSON strings, decimal for `int` and `long`. A map's values are `int`, as JSON numbers.
+- `capacity`: optional, for `hash_map`, `hash_set`, `open_hash_map` and `open_hash_set` only. The table is made with the constructor that takes an expected size. Not negative.
+- `ops`: a list of operations, each a list whose first element is its name.
+
+Output: `{}` and one blob, every operation's result in order, big-endian:
+
+- An `int` is 4 bytes, a `long` 8, a `string` a 4-byte length and then its UTF-8 bytes, and a boolean 1 byte, 0 or 1.
+- A *maybe* is a 0 byte for nothing, or a 1 byte and then the thing.
+- A key is written as its key type, and an *entry* is a key and then its `int` value.
+- An *iteration* is an `int` count, then each key, or each entry for a map, in the collection's iteration order.
+
+On every map:
+
+| Operation | Result |
+| --- | --- |
+| `["put", k, v]` | maybe the previous value |
+| `["get", k]`, `["remove", k]` | maybe the value |
+| `["contains", k]` | boolean, `containsKey` |
+| `["size"]` | int |
+| `["clear"]` | nothing |
+| `["iter"]` | iteration |
+
+On every set:
+
+| Operation | Result |
+| --- | --- |
+| `["add", k]`, `["remove", k]` | boolean, whether the set changed |
+| `["contains", k]` | boolean |
+| `["size"]`, `["clear"]`, `["iter"]` | as on maps |
+
+On linked and tree maps and sets, with `poll_*` giving a maybe-entry on maps and a maybe-key on sets:
+
+| Operation | Result |
+| --- | --- |
+| `["first"]`, `["last"]` | maybe the key, `firstKey`/`lastKey` or `getFirst`/`getLast` without throwing |
+| `["poll_first"]`, `["poll_last"]` | `pollFirstEntry`/`pollLastEntry` or `pollFirst`/`pollLast`, or `SequencedMap`'s and `SequencedSet`'s `removeFirst`/`removeLast` |
+
+On linked maps, `["put_first", k, v]` and `["put_last", k, v]` give maybe the previous value. On linked sets, `["add_first", k]` and `["add_last", k]` give nothing. Both move an existing key to that end.
+
+On tree maps and sets, `["floor", k]`, `["ceiling", k]`, `["lower", k]` and `["higher", k]` give maybe the key, and `["range", a, b]` gives an iteration of the keys from `a` up to but not including `b`, with no values. A range whose end is before its start is an `error` status.
+
+On open maps and sets, `["trim"]` gives nothing. It shrinks the table to fit, which changes the iteration order.
+
+On `priority_queue`:
+
+| Operation | Result |
+| --- | --- |
+| `["add", k]` | boolean, always 1 |
+| `["poll"]`, `["peek"]` | maybe the key |
+| `["remove", k]`, `["contains", k]` | boolean |
+| `["remove_iter", m, r]` | nothing. Walks the queue's iterator and removes each key whose number, or string length, is `r` modulo `m` (`Math.floorMod`), as `LevelChunkTicks.removeIf` does. `m` is positive |
+| `["size"]`, `["clear"]`, `["iter"]` | as on maps |
+
+On `array_deque`: `["add_first", k]` and `["add_last", k]` give nothing. `["poll_first"]`, `["poll_last"]`, `["first"]` and `["last"]` give maybe the key, `peekFirst` and `peekLast` for the last two. `["contains", k]`, `["size"]`, `["clear"]` and `["iter"]` are as before.
+
+An operation a collection doesn't have is an `error` status, as is a key that doesn't parse as the case's type.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

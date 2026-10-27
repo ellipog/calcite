@@ -1,0 +1,900 @@
+/// The `collections` probe (rig/PROTOCOL.md): operations on the Calx tables that stand for the
+/// Java and fastutil collections vanilla uses, each result and the iteration order written to
+/// one blob, so the rig compares Calcite's order with Java's.
+module rig.collections
+
+import rig.frame.{Outcome}
+import rig.json.{Json, Member, as_i32, as_string, push_text, take}
+
+/// A key type a case can name: read from the case's text, and written to the result.
+interface Key {
+    fn read(text: String) -> Self?
+    fn put(self, out: mut List<u8>)
+    /// What `remove_iter` tests: the number, or a string's length.
+    fn number(self) -> i64
+}
+
+impl Key for i32 {
+    fn read(text: String) -> Self? {
+        return i32.parse(text)
+    }
+
+    fn put(self, out: mut List<u8>) {
+        put_u32(mut out, u32.wrap(self))
+    }
+
+    fn number(self) -> i64 {
+        return i64(self)
+    }
+}
+
+impl Key for i64 {
+    fn read(text: String) -> Self? {
+        return i64.parse(text)
+    }
+
+    fn put(self, out: mut List<u8>) {
+        put_u32(mut out, u32.wrap(self >> 32))
+        put_u32(mut out, u32.wrap(self))
+    }
+
+    fn number(self) -> i64 {
+        return self
+    }
+}
+
+/// A `String` key, with `String`'s `hashCode` and order.
+struct Text {
+    s: String
+}
+
+impl JavaHash for Text {
+    fn java_hash(self) -> i32 {
+        return self.s.java_hash()
+    }
+}
+
+impl Key for Text {
+    fn read(text: String) -> Self? {
+        return some(Text { s: text.copy() })
+    }
+
+    fn put(self, out: mut List<u8>) {
+        put_u32(mut out, u32.wrap(self.s.len()))
+        push_text(mut out, self.s)
+    }
+
+    fn number(self) -> i64 {
+        return i64.wrap(self.s.utf16_len())
+    }
+}
+
+pub fn run_collections(input: own List<Member>) -> Outcome {
+    var fields = input
+    let collection = as_string(take(mut fields, "collection") ?? Json.Null) else return Outcome.Failed("`collection` must be a string")
+    let key = as_string(take(mut fields, "key") ?? Json.Null) else return Outcome.Failed("`key` must be a string")
+    var capacity: usize? = none
+    if let value = take(mut fields, "capacity") {
+        let n = as_i32(value) else return Outcome.Failed("`capacity` must be a 32-bit integer")
+        if n < 0 {
+            return Outcome.Failed("`capacity` must not be negative")
+        }
+        let sized = collection == "hash_map" or collection == "hash_set" or collection == "open_hash_map" or collection == "open_hash_set"
+        if not sized {
+            return Outcome.Failed("`capacity` applies only to hash_map, hash_set, open_hash_map and open_hash_set")
+        }
+        capacity = some(usize.wrap(n))
+    }
+    let ops_value = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let ops = match ops_value {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    var out: List<u8> = []
+    var error = String()
+    let done = match key {
+        "int" => run_on<i32>(collection, capacity, ops, mut out, mut error),
+        "long" => run_on<i64>(collection, capacity, ops, mut out, mut error),
+        "string" => run_on<Text>(collection, capacity, ops, mut out, mut error),
+        _ => {
+            error = "unknown key type `{key}`"
+            false
+        }
+    }
+    if not done {
+        return Outcome.Failed(error)
+    }
+    return Outcome.Done { output: [], blobs: [out] }
+}
+
+fn run_on<K: Key + JavaHash + Hash + Order>(collection: String, capacity: usize?, ops: List<Json>, out: mut List<u8>, error: mut String) -> bool {
+    return match collection {
+        "hash_map" => java_map<K>(capacity, ops, mut out, mut error),
+        "linked_hash_map" => linked_map<K>(ops, mut out, mut error),
+        "tree_map" => sorted_map<K>(ops, mut out, mut error),
+        "open_hash_map" => open_map<K>(capacity, ops, mut out, mut error),
+        "hash_set" => java_set<K>(capacity, ops, mut out, mut error),
+        "linked_hash_set" => linked_set<K>(ops, mut out, mut error),
+        "tree_set" => sorted_set<K>(ops, mut out, mut error),
+        "open_hash_set" => open_set<K>(capacity, ops, mut out, mut error),
+        "priority_queue" => queue<K>(ops, mut out, mut error),
+        "array_deque" => deque<K>(ops, mut out, mut error),
+        _ => {
+            error = "unknown collection `{collection}`"
+            false
+        }
+    }
+}
+
+// --- reading operations -------------------------------------------------------------------------
+
+/// Operation `i`'s name, or `none` with the error if it isn't a non-empty array named by a string.
+fn name_of(ops: List<Json>, i: usize, error: mut String) -> String? {
+    match ops[i] {
+        Json.Array(items) => {
+            if not items.is_empty() {
+                if let name = as_string(items[0]) {
+                    return some(name)
+                }
+            }
+        }
+        _ => {}
+    }
+    error = "operation {i} must be a non-empty array named by a string"
+    return none
+}
+
+/// How many arguments operation `i` has.
+fn arity(ops: List<Json>, i: usize) -> usize {
+    return match ops[i] {
+        Json.Array(items) => items.len() - 1,
+        _ => 0,
+    }
+}
+
+fn expect(ops: List<Json>, i: usize, n: usize, name: String, error: mut String) -> bool {
+    if arity(ops, i) == n {
+        return true
+    }
+    error = "operation {i}: `{name}` takes {n} arguments, got {arity(ops, i)}"
+    return false
+}
+
+/// Argument `k` of operation `i`, a key.
+fn key_of<K: Key>(ops: List<Json>, i: usize, k: usize, error: mut String) -> K? {
+    let text = match ops[i] {
+        Json.Array(items) => as_string(items[k]),
+        _ => none,
+    }
+    if let t = text {
+        if let key = K.read(t) {
+            return some(key)
+        }
+    }
+    error = "operation {i}'s key must be a string naming a key of the case's type"
+    return none
+}
+
+/// Argument `k` of operation `i`, a 32-bit integer.
+fn int_of(ops: List<Json>, i: usize, k: usize, error: mut String) -> i32? {
+    let v = match ops[i] {
+        Json.Array(items) => as_i32(items[k]),
+        _ => none,
+    }
+    if let x = v {
+        return some(x)
+    }
+    error = "operation {i}'s argument {k} must be a 32-bit integer"
+    return none
+}
+
+fn no_such(i: usize, name: String, collection: String, error: mut String) -> bool {
+    error = "operation {i}: `{name}` doesn't apply to {collection}"
+    return false
+}
+
+// --- writing results ----------------------------------------------------------------------------
+
+fn put_u32(out: mut List<u8>, v: u32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}
+
+fn put_i32(out: mut List<u8>, v: i32) {
+    put_u32(mut out, u32.wrap(v))
+}
+
+fn put_size(out: mut List<u8>, n: usize) {
+    put_u32(mut out, u32.wrap(n))
+}
+
+fn put_bool(out: mut List<u8>, b: bool) {
+    out.push(if b { 1 } else { 0 })
+}
+
+fn put_maybe_value(out: mut List<u8>, v: i32?) {
+    if let x = v {
+        out.push(1)
+        put_i32(mut out, x)
+    } else {
+        out.push(0)
+    }
+}
+
+fn put_maybe_key<K: Key>(out: mut List<u8>, k: K?) {
+    if let x = k {
+        out.push(1)
+        x.put(mut out)
+    } else {
+        out.push(0)
+    }
+}
+
+fn put_maybe_entry<K: Key>(out: mut List<u8>, e: (K, i32)?) {
+    if let (k, v) = e {
+        out.push(1)
+        k.put(mut out)
+        put_i32(mut out, v)
+    } else {
+        out.push(0)
+    }
+}
+
+/// A key found in a loop, or nothing: written as a maybe-key. `found` holds the key's bytes.
+fn put_found(out: mut List<u8>, found: List<u8>, any: bool) {
+    if any {
+        out.push(1)
+        for b in found {
+            out.push(b)
+        }
+    } else {
+        out.push(0)
+    }
+}
+
+/// The keys a loop collected, `count` of them, as a count and then the keys.
+fn put_keys(out: mut List<u8>, count: usize, keys: List<u8>) {
+    put_size(mut out, count)
+    for b in keys {
+        out.push(b)
+    }
+}
+
+/// `remove_iter`'s test: the key's number is `r` modulo `m`, as Java's `Math.floorMod`.
+fn picks<K: Key>(k: K, m: i32, r: i32) -> bool {
+    let mm = i64(m)
+    return ((k.number() % mm) + mm) % mm == i64(r)
+}
+
+// --- java.util.HashMap and HashSet --------------------------------------------------------------
+
+fn java_map<K: Key + JavaHash>(capacity: usize?, ops: List<Json>, out: mut List<u8>, error: mut String) -> bool {
+    var m = JavaHashMap<K, i32>()
+    if let c = capacity {
+        m = JavaHashMap<K, i32>(c)
+    }
+    let n = ops.len()
+    for i in 0..n {
+        let name = name_of(ops, i, mut error) else return false
+        if name == "put" {
+            if not expect(ops, i, 2, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            let v = int_of(ops, i, 2, mut error) else return false
+            put_maybe_value(mut out, m.get(k))
+            m.insert(k, v)
+        } else if name == "get" or name == "remove" or name == "contains" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            if name == "get" {
+                put_maybe_value(mut out, m.get(k))
+            } else if name == "remove" {
+                put_maybe_value(mut out, m.remove(k))
+            } else {
+                put_bool(mut out, m.contains(k))
+            }
+        } else if name == "size" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, m.len())
+        } else if name == "clear" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            m.clear()
+        } else if name == "iter" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, m.len())
+            for (k, v) in m {
+                k.put(mut out)
+                put_i32(mut out, v)
+            }
+        } else {
+            return no_such(i, name, "hash_map", mut error)
+        }
+    }
+    return true
+}
+
+fn java_set<K: Key + JavaHash>(capacity: usize?, ops: List<Json>, out: mut List<u8>, error: mut String) -> bool {
+    var s = JavaHashSet<K>()
+    if let c = capacity {
+        s = JavaHashSet<K>(c)
+    }
+    let n = ops.len()
+    for i in 0..n {
+        let name = name_of(ops, i, mut error) else return false
+        if name == "add" or name == "remove" or name == "contains" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            let had = s.contains(k)
+            if name == "add" {
+                put_bool(mut out, not had)
+                s.insert(k)
+            } else if name == "remove" {
+                put_bool(mut out, had)
+                s.remove(k)
+            } else {
+                put_bool(mut out, had)
+            }
+        } else if name == "size" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, s.len())
+        } else if name == "clear" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            s.clear()
+        } else if name == "iter" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, s.len())
+            for k in s {
+                k.put(mut out)
+            }
+        } else {
+            return no_such(i, name, "hash_set", mut error)
+        }
+    }
+    return true
+}
+
+// --- fastutil's open maps and sets --------------------------------------------------------------
+
+fn open_map<K: Key + JavaHash>(capacity: usize?, ops: List<Json>, out: mut List<u8>, error: mut String) -> bool {
+    var m = OpenHashMap<K, i32>()
+    if let c = capacity {
+        m = OpenHashMap<K, i32>(c)
+    }
+    let n = ops.len()
+    for i in 0..n {
+        let name = name_of(ops, i, mut error) else return false
+        if name == "put" {
+            if not expect(ops, i, 2, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            let v = int_of(ops, i, 2, mut error) else return false
+            put_maybe_value(mut out, m.get(k))
+            m.insert(k, v)
+        } else if name == "get" or name == "remove" or name == "contains" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            if name == "get" {
+                put_maybe_value(mut out, m.get(k))
+            } else if name == "remove" {
+                put_maybe_value(mut out, m.remove(k))
+            } else {
+                put_bool(mut out, m.contains(k))
+            }
+        } else if name == "size" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, m.len())
+        } else if name == "clear" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            m.clear()
+        } else if name == "trim" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            m.trim()
+        } else if name == "iter" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, m.len())
+            for (k, v) in m {
+                k.put(mut out)
+                put_i32(mut out, v)
+            }
+        } else {
+            return no_such(i, name, "open_hash_map", mut error)
+        }
+    }
+    return true
+}
+
+fn open_set<K: Key + JavaHash>(capacity: usize?, ops: List<Json>, out: mut List<u8>, error: mut String) -> bool {
+    var s = OpenHashSet<K>()
+    if let c = capacity {
+        s = OpenHashSet<K>(c)
+    }
+    let n = ops.len()
+    for i in 0..n {
+        let name = name_of(ops, i, mut error) else return false
+        if name == "add" or name == "remove" or name == "contains" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            let had = s.contains(k)
+            if name == "add" {
+                put_bool(mut out, not had)
+                s.insert(k)
+            } else if name == "remove" {
+                put_bool(mut out, had)
+                s.remove(k)
+            } else {
+                put_bool(mut out, had)
+            }
+        } else if name == "size" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, s.len())
+        } else if name == "clear" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            s.clear()
+        } else if name == "trim" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            s.trim()
+        } else if name == "iter" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, s.len())
+            for k in s {
+                k.put(mut out)
+            }
+        } else {
+            return no_such(i, name, "open_hash_set", mut error)
+        }
+    }
+    return true
+}
+
+// --- LinkedHashMap and LinkedHashSet ------------------------------------------------------------
+
+fn linked_map<K: Key + Hash>(ops: List<Json>, out: mut List<u8>, error: mut String) -> bool {
+    var m = LinkedMap<K, i32>()
+    let n = ops.len()
+    for i in 0..n {
+        let name = name_of(ops, i, mut error) else return false
+        if name == "put" or name == "put_first" or name == "put_last" {
+            if not expect(ops, i, 2, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            let v = int_of(ops, i, 2, mut error) else return false
+            put_maybe_value(mut out, m.get(k))
+            if name == "put" {
+                m.insert(k, v)
+            } else if name == "put_first" {
+                m.insert_first(k, v)
+            } else {
+                m.insert_last(k, v)
+            }
+        } else if name == "get" or name == "remove" or name == "contains" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            if name == "get" {
+                put_maybe_value(mut out, m.get(k))
+            } else if name == "remove" {
+                put_maybe_value(mut out, m.remove(k))
+            } else {
+                put_bool(mut out, m.contains(k))
+            }
+        } else if name == "first" or name == "last" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            var found: List<u8> = []
+            for (k, _) in m {
+                found.clear()
+                k.put(mut found)
+                if name == "first" {
+                    break
+                }
+            }
+            put_found(mut out, found, not m.is_empty())
+        } else if name == "poll_first" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_maybe_entry(mut out, m.pop_first())
+        } else if name == "poll_last" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_maybe_entry(mut out, m.pop_last())
+        } else if name == "size" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, m.len())
+        } else if name == "clear" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            m.clear()
+        } else if name == "iter" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, m.len())
+            for (k, v) in m {
+                k.put(mut out)
+                put_i32(mut out, v)
+            }
+        } else {
+            return no_such(i, name, "linked_hash_map", mut error)
+        }
+    }
+    return true
+}
+
+fn linked_set<K: Key + Hash>(ops: List<Json>, out: mut List<u8>, error: mut String) -> bool {
+    var s = LinkedSet<K>()
+    let n = ops.len()
+    for i in 0..n {
+        let name = name_of(ops, i, mut error) else return false
+        if name == "add" or name == "remove" or name == "contains" or name == "add_first" or name == "add_last" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            let had = s.contains(k)
+            if name == "add" {
+                put_bool(mut out, not had)
+                s.insert(k)
+            } else if name == "add_first" {
+                s.insert_first(k)
+            } else if name == "add_last" {
+                s.insert_last(k)
+            } else if name == "remove" {
+                put_bool(mut out, had)
+                s.remove(k)
+            } else {
+                put_bool(mut out, had)
+            }
+        } else if name == "first" or name == "last" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            var found: List<u8> = []
+            for k in s {
+                found.clear()
+                k.put(mut found)
+                if name == "first" {
+                    break
+                }
+            }
+            put_found(mut out, found, not s.is_empty())
+        } else if name == "poll_first" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_maybe_key(mut out, s.pop_first())
+        } else if name == "poll_last" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_maybe_key(mut out, s.pop_last())
+        } else if name == "size" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, s.len())
+        } else if name == "clear" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            s.clear()
+        } else if name == "iter" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, s.len())
+            for k in s {
+                k.put(mut out)
+            }
+        } else {
+            return no_such(i, name, "linked_hash_set", mut error)
+        }
+    }
+    return true
+}
+
+// --- TreeMap and TreeSet ------------------------------------------------------------------------
+
+fn sorted_map<K: Key + Order>(ops: List<Json>, out: mut List<u8>, error: mut String) -> bool {
+    var m = SortedMap<K, i32>()
+    let n = ops.len()
+    for i in 0..n {
+        let name = name_of(ops, i, mut error) else return false
+        if name == "put" {
+            if not expect(ops, i, 2, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            let v = int_of(ops, i, 2, mut error) else return false
+            put_maybe_value(mut out, m.get(k))
+            m.insert(k, v)
+        } else if name == "get" or name == "remove" or name == "contains" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            if name == "get" {
+                put_maybe_value(mut out, m.get(k))
+            } else if name == "remove" {
+                put_maybe_value(mut out, m.remove(k))
+            } else {
+                put_bool(mut out, m.contains(k))
+            }
+        } else if name == "first" or name == "last" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            var found: List<u8> = []
+            for (k, _) in m {
+                found.clear()
+                k.put(mut found)
+                if name == "first" {
+                    break
+                }
+            }
+            put_found(mut out, found, not m.is_empty())
+        } else if name == "poll_first" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_maybe_entry(mut out, m.pop_first())
+        } else if name == "poll_last" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_maybe_entry(mut out, m.pop_last())
+        } else if name == "floor" or name == "lower" {
+            // The greatest key up to `k`, or before it: the last of a range.
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            var found: List<u8> = []
+            var any = false
+            if name == "floor" {
+                for (x, _) in m.range(..=k) {
+                    found.clear()
+                    x.put(mut found)
+                    any = true
+                }
+            } else {
+                for (x, _) in m.range(..k) {
+                    found.clear()
+                    x.put(mut found)
+                    any = true
+                }
+            }
+            put_found(mut out, found, any)
+        } else if name == "ceiling" or name == "higher" {
+            // The least key from `k`, or after it: the first of a range.
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            var found: List<u8> = []
+            var any = false
+            for (x, _) in m.range(k..) {
+                if name == "higher" and x == k {
+                    continue
+                }
+                x.put(mut found)
+                any = true
+                break
+            }
+            put_found(mut out, found, any)
+        } else if name == "range" {
+            if not expect(ops, i, 2, name, mut error) { return false }
+            let a = key_of<K>(ops, i, 1, mut error) else return false
+            let b = key_of<K>(ops, i, 2, mut error) else return false
+            if a > b {
+                error = "operation {i}: the range ends before it starts"
+                return false
+            }
+            var keys: List<u8> = []
+            var count: usize = 0
+            for (x, _) in m.range(a..b) {
+                x.put(mut keys)
+                count += 1
+            }
+            put_keys(mut out, count, keys)
+        } else if name == "size" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, m.len())
+        } else if name == "clear" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            m.clear()
+        } else if name == "iter" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, m.len())
+            for (k, v) in m {
+                k.put(mut out)
+                put_i32(mut out, v)
+            }
+        } else {
+            return no_such(i, name, "tree_map", mut error)
+        }
+    }
+    return true
+}
+
+fn sorted_set<K: Key + Order>(ops: List<Json>, out: mut List<u8>, error: mut String) -> bool {
+    var s = SortedSet<K>()
+    let n = ops.len()
+    for i in 0..n {
+        let name = name_of(ops, i, mut error) else return false
+        if name == "add" or name == "remove" or name == "contains" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            let had = s.contains(k)
+            if name == "add" {
+                put_bool(mut out, not had)
+                s.insert(k)
+            } else if name == "remove" {
+                put_bool(mut out, had)
+                s.remove(k)
+            } else {
+                put_bool(mut out, had)
+            }
+        } else if name == "first" or name == "last" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            var found: List<u8> = []
+            for k in s {
+                found.clear()
+                k.put(mut found)
+                if name == "first" {
+                    break
+                }
+            }
+            put_found(mut out, found, not s.is_empty())
+        } else if name == "poll_first" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_maybe_key(mut out, s.pop_first())
+        } else if name == "poll_last" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_maybe_key(mut out, s.pop_last())
+        } else if name == "floor" or name == "lower" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            var found: List<u8> = []
+            var any = false
+            if name == "floor" {
+                for x in s.range(..=k) {
+                    found.clear()
+                    x.put(mut found)
+                    any = true
+                }
+            } else {
+                for x in s.range(..k) {
+                    found.clear()
+                    x.put(mut found)
+                    any = true
+                }
+            }
+            put_found(mut out, found, any)
+        } else if name == "ceiling" or name == "higher" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            var found: List<u8> = []
+            var any = false
+            for x in s.range(k..) {
+                if name == "higher" and x == k {
+                    continue
+                }
+                x.put(mut found)
+                any = true
+                break
+            }
+            put_found(mut out, found, any)
+        } else if name == "range" {
+            if not expect(ops, i, 2, name, mut error) { return false }
+            let a = key_of<K>(ops, i, 1, mut error) else return false
+            let b = key_of<K>(ops, i, 2, mut error) else return false
+            if a > b {
+                error = "operation {i}: the range ends before it starts"
+                return false
+            }
+            var keys: List<u8> = []
+            var count: usize = 0
+            for x in s.range(a..b) {
+                x.put(mut keys)
+                count += 1
+            }
+            put_keys(mut out, count, keys)
+        } else if name == "size" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, s.len())
+        } else if name == "clear" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            s.clear()
+        } else if name == "iter" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, s.len())
+            for k in s {
+                k.put(mut out)
+            }
+        } else {
+            return no_such(i, name, "tree_set", mut error)
+        }
+    }
+    return true
+}
+
+// --- PriorityQueue and ArrayDeque ---------------------------------------------------------------
+
+fn queue<K: Key + Order>(ops: List<Json>, out: mut List<u8>, error: mut String) -> bool {
+    var q = PriorityQueue<K>()
+    let n = ops.len()
+    for i in 0..n {
+        let name = name_of(ops, i, mut error) else return false
+        if name == "add" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            q.push(k)
+            put_bool(mut out, true)
+        } else if name == "remove" or name == "contains" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            if name == "remove" {
+                put_bool(mut out, q.remove(k))
+            } else {
+                put_bool(mut out, q.contains(k))
+            }
+        } else if name == "poll" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_maybe_key(mut out, q.pop())
+        } else if name == "peek" {
+            // A loop starts with the least.
+            if not expect(ops, i, 0, name, mut error) { return false }
+            var found: List<u8> = []
+            for k in q {
+                k.put(mut found)
+                break
+            }
+            put_found(mut out, found, not q.is_empty())
+        } else if name == "remove_iter" {
+            // Vanilla's LevelChunkTicks.removeIf: a loop removing with the iterator.
+            if not expect(ops, i, 2, name, mut error) { return false }
+            let m = int_of(ops, i, 1, mut error) else return false
+            let r = int_of(ops, i, 2, mut error) else return false
+            if m <= 0 {
+                error = "operation {i}: the modulus must be positive"
+                return false
+            }
+            var marks = List<bool>()
+            for k in q {
+                marks.push(picks(k, m, r))
+            }
+            q.remove_marked(marks)
+        } else if name == "size" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, q.len())
+        } else if name == "clear" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            q.clear()
+        } else if name == "iter" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, q.len())
+            for k in q {
+                k.put(mut out)
+            }
+        } else {
+            return no_such(i, name, "priority_queue", mut error)
+        }
+    }
+    return true
+}
+
+fn deque<K: Key + Equal>(ops: List<Json>, out: mut List<u8>, error: mut String) -> bool {
+    var d = Deque<K>()
+    let n = ops.len()
+    for i in 0..n {
+        let name = name_of(ops, i, mut error) else return false
+        if name == "add_first" or name == "add_last" or name == "contains" {
+            if not expect(ops, i, 1, name, mut error) { return false }
+            let k = key_of<K>(ops, i, 1, mut error) else return false
+            if name == "add_first" {
+                d.push_first(k)
+            } else if name == "add_last" {
+                d.push_last(k)
+            } else {
+                put_bool(mut out, d.contains(k))
+            }
+        } else if name == "poll_first" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_maybe_key(mut out, d.pop_first())
+        } else if name == "poll_last" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_maybe_key(mut out, d.pop_last())
+        } else if name == "first" or name == "last" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            if d.is_empty() {
+                out.push(0)
+            } else {
+                out.push(1)
+                if name == "first" {
+                    d[0].put(mut out)
+                } else {
+                    d[d.len() - 1].put(mut out)
+                }
+            }
+        } else if name == "size" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, d.len())
+        } else if name == "clear" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            d.clear()
+        } else if name == "iter" {
+            if not expect(ops, i, 0, name, mut error) { return false }
+            put_size(mut out, d.len())
+            for k in d {
+                k.put(mut out)
+            }
+        } else {
+            return no_such(i, name, "array_deque", mut error)
+        }
+    }
+    return true
+}

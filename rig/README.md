@@ -111,6 +111,7 @@ Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.
 py -I cases/rng/gen.py      # cases/rng/generated.json
 py -I cases/nbt/gen.py      # cases/nbt/limits.json
 py -I cases/math/gen.py     # cases/math, cases/strictmath and cases/mth
+py -I cases/collections/gen.py   # cases/collections/generated.json
 ```
 
 ### Blobs in case files
@@ -140,7 +141,7 @@ The generators use SplitMix64 from the given seed. A range value is `min + (max 
 
 - calx is found from the `CALX` environment variable, then `PATH`, then `../calx/build/compiler/<platform>/` beside this repository. calx finds clang itself.
 - `CALCITE_DEBUG=1` builds the adapter in debug mode, where it checks that it frees everything it allocates and exits with status 102 if not.
-- It implements `ping` and `rng`, which pass 100% on Windows and Linux. Every other probe reports `unimplemented` until Calcite has the code behind it.
+- It implements `ping`, `rng` and `collections`, which pass 100% on Windows and Linux. Every other probe reports `unimplemented` until Calcite has the code behind it.
 
 The adapter's parts are in [`src/`](../src/README.md): the frames and JSON in `rig.frame` and `rig.json`, and one module per probe.
 
@@ -188,3 +189,4 @@ CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Wi
 - **Block state IDs are arithmetic.** Each block's states take consecutive IDs, in block registry order, and a state's offset within its block is the mixed-radix number of its property values, with properties in name order and the last changing fastest. The data generator's report lists properties in a different order (its JSON writer puts `type` first), so the [converter](../oracle/datagen/README.md#blocksjson) sorts them itself. All 35,723 states and 1,286 blocks match the `block_state` probe.
 - **The block state parser is lenient in places.** It accepts a trailing comma (`oak_stairs[facing=east,]`), a leading zero or plus sign on a number (`note=07`, `note=+7`), and spaces around `=` and `,`. It stops at the first character it can't use, without complaint (`stone trailing` parses as stone). Values are case-sensitive (`TRUE` is rejected), and `Stone` is read as an empty name.
 - **The block state NBT reader never fails.** An unknown or malformed block name reads as air, and an unknown property, a value of the wrong type or a value out of range is skipped, leaving the default. 26.3 stores states as `{id, properties}`; the old `{Name, Properties}` form reads as air.
+- **Calx's Java-ordered tables iterate exactly as Java's do.** `JavaHashMap`, `LinkedMap`, `SortedMap`, `OpenHashMap`, their sets, `PriorityQueue` and `Deque` give the same results and the same order as `HashMap`, `LinkedHashMap`, `TreeMap`, fastutil's open tables, `PriorityQueue` and `ArrayDeque` in all 180 `collections` cases. Those cases include keys whose hashes all collide, so `HashMap`'s bins turn into trees, fastutil tables that shrink and `trim`, and removal through a priority queue's iterator.

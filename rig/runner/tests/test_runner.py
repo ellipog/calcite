@@ -180,7 +180,9 @@ class PingAdapter(unittest.TestCase):
                              capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("| ping (rig) | 5 | 5 |", out.stdout)
-        self.assertIn("| **All game probes** | 597 | 0 |", out.stdout)
+        # Every game case is unimplemented here, so none passes.
+        game = sum(len(c) for probe, c in cases.load_all(ROOT / "cases").items() if probe != "ping")
+        self.assertIn(f"| **All game probes** | {game} | 0 |", out.stdout)
 
 
 if __name__ == "__main__":
