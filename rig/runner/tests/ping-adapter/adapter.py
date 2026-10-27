@@ -1,9 +1,7 @@
-"""Calcite's rig adapter (P1.6), a stub until Calcite can run probes.
+"""A ping-only adapter for the runner's own tests, so they never need calx.
 
-It speaks the rig protocol (rig/PROTOCOL.md) and implements only `ping`, so every other
-probe scores as unimplemented. As Calcite's code lands, each probe moves here: this
-process starts Calcite's probe binary and forwards requests to it.
-
+It speaks the rig protocol (rig/PROTOCOL.md) and implements only `ping`, so every other probe
+scores as unimplemented. It was Calcite's stub adapter until Calcite's own replaced it (D87).
 Written from PROTOCOL.md alone, sharing no code with the runner, to keep the contract honest.
 """
 
@@ -45,7 +43,7 @@ def run(header, blobs):
     if probe == "ping":
         reply.update(status="ok", output={"echo": header.get("input", {}).get("echo")})
         return reply, blobs
-    reply.update(status="unimplemented", message=f"Calcite has no `{probe}` probe yet")
+    reply.update(status="unimplemented", message=f"no `{probe}` probe here")
     return reply, []
 
 
@@ -55,7 +53,7 @@ def main():
         header, blobs = frame
         kind = header.get("type")
         if kind == "hello":
-            write_frame(stdout, {"type": "hello", "protocol": PROTOCOL, "adapter": "calcite",
+            write_frame(stdout, {"type": "hello", "protocol": PROTOCOL, "adapter": "ping-only",
                                  "game_version": "26.3", "probes": PROBES,
                                  "about": {"stage": "stub"}})
         elif kind == "run":

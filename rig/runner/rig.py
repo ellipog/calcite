@@ -3,7 +3,7 @@
     py -I rig/runner/rig.py list
     py -I rig/runner/rig.py record [--probe P ...] [--config strict-math|intrinsics|all]
     py -I rig/runner/rig.py check [--probe P ...] [--variants all|name,...] [--config ...] [--quarantine]
-    py -I rig/runner/rig.py score [--adapter calcite|vanilla|PATH] [--probe P ...]
+    py -I rig/runner/rig.py score [--adapter calcite|vanilla|PATH] [--probe P ...] [--strict]
     py -I rig/runner/rig.py diff PROBE CASE [--adapter ...]
 
 See rig/README.md.
@@ -374,6 +374,7 @@ def cmd_score(args):
         "notes": notes,
     }, indent=2) + "\n", encoding="utf-8", newline="\n")
     print(f"\nFull report: {report}")
+    return 1 if args.strict and fails else 0
 
 
 def _hexdump(data, start, width=16):
@@ -444,6 +445,7 @@ def main():
     p.add_argument("--adapter", default="calcite", help="calcite, vanilla, or a path to an adapter.json")
     p.add_argument("--probe", action="append")
     p.add_argument("--config", help="when scoring vanilla itself, the configuration to run it in")
+    p.add_argument("--strict", action="store_true", help="exit with status 1 if any case fails or errors")
     p.set_defaults(fn=cmd_score)
 
     p = sub.add_parser("diff", help="compare one case's result with vanilla's golden")
@@ -454,8 +456,8 @@ def main():
     p.set_defaults(fn=cmd_diff)
 
     args = parser.parse_args()
-    args.fn(args)
+    return args.fn(args) or 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

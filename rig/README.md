@@ -12,7 +12,7 @@ The rig runs the same inputs through vanilla and through Calcite and compares th
 | Protocol | [`PROTOCOL.md`](PROTOCOL.md) | The wire format between the runner and an adapter, and every probe's signature |
 | Runner | [`runner/`](runner/) | Python: loads cases, runs adapters, records, self-checks, scores |
 | Vanilla adapter | [`../oracle/vanilla-adapter/`](../oracle/vanilla-adapter/) | Java 25: runs probes against Mojang's server code |
-| Calcite adapter | [`calcite-adapter/`](calcite-adapter/) | Runs probes against Calcite. A stub until Calcite has code |
+| Calcite adapter | [`calcite-adapter/`](calcite-adapter/) | Runs probes against Calcite's own code, built from [`../src/rig/`](../src/rig/) with calx |
 | Cases | [`../cases/`](../cases/) | Committed inputs, one folder per probe |
 | Expected hashes | `../expected/26.3/` | Committed: the hash of vanilla's result for every case, and the quarantine list |
 | Goldens | `../golden/26.3/` | Gitignored: vanilla's full results, for `diff` |
@@ -95,6 +95,8 @@ Runs an adapter (`--adapter calcite`, the default, or `vanilla`, or a path to an
 
 The score is passes over the cases that count: everything except differences, quarantined and unrecorded cases. `ping` tests the rig itself, so its row is marked `(rig)` and it isn't part of the total. The full report, with every case's outcome, goes to `build/rig/<platform>/scoreboard-<adapter>.json`. Adapter logs go to `build/rig/<platform>/logs/`.
 
+With `--strict`, it exits with status 1 if any case fails or errors, as CI runs it. Unimplemented cases don't count.
+
 Scoring vanilla against itself should always give 100%. If it doesn't, something isn't repeatable that the self-check missed.
 
 ### `diff`
@@ -132,6 +134,16 @@ Each entry in a case's `"blobs"` is one part, or a list of parts joined in order
 
 The generators use SplitMix64 from the given seed. A range value is `min + (max - min) * u`, with `u` the top 53 bits of the next output times 2^-53, computed in `f64`. `i32_range` takes the next output modulo the range's size. These definitions are fixed: changing one changes every case that uses it.
 
+## The Calcite adapter
+
+`calcite-adapter/adapter.json` starts [`launch.py`](calcite-adapter/launch.py), which builds [`src/rig/adapter.calx`](../src/rig/adapter.calx) with `calx build --release` and runs it (D87). The build takes under half a second, and about 50 ms when nothing changed, so it happens on every start. The binary goes to `build/rig/<platform>/`.
+
+- calx is found from the `CALX` environment variable, then `PATH`, then `../calx/build/compiler/<platform>/` beside this repository. calx finds clang itself.
+- `CALCITE_DEBUG=1` builds the adapter in debug mode, where it checks that it frees everything it allocates and exits with status 102 if not.
+- It implements `ping` and `rng`, which pass 100% on Windows and Linux. Every other probe reports `unimplemented` until Calcite has the code behind it.
+
+The adapter's parts are in [`src/`](../src/README.md): the frames and JSON in `rig.frame` and `rig.json`, and one module per probe.
+
 ## Adding a probe
 
 1. Specify it in [`PROTOCOL.md`](PROTOCOL.md#probes), at version 1.
@@ -140,7 +152,7 @@ The generators use SplitMix64 from the given seed. A range value is `min + (max 
 4. `record`, then `check --variants all`. Quarantine what doesn't repeat, and look at why.
 5. Commit the cases and `expected/26.3/<probe>.json`.
 
-Calcite's adapter reports the new probe as unimplemented until Calcite can run it.
+Calcite's adapter reports the new probe as unimplemented until Calcite can run it. To implement it there, add a module under `src/rig/` and list the probe in `hello` in `src/rig/adapter.calx`.
 
 ## Tests and CI
 
@@ -155,7 +167,7 @@ The runner's tests use only the standard library and never need the vanilla jar.
 - that every `gen.py` reproduces its committed case file exactly
 - that every case has an expected hash
 - the differences registry and the store
-- the Calcite stub, end to end through `score`
+- a ping-only test adapter, end to end through `score`
 
 The data converter and the jar fetch step have their own tests, which don't need the jar either ([`oracle/datagen/`](../oracle/datagen/README.md#tests)):
 
@@ -163,7 +175,7 @@ The data converter and the jar fetch step have their own tests, which don't need
 py -I -m unittest discover -s oracle/datagen/tests -v
 ```
 
-CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Windows and Linux, with the oldest supported Python (3.10) and the newest, then scores Calcite against the committed hashes (`P1.9`).
+CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Windows and Linux, with the oldest supported Python (3.10) and the newest. A second job checks out calx beside Calcite, builds it, runs Calcite's Calx tests (`py -I src/test/run.py`), and scores Calcite against the committed hashes with `--strict` (`P1.9`).
 
 ## Found so far
 
@@ -172,6 +184,7 @@ CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Wi
 - **`Math` isn't `StrictMath` on x86-64.** HotSpot's intrinsics differ from `StrictMath` by 1 ULP on 3% of `sin` and `cos` results, 9% of `pow`, 7% of `log` on (0, 1), and similar shares of `tan`, `exp`, `log10` and `cbrt`. `tanh` differs by up to 2 ULP. `mathcmp.py` measured this on 500,000 arguments per range, with the same counts on Windows and Linux. It's why the rig records [two configurations](#vanillas-two-configurations). Full table: [`CALX_SPEC.md`](https://github.com/ellipog/calx/blob/main/docs/CALX_SPEC.md#transcendental-functions).
 - **With the intrinsics off, `Math` is exactly `StrictMath`.** Under `-XX:-UseLibmIntrinsic`, every function matched on all 22 million arguments.
 - **Each configuration agrees with itself.** Every case gives the same bits under the interpreter, C1 and C2, in both configurations. So does `Mth`'s sine table: rounding to `f32` hides the 1-ULP differences, and all 65,536 entries equal both `(float) StrictMath.sin` and `(float) Math.sin`.
+- **Two float constants in the decompiled source are wrong.** `XoroshiroRandomSource` shows `DOUBLE_UNIT = 1.110223E-16F` and multiplies by that float literal, which would make `nextDouble` inexact. The bytecode holds the double 2^-53 (`1.1102230246251565E-16`), so the decompiler printed a double as a float. Calcite's sources read their constants from `javap`, not the decompiler (D86).
 - **Block state IDs are arithmetic.** Each block's states take consecutive IDs, in block registry order, and a state's offset within its block is the mixed-radix number of its property values, with properties in name order and the last changing fastest. The data generator's report lists properties in a different order (its JSON writer puts `type` first), so the [converter](../oracle/datagen/README.md#blocksjson) sorts them itself. All 35,723 states and 1,286 blocks match the `block_state` probe.
 - **The block state parser is lenient in places.** It accepts a trailing comma (`oak_stairs[facing=east,]`), a leading zero or plus sign on a number (`note=07`, `note=+7`), and spaces around `=` and `,`. It stops at the first character it can't use, without complaint (`stone trailing` parses as stone). Values are case-sensitive (`TRUE` is rejected), and `Stone` is read as an empty name.
 - **The block state NBT reader never fails.** An unknown or malformed block name reads as air, and an unknown property, a value of the wrong type or a value out of range is skipped, leaving the default. 26.3 stores states as `{id, properties}`; the old `{Name, Properties}` form reads as air.

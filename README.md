@@ -8,7 +8,7 @@ Goals:
 - **Performance.** Folia-style regions on every core, ticking in lockstep so results never depend on the thread count.
 - **Vanilla parity.** Worldgen matches block for block and behavior matches vanilla, checked bit for bit by an oracle rig. Bugs and exploits are fixed and listed.
 
-Status: Phases 0 and 1 (design, and the oracle rig) are done and in review. Phase 2, the data tables generated from the vanilla jar, is in progress.
+Status: Phases 0 and 1 (design, and the oracle rig) are done and in review. Phase 2, the data tables generated from the vanilla jar, is in progress. In Phase 3, Calcite's first Calx code, vanilla's random sources, passes the rig's `rng` probe bit for bit.
 
 Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calcite)). Calx has its own board, aaen-studios/clx ([open](https://acta.aaenz.no/aaen-studios/clx)). The phase gates live here.
 
@@ -17,6 +17,7 @@ Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calc
 - [Build plan](docs/PLAN.md): phases, tasks and gates
 - [Decision log](docs/decisions.md): everything that's settled, and why
 - [Host API sketch](plugins/api/HOST_API.md): the plugin contract
+- [Source](src/README.md): Calcite's Calx modules and their tests
 - [Oracle rig](rig/README.md): how Calcite is checked against vanilla, bit for bit
 - [Data generator and tables](oracle/datagen/README.md): the tables Calcite's codegen reads, generated from the jar
 

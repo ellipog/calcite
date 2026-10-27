@@ -23,7 +23,7 @@ import differences  # noqa: E402
 from protocol import Adapter, Result, canonical_json, read_frame, result_hash, write_frame  # noqa: E402
 from store import Store  # noqa: E402
 
-STUB = ROOT / "rig" / "calcite-adapter" / "adapter.py"
+PING_ADAPTER = Path(__file__).resolve().parent / "ping-adapter"
 
 
 class Frames(unittest.TestCase):
@@ -166,16 +166,17 @@ class StoreFiles(unittest.TestCase):
             self.assertEqual(ref.golden("rng", "a")["blobs"], [b"\x01"])
 
 
-class CalciteStub(unittest.TestCase):
+class PingAdapter(unittest.TestCase):
     def test_protocol(self):
-        with Adapter([sys.executable, "-I", str(STUB)], cwd=str(STUB.parent)) as a:
-            self.assertEqual(a.name, "calcite")
+        with Adapter([sys.executable, "-I", "adapter.py"], cwd=str(PING_ADAPTER)) as a:
+            self.assertEqual(a.name, "ping-only")
             r = a.run("ping", "p", {"echo": {"k": [1, None]}}, [b"\x09"])
             self.assertEqual((r.status, r.output, r.blobs), ("ok", {"echo": {"k": [1, None]}}, [b"\x09"]))
             self.assertEqual(a.run("rng", "r", {}).status, "unimplemented")
 
     def test_score_end_to_end(self):
-        out = subprocess.run([sys.executable, "-I", str(RUNNER / "rig.py"), "score"],
+        out = subprocess.run([sys.executable, "-I", str(RUNNER / "rig.py"), "score", "--strict",
+                              "--adapter", str(PING_ADAPTER / "adapter.json")],
                              capture_output=True, text=True, encoding="utf-8")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("| ping (rig) | 5 | 5 |", out.stdout)
