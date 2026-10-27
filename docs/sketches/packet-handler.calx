@@ -1,0 +1,214 @@
+// Sketch 3 of 3: one packet handler.
+// The player movement packets, the hottest packets on any server: a declaration that packet codegen
+// turns into a reader and writer (P4.1), and the handler, following vanilla's
+// ServerGamePacketListenerImpl.handleMovePlayer and handlePlayerPositionChange in 26.3.
+// Imagined Calx syntax from Phase 0. Nothing here compiles yet. README.md explains the conventions.
+//
+// Every double and float here has to be Java-exact (CALX_SPEC "Integer and float semantics"). The
+// thresholds decide when a client gets teleported back, which players see.
+
+module calcite.net.play.movement
+
+import calcite.world.{Region, Player, Vec3, Aabb, MoverType, Mth}
+import calcite.world.effects.MobEffect
+import calcite.net.{Packet, Disconnect}
+
+// One declaration per packet. The packet ID comes from the protocol report the data generator writes
+// (Phase 2), matched by name, so a version bump that moves IDs needs no code change. The field types
+// say the wire encoding: f64 is a big-endian double, Flags<MoveFlag, u8> a bit set in one unsigned byte.
+@packet(play, serverbound, "move_player_pos")
+struct MovePos {
+    x: f64
+    y: f64
+    z: f64
+    flags: Flags<MoveFlag, u8>
+}
+
+@packet(play, serverbound, "move_player_pos_rot")
+struct MovePosRot {
+    x: f64
+    y: f64
+    z: f64
+    y_rot: f32
+    x_rot: f32
+    flags: Flags<MoveFlag, u8>
+}
+
+@packet(play, serverbound, "move_player_rot")
+struct MoveRot {
+    y_rot: f32
+    x_rot: f32
+    flags: Flags<MoveFlag, u8>
+}
+
+@packet(play, serverbound, "move_player_status_only")
+struct MoveStatus {
+    flags: Flags<MoveFlag, u8>
+}
+
+enum MoveFlag: u8 {
+    OnGround = 1
+    HorizontalCollision = 2
+}
+
+// All four become one value, as in vanilla, where they're subclasses of ServerboundMovePlayerPacket.
+struct Move {
+    pos: Vec3?
+    rot: (f32, f32)?
+    on_ground: bool
+    horizontal_collision: bool
+}
+
+fn invalid(x: f64, y: f64, z: f64, y_rot: f32, x_rot: f32) -> bool {
+    return x.is_nan() or y.is_nan() or z.is_nan() or not x_rot.is_finite() or not y_rot.is_finite()
+}
+
+// Called with the player checked out of the region, so both can be changed (see region.calx).
+fn handle_move(p: mut Player, r: mut Region, snap: Snapshot, m: Move) ! Disconnect {
+    let pos = m.pos ?? p.position
+    let (y_rot, x_rot) = m.rot ?? (p.y_rot, p.x_rot)
+    if invalid(pos.x, pos.y, pos.z, y_rot, x_rot) {
+        fail Disconnect.translatable("multiplayer.disconnect.invalid_player_movement")
+    }
+    // New in 26.x: one position packet per tick. Packets are handled once per tick, so a second one
+    // in the same tick means a modified client.
+    if m.pos != none {
+        if p.conn.received_position_this_tick {
+            fail Disconnect.translatable("multiplayer.disconnect.invalid_player_movement")
+        }
+        p.conn.received_position_this_tick = true
+    }
+    if p.won_game {
+        return
+    }
+    if p.conn.tick_count == 0 {
+        p.reset_position()
+    }
+    if not p.conn.client_loaded {
+        return
+    }
+    if p.update_awaiting_teleport() {
+        // Still waiting for the client to confirm a teleport, so only the rotation counts.
+        p.abs_snap_rotation_to(Mth.wrap_degrees(y_rot), Mth.wrap_degrees(x_rot))
+        return
+    }
+    position_change(mut p, mut r, snap, pos, y_rot, x_rot, m.on_ground, m.horizontal_collision)
+}
+
+fn position_change(p: mut Player, r: mut Region, snap: Snapshot, requested: Vec3, req_y_rot: f32, req_x_rot: f32,
+                   on_ground: bool, horizontal_collision: bool) {
+    let target = Vec3(
+        Mth.clamp(requested.x, -3.0e7, 3.0e7),
+        Mth.clamp(requested.y, -2.0e7, 2.0e7),
+        Mth.clamp(requested.z, -3.0e7, 3.0e7),
+    )
+    let y_rot = Mth.wrap_degrees(req_y_rot)
+    let x_rot = Mth.wrap_degrees(req_x_rot)
+    if p.is_passenger() {
+        p.abs_snap_to(p.position, y_rot, x_rot)
+        r.chunk_tracking.moved(p)
+        return
+    }
+    let start = p.position
+    var d = target - p.conn.first_good
+    let expected = p.delta_movement.length_sqr()
+    var moved = d.x * d.x + d.y * d.y + d.z * d.z
+    if p.is_sleeping() {
+        if moved > 1.0 {
+            p.teleport_client(p.position, y_rot, x_rot)
+        }
+        return
+    }
+    let fall_flying = p.is_fall_flying()
+    if snap.tick_rate.runs_normally() {
+        p.conn.received_move_packets += 1
+        var delta_packets = p.conn.received_move_packets - p.conn.known_move_packets
+        if delta_packets > 5 {
+            delta_packets = 1
+        }
+        if p.should_check_movement(fall_flying, snap.game_rules) {
+            // In Java this is float * int, widened to double for the comparison. The emitted C has to
+            // do the same: f32 multiply, then convert.
+            let meters_per_tick: f32 = if fall_flying { 300.0 } else { 100.0 }
+            if moved - expected > f64(meters_per_tick * f32(delta_packets)) {
+                log.warn("{p.name} moved too quickly! {d.x},{d.y},{d.z}")
+                p.teleport_client(p.position, p.y_rot, p.x_rot)
+                return
+            }
+        }
+    }
+
+    let old_box = p.bounding_box()
+    d = target - p.conn.last_good
+    let moved_upwards = d.y > 0.0
+    if p.on_ground and not on_ground and moved_upwards {
+        p.jump_from_ground(mut r)
+    }
+    let stands_on_something = p.vertical_collision_below
+    if on_ground and not stands_on_something {
+        p.force_send_support_blocks(r)
+    }
+    p.move(mut r, MoverType.Player, d)            // collisions against the region's blocks and entities
+    let original_dy = d.y
+    d = target - p.position
+    // Always true, so the vertical error never counts. That's vanilla's behavior and clients rely on it,
+    // so it's copied as is. It isn't an exploit, so it doesn't go in rig/differences/.
+    if d.y > -0.5 or d.y < 0.5 {
+        d.y = 0.0
+    }
+    moved = d.x * d.x + d.y * d.y + d.z * d.z
+    let wrong = not p.is_changing_dimension() and moved > 0.0625 and not p.is_sleeping()
+        and not p.is_creative() and not p.is_spectator() and not p.in_post_impulse_grace_time()
+    if wrong {
+        log.warn("{p.name} moved wrongly!")
+    }
+    let accept = p.no_physics or p.is_sleeping()
+        or ((not wrong or not r.no_collision(p, old_box)) and not colliding_with_anything_new(r, p, old_box, target))
+    if not accept {
+        p.teleport_client(start, y_rot, x_rot)
+        p.check_fall_damage(mut r, p.position - start, on_ground)
+        p.remove_latest_movement_recording()
+        return
+    }
+
+    let old_block = p.block_position()
+    p.abs_snap_to(target, y_rot, x_rot)
+    p.conn.client_floating = original_dy >= -0.03125 and not stands_on_something and not p.is_spectator()
+        and not snap.allow_flight and not p.abilities.may_fly and not p.has_effect(MobEffect.levitation)
+        and not fall_flying and not p.is_auto_spin_attack() and no_blocks_around(r, p)
+    // Sends chunks that came into view and drops ones that left. Only chunks this region owns can be in
+    // view of a player here, because the layout merges regions before they get that close (D47).
+    r.chunk_tracking.moved(p)
+    let client_delta = p.position - start
+    p.set_on_ground_with_movement(on_ground, horizontal_collision, client_delta)
+    p.check_fall_damage(mut r, client_delta, on_ground)
+    p.handle_known_movement(client_delta)
+    if moved_upwards {
+        p.reset_fall_distance()
+    }
+    if on_ground or p.has_landed_in_liquid() or p.on_climbable(r) or p.is_spectator() or fall_flying
+        or p.is_auto_spin_attack() {
+        p.try_reset_current_impulse_context()
+    }
+    p.check_movement_statistics(client_delta)
+    p.conn.last_good = p.position
+
+    // Plugins hear about it only when the player enters a new block (finding 10 in the samples README).
+    if p.block_position() != old_block {
+        snap.plugins.fire(mut r, PlayerMoveBlock { player: p, from: old_block, to: p.block_position(), cause: MoveCause.Walk })
+    }
+}
+
+fn colliding_with_anything_new(r: Region, p: Player, old_box: Aabb, to: Vec3) -> bool {
+    let new_box = p.bounding_box().move_by(to - p.position)
+    // 1.0E-5F in Java: a float literal widened to a double, 9.999999747378752E-6, not 1.0E-5. Calx has to
+    // keep the literal's type, so the sketch spells out the conversion.
+    let shrink = f64(1.0e-5f32)
+    let old_shape = Shapes.create(old_box.deflate(shrink))
+    for shape in r.pre_move_collisions(p, new_box.deflate(shrink), old_box.bottom_center()) {
+        if not Shapes.join_is_not_empty(shape, old_shape, BooleanOp.And) {
+            return true
+        }
+    }
+    return false
+}

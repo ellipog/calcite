@@ -85,7 +85,7 @@ Settle the language, the tick model and the plugin API on paper before writing a
   - chunky calls and handles
   - versioning and doc comments on everything
 - **P0.6** Define the Phase 3 tick-loop benchmark in `docs/benchmarks.md`, so the gate is fixed before the compiler exists. It should cover palette-container reads and writes, entity physics in doubles, hash-map work and actor messages.
-- **P0.7** Keep the decision log current. Settled questions are D1–D41.
+- **P0.7** Keep the decision log current. Every settled question goes in it, numbered in order.
 
 **Done when**
 

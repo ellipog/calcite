@@ -1,0 +1,176 @@
+// Sketch 2 of 3: one region actor.
+// A region owns a set of chunks in one world, and the entities, players, scheduled ticks and block events
+// in them. Each tick it runs the region-local part of ServerLevel.tick, in vanilla's order.
+// Imagined Calx syntax from Phase 0. Nothing here compiles yet. README.md explains the conventions.
+
+module calcite.world.region
+
+import std.collections.{LinkedOpenHashMap, ArrayList}       // fastutil- and Java-compatible (D27)
+import std.random.LegacyRandom                               // java.util.Random's LCG, bit for bit
+import calcite.world.{Chunk, ChunkPos, Entity, EntityId, PlayerConn, LevelTicks, BlockEvent, Snapshot}
+import calcite.world.spawn.{SpawnState, NaturalSpawner}
+import calcite.msg.{Outbox, Inbox, Message, Handoff}
+
+// The region's own state. Nothing outside the region can reach it during the region phase (D19).
+//
+// A region is a connected group of loaded chunks: any two loaded chunks closer than the merge distance are
+// always in the same region (D47). So a contiguous loaded area is one region, and anything a region ticks
+// (redstone, collisions, mob AI, explosions) can only reach chunks the region owns or chunks that aren't
+// loaded, which vanilla doesn't reach into either. The things that do jump across unloaded space, such as
+// ender pearls, portals and plugin teleports, are handoffs.
+actor struct Region {
+    id: RegionId
+    world: WorldKey
+    chunks: LinkedOpenHashMap<ChunkPos, own Chunk>
+    // EntityTickList in vanilla: an Int2ObjectLinkedOpenHashMap, so entities tick in the order they were
+    // added. Arrivals from other regions are appended, as if they'd just been added.
+    entities: LinkedOpenHashMap<EntityId, own Entity>
+    players: ArrayList<EntityId>
+    block_ticks: LevelTicks<Block>
+    fluid_ticks: LevelTicks<Fluid>
+    block_events: BlockEventQueue
+    // Vanilla has one random per level. Here each region has one. With a single region it's vanilla's
+    // stream exactly, given the same seed. A region made by a split gets a stream forked from its
+    // parent's, so the layout alone decides the streams (D9, D22).
+    random: LegacyRandom
+    empty_time: i32 = 0
+    inbox: Inbox<Message>
+    outbox: Outbox<Message>
+}
+
+impl Region {
+    fn tick(r: mut Region, n: i64, snap: Snapshot, packets: Packets) {
+        let runs = snap.tick_rate.runs_normally()
+
+        // Messages delivered at the last barrier, in delivery order (D20, D46). Handoffs were adopted at the
+        // barrier itself, so arriving players are already here. The inbox is taken out of r first, because
+        // the handlers need all of r. Plugin handlers come from the snapshot: they're shared, read-only
+        // code, since region code keeps no plugin state (D42).
+        for m in r.inbox.take() {
+            snap.plugins.receive(mut r, m)
+        }
+
+        // This region's share of the tick's packets, in the input sequence. Vanilla handles all queued
+        // packets at the start of the tick (PacketProcessor.processQueuedPackets), before anything ticks.
+        // The handler needs the player and the rest of the region at once, both mutable. checkout takes
+        // the player out of the map until the end of the enclosing block, so the two can't alias, then
+        // puts it back in the same place in the order. While it's out, r.entities[id] gives none.
+        for p in packets {
+            checkout player = r.entities[p.player] else continue     // left the region or disconnected
+            handle_packet(mut player, mut r, snap, p.packet)          // see packet-handler.calx
+        }
+
+        // Scheduled block and fluid ticks. Vanilla caps them at 65536 per world per tick. Here the cap is per
+        // region, which only shows on a server far too overloaded to play on. Listed as a deliberate difference.
+        // As in vanilla's LevelTicks.tick, the due ticks are taken out first, so ticks scheduled while they
+        // run go back into the container for later.
+        if runs {
+            let time = snap.game_time(r.world)
+            for t in r.block_ticks.take_due(time, max: 65536) {
+                r.tick_block(t.pos, t.kind)
+            }
+            for t in r.fluid_ticks.take_due(time, max: 65536) {
+                r.tick_fluid(t.pos, t.kind)
+            }
+        }
+
+        // ServerChunkCache.tick: tickets, then ticking chunks, then unloading.
+        r.update_tickets()
+        if runs {
+            r.tick_chunks(snap)
+        }
+        r.broadcast_changed_chunks()
+        r.unload_chunks()
+
+        if runs {
+            r.run_block_events()
+        }
+
+        // Vanilla stops ticking entities 300 ticks after a world has no tickets left. Here it's per region.
+        if r.has_active_tickets() {
+            r.empty_time = 0
+        }
+        if runs {
+            r.empty_time += 1
+        }
+        if r.empty_time < 300 {
+            r.tick_entities(snap)
+            r.tick_block_entities()
+        }
+        // PersistentEntitySectionManager.tick: entities moving between sections, loading and unloading.
+        // Here it also queues handoffs for non-player entities that left the region's chunks.
+        r.entity_management()
+
+        // MinecraftServer.tickConnection and playerList.tick, for the players in this region. A player who
+        // crossed into another region's chunk this tick is sent there at the barrier.
+        for id in r.players.copy() {
+            {
+                checkout player = r.entities[id] else continue
+                tick_connection(mut player, mut r)              // keepalive, chunk sending, per-tick resets
+            }
+            if let to = r.crossed_border(id) {
+                // Takes the player, its passengers and its plugin data out of r. Ownership moves with the
+                // message, so nothing is copied and the player is never in two regions.
+                let h: own Handoff = Handoff.take(mut r, id)
+                r.outbox.send(Destination.Chunk(r.world, to, load: true), h)
+            }
+        }
+    }
+
+    // ServerChunkCache.tickChunks, for this region's chunks.
+    fn tick_chunks(r: mut Region, snap: Snapshot) {
+        // Mob caps count every mob in the world. A region can count only its own, so it adds the other
+        // regions' counts from the last barrier (in the snapshot). In a single region this is exactly
+        // vanilla. With several, a cap can be off by what other regions spawned this tick. For the inventory.
+        let state = SpawnState.create(r, others: snap.mob_counts_except(r.id))
+        let spawning = snap.game_rules.spawn_mobs
+        let categories = if spawning {
+            NaturalSpawner.filtered_categories(state, spawn_persistent: snap.game_time(r.world) % 400 == 0)
+        } else {
+            []
+        }
+        var chunks = r.spawning_chunks()             // ChunkMap.collectSpawningChunks, in vanilla's order
+        r.random.shuffle(mut chunks)                 // Util.shuffle with the level random
+        for c in chunks {
+            r.chunks[c].inhabited_time += 1
+            if r.in_entity_ticking_range(c) {
+                r.tick_thunder(c)
+            }
+            if not categories.is_empty() and r.can_spawn_in(c) {
+                NaturalSpawner.spawn_for_chunk(mut r, c, state, categories)
+            }
+        }
+        let speed = snap.game_rules.random_tick_speed
+        for c in r.block_ticking_chunks() {
+            r.tick_chunk(c, speed)                   // ice and snow, then random ticks per section
+        }
+        // Custom spawners (phantoms, patrols and the rest) run in the global phase. See tick-loop.calx.
+    }
+
+    fn tick_entities(r: mut Region, snap: Snapshot) {
+        // Entities can be added and removed while the list is walked. Vanilla copies the list when that
+        // happens (EntityTickList.ensureActiveIsNotIterated), so the walk sees the list as it was when it
+        // started. ids_at_start() gives that same view without a copy unless the map actually changes.
+        for id in r.entities.ids_at_start() {
+            // An entity's tick reads and writes the region around it: collisions, other entities, blocks.
+            checkout e = r.entities[id] else continue    // removed by an earlier entity this tick
+            if e.removed or snap.tick_rate.is_frozen(e) {
+                continue
+            }
+            check_despawn(mut e, mut r)
+            if not e.is_player() and not r.in_entity_ticking_range(e.chunk()) {
+                continue
+            }
+            if let vehicle = e.vehicle {
+                if r.entities.get(vehicle).map(|v| not v.removed and v.has_passenger(e.id)).or(false) {
+                    continue                             // the vehicle ticks its passengers
+                }
+                stop_riding(mut e, mut r)
+            }
+            // A panic in an entity's tick is a Calcite bug, so it writes a crash report and stops the
+            // server, as vanilla does. A panic in a plugin handler called from in here stops only that
+            // plugin instance (D25).
+            tick_non_passenger(mut e, mut r, snap)
+        }
+    }
+}
