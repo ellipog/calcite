@@ -176,7 +176,7 @@ Build the smallest Calx that can run a tick loop and talk to C, written from zer
 - **P3.7** Region actors, minimal at first: spawn an actor, send a flat message, receive it, and a lockstep tick barrier that delivers messages in a fixed order (D19, D20).
 - **P3.8** Write the Calcite adapter in Calx: stdin/stdout and enough JSON to read `PROTOCOL.md` headers, answering the RNG probes.
 - **P3.9** A compiler test suite of small Calx programs with expected output, run on every change in CI on both platforms. Docs examples run as part of it (D41).
-- **P3.10** Debugging support: emit `#line` directives so debuggers and profilers on both platforms show Calx source lines, and make compiler errors readable. Editor syntax highlighting is enough at first.
+- **P3.10** Debugging support: emit `#line` directives so debuggers and profilers on both platforms show Calx source lines, and make compiler errors readable. Editor support starts here (D65): a VS Code extension with a TextMate grammar, the compiler's errors as you type through `calx check --json`, and running files.
 - **P3.11** Start performance tracking (D34): run the benchmark per commit and keep the results in `bench/`. Have the emitter add `restrict` where ownership proves there's no aliasing.
 - **P3.12** Write the reference page for every feature as it lands (D40), and move its section out of `CALX_SPEC.md`. Start the guide with a first tutorial once there's enough language to write one.
 - **P3.13** Make the type checker as strict as D63 says: exact-only `T(x)`, named lossy conversions, no implicit optionals, no dropped values, no unused names or shadowing, and parentheses where precedence surprises. Every rule gets a compile-fail test.
@@ -332,7 +332,7 @@ Make Calcite the best server to write plugins for. Determinism (D21) is the secr
   - `new` (from templates), `build` and `test`
   - `run`: a dev server that hot-reloads on save
   - a plugin manifest with dependencies on other plugins
-- **P9.2** A Calx language server (diagnostics, completion, go-to-definition, hover docs from the host API) and a VS Code extension.
+- **P9.2** A Calx language server (diagnostics, completion, go-to-definition, hover docs from the host API), which the VS Code extension from P3.10 switches to (D65).
 - **P9.3** A plugin test harness: headless Calcite, scripted bots (the rig's bot) and recorded input logs replayed against the plugin, with assertions on world state and packets.
 - **P9.4** The docs website, built from the Markdown both repos have been keeping since Phase 0 (D40). Pick the site generator then. It covers the Calx guide and reference, the plugin guide, and the generated host API reference. The five samples become tutorials. This can come earlier if you want it sooner.
 - **P9.5** A profiler view for the per-plugin data from P7.6.
@@ -376,7 +376,7 @@ calx/
 ├─ runtime/              # C: sockets, threads, queues, compression, crypto (Windows + Linux)
 ├─ std/                  # Calx standard library, including Java-compatible collections
 ├─ tests/                # small Calx programs with expected output
-├─ tools/                # later: language server, VS Code extension
+├─ tools/                # the VS Code extension (P3.10); later the language server
 ├─ bench/                # Phase 3: the tick-loop benchmark in Calx and Rust, results per commit
 └─ docs/
    ├─ README.md          # docs index and page order
