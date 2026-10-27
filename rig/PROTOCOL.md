@@ -39,10 +39,11 @@ The adapter answers with what it is and which probes it knows, each with its ver
 
 ```json
 {"type": "hello", "protocol": 1, "adapter": "vanilla", "game_version": "26.3",
- "probes": {"ping": 1, "rng": 1, "nbt": 1, "text": 1, "math": 1, "strictmath": 1, "mth": 1}}
+ "probes": {"ping": 1, "rng": 1, "nbt": 1, "text": 1, "math": 1, "strictmath": 1, "mth": 1},
+ "about": {"java.vm.version": "25.0.5+8-LTS", "os.arch": "amd64"}}
 ```
 
-A probe the adapter doesn't list is reported as unimplemented, without being run.
+A probe the adapter doesn't list is reported as unimplemented, without being run. `about` is optional and free-form: whatever the adapter thinks a result depends on, such as the JVM build. The runner records it beside the goldens.
 
 ### `run`
 
@@ -64,7 +65,13 @@ The adapter answers with the same `id`:
 - **`unimplemented`**: the adapter knows the probe but not this part of it.
 - **`error`**: the adapter itself failed, such as an exception in its own code, with a `message`.
 
-An input that the game itself rejects, such as SNBT with a syntax error, is still `ok`. The rejection is the result, and it's compared like any other.
+An input that the game itself rejects, such as SNBT with a syntax error, is still `ok`. The rejection is the result, and it's compared like any other. Unless a probe says otherwise, a rejection's output is:
+
+```json
+{"exception": "CommandSyntaxException", "error": "Expected a valid unquoted string at position 3: {a:<--[HERE]"}
+```
+
+`exception` is the simple name of the class vanilla threw, and `error` is its message, or `""` if it has none. Calcite's adapter maps its own errors to the same names. The messages matter, since players see many of them.
 
 ### `bye`
 
@@ -113,7 +120,7 @@ Each probe is a pure function of its input. Version numbers change when a probe'
 
 ### `ping` (v1)
 
-Input `{"echo": <any JSON>}`. Output `{"echo": <the same>}`. For testing the rig itself.
+Input `{"echo": <any JSON>}` and any blobs. Output `{"echo": <the same>}` and the same blobs. For testing the rig itself.
 
 ### `rng` (v1)
 
@@ -157,28 +164,36 @@ Output: `{}` and one blob, the concatenation of every operation's result in orde
 
 Seeds inside operations are decimal strings too.
 
-If the game throws, as `nextInt(0)` does, the run stops there and the output is `{"error": <the exception's class name>, "at": <the operation's index>}`, with the blob holding the results before it. An operation that doesn't apply to the current source, such as `setDecorationSeed` after `fork`, is an `error` status: the case is wrong, not the game.
+If the game throws, as `nextInt(0)` does, the run stops there. The output is the rejection plus `"at"`, the operation's index, and the blob holds the results before it. An operation that doesn't apply to the current source, such as `setDecorationSeed` after `fork`, is an `error` status: the case is wrong, not the game.
 
 ### `nbt` (v1)
 
 Input, one of:
 
-- `{"from": "snbt", "snbt": "..."}`: parsed with `TagParser.parseCompoundFully`
-- `{"from": "binary"}` with one blob: an unnamed binary tag, read with `NbtIo.readAnyTag` and no size limit
+- `{"from": "snbt", "snbt": "..."}`: parsed with `TagParser.parseCompoundFully`, as data files and most commands do
+- `{"from": "snbt_any", "snbt": "..."}`: any tag, not just a compound, parsed with `TagParser.create(NbtOps.INSTANCE).parseFully`
+- `{"from": "binary"}` with one blob: a tag in network form (a type byte, then the payload, no name), read with `NbtIo.readAnyTag` and no size limit
 
-Output: `{"snbt": <the tag's toString()>, "type": <the tag type ID>}` and one blob, the tag written with `NbtIo.writeAnyTag`. If parsing fails: `{"error": <the exception's message>}` and no blobs.
+Output: `{"snbt": <the tag's toString()>, "type": <the tag type ID>}` and one blob, the tag written with `NbtIo.writeAnyTag`. If parsing fails, the rejection and no blobs.
+
+Strings in binary NBT are Java's modified UTF-8, so a character outside the Basic Multilingual Plane is two 3-byte surrogates, not one 4-byte sequence.
 
 ### `text` (v1)
 
-Input `{"json": "..."}`: a text component as JSON, decoded with `ComponentSerialization.CODEC` and `JsonOps`.
+Input, one of:
 
-Output: `{"json": <re-encoded with the same codec, as compact JSON>, "plain": <getString()>}` and one blob, the component encoded with `NbtOps` and written with `NbtIo.writeAnyTag`. That's the protocol's form since 1.20.3. If decoding fails: `{"error": <the codec's error message>}`.
+- `{"json": "..."}`: a text component as JSON, as data packs write them
+- `{"snbt": "..."}`: as SNBT, as commands like `/tellraw` take them since 1.21.5
 
-v1 decodes without registries, so components that need them (hover events showing items or entities) return `unimplemented`.
+The component is decoded with `ComponentSerialization.CODEC`, using `RegistryOps` over vanilla's built-in registries (`VanillaRegistries.createWorldLookup()`), so hover events can show items and entities.
+
+Output: `{"json": <re-encoded with the same codec, written by GsonHelper.toStableString>, "plain": <getString()>}` and one blob, the component encoded as NBT and written with `NbtIo.writeAnyTag`. That's the network form since 1.20.3. `toStableString` sorts object keys, so `json` doesn't depend on codec field order. `plain` is resolved with vanilla's `en_us` language file.
+
+If the JSON or SNBT doesn't parse, the output is the rejection. If the codec rejects it: `{"error": <the codec's message>}`.
 
 ### `math` and `strictmath` (v1)
 
-Input `{"fn": <name>}` and one blob of `f64` arguments, big-endian. `atan2` and `pow` take them in pairs.
+Input `{"fn": <name>}` and one blob of `f64` arguments, big-endian. `atan2`, `pow` and `hypot` take them in pairs.
 
 Output: `{}` and one blob, `java.lang.Math.<fn>` (for `math`) or `java.lang.StrictMath.<fn>` (for `strictmath`) of each argument, as `f64` bits.
 
@@ -192,7 +207,7 @@ Vanilla's `Mth` helpers that use lookup tables or bit tricks, where a natural re
 
 | Input | Output blob |
 | --- | --- |
-| `{"fn": "sin_table"}` | All 65,536 entries of `Mth`'s sine table, in order, as `f32` bits. Entry *i* is `Mth.sin(i / 10430.378350470453)`, which reads entry *i* exactly |
+| `{"fn": "sin_table"}` | All 65,536 entries of `Mth`'s private sine table, in order, as `f32` bits. Entry *i* is `(float) Math.sin(i / 10430.378350470453)`. The vanilla adapter reads the table directly, since going through `Mth.sin` with an angle could round to the neighboring entry |
 | `{"fn": "sin"}`, `{"fn": "cos"}` with a blob of `f64` arguments | `Mth.sin` or `Mth.cos` of each, as `f32` bits |
 | `{"fn": "atan2"}` with a blob of `(y, x)` `f64` pairs | `Mth.atan2(y, x)` of each, as `f64` bits. It uses `Mth`'s own arcsine tables, not `Math.atan2` |
 | `{"fn": "fast_inv_sqrt"}` with a blob of `f64` arguments | `Mth.fastInvSqrt` of each, as `f64` bits |
