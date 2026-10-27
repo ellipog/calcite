@@ -5,7 +5,9 @@ Usage: py -I build.py [--version 26.3] [--java-home PATH]
 Reads the bundler's library list from oracle/jars/server-<version>.jar,
 extracts the inner server jar and its libraries into oracle/work/ (checking
 each SHA-256 against the list), compiles the adapter with JDK 25, and writes
-build/adapter.json: the command line the rig's runner starts the adapter with.
+build/<platform>/adapter.json: the command line the rig's runner starts the
+adapter with. Each platform builds into its own folder, so a Windows checkout
+can also be built and run from WSL.
 
 Nothing from the jar leaves oracle/work/ and build/, which are both gitignored.
 """
@@ -23,7 +25,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ORACLE = HERE.parent
 WORK = ORACLE / "work"
-BUILD = HERE / "build"
+PLATFORM = "windows" if os.name == "nt" else sys.platform
+BUILD = HERE / "build" / PLATFORM
 REQUIRED_JAVA = 25
 
 
@@ -144,6 +147,13 @@ def main():
         ],
         # The game creates files relative to the working directory.
         "cwd": str(WORK),
+        # JVM flags for each vanilla configuration the rig records (D60). `strict-math` is the
+        # reference: with HotSpot's LIBM intrinsics off, Math gives StrictMath's results.
+        "configs": {
+            "strict-math": ["-XX:+UnlockDiagnosticVMOptions", "-XX:-UseLibmIntrinsic"],
+            "intrinsics": [],
+        },
+        "default_config": "strict-math",
     }
     (BUILD / "adapter.json").write_text(json.dumps(adapter, indent=2) + "\n", encoding="utf-8")
     print(f"build: wrote {BUILD / 'adapter.json'}")

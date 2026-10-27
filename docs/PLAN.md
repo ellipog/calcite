@@ -105,7 +105,7 @@ Build the rig before any server code, so every feature is measured from the day 
 - **P1.2** Write the vanilla adapter in Java 25: boot, a probe dispatcher over stdin/stdout, and the first probes (RNG, NBT, text components). The jar has been unobfuscated since 26.1, so the adapter calls vanilla by its real names, with no mapping step.
 - **P1.3** Write the runner in Python: case files, golden recording, hashes in `expected/26.3/`, the self-check and the scoreboard.
 - **P1.4** Make the self-check vary everything vanilla itself might be sensitive to, not just run it twice: JVM restarts, worker thread counts and generation order. Quarantine anything that varies, or list it as a deliberate difference.
-- **P1.5** Add a `Math` against `StrictMath` probe for every transcendental function vanilla calls (`sin`, `cos`, `tan`, `atan2`, `exp`, `log`, `pow` and so on), and run it on Windows and on Linux. Where they differ, Calx has to match HotSpot's intrinsic, not fdlibm.
+- **P1.5** Add a `Math` against `StrictMath` probe for every transcendental function vanilla calls (`sin`, `cos`, `tan`, `atan2`, `exp`, `log`, `pow` and so on), and run it on Windows and on Linux. Done: HotSpot's x86-64 intrinsics differ from `StrictMath`, and can't be matched without copying GPL code. So the rig's reference is vanilla with the intrinsics off, where `Math` is exactly `StrictMath`, and default vanilla is recorded too, to measure the gap (D60).
 - **P1.6** Add a Calcite adapter stub that answers "unimplemented" to every probe.
 - **P1.7** Write `rig/PROTOCOL.md` for the adapter wire format: a JSON header plus raw byte blobs, sharing no code with Calcite.
 - **P1.8** Keep a registry of deliberate differences in `rig/differences/`: each fixed vanilla bug or exploit, the cases it affects, and why. The scoreboard reports these separately instead of counting them as failures.
@@ -164,7 +164,7 @@ Build the smallest Calx that can run a tick loop and talk to C, written from zer
 - **P3.4** Java-exact semantics in the emitted C:
   - `-ffp-contract=off` and no fast-math
   - every case in the spec's integer list
-  - ports of vanilla's RNGs: java.util.Random's LCG, Xoroshiro128++ and the positional random factories, which need MD5
+  - vanilla's RNGs: java.util.Random's LCG, Xoroshiro128++ and the positional random factories, which need MD5
 - **P3.5** A runtime library in C for Windows and Linux, with macOS later:
   - event-driven sockets (IOCP and epoll, D33), threads and typed queues
   - a monotonic clock and plugin library loading
@@ -353,12 +353,13 @@ New drops arrive roughly quarterly, so treat each one as a routine update rather
 
 ## Decisions
 
-Every decision is in [`decisions.md`](decisions.md), D1 to D41, with the date and the phase it applies from. New questions go there too.
+Every decision is in [`decisions.md`](decisions.md), with the date and the phase it applies from. New questions go there too.
 
 Notes on licensing and legal questions:
 
+- **Copying code (D59).** Copy only when it's clearly the best option and its license allows it in an MIT project, keeping the notice. GPL code can't be copied.
 - MIT is one more reason not to read GPL servers. Pumpkin, Paper and Folia are GPL; Pumpkin's plugin API crates are MIT/Apache.
-- Bit-exact parity means porting Mojang's own code closely, and that code is easy to read now that it's unobfuscated. That raises the same derivative-work question as reading GPL code, except the source is proprietary. Every third-party server lives with this. Before publishing anything, read Mojang's EULA and usage guidelines; I'm not a lawyer.
+- Bit-exact parity means reproducing Mojang's behaviour closely, and vanilla's code is easy to read now that it's unobfuscated. Mojang's code has no license that allows copying, so Calcite is written from it as a reference, in its own structure for regions and actors. Where the bits force it, the arithmetic still follows vanilla's, in the same order. That raises the same derivative-work question every third-party server lives with. Before publishing anything, read Mojang's EULA and usage guidelines; I'm not a lawyer.
 - Wasmtime's Apache 2.0 license is fine to embed in an MIT project. So are libdeflate (MIT) and lz4 (BSD-2).
 - For Bedrock, Geyser's standalone proxy translates to the Java protocol, so it should work in front of Calcite unchanged. Bedrock-only accounts would need an auth plugin along the lines of Floodgate.
 

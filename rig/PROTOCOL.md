@@ -205,7 +205,7 @@ Output: `{}` and one blob, `java.lang.Math.<fn>` (for `math`) or `java.lang.Stri
 
 Functions: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log`, `log10`, `log1p`, `pow`, `sqrt`, `cbrt`, `sinh`, `cosh`, `tanh`, `expm1`, `hypot`.
 
-The `math` hashes are what Calcite must match, since vanilla calls `Math`. Comparing the two probes' goldens shows where `Math` and `StrictMath` differ (`P1.5`, D58).
+Vanilla calls `Math`. In the rig's reference configuration (HotSpot's LIBM intrinsics off, D60), `Math` gives exactly `StrictMath`'s results, so both probes' hashes are the same there. With HotSpot's default intrinsics they differ, and `rig/runner/mathcmp.py` measures by how much (`P1.5`).
 
 ### `mth` (v1)
 

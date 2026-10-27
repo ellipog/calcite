@@ -13,12 +13,24 @@ def _write_json(path, data):
     tmp.replace(path)
 
 
+REFERENCE_CONFIG = "strict-math"
+
+
 class Store:
-    def __init__(self, root, game_version):
+    """The files for one game version and one vanilla configuration (D60).
+
+    The reference configuration lives at expected/<version>/; any other in a subfolder named
+    for it, such as expected/<version>/intrinsics/. Quarantine is shared by all of them.
+    """
+
+    def __init__(self, root, game_version, config=REFERENCE_CONFIG):
         self.root = Path(root)
         self.version = game_version
-        self.expected_dir = self.root / "expected" / game_version
-        self.golden_dir = self.root / "golden" / game_version
+        self.config = config
+        self.quarantine_path = self.root / "expected" / game_version / "quarantine.json"
+        sub = () if config == REFERENCE_CONFIG else (config,)
+        self.expected_dir = self.root.joinpath("expected", game_version, *sub)
+        self.golden_dir = self.root.joinpath("golden", game_version, *sub)
 
     # Expected hashes: expected/<version>/<probe>.json
 
@@ -41,6 +53,7 @@ class Store:
             "probe": probe,
             "probe_version": probe_version,
             "game_version": self.version,
+            "config": self.config,
             "recorded_with": about,
             "hashes": dict(sorted(hashes.items())),
         })
@@ -48,13 +61,12 @@ class Store:
     # Quarantine: expected/<version>/quarantine.json, {"probe:case": reason}
 
     def quarantine(self):
-        path = self.expected_dir / "quarantine.json"
-        if not path.is_file():
+        if not self.quarantine_path.is_file():
             return {}
-        return json.loads(path.read_text(encoding="utf-8"))["cases"]
+        return json.loads(self.quarantine_path.read_text(encoding="utf-8"))["cases"]
 
     def save_quarantine(self, cases):
-        _write_json(self.expected_dir / "quarantine.json", {
+        _write_json(self.quarantine_path, {
             "about": "Cases where vanilla itself isn't repeatable, found by the self-check. They aren't scored.",
             "cases": dict(sorted(cases.items())),
         })

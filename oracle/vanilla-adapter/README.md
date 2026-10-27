@@ -23,11 +23,16 @@ The build:
 1. Reads `META-INF/versions.list` and `META-INF/libraries.list` from the bundler jar.
 2. Extracts the inner server jar and its 39 libraries into `oracle/work/versions/` and `oracle/work/libraries/`, checking each against the bundler's SHA-256. Files that are already there with the right hash are kept.
 3. Compiles `src/` with `javac --release 25`, with warnings as errors.
-4. Writes `build/adapter.json`, the command line the runner starts the adapter with.
+4. Writes `build/<platform>/adapter.json`: the command line the runner starts the adapter with, and the JVM flags for each vanilla configuration the rig records (D60). Each platform gets its own folder, so one checkout can be built from Windows and from WSL.
+
+| Configuration | JVM flags |
+| --- | --- |
+| `strict-math`, the reference | `-XX:+UnlockDiagnosticVMOptions -XX:-UseLibmIntrinsic`, so `Math` gives exactly `StrictMath`'s results |
+| `intrinsics` | none: HotSpot's defaults |
 
 ## Running
 
-The runner starts it from `build/adapter.json`. To start it by hand, use that file's `argv` with `oracle/work/` as the working directory, and talk to it over stdin and stdout.
+The runner starts it from `build/<platform>/adapter.json`. To start it by hand, use that file's `argv`, with a configuration's flags after the `java` executable, with `oracle/work/` as the working directory. Then talk to it over stdin and stdout.
 
 - **Stdout carries only frames.** The adapter takes the real stdout before vanilla loads, and points `System.out` at stderr, so a stray print can't corrupt a frame.
 - **Logs go to stderr.** [`log4j2.xml`](log4j2.xml) sends every log there, and the runner saves it.

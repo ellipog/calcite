@@ -1,8 +1,8 @@
 """The oracle rig's runner (P1.3).
 
     py -I rig/runner/rig.py list
-    py -I rig/runner/rig.py record [--probe P ...]
-    py -I rig/runner/rig.py check [--probe P ...] [--variants all|name,...] [--quarantine]
+    py -I rig/runner/rig.py record [--probe P ...] [--config strict-math|intrinsics|all]
+    py -I rig/runner/rig.py check [--probe P ...] [--variants all|name,...] [--config ...] [--quarantine]
     py -I rig/runner/rig.py score [--adapter calcite|vanilla|PATH] [--probe P ...]
     py -I rig/runner/rig.py diff PROBE CASE [--adapter ...]
 
@@ -11,6 +11,7 @@ See rig/README.md.
 
 import argparse
 import json
+import os
 import random
 import sys
 import time
@@ -24,9 +25,10 @@ from protocol import Adapter, ProtocolError, Result, canonical_json  # noqa: E40
 from store import Store  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
-OUT = ROOT / "build" / "rig"
+PLATFORM = "windows" if os.name == "nt" else sys.platform
+OUT = ROOT / "build" / "rig" / PLATFORM
 ADAPTERS = {
-    "vanilla": ROOT / "oracle" / "vanilla-adapter" / "build" / "adapter.json",
+    "vanilla": ROOT / "oracle" / "vanilla-adapter" / "build" / PLATFORM / "adapter.json",
     "calcite": ROOT / "rig" / "calcite-adapter" / "adapter.json",
 }
 
@@ -53,16 +55,22 @@ class Session:
 
     MAX_RESTARTS = 3
 
-    def __init__(self, name, jvm_args=(), log_name=None):
+    def __init__(self, name, jvm_args=(), log_name=None, config=None):
         spec_path = ADAPTERS.get(name, Path(name))
         if not spec_path.is_file():
             hint = " Run oracle/vanilla-adapter/build.py first." if name == "vanilla" else ""
             die(f"no adapter at {spec_path}.{hint}")
         self.spec = json.loads(spec_path.read_text(encoding="utf-8"))
+        # A configuration is a set of JVM flags the adapter is recorded under (D60).
+        configs = self.spec.get("configs", {})
+        self.config = config or self.spec.get("default_config")
+        if configs and self.config not in configs:
+            die(f"adapter {name} has no configuration `{self.config}`. It has: {', '.join(configs)}")
+        self.jvm_flags = list(configs.get(self.config, [])) + list(jvm_args)
         argv = [sys.executable if a == "{python}" else a for a in self.spec["argv"]]
-        self.argv = argv[:1] + list(jvm_args) + argv[1:]
+        self.argv = argv[:1] + self.jvm_flags + argv[1:]
         self.cwd = self.spec.get("cwd") or str(spec_path.parent)
-        self.log = OUT / "logs" / f"{log_name or Path(name).stem}.log"
+        self.log = OUT / "logs" / f"{log_name or Path(name).stem}{'-' + self.config if configs else ''}.log"
         self.restarts = 0
         self.adapter = self._start()
 
@@ -75,7 +83,10 @@ class Session:
 
     @property
     def about(self):
-        return {"adapter": self.adapter.name, "game_version": self.adapter.game_version, **self.adapter.about}
+        about = {"adapter": self.adapter.name, "game_version": self.adapter.game_version, **self.adapter.about}
+        if self.config:
+            about.update(config=self.config, jvm_flags=self.jvm_flags)
+        return about
 
     def run(self, case):
         version = self.adapter.probes.get(case.probe)
@@ -109,23 +120,59 @@ def load_differences():
         die(str(e))
 
 
+def vanilla_configs(choice):
+    """The vanilla configurations a command runs under: one by name, or `all`."""
+    spec_path = ADAPTERS["vanilla"]
+    if not spec_path.is_file():
+        die(f"no adapter at {spec_path}. Run oracle/vanilla-adapter/build.py first.")
+    names = list(json.loads(spec_path.read_text(encoding="utf-8")).get("configs", {}))
+    if choice == "all":
+        return names
+    if choice not in names:
+        die(f"no configuration `{choice}`. Configurations: {', '.join(names)}, all")
+    return [choice]
+
+
+def other_configs(version):
+    """Stores for every recorded configuration except the reference."""
+    base = ROOT / "expected" / version
+    if not base.is_dir():
+        return []
+    return [Store(ROOT, version, p.name) for p in sorted(base.iterdir()) if p.is_dir()]
+
+
 def cmd_list(args):
     store = Store(ROOT, args.version)
+    others = other_configs(args.version)
     by_probe = load_cases(args.probe)
     quarantine = store.quarantine()
-    print(f"{'probe':<12} {'cases':>6} {'recorded':>9} {'quarantined':>12}")
+    columns = "".join(f" {'differs in ' + o.config:>24}" for o in others)
+    print(f"{'probe':<12} {'cases':>6} {'recorded':>9} {'quarantined':>12}{columns}")
     for probe, cases in by_probe.items():
         expected = store.expected(probe)
         recorded = sum(1 for c in cases if c.id in expected)
         q = sum(1 for c in cases if c.key in quarantine)
-        print(f"{probe:<12} {len(cases):>6} {recorded:>9} {q:>12}")
+        differs = ""
+        for other in others:
+            theirs = other.expected(probe)
+            n = sum(1 for c in cases if c.id in expected and c.id in theirs and expected[c.id] != theirs[c.id])
+            differs += f" {n:>24}"
+        print(f"{probe:<12} {len(cases):>6} {recorded:>9} {q:>12}{differs}")
 
 
 def cmd_record(args):
-    store = Store(ROOT, args.version)
+    failed = False
+    for config in vanilla_configs(args.config):
+        print(f"== {config}")
+        failed |= not _record(args, config)
+    sys.exit(1 if failed else 0)
+
+
+def _record(args, config):
+    store = Store(ROOT, args.version, config)
     by_probe = load_cases(args.probe)
     quarantine = store.quarantine()
-    session = Session("vanilla")
+    session = Session("vanilla", config=config)
     if session.adapter.game_version != args.version:
         die(f"the vanilla adapter is {session.adapter.game_version}, not {args.version}")
     failed = False
@@ -158,13 +205,13 @@ def cmd_record(args):
                 print(f"  changed: {probe}:{cid}{note}")
     finally:
         session.close()
-    sys.exit(1 if failed else 0)
+    return not failed
 
 
-def _run_variant(name, by_probe, expected_by_probe, quarantine):
+def _run_variant(name, config, by_probe, expected_by_probe, quarantine):
     """Runs every case under one variant, returning {case key: why it differs from expected}."""
     variant = VARIANTS[name]
-    session = Session("vanilla", variant["jvm"], log_name=f"vanilla-{name}")
+    session = Session("vanilla", variant["jvm"], log_name=f"vanilla-{name}", config=config)
     mismatches = {}
     try:
         work = [c for cases in by_probe.values() for c in cases]
@@ -192,25 +239,27 @@ def _run_variant(name, by_probe, expected_by_probe, quarantine):
 
 def cmd_check(args):
     """The self-check: vanilla against its own recorded hashes, under each variant."""
-    store = Store(ROOT, args.version)
-    by_probe = load_cases(args.probe)
-    quarantine = store.quarantine()
     names = list(VARIANTS) if args.variants == "all" else args.variants.split(",")
     for name in names:
         if name not in VARIANTS:
             die(f"unknown variant `{name}`. Variants: {', '.join(VARIANTS)}")
-    expected = {probe: store.expected(probe) for probe in by_probe}
-    unrecorded = [c.key for cases in by_probe.values() for c in cases if c.id not in expected[c.probe]]
-    if unrecorded:
-        print(f"check: {len(unrecorded)} cases have no expected hash yet; run `record` first. First: {unrecorded[0]}")
-
+    by_probe = load_cases(args.probe)
     found = {}
-    for name in names:
-        started = time.time()
-        mismatches = _run_variant(name, by_probe, expected, quarantine)
-        print(f"{name:<14} {len(mismatches):>5} mismatches  {time.time() - started:6.1f}s  ({VARIANTS[name]['about']})")
-        for key, why in mismatches.items():
-            found.setdefault(key, []).append(f"{name}: {why}")
+    store = None
+    for config in vanilla_configs(args.config):
+        store = Store(ROOT, args.version, config)
+        quarantine = store.quarantine()
+        expected = {probe: store.expected(probe) for probe in by_probe}
+        unrecorded = [c.key for cases in by_probe.values() for c in cases if c.id not in expected[c.probe]]
+        print(f"== {config}")
+        if unrecorded:
+            print(f"check: {len(unrecorded)} cases have no expected hash yet; run `record` first. First: {unrecorded[0]}")
+        for name in names:
+            started = time.time()
+            mismatches = _run_variant(name, config, by_probe, expected, quarantine)
+            print(f"{name:<14} {len(mismatches):>5} mismatches  {time.time() - started:6.1f}s  ({VARIANTS[name]['about']})")
+            for key, why in mismatches.items():
+                found.setdefault(key, []).append(f"{config}/{name}: {why}")
 
     if not found:
         print("check: vanilla is repeatable on every recorded case")
@@ -219,9 +268,10 @@ def cmd_check(args):
     for key, whys in sorted(found.items())[:40]:
         print(f"  {key}: {'; '.join(whys)}")
     if args.quarantine:
+        quarantine = store.quarantine()
         quarantine.update({k: "; ".join(v) for k, v in found.items()})
         store.save_quarantine(quarantine)
-        print(f"check: quarantined them in {store.expected_dir / 'quarantine.json'}")
+        print(f"check: quarantined them in {store.quarantine_path}")
     sys.exit(1)
 
 
@@ -230,15 +280,19 @@ OUTCOMES = ("pass", "fail", "difference", "unimplemented", "error", "quarantined
 
 def cmd_score(args):
     store = Store(ROOT, args.version)
+    others = other_configs(args.version)
     by_probe = load_cases(args.probe)
     quarantine = store.quarantine()
     differences = load_differences()
-    session = Session(args.adapter)
+    session = Session(args.adapter, config=args.config)
     outcomes, notes = {}, {}
     stale = []
+    # For each other configuration: cases it recorded differently, and how many of those pass it.
+    other_counts = {o.config: {"differ": 0, "pass": 0, "scored": 0} for o in others}
     try:
         for probe, cases in by_probe.items():
             expected = store.expected(probe)
+            theirs = {o.config: o.expected(probe) for o in others}
             for case in cases:
                 if case.key in quarantine:
                     outcomes[case.key] = "quarantined"
@@ -247,6 +301,13 @@ def cmd_score(args):
                     outcomes[case.key] = "unrecorded"
                     continue
                 result = session.run(case)
+                for config, hashes in theirs.items():
+                    if case.id not in hashes or result.status != "ok":
+                        continue
+                    counts = other_counts[config]
+                    counts["scored"] += 1
+                    counts["pass"] += result.digest() == hashes[case.id]
+                    counts["differ"] += hashes[case.id] != expected[case.id]
                 covering = [d for d in differences if d.covers(case.key)]
                 if result.status in ("unimplemented", "error"):
                     outcomes[case.key] = result.status
@@ -272,7 +333,7 @@ def cmd_score(args):
     total = {o: sum(r[2][o] for r in rows) for o in OUTCOMES}
 
     header = f"| Probe | Cases | {' | '.join(o.capitalize() for o in OUTCOMES)} | Score |"
-    print(f"Scoreboard: {session.adapter.name} against vanilla {args.version}\n")
+    print(f"Scoreboard: {session.adapter.name} against vanilla {args.version} ({store.config}, the reference)\n")
     print(header)
     print("|" + "---|" * (len(OUTCOMES) + 3))
     for probe, n, counts in rows + [("**All**", sum(r[1] for r in rows), total)]:
@@ -287,17 +348,23 @@ def cmd_score(args):
             print(f"  {key}: {outcomes[key]}{': ' + notes[key].splitlines()[0] if notes.get(key) else ''}")
     for line in stale:
         print(f"note: {line}")
+    for config, counts in other_counts.items():
+        if counts["scored"]:
+            print(f"\nAgainst vanilla's `{config}` configuration: {counts['pass']} of {counts['scored']} pass."
+                  f" {counts['differ']} of those cases come out differently there than in {store.config}.")
 
     OUT.mkdir(parents=True, exist_ok=True)
     report = OUT / f"scoreboard-{Path(args.adapter).stem}.json"
     report.write_text(json.dumps({
         "adapter": session.about,
         "game_version": args.version,
+        "reference": store.config,
         "totals": total,
         "probes": {p: c for p, _, c in rows},
+        "other_configs": other_counts,
         "cases": outcomes,
         "notes": notes,
-    }, indent=2) + "\n", encoding="utf-8")
+    }, indent=2) + "\n", encoding="utf-8", newline="\n")
     print(f"\nFull report: {report}")
 
 
@@ -315,7 +382,7 @@ def cmd_diff(args):
     golden = store.golden(args.probe, args.case)
     if golden is None:
         die(f"no golden for {case.key}; run `record` first")
-    session = Session(args.adapter)
+    session = Session(args.adapter, config=args.config)
     try:
         result = session.run(case)
     finally:
@@ -355,23 +422,27 @@ def main():
 
     p = sub.add_parser("record", help="run vanilla, write goldens and expected hashes")
     p.add_argument("--probe", action="append")
+    p.add_argument("--config", default="strict-math", help="vanilla configuration: strict-math (the reference), intrinsics, or all")
     p.set_defaults(fn=cmd_record)
 
     p = sub.add_parser("check", help="self-check: vanilla against its own expected hashes")
     p.add_argument("--probe", action="append")
     p.add_argument("--variants", default="default", help=f"`all` or a comma list of: {', '.join(VARIANTS)}")
     p.add_argument("--quarantine", action="store_true", help="quarantine the cases that aren't repeatable")
+    p.add_argument("--config", default="strict-math", help="vanilla configuration: strict-math (the reference), intrinsics, or all")
     p.set_defaults(fn=cmd_check)
 
     p = sub.add_parser("score", help="run an adapter against the expected hashes")
     p.add_argument("--adapter", default="calcite", help="calcite, vanilla, or a path to an adapter.json")
     p.add_argument("--probe", action="append")
+    p.add_argument("--config", help="when scoring vanilla itself, the configuration to run it in")
     p.set_defaults(fn=cmd_score)
 
     p = sub.add_parser("diff", help="compare one case's result with vanilla's golden")
     p.add_argument("probe")
     p.add_argument("case")
     p.add_argument("--adapter", default="calcite")
+    p.add_argument("--config", help="when diffing vanilla itself, the configuration to run it in")
     p.set_defaults(fn=cmd_diff)
 
     args = parser.parse_args()
