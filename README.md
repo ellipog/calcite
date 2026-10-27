@@ -8,7 +8,7 @@ Goals:
 - **Performance.** Folia-style regions on every core, ticking in lockstep so results never depend on the thread count.
 - **Vanilla parity.** Worldgen matches block for block and behavior matches vanilla, checked bit for bit by an oracle rig. Bugs and exploits are fixed and listed.
 
-Status: Phases 0 and 1 (design, and the oracle rig) are done and in review. Phase 2, the data tables generated from the vanilla jar, is in progress. In Phase 3, Calcite's first Calx code, vanilla's random sources, passes the rig's `rng` probe bit for bit.
+Status: Phases 0 to 3 have passed their gates and are in review. That covers the design, the oracle rig, the data tables generated from the vanilla jar, and the Calx compiler core. Calcite's first Calx code, vanilla's random sources, passes the rig's `rng` probe bit for bit on Windows and Linux. Calx runs the Phase 3 tick-loop benchmark in about 0.7× the time of its Rust reference ([results](https://github.com/ellipog/calx#performance)). Next is Phase 4: the protocol, and a flat world a real client can join.
 
 Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calcite)). Calx has its own board, aaen-studios/clx ([open](https://acta.aaenz.no/aaen-studios/clx)). The phase gates live here.
 
