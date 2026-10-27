@@ -16,7 +16,7 @@ import java.util.List;
 /** One protocol frame: a JSON header and the blobs it lists (rig/PROTOCOL.md, "Frames"). */
 record Frame(JsonObject header, List<byte[]> blobs) {
     private static final int MAX_HEADER = 64 << 20;
-    private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().create();
+    private static final Gson GSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
 
     /** Reads the next frame, or returns null at the end of the input. */
     static Frame read(DataInputStream in) throws IOException {

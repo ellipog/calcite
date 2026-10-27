@@ -43,17 +43,27 @@ final class NbtProbe implements Probe {
             };
         } catch (CaseError e) {
             throw e;
-        } catch (Exception e) {
+        } catch (Exception | StackOverflowError e) {
+            // The SNBT parser has no depth limit of its own, so deep input overflows the stack.
             return Result.rejected(e);
         }
-        return Result.ok(describe(tag), binary(tag));
-    }
 
-    static JsonObject describe(Tag tag) {
         JsonObject output = new JsonObject();
         output.addProperty("snbt", tag.toString());
         output.addProperty("type", tag.getId());
-        return output;
+        // Network form, as FriendlyByteBuf.writeNbt writes it. It throws on a string over 65,535 bytes.
+        byte[] network;
+        try {
+            network = binary(tag);
+            output.addProperty("network", "ok");
+        } catch (IOException e) {
+            network = new byte[0];
+            output.add("network", Result.rejection(e));
+        }
+        // File form, as NbtIo.write writes it: named root, and over-long strings written as "".
+        ByteArrayOutputStream file = new ByteArrayOutputStream();
+        NbtIo.writeUnnamedTagWithFallback(tag, new DataOutputStream(file));
+        return Result.ok(output, network, file.toByteArray());
     }
 
     static byte[] binary(Tag tag) throws IOException {

@@ -81,6 +81,12 @@ def find_java_home(explicit):
     javac = shutil.which("javac")
     if javac:
         candidates.append(str(Path(javac).resolve().parent.parent))
+    # Common install locations, newest first.
+    for pattern in ("~/tools/jdk-25*", "C:/Program Files/Eclipse Adoptium/jdk-25*",
+                    "C:/Program Files/Java/jdk-25*", "/usr/lib/jvm/*25*", "/opt/jdk-25*"):
+        base = Path(pattern.split("*")[0]).expanduser()
+        if base.parent.is_dir():
+            candidates += [str(p) for p in sorted(base.parent.glob(base.name + "*"), reverse=True)]
     exe = ".exe" if os.name == "nt" else ""
     for home in candidates:
         if not home:

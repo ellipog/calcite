@@ -95,6 +95,7 @@ So that results hash the same from any language:
 - **Never put a float in JSON.** Floats go in blobs as raw IEEE bits, big-endian.
 - **Integers in JSON stay within ±2^53.** A 64-bit value (a seed, a `long` result) is a decimal string.
 - **Strings are compared exactly.** No trimming, no normalization.
+- **Nulls are written.** A field whose value is `null` stays in the output as `null`, never left out. Some JSON libraries drop null fields by default, as Gson does, and that changes the hash.
 
 ## Case files
 
@@ -110,8 +111,8 @@ Case inputs are committed in `cases/<probe>/<group>.json`:
 }
 ```
 
-- `id` is unique within the probe.
-- A case with blobs lists them as base64 strings in `"blobs"`.
+- `id` is unique within the probe, and uses only `a-z`, `0-9`, `.`, `_` and `-`.
+- A case with blobs lists them in `"blobs"`. Each is base64, or a readable form such as `{"f64": ["1.5", "nan"]}` or a seeded generator, which the runner expands to bytes before sending. Adapters only ever see bytes. The forms are listed in [`README.md`](README.md#blobs-in-case-files).
 - Generated case files say what generated them in a top-level `"generated_by"` field, and the generator is committed beside them with its seed.
 
 ## Probes
@@ -174,7 +175,12 @@ Input, one of:
 - `{"from": "snbt_any", "snbt": "..."}`: any tag, not just a compound, parsed with `TagParser.create(NbtOps.INSTANCE).parseFully`
 - `{"from": "binary"}` with one blob: a tag in network form (a type byte, then the payload, no name), read with `NbtIo.readAnyTag` and no size limit
 
-Output: `{"snbt": <the tag's toString()>, "type": <the tag type ID>}` and one blob, the tag written with `NbtIo.writeAnyTag`. If parsing fails, the rejection and no blobs.
+Output: `{"snbt": <the tag's toString()>, "type": <the tag type ID>, "network": "ok"}` and two blobs:
+
+1. The **network form**, written with `NbtIo.writeAnyTag` as `FriendlyByteBuf.writeNbt` does. If that throws, as it does for a string over 65,535 bytes, `network` is the rejection and this blob is empty.
+2. The **file form**, written with `NbtIo.writeUnnamedTagWithFallback` as `NbtIo.write` does for saves: a type byte, an empty name, then the payload, with any over-long string written as `""`.
+
+If parsing fails, the output is the rejection and there are no blobs. The SNBT parser has no depth limit of its own, so deeply nested input overflows the stack. That's reported as a `StackOverflowError` rejection, and the self-check decides whether it's repeatable.
 
 Strings in binary NBT are Java's modified UTF-8, so a character outside the Basic Multilingual Plane is two 3-byte surrogates, not one 4-byte sequence.
 
