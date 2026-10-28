@@ -1,0 +1,454 @@
+/// Checks play in server.network over real TCP on 127.0.0.1, in the flat world: what a player
+/// is sent as they join, their chunks a batch at a time, their view following them, the
+/// teleport they're to accept before they move, and what other players see as they come and go.
+module test.play
+
+import auth.services.{Services}
+import chat.component.{Component}
+import chat.language.{Language}
+import java.uuid.{Uuid}
+import pack.resources.{KnownPack}
+import protocol.codec.{Codec}
+import protocol.common.{ChatVisibility, ClientInformation, HumanoidArm, ParticleStatus, ServerboundClientInformation, ServerboundKeepAlive}
+import protocol.configuration.{ServerboundFinishConfiguration, ServerboundSelectKnownPacks}
+import protocol.handshake.{ClientIntent, ClientIntention}
+import protocol.ids.{packet_names}
+import protocol.login.{ServerboundHello, ServerboundLoginAcknowledged}
+import protocol.play.{ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundMovePlayerPos, ON_GROUND}
+import protocol.state.{State, Bound}
+import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
+import registry.registries.{Registries}
+import resources.identifier.{Identifier}
+import server.chunks.{in_view, in_view_all}
+import server.configuration.{Configuration}
+import server.network.{Network, StatusInfo, LoginSettings}
+import server.play.{World}
+import std.crypto.{RsaKey}
+import std.net.{Net, Conn, Event}
+import world.pos.{ChunkPos}
+
+fn check(got: String, want: String) {
+    if got != want {
+        panic("got {got}, want {want}")
+    }
+}
+
+fn check_int(got: i64, want: i64) {
+    if got != want {
+        panic("got {got}, want {want}")
+    }
+}
+
+fn core() -> KnownPack {
+    return KnownPack { namespace: "minecraft", id: "core", version: "26.3" }
+}
+
+fn new_server(net: Net) -> Network {
+    let packs: List<KnownPack?> = [some(core())]
+    let configuration = Configuration.new("calcite", [], [Identifier { namespace: "minecraft", path: "vanilla" }], Registries { synced: [], builtin: [] }, packs)
+    let settings = LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: -1, log_ips: true, prevent_proxy_connections: false, velocity_secret: none }
+    let status = StatusInfo { enabled: true, json: "\{\}", motd: "A Minecraft Server", online: 0, max_players: 20, description: Component.literal("A Minecraft Server"), favicon: none }
+    var lang = Language.empty()
+    lang.add("multiplayer.player.joined", "%s joined the game")
+    lang.add("multiplayer.player.left", "%s left the game")
+    return Network.new(net, status, settings, lang, Services.offline(), RsaKey.generate(1024), configuration, World.defaults())
+}
+
+fn packet<T: Wire + Packet>(p: T, state: State) -> List<u8> {
+    var w = Writer.new()
+    write_packet(p, state, mut w)
+    return w.into_bytes()
+}
+
+fn play<T: Wire + Packet>(p: T) -> List<u8> {
+    return packet(p, State.Play)
+}
+
+// A packet the client was sent, by its name in play, with the fields after its ID; or
+// `nothing`, or `closed` once the server closed the connection and nothing is left.
+struct Got {
+    name: String
+    body: List<u8>
+}
+
+struct Client {
+    conn: Conn
+    codec: Codec
+    closed: bool
+    // The state the client reads in, which names the packets.
+    state: State
+}
+
+impl Client {
+    fn send(mut self, net: Net, p: own List<u8>) {
+        net.write(self.conn, self.codec.encode(p)!)
+    }
+
+    fn next(mut self) -> Got {
+        let body = match self.codec.next()! {
+            some(b) => b,
+            none => return Got { name: if self.closed { String("closed") } else { String("nothing") }, body: [] },
+        }
+        var r = Reader.new(body)
+        let id = usize.wrap(r.varint()!)
+        let names = packet_names(self.state, Bound.Clientbound)
+        return Got { name: names[id].copy(), body: r.rest() }
+    }
+
+    // The names of what came, up to the first that isn't one of `skip`, which is returned.
+    fn after(mut self, skip: List<String>) -> Got {
+        loop {
+            let got = self.next()
+            var skipped = false
+            for s in skip {
+                if got.name == s {
+                    skipped = true
+                }
+            }
+            if not skipped {
+                return got
+            }
+        }
+    }
+
+    // Reads everything that came.
+    fn drain(mut self) {
+        loop {
+            let got = self.next()
+            if got.name == "nothing" or got.name == "closed" {
+                return
+            }
+        }
+    }
+}
+
+// A server and its clients, on a clock the test moves.
+struct Rig {
+    net: Net
+    server: Network
+    port: u16
+    clients: List<Client>
+    now: u64
+}
+
+impl Rig {
+    // Polls until nothing more comes for 50 ms, giving the server its events and the clients
+    // what they were sent.
+    fn settle(mut self) {
+        loop {
+            var events = List<Event>()
+            self.net.poll(50, mut events)
+            if events.is_empty() {
+                return
+            }
+            for e in events {
+                if self.server.handle(e, self.now) {
+                    continue
+                }
+                for i in 0..self.clients.len() {
+                    match e {
+                        Event.Received(c) => {
+                            if c == self.clients[i].conn {
+                                _ = self.clients[i].codec.read_from(self.net, c)
+                            }
+                        },
+                        Event.Closed(c) => {
+                            if c == self.clients[i].conn {
+                                self.clients[i].closed = true
+                            }
+                        },
+                        _ => {},
+                    }
+                }
+            }
+        }
+    }
+
+    fn send(mut self, client: usize, p: own List<u8>) {
+        let net = self.net
+        self.clients[client].send(net, p)
+        self.settle()
+    }
+
+    // A server tick, `ms` milliseconds after the last.
+    fn tick(mut self, ms: u64) {
+        self.now += ms * 1000000
+        self.server.tick(self.now)
+        self.settle()
+    }
+
+    fn next(mut self, client: usize) -> Got {
+        return self.clients[client].next()
+    }
+
+    fn expect(mut self, client: usize, names: List<String>) {
+        for name in names {
+            check(self.clients[client].next().name, name)
+        }
+    }
+
+    // The server's log since the last call.
+    fn logs(mut self) -> String {
+        var out = String()
+        for e in self.server.take_logs() {
+            out.push_str("{e.message}|")
+        }
+        return out
+    }
+
+    // A player who logs in and goes through configuration, up to finishing it.
+    fn join(mut self, name: String) -> usize {
+        let conn = self.net.connect("127.0.0.1", self.port)!
+        self.clients.push(Client { conn: conn, codec: Codec.new(), closed: false, state: State.Login })
+        let at = self.clients.len() - 1
+        self.settle()
+        let intention = ClientIntention { protocol_version: 777, host_name: "localhost", port: 25565, intention: ClientIntent.Login }
+        let net = self.net
+        self.clients[at].send(net, packet(intention, State.Handshake))
+        self.send(at, packet(ServerboundHello { name: name.copy(), profile_id: Uuid.new(0, 0) }, State.Login))
+        self.tick(50)
+        self.clients[at].drain()
+        self.send(at, packet(ServerboundLoginAcknowledged {}, State.Login))
+        self.clients[at].state = State.Configuration
+        self.send(at, packet(ServerboundClientInformation { information: information() }, State.Configuration))
+        self.send(at, packet(ServerboundSelectKnownPacks { packs: [core()] }, State.Configuration))
+        self.tick(50)
+        self.clients[at].drain()
+        self.clients[at].state = State.Play
+        self.send(at, packet(ServerboundFinishConfiguration {}, State.Configuration))
+        return at
+    }
+
+    // Takes the batch the client was sent, if one came, past the time sent each second: the
+    // chunks' positions, in order.
+    fn batch(mut self, client: usize) -> List<ChunkPos> {
+        var out = List<ChunkPos>()
+        let start = self.clients[client].after(["set_time"])
+        if start.name == "nothing" {
+            return out
+        }
+        check(start.name, "chunk_batch_start")
+        loop {
+            let got = self.next(client)
+            if got.name == "chunk_batch_finished" {
+                var r = Reader.new(got.body)
+                check_int(i64(r.varint()!), i64.wrap(out.len()))
+                return out
+            }
+            check(got.name, "level_chunk_with_light")
+            var r = Reader.new(got.body)
+            let x = r.i32()!
+            let z = r.i32()!
+            out.push(ChunkPos { x: x, z: z })
+        }
+    }
+}
+
+fn information() -> ClientInformation {
+    return ClientInformation { language: "en_us", view_distance: 12, chat_visibility: ChatVisibility.Full, chat_colors: true, model_customisation: 127, main_hand: HumanoidArm.Right, text_filtering_enabled: false, allows_listing: true, particle_status: ParticleStatus.All }
+}
+
+fn new_rig() -> Rig {
+    let net = Net.new()!
+    let server = new_server(net)
+    let port = server.listen("127.0.0.1", 0)!
+    return Rig { net: net, server: server, port: port, clients: [], now: 0 }
+}
+
+// Everything that's sent as a player joins, in vanilla's order, before their chunks.
+fn joining() -> List<String> {
+    return [
+        "login", "change_difficulty", "player_abilities", "set_held_slot", "update_recipes",
+        "entity_event", "commands", "recipe_book_settings", "recipe_book_add", "player_position",
+        "server_data", "player_info_update", "player_info_update", "initialize_border", "set_time",
+        "set_default_spawn_position", "game_event", "ticking_state", "ticking_step",
+        "set_chunk_cache_center", "post_effects", "container_set_content", "nothing",
+    ]
+}
+
+// Sends chunk batches, acknowledging each, until the client has every chunk it's to have.
+fn load_all(rig: mut Rig, client: usize) -> List<ChunkPos> {
+    var all = List<ChunkPos>()
+    loop {
+        rig.tick(50)
+        let batch = rig.batch(client)
+        if batch.is_empty() {
+            return all
+        }
+        for c in batch {
+            all.push(c)
+        }
+        rig.send(client, play(ServerboundChunkBatchReceived { desired_chunks_per_tick: 25.0 }))
+    }
+}
+
+fn join() {
+    var rig = new_rig()
+    let steve = rig.join("Steve")
+    rig.expect(steve, joining())
+    let log = rig.logs()
+    let at = log.find("[/127.0.0.1:") else panic("no address in {log}")
+    check(log[..at], "Steve")
+    let end = log.find("] logged in") else panic("no login in {log}")
+    check(log[end..], "] logged in with entity id 1 at (0.5, -60.0, 0.5)|System chat: Steve joined the game|")
+
+    // The first batch is as many as the client is first thought to want, 9, nearest first;
+    // the next waits for the client to say it has it.
+    rig.tick(50)
+    let first = rig.batch(steve)
+    check_int(i64.wrap(first.len()), 9)
+    check_int(i64(first[0].x), 0)
+    check_int(i64(first[0].z), 0)
+    for c in first {
+        if c.distance_squared(ChunkPos { x: 0, z: 0 }) > 2 {
+            panic("{c.x}, {c.z} isn't among the nearest")
+        }
+    }
+    rig.tick(50)
+    check(rig.next(steve).name, "nothing")
+    rig.send(steve, play(ServerboundChunkBatchReceived { desired_chunks_per_tick: 25.0 }))
+    rig.tick(50)
+    check_int(i64.wrap(rig.batch(steve).len()), 25)
+    rig.send(steve, play(ServerboundChunkBatchReceived { desired_chunks_per_tick: 25.0 }))
+    var have = load_all(mut rig, steve)
+    for c in first {
+        have.push(c)
+    }
+    // The view is the client's 12 chunks, down to the server's 10, and every chunk in it came
+    // once.
+    let view = in_view_all(ChunkPos { x: 0, z: 0 }, 10)
+    check_int(i64.wrap(have.len()) + 25, i64.wrap(view.len()))
+    println("ok join")
+}
+
+fn moving() {
+    var rig = new_rig()
+    let steve = rig.join("Steve")
+    rig.clients[steve].drain()
+    // A move before the teleport is accepted doesn't count.
+    rig.send(steve, play(ServerboundMovePlayerPos { x: 40.5, y: -60.0, z: 0.5, flags: ON_GROUND }))
+    rig.send(steve, play(ServerboundClientTickEnd {}))
+    check(rig.next(steve).name, "nothing")
+    // Nor does one more than 20 ticks later, and the teleport is sent again.
+    _ = load_all(mut rig, steve)
+    rig.send(steve, play(ServerboundMovePlayerPos { x: 40.5, y: -60.0, z: 0.5, flags: ON_GROUND }))
+    rig.send(steve, play(ServerboundClientTickEnd {}))
+    let again = rig.next(steve)
+    check(again.name, "player_position")
+    var t = Reader.new(again.body)
+    check_int(i64(t.varint()!), 2)
+    check(rig.next(steve).name, "nothing")
+    // Once it's accepted, a move two chunks east moves the view: the chunks that left it are
+    // forgotten and those that came in are sent.
+    rig.send(steve, play(ServerboundAcceptTeleportation { teleport_id: 2, x: 0.5, y: -60.0, z: 0.5, y_rot: 0.0, x_rot: 0.0 }))
+    check(rig.next(steve).name, "nothing")
+    rig.send(steve, play(ServerboundMovePlayerPos { x: 40.5, y: -60.0, z: 0.5, flags: ON_GROUND }))
+    let center = rig.next(steve)
+    check(center.name, "set_chunk_cache_center")
+    var r = Reader.new(center.body)
+    check_int(i64(r.varint()!), 2)
+    check_int(i64(r.varint()!), 0)
+    let old = ChunkPos { x: 0, z: 0 }
+    let new = ChunkPos { x: 2, z: 0 }
+    var left = 0
+    var came = 0
+    for x in -14..15 {
+        for z in -14..15 {
+            let saw = in_view(old, 10, x, z)
+            let sees = in_view(new, 10, x, z)
+            if saw and not sees {
+                left += 1
+            } else if sees and not saw {
+                came += 1
+            }
+        }
+    }
+    var forgotten = 0
+    loop {
+        let got = rig.next(steve)
+        if got.name == "nothing" {
+            break
+        }
+        check(got.name, "forget_level_chunk")
+        var f = Reader.new(got.body)
+        let packed = f.i64()!
+        let x = i32.wrap(packed)
+        let z = i32.wrap(packed >> 32)
+        if in_view(new, 10, x, z) {
+            panic("{x}, {z} is still in view")
+        }
+        forgotten += 1
+    }
+    check_int(i64(forgotten), i64(left))
+    rig.send(steve, play(ServerboundClientTickEnd {}))
+    let sent = load_all(mut rig, steve)
+    check_int(i64.wrap(sent.len()), i64(came))
+    for c in sent {
+        if in_view(old, 10, c.x, c.z) {
+            panic("{c.x}, {c.z} was in view already")
+        }
+    }
+    // Two moves in one tick are one too many.
+    rig.send(steve, play(ServerboundMovePlayerPos { x: 40.5, y: -60.0, z: 1.5, flags: ON_GROUND }))
+    rig.send(steve, play(ServerboundMovePlayerPos { x: 40.5, y: -60.0, z: 2.5, flags: ON_GROUND }))
+    check(rig.next(steve).name, "disconnect")
+    println("ok moving")
+}
+
+fn others() {
+    var rig = new_rig()
+    let steve = rig.join("Steve")
+    rig.clients[steve].drain()
+    _ = load_all(mut rig, steve)
+    _ = rig.logs()
+    // Steve is told Alex joined, and sees them in the tab list; Alex is sent Steve, then
+    // themself, and not their own joining.
+    let alex = rig.join("Alex")
+    check(rig.next(steve).name, "system_chat")
+    check(rig.next(steve).name, "player_info_update")
+    check(rig.next(steve).name, "nothing")
+    check(rig.clients[alex].after(["login", "change_difficulty", "player_abilities", "set_held_slot", "update_recipes", "entity_event", "commands", "recipe_book_settings", "recipe_book_add", "player_position", "server_data"]).name, "player_info_update")
+    let them = rig.next(alex)
+    check(them.name, "player_info_update")
+    let log = rig.logs()
+    let at = log.find("|System chat: ") else panic("no join message in {log}")
+    check(log[at..], "|System chat: Alex joined the game|")
+    rig.clients[alex].drain()
+    // As Alex leaves, Steve is told, and they're taken off the tab list.
+    let conn = rig.clients[alex].conn
+    rig.net.close(conn)
+    rig.settle()
+    check(rig.next(steve).name, "system_chat")
+    check(rig.next(steve).name, "player_info_remove")
+    check(rig.logs(), "Alex lost connection: disconnect.endOfStream|System chat: Alex left the game|")
+    println("ok others")
+}
+
+fn keep_alive() {
+    var rig = new_rig()
+    let steve = rig.join("Steve")
+    rig.clients[steve].drain()
+    _ = load_all(mut rig, steve)
+    // The keep-alive is 15 seconds after the last, which was configuration's first.
+    rig.tick(15000)
+    let k = rig.clients[steve].after(["chunk_batch_start", "level_chunk_with_light", "chunk_batch_finished", "set_time"])
+    check(k.name, "keep_alive")
+    var r = Reader.new(k.body)
+    let challenge = r.i64()!
+    rig.send(steve, play(ServerboundKeepAlive { challenge: challenge }))
+    rig.clients[steve].drain()
+    rig.tick(14000)
+    rig.clients[steve].drain()
+    if rig.clients[steve].closed {
+        panic("Steve was disconnected")
+    }
+    println("ok keep_alive")
+}
+
+fn main() {
+    join()
+    moving()
+    others()
+    keep_alive()
+    println("ok")
+}
