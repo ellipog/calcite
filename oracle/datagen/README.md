@@ -107,6 +107,7 @@ py -I oracle/datagen/calx_tables.py --check    # fail if a committed one is out 
 | `src/protocol/ids.calx` | `index.json`, `packets.json` | `PROTOCOL_VERSION`, `game_version()`, and `packet_names(state, bound)`, each state's packets in ID order, which `@packet` reads its IDs from |
 | `src/registry/builtin.calx` | `registries.json` | `builtin_names()`, the 95 built-in registries in the order of their IDs, and `builtin_entries(i)`, each one's entries in ID order |
 | `src/pack/pin.calx` | `../versions.json` | `jar_version()`, `jar_url()`, `jar_sha1()` and `JAR_SIZE`: the pinned server jar, which the server downloads and checks |
+| `src/world/blocks.calx` | `blocks.json` | `STATE_COUNT`, `first_states()`, each block's first state ID, and `default_offsets()`, where its default state is among its states, in block ID order |
 
 They're committed, and hold only the names and IDs the protocol needs, which every compatible server encodes. Don't edit one: change the script and run it again. A new game version that changes them changes Calcite's build, which is the point: `@packet` then fails to compile for a packet that was renamed or removed.
 

@@ -102,5 +102,32 @@ class PinModule(unittest.TestCase):
             calx_tables.pin_module("1.0", dict(self.PIN, sha1="ABC"))
 
 
+class BlocksModule(unittest.TestCase):
+    @staticmethod
+    def block(id, name, first, count, default):
+        return {"id": id, "name": name, "first_state": first, "state_count": count, "default_state": default}
+
+    def test_writes_first_states_and_default_offsets(self):
+        text = calx_tables.blocks_module(INDEX, {"state_count": 4, "blocks": [
+            self.block(0, "minecraft:air", 0, 1, 0),
+            self.block(1, "minecraft:grass_block", 1, 2, 2),
+            self.block(2, "minecraft:dirt", 3, 1, 3),
+        ]})
+        self.assertIn("pub const STATE_COUNT: u32 = 4\n", text)
+        self.assertIn("    return [0, 1, 3]\n", text)
+        self.assertIn("    return [0, 1, 0]\n", text)
+
+    def test_rejects_states_that_dont_follow_on(self):
+        with self.assertRaisesRegex(ValueError, "don't run from 0"):
+            calx_tables.blocks_module(INDEX, {"state_count": 1, "blocks": [self.block(1, "minecraft:air", 0, 1, 0)]})
+        with self.assertRaisesRegex(ValueError, "follow"):
+            calx_tables.blocks_module(INDEX, {"state_count": 2, "blocks": [
+                self.block(0, "minecraft:air", 0, 1, 0), self.block(1, "minecraft:stone", 2, 1, 2)]})
+        with self.assertRaisesRegex(ValueError, "default state"):
+            calx_tables.blocks_module(INDEX, {"state_count": 1, "blocks": [self.block(0, "minecraft:air", 0, 1, 1)]})
+        with self.assertRaisesRegex(ValueError, "not the 3"):
+            calx_tables.blocks_module(INDEX, {"state_count": 3, "blocks": [self.block(0, "minecraft:air", 0, 1, 0)]})
+
+
 if __name__ == "__main__":
     unittest.main()

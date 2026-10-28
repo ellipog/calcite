@@ -9,6 +9,7 @@ IDs the protocol needs, which every compatible server encodes:
 - `protocol.ids`: the protocol version, and each state's packets in ID order.
 - `registry.builtin`: the built-in registries and their entries in ID order.
 - `pack.pin`: where the pinned server jar comes from, and its size and SHA-1, from versions.json.
+- `world.blocks`: each block's first state ID and default state, in block ID order.
 """
 
 import argparse
@@ -117,6 +118,46 @@ def builtin_module(index, registries):
     return "\n".join(lines)
 
 
+def blocks_module(index, blocks):
+    """The text of src/world/blocks.calx."""
+    entries = blocks["blocks"]
+    if [b["id"] for b in entries] != list(range(len(entries))):
+        raise ValueError("blocks.json's block IDs don't run from 0 without gaps")
+    first = 0
+    for b in entries:
+        if b["first_state"] != first:
+            raise ValueError(f"{b['name']}'s states don't follow the block before's")
+        if not b["first_state"] <= b["default_state"] < b["first_state"] + b["state_count"]:
+            raise ValueError(f"{b['name']}'s default state isn't one of its states")
+        first += b["state_count"]
+    if first != blocks["state_count"]:
+        raise ValueError(f"blocks.json's blocks have {first} states, not the {blocks['state_count']} it says")
+    firsts = ", ".join(str(b["first_state"]) for b in entries)
+    defaults = ", ".join(str(b["default_state"] - b["first_state"]) for b in entries)
+    lines = [
+        f"/// Vanilla {index['game_version']}'s block state IDs: a block's states are numbered on from the last",
+        "/// state of the block before it, in block ID order, which is the order of `registry.builtin`'s",
+        "/// `block` registry. Written by oracle/datagen/calx_tables.py from blocks.json (D126): don't edit",
+        "/// it.",
+        "module world.blocks",
+        "",
+        "/// How many block states there are.",
+        f"pub const STATE_COUNT: u32 = {blocks['state_count']}",
+        "",
+        "/// The ID of each block's first state, in block ID order.",
+        "pub fn first_states() -> List<u32> {",
+        f"    return [{firsts}]",
+        "}",
+        "",
+        "/// Where each block's default state is among its states, in block ID order.",
+        "pub fn default_offsets() -> List<u32> {",
+        f"    return [{defaults}]",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def pin_module(version, pin):
     """The text of src/pack/pin.calx."""
     url, sha1, size = pin["url"], pin["sha1"], int(pin["size"])
@@ -155,11 +196,13 @@ def outputs(tables, version=VERSION):
     index = json.loads((tables / "index.json").read_text(encoding="utf-8"))
     packets = json.loads((tables / "packets.json").read_text(encoding="utf-8"))
     registries = json.loads((tables / "registries.json").read_text(encoding="utf-8"))
+    blocks = json.loads((tables / "blocks.json").read_text(encoding="utf-8"))
     pins = json.loads((CALCITE / "oracle" / "versions.json").read_text(encoding="utf-8"))
     return {
         CALCITE / "src" / "protocol" / "ids.calx": ids_module(index, packets),
         CALCITE / "src" / "registry" / "builtin.calx": builtin_module(index, registries),
         CALCITE / "src" / "pack" / "pin.calx": pin_module(version, pins[version]),
+        CALCITE / "src" / "world" / "blocks.calx": blocks_module(index, blocks),
     }
 
 
