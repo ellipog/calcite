@@ -1,0 +1,169 @@
+/// Checks server.link's input log (D21): a login recorded over TCP replays into a server made the
+/// same way to the same packets and lines, from the log taken in pieces; a server made another
+/// way is told where it first sent something else; one that goes another way stops where it
+/// did; and what isn't a whole log is refused, or replays up to where it's cut off.
+module test.replay
+
+import auth.services.{Services}
+import chat.component.{Component}
+import chat.language.{Language}
+import java.uuid.{Uuid}
+import protocol.codec.{Codec}
+import protocol.handshake.{ClientIntent, ClientIntention}
+import protocol.ids.{game_version}
+import protocol.login.{ServerboundHello, ServerboundLoginAcknowledged}
+import protocol.state.{State}
+import protocol.wire.{Writer, Wire, Packet, write_packet}
+import registry.registries.{Registries}
+import server.configuration.{Configuration}
+import server.link.{Link}
+import server.network.{LoginSettings, Network, StatusInfo, key_ready}
+import server.play.{World}
+import server.status.{ServerStatus}
+import std.crypto.{RsaKey}
+import std.net.{Net, Conn, Event}
+import std.time.{Timestamp}
+
+fn check(got: String, want: String) {
+    if got != want {
+        panic("got {got}, want {want}")
+    }
+}
+
+fn login(threshold: i32, velocity: bool) -> LoginSettings {
+    let secret = if velocity { some(String("hunter2")) } else { none }
+    return LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: threshold, log_ips: true, prevent_proxy_connections: false, velocity_secret: secret }
+}
+
+fn server(link: own Link, settings: own LoginSettings) -> Network {
+    let status = StatusInfo { enabled: true, status: ServerStatus.starting(Component.literal("A Minecraft Server"), 20, none), motd: "A Minecraft Server" }
+    let configuration = Configuration.new("calcite", [], [], Registries { synced: [], builtin: [] }, [])
+    return Network.new(link, status, settings, Language.empty(), Services.offline(), key_ready(RsaKey.generate(1024)), configuration, World.defaults())
+}
+
+fn packet<T: Wire + Packet>(p: T, state: State) -> List<u8> {
+    var w = Writer.new()
+    write_packet(p, state, mut w)
+    return w.into_bytes()
+}
+
+// Polls until nothing comes for 50 ms, handing the server its events at `now`, and the client
+// what it was sent.
+fn settle(net: Net, s: mut Network, client: Conn, codec: mut Codec, now: u64) {
+    loop {
+        var events = List<Event>()
+        net.poll(50, mut events)
+        if events.is_empty() {
+            return
+        }
+        for e in events {
+            if s.handle(e, now) {
+                continue
+            }
+            match e {
+                Event.Received(c) => {
+                    if c == client {
+                        _ = codec.read_from(net, c)
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+}
+
+// Steve logs in, in one write, a tick lets him in, and he acknowledges it and leaves: the log,
+// taken in two pieces and joined.
+fn session(threshold: i32) -> List<u8> {
+    let net = Net.new()!
+    var s = server(Link.record(net), login(threshold, false))
+    let port = s.listen("127.0.0.1", 0)!
+    let client = net.connect("127.0.0.1", port)!
+    var codec = Codec.new()
+    s.set_clock(Timestamp { unix_ms: 1700000000000 })
+    settle(net, mut s, client, mut codec, 1000)
+    let intention = ClientIntention { protocol_version: 777, host_name: "localhost", port: 25565, intention: ClientIntent.Login }
+    var hello = codec.encode(packet(intention, State.Handshake))!
+    for b in codec.encode(packet(ServerboundHello { name: "Steve", profile_id: Uuid.new(0, 0) }, State.Login))! {
+        hello.push(b)
+    }
+    net.write(client, hello)
+    settle(net, mut s, client, mut codec, 2000)
+    var log = s.take_log()
+    s.tick(50000000)
+    settle(net, mut s, client, mut codec, 50000000)
+    if threshold >= 0 {
+        _ = codec.next()!!
+        codec.start_compression(threshold)
+    }
+    _ = codec.next()!!
+    net.write(client, codec.encode(packet(ServerboundLoginAcknowledged {}, State.Login))!)
+    settle(net, mut s, client, mut codec, 60000000)
+    net.close(client)
+    settle(net, mut s, client, mut codec, 70000000)
+    _ = s.take_logs()
+    for b in s.take_log() {
+        log.push(b)
+    }
+    return log
+}
+
+// A log's header, with `version` and the game's version `game`.
+fn header(version: i32, game: String) -> List<u8> {
+    var w = Writer.new()
+    w.raw("Calcite input log".to_bytes())
+    w.varint(version)
+    w.byte_array(game.to_bytes())
+    return w.into_bytes()
+}
+
+fn refusal(log: own List<u8>) -> String {
+    return match Link.replay(log) {
+        ok(_) => String("replayed"),
+        err(message) => message,
+    }
+}
+
+fn main() {
+    let log = session(256)
+
+    // The same server replays it: the compression and the profile, configuration's first three
+    // packets, and the line logged as Steve left.
+    var same = server(Link.replay(log.copy())!, login(256, false))
+    let report = same.replay_all()
+    check(report.to_string(), "1 ticks, 6 packets and lines compared, 0 different")
+    check("{report.same()}", "true")
+
+    // A server that doesn't compress sends the profile where the recording sent the compression
+    // first, and from then on each packet is one late. It can't read the client's compressed
+    // acknowledgement, so it sends a disconnect where the recording sent its last packet, and
+    // logs another reason as Steve leaves: six differences.
+    var plain = server(Link.replay(log.copy())!, login(-1, false))
+    let differs = plain.replay_all()
+    let first = differs.first.copy() ?? String()
+    check(first[..first.find(" was sent")!], "at tick 1, connection 2")
+    check(first[first.find(" was sent")!..], " was sent packet 0x02 of 40 bytes, where the recording sent connection 2 packet 0x03 of 3 bytes")
+    check("{differs.differences} {differs.stopped == none} {differs.same()}", "6 true false")
+
+    // Behind Velocity, the hello draws a query's ID, which the recording never did, so the
+    // replay stops there.
+    var proxied = server(Link.replay(log.copy())!, login(256, true))
+    let stopped = proxied.replay_all().stopped ?? String()
+    check(stopped[..stopped.find(" where")!], "at tick 0, the server drew random bytes,")
+
+    // What isn't an input log, or is another's, is refused.
+    check(refusal([1, 2, 3]), "it isn't an input log")
+    check(refusal(header(2, game_version())), "it's an input log of version 2, and this build reads version 1")
+    check(refusal(header(1, "1.0")), "it was recorded with Minecraft 1.0, and this is {game_version()}")
+    check(refusal(header(1, game_version())), "replayed")
+
+    // A log cut off in its last record, the line logged as Steve left, replays up to it.
+    var cut = log.copy()
+    cut.truncate(log.len() - 3)
+    var shorter = server(Link.replay(cut)!, login(256, false))
+    let rest = shorter.replay_all()
+    check("{rest.differences} {rest.stopped == none}", "1 true")
+    let missing = rest.first.copy() ?? String()
+    check("{missing.contains("lost connection")} {missing.ends_with("after everything the recording logged")}", "true true")
+    println("ok")
+}

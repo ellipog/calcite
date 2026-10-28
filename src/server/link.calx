@@ -1,0 +1,829 @@
+/// What comes into the server from outside, and the input log it's recorded in and replayed
+/// from (D21, D144).
+///
+/// What the server does is decided by what comes in: what its connections send and when, its
+/// clocks, the random bytes it draws, its key pair, and what Mojang's services answer. The rest
+/// it works out. A `Link` is where the server gets each of those. Live, it asks the system.
+/// Recording, it asks the system and writes each answer in the log, in the order the server
+/// asked. Replaying, it takes each answer from the log instead, so the server runs again as it
+/// ran, with no sockets, clocks or requests.
+///
+/// What the server sends and logs goes in the log too, as a check. A replay compares each packet
+/// it sends, and each line it logs, with the recording's, and says where they first differ, so a
+/// log recorded with one build can be replayed with another to see what changed.
+module server.link
+
+import protocol.ids.{game_version}
+import protocol.wire.{DecodeError, Reader, Writer}
+import server.log.{Entry, Level}
+import std.crypto.{RsaKey, random_bytes}
+import std.http.{Error, Header, Request, Response, get as http_get}
+import std.lz4.{xxh32}
+import std.net.{Address, Conn, Event, Ip, Net, NetError, Waker}
+import std.time.{Timestamp}
+
+/// Whether a link asks the system, and whether it writes the answers in a log or takes them
+/// from one.
+pub enum Mode {
+    /// It asks the system, and keeps nothing.
+    Live
+    /// It asks the system, and writes each answer in its log.
+    Recording
+    /// It takes each answer from a log, in the order the log has them.
+    Replaying
+}
+
+/// What a replay hands the server next, as the server's loop handed it over as it ran: an event
+/// of its `Net`, a tick or a sweep of stale connections, each at a time on the loop's clock, or
+/// the wall clock's time.
+pub enum Input {
+    Event(Event, u64)
+    Tick(u64)
+    Sweep(u64)
+    Clock(Timestamp)
+}
+
+/// A request of a web service, which a replay answers from the log.
+pub struct Call {
+    request: List<Request>
+}
+
+/// What a replay found: how many ticks it ran, how many packets and lines it compared with the
+/// recording's, how many differed and the first that did, and why it stopped early, if it did.
+pub struct Report {
+    pub ticks: u64
+    pub compared: u64
+    pub differences: u64
+    pub first: String?
+    pub stopped: String?
+}
+
+impl Report {
+    /// Whether the replay ran to the end of the log and sent and logged what the recording did.
+    pub fn same(self) -> bool {
+        return self.differences == 0 and self.stopped == none
+    }
+
+    /// What it found, in a line or two.
+    pub fn to_string(self) -> String {
+        var out = "{self.ticks} ticks, {self.compared} packets and lines compared, {self.differences} different"
+        if let f = self.first {
+            out.push_str("; the first: {f}")
+        }
+        if let s = self.stopped {
+            out.push_str("; it stopped: {s}")
+        }
+        return out
+    }
+}
+
+// The kinds of record. What the server's loop hands it, which a replay hands it again:
+const ACCEPTED: u8 = 1
+const RECEIVED: u8 = 2
+const CLOSED: u8 = 3
+const TICK: u8 = 4
+const SWEEP: u8 = 5
+const CLOCK: u8 = 6
+// What the server asks for as it handles those, which a replay answers with:
+const READ: u8 = 16
+const PEER: u8 = 17
+const RANDOM: u8 = 18
+const KEY: u8 = 19
+const DONE: u8 = 20
+const RESPONSE: u8 = 21
+// What it sends and logs, which a replay compares with what it sends and logs:
+const SENT: u8 = 32
+const LOGGED: u8 = 33
+
+// What a record of each kind is, as a replay that went another way says.
+fn kind_name(tag: u8) -> String {
+    return match tag {
+        ACCEPTED => String("accepted a connection"),
+        RECEIVED => String("received bytes"),
+        CLOSED => String("lost a connection"),
+        TICK => String("ticked"),
+        SWEEP => String("swept stale connections"),
+        CLOCK => String("read the wall clock"),
+        READ => String("read what a connection sent"),
+        PEER => String("asked a connection's address"),
+        RANDOM => String("drew random bytes"),
+        KEY => String("took its key pair"),
+        DONE => String("asked whether a request was done"),
+        RESPONSE => String("took a request's response"),
+        _ => "did something this build doesn't know ({tag})",
+    }
+}
+
+// The first bytes of a log, then the version of what follows them.
+fn magic() -> String {
+    return String("Calcite input log")
+}
+
+const VERSION: i32 = 1
+
+// One record of a log: its kind, and what it holds.
+struct Record {
+    tag: u8
+    body: List<u8>
+}
+
+/// Where the server gets what comes from outside, and where what it sends goes.
+pub struct Link {
+    mode: Mode
+    // The sockets, unless it's replaying.
+    net: Net?
+    // Recording: the log since it was last taken.
+    log: Writer?
+    // Replaying: what the server is handed and told, still to come, and what the recording sent
+    // and logged, still to compare. Lines are recorded as they're taken, which the caller picks,
+    // so they're compared apart from the packets.
+    inputs: Deque<Record>
+    packets: Deque<Record>
+    lines: Deque<Record>
+    // The ticks so far, which say where something happened.
+    ticks: u64
+    // Replaying: what's been compared, what differed, and why the replay stopped, if it did.
+    compared: u64
+    differences: u64
+    first: String?
+    stopped: String?
+}
+
+impl Link {
+    /// A link to the system's sockets and clocks, which keeps nothing.
+    pub fn live(net: Net) -> Link {
+        return Link.on(Mode.Live, some(net))
+    }
+
+    /// A link to the system that writes everything that comes in, and what the server sends and
+    /// logs, in a log, which `take_log` gives.
+    pub fn record(net: Net) -> Link {
+        var head = Writer.new()
+        head.raw(magic().to_bytes())
+        head.varint(VERSION)
+        head.byte_array(game_version().to_bytes())
+        var link = Link.on(Mode.Recording, some(net))
+        link.log = some(head)
+        return link
+    }
+
+    /// A link that replays `log`, or why it can't: it isn't a log, or another version of the
+    /// game recorded it. A record cut off at the end, by a server stopped as it wrote it, is
+    /// left out.
+    pub fn replay(log: own List<u8>) -> Link ! String {
+        var r = Reader.new(log)
+        let m = magic().to_bytes()
+        let head = match r.bytes(m.len()) {
+            ok(b) => b,
+            err(_) => fail "it isn't an input log",
+        }
+        if head != m {
+            fail "it isn't an input log"
+        }
+        let version = match r.varint() {
+            ok(v) => v,
+            err(_) => fail "it isn't an input log",
+        }
+        if version != VERSION {
+            fail "it's an input log of version {version}, and this build reads version {VERSION}"
+        }
+        let game = match r.byte_array(256) {
+            ok(b) => String.from_utf8(b) ?? String(),
+            err(_) => fail "it isn't an input log",
+        }
+        if game != game_version() {
+            fail "it was recorded with Minecraft {game}, and this is {game_version()}"
+        }
+        var link = Link.on(Mode.Replaying, none)
+        while r.left() > 0 {
+            let tag = match r.u8() {
+                ok(t) => t,
+                err(_) => break,
+            }
+            let body = match r.byte_array_in_left() {
+                ok(b) => b,
+                err(_) => break,
+            }
+            if tag == SENT {
+                link.packets.push_last(Record { tag: tag, body: body })
+            } else if tag == LOGGED {
+                link.lines.push_last(Record { tag: tag, body: body })
+            } else {
+                link.inputs.push_last(Record { tag: tag, body: body })
+            }
+        }
+        return link
+    }
+
+    fn on(mode: Mode, net: Net?) -> Link {
+        return Link { mode: mode, net: net, log: none, inputs: Deque<Record>(), packets: Deque<Record>(), lines: Deque<Record>(), ticks: 0, compared: 0, differences: 0, first: none, stopped: none }
+    }
+
+    /// The log so far, which is left empty. Each call gives what was recorded since the last, so
+    /// the pieces joined are the log.
+    pub fn take_log(mut self) -> List<u8> {
+        let log = self.log.replace(Writer.new()) ?? Writer.new()
+        return log.into_bytes()
+    }
+
+    /// What the replay found so far.
+    pub fn report(self) -> Report {
+        return Report { ticks: self.ticks, compared: self.compared, differences: self.differences, first: self.first.copy(), stopped: self.stopped.copy() }
+    }
+
+    fn recording(self) -> bool {
+        return self.mode == Mode.Recording
+    }
+
+    fn replaying(self) -> bool {
+        return self.mode == Mode.Replaying
+    }
+
+    // Writes a record of the kind `tag`, holding what `body` wrote.
+    fn put(mut self, tag: u8, body: own Writer) {
+        var log = self.log.take() ?? Writer.new()
+        log.u8(tag)
+        log.byte_array(body.into_bytes())
+        self.log = some(log)
+    }
+
+    // --- What the server's loop hands it ---
+
+    /// Records that the server was handed a new connection, at `now` on its loop's clock.
+    pub fn accepted(mut self, c: Conn, now: u64) {
+        self.event(ACCEPTED, c, now)
+    }
+
+    /// Records that bytes arrived on one of the server's connections.
+    pub fn received(mut self, c: Conn, now: u64) {
+        self.event(RECEIVED, c, now)
+    }
+
+    /// Records that one of the server's connections closed.
+    pub fn closed(mut self, c: Conn, now: u64) {
+        self.event(CLOSED, c, now)
+    }
+
+    fn event(mut self, tag: u8, c: Conn, now: u64) {
+        if not self.recording() {
+            return
+        }
+        var w = Writer.new()
+        w.varlong(i64(c.id()))
+        w.varlong(i64.wrap(now))
+        self.put(tag, w)
+    }
+
+    /// Records a tick at `now`, and counts it.
+    pub fn tick(mut self, now: u64) {
+        if self.recording() {
+            var w = Writer.new()
+            w.varlong(i64.wrap(now))
+            self.put(TICK, w)
+        }
+        if not self.replaying() {
+            self.ticks += 1
+        }
+    }
+
+    /// Records a sweep of stale connections at `now`.
+    pub fn sweep(mut self, now: u64) {
+        if self.recording() {
+            var w = Writer.new()
+            w.varlong(i64.wrap(now))
+            self.put(SWEEP, w)
+        }
+    }
+
+    /// Records the wall clock's time, as the server was told it.
+    pub fn clock(mut self, now: Timestamp) {
+        if self.recording() {
+            var w = Writer.new()
+            w.varlong(now.unix_ms)
+            self.put(CLOCK, w)
+        }
+    }
+
+    /// Replaying, what the server's loop handed it next as it ran, or `none` at the end of the
+    /// log, or once the server went another way than it did.
+    pub fn next_input(mut self) -> Input? {
+        if self.stopped != none {
+            return none
+        }
+        let record = self.inputs.pop_first() else return none
+        var r = Reader.new(record.body)
+        let input = match read_input(record.tag, mut r) {
+            ok(some(i)) => i,
+            ok(none) => {
+                self.stop("the server {kind_name(record.tag)} where its loop was to hand it something")
+                return none
+            },
+            err(e) => {
+                self.stop("the log is damaged: {e.message}")
+                return none
+            },
+        }
+        if record.tag == TICK {
+            self.ticks += 1
+        }
+        return some(input)
+    }
+
+    // Replaying, the next record, which is to be of the kind `tag`: what the server asked for as
+    // it was recorded, at the point it asks again. `none` if it asked for something else then,
+    // and the replay stops there, since the server has gone another way.
+    fn answer(mut self, tag: u8) -> Reader? {
+        if self.stopped != none {
+            return none
+        }
+        let record = self.inputs.pop_first() else {
+            self.stop("the log ended where the server {kind_name(tag)}")
+            return none
+        }
+        if record.tag != tag {
+            self.stop("the server {kind_name(tag)}, where as it was recorded it {kind_name(record.tag)}")
+            return none
+        }
+        return some(Reader.new(record.body))
+    }
+
+    // Stops the replay, saying why and at which tick.
+    fn stop(mut self, why: own String) {
+        if self.stopped == none {
+            self.stopped = some("at tick {self.ticks}, {why}")
+        }
+    }
+
+    // A record's answer couldn't be read.
+    fn damaged(mut self, e: DecodeError) {
+        self.stop("the log is damaged: {e.message}")
+    }
+
+    // --- What the server asks for ---
+
+    /// Listens on `host` and `port`, as `Net.listen`. Replaying, it listens nowhere, and gives
+    /// `port`.
+    pub fn listen(self, host: String, port: u16) -> u16 ! NetError {
+        let net = self.net else return port
+        return try net.listen(host, port)
+    }
+
+    /// The connection's address, as `Net.peer` gives it.
+    pub fn peer(mut self, c: Conn) -> Address? {
+        if self.replaying() {
+            var r = self.answer(PEER) else return none
+            return match read_peer(mut r) {
+                ok(a) => a,
+                err(e) => {
+                    self.damaged(e)
+                    none
+                },
+            }
+        }
+        let net = self.net else return none
+        let peer = net.peer(c)
+        if self.recording() {
+            var w = Writer.new()
+            write_peer(mut w, peer)
+            self.put(PEER, w)
+        }
+        return peer
+    }
+
+    /// What arrived on the connection, as `Net.read` takes it.
+    pub fn read(mut self, c: Conn) -> List<u8> {
+        if self.replaying() {
+            var r = self.answer(READ) else return List<u8>()
+            return r.rest()
+        }
+        var bytes = List<u8>()
+        let net = self.net else return bytes
+        _ = net.read(c, mut bytes)
+        if self.recording() {
+            var w = Writer.new()
+            w.raw(bytes)
+            self.put(READ, w)
+        }
+        return bytes
+    }
+
+    /// Takes what arrived on the connection and drops it, as a server does with what comes on a
+    /// connection it's closing. Since it changes nothing, it isn't recorded.
+    pub fn discard(self, c: Conn) {
+        let net = self.net else return
+        var dropped = List<u8>()
+        _ = net.read(c, mut dropped)
+    }
+
+    /// `n` random bytes from the system's generator, as `random_bytes`.
+    pub fn random(mut self, n: usize) -> List<u8> {
+        if self.replaying() {
+            var r = self.answer(RANDOM) else return [0; n]
+            let bytes = r.rest()
+            if bytes.len() != n {
+                self.stop("the server drew {n} random bytes, where as it was recorded it drew {bytes.len()}")
+                return [0; n]
+            }
+            return bytes
+        }
+        let bytes = random_bytes(n)
+        if self.recording() {
+            var w = Writer.new()
+            w.raw(bytes)
+            self.put(RANDOM, w)
+        }
+        return bytes
+    }
+
+    /// The server's key pair, from the thread making it, waiting for it if it's not made yet:
+    /// `none` if it never comes. Replaying, it's the key pair the recording had, so what clients
+    /// encrypted with its public key opens again; the queue is left alone.
+    pub fn key(mut self, coming: mut Receiver<RsaKey>) -> RsaKey? {
+        if self.replaying() {
+            var r = self.answer(KEY) else return none
+            let key = RsaKey.from_primes(r.rest())
+            if key == none {
+                self.stop("the log's key pair isn't one")
+            }
+            return key
+        }
+        let key = coming.wait() else return none
+        if self.recording() {
+            var w = Writer.new()
+            w.raw(key.primes())
+            self.put(KEY, w)
+        }
+        return some(key)
+    }
+
+    /// Starts a GET request, as `std.http.get`. Replaying, nothing is sent.
+    pub fn get(self, url: String, headers: List<Header>, timeout_ms: u32, limit: usize) -> Call {
+        if self.replaying() {
+            return Call { request: List<Request>() }
+        }
+        return Call { request: [http_get(url, headers, timeout_ms, limit)] }
+    }
+
+    /// Whether the request has finished, so that `wait` won't wait.
+    pub fn done(mut self, call: Call) -> bool {
+        if self.replaying() {
+            var r = self.answer(DONE) else return false
+            return match r.bool() {
+                ok(d) => d,
+                err(e) => {
+                    self.damaged(e)
+                    false
+                },
+            }
+        }
+        let finished = call.request.is_empty() or call.request[0].done()
+        if self.recording() {
+            var w = Writer.new()
+            w.bool(finished)
+            self.put(DONE, w)
+        }
+        return finished
+    }
+
+    /// Waits for the request to finish, and gives its response. Panics if it was taken already.
+    @track_caller
+    pub fn wait(mut self, call: mut Call) -> Response ! Error {
+        if self.replaying() {
+            var r = self.answer(RESPONSE) else fail Error.Unavailable
+            match read_response(mut r) {
+                ok(Answered.Got(response)) => return response,
+                ok(Answered.Failed(e)) => fail e,
+                err(e) => {
+                    self.damaged(e)
+                    fail Error.Unavailable
+                },
+            }
+        }
+        var request = call.request.pop() else panic("the request's response was taken already")
+        match request.wait() {
+            ok(response) => {
+                if self.recording() {
+                    var w = Writer.new()
+                    w.u8(0)
+                    write_response(mut w, response)
+                    self.put(RESPONSE, w)
+                }
+                return response
+            },
+            err(e) => {
+                if self.recording() {
+                    var w = Writer.new()
+                    w.u8(1)
+                    write_error(mut w, e)
+                    self.put(RESPONSE, w)
+                }
+                fail e
+            },
+        }
+    }
+
+    // --- Where what the server sends goes ---
+
+    /// Queues bytes to send on the connection, as `Net.write`. Replaying, they go nowhere.
+    pub fn write(self, c: Conn, bytes: List<u8>) {
+        if let net = self.net {
+            net.write(c, bytes)
+        }
+    }
+
+    /// Closes the connection once what's queued is sent, as `Net.close`.
+    pub fn close(self, c: Conn) {
+        if let net = self.net {
+            net.close(c)
+        }
+    }
+
+    /// Something another thread wakes the poll with, as `Net.waker`. Replaying there's no poll,
+    /// so there's none, and the server encodes everything on its own thread.
+    pub fn waker(self) -> Waker ! NetError {
+        let net = self.net else fail NetError.Os(0)
+        return try net.waker()
+    }
+
+    // --- What the server sends and logs, as a check ---
+
+    /// Records that the server queued `packet`, its ID then its fields, or bytes that go as they
+    /// are, for the connection; replaying, compares it with what the recording queued next.
+    pub fn sent(mut self, c: Conn, packet: List<u8>) {
+        if self.mode == Mode.Live {
+            return
+        }
+        var w = Writer.new()
+        w.varlong(i64(c.id()))
+        w.varint(packet_id(packet))
+        w.varint(i32.wrap(packet.len()))
+        w.i32(i32.wrap(xxh32(packet, 0)))
+        if self.recording() {
+            self.put(SENT, w)
+            return
+        }
+        let got = w.into_bytes()
+        self.compared += 1
+        let want = self.packets.pop_first() else {
+            self.differ("connection {c.slot()} was sent packet {hex_id(packet_id(packet))} of {packet.len()} bytes, after everything the recording sent")
+            return
+        }
+        if got != want.body {
+            self.differ("connection {c.slot()} was sent packet {hex_id(packet_id(packet))} of {packet.len()} bytes, where the recording sent {sent_text(want.body)}")
+        }
+    }
+
+    /// Records a line the server logged; replaying, compares it with what the recording logged
+    /// next.
+    pub fn logged(mut self, e: Entry) {
+        if self.mode == Mode.Live {
+            return
+        }
+        var w = Writer.new()
+        w.u8(level_byte(e.level))
+        w.bool(e.thread != none)
+        if let t = e.thread {
+            w.byte_array(t.to_bytes())
+        }
+        w.byte_array(e.message.to_bytes())
+        if self.recording() {
+            self.put(LOGGED, w)
+            return
+        }
+        let got = w.into_bytes()
+        self.compared += 1
+        let want = self.lines.pop_first() else {
+            self.differ("the server logged \"{e.message}\", after everything the recording logged")
+            return
+        }
+        if got != want.body {
+            self.differ("the server logged \"{e.message}\", where the recording logged \"{logged_text(want.body)}\"")
+        }
+    }
+
+    fn differ(mut self, what: own String) {
+        self.differences += 1
+        if self.first == none {
+            self.first = some("at tick {self.ticks}, {what}")
+        }
+    }
+
+    /// Replaying, counts what the recording sent and logged that the replay didn't, once the log
+    /// has run out.
+    pub fn finish(mut self) {
+        while let record = self.packets.pop_first() {
+            self.compared += 1
+            self.differ("the recording {check_text(record)}, which the replay didn't")
+        }
+        while let record = self.lines.pop_first() {
+            self.compared += 1
+            self.differ("the recording {check_text(record)}, which the replay didn't")
+        }
+    }
+}
+
+// An input record's body, as what the server's loop hands it: `none` if it's something the
+// server asks for instead.
+fn read_input(tag: u8, r: mut Reader) -> Input? ! DecodeError {
+    match tag {
+        ACCEPTED => {
+            let c = Conn.from_id(u32.wrap(try r.varlong()))
+            return some(Input.Event(Event.Accepted(c), u64.wrap(try r.varlong())))
+        },
+        RECEIVED => {
+            let c = Conn.from_id(u32.wrap(try r.varlong()))
+            return some(Input.Event(Event.Received(c), u64.wrap(try r.varlong())))
+        },
+        CLOSED => {
+            let c = Conn.from_id(u32.wrap(try r.varlong()))
+            return some(Input.Event(Event.Closed(c), u64.wrap(try r.varlong())))
+        },
+        TICK => return some(Input.Tick(u64.wrap(try r.varlong()))),
+        SWEEP => return some(Input.Sweep(u64.wrap(try r.varlong()))),
+        CLOCK => return some(Input.Clock(Timestamp { unix_ms: try r.varlong() })),
+        _ => return none,
+    }
+}
+
+fn write_peer(w: mut Writer, peer: Address?) {
+    let a = peer else {
+        w.u8(0)
+        return
+    }
+    match a.ip {
+        Ip.V4(b) => {
+            w.u8(4)
+            let n: usize = 4
+            for i in 0..n {
+                w.u8(b[i])
+            }
+        },
+        Ip.V6(b, scope) => {
+            w.u8(6)
+            let n: usize = 16
+            for i in 0..n {
+                w.u8(b[i])
+            }
+            w.i32(i32.wrap(scope))
+        },
+    }
+    w.u16(a.port)
+}
+
+fn read_peer(r: mut Reader) -> Address? ! DecodeError {
+    let kind = try r.u8()
+    if kind == 0 {
+        return none
+    }
+    if kind == 4 {
+        var b: [u8; 4] = [0; 4]
+        let n: usize = 4
+        for i in 0..n {
+            b[i] = try r.u8()
+        }
+        return some(Address { ip: Ip.V4(b), port: try r.u16() })
+    }
+    var b: [u8; 16] = [0; 16]
+    let n: usize = 16
+    for i in 0..n {
+        b[i] = try r.u8()
+    }
+    let scope = u32.wrap(try r.i32())
+    return some(Address { ip: Ip.V6(b, scope), port: try r.u16() })
+}
+
+fn write_response(w: mut Writer, response: Response) {
+    w.varint(i32.wrap(response.status))
+    w.count(response.headers.len())
+    for h in response.headers {
+        w.byte_array(h.name.to_bytes())
+        w.byte_array(h.value.to_bytes())
+    }
+    w.byte_array(response.body)
+}
+
+fn write_error(w: mut Writer, e: Error) {
+    match e {
+        Error.BadUrl => w.u8(0),
+        Error.Resolve => w.u8(1),
+        Error.Connect => w.u8(2),
+        Error.Tls => w.u8(3),
+        Error.Timeout => w.u8(4),
+        Error.Protocol => w.u8(5),
+        Error.TooLong => w.u8(6),
+        Error.Unavailable => w.u8(7),
+        Error.Os(code) => {
+            w.u8(8)
+            w.i32(code)
+        },
+    }
+}
+
+// What a request came to: its response, or why there was none.
+enum Answered {
+    Got(Response)
+    Failed(Error)
+}
+
+// A response record.
+fn read_response(r: mut Reader) -> Answered ! DecodeError {
+    if try r.u8() == 1 {
+        let e = match try r.u8() {
+            0 => Error.BadUrl,
+            1 => Error.Resolve,
+            2 => Error.Connect,
+            3 => Error.Tls,
+            4 => Error.Timeout,
+            5 => Error.Protocol,
+            6 => Error.TooLong,
+            7 => Error.Unavailable,
+            8 => Error.Os(try r.i32()),
+            n => fail DecodeError { message: "no such error as {n}" },
+        }
+        return Answered.Failed(e)
+    }
+    let status = u32.wrap(try r.varint())
+    let count = try r.count(65536)
+    var headers = List<Header>()
+    for _ in 0..count {
+        let name = String.from_utf8(try r.byte_array(65536)) ?? String()
+        let value = String.from_utf8(try r.byte_array(1048576)) ?? String()
+        headers.push(Header { name: name, value: value })
+    }
+    let body = try r.byte_array_in_left()
+    return Answered.Got(Response { status: status, headers: headers, body: body })
+}
+
+fn level_byte(level: Level) -> u8 {
+    return match level {
+        Level.Info => 0,
+        Level.Warn => 1,
+        Level.Error => 2,
+    }
+}
+
+// The packet's ID, the VarInt it starts with, or -1 if it doesn't start with one, as bytes that
+// go as they are needn't.
+fn packet_id(packet: List<u8>) -> i32 {
+    var value: i32 = 0
+    var shift: i32 = 0
+    for b in packet {
+        value |= (i32(b) & 0x7F) << shift
+        if (b & 0x80) == 0 {
+            return value
+        }
+        shift += 7
+        if shift >= 35 {
+            return -1
+        }
+    }
+    return -1
+}
+
+fn hex_id(id: i32) -> String {
+    if id < 0 {
+        return String("of raw bytes")
+    }
+    let digits = "0123456789abcdef"
+    let hi = usize.wrap(id / 16 % 16)
+    let lo = usize.wrap(id % 16)
+    return "0x{digits[hi..hi + 1]}{digits[lo..lo + 1]}"
+}
+
+// A check, as a difference describes it: what was sent or logged.
+fn check_text(record: Record) -> String {
+    if record.tag == SENT {
+        return "sent {sent_text(record.body)}"
+    }
+    return "logged \"{logged_text(record.body)}\""
+}
+
+// A sent record: the connection, and the packet's ID and length.
+fn sent_text(body: List<u8>) -> String {
+    var r = Reader.new(body.copy())
+    if let ok(conn) = r.varlong() {
+        if let ok(id) = r.varint() {
+            if let ok(len) = r.varint() {
+                return "connection {conn & 0xFFFFFF} packet {hex_id(id)} of {len} bytes"
+            }
+        }
+    }
+    return String("a damaged record")
+}
+
+// A logged record's message.
+fn logged_text(body: List<u8>) -> String {
+    var r = Reader.new(body.copy())
+    return match read_logged(mut r) {
+        ok(message) => message,
+        err(_) => String("a damaged record"),
+    }
+}
+
+fn read_logged(r: mut Reader) -> String ! DecodeError {
+    _ = try r.u8()
+    if try r.bool() {
+        _ = try r.byte_array_in_left()
+    }
+    return String.from_utf8(try r.byte_array_in_left()) ?? String()
+}

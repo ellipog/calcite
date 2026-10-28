@@ -10,6 +10,12 @@
 /// of the jar, and keeps it in cache/, with what it makes of it, which later starts read instead
 /// (D140). As with vanilla's `java -D...`, `-Dminecraft.api.env=staging` or
 /// `-Dminecraft.api.discovery.host=URL` on its command line picks the Mojang services it uses.
+///
+/// With `record-inputs=true` in calcite.properties, it records everything it's handed to a new
+/// input log in recordings/. `--replay FILE` starts it from the same folder, with what that log
+/// recorded where the network, the clock, Mojang's services and the system's random numbers would
+/// be, and checks it sends and logs what it did as it was recorded: it says what it found, and
+/// fails if it went another way (D21).
 module calcite
 
 import auth.services.{Environment, Services}
@@ -24,14 +30,15 @@ import resources.identifier.{Identifier}
 import server.boot.{Boot, cache_key, cache_path, load_boot, save_boot}
 import server.config.{CalciteConfig, default_text}
 import server.configuration.{CodeOfConduct, Configuration, ResourcePack, read_codes, resource_pack, server_links}
+import server.link.{Link}
 import server.log.{Entry, Level, log}
 import server.network.{LoginSettings, Network, StatusInfo}
-import server.play.{World}
+import server.play.{World, parse_seed, random_seed}
 import server.properties.{ServerProperties, load}
 import server.status.{ServerStatus, check_icon}
 import std.crypto.{RsaKey}
 import std.env.{args}
-import std.fs.{is_file, read, write}
+import std.fs.{append, is_file, make_dir_all, read, write}
 import std.net.{Net, Event, NetError}
 import std.thread.{Task}
 import std.time.{Instant, Timestamp}
@@ -45,6 +52,30 @@ impl Task for KeyMaker {
     fn run(own self) {
         var out = self.out
         out.send(RsaKey.generate(1024))
+    }
+}
+
+// Appends what the server's link records to the input log at `path`, on its own thread, so the
+// server never waits for the disk. A piece that can't be written ends the log there, which is
+// logged.
+struct Recorder {
+    path: String
+    pieces: Receiver<List<u8>>
+}
+
+impl Task for Recorder {
+    fn run(own self) {
+        let path = self.path
+        var pieces = self.pieces
+        while let piece = pieces.wait() {
+            match append(path, piece) {
+                ok => {},
+                err(_) => {
+                    log("Recorder", Level.Error, "Failed to record inputs to {path}")
+                    return
+                },
+            }
+        }
     }
 }
 
@@ -137,6 +168,67 @@ fn calcite_config() -> CalciteConfig? {
     return some(config)
 }
 
+// The input log the command line names with `--replay FILE`.
+fn replay_path(arguments: List<String>) -> String? {
+    for i in 1..arguments.len() {
+        if arguments[i - 1] == "--replay" {
+            return some(arguments[i].copy())
+        }
+    }
+    return none
+}
+
+// A link replaying the input log at `path`, which fails if it can't be read or isn't one.
+fn replay_link(path: String) -> Link ! String {
+    let bytes = match read(path) {
+        ok(b) => b,
+        err(_) => {
+            fail "can't read the input log {path}"
+        },
+    }
+    return match Link.replay(bytes) {
+        ok(link) => link,
+        err(message) => {
+            fail "can't replay {path}: {message}"
+        },
+    }
+}
+
+fn two(n: i32) -> String {
+    return if n < 10 { "0{n}" } else { "{n}" }
+}
+
+// A link recording what the server is handed to a new input log in recordings/, named for the
+// day as vanilla names its old logs, `2026-10-28-1.inputs` and on, which the `Recorder` thread
+// writes to. If the log can't be started, that's logged, and the server runs without one.
+fn record_link(net: Net, recorder: mut Sender<List<u8>>?) -> Link {
+    let now = unsafe { Timestamp.now() }
+    let t = now.date_time(unsafe { now.local_offset() })
+    let day = "{t.year}-{two(t.month)}-{two(t.day)}"
+    var n = 1
+    while is_file("recordings/{day}-{n}.inputs") {
+        n += 1
+    }
+    let path = "recordings/{day}-{n}.inputs"
+    var link = Link.record(net)
+    let started = match make_dir_all("recordings") {
+        ok => match write(path, link.take_log()) {
+            ok => true,
+            err(_) => false,
+        },
+        err(_) => false,
+    }
+    if not started {
+        log("main", Level.Warn, "Failed to record inputs to {path}")
+        return Link.live(net)
+    }
+    log("main", Level.Warn, "Recording every input to {path}, which holds what players send and the server's private key")
+    let pieces = Receiver<List<u8>>()
+    recorder = some(pieces.sender())
+    _ = unsafe { Thread.spawn(Recorder { path: path, pieces: pieces }) }
+    return link
+}
+
 // The value of the system property `name`, as Java's `-Dname=value` sets it: the last one given.
 fn system_property(arguments: List<String>, name: String) -> String? {
     let prefix = "-D{name}="
@@ -216,7 +308,7 @@ fn load_data() -> Boot? {
 // What configuration sends every player, from the data packs, the server's language, and its
 // world. Then the server's links and its code of conduct, which vanilla's `DedicatedServer`
 // reads as it's made, the resource pack it offers, from server.properties.
-fn load_configuration(props: ServerProperties, offer: own ResourcePack?, language: mut Language, world: mut World?) -> Configuration? {
+fn load_configuration(props: ServerProperties, seed: i64, offer: own ResourcePack?, language: mut Language, world: mut World?) -> Configuration? {
     let boot = load_data() else return none
     language = boot.language
     let registries = boot.registries
@@ -236,7 +328,7 @@ fn load_configuration(props: ServerProperties, offer: own ResourcePack?, languag
         }
     }
     let features: List<Identifier> = [Identifier { namespace: "minecraft", path: "vanilla" }]
-    match World.load(props, registries, boot.chat_types) {
+    match World.load(props, seed, registries, boot.chat_types) {
         ok(w) => world = some(w),
         err(message) => {
             log("main", Level.Error, "Failed to start the minecraft server: {message}")
@@ -257,7 +349,9 @@ fn seconds(ns: u64) -> String {
     return "{ms / 1000}.{pad}{frac}s"
 }
 
-fn main() {
+fn main() ! String {
+    let arguments = args()
+    let replaying = replay_path(arguments)
     var problem: Entry? = none
     let file = match load("server.properties", mut problem) {
         ok(p) => p,
@@ -280,32 +374,46 @@ fn main() {
     }
     let config = calcite_config() else return
 
+    // Everything from outside goes through the link (D21): the network's, or the input log's
+    // when replaying, with no network.
+    let start = unsafe { Instant.now() }
+    var net: Net? = none
+    var recorder: Sender<List<u8>>? = none
+    var made: Link? = none
+    if let path = replaying {
+        made = some(try replay_link(path))
+    } else {
+        let n = match Net.new() {
+            ok(n) => n,
+            err(e) => {
+                error("Failed to start the network: {bind_error(e)}")
+                return
+            },
+        }
+        made = some(if config.record_inputs { record_link(n, mut recorder) } else { Link.live(n) })
+        net = some(n)
+    }
+    var link = made else return
+    // Vanilla draws a random seed as it reads server.properties, if `level-seed` is empty.
+    let seed = parse_seed(props.level_seed) ?? random_seed(link.random(8))
+
     // Mojang's services are found as vanilla's `Main` finds them, before the server starts, and
     // the discovery document is fetched while it does.
-    let start = unsafe { Instant.now() }
-    let arguments = args()
     let environment = Environment.from_properties(system_property(arguments, "minecraft.api.env"), system_property(arguments, "minecraft.api.discovery.host"))
     log("main", Level.Info, "Environment: {environment.to_string()}")
     var services = Services.new(environment)
     var fetched = List<Entry>()
-    services.tick(0, mut fetched)
+    services.tick(0, mut fetched, mut link)
     for e in fetched {
         log(e.thread_or("main"), e.level, e.message)
     }
     var language = Language.empty()
     var loaded_world: World? = none
-    let configuration = load_configuration(props, pack, mut language, mut loaded_world) else return
+    let configuration = load_configuration(props, seed, pack, mut language, mut loaded_world) else return
     let world = loaded_world else return
 
     info("Starting minecraft server version {game_version()}")
     info("Loading properties")
-    let net = match Net.new() {
-        ok(n) => n,
-        err(e) => {
-            error("Failed to start the network: {bind_error(e)}")
-            return
-        },
-    }
     let settings = LoginSettings {
         online_mode: props.online_mode,
         accepts_transfers: props.accepts_transfers,
@@ -315,11 +423,13 @@ fn main() {
         velocity_secret: if config.velocity_forwarding { some(config.velocity_secret.copy()) } else { none },
     }
     // Vanilla makes the key pair here, before it listens. Calcite starts making it, and lets the
-    // first online login wait for it.
+    // first online login wait for it. A replay has the recording's.
     info("Generating keypair")
     let keys = Receiver<RsaKey>()
-    _ = unsafe { Thread.spawn(KeyMaker { out: keys.sender() }) }
-    var network = Network.new(net, status_info(props, none), settings, language, services, keys, configuration, world)
+    if replaying == none {
+        _ = unsafe { Thread.spawn(KeyMaker { out: keys.sender() }) }
+    }
+    var network = Network.new(link, status_info(props, none), settings, language, services, keys, configuration, world)
     let host = if props.server_ip.is_empty() { String("*") } else { props.server_ip.copy() }
     info("Starting Minecraft server on {host}:{props.server_port}")
     let port = u16.try_from(props.server_port) ?? 0
@@ -352,7 +462,26 @@ fn main() {
         network.set_status(status_info(props, icon))
     }
 
-    run(net, mut network, start)
+    if let path = replaying {
+        try replay(mut network, path)
+        return
+    }
+    run(net!, mut network, start, mut recorder)
+}
+
+// Replays the rest of the input log at `path`, logging what the server logs, then what the replay
+// found. A replay that went another way than the recording fails, with where it first did.
+fn replay(network: mut Network, path: String) ! String {
+    while network.replay_step() {
+        for e in network.take_logs() {
+            log(e.thread_or("Server thread"), e.level, e.message)
+        }
+    }
+    let report = network.report()
+    if not report.same() {
+        fail "the replay of {path} went another way: {report.to_string()}"
+    }
+    info("Replayed {path}: {report.to_string()}")
 }
 
 // 50 ms, the length of a tick at 20 ticks a second.
@@ -360,8 +489,9 @@ const TICK_NS: u64 = 50000000
 
 // The server's ticks, 20 a second, with the network's events handled as they come between them,
 // as vanilla's `runServer` runs them. A server more than 2 seconds behind warns, at most once in
-// 15 seconds, and skips the ticks it missed.
-fn run(net: Net, network: mut Network, start: Instant) {
+// 15 seconds, and skips the ticks it missed. What the link records goes to `recorder`, after each
+// turn of the loop.
+fn run(net: Net, network: mut Network, start: Instant, recorder: mut Sender<List<u8>>?) {
     var events = List<Event>()
     var next = unsafe { Instant.now() }.nanos_since(start) + TICK_NS
     var last_warning: u64 = 0
@@ -388,6 +518,11 @@ fn run(net: Net, network: mut Network, start: Instant) {
         }
         for e in network.take_logs() {
             log(e.thread_or("Server thread"), e.level, e.message)
+        }
+        if let to = recorder.take() {
+            var out = to
+            out.send(network.take_log())
+            recorder = some(out)
         }
     }
 }

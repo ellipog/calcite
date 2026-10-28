@@ -29,12 +29,13 @@ import resources.identifier.{Identifier}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunks.{ChunkSender, in_view, in_view_all}
 import server.configuration.{Configuration}
+import server.link.{Input, Link, Report}
 import server.log.{Entry}
 import server.sending.{Outbox, Sending}
 import server.status.{ServerStatus}
 import server.play.{World, display_name}
-import std.crypto.{RsaKey, RsaPublicKey, random_bytes}
-import std.net.{Net, Conn, Event, NetError, Address, Ip}
+import std.crypto.{RsaKey, RsaPublicKey}
+import std.net.{Conn, Event, NetError, Address, Ip}
 import std.time.{Timestamp}
 import world.flat.{SURFACE_Y}
 import world.item.{ItemStack}
@@ -160,7 +161,9 @@ struct Connection {
     last_read: u64
     // Whether the server has closed it, and waits for its `Closed` event.
     closing: bool
-    // The address as vanilla logs it, such as `/127.0.0.1:50412`, or `IP hidden`.
+    // The address the connection is from, and as vanilla logs it, such as `/127.0.0.1:50412`,
+    // or `IP hidden`.
+    peer: Address?
     address: String
     login: LoginState
     login_ticks: i32
@@ -242,9 +245,9 @@ struct Check {
 }
 
 /// Every connection the server accepted, on a `Net` that may hold other connections too, such
-/// as a test's client.
+/// as a test's client, through a link that may record what comes in or replay it.
 pub struct Network {
-    net: Net
+    link: Link
     connections: List<Connection?>
     status: StatusInfo
     settings: LoginSettings
@@ -287,12 +290,12 @@ pub fn key_ready(key: own RsaKey) -> Receiver<RsaKey> {
 }
 
 impl Network {
-    /// The network, which authenticates players with `services` in online mode, with the key pair
-    /// that comes on `keys` as the server's, configures them with `configuration` and lets them
-    /// into `world`. Only an online login needs the key pair, so the first waits for it, and the
-    /// server can listen while another thread makes it.
-    pub fn new(net: Net, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, keys: own Receiver<RsaKey>, configuration: own Configuration, world: own World) -> Network {
-        var network = Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>(), sending: Sending.new(net), to_flush: List<Conn>() }
+    /// The network on `link`, which authenticates players with `services` in online mode, with
+    /// the key pair that comes on `keys` as the server's, configures them with `configuration`
+    /// and lets them into `world`. Only an online login needs the key pair, so the first waits
+    /// for it, and the server can listen while another thread makes it.
+    pub fn new(link: own Link, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, keys: own Receiver<RsaKey>, configuration: own Configuration, world: own World) -> Network {
+        var network = Network { link: link, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>(), sending: Sending.new(), to_flush: List<Conn>() }
         network.rebuild_status()
         return network
     }
@@ -300,13 +303,14 @@ impl Network {
     /// Sets the wall clock's time, which the caller reads before it hands over what happened, as
     /// vanilla reads `Instant.now()` as it handles each message.
     pub fn set_clock(mut self, now: Timestamp) {
+        self.link.clock(now)
         self.clock = now
     }
 
     /// Listens on `host` and `port`, as vanilla's `startTcpServerListener`. An empty host is
     /// every address.
     pub fn listen(self, host: String, port: u16) -> u16 ! NetError {
-        return try self.net.listen(host, port)
+        return try self.link.listen(host, port)
     }
 
     /// Replaces what the server list shows, as vanilla rebuilds it every 5 seconds.
@@ -326,6 +330,7 @@ impl Network {
     pub fn take_logs(mut self) -> List<Entry> {
         var out = List<Entry>()
         for e in self.logs {
+            self.link.logged(e)
             out.push(Entry { level: e.level, message: e.message.copy(), thread: e.thread.copy() })
         }
         self.logs.clear()
@@ -335,6 +340,44 @@ impl Network {
     /// The public keys of Mojang's services, once they've been fetched.
     pub fn service_keys(self) -> KeySet? {
         return self.services.key_set()
+    }
+
+    /// What the link recorded since this was last called, which is the input log when the pieces
+    /// are joined: nothing unless the link records.
+    pub fn take_log(mut self) -> List<u8> {
+        return self.link.take_log()
+    }
+
+    /// Hands the server the next input of the log its link replays, as the server's loop handed
+    /// it over as it ran (D21). False once the log has run out, or the server has gone another
+    /// way than it did as it was recorded, which `report` says. The caller takes the logs as the
+    /// loop did, which checks them.
+    pub fn replay_step(mut self) -> bool {
+        let input = self.link.next_input() else {
+            self.link.finish()
+            return false
+        }
+        match input {
+            Input.Event(e, now) => _ = self.handle(e, now),
+            Input.Tick(now) => self.tick(now),
+            Input.Sweep(now) => self.sweep(now),
+            Input.Clock(t) => self.set_clock(t),
+        }
+        return true
+    }
+
+    /// Replays the rest of the log, taking the logs after each input, and says what it found.
+    pub fn replay_all(mut self) -> Report {
+        while self.replay_step() {
+            _ = self.take_logs()
+        }
+        return self.report()
+    }
+
+    /// What the replay found: whether the server sent and logged what it did as it was
+    /// recorded, and where it first didn't.
+    pub fn report(self) -> Report {
+        return self.link.report()
     }
 
     /// How many connections are open.
@@ -355,18 +398,21 @@ impl Network {
     pub fn handle(mut self, e: Event, now: u64) -> bool {
         match e {
             Event.Accepted(c) => {
+                self.link.accepted(c, now)
                 let slot = c.slot()
                 while self.connections.len() <= slot {
                     self.connections.push(none)
                 }
-                let address = if self.settings.log_ips { java_address(self.net.peer(c)) } else { String("IP hidden") }
-                self.connections[slot] = some(Connection { conn: c, codec: Decoder.new(), out: Outbox.new(), listed: false, phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false, address: address, login: LoginState.Hello, login_ticks: 0, transferred: false, challenge: List<u8>(), query_id: 0, name: none, profile: none, reason: none, tasks: List<Task>(), task: none, information: ClientInformation.default(), keep_alive_time: 0, keep_alive_pending: false, latency: 0, outbound: State.Login, player: Player() })
+                let peer = self.link.peer(c)
+                let address = if self.settings.log_ips { java_address(peer) } else { String("IP hidden") }
+                self.connections[slot] = some(Connection { conn: c, codec: Decoder.new(), out: Outbox.new(), listed: false, phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false, peer: peer, address: address, login: LoginState.Hello, login_ticks: 0, transferred: false, challenge: List<u8>(), query_id: 0, name: none, profile: none, reason: none, tasks: List<Task>(), task: none, information: ClientInformation.default(), keep_alive_time: 0, keep_alive_pending: false, latency: 0, outbound: State.Login, player: Player() })
                 return true
             },
             Event.Received(c) => {
                 if not self.owns(c) {
                     return false
                 }
+                self.link.received(c, now)
                 self.receive(c, now)
                 self.flush()
                 return true
@@ -375,6 +421,7 @@ impl Network {
                 if not self.owns(c) {
                     return false
                 }
+                self.link.closed(c, now)
                 let con = self.connections[c.slot()].take() else return true
                 self.lost(con)
                 self.flush()
@@ -396,7 +443,8 @@ impl Network {
     /// are done have been acted on; then each player is sent the chunks that are due. Mojang's
     /// services are fetched from as they're due.
     pub fn tick(mut self, now: u64) {
-        self.services.tick(now, mut self.logs)
+        self.link.tick(now)
+        self.services.tick(now, mut self.logs, mut self.link)
         // The status is rebuilt every 5 seconds, as `tickServer` rebuilds it.
         if now >= self.status_due {
             self.status_due = now + STATUS_EXPIRE_NS
@@ -435,6 +483,7 @@ impl Network {
 
     /// Closes each connection that has sent nothing for 30 seconds, as of `now`.
     pub fn sweep(mut self, now: u64) {
+        self.link.sweep(now)
         for i in 0..self.connections.len() {
             var stale = false
             if let c = self.connections[i] {
@@ -499,8 +548,7 @@ impl Network {
         var con = self.connections[slot].take() else return
         if con.closing {
             // What arrives after the server closed the connection is dropped.
-            var dropped = List<u8>()
-            _ = self.net.read(c, mut dropped)
+            self.link.discard(c)
         } else if not self.serve(mut con, now) {
             self.close(mut con)
         }
@@ -509,7 +557,7 @@ impl Network {
 
     // Reads what arrived on the connection and answers it. False when it's to close.
     fn serve(mut self, con: mut Connection, now: u64) -> bool {
-        _ = con.codec.read_from(self.net, con.conn)
+        con.codec.push(self.link.read(con.conn))
         con.last_read = now
         if not con.started {
             con.started = true
@@ -517,6 +565,7 @@ impl Network {
                 let kind = classify(con.codec.peek())
                 if kind != Legacy.Modern {
                     let answer = response(kind, game_version(), self.status.motd, self.status.status.online, self.status.status.max_players)
+                    self.link.sent(con.conn, answer)
                     con.out.raw(answer)
                     self.list(mut con)
                     return false
@@ -642,7 +691,7 @@ impl Network {
         }
         con.phase = Phase.Login
         con.transferred = transferred
-        con.challenge = random_bytes(4)
+        con.challenge = self.link.random(4)
         return true
     }
 
@@ -694,7 +743,7 @@ impl Network {
         con.name = some(p.name.copy())
         if self.settings.velocity_secret != none {
             // Behind Velocity, the proxy has authenticated the player, and is asked who they are.
-            let id = random_bytes(4)
+            let id = self.link.random(4)
             con.query_id = (i32(id[0]) << 24) | (i32(id[1]) << 16) | (i32(id[2]) << 8) | i32(id[3])
             con.login = LoginState.Forwarding
             let query = ClientboundCustomQuery { transaction_id: con.query_id, channel: Identifier.parse(channel())!, payload: request() }
@@ -743,7 +792,7 @@ impl Network {
         con.out.start_encryption(secret)
         self.authenticators += 1
         let name = con.name.copy() ?? String()
-        let ip = if self.settings.prevent_proxy_connections { host_address(self.net.peer(con.conn)) } else { none }
+        let ip = if self.settings.prevent_proxy_connections { host_address(con.peer) } else { none }
         let join = JoinCheck.new(name, hash, ip)
         self.checks.push(Check { conn: con.conn, thread: "User Authenticator #{self.authenticators}", user: user(con), name: name, join: join })
         return true
@@ -757,7 +806,7 @@ impl Network {
             ok(f) => {
                 if self.settings.log_ips {
                     var port: u16 = 0
-                    if let peer = self.net.peer(con.conn) {
+                    if let peer = con.peer {
                         port = peer.port
                     }
                     con.address = socket_text(f.address, port)
@@ -780,7 +829,7 @@ impl Network {
         if self.key != none {
             return
         }
-        let key = self.coming.wait() else panic("the server's key pair never came")
+        let key = self.link.key(mut self.coming) else panic("the server's key pair never came")
         self.public_key = key.public_der()
         self.key = some(key)
     }
@@ -811,7 +860,7 @@ impl Network {
         while i < self.checks.len() {
             var check = self.checks.remove(i)
             var lines = List<Entry>()
-            let result = self.services.poll(mut check.join, mut lines)
+            let result = self.services.poll(mut check.join, mut lines, mut self.link)
             for e in lines {
                 self.logs.push(Entry { level: e.level, message: e.message.copy(), thread: some(check.thread.copy()) })
             }
@@ -1754,7 +1803,7 @@ impl Network {
         if let s = self.session {
             return s
         }
-        let s = Uuid.random()
+        let s = Uuid.version4(self.link.random(16))
         self.session = some(s)
         return s
     }
@@ -1846,6 +1895,7 @@ impl Network {
     // Queues a packet's ID and fields, which go through the connection's compression and
     // encryption at the next flush.
     fn send_bytes(mut self, con: mut Connection, packet: own List<u8>) {
+        self.link.sent(con.conn, packet)
         con.out.packet(packet)
         self.list(mut con)
     }
@@ -1868,7 +1918,7 @@ impl Network {
             }
             var con = self.connections[c.slot()].take() else continue
             con.listed = false
-            self.sending.dispatch(c, mut con.out, mut problems)
+            self.sending.dispatch(c, mut con.out, mut problems, self.link)
             self.connections[c.slot()] = some(con)
         }
         self.failed(problems)
@@ -1885,7 +1935,7 @@ impl Network {
                 continue
             }
             var con = self.connections[c.slot()].take() else continue
-            self.sending.arrived(e, mut con.out, mut problems)
+            self.sending.arrived(e, mut con.out, mut problems, self.link)
             self.connections[c.slot()] = some(con)
         }
         self.failed(problems)
