@@ -14,7 +14,7 @@ import chat.component.{ClickEvent, Component}
 import chat.language.{Language}
 import java.uuid.{Uuid}
 import protocol.chat.{ChatSession, ChatTypeBound, ClientboundPlayerChat, FilterMask, MessageSignature, PackedSignature, ServerboundChat, ServerboundChatCommandSigned, SignedBody}
-import protocol.codec.{Codec}
+import protocol.codec.{Decoder}
 import protocol.common.{ChatVisibility, ClientInformation, ClientboundDisconnect, ClientboundKeepAlive, ClientboundPostEffects, ClientboundResourcePackPush, ResourcePackAction, ServerboundKeepAlive}
 import protocol.configuration.{ClientboundCodeOfConduct, ClientboundFinishConfiguration, ConfigurationIn}
 import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
@@ -30,6 +30,7 @@ import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, Message
 import server.chunks.{ChunkSender, in_view, in_view_all}
 import server.configuration.{Configuration}
 import server.log.{Entry}
+import server.sending.{Outbox, Sending}
 import server.status.{ServerStatus}
 import server.play.{World, display_name}
 import std.crypto.{RsaKey, RsaPublicKey, random_bytes}
@@ -147,7 +148,10 @@ enum LoginState {
 
 struct Connection {
     conn: Conn
-    codec: Codec
+    codec: Decoder
+    // What it's to send, and whether it's on the list of connections to flush.
+    out: Outbox
+    listed: bool
     phase: Phase
     // Whether anything has arrived yet, since only the first read can be an old ping.
     started: bool
@@ -269,6 +273,9 @@ pub struct Network {
     // The wall clock's time, which players' messages are stamped with.
     clock: Timestamp
     logs: List<Entry>
+    // The codec threads, and the connections with something to send since the last flush.
+    sending: Sending
+    to_flush: List<Conn>
 }
 
 /// A queue that already holds `key`, for a network whose key pair is made before it starts.
@@ -285,7 +292,7 @@ impl Network {
     /// into `world`. Only an online login needs the key pair, so the first waits for it, and the
     /// server can listen while another thread makes it.
     pub fn new(net: Net, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, keys: own Receiver<RsaKey>, configuration: own Configuration, world: own World) -> Network {
-        var network = Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>() }
+        var network = Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>(), sending: Sending.new(net), to_flush: List<Conn>() }
         network.rebuild_status()
         return network
     }
@@ -342,7 +349,9 @@ impl Network {
     }
 
     /// Handles one event from the `Net`'s poll, at `now` nanoseconds on the caller's clock, and
-    /// says whether it was the server's: an event about any other connection is left alone.
+    /// says whether it was the server's: an event about any other connection is left alone, and
+    /// `Woken` is everyone's, since anything with a waker may have woken the poll. What the
+    /// server sends because of it is flushed.
     pub fn handle(mut self, e: Event, now: u64) -> bool {
         match e {
             Event.Accepted(c) => {
@@ -351,7 +360,7 @@ impl Network {
                     self.connections.push(none)
                 }
                 let address = if self.settings.log_ips { java_address(self.net.peer(c)) } else { String("IP hidden") }
-                self.connections[slot] = some(Connection { conn: c, codec: Codec.new(), phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false, address: address, login: LoginState.Hello, login_ticks: 0, transferred: false, challenge: List<u8>(), query_id: 0, name: none, profile: none, reason: none, tasks: List<Task>(), task: none, information: ClientInformation.default(), keep_alive_time: 0, keep_alive_pending: false, latency: 0, outbound: State.Login, player: Player() })
+                self.connections[slot] = some(Connection { conn: c, codec: Decoder.new(), out: Outbox.new(), listed: false, phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false, address: address, login: LoginState.Hello, login_ticks: 0, transferred: false, challenge: List<u8>(), query_id: 0, name: none, profile: none, reason: none, tasks: List<Task>(), task: none, information: ClientInformation.default(), keep_alive_time: 0, keep_alive_pending: false, latency: 0, outbound: State.Login, player: Player() })
                 return true
             },
             Event.Received(c) => {
@@ -359,18 +368,24 @@ impl Network {
                     return false
                 }
                 self.receive(c, now)
+                self.flush()
                 return true
             },
             Event.Closed(c) => {
                 if not self.owns(c) {
                     return false
                 }
-                self.connections.push(none)
-                let con = self.connections.swap_remove(c.slot()) else return true
+                let con = self.connections[c.slot()].take() else return true
                 self.lost(con)
+                self.flush()
                 return true
             },
             Event.Connected(_) => return false,
+            Event.Woken => {
+                self.sent()
+                self.flush()
+                return false
+            },
         }
     }
 
@@ -396,8 +411,7 @@ impl Network {
         self.world.game_time += 1
         for i in 0..self.connections.len() {
             let phase = self.ticking(i) else continue
-            self.connections.push(none)
-            var con = self.connections.swap_remove(i) else continue
+            var con = self.connections[i].take() else continue
             match phase {
                 Phase.Login => self.tick_login(mut con),
                 Phase.Configuration => self.tick_configuration(mut con, now),
@@ -409,14 +423,14 @@ impl Network {
             if not self.playing(i) {
                 continue
             }
-            self.connections.push(none)
-            var con = self.connections.swap_remove(i) else continue
+            var con = self.connections[i].take() else continue
             self.send_chunks(mut con)
             self.connections[i] = some(con)
         }
         if self.open() == 0 {
             self.session = none
         }
+        self.flush()
     }
 
     /// Closes each connection that has sent nothing for 30 seconds, as of `now`.
@@ -427,13 +441,13 @@ impl Network {
                 stale = not c.closing and now > c.last_read and now - c.last_read >= READ_TIMEOUT_NS
             }
             if stale {
-                self.connections.push(none)
-                var con = self.connections.swap_remove(i) else continue
+                var con = self.connections[i].take() else continue
                 con.reason = some(Component.translatable("disconnect.timeout", []))
                 self.close(mut con)
                 self.connections[i] = some(con)
             }
         }
+        self.flush()
     }
 
     fn owns(self, c: Conn) -> bool {
@@ -466,22 +480,23 @@ impl Network {
         return false
     }
 
-    // Closes the connection, once: one closed while it was handled, such as a sender with too
-    // many messages unseen, is closed already when its handler returns.
-    fn close(self, con: mut Connection) {
+    // Closes the connection, once, after what it was sent before: one closed while it was
+    // handled, such as a sender with too many messages unseen, is closed already when its handler
+    // returns. What arrives from then on is dropped.
+    fn close(mut self, con: mut Connection) {
         if con.closing {
             return
         }
         con.closing = true
-        self.net.close(con.conn)
+        con.out.end()
+        self.list(mut con)
     }
 
     fn receive(mut self, c: Conn, now: u64) {
         let slot = c.slot()
         // Takes the connection out, leaving `none` in its slot, so the rest of `self` can be
         // used while it changes.
-        self.connections.push(none)
-        var con = self.connections.swap_remove(slot) else return
+        var con = self.connections[slot].take() else return
         if con.closing {
             // What arrives after the server closed the connection is dropped.
             var dropped = List<u8>()
@@ -502,7 +517,8 @@ impl Network {
                 let kind = classify(con.codec.peek())
                 if kind != Legacy.Modern {
                     let answer = response(kind, game_version(), self.status.motd, self.status.status.online, self.status.status.max_players)
-                    self.net.write(con.conn, answer)
+                    con.out.raw(answer)
+                    self.list(mut con)
                     return false
                 }
             }
@@ -724,6 +740,7 @@ impl Network {
         let hash = server_hash(secret, self.public_key)
         con.login = LoginState.Authenticating
         con.codec.start_encryption(secret)
+        con.out.start_encryption(secret)
         self.authenticators += 1
         let name = con.name.copy() ?? String()
         let ip = if self.settings.prevent_proxy_connections { host_address(self.net.peer(con.conn)) } else { none }
@@ -814,8 +831,7 @@ impl Network {
         let slot = check.conn.slot()
         var taken: Connection? = none
         if self.owns(check.conn) {
-            self.connections.push(none)
-            taken = self.connections.swap_remove(slot)
+            taken = self.connections[slot].take()
         }
         match joined {
             Joined.Yes(profile) => {
@@ -878,6 +894,7 @@ impl Network {
         if threshold >= 0 {
             self.send(mut con, ClientboundLoginCompression { threshold: threshold }, State.Login)
             con.codec.start_compression(threshold)
+            con.out.start_compression(threshold)
         }
         con.login = LoginState.ProtocolSwitching
         let session = self.session_id()
@@ -1590,8 +1607,7 @@ impl Network {
             if not self.playing(i) {
                 continue
             }
-            self.connections.push(none)
-            var other = self.connections.swap_remove(i) else continue
+            var other = self.connections[i].take() else continue
             self.player_chat(mut other, message, chat)
             self.connections[i] = some(other)
         }
@@ -1711,8 +1727,7 @@ impl Network {
             if not self.playing(i) {
                 continue
             }
-            self.connections.push(none)
-            var other = self.connections.swap_remove(i) else continue
+            var other = self.connections[i].take() else continue
             self.send_bytes(mut other, packet.copy())
             self.connections[i] = some(other)
         }
@@ -1727,8 +1742,7 @@ impl Network {
             if not self.playing(i) {
                 continue
             }
-            self.connections.push(none)
-            var other = self.connections.swap_remove(i) else continue
+            var other = self.connections[i].take() else continue
             if other.information.chat_visibility != ChatVisibility.Hidden {
                 self.send_bytes(mut other, packet.copy())
             }
@@ -1829,11 +1843,58 @@ impl Network {
         self.send_bytes(mut con, w.into_bytes())
     }
 
-    // Sends a packet's ID and fields, through the connection's compression and encryption.
+    // Queues a packet's ID and fields, which go through the connection's compression and
+    // encryption at the next flush.
     fn send_bytes(mut self, con: mut Connection, packet: own List<u8>) {
-        match con.codec.encode(packet) {
-            ok(bytes) => self.net.write(con.conn, bytes),
-            err(message) => self.logs.push(Entry.error("Failed to send packet: {message}")),
+        con.out.packet(packet)
+        self.list(mut con)
+    }
+
+    // Puts the connection on the list to flush.
+    fn list(mut self, con: mut Connection) {
+        if not con.listed {
+            con.listed = true
+            self.to_flush.push(con.conn)
+        }
+    }
+
+    // Sends what each connection queued since the last flush, as vanilla flushes once a tick
+    // ends and after each packet it handles between ticks.
+    fn flush(mut self) {
+        var problems = List<String>()
+        while let c = self.to_flush.pop() {
+            if not self.owns(c) {
+                continue
+            }
+            var con = self.connections[c.slot()].take() else continue
+            con.listed = false
+            self.sending.dispatch(c, mut con.out, mut problems)
+            self.connections[c.slot()] = some(con)
+        }
+        self.failed(problems)
+    }
+
+    // Sends what the codec threads have encoded, and what each of those connections queued
+    // meanwhile. What came back for a connection that's gone is dropped.
+    fn sent(mut self) {
+        var problems = List<String>()
+        var back = self.sending.take_done()
+        while let e = back.pop() {
+            let c = e.conn
+            if not self.owns(c) {
+                continue
+            }
+            var con = self.connections[c.slot()].take() else continue
+            self.sending.arrived(e, mut con.out, mut problems)
+            self.connections[c.slot()] = some(con)
+        }
+        self.failed(problems)
+    }
+
+    // Logs why packets couldn't be sent.
+    fn failed(mut self, problems: List<String>) {
+        for p in problems {
+            self.logs.push(Entry.error("Failed to send packet: {p}"))
         }
     }
 }

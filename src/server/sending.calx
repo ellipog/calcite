@@ -1,0 +1,259 @@
+/// What the server sends each connection, and the codec threads that encode most of it, off the
+/// tick thread (D33, D143).
+///
+/// A connection's packets are queued in order as the server handles what arrives and ticks,
+/// with where its compression and encryption start among them. A flush encodes what each
+/// connection queued: compressed, framed and encrypted, as vanilla's encoders do it. The server
+/// flushes once a tick ends and after each thing it handles between ticks, as vanilla does, so a
+/// tick's packets go to the system in one send a connection.
+///
+/// A flush of a few small packets encodes them on the tick thread, where that costs less than
+/// handing them over. More go to a codec thread with the connection's encoder, and the bytes and
+/// the encoder come back on a queue, waking the poll. Only one batch of a connection is away at a
+/// time, so its bytes keep their order, and what it queues meanwhile goes once the encoder is
+/// back. The codec threads start as batches need them, up to one fewer than the processors.
+module server.sending
+
+import protocol.codec.{Encoder}
+import protocol.wire.{Writer}
+import std.net.{Conn, Net, Waker}
+import std.pool.{workers}
+import std.thread.{Task}
+
+/// The most bytes of packets a flush encodes on the tick thread. Encrypting takes about 7 ns a
+/// byte and compressing more, while handing a batch to a codec thread costs a few microseconds.
+pub const INLINE_BYTES: usize = 1024
+
+/// One thing a connection sends, in order.
+enum Step {
+    /// A packet, its ID then its fields.
+    Packet(List<u8>)
+    /// Bytes that go as they are, such as the answer to the old ping, which isn't framed.
+    Raw(List<u8>)
+    /// Compression from here on, with this threshold, or none if it's negative.
+    Compress(i32)
+    /// Encryption from here on, with this secret.
+    Encrypt(List<u8>)
+}
+
+/// What a connection has queued to send.
+pub struct Outbox {
+    // The connection's encoder, or `none` while it's away on a codec thread.
+    encoder: Encoder?
+    steps: Deque<Step>
+    // How many bytes of packets the steps hold.
+    bytes: usize
+    // Whether the connection is to close once everything is sent, and whether it has.
+    ending: bool
+    ended: bool
+}
+
+impl Outbox {
+    /// An empty outbox, with neither compression nor encryption, as a connection starts.
+    pub fn new() -> Outbox {
+        return Outbox { encoder: some(Encoder.new()), steps: Deque<Step>(), bytes: 0, ending: false, ended: false }
+    }
+
+    /// Queues a packet, its ID then its fields.
+    pub fn packet(mut self, body: own List<u8>) {
+        self.bytes += body.len()
+        self.steps.push_last(Step.Packet(body))
+    }
+
+    /// Queues bytes that go as they are.
+    pub fn raw(mut self, bytes: own List<u8>) {
+        self.bytes += bytes.len()
+        self.steps.push_last(Step.Raw(bytes))
+    }
+
+    /// Compresses the packets queued after this with `threshold`, or none if it's negative.
+    pub fn start_compression(mut self, threshold: i32) {
+        self.steps.push_last(Step.Compress(threshold))
+    }
+
+    /// Encrypts what's queued after this, with `secret` as the key and the IV.
+    pub fn start_encryption(mut self, secret: List<u8>) {
+        self.steps.push_last(Step.Encrypt(secret.copy()))
+    }
+
+    /// Closes the connection once everything queued is sent.
+    pub fn end(mut self) {
+        self.ending = true
+    }
+}
+
+// A connection's steps and its encoder, on their way to a codec thread.
+struct Batch {
+    conn: Conn
+    encoder: Encoder
+    steps: Deque<Step>
+}
+
+/// A batch a codec thread encoded: its connection's encoder, the bytes to send, and why any
+/// packet couldn't be.
+pub struct Encoded {
+    pub conn: Conn
+    encoder: Encoder
+    bytes: List<u8>
+    problems: List<String>
+}
+
+// A codec thread: it encodes each batch that comes, sends it back, and wakes the poll.
+struct CodecThread {
+    jobs: Receiver<Batch>
+    done: Sender<Encoded>
+    waker: Waker
+}
+
+impl Task for CodecThread {
+    fn run(own self) {
+        var jobs = self.jobs
+        var done = self.done
+        while let b = jobs.wait() {
+            var encoder = b.encoder
+            var steps = b.steps
+            var problems = List<String>()
+            let bytes = encode(mut encoder, mut steps, mut problems)
+            done.send(Encoded { conn: b.conn, encoder: encoder, bytes: bytes, problems: problems })
+            self.waker.wake()
+        }
+    }
+}
+
+// The steps, taken in order, as the bytes to send through `encoder`. A packet that can't be
+// sent, such as one too big, is left out, with why in `problems`.
+fn encode(encoder: mut Encoder, steps: mut Deque<Step>, problems: mut List<String>) -> List<u8> {
+    var w = Writer.new()
+    while let s = steps.pop_first() {
+        match s {
+            Step.Packet(body) => {
+                match encoder.encode(body) {
+                    ok(bytes) => w.raw(bytes),
+                    err(message) => problems.push(message),
+                }
+            },
+            Step.Raw(bytes) => w.raw(bytes),
+            Step.Compress(threshold) => encoder.start_compression(threshold),
+            Step.Encrypt(secret) => encoder.start_encryption(secret),
+        }
+    }
+    return w.into_bytes()
+}
+
+/// The codec threads, and the queues to and from them.
+pub struct Sending {
+    net: Net
+    // What wakes the poll once a batch is back, made with the first batch handed over. Without
+    // one, everything is encoded on the tick thread.
+    waker: Waker?
+    no_waker: bool
+    // The batches waiting for a codec thread, which each takes from, and those coming back.
+    jobs: Receiver<Batch>
+    to_jobs: Sender<Batch>
+    done: Receiver<Encoded>
+    to_done: Sender<Encoded>
+    // How many codec threads have started, how many may, and how many batches are away.
+    started: usize
+    most: usize
+    batches_away: usize
+}
+
+impl Sending {
+    /// Sending on `net`, with no codec thread started yet.
+    pub fn new(net: Net) -> Sending {
+        let jobs = Receiver<Batch>()
+        let to_jobs = jobs.sender()
+        let done = Receiver<Encoded>()
+        let to_done = done.sender()
+        // The tick thread is busy itself, so the codec threads leave it a processor.
+        let processors = unsafe { workers() }
+        let most = if processors > 2 { processors - 1 } else { 1 }
+        return Sending { net: net, waker: none, no_waker: false, jobs: jobs, to_jobs: to_jobs, done: done, to_done: to_done, started: 0, most: most, batches_away: 0 }
+    }
+
+    /// Encodes what `out` queued for `conn`: here if it's at most `INLINE_BYTES` of packets, and
+    /// on a codec thread otherwise. If a codec thread has the connection's encoder already, it
+    /// waits for it. Once everything is sent, a connection that's ending is closed. Why any
+    /// packet couldn't be sent goes in `problems`.
+    pub fn dispatch(mut self, conn: Conn, out: mut Outbox, problems: mut List<String>) {
+        if out.encoder == none {
+            return
+        }
+        if not out.steps.is_empty() {
+            if out.bytes > INLINE_BYTES and self.can_hand_over() {
+                var steps = Deque<Step>()
+                while let s = out.steps.pop_first() {
+                    steps.push_last(s)
+                }
+                let encoder = out.encoder.take()!
+                out.bytes = 0
+                self.to_jobs.send(Batch { conn: conn, encoder: encoder, steps: steps })
+                self.batches_away += 1
+                return
+            }
+            var encoder = out.encoder.take()!
+            let bytes = encode(mut encoder, mut out.steps, mut problems)
+            out.encoder = some(encoder)
+            out.bytes = 0
+            self.net.write(conn, bytes)
+        }
+        if out.ending and not out.ended {
+            out.ended = true
+            self.net.close(conn)
+        }
+    }
+
+    /// How many codec threads have started.
+    pub fn threads(self) -> usize {
+        return self.started
+    }
+
+    /// How many batches are on codec threads, or waiting for one.
+    pub fn away(self) -> usize {
+        return self.batches_away
+    }
+
+    /// The batches that have come back from the codec threads.
+    pub fn take_done(mut self) -> List<Encoded> {
+        var back = List<Encoded>()
+        while let e = self.done.next() {
+            self.batches_away -= 1
+            back.push(e)
+        }
+        return back
+    }
+
+    /// Sends what a batch came back with, gives its connection's encoder back to `out`, and then
+    /// dispatches what the connection queued meanwhile.
+    pub fn arrived(mut self, e: own Encoded, out: mut Outbox, problems: mut List<String>) {
+        let conn = e.conn
+        self.net.write(conn, e.bytes)
+        for p in e.problems {
+            problems.push(p.copy())
+        }
+        out.encoder = some(e.encoder)
+        self.dispatch(conn, mut out, mut problems)
+    }
+
+    // Whether a batch can go to a codec thread, starting one if every one started has a batch.
+    fn can_hand_over(mut self) -> bool {
+        if self.no_waker {
+            return false
+        }
+        if self.waker == none {
+            match self.net.waker() {
+                ok(w) => self.waker = some(w),
+                err(_) => {
+                    self.no_waker = true
+                    return false
+                },
+            }
+        }
+        if self.batches_away >= self.started and self.started < self.most {
+            let waker = self.waker!
+            _ = unsafe { Thread.spawn(CodecThread { jobs: self.jobs.share(), done: self.to_done.share(), waker: waker }) }
+            self.started += 1
+        }
+        return true
+    }
+}

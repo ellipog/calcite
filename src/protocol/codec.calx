@@ -1,6 +1,11 @@
 /// A connection's codec: the frames that arrive, decrypted and decompressed once the login turns
 /// those on, and the packets it sends, compressed, framed and encrypted. It's vanilla's pipeline
 /// of `CipherDecoder`, `Varint21FrameDecoder` and `CompressionDecoder`, and their encoders.
+///
+/// The two directions are apart, a `Decoder` and an `Encoder`, since the server decodes on the
+/// thread that handles what arrives and encodes wherever there's a thread free: an `Encoder`
+/// holds nothing of the connection, so it can move to another thread and back. A `Codec` is both,
+/// for a client.
 module protocol.codec
 
 import protocol.compression.{compress, decompress}
@@ -9,22 +14,22 @@ import protocol.wire.{DecodeError}
 import std.crypto.{Cfb8}
 import std.net.{Net, Conn}
 
-pub struct Codec {
+/// What a connection receives: whole frames, decrypted and decompressed.
+pub struct Decoder {
     frames: FrameReader
-    // Both ciphers are made with the codec, and keyed when encryption starts.
+    // The cipher is made with the decoder, and keyed when encryption starts.
     encrypted: bool
     decrypter: Cfb8
-    encrypter: Cfb8
     // The compression threshold, or -1 while compression is off.
     threshold: i32
     incoming: List<u8>
 }
 
-impl Codec {
-    /// A codec with neither encryption nor compression, as a connection starts.
-    pub fn new() -> Codec {
+impl Decoder {
+    /// A decoder with neither encryption nor compression, as a connection starts.
+    pub fn new() -> Decoder {
         let zero: List<u8> = [0; 16]
-        return Codec { frames: FrameReader.new(), encrypted: false, decrypter: Cfb8.new(zero, zero), encrypter: Cfb8.new(zero, zero), threshold: -1, incoming: List<u8>() }
+        return Decoder { frames: FrameReader.new(), encrypted: false, decrypter: Cfb8.new(zero, zero), threshold: -1, incoming: List<u8>() }
     }
 
     /// Takes the bytes that arrived on `c`, and says how many there were.
@@ -67,6 +72,41 @@ impl Codec {
         return some(try decompress(body, self.threshold))
     }
 
+    /// Decompresses each packet that comes from now on with `threshold`, as vanilla's
+    /// `setupCompression` does. A negative threshold turns compression off.
+    pub fn start_compression(mut self, threshold: i32) {
+        self.threshold = if threshold < 0 { -1 } else { threshold }
+    }
+
+    /// Decrypts everything from now on with AES-CFB8 keyed by `secret`, which is also the IV, as
+    /// vanilla's `setEncryptionKey` does. Bytes that arrived before this but aren't yet taken
+    /// came after the packet that started it, so they're decrypted too.
+    pub fn start_encryption(mut self, secret: List<u8>) {
+        self.decrypter = Cfb8.new(secret, secret)
+        self.encrypted = true
+        if self.frames.waiting() > 0 {
+            var rest = self.frames.take_waiting()
+            self.decrypter.decrypt(mut rest)
+            self.frames.push(rest)
+        }
+    }
+}
+
+/// What a connection sends: each packet compressed, framed and encrypted, as compression and
+/// encryption have been turned on.
+pub struct Encoder {
+    encrypted: bool
+    encrypter: Cfb8
+    threshold: i32
+}
+
+impl Encoder {
+    /// An encoder with neither encryption nor compression, as a connection starts.
+    pub fn new() -> Encoder {
+        let zero: List<u8> = [0; 16]
+        return Encoder { encrypted: false, encrypter: Cfb8.new(zero, zero), threshold: -1 }
+    }
+
     /// The packet, its ID then its fields, as the bytes to send.
     pub fn encode(mut self, packet: own List<u8>) -> List<u8> ! String {
         var body = packet
@@ -80,33 +120,78 @@ impl Codec {
         return bytes
     }
 
-    /// Compresses each packet of `threshold` bytes or more from now on, both ways, as vanilla's
-    /// `setupCompression` does. A negative threshold turns compression off.
+    /// Compresses each packet of `threshold` bytes or more from now on. A negative threshold
+    /// turns compression off.
     pub fn start_compression(mut self, threshold: i32) {
         self.threshold = if threshold < 0 { -1 } else { threshold }
     }
 
+    /// Encrypts everything from now on with AES-CFB8 keyed by `secret`, which is also the IV.
+    pub fn start_encryption(mut self, secret: List<u8>) {
+        self.encrypter = Cfb8.new(secret, secret)
+        self.encrypted = true
+    }
+}
+
+/// Both directions of a connection, for a client, which starts compression and encryption on
+/// both at once.
+pub struct Codec {
+    decoder: Decoder
+    encoder: Encoder
+}
+
+impl Codec {
+    /// A codec with neither encryption nor compression, as a connection starts.
+    pub fn new() -> Codec {
+        return Codec { decoder: Decoder.new(), encoder: Encoder.new() }
+    }
+
+    /// Takes the bytes that arrived on `c`, and says how many there were.
+    pub fn read_from(mut self, net: Net, c: Conn) -> usize {
+        return self.decoder.read_from(net, c)
+    }
+
+    /// Adds bytes as if they'd arrived.
+    pub fn push(mut self, bytes: List<u8>) {
+        self.decoder.push(bytes)
+    }
+
+    /// The bytes that arrived and aren't yet taken as frames, decrypted.
+    pub fn peek(self) -> List<u8> {
+        return self.decoder.peek()
+    }
+
+    /// The next whole packet: its ID, then its fields. `none` until all of it has arrived.
+    pub fn next(mut self) -> List<u8>? ! DecodeError {
+        return try self.decoder.next()
+    }
+
+    /// The packet, its ID then its fields, as the bytes to send.
+    pub fn encode(mut self, packet: own List<u8>) -> List<u8> ! String {
+        return try self.encoder.encode(packet)
+    }
+
+    /// Compresses each packet of `threshold` bytes or more from now on, both ways, as vanilla's
+    /// `setupCompression` does. A negative threshold turns compression off.
+    pub fn start_compression(mut self, threshold: i32) {
+        self.decoder.start_compression(threshold)
+        self.encoder.start_compression(threshold)
+    }
+
     /// Whether compression is on.
     pub fn compressing(self) -> bool {
-        return self.threshold >= 0
+        return self.encoder.threshold >= 0
     }
 
     /// Encrypts everything from now on, both ways, with AES-CFB8 keyed by `secret`, which is
-    /// also the IV, as vanilla's `setEncryptionKey` does. Bytes that arrived before this but
-    /// aren't yet taken came after the packet that started it, so they're decrypted too.
+    /// also the IV, as vanilla's `setEncryptionKey` does.
     pub fn start_encryption(mut self, secret: List<u8>) {
-        self.decrypter = Cfb8.new(secret, secret)
-        self.encrypter = Cfb8.new(secret, secret)
-        self.encrypted = true
-        if self.frames.waiting() > 0 {
-            var rest = self.frames.take_waiting()
-            self.decrypter.decrypt(mut rest)
-            self.frames.push(rest)
-        }
+        self.decoder.start_encryption(secret)
+        self.encoder.start_encryption(secret)
     }
 
     /// Whether encryption is on.
     pub fn encrypting(self) -> bool {
-        return self.encrypted
+        return self.encoder.encrypted
     }
 }
