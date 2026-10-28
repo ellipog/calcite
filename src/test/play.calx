@@ -1,32 +1,36 @@
 /// Checks play in server.network over real TCP on 127.0.0.1, in the flat world: what a player
 /// is sent as they join, their chunks a batch at a time, their view following them, the
 /// teleport they're to accept before they move, what other players see as they come and go, and
-/// chat: messages to everyone, what's refused, spam, and commands, which are all unknown so far.
+/// chat: messages to everyone, what's refused, spam, commands, which are all unknown so far, and
+/// signed chat, with chat sessions whose keys a test key signs where Mojang's would.
 module test.play
 
 import auth.profile.{GameProfile}
-import auth.services.{Services}
+import auth.services.{KeySet, Services}
 import chat.component.{ClickEvent, Component}
 import chat.language.{Language}
 import java.uuid.{Uuid}
 import pack.resources.{KnownPack}
-import protocol.chat.{ChatTypeBound, ClientboundPlayerChat, FilterMask, LastSeenUpdate, ServerboundChat, ServerboundChatAck, ServerboundChatCommand, SignedBody}
+import protocol.chat.{ArgumentSignature, ChatSession, ChatTypeBound, ClientboundPlayerChat, FilterMask, LastSeenUpdate, MessageSignature, PackedSignature, ServerboundChat, ServerboundChatAck, ServerboundChatCommand, ServerboundChatCommandSigned, ServerboundChatSessionUpdate, SignedBody}
 import protocol.codec.{Codec}
-import protocol.common.{ChatVisibility, ClientInformation, HumanoidArm, ParticleStatus, ServerboundClientInformation, ServerboundKeepAlive}
+import protocol.common.{ChatVisibility, ClientInformation, ClientboundDisconnect, HumanoidArm, ParticleStatus, ServerboundClientInformation, ServerboundKeepAlive}
 import protocol.configuration.{ServerboundFinishConfiguration, ServerboundSelectKnownPacks}
 import protocol.handshake.{ClientIntent, ClientIntention}
 import protocol.ids.{packet_names}
 import protocol.login.{ServerboundHello, ServerboundLoginAcknowledged}
-import protocol.play.{ClientboundSystemChat, ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundMovePlayerPos, ON_GROUND}
+import protocol.play.{ClientboundPlayerInfoUpdate, ClientboundSystemChat, INITIALIZE_CHAT, PlayerEntry, PlayerInfo, ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundMovePlayerPos, ON_GROUND}
 import protocol.state.{State, Bound}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import registry.registries.{Registries}
 import resources.identifier.{Identifier}
+import server.chat.{MessageBody, checksum, key_payload, signed_payload}
 import server.chunks.{in_view, in_view_all}
 import server.configuration.{Configuration}
 import server.network.{LoginSettings, Network, StatusInfo, key_ready}
 import server.play.{World, display_name}
+import server.status.{ServerStatus}
 import std.crypto.{RsaKey}
+import std.hash.{Algorithm}
 import std.net.{Net, Conn, Event}
 import std.time.{Timestamp}
 import world.pos.{ChunkPos}
@@ -47,18 +51,18 @@ fn core() -> KnownPack {
     return KnownPack { namespace: "minecraft", id: "core", version: "26.3" }
 }
 
-fn new_server(net: Net) -> Network {
+fn new_server(net: Net, services: own Services) -> Network {
     let packs: List<KnownPack?> = [some(core())]
     let configuration = Configuration.new("calcite", [], [Identifier { namespace: "minecraft", path: "vanilla" }], Registries { synced: [], builtin: [] }, packs)
     let settings = LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: -1, log_ips: true, prevent_proxy_connections: false, velocity_secret: none }
-    let status = StatusInfo { enabled: true, json: "\{\}", motd: "A Minecraft Server", online: 0, max_players: 20, description: Component.literal("A Minecraft Server"), favicon: none }
+    let status = StatusInfo { enabled: true, status: ServerStatus.starting(Component.literal("A Minecraft Server"), 20, none), motd: "A Minecraft Server" }
     var lang = Language.empty()
     lang.add("multiplayer.player.joined", "%s joined the game")
     lang.add("multiplayer.player.left", "%s left the game")
     // Not vanilla's text, which stays out of the repository, but in the same form.
     lang.add("chat.type.text", "%s says %s")
     lang.add("chat.disabled.missingProfileKey", "no key")
-    return Network.new(net, status, settings, lang, Services.offline(), key_ready(RsaKey.generate(1024)), configuration, World.defaults())
+    return Network.new(net, status, settings, lang, services, key_ready(RsaKey.generate(1024)), configuration, World.defaults())
 }
 
 fn packet<T: Wire + Packet>(p: T, state: State) -> List<u8> {
@@ -256,8 +260,12 @@ fn information() -> ClientInformation {
 }
 
 fn new_rig() -> Rig {
+    return new_rig_with(Services.offline())
+}
+
+fn new_rig_with(services: own Services) -> Rig {
     let net = Net.new()!
-    let server = new_server(net)
+    let server = new_server(net, services)
     let port = server.listen("127.0.0.1", 0)!
     return Rig { net: net, server: server, port: port, clients: [], now: 0 }
 }
@@ -644,6 +652,230 @@ fn acknowledgements() {
     println("ok acknowledgements")
 }
 
+// Signed chat. A key of the test's own stands in for Mojang's, which signs players' chat keys.
+const HOUR_MS: i64 = 3600000
+
+fn mojang_keys(mojang: RsaKey) -> Services {
+    return Services.with_keys(KeySet { profile_property: [], player_certificate: [mojang.public_der()] })
+}
+
+// A chat session of `name`'s, with `key`, which expires at `expires_at`, signed by `services`
+// as Mojang signs a player's key.
+fn session_of(name: String, services: RsaKey, key: RsaKey, expires_at: i64) -> ChatSession {
+    let id = GameProfile.offline(name).id
+    var session = ChatSession { session_id: Uuid.new(7, expires_at), expires_at: expires_at, key: key.public_key(), key_signature: [] }
+    session.key_signature = services.sign(Algorithm.Sha1, key_payload(id, session))
+    return session
+}
+
+// The signature of the `index`th message of `name`'s session, as their client signs it.
+fn sign_message(name: String, key: RsaKey, session: ChatSession, index: i32, body: MessageBody) -> MessageSignature {
+    let id = GameProfile.offline(name).id
+    return MessageSignature { bytes: key.sign(Algorithm.Sha256, signed_payload(id, session.session_id, index, body)) }
+}
+
+// A message as a client sends it, with what it says it saw.
+fn chat_packet(body: MessageBody, signature: MessageSignature?, update: own LastSeenUpdate) -> List<u8> {
+    return play(ServerboundChat { message: body.content.copy(), time_stamp: body.time_stamp, salt: body.salt, signature: signature.copy(), last_seen: update })
+}
+
+// What a client says it saw: its window moved on by `offset`, with the last `count` of its 20
+// acknowledged, and no checksum.
+fn seen_last(count: usize, offset: i32) -> LastSeenUpdate {
+    var bits: List<u8> = [0, 0, 0]
+    for i in (20 - count)..20 {
+        bits[i / 8] = bits[i / 8] | u8.wrap(1 << i32.wrap(i % 8))
+    }
+    return LastSeenUpdate { offset: offset, acknowledged: bits, checksum: 0 }
+}
+
+// The player chat packet vanilla sends of a signed message from `name`, the `global`th its
+// recipient was sent, with the signatures its sender saw as the recipient's cache packs them.
+fn signed_player_chat(name: String, body: MessageBody, global: i32, index: i32, signature: MessageSignature, seen: own List<PackedSignature>) -> List<u8> {
+    let profile = GameProfile.offline(name)
+    let packed = SignedBody { content: body.content.copy(), time_stamp: body.time_stamp, salt: body.salt, last_seen: seen }
+    let chat = ChatTypeBound { chat_type: 0, name: display_name(profile), target_name: none }
+    return fields(ClientboundPlayerChat { global_index: global, sender: profile.id, index: index, signature: some(signature.copy()), body: packed, unsigned_content: none, filter_mask: FilterMask.PassThrough, chat_type: chat })
+}
+
+fn cached(id: i32) -> PackedSignature {
+    return PackedSignature { id: id, full: none }
+}
+
+// The tab list update that tells everyone of `name`'s chat session.
+fn initialize_chat(name: String, session: ChatSession?) -> List<u8> {
+    let player = PlayerEntry { id: GameProfile.offline(name).id, chat_session: session.copy() }
+    return fields(ClientboundPlayerInfoUpdate { info: PlayerInfo { actions: INITIALIZE_CHAT, entries: [player] } })
+}
+
+fn refused(problem: String) -> List<u8> {
+    return system(Component.translatable(problem, []).colored("red"))
+}
+
+fn signed_chat() {
+    let mojang = RsaKey.generate(1024)
+    var rig = new_rig_with(mojang_keys(mojang))
+    let (steve, alex) = two(mut rig)
+    // Steve's session goes to everyone, Steve too; the same key again is nothing new.
+    let key = RsaKey.generate(2048)
+    let session = session_of("Steve", mojang, key, CLOCK_MS + HOUR_MS)
+    rig.send(steve, play(ServerboundChatSessionUpdate { session: session.copy() }))
+    expect_bytes(mut rig, alex, "player_info_update", initialize_chat("Steve", some(session.copy())))
+    expect_bytes(mut rig, steve, "player_info_update", initialize_chat("Steve", some(session.copy())))
+    rig.send(steve, play(ServerboundChatSessionUpdate { session: session.copy() }))
+    check(rig.next(steve).name, "nothing")
+    check(rig.logs(), "")
+
+    // A signed message goes to everyone with its signature, and the console logs it as it is.
+    let hello = MessageBody { content: "hello", time_stamp: CLOCK_MS, salt: 99, last_seen: [] }
+    let s0 = sign_message("Steve", key, session, 0, hello)
+    rig.send(steve, chat_packet(hello, some(s0.copy()), LastSeenUpdate.empty()))
+    expect_bytes(mut rig, steve, "player_chat", signed_player_chat("Steve", hello, 0, 0, s0, []))
+    expect_bytes(mut rig, alex, "player_chat", signed_player_chat("Steve", hello, 0, 0, s0, []))
+    check(rig.logs(), "Steve says hello|")
+
+    // Alex has no session, so his message is unsigned, though he says he saw Steve's, and
+    // the checksum of what he saw matches.
+    var saw = seen_last(1, 1)
+    saw.checksum = checksum([s0.copy()])
+    rig.send(alex, play(ServerboundChat { message: "hi", time_stamp: 5, salt: 6, signature: none, last_seen: saw }))
+    expect_bytes(mut rig, steve, "player_chat", player_chat("Alex", "hi", 1))
+    expect_bytes(mut rig, alex, "player_chat", player_chat("Alex", "hi", 1))
+    check(rig.logs(), "[Not Secure] Alex says hi|")
+
+    // Steve's next message is the next in his chain, signed with what he saw, which each client
+    // is sent by its place in its cache.
+    let again = MessageBody { content: "again", time_stamp: CLOCK_MS + 1000, salt: 100, last_seen: [s0.copy()] }
+    let s1 = sign_message("Steve", key, session, 1, again)
+    rig.send(steve, chat_packet(again, some(s1.copy()), seen_last(1, 1)))
+    expect_bytes(mut rig, steve, "player_chat", signed_player_chat("Steve", again, 2, 1, s1, [cached(0)]))
+    expect_bytes(mut rig, alex, "player_chat", signed_player_chat("Steve", again, 2, 1, s1, [cached(0)]))
+    check(rig.logs(), "Steve says again|")
+
+    // A signature that isn't Steve's of the message is refused, which breaks the chain, so the
+    // next is refused too, however it's signed. So is one that isn't signed at all.
+    let tampered = MessageBody { content: "agian", time_stamp: CLOCK_MS + 2000, salt: 101, last_seen: [s0.copy(), s1.copy()] }
+    rig.send(steve, chat_packet(tampered, some(sign_message("Steve", key, session, 2, again)), seen_last(2, 1)))
+    expect_bytes(mut rig, steve, "system_chat", refused("chat.disabled.invalid_signature"))
+    check(rig.next(alex).name, "nothing")
+    check(rig.logs(), "Failed to update secure chat state for Steve: 'chat.disabled.invalid_signature'|")
+    rig.send(steve, chat_packet(tampered, some(sign_message("Steve", key, session, 2, tampered)), seen_last(2, 0)))
+    expect_bytes(mut rig, steve, "system_chat", refused("chat.disabled.chain_broken"))
+    check(rig.logs(), "Failed to update secure chat state for Steve: 'chat.disabled.chain_broken'|")
+    rig.send(steve, chat_packet(tampered, none, seen_last(2, 0)))
+    expect_bytes(mut rig, steve, "system_chat", refused("chat.disabled.missingProfileKey"))
+    check(rig.next(alex).name, "nothing")
+    check(rig.logs(), "Failed to update secure chat state for Steve: 'no key'|")
+
+    // A new key starts a new chain, and everyone is told of it.
+    let renewed_key = RsaKey.generate(2048)
+    let renewed = session_of("Steve", mojang, renewed_key, CLOCK_MS + 2 * HOUR_MS)
+    rig.send(steve, play(ServerboundChatSessionUpdate { session: renewed.copy() }))
+    expect_bytes(mut rig, alex, "player_info_update", initialize_chat("Steve", some(renewed.copy())))
+    expect_bytes(mut rig, steve, "player_info_update", initialize_chat("Steve", some(renewed.copy())))
+    let fresh = MessageBody { content: "fresh", time_stamp: CLOCK_MS + 3000, salt: 102, last_seen: [s0.copy(), s1.copy()] }
+    let t0 = sign_message("Steve", renewed_key, renewed, 0, fresh)
+    rig.send(steve, chat_packet(fresh, some(t0.copy()), seen_last(2, 0)))
+    // Each cache has the last signature first.
+    expect_bytes(mut rig, steve, "player_chat", signed_player_chat("Steve", fresh, 3, 0, t0, [cached(1), cached(0)]))
+    expect_bytes(mut rig, alex, "player_chat", signed_player_chat("Steve", fresh, 3, 0, t0, [cached(1), cached(0)]))
+    check(rig.logs(), "Steve says fresh|")
+
+    // A player who joins now gets Steve's session with the tab list, and Alex without one.
+    let notch = rig.join("Notch")
+    let list = rig.clients[notch].after(["login", "change_difficulty", "player_abilities", "set_held_slot", "update_recipes", "entity_event", "commands", "recipe_book_settings", "recipe_book_add", "player_position", "server_data"])
+    check(list.name, "player_info_update")
+    var r = Reader.new(list.body)
+    let info = PlayerInfo.read(mut r)!
+    let steve_session = info.entries[0].chat_session.copy()!
+    check("{info.entries.len()} {info.entries[0].name} {steve_session.key.der() == renewed.key.der()} {info.entries[1].chat_session == none}", "2 Steve true true")
+    rig.clients[notch].drain()
+    rig.clients[steve].drain()
+    rig.clients[alex].drain()
+    _ = rig.logs()
+
+    // A message from more than 5 minutes ago is taken, with a warning, and isn't taken as
+    // Steve's, so it's logged as not secure.
+    rig.server.set_clock(Timestamp { unix_ms: CLOCK_MS + 600000 })
+    let late = MessageBody { content: "late", time_stamp: CLOCK_MS + 4000, salt: 103, last_seen: [s0.copy(), s1.copy(), t0.copy()] }
+    let t1 = sign_message("Steve", renewed_key, renewed, 1, late)
+    rig.send(steve, chat_packet(late, some(t1.copy()), seen_last(3, 1)))
+    check(rig.next(steve).name, "player_chat")
+    check(rig.logs(), "Received expired chat: 'late'. Is the client/server system time unsynchronized?|[Not Secure] Steve says late|")
+    // One from before the last is refused, and breaks the chain.
+    let early = MessageBody { content: "early", time_stamp: CLOCK_MS + 3500, salt: 104, last_seen: [s0.copy(), s1.copy(), t0.copy(), t1.copy()] }
+    rig.send(steve, chat_packet(early, some(sign_message("Steve", renewed_key, renewed, 2, early)), seen_last(4, 1)))
+    expect_bytes(mut rig, steve, "system_chat", refused("chat.disabled.out_of_order_chat"))
+    check(rig.logs(), "Failed to update secure chat state for Steve: 'chat.disabled.out_of_order_chat'|")
+
+    // A signed command whose signatures aren't of the command's arguments is refused, and
+    // Calcite's commands have none; one without signatures is unknown, as an unsigned one is.
+    let signed_args: List<ArgumentSignature> = [ArgumentSignature { name: "message", signature: t1.copy() }, ArgumentSignature { name: "target", signature: t1.copy() }]
+    rig.send(steve, play(ServerboundChatCommandSigned { command: "msg Alex hi", time_stamp: CLOCK_MS + 5000, salt: 105, argument_signatures: signed_args, last_seen: seen_last(4, 0) }))
+    expect_bytes(mut rig, steve, "system_chat", refused("chat.disabled.invalid_command_signature"))
+    check(rig.next(steve).name, "nothing")
+    check(rig.logs(), "Signed command mismatch between server and client ('msg Alex hi'): got [message, target] from client, but expected []|Failed to update secure chat state for Steve: 'chat.disabled.invalid_command_signature'|")
+    rig.send(steve, play(ServerboundChatCommandSigned { command: "spawn", time_stamp: CLOCK_MS + 6000, salt: 106, argument_signatures: [], last_seen: seen_last(4, 0) }))
+    check(rig.next(steve).name, "system_chat")
+    check(rig.next(steve).name, "system_chat")
+    check(rig.next(steve).name, "nothing")
+    check(rig.logs(), "")
+
+    // A key that expires before the last ends the connection.
+    rig.send(steve, play(ServerboundChatSessionUpdate { session: session_of("Steve", mojang, renewed_key, CLOCK_MS + HOUR_MS) }))
+    expect_bytes(mut rig, steve, "disconnect", fields(ClientboundDisconnect { reason: Component.translatable("multiplayer.disconnect.expired_public_key", []) }))
+    check(rig.logs(), "Steve lost connection: multiplayer.disconnect.expired_public_key|System chat: Steve left the game|")
+    println("ok signed chat")
+}
+
+fn chat_sessions() {
+    let mojang = RsaKey.generate(1024)
+    let key = RsaKey.generate(2048)
+    // Without the services' keys, a session is ignored, and bytes that aren't a key don't
+    // decode.
+    var rig = new_rig()
+    let (steve, alex) = two(mut rig)
+    rig.send(steve, play(ServerboundChatSessionUpdate { session: session_of("Steve", mojang, key, CLOCK_MS + HOUR_MS) }))
+    check(rig.next(steve).name, "nothing")
+    check(rig.logs(), "Ignoring chat session from Steve due to missing Services public key|")
+    var w = Writer.new()
+    w.varint(ServerboundChatSessionUpdate.id(State.Play))
+    w.uuid(Uuid.new(1, 2))
+    w.i64(CLOCK_MS + HOUR_MS)
+    w.byte_array([0x30, 0x03, 0x02, 0x01, 0x01])
+    w.byte_array([])
+    rig.send(alex, w.into_bytes())
+    let problem = Component.literal("Internal Exception: io.netty.handler.codec.DecoderException: Failed to decode packet 'serverbound/minecraft:chat_session_update'")
+    expect_bytes(mut rig, alex, "disconnect", fields(ClientboundDisconnect { reason: Component.translatable("disconnect.genericReason", [problem]) }))
+
+    var keyed = new_rig_with(mojang_keys(mojang))
+    let (a, b) = two(mut keyed)
+    // A key that has expired is taken, though no one is shown it, and the player's messages are
+    // refused.
+    let expired = session_of("Alex", mojang, key, CLOCK_MS - 1)
+    keyed.send(b, play(ServerboundChatSessionUpdate { session: expired.copy() }))
+    expect_bytes(mut keyed, a, "player_info_update", initialize_chat("Alex", none))
+    expect_bytes(mut keyed, b, "player_info_update", initialize_chat("Alex", none))
+    let body = MessageBody { content: "old key", time_stamp: CLOCK_MS, salt: 1, last_seen: [] }
+    keyed.send(b, chat_packet(body, some(sign_message("Alex", key, expired, 0, body)), LastSeenUpdate.empty()))
+    expect_bytes(mut keyed, b, "system_chat", refused("chat.disabled.expiredProfileKey"))
+    check(keyed.next(a).name, "nothing")
+    check(keyed.logs(), "Failed to update secure chat state for Alex: 'chat.disabled.expiredProfileKey'|")
+    // A key the services didn't sign ends the connection. A signature that isn't their key's
+    // length logs Java's exception first.
+    var forged = session_of("Steve", mojang, key, CLOCK_MS + HOUR_MS)
+    forged.key_signature = [1, 2, 3]
+    keyed.send(a, play(ServerboundChatSessionUpdate { session: forged }))
+    expect_bytes(mut keyed, a, "disconnect", fields(ClientboundDisconnect { reason: Component.translatable("multiplayer.disconnect.invalid_public_key_signature", []) }))
+    check(keyed.logs(), "Failed to verify Services signature\njava.security.SignatureException: Bad signature length: got 3 but was expecting 128|Failed to validate profile key\nnet.minecraft.world.entity.player.ProfilePublicKey$ValidationException: multiplayer.disconnect.invalid_public_key_signature|Steve lost connection: multiplayer.disconnect.invalid_public_key_signature|System chat: Steve left the game|")
+    // Nor is a key signed for someone else.
+    keyed.clients[b].drain()
+    keyed.send(b, play(ServerboundChatSessionUpdate { session: session_of("Steve", mojang, key, CLOCK_MS + HOUR_MS) }))
+    check(keyed.next(b).name, "disconnect")
+    check(keyed.logs(), "Failed to validate profile key\nnet.minecraft.world.entity.player.ProfilePublicKey$ValidationException: multiplayer.disconnect.invalid_public_key_signature|Alex lost connection: multiplayer.disconnect.invalid_public_key_signature|System chat: Alex left the game|")
+    println("ok chat sessions")
+}
+
 fn main() {
     join()
     moving()
@@ -653,5 +885,7 @@ fn main() {
     commands()
     spam()
     acknowledgements()
+    signed_chat()
+    chat_sessions()
     println("ok")
 }

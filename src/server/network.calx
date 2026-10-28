@@ -13,7 +13,7 @@ import auth.velocity.{channel, request, read}
 import chat.component.{ClickEvent, Component}
 import chat.language.{Language}
 import java.uuid.{Uuid}
-import protocol.chat.{ChatTypeBound, ClientboundPlayerChat, FilterMask, ServerboundChat, SignedBody}
+import protocol.chat.{ChatSession, ChatTypeBound, ClientboundPlayerChat, FilterMask, MessageSignature, PackedSignature, ServerboundChat, ServerboundChatCommandSigned, SignedBody}
 import protocol.codec.{Codec}
 import protocol.common.{ChatVisibility, ClientInformation, ClientboundDisconnect, ClientboundKeepAlive, ClientboundPostEffects, ClientboundResourcePackPush, ResourcePackAction, ServerboundKeepAlive}
 import protocol.configuration.{ClientboundCodeOfConduct, ClientboundFinishConfiguration, ConfigurationIn}
@@ -21,17 +21,18 @@ import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
-import protocol.play.{Abilities, BookRecipes, BookTab, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundCommands, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundInitializeBorder, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, ClockUpdate, CommandNode, GlobalPos, LEVEL_CHUNKS_LOAD_START, NodeKind, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes}
+import protocol.play.{Abilities, BookRecipes, BookTab, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundCommands, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundInitializeBorder, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, ClockUpdate, CommandNode, GlobalPos, INITIALIZE_CHAT, LEVEL_CHUNKS_LOAD_START, NodeKind, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes}
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import resources.identifier.{Identifier}
-import server.chat.{LastSeenValidator, Throttler, is_illegal}
+import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunks.{ChunkSender, in_view, in_view_all}
 import server.configuration.{Configuration}
 import server.log.{Entry}
+import server.status.{ServerStatus}
 import server.play.{World, display_name}
-import std.crypto.{RsaKey, random_bytes}
+import std.crypto.{RsaKey, RsaPublicKey, random_bytes}
 import std.net.{Net, Conn, Event, NetError, Address, Ip}
 import std.time.{Timestamp}
 import world.flat.{SURFACE_Y}
@@ -54,17 +55,15 @@ pub const KEEP_ALIVE_MS: i64 = 15000
 pub struct StatusInfo {
     /// Whether the server answers the server list, from `enable-status`.
     pub enabled: bool
-    /// The status response's JSON.
-    pub json: String
-    /// For the old ping: the description as text, and the player counts.
+    /// What the status response says. Its description and icon are what a player is sent as
+    /// they join, for their pause menu.
+    pub status: ServerStatus
+    /// The description as text, for the old ping.
     pub motd: String
-    pub online: i32
-    pub max_players: i32
-    /// The description and the icon, which a player is sent as they join, for their pause
-    /// menu.
-    pub description: Component
-    pub favicon: List<u8>?
 }
+
+/// How often the status is rebuilt, as vanilla's `STATUS_EXPIRE_TIME_NANOS`: 5 seconds.
+pub const STATUS_EXPIRE_NS: u64 = 5000000000
 
 /// How the server lets players in, from server.properties.
 pub struct LoginSettings {
@@ -217,6 +216,13 @@ struct Player {
     next_chat_index: i32 = 0
     chat_spam: Throttler = Throttler()
     command_spam: Throttler = Throttler()
+    // The player's chat session, once the services' signature of its key is checked, and where
+    // their signed messages are in its chain, as the listener's `chatSession` and
+    // `signedMessageDecoder`; without a session their messages are unsigned. Then the
+    // signatures their client keeps of the messages it was sent, as `messageSignatureCache`.
+    session: ChatSession? = none
+    chain: Chain = Chain()
+    signatures: SignatureCache = SignatureCache()
 }
 
 // A login's check with the session server. It goes on if the player leaves, as vanilla's
@@ -240,6 +246,9 @@ pub struct Network {
     settings: LoginSettings
     lang: Language
     services: Services
+    // The status response's JSON, and when it's next rebuilt, on the caller's clock.
+    status_json: String
+    status_due: u64
     // The server's key pair and its public key as the client is sent it, once the first online
     // login needs them, from the queue they come on from the thread making them.
     key: RsaKey?
@@ -276,7 +285,9 @@ impl Network {
     /// into `world`. Only an online login needs the key pair, so the first waits for it, and the
     /// server can listen while another thread makes it.
     pub fn new(net: Net, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, keys: own Receiver<RsaKey>, configuration: own Configuration, world: own World) -> Network {
-        return Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>() }
+        var network = Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>() }
+        network.rebuild_status()
+        return network
     }
 
     /// Sets the wall clock's time, which the caller reads before it hands over what happened, as
@@ -294,6 +305,14 @@ impl Network {
     /// Replaces what the server list shows, as vanilla rebuilds it every 5 seconds.
     pub fn set_status(mut self, status: own StatusInfo) {
         self.status = status
+        self.rebuild_status()
+    }
+
+    // The status as `buildServerStatus` makes it, with whether secure chat is enforced, which
+    // changes once the services' keys come.
+    fn rebuild_status(mut self) {
+        self.status.status.enforces_secure_chat = self.enforces_secure_chat()
+        self.status_json = self.status.status.to_json()
     }
 
     /// What happened since the last call that's worth logging, oldest first.
@@ -363,6 +382,11 @@ impl Network {
     /// services are fetched from as they're due.
     pub fn tick(mut self, now: u64) {
         self.services.tick(now, mut self.logs)
+        // The status is rebuilt every 5 seconds, as `tickServer` rebuilds it.
+        if now >= self.status_due {
+            self.status_due = now + STATUS_EXPIRE_NS
+            self.rebuild_status()
+        }
         self.authenticate()
         self.ticks += 1
         if self.ticks % 20 == 0 {
@@ -442,7 +466,12 @@ impl Network {
         return false
     }
 
+    // Closes the connection, once: one closed while it was handled, such as a sender with too
+    // many messages unseen, is closed already when its handler returns.
     fn close(self, con: mut Connection) {
+        if con.closing {
+            return
+        }
         con.closing = true
         self.net.close(con.conn)
     }
@@ -472,7 +501,7 @@ impl Network {
             if self.status.enabled {
                 let kind = classify(con.codec.peek())
                 if kind != Legacy.Modern {
-                    let answer = response(kind, game_version(), self.status.motd, self.status.online, self.status.max_players)
+                    let answer = response(kind, game_version(), self.status.motd, self.status.status.online, self.status.status.max_players)
                     self.net.write(con.conn, answer)
                     return false
                 }
@@ -520,7 +549,7 @@ impl Network {
                             return false
                         }
                         con.status_requested = true
-                        let answer = ClientboundStatusResponse { json: self.status.json.copy() }
+                        let answer = ClientboundStatusResponse { json: self.status_json.copy() }
                         self.send(mut con, answer, State.Status)
                         return true
                     },
@@ -1121,7 +1150,7 @@ impl Network {
         self.broadcast_system(Component.translatable("multiplayer.player.joined", [display_name(profile)]).colored("yellow"))
         self.teleport(mut con, 0.5, f64(SURFACE_Y), 0.5, 0.0, 0.0)
         if not con.transferred {
-            let data = ClientboundServerData { motd: self.status.description.copy(), icon: self.status.favicon.copy() }
+            let data = ClientboundServerData { motd: self.status.status.description.copy(), icon: self.status.status.favicon.copy() }
             self.send(mut con, data, State.Play)
         }
         // The tab list: those already in the world to the new player, then the new player to
@@ -1130,14 +1159,14 @@ impl Network {
         for c in self.connections {
             if let other = c {
                 if not other.closing and other.phase == Phase.Play {
-                    if let e = entry(other, mode) {
+                    if let e = entry(other, mode, self.clock.unix_ms) {
                         others.push(e)
                     }
                 }
             }
         }
         self.send(mut con, ClientboundPlayerInfoUpdate { info: PlayerInfo.initializing(others) }, State.Play)
-        if let e = entry(con, mode) {
+        if let e = entry(con, mode, self.clock.unix_ms) {
             let packet = encode_play(ClientboundPlayerInfoUpdate { info: PlayerInfo.initializing([e]) })
             self.broadcast(packet.copy())
             self.send_bytes(mut con, packet)
@@ -1282,6 +1311,8 @@ impl Network {
                 }
             },
             PlayIn.ChatCommand(c) => return self.chat_command(mut con, c.command),
+            PlayIn.ChatCommandSigned(c) => return self.signed_command(mut con, c),
+            PlayIn.ChatSessionUpdate(u) => return self.chat_session_update(mut con, u.session),
             PlayIn.AcceptTeleportation(a) => {
                 if a.teleport_id == con.player.teleport_id {
                     if not con.player.awaiting or invalid(a.x, a.y, a.z, a.y_rot, a.x_rot) {
@@ -1328,13 +1359,11 @@ impl Network {
     }
 
     // A chat message, as `handleChat`: what it says the player has seen is checked, then its
-    // characters, and whether the player shows chat. Calcite doesn't read chat sessions yet, so
-    // every message is unsigned, as vanilla's `SignedMessageChain.Decoder.unsigned` decodes it
-    // for a player without one, which is refused while the server enforces secure chat.
-    // Otherwise it goes to every player, and counts toward the sender's spam.
+    // characters, and whether the player shows chat, then the message is unpacked, signed or
+    // not. One that's taken goes to every player, and counts toward the sender's spam.
     fn chat(mut self, con: mut Connection, c: ServerboundChat) -> bool {
-        match con.player.last_seen.apply_update(c.last_seen) {
-            ok(_) => {},
+        let seen = match con.player.last_seen.apply_update(c.last_seen) {
+            ok(s) => s,
             err(problem) => {
                 self.chat_invalid(mut con, "Failed to validate message acknowledgements", problem)
                 return false
@@ -1343,14 +1372,52 @@ impl Network {
         if let stays = self.refuse_chat(mut con, c.message, false) {
             return stays
         }
-        if self.enforces_secure_chat() {
-            let problem = Component.translatable("chat.disabled.missingProfileKey", [])
-            self.logs.push(Entry.warn("Failed to update secure chat state for {player_name(con)}: '{problem.get_string(self.lang)}'"))
-            self.system_message(mut con, problem.colored("red"))
-            return true
+        let body = MessageBody { content: c.message.copy(), time_stamp: c.time_stamp, salt: c.salt, last_seen: seen }
+        let message = self.unpack(mut con, c.signature, body) else return true
+        self.broadcast_chat(mut con, message)
+        // Sending it may have ended the sender's connection, with too many messages unseen.
+        if con.closing {
+            return false
         }
-        self.broadcast_chat(mut con, c.message)
         return self.spam(mut con, false)
+    }
+
+    // The message the player sent, as their listener's decoder unpacks it: checked on their chat
+    // session's chain if they have one, and otherwise unsigned, as
+    // `SignedMessageChain.Decoder.unsigned` takes it, which refuses it while the server enforces
+    // secure chat. One that's refused is `none`, and the player is told why.
+    fn unpack(mut self, con: mut Connection, signature: MessageSignature?, body: MessageBody) -> ChatMessage? {
+        let sender = player_id(con)
+        let now = self.clock.unix_ms
+        if con.player.session == none {
+            if self.enforces_secure_chat() {
+                self.decode_failure(mut con, Component.translatable("chat.disabled.missingProfileKey", []))
+                return none
+            }
+            return some(ChatMessage.unsigned(sender, body.content, now))
+        }
+        // The chain moves on apart from the session it's checked with, which is read in place.
+        var chain = con.player.chain
+        var message: ChatMessage? = none
+        var problem = Component.empty()
+        if let session = con.player.session {
+            match chain.unpack(sender, session, signature, body, now, mut self.logs) {
+                ok(m) => message = some(m),
+                err(p) => problem = p,
+            }
+        }
+        con.player.chain = chain
+        if message == none {
+            self.decode_failure(mut con, problem)
+        }
+        return message
+    }
+
+    // What vanilla's `handleMessageDecodeFailure` does with a message that's refused: logs why,
+    // and tells the player, in red.
+    fn decode_failure(mut self, con: mut Connection, problem: own Component) {
+        self.logs.push(Entry.warn("Failed to update secure chat state for {player_name(con)}: '{problem.get_string(self.lang)}'"))
+        self.system_message(mut con, problem.colored("red"))
     }
 
     // A command, as `handleChatCommand`, once its characters are checked. Calcite has no
@@ -1361,6 +1428,92 @@ impl Network {
         }
         self.unknown_command(mut con, command)
         return self.spam(mut con, true)
+    }
+
+    // A command with signed arguments, as `handleSignedChatCommand`: what it says the player
+    // has seen is checked, then its characters, then its arguments' signatures, against the
+    // arguments the command has. Calcite has no commands, so none has an argument to sign. A
+    // command that comes with signatures doesn't match, as `collectSignedArguments` finds,
+    // which breaks the player's chain, and isn't run; one without is unknown. Either counts
+    // toward the player's command spam.
+    fn signed_command(mut self, con: mut Connection, c: ServerboundChatCommandSigned) -> bool {
+        match con.player.last_seen.apply_update(c.last_seen) {
+            ok(_) => {},
+            err(problem) => {
+                self.chat_invalid(mut con, "Failed to validate message acknowledgements", problem)
+                return false
+            },
+        }
+        if let stays = self.refuse_chat(mut con, c.command, true) {
+            return stays
+        }
+        if c.argument_signatures.is_empty() {
+            self.unknown_command(mut con, c.command)
+        } else {
+            con.player.chain.set_broken()
+            var names = String()
+            for a in c.argument_signatures {
+                if not names.is_empty() {
+                    names.push_str(", ")
+                }
+                names.push_str(a.name)
+            }
+            self.logs.push(Entry.error("Signed command mismatch between server and client ('{c.command}'): got [{names}] from client, but expected []"))
+            self.decode_failure(mut con, Component.translatable("chat.disabled.invalid_command_signature", []))
+        }
+        return self.spam(mut con, true)
+    }
+
+    // A chat session, as `handleChatSessionUpdate`: one with the key the player has is nothing
+    // new, and one whose key expires before theirs ends the connection. Otherwise its key is to
+    // be signed by the services for the player, or the connection ends; then the player's
+    // messages are checked on its chain, from its start, and everyone is told of it, as
+    // `resetPlayerChatState` does. Without the services' keys, it's ignored.
+    fn chat_session_update(mut self, con: mut Connection, session: ChatSession) -> bool {
+        var older = false
+        if let old = con.player.session {
+            if old.same_key(session) {
+                return true
+            }
+            older = session.expires_at < old.expires_at
+        }
+        if older {
+            self.disconnect(mut con, Component.translatable("multiplayer.disconnect.expired_public_key", []))
+            return false
+        }
+        let keys = self.certificate_keys()
+        if keys.is_empty() {
+            self.logs.push(Entry.warn("Ignoring chat session from {player_name(con)} due to missing Services public key"))
+            return true
+        }
+        let id = player_id(con)
+        if not signed_by_services(session, id, keys, mut self.logs) {
+            let reason = Component.translatable("multiplayer.disconnect.invalid_public_key_signature", [])
+            self.logs.push(Entry.error("Failed to validate profile key\nnet.minecraft.world.entity.player.ProfilePublicKey$ValidationException: {reason.get_string(self.lang)}"))
+            self.disconnect(mut con, reason)
+            return false
+        }
+        con.player.session = some(session.copy())
+        con.player.chain = Chain.start()
+        let started = PlayerEntry { id: id, chat_session: live_session(con, self.clock.unix_ms) }
+        let packet = encode_play(ClientboundPlayerInfoUpdate { info: PlayerInfo { actions: INITIALIZE_CHAT, entries: [started] } })
+        self.broadcast(packet.copy())
+        self.send_bytes(mut con, packet)
+        return true
+    }
+
+    // The services' keys that sign players' chat keys, once they're fetched, as
+    // `Services.profileKeySignatureValidator` has them.
+    fn certificate_keys(self) -> List<RsaPublicKey> {
+        var out = List<RsaPublicKey>()
+        if let keys = self.services.key_set() {
+            for der in keys.player_certificate {
+                if let k = RsaPublicKey.from_der(der.copy()) {
+                    out.push(k)
+                }
+            }
+        }
+        return out
     }
 
     // What vanilla's `tryHandleChat` refuses: a message with a character chat can't have ends
@@ -1386,10 +1539,14 @@ impl Network {
         self.disconnect(mut con, Component.translatable("multiplayer.disconnect.chat_validation_failed", []))
     }
 
-    // Whether the server enforces secure chat, which vanilla does only once it can check
-    // players' keys, with Mojang's services in online mode.
+    // Whether the server enforces secure chat, which vanilla does with `enforce-secure-profile`
+    // in online mode, once it has the services' keys that sign players' chat keys.
     fn enforces_secure_chat(self) -> bool {
-        return self.world.settings.enforces_secure_chat and self.settings.online_mode and self.services.key_set() != none
+        if not self.world.settings.enforces_secure_chat or not self.settings.online_mode {
+            return false
+        }
+        let keys = self.services.key_set() else return false
+        return not keys.player_certificate.is_empty()
     }
 
     // A message or command counts toward the player's spam, as `detectRateSpam`: too many too
@@ -1411,21 +1568,23 @@ impl Network {
         return true
     }
 
-    // An unsigned message from the player in `con` to everyone, as `PlayerList.broadcastChatMessage`
-    // sends it: logged as not secure, then sent as `minecraft:chat`, from the player's name, to
-    // each player who shows all chat, the sender too.
-    fn broadcast_chat(mut self, con: mut Connection, message: String) {
+    // A message from the player in `con` to everyone, as `PlayerList.broadcastChatMessage` sends
+    // it: logged, as not secure unless it's signed and hasn't expired, then sent as
+    // `minecraft:chat`, from the player's name, to each player who shows all chat, the sender
+    // too.
+    fn broadcast_chat(mut self, con: mut Connection, message: ChatMessage) {
         var found: GameProfile? = none
         if let p = con.profile {
             found = some(p.copy())
         }
         let profile = found else return
         let sender = display_name(profile)
-        let shown = self.world.chat_decoration().decorate(Component.literal(message), sender, none)
-        self.logs.push(Entry.info("[Not Secure] {shown.get_string(self.lang)}"))
-        // An unsigned message, as `PlayerChatMessage.unsigned` makes it: the first of its sender's,
-        // stamped with the server's clock, with no salt and nothing seen.
-        let body = SignedBody { content: message.copy(), time_stamp: self.clock.unix_ms, salt: 0, last_seen: [] }
+        let shown = self.world.chat_decoration().decorate(Component.literal(message.body.content), sender, none)
+        if message.trusted(self.clock.unix_ms) {
+            self.logs.push(Entry.info(shown.get_string(self.lang)))
+        } else {
+            self.logs.push(Entry.info("[Not Secure] {shown.get_string(self.lang)}"))
+        }
         let chat = ChatTypeBound { chat_type: self.world.chat, name: sender, target_name: none }
         for i in 0..self.connections.len() {
             if not self.playing(i) {
@@ -1433,22 +1592,37 @@ impl Network {
             }
             self.connections.push(none)
             var other = self.connections.swap_remove(i) else continue
-            self.player_chat(mut other, profile.id, body, chat)
+            self.player_chat(mut other, message, chat)
             self.connections[i] = some(other)
         }
-        self.player_chat(mut con, profile.id, body, chat)
+        self.player_chat(mut con, message, chat)
     }
 
     // A player's message to the player in `con`, if they show all chat, as
-    // `ServerPlayer.sendChatMessage`, which counts it among those they were sent.
-    fn player_chat(mut self, con: mut Connection, sender: Uuid, body: SignedBody, chat: ChatTypeBound) {
+    // `ServerPlayer.sendChatMessage` and the listener's `sendPlayerChatMessage` send it: its place
+    // among all they were sent, and the signatures its sender had seen by their places in the
+    // client's cache, where it has them. A signed one then goes in the cache and among those the
+    // player is to say they saw, and too many they haven't ends their connection.
+    fn player_chat(mut self, con: mut Connection, message: ChatMessage, chat: ChatTypeBound) {
         if con.information.chat_visibility != ChatVisibility.Full {
             return
         }
         let index = con.player.next_chat_index
         con.player.next_chat_index += 1
-        let packet = ClientboundPlayerChat { global_index: index, sender: sender, index: 0, signature: none, body: body.copy(), unsigned_content: none, filter_mask: FilterMask.PassThrough, chat_type: chat.copy() }
+        var seen = List<PackedSignature>()
+        for s in message.body.last_seen {
+            seen.push(con.player.signatures.pack(s))
+        }
+        let body = SignedBody { content: message.body.content.copy(), time_stamp: message.body.time_stamp, salt: message.body.salt, last_seen: seen }
+        let packet = ClientboundPlayerChat { global_index: index, sender: message.sender, index: message.index, signature: message.signature.copy(), body: body, unsigned_content: none, filter_mask: FilterMask.PassThrough, chat_type: chat.copy() }
         self.send(mut con, packet, State.Play)
+        let signature = message.signature else return
+        con.player.signatures.push(message.body.last_seen, some(signature.copy()))
+        con.player.last_seen.add_pending(signature)
+        if con.player.last_seen.tracked_count() > MOST_PENDING {
+            self.disconnect(mut con, Component.translatable("multiplayer.disconnect.too_many_pending_chats", []))
+            self.close(mut con)
+        }
     }
 
     // What vanilla's `Commands.finishParsing` tells the player of a command it has no node for:
@@ -1673,12 +1847,23 @@ fn closed_tab() -> BookTab {
     return BookTab { open: false, filtering: false }
 }
 
-// The player's tab list entry, as `ClientboundPlayerInfoUpdatePacket.Entry` makes it from them:
-// listed, with their latency and game mode, no name of their own, and their hat if their skin
-// shows it.
-fn entry(con: Connection, mode: GameType) -> PlayerEntry? {
+// The player's tab list entry, as `ClientboundPlayerInfoUpdatePacket.Entry` makes it from them
+// as of `now`: listed, with their chat session, their latency and game mode, no name of their
+// own, and their hat if their skin shows it.
+fn entry(con: Connection, mode: GameType, now: i64) -> PlayerEntry? {
     if let p = con.profile {
-        return some(PlayerEntry { id: p.id, name: p.name.copy(), properties: p.properties.copy(), game_type: mode, listed: true, latency: con.latency, show_hat: con.information.model_customisation & 64 != 0 })
+        return some(PlayerEntry { id: p.id, name: p.name.copy(), properties: p.properties.copy(), chat_session: live_session(con, now), game_type: mode, listed: true, latency: con.latency, show_hat: con.information.model_customisation & 64 != 0 })
+    }
+    return none
+}
+
+// The player's chat session, unless its key has expired as of `now`, as `getChatSession` gives
+// it.
+fn live_session(con: Connection, now: i64) -> ChatSession? {
+    if let s = con.player.session {
+        if s.expires_at >= now {
+            return some(s.copy())
+        }
     }
     return none
 }
@@ -1739,6 +1924,13 @@ fn player_name(con: Connection) -> String {
         return p.name.copy()
     }
     return String()
+}
+
+fn player_id(con: Connection) -> Uuid {
+    if let p = con.profile {
+        return p.id
+    }
+    return Uuid.new(0, 0)
 }
 
 fn user(con: Connection) -> String {

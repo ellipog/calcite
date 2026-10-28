@@ -1,10 +1,255 @@
 /// What the server checks of a player's chat, as vanilla's play listener does: the characters a
-/// message may have, how fast messages may come, as `TickThrottler` counts them, and the window
-/// of the last 20 signed messages the player was sent, which each message says it has seen, as
-/// `LastSeenMessagesValidator` keeps it.
+/// message may have, how fast messages may come, as `TickThrottler` counts them, the window of
+/// the last 20 signed messages the player was sent, which each message says it has seen, as
+/// `LastSeenMessagesValidator` keeps it, and signed messages: the services' signature of a
+/// player's key, the chain their messages come on, as `SignedMessageChain` checks it, and the
+/// signatures a client keeps of those it was sent, as `MessageSignatureCache`.
 module server.chat
 
-import protocol.chat.{LastSeenUpdate, MessageSignature}
+import chat.component.{Component}
+import java.uuid.{Uuid}
+import protocol.chat.{ChatSession, LastSeenUpdate, MessageSignature, PackedSignature}
+import protocol.wire.{Writer}
+import server.log.{Entry}
+import std.crypto.{RsaPublicKey}
+import std.hash.{Algorithm}
+
+/// How long after it's sent a message is still taken as from its sender, vanilla's
+/// `MESSAGE_EXPIRES_AFTER_SERVER`, 5 minutes, in milliseconds.
+pub const MESSAGE_EXPIRES_MS: i64 = 300000
+
+/// How many signatures a client keeps of the messages it was sent, vanilla's
+/// `MessageSignatureCache.DEFAULT_CAPACITY`.
+pub const SIGNATURE_CACHE: usize = 128
+
+/// How many signed messages a player may have been sent without saying they saw them, past
+/// which they're disconnected, as vanilla's `sendPlayerChatMessage` counts them.
+pub const MOST_PENDING: usize = 4096
+
+/// What a player signs of a message, vanilla's `SignedMessageBody`: its text, when they sent
+/// it, in milliseconds since 1970, a salt, and the signatures of the messages they'd last seen,
+/// oldest first.
+pub struct MessageBody {
+    pub content: String
+    pub time_stamp: i64
+    pub salt: i64
+    pub last_seen: List<MessageSignature>
+}
+
+/// A player's message once the server has decoded it, vanilla's `PlayerChatMessage`: who sent
+/// it and its place in their chain, its signature if it's signed, and what was signed. An
+/// unsigned message is the first of a chain of its own.
+pub struct ChatMessage {
+    pub sender: Uuid
+    pub index: i32
+    pub signature: MessageSignature?
+    pub body: MessageBody
+}
+
+impl ChatMessage {
+    /// A message no one signed, as `PlayerChatMessage.unsigned` makes it: stamped with `now`,
+    /// with no salt and nothing seen.
+    pub fn unsigned(sender: Uuid, content: String, now: i64) -> ChatMessage {
+        let body = MessageBody { content: content.copy(), time_stamp: now, salt: 0, last_seen: [] }
+        return ChatMessage { sender: sender, index: 0, signature: none, body: body }
+    }
+
+    /// Whether it was sent more than 5 minutes before `now`, as `hasExpiredServer` decides.
+    pub fn expired(self, now: i64) -> bool {
+        return self.body.time_stamp < now - MESSAGE_EXPIRES_MS
+    }
+
+    /// Whether the server takes it as from its sender, as `PlayerList.verifyChatTrusted`
+    /// decides: it's signed, and hasn't expired.
+    pub fn trusted(self, now: i64) -> bool {
+        return self.signature != none and not self.expired(now)
+    }
+}
+
+/// What a player's key signs of a message, as `PlayerChatMessage.updateSignature` writes it,
+/// big-endian: 1, the sender's UUID, the session's, the message's place in the chain, the salt,
+/// the time stamp in whole seconds, the text's UTF-8 with its length before it, then how many
+/// signatures were seen, and each.
+pub fn signed_payload(sender: Uuid, session: Uuid, index: i32, body: MessageBody) -> List<u8> {
+    var w = Writer.new()
+    w.i32(1)
+    w.uuid(sender)
+    w.uuid(session)
+    w.i32(index)
+    w.i64(body.salt)
+    w.i64(epoch_second(body.time_stamp))
+    let content = body.content.to_bytes()
+    w.i32(i32.wrap(content.len()))
+    w.raw(content)
+    w.i32(i32.wrap(body.last_seen.len()))
+    for s in body.last_seen {
+        w.raw(s.bytes)
+    }
+    return w.into_bytes()
+}
+
+// The whole seconds since 1970 of a time in milliseconds, rounded down, as `Instant`'s
+// `getEpochSecond` gives them, before 1970 too.
+fn epoch_second(ms: i64) -> i64 {
+    return if ms % 1000 < 0 { ms / 1000 - 1 } else { ms / 1000 }
+}
+
+/// What the services sign of a player's chat key, as `ProfilePublicKey.Data.signedPayload`
+/// writes it, big-endian: the player's UUID, when the key expires in milliseconds, and the key's
+/// DER.
+pub fn key_payload(profile: Uuid, session: ChatSession) -> List<u8> {
+    var w = Writer.new()
+    w.uuid(profile)
+    w.i64(session.expires_at)
+    w.raw(session.key.der())
+    return w.into_bytes()
+}
+
+/// Whether one of the services' keys signed the session's key for `profile`, with
+/// `SHA1withRSA`, as `ProfilePublicKey.createValidated` checks it with the validator of
+/// `Services.profileKeySignatureValidator`. Each key is tried in turn, and one the signature
+/// isn't the length of logs Java's `SignatureException`, as vanilla logs it, and is a no.
+pub fn signed_by_services(session: ChatSession, profile: Uuid, keys: List<RsaPublicKey>, logs: mut List<Entry>) -> bool {
+    let payload = key_payload(profile, session)
+    for key in keys {
+        if verify(key, Algorithm.Sha1, payload, session.key_signature, "Failed to verify Services signature", mut logs) {
+            return true
+        }
+    }
+    return false
+}
+
+// Whether `signature` is the key's signature of `payload`, as Java's `Signature.verify` decides,
+// which throws for a signature that isn't the key's length; vanilla logs that after `line`, and
+// takes it as a no.
+fn verify(key: RsaPublicKey, hash: Algorithm, payload: List<u8>, signature: List<u8>, line: String, logs: mut List<Entry>) -> bool {
+    if signature.len() != key.size() {
+        logs.push(Entry.error("{line}\njava.security.SignatureException: Bad signature length: got {signature.len()} but was expecting {key.size()}"))
+        return false
+    }
+    return key.verify(hash, payload.copy(), signature.copy())
+}
+
+/// Where a player's signed messages are in their chat session's chain, vanilla's
+/// `SignedMessageChain`: the next message's place in it, which is `none` once it's broken, and
+/// the last one's time stamp, which the next can't be before. The default is no chain, for a
+/// player without a session.
+pub struct Chain {
+    next: i32? = none
+    last_time_stamp: i64 = 0
+}
+
+impl Chain {
+    /// A chain at its start, as a new chat session begins one.
+    pub fn start() -> Chain {
+        return Chain { next: some(0), last_time_stamp: 0 }
+    }
+
+    /// The next message `sender` sent with their `session`, as of `now` in milliseconds, as the
+    /// chain's decoder unpacks it, or what's wrong with it, as vanilla's `DecodeException`s say:
+    /// it isn't signed, the key has expired, the chain is broken, it's from before the last
+    /// message, or the signature isn't the key's. The last two break the chain. A message that's
+    /// expired is taken, with a warning.
+    pub fn unpack(mut self, sender: Uuid, session: ChatSession, signature: MessageSignature?, body: MessageBody, now: i64, logs: mut List<Entry>) -> ChatMessage ! Component {
+        let signed = signature else fail Component.translatable("chat.disabled.missingProfileKey", [])
+        if session.expires_at < now {
+            fail Component.translatable("chat.disabled.expiredProfileKey", [])
+        }
+        let index = self.next else fail Component.translatable("chat.disabled.chain_broken", [])
+        if body.time_stamp < self.last_time_stamp {
+            self.next = none
+            fail Component.translatable("chat.disabled.out_of_order_chat", [])
+        }
+        self.last_time_stamp = body.time_stamp
+        let payload = signed_payload(sender, session.session_id, index, body)
+        if not verify(session.key, Algorithm.Sha256, payload, signed.bytes, "Failed to verify signature", mut logs) {
+            self.next = none
+            fail Component.translatable("chat.disabled.invalid_signature", [])
+        }
+        let message = ChatMessage { sender: sender, index: index, signature: some(signed.copy()), body: body.copy() }
+        if message.expired(now) {
+            logs.push(Entry.warn("Received expired chat: '{body.content}'. Is the client/server system time unsynchronized?"))
+        }
+        // The last place there is ends the chain.
+        self.next = if index == 2147483647 { none } else { some(index + 1) }
+        return message
+    }
+
+    /// Breaks the chain, as a signed command whose arguments don't match does.
+    pub fn set_broken(mut self) {
+        self.next = none
+    }
+}
+
+/// The signatures a client keeps of the signed messages it was sent, as both sides' vanilla
+/// `MessageSignatureCache` keeps them, the newest first, so a message can name one it has by
+/// its place instead of sending it whole. The default is empty.
+pub struct SignatureCache {
+    // At most 128; a place past the end is empty.
+    entries: List<MessageSignature> = []
+}
+
+impl SignatureCache {
+    /// The signature's place, or -1 if it isn't kept, as `pack` finds it.
+    pub fn find(self, signature: MessageSignature) -> i32 {
+        for i in 0..self.entries.len() {
+            if self.entries[i].bytes == signature.bytes {
+                return i32.wrap(i)
+            }
+        }
+        return -1
+    }
+
+    /// The signature as a message sends it, by its place if it's kept, as `MessageSignature.pack`.
+    pub fn pack(self, signature: MessageSignature) -> PackedSignature {
+        let id = self.find(signature)
+        if id == -1 {
+            return PackedSignature { id: -1, full: some(signature.copy()) }
+        }
+        return PackedSignature { id: id, full: none }
+    }
+
+    /// Keeps what a client was just sent, as vanilla's `push` does: the message's signature
+    /// first, then those its sender had seen, newest first, then the signatures that were kept
+    /// and aren't among them, in their order, as far as 128 go.
+    pub fn push(mut self, last_seen: List<MessageSignature>, signature: MessageSignature?) {
+        var queue = Deque<MessageSignature>()
+        for s in last_seen {
+            queue.push_last(s.copy())
+        }
+        if let s = signature {
+            queue.push_last(s.copy())
+        }
+        var fresh = List<MessageSignature>()
+        for i in 0..queue.len() {
+            fresh.push(queue[i].copy())
+        }
+        var i: usize = 0
+        while i < SIGNATURE_CACHE {
+            let next = queue.pop_last() else break
+            if i == self.entries.len() {
+                self.entries.push(next)
+            } else {
+                let old = self.entries[i].copy()
+                self.entries[i] = next
+                if not holds(fresh, old) {
+                    queue.push_first(old)
+                }
+            }
+            i += 1
+        }
+    }
+}
+
+// Whether `list` holds a signature with the bytes of `s`.
+fn holds(list: List<MessageSignature>, s: MessageSignature) -> bool {
+    for e in list {
+        if e.bytes == s.bytes {
+            return true
+        }
+    }
+    return false
+}
 
 /// How many of the last signed messages a client tracks, vanilla's
 /// `LastSeenMessages.LAST_SEEN_MESSAGES_MAX_LENGTH`.
