@@ -168,7 +168,7 @@ Build the smallest Calx that can run a tick loop and talk to C, written from zer
 - **P3.5** A runtime library in C for Windows and Linux, with macOS later:
   - event-driven sockets (IOCP and epoll, D33), threads and typed queues
   - a monotonic clock and plugin library loading
-  - libdeflate and lz4, and the crypto library (D32)
+  - zlib, lz4, hashes and crypto written in the runtime, and TLS from the system (D118, which replaces D32)
   - an HTTPS client for Mojang's session server
 
   Use clang on both platforms, and build and test on both from the first commit.
@@ -363,7 +363,7 @@ Notes on licensing and legal questions:
 - **Copying code (D59).** Copy only when it's clearly the best option and its license allows it in an MIT project, keeping the notice. GPL code can't be copied.
 - MIT is one more reason not to read GPL servers. Pumpkin, Paper and Folia are GPL; Pumpkin's plugin API crates are MIT/Apache.
 - Bit-exact parity means reproducing Mojang's behaviour closely, and vanilla's code is easy to read now that it's unobfuscated. Mojang's code has no license that allows copying, so Calcite is written from it as a reference, in its own structure for regions and actors. Where the bits force it, the arithmetic still follows vanilla's, in the same order. That raises the same derivative-work question every third-party server lives with. Before publishing anything, read Mojang's EULA and usage guidelines; I'm not a lawyer.
-- Wasmtime's Apache 2.0 license is fine to embed in an MIT project. So are libdeflate (MIT) and lz4 (BSD-2).
+- Wasmtime's Apache 2.0 license is fine to embed in an MIT project. No other native library is vendored: zlib, lz4 and the crypto are written in Calx's runtime (D118).
 - For Bedrock, Geyser's standalone proxy translates to the Java protocol, so it should work in front of Calcite unchanged. Bedrock-only accounts would need an auth plugin along the lines of Floodgate.
 
 ## Repo layout
