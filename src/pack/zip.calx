@@ -1,0 +1,244 @@
+/// Zip archives, such as Mojang's server jar and the jar bundled in it, read from memory as Java's
+/// `ZipFile` reads them: the central directory at the end, Zip64 where an archive needs it, and
+/// entries stored or deflated, each checked against its CRC-32.
+module pack.zip
+
+import std.zlib.{Format, crc32, decompress_into}
+
+/// A file in an archive.
+pub struct Entry {
+    /// Its path in the archive, such as `data/minecraft/dimension_type/overworld.json`.
+    pub name: String
+    /// How many bytes it is.
+    pub size: usize
+    method: u16
+    crc: u32
+    compressed: usize
+    // Where its local header starts.
+    header: usize
+}
+
+/// An archive, which holds its bytes.
+pub struct Zip {
+    bytes: List<u8>
+    files: List<Entry>
+    by_name: Map<String, usize>
+}
+
+// The records' signatures.
+const END: u32 = 0x06054b50
+const END64: u32 = 0x06064b50
+const LOCATOR64: u32 = 0x07064b50
+const CENTRAL: u32 = 0x02014b50
+const LOCAL: u32 = 0x04034b50
+
+impl Zip {
+    /// The archive in `bytes`, or why it can't be read.
+    pub fn open(bytes: own List<u8>) -> Zip ! String {
+        let n = bytes.len()
+        if n < 22 {
+            fail String("zip END header not found")
+        }
+        // The end record is the last thing in the archive but a comment of up to 65,535 bytes.
+        var at: usize = n - 22
+        var found = false
+        let lowest: usize = if n - 22 > 65535 { n - 22 - 65535 } else { 0 }
+        loop {
+            if le32(bytes, at) == END and at + 22 + usize(le16(bytes, at + 20)) <= n {
+                found = true
+                break
+            }
+            if at == lowest {
+                break
+            }
+            at -= 1
+        }
+        if not found {
+            fail String("zip END header not found")
+        }
+        var count = usize(le16(bytes, at + 10))
+        var directory = usize(le32(bytes, at + 16))
+        var directory_size = usize(le32(bytes, at + 12))
+        if count == 0xFFFF or directory == 0xFFFFFFFF or directory_size == 0xFFFFFFFF {
+            if at < 20 or le32(bytes, at - 20) != LOCATOR64 {
+                fail String("invalid END header (bad central directory offset)")
+            }
+            let end64 = le64(bytes, at - 12)
+            if end64 + 56 > u64(n) or le32(bytes, usize.wrap(end64)) != END64 {
+                fail String("invalid zip64 END header")
+            }
+            let e = usize.wrap(end64)
+            let count64 = le64(bytes, e + 32)
+            let size64 = le64(bytes, e + 40)
+            let directory64 = le64(bytes, e + 48)
+            if directory64 > u64(n) or size64 > u64(n) or count64 > u64(n) {
+                fail String("invalid END header (bad central directory offset)")
+            }
+            count = usize.wrap(count64)
+            directory_size = usize.wrap(size64)
+            directory = usize.wrap(directory64)
+        }
+        if directory > n or directory_size > n - directory {
+            fail String("invalid END header (bad central directory offset)")
+        }
+        // Each entry takes at least 46 bytes of the directory.
+        if count > directory_size / 46 {
+            fail String("invalid END header (bad total entries)")
+        }
+        var files = List<Entry>()
+        files.reserve(count)
+        var by_name = Map<String, usize>()
+        by_name.reserve(count)
+        var p = directory
+        let end = directory + directory_size
+        for _ in 0..count {
+            if p + 46 > end or le32(bytes, p) != CENTRAL {
+                fail String("invalid CEN header (bad signature)")
+            }
+            let flags = le16(bytes, p + 8)
+            if flags & 1 != 0 {
+                fail String("invalid CEN header (encrypted entry)")
+            }
+            let method = le16(bytes, p + 10)
+            let name_len = usize(le16(bytes, p + 28))
+            let extra_len = usize(le16(bytes, p + 30))
+            let comment_len = usize(le16(bytes, p + 32))
+            let next = p + 46 + name_len + extra_len + comment_len
+            if next > end {
+                fail String("invalid CEN header (bad header size)")
+            }
+            var compressed = u64(le32(bytes, p + 20))
+            var size = u64(le32(bytes, p + 24))
+            var header = u64(le32(bytes, p + 42))
+            // Zip64's extra field holds the sizes and offset too big for 32 bits, in that order.
+            var x = p + 46 + name_len
+            let x_end = x + extra_len
+            while x + 4 <= x_end {
+                let id = le16(bytes, x)
+                let len = usize(le16(bytes, x + 2))
+                if x + 4 + len > x_end {
+                    break
+                }
+                if id == 1 {
+                    var f = x + 4
+                    if size == 0xFFFFFFFF and f + 8 <= x + 4 + len {
+                        size = le64(bytes, f)
+                        f += 8
+                    }
+                    if compressed == 0xFFFFFFFF and f + 8 <= x + 4 + len {
+                        compressed = le64(bytes, f)
+                        f += 8
+                    }
+                    if header == 0xFFFFFFFF and f + 8 <= x + 4 + len {
+                        header = le64(bytes, f)
+                    }
+                }
+                x += 4 + len
+            }
+            // Deflate makes at most about 1,032 bytes of each byte it reads.
+            if header >= u64(n) or compressed > u64(n) or size > compressed * 1032 + 1024 {
+                fail String("invalid CEN header (bad entry offset)")
+            }
+            let name = text(bytes, p + 46, name_len) else fail String("invalid CEN header (bad entry name)")
+            by_name.insert(name.copy(), files.len())
+            files.push(Entry { name: name, size: usize.wrap(size), method: method, crc: le32(bytes, p + 16), compressed: usize.wrap(compressed), header: usize.wrap(header) })
+            p = next
+        }
+        return Zip { bytes: bytes, files: files, by_name: by_name }
+    }
+
+    /// Its files, in the order the central directory lists them.
+    pub fn entries(self) -> List<Entry> {
+        return self.files.copy()
+    }
+
+    /// How many files it has.
+    pub fn len(self) -> usize {
+        return self.files.len()
+    }
+
+    /// The path of file `i`.
+    pub fn name(self, i: usize) -> String {
+        return self.files[i].name.copy()
+    }
+
+    /// The index of the file at `name`, or `none`. A later file of the same name wins.
+    pub fn find(self, name: String) -> usize? {
+        return self.by_name.get(name)
+    }
+
+    /// What file `i` holds, or why it can't be read.
+    pub fn read(self, i: usize) -> List<u8> ! String {
+        let header = self.files[i].header
+        let size = self.files[i].size
+        let compressed = self.files[i].compressed
+        let method = self.files[i].method
+        let n = self.bytes.len()
+        if header + 30 > n or le32(self.bytes, header) != LOCAL {
+            fail "invalid LOC header (bad signature) in {self.files[i].name}"
+        }
+        let start = header + 30 + usize(le16(self.bytes, header + 26)) + usize(le16(self.bytes, header + 28))
+        if start > n or compressed > n - start {
+            fail "invalid LOC header (bad entry size) in {self.files[i].name}"
+        }
+        var out = List<u8>()
+        if method == 0 {
+            if compressed != size {
+                fail "invalid LOC header (bad entry size) in {self.files[i].name}"
+            }
+            out.reserve(size)
+            for k in start..start + size {
+                out.push(self.bytes[k])
+            }
+        } else if method == 8 {
+            out.reserve(size)
+            let ended = match decompress_into(self.bytes, start, start + compressed, Format.Raw, size, mut out) {
+                ok(b) => b,
+                err(_) => fail "invalid entry compressed data in {self.files[i].name}",
+            }
+            if not ended or out.len() != size {
+                fail "invalid entry size in {self.files[i].name}: expected {size}"
+            }
+        } else {
+            fail "unsupported compression method {method} in {self.files[i].name}"
+        }
+        if crc32(out) != self.files[i].crc {
+            fail "invalid entry CRC in {self.files[i].name}"
+        }
+        return out
+    }
+
+    /// What the file at `name` holds, or why it can't be read.
+    pub fn read_named(self, name: String) -> List<u8> ! String {
+        let i = self.find(name) else fail "no entry {name}"
+        return try self.read(i)
+    }
+}
+
+fn le16(b: List<u8>, at: usize) -> u16 {
+    if at + 2 > b.len() {
+        return 0
+    }
+    return u16.wrap(u32(b[at]) | (u32(b[at + 1]) << 8))
+}
+
+fn le32(b: List<u8>, at: usize) -> u32 {
+    if at + 4 > b.len() {
+        return 0
+    }
+    return u32(b[at]) | (u32(b[at + 1]) << 8) | (u32(b[at + 2]) << 16) | (u32(b[at + 3]) << 24)
+}
+
+fn le64(b: List<u8>, at: usize) -> u64 {
+    return u64(le32(b, at)) | (u64(le32(b, at + 4)) << 32)
+}
+
+// `len` bytes at `at` as UTF-8, as Java's `ZipFile` reads names by default.
+fn text(b: List<u8>, at: usize, len: usize) -> String? {
+    var bytes = List<u8>()
+    bytes.reserve(len)
+    for k in at..at + len {
+        bytes.push(b[k])
+    }
+    return String.from_utf8(bytes)
+}

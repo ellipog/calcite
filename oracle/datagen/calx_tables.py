@@ -4,8 +4,11 @@
     py -I oracle/datagen/calx_tables.py --check    # fail if what's committed is out of date
 
 The modules are committed, so Calcite builds without the jar. They hold only the identifiers and
-IDs the protocol needs, which every compatible server encodes. For now that's `protocol.ids`: the
-protocol version, and each state's packets in ID order.
+IDs the protocol needs, which every compatible server encodes:
+
+- `protocol.ids`: the protocol version, and each state's packets in ID order.
+- `registry.builtin`: the built-in registries and their entries in ID order.
+- `pack.pin`: where the pinned server jar comes from, and its size and SHA-1, from versions.json.
 """
 
 import argparse
@@ -73,10 +76,91 @@ def ids_module(index, packets):
     return "\n".join(lines)
 
 
-def outputs(tables):
+def short(name):
+    """An identifier as the modules write it: without `minecraft:`, or whole in another namespace."""
+    if ":" not in name:
+        raise ValueError(f"{name!r} has no namespace")
+    if '"' in name or "\\" in name or "{" in name:
+        raise ValueError(f"{name!r} can't be written in a Calx string")
+    return name[len("minecraft:"):] if name.startswith("minecraft:") else name
+
+
+def strings(names):
+    return ", ".join(f'"{n}"' for n in names)
+
+
+def builtin_module(index, registries):
+    """The text of src/registry/builtin.calx."""
+    by_id = sorted(registries.items(), key=lambda item: item[1]["id"])
+    ids = [r["id"] for _, r in by_id]
+    if ids != list(range(len(ids))):
+        raise ValueError(f"registries.json's registry IDs don't run from 0 without gaps: {ids}")
+    lines = [
+        f"/// Vanilla {index['game_version']}'s built-in registries, the ones it defines in code, and their entries in ID",
+        "/// order, so an entry's ID is its place in its list. Written by oracle/datagen/calx_tables.py from",
+        "/// registries.json (D61): don't edit it.",
+        "module registry.builtin",
+        "",
+        "/// The built-in registries, in the order of their own IDs, by name without `minecraft:`.",
+        "pub fn builtin_names() -> List<String> {",
+        f"    return [{strings(short(name) for name, _ in by_id)}]",
+        "}",
+        "",
+        "/// The entries of the registry at `index` in `builtin_names`, in ID order, by name without",
+        "/// `minecraft:` where they're in it. None for an index past the last.",
+        "pub fn builtin_entries(index: usize) -> List<String> {",
+        "    return match index {",
+    ]
+    for name, registry in by_id:
+        lines.append(f"        {registry['id']} => [{strings(short(e) for e in registry['entries'])}],")
+    lines += ["        _ => [],", "    }", "}", ""]
+    return "\n".join(lines)
+
+
+def pin_module(version, pin):
+    """The text of src/pack/pin.calx."""
+    url, sha1, size = pin["url"], pin["sha1"], int(pin["size"])
+    if not url.startswith("https://") or '"' in url or "{" in url or "\\" in url:
+        raise ValueError(f"the pinned URL {url!r} isn't an https URL Calx can hold")
+    if len(sha1) != 40 or any(c not in "0123456789abcdef" for c in sha1):
+        raise ValueError(f"the pinned SHA-1 {sha1!r} isn't 40 lowercase hex digits")
+    lines = [
+        f"/// Where Mojang's {version} server jar comes from, and its size and SHA-1, as oracle/versions.json",
+        "/// pins them (D62). Written by oracle/datagen/calx_tables.py: don't edit it.",
+        "module pack.pin",
+        "",
+        "/// The game version the jar is.",
+        "pub fn jar_version() -> String {",
+        f'    return "{version}"',
+        "}",
+        "",
+        "/// Mojang's URL for the jar.",
+        "pub fn jar_url() -> String {",
+        f'    return "{url}"',
+        "}",
+        "",
+        "/// The jar's SHA-1, in lowercase hex.",
+        "pub fn jar_sha1() -> String {",
+        f'    return "{sha1}"',
+        "}",
+        "",
+        "/// The jar's size in bytes.",
+        f"pub const JAR_SIZE: usize = {size}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def outputs(tables, version=VERSION):
     index = json.loads((tables / "index.json").read_text(encoding="utf-8"))
     packets = json.loads((tables / "packets.json").read_text(encoding="utf-8"))
-    return {CALCITE / "src" / "protocol" / "ids.calx": ids_module(index, packets)}
+    registries = json.loads((tables / "registries.json").read_text(encoding="utf-8"))
+    pins = json.loads((CALCITE / "oracle" / "versions.json").read_text(encoding="utf-8"))
+    return {
+        CALCITE / "src" / "protocol" / "ids.calx": ids_module(index, packets),
+        CALCITE / "src" / "registry" / "builtin.calx": builtin_module(index, registries),
+        CALCITE / "src" / "pack" / "pin.calx": pin_module(version, pins[version]),
+    }
 
 
 def main():
@@ -91,7 +175,7 @@ def main():
         print(f"no tables at {args.tables}: run oracle/datagen/datagen.py first", file=sys.stderr)
         return 2
     stale = []
-    for path, text in outputs(args.tables).items():
+    for path, text in outputs(args.tables, args.version).items():
         old = path.read_text(encoding="utf-8") if path.exists() else None
         if old == text:
             continue

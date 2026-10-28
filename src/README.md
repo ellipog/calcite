@@ -20,6 +20,14 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `java.properties` | `Properties`, a `.properties` file read with Java's rules for escapes, continued lines and comments | `java.util.Properties.load` |
 | `json.gson` | `JsonWriter`, compact JSON with Gson's escapes | Gson's `JsonWriter`, with `disableHtmlEscaping` |
 | `json.tree` | `Json`, a JSON value, with a strict parser, a writer and lookups | |
+| `pack.zip` | `Zip`, a zip archive in memory: the central directory, Zip64, and entries stored or deflated, each checked against its CRC-32 | `java.util.zip.ZipFile` |
+| `pack.resources` | `Pack`, a data pack's files under `data/`, and `Resources`, the packs in order, whose `list` and `stacks` give files in vanilla's order, later packs over earlier ones | `PackResources`, `MultiPackResourceManager`, `FileToIdConverter`, `KnownPack` |
+| `pack.vanilla` | `vanilla_pack`: the built-in data pack, from the jar bundled in Mojang's server jar, downloaded the first time and checked against its pins | `VanillaPackResources`, the bundler's `versions.list` |
+| `pack.pin` | Where the pinned server jar comes from, and its size and SHA-1, written by [`calx_tables.py`](../oracle/datagen/README.md#calx-modules) | |
+| `registry.builtin` | The 95 built-in registries and their entries in ID order, written by [`calx_tables.py`](../oracle/datagen/README.md#calx-modules) | `BuiltInRegistries` |
+| `registry.registry` | `Registry`, a registry's entries with their IDs and its tags, and `Tag` | `MappedRegistry`, `HolderSet.Named` |
+| `registry.tags` | `load_tags`: a registry's tags from the packs, read, merged and built in vanilla's order, with its log lines | `TagLoader`, `TagFile`, `TagEntry`, `DependencySorter` |
+| `registry.registries` | `Registries`: the synchronized registries, in the order they're sent, and the built-in ones, each with its tags | `RegistryDataLoader`, `RegistrySynchronization` |
 | `chat.component` | `Component`: text and translations with their arguments and siblings, their JSON, and `get_string`, their text | `Component`, `ComponentSerialization.CODEC`, `TranslatableContents` |
 | `chat.language` | `Language`, the text of each translation key, which the server's own text, such as its log, is made with | `Language` |
 | `resources.identifier` | `Identifier`, a namespace and a path, parsed with vanilla's rules and messages | `Identifier` |
@@ -46,6 +54,7 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `rig.frame` | The rig's frames, whose headers are JSON | |
 | `rig.rng` | The `rng` probe | |
 | `rig.collections` | The `collections` probe: Calx's Java-ordered tables against Java's and fastutil's | |
+| `rig.registries` | The `registries` probe: the vanilla data pack's registries and tags against vanilla's | |
 
 ## Random sources
 

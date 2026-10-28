@@ -302,6 +302,16 @@ On `array_deque`: `["add_first", k]` and `["add_last", k]` give nothing. `["poll
 
 An operation a collection doesn't have is an `error` status, as is a key that doesn't parse as the case's type.
 
+### `registries` (v1)
+
+What a server with only the vanilla data pack sends a client in configuration: its known packs, the synchronized registries in `registry_data`, and the tags in `update_tags`. The registries load once, as `WorldLoader.load` loads them, and are kept. Identifiers are written whole, `minecraft:stone`.
+
+| Input | Output |
+| --- | --- |
+| `{"op": "known_packs"}` | `packs`: the server's known packs in order, each `[namespace, id, version]` |
+| `{"op": "synced"}` | `registries`: each synchronized registry in the order the server sends them, `{name, entries}`, with `entries` in ID order, each `[id, sent_with_data]`. An entry from a pack the client knows goes without its data |
+| `{"op": "tags", "registry": name}` | `tags`: the registry's tags as `update_tags` sends them, by name in string order, each `[name, ids]` with the entries' IDs in the order sent. An empty list for a registry it sends no tags for |
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

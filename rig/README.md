@@ -112,6 +112,7 @@ py -I cases/rng/gen.py      # cases/rng/generated.json
 py -I cases/nbt/gen.py      # cases/nbt/limits.json
 py -I cases/math/gen.py     # cases/math, cases/strictmath and cases/mth
 py -I cases/collections/gen.py   # cases/collections/generated.json
+py -I cases/registries/gen.py    # cases/registries/configuration.json
 ```
 
 ### Blobs in case files
@@ -141,7 +142,8 @@ The generators use SplitMix64 from the given seed. A range value is `min + (max 
 
 - calx is found from the `CALX` environment variable, then `PATH`, then `../calx/build/compiler/<platform>/` beside this repository. calx finds clang itself.
 - `CALCITE_DEBUG=1` builds the adapter in debug mode, where it checks that it frees everything it allocates and exits with status 102 if not.
-- It implements `ping`, `rng` and `collections`, which pass 100% on Windows and Linux. Every other probe reports `unimplemented` until Calcite has the code behind it.
+- It implements `ping`, `rng`, `collections` and `registries`, which pass 100% on Windows and Linux. Every other probe reports `unimplemented` until Calcite has the code behind it.
+- It runs from the repository's root. `registries` reads the vanilla data pack from the pinned jar in `oracle/jars/`, which [`fetch.py`](../oracle/fetch.py) gets.
 
 The adapter's parts are in [`src/`](../src/README.md): the frames in `rig.frame`, their JSON in `json.tree`, and one module per probe.
 
@@ -176,7 +178,7 @@ The data converter and the jar fetch step have their own tests, which don't need
 py -I -m unittest discover -s oracle/datagen/tests -v
 ```
 
-CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Windows and Linux, with the oldest supported Python (3.10) and the newest. A second job checks out calx beside Calcite, builds it, runs Calcite's Calx tests (`py -I src/test/run.py`), and scores Calcite against the committed hashes with `--strict` (`P1.9`).
+CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Windows and Linux, with the oldest supported Python (3.10) and the newest. A second job checks out calx beside Calcite, builds it, runs Calcite's Calx tests (`py -I src/test/run.py`), fetches the pinned server jar, which the `registries` probe reads and which it caches, and scores Calcite against the committed hashes with `--strict` (`P1.9`).
 
 ## Found so far
 
@@ -189,4 +191,5 @@ CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Wi
 - **Block state IDs are arithmetic.** Each block's states take consecutive IDs, in block registry order, and a state's offset within its block is the mixed-radix number of its property values, with properties in name order and the last changing fastest. The data generator's report lists properties in a different order (its JSON writer puts `type` first), so the [converter](../oracle/datagen/README.md#blocksjson) sorts them itself. All 35,723 states and 1,286 blocks match the `block_state` probe.
 - **The block state parser is lenient in places.** It accepts a trailing comma (`oak_stairs[facing=east,]`), a leading zero or plus sign on a number (`note=07`, `note=+7`), and spaces around `=` and `,`. It stops at the first character it can't use, without complaint (`stone trailing` parses as stone). Values are case-sensitive (`TRUE` is rejected), and `Stone` is read as an empty name.
 - **The block state NBT reader never fails.** An unknown or malformed block name reads as air, and an unknown property, a value of the wrong type or a value out of range is skipped, leaving the default. 26.3 stores states as `{id, properties}`; the old `{Name, Properties}` form reads as air.
+- **Registry IDs and tags come out of the data pack exactly as vanilla builds them.** All 129 `registries` cases match: the 32 synchronized registries' entries in vanilla's order, and the tags of every registry the server sends, 773 in all, with their entries in vanilla's order. Entries of a data-driven registry take IDs in the order of their files' identifiers, which vanilla sorts by path and then namespace, and a tag's tags go in where they're listed, each entry once.
 - **Calx's Java-ordered tables iterate exactly as Java's do.** `JavaHashMap`, `LinkedMap`, `SortedMap`, `OpenHashMap`, their sets, `PriorityQueue` and `Deque` give the same results and the same order as `HashMap`, `LinkedHashMap`, `TreeMap`, fastutil's open tables, `PriorityQueue` and `ArrayDeque` in all 180 `collections` cases. Those cases include keys whose hashes all collide, so `HashMap`'s bins turn into trees, fastutil tables that shrink and `trim`, and removal through a priority queue's iterator.

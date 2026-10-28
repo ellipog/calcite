@@ -39,7 +39,9 @@ def main():
     built = subprocess.run(build, cwd=CALCITE, stdout=sys.stderr, stdin=subprocess.DEVNULL)
     if built.returncode != 0:
         sys.exit(f"calcite-adapter: the build failed with status {built.returncode}")
-    return subprocess.run([str(binary)]).returncode
+    # It runs from the repository's root, where probes find what they read, such as the jar in
+    # oracle/jars/.
+    return subprocess.run([str(binary)], cwd=CALCITE).returncode
 
 
 if __name__ == "__main__":

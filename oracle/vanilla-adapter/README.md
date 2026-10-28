@@ -52,6 +52,9 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `TextProbe.java` | `text` |
 | `MathProbe.java` | `math` and `strictmath` |
 | `MthProbe.java` | `mth` |
+| `BlockStateProbe.java` | `block_state` |
+| `CollectionsProbe.java` | `collections` |
+| `RegistriesProbe.java` | `registries`: the vanilla data pack's registries and tags, loaded once as `WorldLoader.load` loads them |
 
 ## Rules for probes
 
