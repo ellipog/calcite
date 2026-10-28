@@ -1,0 +1,181 @@
+/// What the server checks of a player's chat, as vanilla's play listener does: the characters a
+/// message may have, how fast messages may come, as `TickThrottler` counts them, and the window
+/// of the last 20 signed messages the player was sent, which each message says it has seen, as
+/// `LastSeenMessagesValidator` keeps it.
+module server.chat
+
+import protocol.chat.{LastSeenUpdate, MessageSignature}
+
+/// How many of the last signed messages a client tracks, vanilla's
+/// `LastSeenMessages.LAST_SEEN_MESSAGES_MAX_LENGTH`.
+pub const LAST_SEEN: usize = 20
+
+/// Whether `message` has a character chat can't, as vanilla's `isChatMessageIllegal`: a control
+/// character, `DEL` or `§`, which starts a formatting code.
+pub fn is_illegal(message: String) -> bool {
+    for i in 0..message.len() {
+        let b = message.byte_at(i)
+        if b < 32 or b == 127 {
+            return true
+        }
+        // `§` is U+00A7, which UTF-8 writes as C2 A7.
+        if b == 0xA7 and i > 0 and message.byte_at(i - 1) == 0xC2 {
+            return true
+        }
+    }
+    return false
+}
+
+/// A count of what a player did lately, vanilla's `TickThrottler`: each thing adds `step`, each
+/// tick takes 1 away, and at `threshold` it's too much, unless the threshold is 0 or less. The
+/// default is chat's with server.properties' default of 10 seconds.
+pub struct Throttler {
+    pub step: i32 = 20
+    pub threshold: i32 = 200
+    pub count: i32 = 0
+}
+
+impl Throttler {
+    /// The throttler of chat or commands, which lets a player send one a second, or a burst of
+    /// `seconds` of them, as vanilla's `TickThrottler(20, 20 * seconds)`.
+    pub fn per_second(seconds: i32) -> Throttler {
+        return Throttler { step: 20, threshold: i32.wrap(i64(seconds) * 20) }
+    }
+
+    pub fn increment(mut self) {
+        self.count = i32.wrap(i64(self.count) + i64(self.step))
+    }
+
+    pub fn tick(mut self) {
+        if self.count > 0 {
+            self.count -= 1
+        }
+    }
+
+    pub fn is_under_threshold(self) -> bool {
+        return self.threshold <= 0 or self.count < self.threshold
+    }
+}
+
+// A signed message the player was sent, and whether they've yet to say they saw it, vanilla's
+// `LastSeenTrackedEntry`.
+struct Tracked {
+    signature: MessageSignature
+    pending: bool
+}
+
+/// The window of signed messages a player was sent that their messages say they've seen,
+/// vanilla's `LastSeenMessagesValidator`: the last 20 they're to have answered for, then those
+/// they were sent since. An entry they acknowledged stays seen until the window moves past it;
+/// one they ignored is gone. A player starts with `new`'s; the default holds no window, for one
+/// who isn't in the world yet.
+pub struct LastSeenValidator {
+    tracked: Deque<Tracked?> = []
+    last_pending: MessageSignature? = none
+}
+
+impl LastSeenValidator {
+    /// A window of 20 empty places, as a player starts with.
+    pub fn new() -> LastSeenValidator {
+        var tracked = Deque<Tracked?>()
+        for _ in 0..LAST_SEEN {
+            tracked.push_last(none)
+        }
+        return LastSeenValidator { tracked: tracked, last_pending: none }
+    }
+
+    /// The player was sent `signature`, unless it's the one they were sent last.
+    pub fn add_pending(mut self, signature: MessageSignature) {
+        if let last = self.last_pending {
+            if last.bytes == signature.bytes {
+                return
+            }
+        }
+        self.tracked.push_last(some(Tracked { signature: signature.copy(), pending: true }))
+        self.last_pending = some(signature.copy())
+    }
+
+    /// How many messages the window and those after it hold.
+    pub fn tracked_count(self) -> usize {
+        return self.tracked.len()
+    }
+
+    /// Moves the window on by `offset` messages, as vanilla's `applyOffset`, or says why it
+    /// can't: it can't go back, nor past the last message sent.
+    pub fn apply_offset(mut self, offset: i32) ! String {
+        let most = i64.wrap(self.tracked.len()) - i64.wrap(LAST_SEEN)
+        if offset < 0 or i64(offset) > most {
+            fail "Advanced last seen window by {offset} messages, but expected at most {most}"
+        }
+        for _ in 0..offset {
+            _ = self.tracked.pop_first()
+        }
+    }
+
+    /// Applies what a message says the player has seen, as vanilla's `applyUpdate`, and gives
+    /// the signatures they've seen, oldest first, or says why it doesn't add up: they can't see
+    /// what wasn't sent, nor stop seeing what they saw, and the checksum, unless it's 0, is to
+    /// match.
+    pub fn apply_update(mut self, update: LastSeenUpdate) -> List<MessageSignature> ! String {
+        try self.apply_offset(update.offset)
+        // A `BitSet`'s length is its highest bit and 1.
+        var length: usize = 0
+        for bit in 0..update.acknowledged.len() * 8 {
+            if acknowledged(update, bit) {
+                length = bit + 1
+            }
+        }
+        if length > LAST_SEEN {
+            fail "Last seen update contained {length} messages, but maximum window size is {LAST_SEEN}"
+        }
+        var seen = List<MessageSignature>()
+        for i in 0..LAST_SEEN {
+            var signature: MessageSignature? = none
+            var pending = false
+            if let message = self.tracked[i] {
+                signature = some(message.signature.copy())
+                pending = message.pending
+            }
+            if acknowledged(update, i) {
+                let s = signature else fail "Last seen update acknowledged unknown or previously ignored message at index {i}"
+                seen.push(s.copy())
+                self.tracked[i] = some(Tracked { signature: s, pending: false })
+            } else {
+                if let s = signature {
+                    if not pending {
+                        fail "Last seen update ignored previously acknowledged message at index {i} and signature {s.to_string()}"
+                    }
+                }
+                self.tracked[i] = none
+            }
+        }
+        if update.checksum != 0 and update.checksum != checksum(seen) {
+            fail String("Checksum mismatch on last seen update: the client and server must have desynced")
+        }
+        return seen
+    }
+}
+
+// Whether the update's bit `i` is set, the first in the low bit of its first byte.
+fn acknowledged(update: LastSeenUpdate, i: usize) -> bool {
+    if i / 8 >= update.acknowledged.len() {
+        return false
+    }
+    return (i32(update.acknowledged[i / 8]) >> i32.wrap(i % 8)) & 1 != 0
+}
+
+/// The checksum of the signatures a player has seen, as vanilla's
+/// `LastSeenMessages.computeChecksum`: Java's `Arrays.hashCode` of each signature's bytes, folded
+/// with 31 as `List.hashCode` folds them, down to a byte that isn't 0.
+pub fn checksum(seen: List<MessageSignature>) -> i8 {
+    var c: i32 = 1
+    for s in seen {
+        var h: i32 = 1
+        for b in s.bytes {
+            h = 31 * h + i32(i8.wrap(b))
+        }
+        c = 31 * c + h
+    }
+    let byte = i8.wrap(c)
+    return if byte == 0 { 1 } else { byte }
+}

@@ -3,16 +3,17 @@
 /// configuring them and letting them into the world, as vanilla's `ServerConnectionListener`,
 /// `ServerHandshakePacketListenerImpl`, `ServerStatusPacketListenerImpl`,
 /// `ServerLoginPacketListenerImpl`, `ServerConfigurationPacketListenerImpl`,
-/// `ServerGamePacketListenerImpl` and `PlayerList` do.
+/// `ServerGamePacketListenerImpl` and `PlayerList` do, with players' chat as they handle it.
 module server.network
 
 import auth.profile.{GameProfile, is_valid_name}
 import auth.services.{JoinCheck, KeySet, Services}
 import auth.session.{Joined, server_hash}
 import auth.velocity.{channel, request, read}
-import chat.component.{Component}
+import chat.component.{ClickEvent, Component}
 import chat.language.{Language}
 import java.uuid.{Uuid}
+import protocol.chat.{ChatTypeBound, ClientboundPlayerChat, FilterMask, ServerboundChat, SignedBody}
 import protocol.codec.{Codec}
 import protocol.common.{ChatVisibility, ClientInformation, ClientboundDisconnect, ClientboundKeepAlive, ClientboundPostEffects, ClientboundResourcePackPush, ResourcePackAction, ServerboundKeepAlive}
 import protocol.configuration.{ClientboundCodeOfConduct, ClientboundFinishConfiguration, ConfigurationIn}
@@ -25,12 +26,14 @@ import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import resources.identifier.{Identifier}
+import server.chat.{LastSeenValidator, Throttler, is_illegal}
 import server.chunks.{ChunkSender, in_view, in_view_all}
 import server.configuration.{Configuration}
 import server.log.{Entry}
 import server.play.{World, display_name}
 import std.crypto.{RsaKey, random_bytes}
 import std.net.{Net, Conn, Event, NetError, Address, Ip}
+import std.time.{Timestamp}
 import world.flat.{SURFACE_Y}
 import world.item.{ItemStack}
 import world.modes.{GameType, PreviousGameType}
@@ -207,6 +210,13 @@ struct Player {
     center_z: i32 = 0
     view: i32 = 0
     sender: ChunkSender = ChunkSender()
+    // The signed messages the player was sent that their messages say they've seen, the place
+    // of the next message they're sent among all those they were, and how fast they've sent
+    // messages and commands lately.
+    last_seen: LastSeenValidator = LastSeenValidator()
+    next_chat_index: i32 = 0
+    chat_spam: Throttler = Throttler()
+    command_spam: Throttler = Throttler()
 }
 
 // A login's check with the session server. It goes on if the player leaves, as vanilla's
@@ -247,6 +257,8 @@ pub struct Network {
     world: World
     entity_ids: i32
     ticks: i32
+    // The wall clock's time, which players' messages are stamped with.
+    clock: Timestamp
     logs: List<Entry>
 }
 
@@ -264,7 +276,13 @@ impl Network {
     /// into `world`. Only an online login needs the key pair, so the first waits for it, and the
     /// server can listen while another thread makes it.
     pub fn new(net: Net, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, keys: own Receiver<RsaKey>, configuration: own Configuration, world: own World) -> Network {
-        return Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, entity_ids: 0, ticks: 0, logs: List<Entry>() }
+        return Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>() }
+    }
+
+    /// Sets the wall clock's time, which the caller reads before it hands over what happened, as
+    /// vanilla reads `Instant.now()` as it handles each message.
+    pub fn set_clock(mut self, now: Timestamp) {
+        self.clock = now
     }
 
     /// Listens on `host` and `port`, as vanilla's `startTcpServerListener`. An empty host is
@@ -1080,12 +1098,13 @@ impl Network {
         let profile = found else return
         self.entity_ids += 1
         let id = self.entity_ids
-        con.player = Player { entity_id: id, x: 0.5, y: f64(SURFACE_Y), z: 0.5 }
+        let chat_spam = Throttler.per_second(self.world.settings.chat_spam_threshold_seconds)
+        let command_spam = Throttler.per_second(self.world.settings.command_spam_threshold_seconds)
+        con.player = Player { entity_id: id, x: 0.5, y: f64(SURFACE_Y), z: 0.5, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam }
         self.logs.push(Entry.info("{profile.name}[{con.address}] logged in with entity id {id} at ({con.player.x}, {con.player.y}, {con.player.z})"))
         let mode = self.world.settings.game_type
         let spawn = SpawnInfo { dimension_type: self.world.settings.dimension_type, dimension: overworld(), seed: self.world.settings.hashed_seed, game_type: mode, previous_game_type: PreviousGameType { mode: none }, is_debug: false, is_flat: true, last_death_location: none, portal_cooldown: 0, sea_level: -63 }
-        // Vanilla enforces secure chat only once it can check players' keys.
-        let secure = self.world.settings.enforces_secure_chat and self.settings.online_mode and self.services.key_set() != none
+        let secure = self.enforces_secure_chat()
         let login = ClientboundLogin { player_id: id, hardcore: self.world.settings.hardcore, levels: [overworld()], max_players: self.world.settings.max_players, chunk_radius: self.world.settings.view_distance, simulation_distance: self.world.settings.simulation_distance, reduced_debug_info: false, show_death_screen: true, do_limited_crafting: false, spawn: spawn, online_mode: self.settings.online_mode, enforces_secure_chat: secure }
         self.send(mut con, login, State.Play)
         let difficulty = self.world.settings.difficulty
@@ -1225,10 +1244,13 @@ impl Network {
         }
     }
 
-    // A player's tick at `now`, as the play listener's `tick`: a keep-alive if one is due.
+    // A player's tick at `now`, as the play listener's `tick`: a keep-alive if one is due, then
+    // the spam counts go down.
     fn tick_play(mut self, con: mut Connection, now: u64) {
         con.player.tick_count += 1
         _ = self.keep_alive(mut con, now)
+        con.player.chat_spam.tick()
+        con.player.command_spam.tick()
     }
 
     // Sends the player the chunks due this tick, as a batch, as `sendNextChunks`.
@@ -1249,6 +1271,17 @@ impl Network {
     // configuration. False when the connection is to close.
     fn play_packet(mut self, con: mut Connection, p: PlayIn, now: u64) -> bool {
         match p {
+            PlayIn.Chat(c) => return self.chat(mut con, c),
+            PlayIn.ChatAck(a) => {
+                match con.player.last_seen.apply_offset(a.offset) {
+                    ok => return true,
+                    err(problem) => {
+                        self.chat_invalid(mut con, "Failed to validate message acknowledgement offset", problem)
+                        return false
+                    },
+                }
+            },
+            PlayIn.ChatCommand(c) => return self.chat_command(mut con, c.command),
             PlayIn.AcceptTeleportation(a) => {
                 if a.teleport_id == con.player.teleport_id {
                     if not con.player.awaiting or invalid(a.x, a.y, a.z, a.y_rot, a.x_rot) {
@@ -1291,6 +1324,165 @@ impl Network {
             PlayIn.MovePlayerPosRot(m) => return self.moved(mut con, true, m.x, m.y, m.z, true, m.y_rot, m.x_rot),
             PlayIn.MovePlayerRot(m) => return self.moved(mut con, false, 0.0, 0.0, 0.0, true, m.y_rot, m.x_rot),
             PlayIn.MovePlayerStatusOnly(_) => return self.moved(mut con, false, 0.0, 0.0, 0.0, false, 0.0, 0.0),
+        }
+    }
+
+    // A chat message, as `handleChat`: what it says the player has seen is checked, then its
+    // characters, and whether the player shows chat. Calcite doesn't read chat sessions yet, so
+    // every message is unsigned, as vanilla's `SignedMessageChain.Decoder.unsigned` decodes it
+    // for a player without one, which is refused while the server enforces secure chat.
+    // Otherwise it goes to every player, and counts toward the sender's spam.
+    fn chat(mut self, con: mut Connection, c: ServerboundChat) -> bool {
+        match con.player.last_seen.apply_update(c.last_seen) {
+            ok(_) => {},
+            err(problem) => {
+                self.chat_invalid(mut con, "Failed to validate message acknowledgements", problem)
+                return false
+            },
+        }
+        if let stays = self.refuse_chat(mut con, c.message, false) {
+            return stays
+        }
+        if self.enforces_secure_chat() {
+            let problem = Component.translatable("chat.disabled.missingProfileKey", [])
+            self.logs.push(Entry.warn("Failed to update secure chat state for {player_name(con)}: '{problem.get_string(self.lang)}'"))
+            self.system_message(mut con, problem.colored("red"))
+            return true
+        }
+        self.broadcast_chat(mut con, c.message)
+        return self.spam(mut con, false)
+    }
+
+    // A command, as `handleChatCommand`, once its characters are checked. Calcite has no
+    // commands yet, so each is unknown, as vanilla's dispatcher finds a command it doesn't have.
+    fn chat_command(mut self, con: mut Connection, command: String) -> bool {
+        if let stays = self.refuse_chat(mut con, command, true) {
+            return stays
+        }
+        self.unknown_command(mut con, command)
+        return self.spam(mut con, true)
+    }
+
+    // What vanilla's `tryHandleChat` refuses: a message with a character chat can't have ends
+    // the connection, and a player who hides chat is told they can't send it. `none` lets it
+    // through; otherwise it's whether the connection stays open.
+    fn refuse_chat(mut self, con: mut Connection, message: String, command: bool) -> bool? {
+        if is_illegal(message) {
+            self.disconnect(mut con, Component.translatable("multiplayer.disconnect.illegal_characters", []))
+            return some(false)
+        }
+        if not command and con.information.chat_visibility == ChatVisibility.Hidden {
+            let content = Component.translatable("chat.disabled.options", []).colored("red")
+            self.send(mut con, ClientboundSystemChat { content: content, overlay: false }, State.Play)
+            return some(true)
+        }
+        return none
+    }
+
+    // What the player's last-seen messages couldn't take, as vanilla logs a
+    // `LastSeenMessagesValidator.ValidationException` before it ends the connection.
+    fn chat_invalid(mut self, con: mut Connection, what: String, problem: String) {
+        self.logs.push(Entry.error("{what} from {player_name(con)}\nnet.minecraft.network.chat.LastSeenMessagesValidator$ValidationException: {problem}"))
+        self.disconnect(mut con, Component.translatable("multiplayer.disconnect.chat_validation_failed", []))
+    }
+
+    // Whether the server enforces secure chat, which vanilla does only once it can check
+    // players' keys, with Mojang's services in online mode.
+    fn enforces_secure_chat(self) -> bool {
+        return self.world.settings.enforces_secure_chat and self.settings.online_mode and self.services.key_set() != none
+    }
+
+    // A message or command counts toward the player's spam, as `detectRateSpam`: too many too
+    // fast ends the connection. False when it does.
+    fn spam(mut self, con: mut Connection, command: bool) -> bool {
+        var under = false
+        if command {
+            con.player.command_spam.increment()
+            under = con.player.command_spam.is_under_threshold()
+        } else {
+            con.player.chat_spam.increment()
+            under = con.player.chat_spam.is_under_threshold()
+        }
+        // Calcite has no operators yet, whom vanilla lets spam.
+        if not under {
+            self.disconnect(mut con, Component.translatable("disconnect.spam", []))
+            return false
+        }
+        return true
+    }
+
+    // An unsigned message from the player in `con` to everyone, as `PlayerList.broadcastChatMessage`
+    // sends it: logged as not secure, then sent as `minecraft:chat`, from the player's name, to
+    // each player who shows all chat, the sender too.
+    fn broadcast_chat(mut self, con: mut Connection, message: String) {
+        var found: GameProfile? = none
+        if let p = con.profile {
+            found = some(p.copy())
+        }
+        let profile = found else return
+        let sender = display_name(profile)
+        let shown = self.world.chat_decoration().decorate(Component.literal(message), sender, none)
+        self.logs.push(Entry.info("[Not Secure] {shown.get_string(self.lang)}"))
+        // An unsigned message, as `PlayerChatMessage.unsigned` makes it: the first of its sender's,
+        // stamped with the server's clock, with no salt and nothing seen.
+        let body = SignedBody { content: message.copy(), time_stamp: self.clock.unix_ms, salt: 0, last_seen: [] }
+        let chat = ChatTypeBound { chat_type: self.world.chat, name: sender, target_name: none }
+        for i in 0..self.connections.len() {
+            if not self.playing(i) {
+                continue
+            }
+            self.connections.push(none)
+            var other = self.connections.swap_remove(i) else continue
+            self.player_chat(mut other, profile.id, body, chat)
+            self.connections[i] = some(other)
+        }
+        self.player_chat(mut con, profile.id, body, chat)
+    }
+
+    // A player's message to the player in `con`, if they show all chat, as
+    // `ServerPlayer.sendChatMessage`, which counts it among those they were sent.
+    fn player_chat(mut self, con: mut Connection, sender: Uuid, body: SignedBody, chat: ChatTypeBound) {
+        if con.information.chat_visibility != ChatVisibility.Full {
+            return
+        }
+        let index = con.player.next_chat_index
+        con.player.next_chat_index += 1
+        let packet = ClientboundPlayerChat { global_index: index, sender: sender, index: 0, signature: none, body: body.copy(), unsigned_content: none, filter_mask: FilterMask.PassThrough, chat_type: chat.copy() }
+        self.send(mut con, packet, State.Play)
+    }
+
+    // What vanilla's `Commands.finishParsing` tells the player of a command it has no node for:
+    // that it's unknown, then the command from where it went wrong, which is its start, with a
+    // click that puts it back in the chat box.
+    fn unknown_command(mut self, con: mut Connection, command: String) {
+        self.failure(mut con, Component.translatable("command.unknown.command", []))
+        var context = Component.empty().colored("gray")
+        context.style.click_event = some(ClickEvent.SuggestCommand("/{command}"))
+        context.extra.push(Component.literal(""))
+        if not command.is_empty() {
+            var rest = Component.literal(command).colored("red")
+            rest.style.underlined = some(true)
+            context.extra.push(rest)
+        }
+        var here = Component.translatable("command.context.here", []).colored("red")
+        here.style.italic = some(true)
+        context.extra.push(here)
+        self.failure(mut con, context)
+    }
+
+    // A command's failure, as `CommandSourceStack.sendFailure` sends it: in red, as a system
+    // message.
+    fn failure(mut self, con: mut Connection, message: own Component) {
+        var c = Component.empty().colored("red")
+        c.extra.push(message)
+        self.system_message(mut con, c)
+    }
+
+    // A message from the server to one player, as `ServerPlayer.sendSystemMessage`, which a
+    // player who hides chat doesn't get.
+    fn system_message(mut self, con: mut Connection, message: own Component) {
+        if con.information.chat_visibility != ChatVisibility.Hidden {
+            self.send(mut con, ClientboundSystemChat { content: message, overlay: false }, State.Play)
         }
     }
 
@@ -1541,6 +1733,14 @@ fn max(a: i32, b: i32) -> i32 {
 
 // The player as the login listener's `getUserName` gives them: the name they gave and the
 // address, or the address alone before the name came.
+// The player's name, as vanilla's `getPlainTextName` gives it.
+fn player_name(con: Connection) -> String {
+    if let p = con.profile {
+        return p.name.copy()
+    }
+    return String()
+}
+
 fn user(con: Connection) -> String {
     if let n = con.name {
         return "{n} ({con.address})"
