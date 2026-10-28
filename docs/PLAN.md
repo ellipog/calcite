@@ -184,10 +184,10 @@ Build the smallest Calx that can run a tick loop and talk to C, written from zer
 
 **Done when**
 
-- [ ] **G3.1** RNG probes are 100% bit-exact against vanilla
-- [ ] **G3.2** The tick-loop benchmark runs within about 10% of the Rust version on both platforms. If it doesn't, follow D37 before going further.
-- [ ] **G3.3** Every shipped language feature has a reference page, and every example in the docs passes in CI
-- [ ] **G3.4** On the reference machine, `calx run` on a small program takes under half a second from a cold cache and under 50 ms when nothing changed, and changing one module of the benchmark rebuilds it in debug mode in under a second
+- [x] **G3.1** RNG probes are 100% bit-exact against vanilla
+- [x] **G3.2** The tick-loop benchmark runs within about 10% of the Rust version on both platforms. If it doesn't, follow D37 before going further.
+- [x] **G3.3** Every shipped language feature has a reference page, and every example in the docs passes in CI
+- [x] **G3.4** On the reference machine, `calx run` on a small program takes under half a second from a cold cache and under 50 ms when nothing changed, and changing one module of the benchmark rebuilds it in debug mode in under a second
 
 ## Phase 4: Protocol and a flat world
 
