@@ -23,4 +23,4 @@ Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calc
 
 ## License
 
-MIT. Calcite contains no Mojang code or assets. It downloads the official server jar from Mojang and reads vanilla's data from it.
+MIT. Calcite contains no Mojang code or assets. It reads vanilla's data from Mojang's official client jar: from the game's copy if it's installed, or else by downloading just the part of the jar that holds the data, the first time it starts.

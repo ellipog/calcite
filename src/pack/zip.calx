@@ -1,9 +1,10 @@
 /// Zip archives, such as Mojang's server jar and the jar bundled in it, read from memory as Java's
 /// `ZipFile` reads them: the central directory at the end, Zip64 where an archive needs it, and
-/// entries stored or deflated, each checked against its CRC-32.
+/// entries stored or deflated, each checked against its CRC-32. A stretch of an archive, without
+/// the central directory, is read file by file from its start, as Java's `ZipInputStream` reads.
 module pack.zip
 
-import std.zlib.{Format, crc32, decompress_into}
+import std.zlib.{Format, crc32, decompress_into, decompress_stream}
 
 /// A file in an archive.
 pub struct Entry {
@@ -16,6 +17,8 @@ pub struct Entry {
     compressed: usize
     // Where its local header starts.
     header: usize
+    // Where in the archive's `inflated` its bytes are, if they were inflated to find its end.
+    inflated: usize?
 }
 
 /// An archive, which holds its bytes.
@@ -23,6 +26,8 @@ pub struct Zip {
     bytes: List<u8>
     files: List<Entry>
     by_name: Map<String, usize>
+    // The files that were inflated as they were walked, one after another.
+    inflated: List<u8>
 }
 
 // The records' signatures.
@@ -31,6 +36,7 @@ const END64: u32 = 0x06064b50
 const LOCATOR64: u32 = 0x07064b50
 const CENTRAL: u32 = 0x02014b50
 const LOCAL: u32 = 0x04034b50
+const DESCRIPTOR: u32 = 0x08074b50
 
 impl Zip {
     /// The archive in `bytes`, or why it can't be read.
@@ -141,10 +147,93 @@ impl Zip {
             }
             let name = text(bytes, p + 46, name_len) else fail String("invalid CEN header (bad entry name)")
             by_name.insert(name.copy(), files.len())
-            files.push(Entry { name: name, size: usize.wrap(size), method: method, crc: le32(bytes, p + 16), compressed: usize.wrap(compressed), header: usize.wrap(header) })
+            files.push(Entry { name: name, size: usize.wrap(size), method: method, crc: le32(bytes, p + 16), compressed: usize.wrap(compressed), header: usize.wrap(header), inflated: none })
             p = next
         }
-        return Zip { bytes: bytes, files: files, by_name: by_name }
+        return Zip { bytes: bytes, files: files, by_name: by_name, inflated: [] }
+    }
+
+    /// The files in `bytes`, read from its start one after another until it ends, or why they
+    /// can't be: each a local header, its data, and the data descriptor after it if it has one,
+    /// as a stretch of an archive without its central directory holds them. A deflated file whose
+    /// sizes are only in its descriptor is inflated to find where it ends, and kept, so reading it
+    /// costs a copy, but no more inflating. Its CRC-32 is checked when it's read.
+    pub fn walk(bytes: own List<u8>) -> Zip ! String {
+        let n = bytes.len()
+        var files = List<Entry>()
+        var by_name = Map<String, usize>()
+        var inflated = List<u8>()
+        var at: usize = 0
+        while at < n {
+            if at + 30 > n or le32(bytes, at) != LOCAL {
+                fail "invalid LOC header (bad signature) at {at}"
+            }
+            let flags = le16(bytes, at + 6)
+            if flags & 1 != 0 {
+                fail "invalid LOC header (encrypted entry) at {at}"
+            }
+            let method = le16(bytes, at + 8)
+            var crc = le32(bytes, at + 14)
+            var compressed = u64(le32(bytes, at + 18))
+            var size = u64(le32(bytes, at + 22))
+            let name_len = usize(le16(bytes, at + 26))
+            let extra_len = usize(le16(bytes, at + 28))
+            let start = at + 30 + name_len + extra_len
+            if start > n {
+                fail "invalid LOC header (bad header size) at {at}"
+            }
+            let name = text(bytes, at + 30, name_len) else fail "invalid LOC header (bad entry name) at {at}"
+            // A local header's Zip64 field holds both sizes, the whole size first.
+            var x = at + 30 + name_len
+            while x + 4 <= start {
+                let len = usize(le16(bytes, x + 2))
+                if x + 4 + len > start {
+                    break
+                }
+                if le16(bytes, x) == 1 and len >= 16 and (size == 0xFFFFFFFF or compressed == 0xFFFFFFFF) {
+                    size = le64(bytes, x + 4)
+                    compressed = le64(bytes, x + 12)
+                }
+                x += 4 + len
+            }
+            var kept: usize? = none
+            var next: usize = 0
+            if flags & 8 != 0 {
+                if method != 8 {
+                    fail "invalid LOC header (stored entry with a data descriptor) in {name}"
+                }
+                let from = inflated.len()
+                // Deflate makes at most about 1,032 bytes of each byte it reads.
+                let end = match decompress_stream(bytes, start, n, Format.Raw, (n - start) * 1032 + 1024, mut inflated) {
+                    ok(e) => e,
+                    err(_) => fail "invalid entry compressed data in {name}",
+                }
+                let used = u64(end - start)
+                let made = u64(inflated.len() - from)
+                // The descriptor's signature is optional, and Zip64 makes its sizes 8 bytes.
+                let d = if le32(bytes, end) == DESCRIPTOR { end + 4 } else { end }
+                if d + 12 <= n and u64(le32(bytes, d + 4)) == used and u64(le32(bytes, d + 8)) == made {
+                    next = d + 12
+                } else if d + 20 <= n and le64(bytes, d + 4) == used and le64(bytes, d + 12) == made {
+                    next = d + 20
+                } else {
+                    fail "invalid data descriptor in {name}"
+                }
+                crc = le32(bytes, d)
+                compressed = used
+                size = made
+                kept = some(from)
+            } else {
+                if compressed > u64(n - start) or size > compressed * 1032 + 1024 {
+                    fail "invalid LOC header (bad entry size) in {name}"
+                }
+                next = start + usize.wrap(compressed)
+            }
+            by_name.insert(name.copy(), files.len())
+            files.push(Entry { name: name, size: usize.wrap(size), method: method, crc: crc, compressed: usize.wrap(compressed), header: at, inflated: kept })
+            at = next
+        }
+        return Zip { bytes: bytes, files: files, by_name: by_name, inflated: inflated }
     }
 
     /// Its files, in the order the central directory lists them.
@@ -173,6 +262,17 @@ impl Zip {
         let size = self.files[i].size
         let compressed = self.files[i].compressed
         let method = self.files[i].method
+        if let from = self.files[i].inflated {
+            var out = List<u8>()
+            out.reserve(size)
+            for k in from..from + size {
+                out.push(self.inflated[k])
+            }
+            if crc32(out) != self.files[i].crc {
+                fail "invalid entry CRC in {self.files[i].name}"
+            }
+            return out
+        }
         let n = self.bytes.len()
         if header + 30 > n or le32(self.bytes, header) != LOCAL {
             fail "invalid LOC header (bad signature) in {self.files[i].name}"

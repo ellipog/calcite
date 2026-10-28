@@ -86,7 +86,9 @@ class BuiltinModule(unittest.TestCase):
 
 
 class PinModule(unittest.TestCase):
-    PIN = {"url": "https://example.com/server.jar", "sha1": "0123456789abcdef0123456789abcdef01234567", "size": 12}
+    PIN = {"url": "https://example.com/server.jar", "sha1": "0123456789abcdef0123456789abcdef01234567", "size": 12,
+           "client": {"url": "https://example.com/client.jar", "sha1": "89abcdef0123456789abcdef0123456789abcdef", "size": 40,
+                      "data": {"offset": 5, "length": 30, "sha256": "ab" * 32}}}
 
     def test_writes_the_pin(self):
         text = calx_tables.pin_module("1.0", self.PIN)
@@ -94,12 +96,19 @@ class PinModule(unittest.TestCase):
         self.assertIn('    return "0123456789abcdef0123456789abcdef01234567"\n', text)
         self.assertIn("pub const JAR_SIZE: usize = 12\n", text)
         self.assertIn('    return "1.0"\n', text)
+        self.assertIn('    return "https://example.com/client.jar"\n', text)
+        self.assertIn("pub const CLIENT_SIZE: u64 = 40\n", text)
+        self.assertIn("pub const DATA_OFFSET: u64 = 5\npub const DATA_LENGTH: usize = 30\n", text)
+        self.assertIn('    return "' + "ab" * 32 + '"\n', text)
 
     def test_rejects_a_bad_pin(self):
         with self.assertRaisesRegex(ValueError, "https URL"):
             calx_tables.pin_module("1.0", dict(self.PIN, url="http://example.com/x"))
         with self.assertRaisesRegex(ValueError, "40 lowercase hex"):
             calx_tables.pin_module("1.0", dict(self.PIN, sha1="ABC"))
+        client = dict(self.PIN["client"], data=dict(self.PIN["client"]["data"], sha256="AB"))
+        with self.assertRaisesRegex(ValueError, "64 lowercase hex"):
+            calx_tables.pin_module("1.0", dict(self.PIN, client=client))
 
 
 class BlocksModule(unittest.TestCase):

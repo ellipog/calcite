@@ -5,8 +5,10 @@
 ///     calx run --release src/calcite.calx
 ///
 /// It runs in the folder it's started from, which holds server.properties and server-icon.png,
-/// as vanilla's does, and calcite.properties, Calcite's own settings. The first time, it
-/// downloads Mojang's server jar, for the data pack in it, to cache/. As with vanilla's `java -D...`, `-Dminecraft.api.env=staging` or
+/// as vanilla's does, and calcite.properties, Calcite's own settings. The first time, it reads the
+/// vanilla data from the game's client jar, if the game is installed, or else downloads that part
+/// of the jar, and keeps it in cache/, with what it makes of it, which later starts read instead
+/// (D140). As with vanilla's `java -D...`, `-Dminecraft.api.env=staging` or
 /// `-Dminecraft.api.discovery.host=URL` on its command line picks the Mojang services it uses.
 module calcite
 
@@ -14,14 +16,15 @@ import auth.services.{Environment, Services}
 import chat.component.{Component}
 import chat.language.{Language}
 import pack.resources.{Pack, Resources}
-import pack.vanilla.{jar_path, vanilla_language, vanilla_pack}
+import pack.vanilla.{data_path, vanilla_data, vanilla_language}
 import protocol.ids.{PROTOCOL_VERSION, game_version}
 import registry.registries.{Registries}
 import resources.identifier.{Identifier}
+import server.boot.{Boot, cache_key, cache_path, load_boot, save_boot}
 import server.config.{CalciteConfig, default_text}
 import server.configuration.{CodeOfConduct, Configuration, ResourcePack, read_codes, resource_pack, server_links}
 import server.log.{Entry, Level, log}
-import server.network.{Network, StatusInfo, LoginSettings}
+import server.network.{LoginSettings, Network, StatusInfo}
 import server.play.{World}
 import server.properties.{ServerProperties, load}
 import server.status.{ServerStatus, check_icon}
@@ -29,7 +32,20 @@ import std.crypto.{RsaKey}
 import std.env.{args}
 import std.fs.{is_file, read, write}
 import std.net.{Net, Event, NetError}
+import std.thread.{Task}
 import std.time.{Instant}
+
+// Makes the server's key pair, on its own thread, so the server needn't wait for it to listen.
+struct KeyMaker {
+    out: Sender<RsaKey>
+}
+
+impl Task for KeyMaker {
+    fn run(own self) {
+        var out = self.out
+        out.send(RsaKey.generate(1024))
+    }
+}
 
 // The thread vanilla's lines name: `main` until the server starts, then `Server thread`.
 fn main_log(e: Entry) {
@@ -144,15 +160,22 @@ fn system_property(arguments: List<String>, name: String) -> String? {
     return value
 }
 
-// What configuration sends every player, from the data packs: so far the vanilla pack alone,
-// from Mojang's server jar, which is downloaded the first time. They load before the server
-// starts, as vanilla's `Main` loads them, and what goes wrong stops it, as there. Then the
-// server's links and its code of conduct, which vanilla's `DedicatedServer` reads as it's made,
-// the resource pack it offers, from server.properties. The server's language, which vanilla's
-// `Language` reads from the jar as it starts, comes from the same jar, into `language`.
-fn load_configuration(props: ServerProperties, offer: own ResourcePack?, language: mut Language, world: mut World?) -> Configuration? {
+// What the data packs make: so far from the vanilla pack alone, from the stretch of Mojang's
+// client jar that holds it. They load before the server starts, as vanilla's `Main` loads them,
+// and what goes wrong stops it, as there, with what it logged. The server's language, which
+// vanilla's `Language` reads from its jar as it starts, comes from the same data. What they make
+// is kept in the boot cache, which later starts with the same build and data read instead, with
+// the lines loading them logged, so they show as they did (D140).
+fn load_data() -> Boot? {
+    let key = cache_key()
+    if let boot = load_boot(cache_path(), key) {
+        for e in boot.logs {
+            main_log(e)
+        }
+        return some(boot)
+    }
     var lines = List<Entry>()
-    let pack = match vanilla_pack(jar_path(), true, mut lines) {
+    let pack = match vanilla_data(data_path(), mut lines) {
         ok(p) => p,
         err(message) => {
             for e in lines {
@@ -162,10 +185,14 @@ fn load_configuration(props: ServerProperties, offer: own ResourcePack?, languag
             return none
         },
     }
-    match vanilla_language(pack, mut lines) {
-        ok(l) => language = l,
+    for e in lines {
+        main_log(e)
+    }
+    var made = List<Entry>()
+    let language = match vanilla_language(pack, mut made) {
+        ok(l) => l,
         err(message) => {
-            for e in lines {
+            for e in made {
                 main_log(e)
             }
             log("main", Level.Error, "Failed to start the minecraft server: {message}")
@@ -174,14 +201,29 @@ fn load_configuration(props: ServerProperties, offer: own ResourcePack?, languag
     }
     let packs: List<Pack> = [pack]
     let resources = Resources.new(packs)
-    let loaded = Registries.load(resources, mut lines)
-    for e in lines {
+    let loaded = Registries.load(resources, mut made)
+    for e in made {
         main_log(e)
     }
     let registries = loaded else {
         log("main", Level.Warn, "Failed to load datapacks, can't proceed with server load. You can either fix your datapacks or reset to vanilla with --safeMode")
         return none
     }
+    let boot = Boot { language: language, registries: registries, packs: resources.pack_info(), logs: made }
+    match save_boot(cache_path(), key, boot) {
+        ok => {},
+        err(message) => log("main", Level.Warn, message),
+    }
+    return some(boot)
+}
+
+// What configuration sends every player, from the data packs, the server's language, and its
+// world. Then the server's links and its code of conduct, which vanilla's `DedicatedServer`
+// reads as it's made, the resource pack it offers, from server.properties.
+fn load_configuration(props: ServerProperties, offer: own ResourcePack?, language: mut Language, world: mut World?) -> Configuration? {
+    let boot = load_data() else return none
+    language = boot.language
+    let registries = boot.registries
     var warnings = List<Entry>()
     let links = server_links(props, mut warnings)
     for e in warnings {
@@ -205,7 +247,7 @@ fn load_configuration(props: ServerProperties, offer: own ResourcePack?, languag
             return none
         },
     }
-    var configuration = Configuration.new("calcite", links, features, registries, resources.pack_info())
+    var configuration = Configuration.new("calcite", links, features, registries, boot.packs)
     configuration.codes = codes
     configuration.pack = offer
     return some(configuration)
@@ -276,9 +318,12 @@ fn main() {
         prevent_proxy_connections: props.prevent_proxy_connections,
         velocity_secret: if config.velocity_forwarding { some(config.velocity_secret.copy()) } else { none },
     }
+    // Vanilla makes the key pair here, before it listens. Calcite starts making it, and lets the
+    // first online login wait for it.
     info("Generating keypair")
-    let key = RsaKey.generate(1024)
-    var network = Network.new(net, status_info(props, none), settings, language, services, key, configuration, world)
+    let keys = Receiver<RsaKey>()
+    _ = unsafe { Thread.spawn(KeyMaker { out: keys.sender() }) }
+    var network = Network.new(net, status_info(props, none), settings, language, services, keys, configuration, world)
     let host = if props.server_ip.is_empty() { String("*") } else { props.server_ip.copy() }
     info("Starting Minecraft server on {host}:{props.server_port}")
     let port = u16.try_from(props.server_port) ?? 0

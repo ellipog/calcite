@@ -165,9 +165,17 @@ def pin_module(version, pin):
         raise ValueError(f"the pinned URL {url!r} isn't an https URL Calx can hold")
     if len(sha1) != 40 or any(c not in "0123456789abcdef" for c in sha1):
         raise ValueError(f"the pinned SHA-1 {sha1!r} isn't 40 lowercase hex digits")
+    client = pin["client"]
+    data = client["data"]
+    client_url, data_sha256 = client["url"], data["sha256"]
+    if not client_url.startswith("https://") or '"' in client_url or "{" in client_url or "\\" in client_url:
+        raise ValueError(f"the pinned client URL {client_url!r} isn't an https URL Calx can hold")
+    if len(data_sha256) != 64 or any(c not in "0123456789abcdef" for c in data_sha256):
+        raise ValueError(f"the pinned data SHA-256 {data_sha256!r} isn't 64 lowercase hex digits")
     lines = [
-        f"/// Where Mojang's {version} server jar comes from, and its size and SHA-1, as oracle/versions.json",
-        "/// pins them (D62). Written by oracle/datagen/calx_tables.py: don't edit it.",
+        f"/// Where Mojang's {version} server jar comes from, and its size and SHA-1, and where the vanilla",
+        "/// data is in the client jar, as oracle/versions.json pins them (D62, D140). Written by",
+        "/// oracle/datagen/calx_tables.py: don't edit it.",
         "module pack.pin",
         "",
         "/// The game version the jar is.",
@@ -187,6 +195,25 @@ def pin_module(version, pin):
         "",
         "/// The jar's size in bytes.",
         f"pub const JAR_SIZE: usize = {size}",
+        "",
+        "/// Mojang's URL for the client jar, which holds the vanilla data as the server jar does, but",
+        "/// with each file compressed on its own, so a stretch of it can be read alone.",
+        "pub fn client_url() -> String {",
+        f'    return "{client_url}"',
+        "}",
+        "",
+        "/// The client jar's size in bytes.",
+        f"pub const CLIENT_SIZE: u64 = {int(client['size'])}",
+        "",
+        "/// Where in the client jar the vanilla data is: from the local header of the first file",
+        "/// Calcite reads, data/ and the two language files, to the end of the last.",
+        f"pub const DATA_OFFSET: u64 = {int(data['offset'])}",
+        f"pub const DATA_LENGTH: usize = {int(data['length'])}",
+        "",
+        "/// The SHA-256 of that stretch, in lowercase hex.",
+        "pub fn data_sha256() -> String {",
+        f'    return "{data_sha256}"',
+        "}",
         "",
     ]
     return "\n".join(lines)

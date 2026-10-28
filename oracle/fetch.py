@@ -1,4 +1,5 @@
-"""Fetches Mojang's server jar for a game version and checks it against a pinned SHA-1 (D30, P2.4).
+"""Fetches Mojang's server jar for a game version and checks it against a pinned SHA-1 (D30, P2.4),
+and pins the stretch of the client jar that holds the vanilla data, which Calcite reads (D140).
 
     py -I oracle/fetch.py [--version 26.3]           download if missing, then verify
     py -I oracle/fetch.py [--version 26.3] --check   verify only, never download
@@ -9,7 +10,9 @@ The jar goes to oracle/jars/server-<version>.jar, which is gitignored: nothing f
 committed. What is committed is oracle/versions.json, the jar's URL, size and SHA-1 per version,
 so every checkout builds against the same bytes and a jar that's already there is checked offline.
 Pinning reads Mojang's version manifest, then the version's metadata, checking the SHA-1 the
-manifest gives for it.
+manifest gives for it. It pins the client jar too, which it downloads to
+oracle/jars/client-<version>.jar, and the stretch of it Calcite reads: from the first file it
+needs, data/ and the two language files, to the end of the last, with that stretch's SHA-256.
 
 The vanilla adapter's build and the data generator step both call ensure(); so will Calcite's build.
 """
@@ -18,8 +21,10 @@ import argparse
 import hashlib
 import json
 import os
+import struct
 import sys
 import urllib.request
+import zipfile
 from pathlib import Path
 
 MANIFEST = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -49,6 +54,40 @@ def jar_path(version):
     return JARS / f"server-{version}.jar"
 
 
+def client_path(version):
+    return JARS / f"client-{version}.jar"
+
+
+# The files Calcite reads from the vanilla data: the data pack and the server's language.
+LANGUAGE = ("assets/minecraft/lang/en_us.json", "assets/minecraft/lang/deprecated.json")
+
+
+def wanted(name):
+    return name.startswith("data/") or name in LANGUAGE
+
+
+def data_stretch(jar):
+    """{offset, length, sha256} of the bytes of the jar from the first local header of a file
+    Calcite reads to the end of the last one's data, data descriptor included."""
+    raw = Path(jar).read_bytes()
+    first, end = None, 0
+    for info in zipfile.ZipFile(jar).infolist():
+        if not wanted(info.filename):
+            continue
+        at = info.header_offset
+        sig, _, flags, _, _, _, _, _, _, n, m = struct.unpack("<IHHHHHIIIHH", raw[at:at + 30])
+        if sig != 0x04034B50:
+            sys.exit(f"fetch: {info.filename} has no local header at {at}")
+        stop = at + 30 + n + m + info.compress_size
+        if flags & 8:
+            stop += 16 if raw[stop:stop + 4] == b"PK\x07\x08" else 12
+        first = at if first is None else min(first, at)
+        end = max(end, stop)
+    if first is None:
+        sys.exit(f"fetch: {jar} holds none of the vanilla data")
+    return {"offset": first, "length": end - first, "sha256": hashlib.sha256(raw[first:end]).hexdigest()}
+
+
 def lookup(version):
     """The server jar's {sha1, size, url} from Mojang's manifest, with the metadata's SHA-1 checked."""
     manifest = json.loads(get(MANIFEST))
@@ -58,15 +97,36 @@ def lookup(version):
     meta = get(entry["url"])
     if hashlib.sha1(meta).hexdigest() != entry["sha1"]:
         sys.exit(f"fetch: {version}'s metadata doesn't match the manifest's SHA-1")
-    server = json.loads(meta).get("downloads", {}).get("server")
-    if server is None:
-        sys.exit(f"fetch: version {version} has no server download")
-    return {"sha1": server["sha1"], "size": server["size"], "url": server["url"]}
+    downloads = json.loads(meta).get("downloads", {})
+    server, client = downloads.get("server"), downloads.get("client")
+    if server is None or client is None:
+        sys.exit(f"fetch: version {version} has no server or no client download")
+    return {"sha1": server["sha1"], "size": server["size"], "url": server["url"],
+            "client": {"sha1": client["sha1"], "size": client["size"], "url": client["url"]}}
+
+
+def ensure_client(version, client):
+    """The path of the version's client jar, checked against `client`'s SHA-1, downloading it if
+    it isn't there."""
+    jar = client_path(version)
+    if jar.is_file() and file_sha1(jar) == client["sha1"]:
+        return jar
+    print(f"fetch: downloading {client['url']} ({client['size']:,} bytes)", file=sys.stderr)
+    data = get(client["url"])
+    if len(data) != client["size"] or hashlib.sha1(data).hexdigest() != client["sha1"]:
+        sys.exit("fetch: the client download doesn't match its size and SHA-1")
+    JARS.mkdir(parents=True, exist_ok=True)
+    tmp = jar.with_suffix(".jar.tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, jar)
+    return jar
 
 
 def pin(version):
     all_pins = pins()
     all_pins[version] = lookup(version)
+    client = all_pins[version]["client"]
+    client["data"] = data_stretch(ensure_client(version, client))
     VERSIONS.write_text(json.dumps(all_pins, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n")
     print(f"fetch: pinned {version} to SHA-1 {all_pins[version]['sha1']} in {VERSIONS.name}")
 

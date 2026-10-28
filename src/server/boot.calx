@@ -1,0 +1,238 @@
+/// The boot cache: what the server makes of the data packs as it starts, kept in cache/boot.bin
+/// so the next start reads that instead of the packs (D140). It holds the server's language, the
+/// registries with their tags, the packs a client may know, and the lines loading them logged,
+/// which are logged again as if they'd been made, so a start from the cache looks like any other.
+///
+/// The file starts with a key that names everything it was made from: the build of Calcite that
+/// wrote it, as `std.build.build_id` gives it, and the SHA-256 of the vanilla data. A cache with
+/// any other key, or that can't be read, is ignored and made again, so a new build, a new pin or
+/// a broken file costs one slow start, never a wrong one. It's written beside its path and moved
+/// there, so a server stopped halfway leaves none.
+module server.boot
+
+import chat.language.{Language}
+import pack.pin.{data_sha256}
+import pack.resources.{KnownPack}
+import protocol.wire.{DecodeError, Reader, Writer}
+import registry.registries.{Registries}
+import registry.registry.{Registry, Tag}
+import resources.identifier.{Identifier}
+import server.log.{Entry, Level}
+import std.build.{build_id}
+import std.fs.{is_file, make_dir_all, read, rename, write}
+
+/// What the server makes of the data packs as it starts.
+pub struct Boot {
+    pub language: Language
+    pub registries: Registries
+    /// Each pack the data came from, with what a client may know it as.
+    pub packs: List<KnownPack?>
+    /// What loading them logged, which isn't the server's own lines on where it got them.
+    pub logs: List<Entry>
+}
+
+/// Where the server keeps the cache, in the folder it runs in.
+pub fn cache_path() -> String {
+    return String("cache/boot.bin")
+}
+
+/// The key of a cache made by this build from the pinned vanilla data.
+pub fn cache_key() -> String {
+    return "{build_id()} {data_sha256()}"
+}
+
+// The first bytes of the file, which say what it is, then the version of what follows them.
+fn magic() -> String {
+    return String("Calcite boot cache")
+}
+
+const FORMAT: i32 = 1
+
+// The longest string the cache holds, in UTF-16 units: far more than any text in the data.
+const LONGEST: i32 = 16777216
+
+/// The cache at `path`, if it's there, can be read, and has `key`.
+pub fn load_boot(path: String, key: String) -> Boot? {
+    if not is_file(path) {
+        return none
+    }
+    let bytes = match read(path) {
+        ok(b) => b,
+        err(_) => return none,
+    }
+    return match decode(bytes, key) {
+        ok(b) => b,
+        err(_) => none,
+    }
+}
+
+/// Writes `boot` to `path` with `key`, or says why it couldn't.
+pub fn save_boot(path: String, key: String, boot: Boot) ! String {
+    var parent = String()
+    for i in 0..path.len() {
+        if path.byte_at(i) == 47 {
+            parent = path[..i]
+        }
+    }
+    if not parent.is_empty() {
+        match make_dir_all(parent) {
+            ok => {},
+            err(e) => fail "Couldn't make {parent}: {e}",
+        }
+    }
+    let part = "{path}.part"
+    match write(part, encode(boot, key)) {
+        ok => {},
+        err(e) => fail "Couldn't write {part}: {e}",
+    }
+    match rename(part, path) {
+        ok => {},
+        err(e) => fail "Couldn't write {path}: {e}",
+    }
+}
+
+/// The cache's bytes: the magic, the format and the key, then what `boot` holds.
+pub fn encode(boot: Boot, key: String) -> List<u8> {
+    var w = Writer.new()
+    w.string(magic(), LONGEST)
+    w.varint(FORMAT)
+    w.string(key, LONGEST)
+    let texts = boot.language.texts()
+    w.count(texts.len())
+    for (k, text) in texts {
+        w.string(k, LONGEST)
+        w.string(text, LONGEST)
+    }
+    for list in [boot.registries.synced.copy(), boot.registries.builtin.copy()] {
+        w.count(list.len())
+        for r in list {
+            write_registry(r, mut w)
+        }
+    }
+    w.count(boot.packs.len())
+    for p in boot.packs {
+        match p {
+            some(k) => {
+                w.bool(true)
+                w.string(k.namespace, LONGEST)
+                w.string(k.id, LONGEST)
+                w.string(k.version, LONGEST)
+            },
+            none => w.bool(false),
+        }
+    }
+    w.count(boot.logs.len())
+    for e in boot.logs {
+        w.u8(match e.level {
+            Level.Info => 0,
+            Level.Warn => 1,
+            Level.Error => 2,
+        })
+        w.string(e.message, LONGEST)
+        match e.thread {
+            some(t) => {
+                w.bool(true)
+                w.string(t, LONGEST)
+            },
+            none => w.bool(false),
+        }
+    }
+    return w.into_bytes()
+}
+
+/// What the cache in `bytes` holds, `none` if its key isn't `key`, or why it can't be read.
+pub fn decode(bytes: own List<u8>, key: String) -> Boot? ! DecodeError {
+    var r = Reader.new(bytes)
+    if try r.string(LONGEST) != magic() or try r.varint() != FORMAT or try r.string(LONGEST) != key {
+        return none
+    }
+    var language = Language.empty()
+    for _ in 0..try r.count(usize.wrap(LONGEST)) {
+        let k = try r.string(LONGEST)
+        language.add(k, try r.string(LONGEST))
+    }
+    var synced = List<Registry>()
+    for _ in 0..try r.count(usize.wrap(LONGEST)) {
+        synced.push(try read_registry(mut r))
+    }
+    var builtin = List<Registry>()
+    for _ in 0..try r.count(usize.wrap(LONGEST)) {
+        builtin.push(try read_registry(mut r))
+    }
+    var packs = List<KnownPack?>()
+    for _ in 0..try r.count(usize.wrap(LONGEST)) {
+        if try r.bool() {
+            let namespace = try r.string(LONGEST)
+            let id = try r.string(LONGEST)
+            packs.push(some(KnownPack { namespace: namespace, id: id, version: try r.string(LONGEST) }))
+        } else {
+            packs.push(none)
+        }
+    }
+    var logs = List<Entry>()
+    for _ in 0..try r.count(usize.wrap(LONGEST)) {
+        let level = match try r.u8() {
+            0 => Level.Info,
+            1 => Level.Warn,
+            _ => Level.Error,
+        }
+        let message = try r.string(LONGEST)
+        let thread: String? = if try r.bool() { some(try r.string(LONGEST)) } else { none }
+        logs.push(Entry { level: level, message: message, thread: thread })
+    }
+    if r.left() != 0 {
+        fail DecodeError { message: "{r.left()} bytes after the end" }
+    }
+    return some(Boot { language: language, registries: Registries { synced: synced, builtin: builtin }, packs: packs, logs: logs })
+}
+
+// An identifier's namespace and path, which were checked when it was read from the packs.
+fn write_id(id: Identifier, w: mut Writer) {
+    w.string(id.namespace, LONGEST)
+    w.string(id.path, LONGEST)
+}
+
+fn read_id(r: mut Reader) -> Identifier ! DecodeError {
+    let namespace = try r.string(LONGEST)
+    return Identifier { namespace: namespace, path: try r.string(LONGEST) }
+}
+
+// A registry: its name, whether it's synchronized, each entry with its pack, then its tags.
+fn write_registry(reg: Registry, w: mut Writer) {
+    write_id(reg.name, mut w)
+    w.bool(reg.synced)
+    w.count(reg.entries.len())
+    for k in 0..reg.entries.len() {
+        write_id(reg.entries[k], mut w)
+        w.varint(match reg.packs[k] {
+            some(p) => i32.wrap(p),
+            none => -1,
+        })
+    }
+    w.count(reg.tags.len())
+    for t in reg.tags {
+        write_id(t.name, mut w)
+        w.count(t.values.len())
+        for v in t.values {
+            w.varint(v)
+        }
+    }
+}
+
+fn read_registry(r: mut Reader) -> Registry ! DecodeError {
+    var reg = Registry.new(try read_id(mut r), try r.bool())
+    for _ in 0..try r.count(usize.wrap(LONGEST)) {
+        let entry = try read_id(mut r)
+        let p = try r.varint()
+        reg.add(entry, if p < 0 { none } else { some(usize.wrap(p)) })
+    }
+    for _ in 0..try r.count(usize.wrap(LONGEST)) {
+        let name = try read_id(mut r)
+        var values = List<i32>()
+        for _ in 0..try r.count(usize.wrap(LONGEST)) {
+            values.push(try r.varint())
+        }
+        reg.tags.push(Tag { name: name, values: values })
+    }
+    return reg
+}

@@ -173,6 +173,10 @@ class Fetch(unittest.TestCase):
             self.assertRegex(pin["sha1"], r"^[0-9a-f]{40}$", version)
             self.assertIn(pin["sha1"], pin["url"], version)
             self.assertGreater(pin["size"], 0, version)
+            client = pin["client"]
+            self.assertIn(client["sha1"], client["url"], version)
+            self.assertRegex(client["data"]["sha256"], r"^[0-9a-f]{64}$", version)
+            self.assertLess(client["data"]["offset"] + client["data"]["length"], client["size"], version)
 
 
 if __name__ == "__main__":
