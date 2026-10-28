@@ -1,0 +1,263 @@
+/// Mojang's session server, as authlib asks it whether a player joined: the server's hash, the
+/// `hasJoined` URL, and what authlib's `MinecraftClient` and `MinecraftServicesSessionService`
+/// make of the answers Mojang's services give.
+module auth.session
+
+import auth.profile.{GameProfile, ProfileProperty}
+import java.uuid.{Uuid}
+import json.gson.{is_text, text_of}
+import json.tree.{Json, get, parse}
+import server.log.{Entry}
+import std.hash.{sha1}
+import std.http.{Response}
+
+/// What a login's check with the session server comes to.
+pub enum Joined {
+    /// The player joined the server with this profile, which has the name they gave.
+    Yes(GameProfile)
+    /// The session server says they didn't, or its answer can't be read:
+    /// `multiplayer.disconnect.unverified_username`.
+    No
+    /// The session server couldn't be asked: `multiplayer.disconnect.authservers_down`.
+    Unavailable
+}
+
+/// What authlib's `MinecraftClient.get` makes of a service's answer.
+pub enum Answer {
+    /// A success's body, to read as JSON.
+    Body(String)
+    /// A success with no body, which authlib reads as `null`.
+    Empty
+    /// A `MinecraftClientException`, and whether it means the service is unavailable, as its
+    /// `toAuthenticationException` decides.
+    Failed(bool)
+}
+
+/// The server's hash, which the client gives the session server when it joins and the server
+/// asks about: the SHA-1 of the server ID, which is empty, the shared secret and the public key,
+/// as Java's `new BigInteger(digest).toString(16)` writes it, a signed number in hex.
+pub fn server_hash(secret: List<u8>, public_key: List<u8>) -> String {
+    var data = secret.copy()
+    for b in public_key {
+        data.push(b)
+    }
+    var digest = sha1(data)
+    let negative = digest[0] >= 0x80
+    if negative {
+        // Two's complement: every bit flipped, then 1 added.
+        var carry: u32 = 1
+        var i = digest.len()
+        while i > 0 {
+            i -= 1
+            let v = u32(digest[i] ^ 0xFF) + carry
+            digest[i] = u8.wrap(v)
+            carry = v >> 8
+        }
+    }
+    let digits = "0123456789abcdef"
+    var out = String()
+    if negative {
+        out.push('-')
+    }
+    var started = false
+    for b in digest {
+        for d in [b / 16, b % 16] {
+            if d != 0 or started {
+                out.push_str(digits[usize(d)..usize(d) + 1])
+                started = true
+            }
+        }
+    }
+    if not started {
+        out.push('0')
+    }
+    return out
+}
+
+/// The URL that asks the session server whether the player named `name` joined the server with
+/// the hash `hash`, as `hasJoinedServer` builds it from the `verify` URL: the query's
+/// fields in the order Java's `HashMap` gives them, each encoded as Java's `URLEncoder` does. `ip`
+/// is the player's address, which vanilla gives with `prevent-proxy-connections=true`.
+pub fn has_joined_url(verify: String, name: String, hash: String, ip: String?) -> String {
+    var query = String()
+    if let address = ip {
+        query.push_str("ip=")
+        url_encode(mut query, address)
+        query.push('&')
+    }
+    query.push_str("serverId=")
+    url_encode(mut query, hash)
+    query.push_str("&username=")
+    url_encode(mut query, name)
+    // As `HttpDiscoveryService.concatenateURL`: the URL without its fragment, then the query
+    // after its own, if it has one.
+    var base = verify.copy()
+    if let fragment = verify.find("#") {
+        base = verify[..fragment]
+    }
+    var join = "?"
+    if let mark = base.find("?") {
+        if mark + 1 < base.len() {
+            join = "&"
+        }
+    }
+    return "{base}{join}{query}"
+}
+
+/// What `MinecraftClient.get` makes of the response to a request of `url`, or of its failure,
+/// `none`, which is an `IOException` to authlib. An error's body names the error, which decides
+/// whether the service is unavailable; a body in HTML is logged, as authlib logs it.
+pub fn answer(result: own Response?, url: String, logs: mut List<Entry>) -> Answer {
+    let response = result else return Answer.Failed(true)
+    let status = response.status
+    if status == 304 {
+        return Answer.Empty
+    }
+    let empty = response.body.is_empty()
+    let kind = response.header("Content-Type") ?? String()
+    // Text that isn't UTF-8 can't be JSON.
+    let text = String.from_utf8(response.body) ?? String("\u{FFFD}")
+    if status < 400 {
+        if empty {
+            return Answer.Empty
+        }
+        return Answer.Body(text)
+    }
+    if kind.starts_with("text/html") {
+        logs.push(Entry.error("Got an error with a html body connecting to {url}: {text}"))
+        return Answer.Failed(status >= 500)
+    }
+    if empty {
+        return Answer.Failed(status >= 500)
+    }
+    // The body is an `ErrorResponse`, or a `JSON_ERROR` if it can't be read as one.
+    let error = match parse(text) {
+        some(Json.Null) => String(),
+        some(Json.Object(members)) => {
+            let field = get(members, "error")
+            if not is_text(field) {
+                return Answer.Failed(false)
+            }
+            text_of(field) ?? String()
+        },
+        _ => return Answer.Failed(false),
+    }
+    if error == "ForbiddenOperationException" or error == "multiplayer.access.banned" or error == "FORCED_USERNAME_CHANGE" or error == "InsufficientPrivilegesException" or status == 401 {
+        return Answer.Failed(false)
+    }
+    return Answer.Failed(status >= 500)
+}
+
+/// What the session server's answer to `hasJoined` means for the player named `name`, as
+/// `hasJoinedServer` reads it: a profile with the UUID it gives and their properties, grouped by
+/// name as authlib's `PropertyMap` groups them, or `No` without a UUID or if it can't be read.
+pub fn joined(a: Answer, name: String) -> Joined {
+    let text = match a {
+        Answer.Body(t) => t.copy(),
+        Answer.Empty => return Joined.No,
+        Answer.Failed(unavailable) => return if unavailable { Joined.Unavailable } else { Joined.No },
+    }
+    let members = match parse(text) {
+        some(Json.Object(m)) => m,
+        _ => return Joined.No,
+    }
+    let id_text = text_of(get(members, "id")) else return Joined.No
+    let id = Uuid.parse(undashed(id_text)) else return Joined.No
+    let properties = match get(members, "properties") {
+        none => List<ProfileProperty>(),
+        some(Json.Null) => List<ProfileProperty>(),
+        some(Json.Array(items)) => {
+            var list = List<ProfileProperty>()
+            for item in items {
+                // What isn't an object is skipped.
+                if let Json.Object(fields) = item {
+                    let property_name = text_of(get(fields, "name")) else return Joined.No
+                    let value = text_of(get(fields, "value")) else return Joined.No
+                    var signature: String? = none
+                    if get(fields, "signature") != none {
+                        let s = text_of(get(fields, "signature")) else return Joined.No
+                        signature = some(s)
+                    }
+                    list.push(ProfileProperty { name: property_name, value: value, signature: signature })
+                }
+            }
+            list
+        },
+        some(Json.Object(entries)) => {
+            // The older form: each name with a list of values, and no signatures.
+            var list = List<ProfileProperty>()
+            for entry in entries {
+                if let Json.Array(values) = entry.value {
+                    for v in values {
+                        let value = text_of(some(v.copy())) else return Joined.No
+                        list.push(ProfileProperty { name: entry.key.copy(), value: value, signature: none })
+                    }
+                }
+            }
+            list
+        },
+        _ => List<ProfileProperty>(),
+    }
+    match get(members, "profileActions") {
+        none => {},
+        some(Json.Null) => {},
+        some(Json.Array(_)) => {},
+        _ => return Joined.No,
+    }
+    return Joined.Yes(GameProfile { id: id, name: name.copy(), properties: grouped(properties) })
+}
+
+/// The properties with those of a name together, the names in the order they first come, as an
+/// `ImmutableMultimap` keeps them.
+pub fn grouped(properties: List<ProfileProperty>) -> List<ProfileProperty> {
+    var out = List<ProfileProperty>()
+    var done = List<String>()
+    for p in properties {
+        if done.contains(p.name) {
+            continue
+        }
+        done.push(p.name.copy())
+        for q in properties {
+            if q.name == p.name {
+                out.push(q.copy())
+            }
+        }
+    }
+    return out
+}
+
+// The UUID text with dashes put in, as authlib's `UndashedUuid.fromStringLenient` puts them: around
+// the first 32 word characters in a row, if there are, which a dashed UUID hasn't.
+fn undashed(text: String) -> String {
+    let n = text.len()
+    var run: usize = 0
+    for i in 0..n {
+        let c = text.byte_at(i)
+        let word = (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+        run = if word { run + 1 } else { 0 }
+        if run == 32 {
+            let s = i + 1 - 32
+            return "{text[..s + 8]}-{text[s + 8..s + 12]}-{text[s + 12..s + 16]}-{text[s + 16..s + 20]}-{text[s + 20..]}"
+        }
+    }
+    return text.copy()
+}
+
+// Adds `s` as Java's `URLEncoder.encode(s, UTF_8)` writes it: letters, digits and `.-*_` as they
+// are, a space as `+`, and every other byte of its UTF-8 as `%` and two uppercase hex digits.
+fn url_encode(out: mut String, s: String) {
+    let digits = "0123456789ABCDEF"
+    for i in 0..s.len() {
+        let b = s.byte_at(i)
+        let keep = (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 46 or b == 45 or b == 42 or b == 95
+        if keep {
+            out.push_str(s[i..i + 1])
+        } else if b == 32 {
+            out.push('+')
+        } else {
+            out.push('%')
+            out.push_str(digits[usize(b / 16)..usize(b / 16) + 1])
+            out.push_str(digits[usize(b % 16)..usize(b % 16) + 1])
+        }
+    }
+}

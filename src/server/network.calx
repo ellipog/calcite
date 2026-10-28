@@ -5,6 +5,8 @@
 module server.network
 
 import auth.profile.{GameProfile, is_valid_name}
+import auth.services.{JoinCheck, KeySet, Services}
+import auth.session.{Joined, server_hash}
 import chat.component.{Component}
 import chat.language.{Language}
 import java.uuid.{Uuid}
@@ -12,11 +14,12 @@ import protocol.codec.{Codec}
 import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{PROTOCOL_VERSION, game_version, packet_names}
 import protocol.legacy.{Legacy, classify, response}
-import protocol.login.{ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundHello}
+import protocol.login.{ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundHello, ServerboundKey}
 import protocol.state.{State, Bound}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import server.log.{Entry}
+import std.crypto.{RsaKey, random_bytes}
 import std.net.{Net, Conn, Event, NetError, Address, Ip}
 import std.text.mutf8.{encode, encoded_len}
 
@@ -50,6 +53,9 @@ pub struct LoginSettings {
     pub compression_threshold: i32
     /// Whether the log shows players' addresses, from `log-ips`.
     pub log_ips: bool
+    /// Whether the session server is given a player's address, so it can refuse a player who
+    /// joins from another address than they logged in from, from `prevent-proxy-connections`.
+    pub prevent_proxy_connections: bool
 }
 
 /// What a connection is doing: which of vanilla's packet listeners it has.
@@ -94,11 +100,25 @@ struct Connection {
     login_ticks: i32
     // Whether another server sent the player here.
     transferred: bool
+    // The 4 random bytes the client is to send back encrypted, as vanilla's `challenge`.
+    challenge: List<u8>
     // The name the client gave, and the profile it's let in with.
     name: String?
     profile: GameProfile?
     // Why the server ended it, which is logged once it's gone.
     reason: Component?
+}
+
+// A login's check with the session server. It goes on if the player leaves, as vanilla's
+// authenticator thread does, and logs what it comes to either way.
+struct Check {
+    conn: Conn
+    // The thread vanilla runs it on, `User Authenticator #1` and up.
+    thread: String
+    // The player as the log names them, and the name they gave.
+    user: String
+    name: String
+    join: JoinCheck
 }
 
 /// Every connection the server accepted, on a `Net` that may hold other connections too, such
@@ -109,6 +129,13 @@ pub struct Network {
     status: StatusInfo
     settings: LoginSettings
     lang: Language
+    services: Services
+    // The server's key pair, made when it starts, and its public key as the client is sent it.
+    key: RsaKey
+    public_key: List<u8>
+    checks: List<Check>
+    // How many authenticators have started, which numbers their threads.
+    authenticators: i32
     // The session ID every login is given, made when the first needs it and dropped once there
     // are no connections, as vanilla's `ServerConnectionListener.getSessionId`.
     session: Uuid?
@@ -116,8 +143,11 @@ pub struct Network {
 }
 
 impl Network {
-    pub fn new(net: Net, status: own StatusInfo, settings: own LoginSettings, lang: own Language) -> Network {
-        return Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, session: none, logs: List<Entry>() }
+    /// The network, which authenticates players with `services` in online mode, with `key` as
+    /// the server's key pair.
+    pub fn new(net: Net, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, key: own RsaKey) -> Network {
+        let public_key = key.public_der()
+        return Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, key: key, public_key: public_key, checks: List<Check>(), authenticators: 0, session: none, logs: List<Entry>() }
     }
 
     /// Listens on `host` and `port`, as vanilla's `startTcpServerListener`. An empty host is
@@ -135,10 +165,15 @@ impl Network {
     pub fn take_logs(mut self) -> List<Entry> {
         var out = List<Entry>()
         for e in self.logs {
-            out.push(Entry { level: e.level, message: e.message.copy() })
+            out.push(Entry { level: e.level, message: e.message.copy(), thread: e.thread.copy() })
         }
         self.logs.clear()
         return out
+    }
+
+    /// The public keys of Mojang's services, once they've been fetched.
+    pub fn service_keys(self) -> KeySet? {
+        return self.services.key_set()
     }
 
     /// How many connections are open.
@@ -162,7 +197,7 @@ impl Network {
                     self.connections.push(none)
                 }
                 let address = if self.settings.log_ips { java_address(self.net.peer(c)) } else { String("IP hidden") }
-                self.connections[slot] = some(Connection { conn: c, codec: Codec.new(), phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false, address: address, login: LoginState.Hello, login_ticks: 0, transferred: false, name: none, profile: none, reason: none })
+                self.connections[slot] = some(Connection { conn: c, codec: Codec.new(), phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false, address: address, login: LoginState.Hello, login_ticks: 0, transferred: false, challenge: List<u8>(), name: none, profile: none, reason: none })
                 return true
             },
             Event.Received(c) => {
@@ -185,9 +220,13 @@ impl Network {
         }
     }
 
-    /// One server tick, as vanilla's `ServerConnectionListener.tick`: each login moves on, as
-    /// its listener's `tick` moves it.
-    pub fn tick(mut self) {
+    /// One server tick, at `now` nanoseconds on the caller's clock, as vanilla's
+    /// `ServerConnectionListener.tick`: each login moves on, as its listener's `tick` moves it,
+    /// once the checks with the session server that are done have been acted on. Mojang's
+    /// services are fetched from as they're due.
+    pub fn tick(mut self, now: u64) {
+        self.services.tick(now, mut self.logs)
+        self.authenticate()
         for i in 0..self.connections.len() {
             if not self.logging_in(i) {
                 continue
@@ -368,6 +407,7 @@ impl Network {
         }
         con.phase = Phase.Login
         con.transferred = transferred
+        con.challenge = random_bytes(4)
         return true
     }
 
@@ -380,10 +420,7 @@ impl Network {
     fn login_packet(mut self, con: mut Connection, p: LoginIn) -> bool {
         match p {
             LoginIn.Hello(hello) => return self.hello(mut con, hello),
-            LoginIn.Key(_) => {
-                self.fault(mut con, "java.lang.IllegalStateException: Unexpected key packet")
-                return false
-            },
+            LoginIn.Key(k) => return self.key_packet(mut con, k),
             LoginIn.CustomQueryAnswer(_) => {
                 self.disconnect(mut con, Component.translatable("multiplayer.disconnect.unexpected_query_response", []))
                 return false
@@ -404,7 +441,8 @@ impl Network {
         }
     }
 
-    // The client's name, as `handleHello`. Offline, the player gets the profile made from it.
+    // The client's name, as `handleHello`. Online, the client is sent the server's public key, to
+    // encrypt a secret with; offline, the player gets the profile made from their name.
     fn hello(mut self, con: mut Connection, p: ServerboundHello) -> bool {
         if con.login != LoginState.Hello {
             self.fault(mut con, "java.lang.IllegalStateException: Unexpected hello packet")
@@ -416,14 +454,135 @@ impl Network {
         }
         con.name = some(p.name.copy())
         if self.settings.online_mode {
-            // Authentication with Mojang's session server isn't written yet, and letting a player
-            // in unauthenticated would let anyone take any name.
-            self.disconnect(mut con, Component.literal("Calcite can't authenticate players yet; set online-mode=false to join"))
-            return false
+            con.login = LoginState.Key
+            let hello = ClientboundHello { server_id: String(), public_key: self.public_key.copy(), challenge: con.challenge.copy(), should_authenticate: true }
+            self.send(mut con, hello, State.Login)
+            return true
         }
         con.profile = some(GameProfile.offline(p.name))
         con.login = LoginState.Verifying
         return true
+    }
+
+    // The client's secret and the challenge, both encrypted with the server's public key, as
+    // `handleKey`. Encryption starts with the secret, and an authenticator checks with the
+    // session server that the player joined with the server's hash.
+    fn key_packet(mut self, con: mut Connection, p: ServerboundKey) -> bool {
+        if con.login != LoginState.Key {
+            self.fault(mut con, "java.lang.IllegalStateException: Unexpected key packet")
+            return false
+        }
+        let protocol_error = String("java.lang.IllegalStateException: Protocol error")
+        var valid = false
+        if let challenge = self.decrypt(p.encrypted_challenge) {
+            valid = challenge == con.challenge
+        }
+        if not valid {
+            self.fault(mut con, protocol_error)
+            return false
+        }
+        // A secret Java can't make an AES key of is a `CryptException` too: vanilla works out the
+        // hash and moves on first, but the login ends either way.
+        let secret = self.decrypt(p.key_bytes) ?? List<u8>()
+        if secret.len() != 16 {
+            self.fault(mut con, protocol_error)
+            return false
+        }
+        let hash = server_hash(secret, self.public_key)
+        con.login = LoginState.Authenticating
+        con.codec.start_encryption(secret)
+        self.authenticators += 1
+        let name = con.name.copy() ?? String()
+        let ip = if self.settings.prevent_proxy_connections { host_address(self.net.peer(con.conn)) } else { none }
+        let join = JoinCheck.new(name, hash, ip)
+        self.checks.push(Check { conn: con.conn, thread: "User Authenticator #{self.authenticators}", user: user(con), name: name, join: join })
+        return true
+    }
+
+    // What the client encrypted with the server's public key, as Java's `RSA` cipher decrypts
+    // it: bytes shorter than the key are a smaller number, as if they had zeros in front.
+    fn decrypt(self, bytes: List<u8>) -> List<u8>? {
+        let size = self.key.size()
+        if bytes.len() >= size {
+            return self.key.decrypt(bytes)
+        }
+        var padded = List<u8>()
+        for _ in bytes.len()..size {
+            padded.push(0)
+        }
+        for b in bytes {
+            padded.push(b)
+        }
+        return self.key.decrypt(padded)
+    }
+
+    // Moves each check with the session server on, and acts on those that are done, as each
+    // authenticator does once `hasJoinedServer` returns.
+    fn authenticate(mut self) {
+        var i: usize = 0
+        while i < self.checks.len() {
+            var check = self.checks.remove(i)
+            var lines = List<Entry>()
+            let result = self.services.poll(mut check.join, mut lines)
+            for e in lines {
+                self.logs.push(Entry { level: e.level, message: e.message.copy(), thread: some(check.thread.copy()) })
+            }
+            match result {
+                some(joined) => self.authenticated(check, joined),
+                none => {
+                    self.checks.insert(i, check)
+                    i += 1
+                },
+            }
+        }
+    }
+
+    // What an authenticator does with what the session server said: the player is let in with
+    // their profile, or told why not. It logs the same if they've left, as vanilla's does.
+    fn authenticated(mut self, check: own Check, joined: own Joined) {
+        let slot = check.conn.slot()
+        var taken: Connection? = none
+        if self.owns(check.conn) {
+            self.connections.push(none)
+            taken = self.connections.swap_remove(slot)
+        }
+        match joined {
+            Joined.Yes(profile) => {
+                self.logs.push(Entry.info("UUID of player {profile.name} is {profile.id.to_string()}").on(check.thread.copy()))
+                if let c = taken {
+                    var waiting = c
+                    if not waiting.closing {
+                        waiting.profile = some(profile)
+                        waiting.login = LoginState.Verifying
+                    }
+                    self.connections[slot] = some(waiting)
+                }
+            },
+            Joined.No => {
+                let reason = Component.translatable("multiplayer.disconnect.unverified_username", [])
+                self.turn_away(check, taken, reason, "Username '{check.name}' tried to join with an invalid session")
+            },
+            Joined.Unavailable => {
+                let reason = Component.translatable("multiplayer.disconnect.authservers_down", [])
+                self.turn_away(check, taken, reason, "Couldn't verify username because servers are unavailable")
+            },
+        }
+    }
+
+    // An authenticator's `disconnect`, then the error it logs. The connection, if it's still
+    // there, was taken out of its slot, and goes back in.
+    fn turn_away(mut self, check: Check, taken: own Connection?, reason: own Component, problem: own String) {
+        self.logs.push(Entry.info("Disconnecting {check.user}: {reason.get_string(self.lang)}").on(check.thread.copy()))
+        if let c = taken {
+            var con = c
+            if not con.closing {
+                self.send(mut con, ClientboundLoginDisconnect { reason_json: reason.to_json() }, State.Login)
+                con.reason = some(reason)
+                self.close(mut con)
+            }
+            self.connections[check.conn.slot()] = some(con)
+        }
+        self.logs.push(Entry.error(problem).on(check.thread.copy()))
     }
 
     // A login's tick, as the login listener's `tick`.
@@ -478,8 +637,8 @@ impl Network {
         return s
     }
 
-    // Tells the client why its login ends, as the login listener's `disconnect`. The caller
-    // closes the connection.
+    // Tells the client why its login ends, as the login listener's `disconnect`, on the server
+    // thread. The caller closes the connection.
     fn disconnect(mut self, con: mut Connection, reason: own Component) {
         let line = "Disconnecting {user(con)}: {reason.get_string(self.lang)}"
         self.logs.push(Entry.info(line))
@@ -572,10 +731,25 @@ fn decode_exception(message: String) -> String {
 // or `/[0:0:0:0:0:0:0:1]:50412`, with all eight groups of an IPv6 address.
 fn java_address(a: Address?) -> String {
     let addr = a else return String("local")
+    let text = ip_text(addr.ip)
     return match addr.ip {
-        Ip.V4(b) => "/{b[0]}.{b[1]}.{b[2]}.{b[3]}:{addr.port}",
+        Ip.V4(_) => "/{text}:{addr.port}",
+        Ip.V6(_, _) => "/[{text}]:{addr.port}",
+    }
+}
+
+// The address as Java's `InetAddress.getHostAddress` writes it: `127.0.0.1`, or
+// `0:0:0:0:0:0:0:1`, which the session server is given with `prevent-proxy-connections`.
+fn host_address(a: Address?) -> String? {
+    let addr = a else return none
+    return some(ip_text(addr.ip))
+}
+
+fn ip_text(ip: Ip) -> String {
+    return match ip {
+        Ip.V4(b) => "{b[0]}.{b[1]}.{b[2]}.{b[3]}",
         Ip.V6(b, scope) => {
-            var out = String("/[")
+            var out = String()
             let groups: usize = 8
             for i in 0..groups {
                 if i > 0 {
@@ -586,7 +760,6 @@ fn java_address(a: Address?) -> String {
             if scope != 0 {
                 out.push_str("%{scope}")
             }
-            out.push_str("]:{addr.port}")
             out
         },
     }

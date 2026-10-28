@@ -143,7 +143,7 @@ The generators use SplitMix64 from the given seed. A range value is `min + (max 
 - `CALCITE_DEBUG=1` builds the adapter in debug mode, where it checks that it frees everything it allocates and exits with status 102 if not.
 - It implements `ping`, `rng` and `collections`, which pass 100% on Windows and Linux. Every other probe reports `unimplemented` until Calcite has the code behind it.
 
-The adapter's parts are in [`src/`](../src/README.md): the frames and JSON in `rig.frame` and `rig.json`, and one module per probe.
+The adapter's parts are in [`src/`](../src/README.md): the frames in `rig.frame`, their JSON in `json.tree`, and one module per probe.
 
 ## Adding a probe
 

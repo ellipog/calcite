@@ -1,0 +1,448 @@
+/// Mojang's services, as authlib's `MinecraftServicesDiscoveryService` finds them. The discovery
+/// document, fetched when the server starts and every 24 hours after, says where each service
+/// is, and the services' public keys are fetched once it's been tried. A login's check with the
+/// session server runs while the server goes on, as vanilla's runs on a thread of its own.
+module auth.services
+
+import auth.session.{Answer, Joined, answer, has_joined_url, joined}
+import java.base64.{decode}
+import json.gson.{is_text, text_of}
+import json.tree.{Json, Member, get, parse}
+import server.log.{Entry}
+import std.http.{Header, Request, Response, get as http_get}
+
+/// The thread vanilla fetches the discovery document and the keys on.
+pub fn discovery_thread() -> String {
+    return String("Minecraft Services Discovery")
+}
+
+/// How long a request of a service may take, as `MinecraftClient`'s 5 seconds to connect and 5
+/// more to read.
+const TIMEOUT_MS: u32 = 10000
+
+/// The longest answer a service may give.
+const LIMIT: usize = 1048576
+
+const MINUTE_NS: u64 = 60000000000
+
+/// Which services the server uses, as authlib's `Environment`.
+pub struct Environment {
+    pub discovery_url: String
+    pub name: String
+}
+
+impl Environment {
+    /// Mojang's own, which the server uses unless it's told otherwise.
+    pub fn prod() -> Environment {
+        return Environment { discovery_url: String("https://discovery.minecraftservices.com/minecraft/client"), name: String("PROD") }
+    }
+
+    pub fn staging() -> Environment {
+        return Environment { discovery_url: String("https://discovery-staging.minecraftservices.com/minecraft/client"), name: String("STAGING") }
+    }
+
+    /// The environment `EnvironmentParser` picks from the system properties `minecraft.api.env`,
+    /// `prod` or `staging` in any case, and `minecraft.api.discovery.host`, a discovery URL of
+    /// one's own, or else `prod`.
+    pub fn from_properties(env: String?, discovery_host: String?) -> Environment {
+        if let e = env {
+            let name = e.to_lower_root()
+            if name == "prod" {
+                return Environment.prod()
+            }
+            if name == "staging" {
+                return Environment.staging()
+            }
+        }
+        if let url = discovery_host {
+            return Environment { discovery_url: url.copy(), name: String("properties") }
+        }
+        return Environment.prod()
+    }
+
+    /// As Java's `toString` writes the record: `Environment[discoveryUrl=..., name=PROD]`.
+    pub fn to_string(self) -> String {
+        return "Environment[discoveryUrl={self.discovery_url}, name={self.name}]"
+    }
+}
+
+/// The services' public keys, each an X.509 SubjectPublicKeyInfo in DER, as authlib's
+/// `ServicesKeySet` holds them: those that sign profile properties, such as skins, and those
+/// that sign the players' chat keys.
+pub struct KeySet {
+    pub profile_property: List<List<u8>>
+    pub player_certificate: List<List<u8>>
+}
+
+/// A login's check with the session server, as `hasJoinedServer` makes it.
+pub struct JoinCheck {
+    name: String
+    hash: String
+    ip: String?
+    url: String
+    // The request once it's started, which waits for the discovery document's first try.
+    request: List<Request>
+    started: bool
+}
+
+impl JoinCheck {
+    /// A check that the player named `name` joined with the server's hash `hash`. `ip` is their
+    /// address, given with `prevent-proxy-connections=true`.
+    pub fn new(name: String, hash: String, ip: String?) -> JoinCheck {
+        return JoinCheck { name: name.copy(), hash: hash.copy(), ip: ip.copy(), url: String(), request: List<Request>(), started: false }
+    }
+}
+
+// Where a service's endpoint is, from the discovery document.
+struct Endpoint {
+    service: String
+    key: String
+    uri: String
+}
+
+// What the discovery document says, as authlib's `DiscoveryResponse` holds it.
+struct Discovered {
+    offline: bool
+    endpoints: List<Endpoint>
+}
+
+// A document fetched at once and again later, as authlib's `RetryableFetch` fetches one: every
+// `refresh` nanoseconds once it has it, and until then after `retry` doubled for each try that
+// didn't get it, up to 64 times.
+struct Fetch {
+    retry: u64
+    refresh: u64
+    due: u64
+    failures: u32
+    has: bool
+    // Whether the first try is done, which a login's check waits for.
+    tried: bool
+    url: String
+    request: List<Request>
+}
+
+impl Fetch {
+    fn new(retry: u64, refresh: u64) -> Fetch {
+        return Fetch { retry: retry, refresh: refresh, due: 0, failures: 0, has: false, tried: false, url: String(), request: List<Request>() }
+    }
+
+    fn start(mut self, url: String) {
+        self.url = url.copy()
+        self.request.push(http_get(url, List<Header>(), TIMEOUT_MS, LIMIT))
+    }
+
+    // The answer, once the request is done.
+    fn finish(mut self, logs: mut List<Entry>) -> Answer? {
+        if not self.request[0].done() {
+            return none
+        }
+        var r = self.request.pop()!
+        let response: Response? = match r.wait() {
+            ok(got) => some(got),
+            err(_) => none,
+        }
+        return some(answer(response, self.url, mut logs))
+    }
+
+    // The try is over, with a value or without: the next is scheduled.
+    fn done(mut self, now: u64, got: bool) {
+        if got {
+            self.has = true
+            self.failures = 0
+        }
+        self.tried = true
+        if self.has {
+            self.due = now + self.refresh
+        } else {
+            let exponent = if self.failures < 6 { self.failures } else { 6 }
+            self.failures += 1
+            self.due = now + self.retry * (1u64 << exponent)
+        }
+    }
+
+    fn running(self) -> bool {
+        return not self.request.is_empty()
+    }
+}
+
+/// The services, and what's been fetched from them.
+pub struct Services {
+    environment: Environment
+    discovery: Fetch
+    found: Discovered?
+    keys: Fetch
+    public_keys: KeySet?
+}
+
+impl Services {
+    /// The services of the environment. Nothing is fetched until the first `tick`.
+    pub fn new(environment: own Environment) -> Services {
+        // The discovery document is tried again after a minute, and the keys after 5.
+        return Services {
+            environment: environment,
+            discovery: Fetch.new(MINUTE_NS, 24 * 60 * MINUTE_NS),
+            found: none,
+            keys: Fetch.new(5 * MINUTE_NS, 24 * 60 * MINUTE_NS),
+            public_keys: none,
+        }
+    }
+
+    /// Services that are never fetched from, as authlib's `createOffline` makes them: every
+    /// service is unavailable, so a login in online mode is told the authentication servers are
+    /// down.
+    pub fn offline() -> Services {
+        var never = Fetch.new(MINUTE_NS, MINUTE_NS)
+        never.due = 0xFFFFFFFFFFFFFFFF
+        never.tried = true
+        var keys = Fetch.new(MINUTE_NS, MINUTE_NS)
+        keys.due = 0xFFFFFFFFFFFFFFFF
+        return Services { environment: Environment.prod(), discovery: never, found: none, keys: keys, public_keys: none }
+    }
+
+    /// The services' public keys, once they've been fetched.
+    pub fn key_set(self) -> KeySet? {
+        if let k = self.public_keys {
+            return some(KeySet { profile_property: k.profile_property.copy(), player_certificate: k.player_certificate.copy() })
+        }
+        return none
+    }
+
+    /// Moves the fetches on, as of `now` nanoseconds, one at a time, as vanilla's discovery
+    /// thread runs them. What they log goes in `logs`, on the discovery thread.
+    pub fn tick(mut self, now: u64, logs: mut List<Entry>) {
+        var lines = List<Entry>()
+        loop {
+            if self.discovery.running() {
+                let a = self.discovery.finish(mut lines) else break
+                self.discovered(a, now, mut lines)
+                continue
+            }
+            if self.keys.running() {
+                let a = self.keys.finish(mut lines) else break
+                self.keyed(a, now, mut lines)
+                continue
+            }
+            // The keys are queued after the discovery document, so it goes first when both are due.
+            if self.discovery.due <= now and self.discovery.due <= self.keys.due {
+                self.discovery.start(self.environment.discovery_url)
+            } else if self.keys.due <= now {
+                match self.url("AUTHENTICATION", "getPublicKeys", mut lines) {
+                    some(url) => self.keys.start(url),
+                    none => {
+                        // `RetryableFetch` logs the exception `getUrl` throws.
+                        lines.push(Entry.warn("Failed to connect"))
+                        self.keys.done(now, false)
+                    },
+                }
+            } else {
+                break
+            }
+        }
+        for e in lines {
+            logs.push(Entry { level: e.level, message: e.message.copy(), thread: some(discovery_thread()) })
+        }
+    }
+
+    /// Moves a check on: `none` while it waits, for the discovery document's first try and then
+    /// the session server, and then what it came to. What it logs goes in `logs`, on the
+    /// caller's thread, which is the login's authenticator.
+    pub fn poll(self, check: mut JoinCheck, logs: mut List<Entry>) -> Joined? {
+        if not check.started {
+            if not self.discovery.tried {
+                return none
+            }
+            let verify = self.url("SESSION", "verify", mut logs) else return some(Joined.Unavailable)
+            check.url = has_joined_url(verify, check.name, check.hash, check.ip)
+            check.request.push(http_get(check.url, List<Header>(), TIMEOUT_MS, LIMIT))
+            check.started = true
+        }
+        if not check.request[0].done() {
+            return none
+        }
+        var r = check.request.pop()!
+        let response: Response? = match r.wait() {
+            ok(got) => some(got),
+            err(_) => none,
+        }
+        return some(joined(answer(response, check.url, mut logs), check.name))
+    }
+
+    // The URL of a service's endpoint, as `getUrl` gives it from the discovery document, or
+    // `none`, with authlib's warning, if it has none.
+    fn url(self, service: String, key: String, logs: mut List<Entry>) -> String? {
+        var offline = true
+        if let d = self.found {
+            offline = d.offline
+            if not offline {
+                for e in d.endpoints {
+                    if e.service == service and e.key == key {
+                        return some(e.uri.copy())
+                    }
+                }
+            }
+        }
+        if offline {
+            logs.push(Entry.warn("Services are unavailable, unable to fetch uri for {service}/{key}"))
+        } else {
+            logs.push(Entry.warn("Services are available, but unable to find uri for {service}/{key}"))
+        }
+        return none
+    }
+
+    fn discovered(mut self, a: Answer, now: u64, lines: mut List<Entry>) {
+        var got = false
+        match a {
+            Answer.Body(text) => {
+                if let d = read_discovery(text) {
+                    self.found = some(d)
+                    got = true
+                } else {
+                    lines.push(Entry.warn("Failed to connect"))
+                }
+            },
+            Answer.Empty => {},
+            Answer.Failed(_) => lines.push(Entry.warn("Failed to connect")),
+        }
+        self.discovery.done(now, got)
+    }
+
+    fn keyed(mut self, a: Answer, now: u64, lines: mut List<Entry>) {
+        var got = false
+        match a {
+            Answer.Body(text) => {
+                match read_keys(text) {
+                    ok(k) => {
+                        self.public_keys = some(k)
+                        got = true
+                    },
+                    err(message) => lines.push(Entry.error(message)),
+                }
+            },
+            Answer.Empty => {},
+            Answer.Failed(_) => lines.push(Entry.error("Failed to request Minecraft Services public key")),
+        }
+        self.keys.done(now, got)
+    }
+}
+
+// The discovery document, as Gson reads a `DiscoveryResponse`, or `none` where it can't: each
+// field must be what the record says, or `null`, a string field may be a number or boolean, and
+// fields it hasn't are ignored. A section, endpoint or URI that's missing or `null` leaves the
+// endpoint out.
+fn read_discovery(text: String) -> Discovered? {
+    let top = match parse(text) {
+        some(Json.Object(m)) => m,
+        _ => return none,
+    }
+    let environment = get(top, "environment")
+    if not is_text(environment) {
+        return none
+    }
+    let offline = (text_of(environment) ?? String()) == "offline"
+    var endpoints = List<Endpoint>()
+    let sections = match get(top, "discovery") {
+        some(Json.Object(m)) => m,
+        some(Json.Null) => List<Member>(),
+        none => List<Member>(),
+        _ => return none,
+    }
+    let names: List<String> = [String("authentication"), String("session"), String("player"), String("profiles"), String("telemetry")]
+    for name in names {
+        let section = match get(sections, name) {
+            some(Json.Object(m)) => m,
+            some(Json.Null) => continue,
+            none => continue,
+            _ => return none,
+        }
+        let entries = match get(section, "endpoints") {
+            some(Json.Object(m)) => m,
+            some(Json.Null) => continue,
+            none => continue,
+            _ => return none,
+        }
+        for entry in entries {
+            match entry.value {
+                Json.Object(fields) => {
+                    let uri = get(fields, "uri")
+                    if not is_text(uri) {
+                        return none
+                    }
+                    if let u = text_of(uri) {
+                        endpoints.push(Endpoint { service: name.to_upper_root(), key: entry.key.copy(), uri: u })
+                    }
+                    match get(fields, "validUris") {
+                        some(Json.Array(uris)) => {
+                            for u in uris {
+                                if not is_text(some(u.copy())) {
+                                    return none
+                                }
+                            }
+                        },
+                        some(Json.Null) => {},
+                        none => {},
+                        _ => return none,
+                    }
+                },
+                Json.Null => {},
+                _ => return none,
+            }
+        }
+    }
+    // A key given twice is the last one.
+    var unique = List<Endpoint>()
+    var i = endpoints.len()
+    while i > 0 {
+        i -= 1
+        var seen = false
+        for u in unique {
+            if u.service == endpoints[i].service and u.key == endpoints[i].key {
+                seen = true
+            }
+        }
+        if not seen {
+            unique.push(Endpoint { service: endpoints[i].service.copy(), key: endpoints[i].key.copy(), uri: endpoints[i].uri.copy() })
+        }
+    }
+    return some(Discovered { offline: offline, endpoints: unique })
+}
+
+// The keys, as authlib's `MinecraftServicesKeyInfo` reads a `KeySetResponse`, or what it logs
+// where it can't: an answer that isn't one is a failed request, and a key that's missing, a
+// malformed key.
+fn read_keys(text: String) -> KeySet ! String {
+    let failed = String("Failed to request Minecraft Services public key")
+    let top = match parse(text) {
+        some(Json.Object(m)) => m,
+        _ => fail failed,
+    }
+    let property = try key_list(get(top, "profilePropertyKeys"), failed)
+    let certificate = try key_list(get(top, "playerCertificateKeys"), failed)
+    return KeySet { profile_property: property, player_certificate: certificate }
+}
+
+fn key_list(value: own Json?, failed: String) -> List<List<u8>> ! String {
+    let malformed = String("Received malformed Minecraft Services public key data")
+    let items = match value {
+        some(Json.Array(items)) => items,
+        some(Json.Null) => return List<List<u8>>(),
+        none => return List<List<u8>>(),
+        _ => fail failed.copy(),
+    }
+    var keys = List<List<u8>>()
+    for item in items {
+        match item {
+            Json.Object(fields) => {
+                let field = get(fields, "publicKey")
+                if not is_text(field) {
+                    fail failed.copy()
+                }
+                let b64 = text_of(field) else fail malformed
+                let der = decode(b64) else fail failed.copy()
+                keys.push(der)
+            },
+            Json.Null => fail malformed,
+            _ => fail failed.copy(),
+        }
+    }
+    return keys
+}

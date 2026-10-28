@@ -1,15 +1,19 @@
 /// Checks logins over real TCP on 127.0.0.1, as server.network runs them: offline profiles,
-/// compression, the session ID, every way vanilla ends a login, and what it logs.
+/// compression, the session ID, online mode with encryption and a web server standing in for
+/// Mojang's services, every way vanilla ends a login, and what it logs.
 module test.login
 
+import auth.services.{Environment, Services}
+import auth.session.{server_hash}
 import chat.language.{Language}
 import java.uuid.{Uuid}
 import protocol.codec.{Codec}
 import protocol.handshake.{ClientIntent, ClientIntention}
-import protocol.login.{ServerboundHello, ServerboundKey, ServerboundLoginAcknowledged, ServerboundCustomQueryAnswer, ClientboundLoginFinished}
+import protocol.login.{ServerboundHello, ServerboundKey, ServerboundLoginAcknowledged, ServerboundCustomQueryAnswer, ClientboundHello, ClientboundLoginFinished}
 import protocol.state.{State}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import server.network.{Network, StatusInfo, LoginSettings, MAX_LOGIN_TICKS}
+import std.crypto.{RsaKey}
 import std.net.{Net, Conn, Event}
 
 fn check(got: String, want: String) {
@@ -28,14 +32,25 @@ fn hex(bytes: List<u8>) -> String {
     return out
 }
 
-// A server with `threshold`, and an invented text for the generic reason, so the log shows how
-// a translation's argument goes in.
+// An offline server with `threshold`, and an invented text for the generic reason, so the log
+// shows how a translation's argument goes in.
 fn new_server(net: Net, threshold: i32, log_ips: bool) -> Network {
+    let settings = LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: threshold, log_ips: log_ips, prevent_proxy_connections: false }
+    return with_settings(net, settings, Services.offline(), RsaKey.generate(1024))
+}
+
+// A server in online mode, with the services the discovery document at `discovery` gives.
+fn online_server(net: Net, discovery: String, prevent_proxy_connections: bool, key: RsaKey) -> Network {
+    let settings = LoginSettings { online_mode: true, accepts_transfers: false, compression_threshold: 256, log_ips: true, prevent_proxy_connections: prevent_proxy_connections }
+    let services = Services.new(Environment.from_properties(none, some(discovery.copy())))
+    return with_settings(net, settings, services, key.copy())
+}
+
+fn with_settings(net: Net, settings: own LoginSettings, services: own Services, key: own RsaKey) -> Network {
     let status = StatusInfo { enabled: true, json: "\{\}", motd: "A Minecraft Server", online: 0, max_players: 20 }
-    let settings = LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: threshold, log_ips: log_ips }
     var lang = Language.empty()
     lang.add("disconnect.genericReason", "Error: %s")
-    return Network.new(net, status, settings, lang)
+    return Network.new(net, status, settings, lang, services, key)
 }
 
 fn packet<T: Wire + Packet>(p: T, state: State) -> List<u8> {
@@ -81,42 +96,68 @@ impl Client {
         return r.string(262144)!
     }
 
-    // The next packet, which must be the login's last, as its profile's UUID and name, and the
-    // session ID.
+    // The next packet, which must be the login's last, as its profile's UUID, name and number
+    // of properties, then each property, and the session ID.
     fn finished(mut self) -> (String, Uuid) {
         let body = self.codec.next()!!
         var r = Reader.new(body)
         check("{r.varint()!}", "2")
         let p = ClientboundLoginFinished.read(mut r)!
-        return ("{p.profile.id.to_string()} {p.profile.name} {p.profile.properties.len()}", p.session_id)
+        var out = "{p.profile.id.to_string()} {p.profile.name} {p.profile.properties.len()}"
+        for property in p.profile.properties {
+            out.push_str(" {property.name}={property.value}/{property.signature.copy() ?? String("-")}")
+        }
+        return (out, p.session_id)
+    }
+
+    // Whether nothing has come, and the connection is open.
+    fn waiting(self) -> bool {
+        return self.codec.peek().is_empty() and not self.closed
     }
 }
 
-// Polls until nothing more comes for 50 ms, giving the server its events and each client what
-// it was sent.
-fn settle(net: Net, s: mut Network, clients: mut List<Client>) {
-    var events = List<Event>()
-    loop {
-        net.poll(50, mut events)
-        if events.is_empty() {
-            return
-        }
+// A web server on a `Net` of its own, standing in for Mojang's services. It answers each request
+// by its path, and keeps the paths it was asked. The session server's answer for `Later` is held
+// back until `release`.
+struct Web {
+    net: Net
+    port: u16
+    conns: List<Conn>
+    requests: List<List<u8>>
+    asked: List<String>
+    held: List<Conn>
+}
+
+impl Web {
+    fn new() -> Web {
+        let net = Net.new()!
+        let port = net.listen("127.0.0.1", 0)!
+        return Web { net: net, port: port, conns: List<Conn>(), requests: List<List<u8>>(), asked: List<String>(), held: List<Conn>() }
+    }
+
+    fn url(self, path: String) -> String {
+        return "http://127.0.0.1:{self.port}{path}"
+    }
+
+    // Answers what has come, waiting up to `ms` milliseconds for something.
+    fn serve(mut self, ms: i64) {
+        var events = List<Event>()
+        self.net.poll(ms, mut events)
         for e in events {
-            if s.handle(e, 0) {
-                continue
-            }
             match e {
-                Event.Received(c) => {
-                    for i in 0..clients.len() {
-                        if clients[i].conn == c {
-                            _ = clients[i].codec.read_from(net, c)
-                        }
-                    }
+                Event.Accepted(c) => {
+                    self.conns.push(c)
+                    self.requests.push(List<u8>())
                 },
-                Event.Closed(c) => {
-                    for i in 0..clients.len() {
-                        if clients[i].conn == c {
-                            clients[i].closed = true
+                Event.Received(c) => {
+                    for i in 0..self.conns.len() {
+                        if self.conns[i] == c {
+                            var got = List<u8>()
+                            _ = self.net.read(c, mut got)
+                            for b in got {
+                                self.requests[i].push(b)
+                            }
+                            self.answer(i)
                         }
                     }
                 },
@@ -124,6 +165,118 @@ fn settle(net: Net, s: mut Network, clients: mut List<Client>) {
             }
         }
     }
+
+    // Answers the request on connection `i` once it has all come.
+    fn answer(mut self, i: usize) {
+        let text = String.from_utf8(self.requests[i].copy())!
+        if not text.contains("\r\n\r\n") {
+            return
+        }
+        self.requests[i].clear()
+        let end = text.find(" HTTP/")!
+        let path = text[4..end]
+        self.asked.push(path.copy())
+        let c = self.conns[i]
+        if path == "/discovery" {
+            let session = "\"session\":\{\"endpoints\":\{\"verify\":\{\"uri\":\"{self.url("/hasJoined")}\"\}\}\}"
+            let keys = "\"authentication\":\{\"endpoints\":\{\"getPublicKeys\":\{\"uri\":\"{self.url("/keys")}\",\"validUris\":[]\}\}\}"
+            self.respond(c, 200, "application/json", "\{\"environment\":\"test\",\"discovery\":\{{session},{keys},\"player\":null\}\}")
+        } else if path == "/keys" {
+            self.respond(c, 200, "application/json", "\{\"profilePropertyKeys\":[\{\"publicKey\":\"QUJD\"\}],\"playerCertificateKeys\":[]\}")
+        } else if path.starts_with("/hasJoined?") {
+            let name = path[path.find("username=")! + 9..]
+            if name == "Later" {
+                self.held.push(c)
+            } else if name == "Nobody" {
+                self.respond(c, 204, "application/json", "")
+            } else if name == "Down" {
+                self.respond(c, 503, "application/json", "\{\"error\":\"ServiceUnavailableException\"\}")
+            } else if name == "Banned" {
+                self.respond(c, 500, "application/json", "\{\"error\":\"ForbiddenOperationException\"\}")
+            } else if name == "Html" {
+                self.respond(c, 502, "text/html", "<h1>Bad Gateway</h1>")
+            } else {
+                self.respond(c, 200, "application/json", profile_json())
+            }
+        } else {
+            self.respond(c, 404, "application/json", "")
+        }
+    }
+
+    // Answers the held requests.
+    fn release(mut self) {
+        for c in self.held {
+            self.respond(c, 200, "application/json", profile_json())
+        }
+        self.held.clear()
+    }
+
+    fn respond(self, c: Conn, status: i32, kind: String, body: String) {
+        self.net.write(c, "HTTP/1.1 {status} X\r\nContent-Type: {kind}\r\nContent-Length: {body.len()}\r\nConnection: close\r\n\r\n{body}".to_bytes())
+        self.net.close(c)
+    }
+}
+
+// What the session server says of a player who joined: their UUID without dashes, a name that
+// isn't theirs, which vanilla ignores, and properties, two with one name.
+fn profile_json() -> String {
+    return "\{\"id\":\"069a79f444e94726a5befca90e38aaf5\",\"name\":\"Someone\",\"properties\":[\{\"name\":\"textures\",\"value\":\"abc\",\"signature\":\"c2ln\"\},\{\"name\":\"other\",\"value\":\"x\"\},\{\"name\":\"textures\",\"value\":\"def\"\}],\"profileActions\":[]\}"
+}
+
+// Polls until nothing more comes for 50 ms, giving the server its events and each client what
+// it was sent.
+fn settle(net: Net, s: mut Network, clients: mut List<Client>) {
+    loop {
+        if not poll(net, mut s, mut clients, 50) {
+            return
+        }
+    }
+}
+
+// One poll of up to `ms` milliseconds, its events handled. Whether there were any.
+fn poll(net: Net, s: mut Network, clients: mut List<Client>, ms: i64) -> bool {
+    var events = List<Event>()
+    net.poll(ms, mut events)
+    for e in events {
+        if s.handle(e, 0) {
+            continue
+        }
+        match e {
+            Event.Received(c) => {
+                for i in 0..clients.len() {
+                    if clients[i].conn == c {
+                        _ = clients[i].codec.read_from(net, c)
+                    }
+                }
+            },
+            Event.Closed(c) => {
+                for i in 0..clients.len() {
+                    if clients[i].conn == c {
+                        clients[i].closed = true
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    return not events.is_empty()
+}
+
+// Runs the server, ticking, and the web server until client `at` is sent something, or the
+// server's log has `line`, or 10 seconds pass.
+fn run_until(net: Net, web: mut Web, s: mut Network, clients: mut List<Client>, at: usize, line: String, seen: mut String) {
+    for _ in 0..1000 {
+        web.serve(5)
+        _ = poll(net, mut s, mut clients, 5)
+        s.tick(0)
+        seen.push_str(logs(mut s))
+        if not clients[at].waiting() or (not line.is_empty() and seen.contains(line)) {
+            settle(net, mut s, mut clients)
+            seen.push_str(logs(mut s))
+            return
+        }
+    }
+    panic("the login never moved on")
 }
 
 // Connects a client, and gives back the clients with it last.
@@ -169,9 +322,13 @@ fn start(net: Net, s: mut Network, port: u16, clients: mut List<Client>, name: S
     return at
 }
 
+// The server's log since the last call, each line with its thread if it isn't the server's.
 fn logs(s: mut Network) -> String {
     var out = String()
     for e in s.take_logs() {
+        if let thread = e.thread {
+            out.push_str("{thread}: ")
+        }
         out.push_str("{e.message}|")
     }
     return out
@@ -184,7 +341,7 @@ fn offline(net: Net) {
     let a = start(net, mut s, port, mut clients, "Steve")
     // The profile goes on the next tick, as vanilla's does.
     check(clients[a].next(), "nothing")
-    s.tick()
+    s.tick(0)
     settle(net, mut s, mut clients)
     // Compression first, then the profile, compressed.
     check(clients[a].next(), "3:8002")
@@ -195,7 +352,7 @@ fn offline(net: Net) {
 
     // A second login gets the same session ID while the first is open.
     let b = start(net, mut s, port, mut clients, "Notch")
-    s.tick()
+    s.tick(0)
     settle(net, mut s, mut clients)
     check(clients[b].next(), "3:8002")
     clients[b].codec.start_compression(256)
@@ -218,9 +375,9 @@ fn offline(net: Net) {
     check(logs(mut s), "Notch ({clients[b].address}) lost connection: disconnect.endOfStream|")
 
     // With no connections, the session ID goes, so the next login gets a new one.
-    s.tick()
+    s.tick(0)
     let c = start(net, mut s, port, mut clients, "Alex")
-    s.tick()
+    s.tick(0)
     settle(net, mut s, mut clients)
     check(clients[c].next(), "3:8002")
     clients[c].codec.start_compression(256)
@@ -236,7 +393,7 @@ fn uncompressed(net: Net) {
     let port = s.listen("127.0.0.1", 0)!
     var clients = List<Client>()
     let a = start(net, mut s, port, mut clients, "Steve")
-    s.tick()
+    s.tick(0)
     settle(net, mut s, mut clients)
     let (profile, _) = clients[a].finished()
     check(profile, "5627dd98-e6be-3c21-b8a8-e92344183641 Steve 0")
@@ -314,15 +471,187 @@ fn failures(net: Net) {
     var slow = List<Client>()
     let b = start(net, mut s, port, mut slow, "")
     for _ in 0..MAX_LOGIN_TICKS {
-        s.tick()
+        s.tick(0)
     }
     settle(net, mut s, mut slow)
     check(slow[b].next(), "nothing")
-    s.tick()
+    s.tick(0)
     settle(net, mut s, mut slow)
     check(slow[b].reason(), "\{\"translate\":\"multiplayer.disconnect.slow_login\"\}")
     check(slow[b].next(), "closed")
     check(logs(mut s), "Disconnecting {slow[b].address}: multiplayer.disconnect.slow_login|{slow[b].address} lost connection: multiplayer.disconnect.slow_login|")
+}
+
+// The server's hello in online mode, as its public key and challenge, which must match `key`.
+fn server_hello(c: mut Client, key: RsaKey) -> List<u8> {
+    let body = c.codec.next()!!
+    var r = Reader.new(body)
+    check("{r.varint()!}", "1")
+    let hello = ClientboundHello.read(mut r)!
+    check(hello.server_id, "")
+    check(hex(hello.public_key), hex(key.public_der()))
+    check("{hello.challenge.len()} {hello.should_authenticate}", "4 true")
+    return hello.challenge.copy()
+}
+
+// Logs in as `name` in online mode, with the secret `secret`, and gives back the client, which
+// encrypts from then on.
+fn online_start(net: Net, web: mut Web, s: mut Network, port: u16, clients: mut List<Client>, name: String, key: RsaKey, secret: List<u8>) -> usize {
+    let a = start(net, mut s, port, mut clients, name)
+    let challenge = server_hello(mut clients[a], key)
+    clients[a].send(net, packet(ServerboundKey { key_bytes: key.encrypt(secret)!, encrypted_challenge: key.encrypt(challenge)! }, State.Login))
+    clients[a].codec.start_encryption(secret)
+    web.serve(0)
+    return a
+}
+
+fn online(net: Net) {
+    var web = Web.new()
+    let key = RsaKey.generate(1024)
+    var s = online_server(net, web.url("/discovery"), false, key)
+    let port = s.listen("127.0.0.1", 0)!
+    var clients = List<Client>()
+    let secret: List<u8> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    let hash = server_hash(secret, key.public_der())
+
+    // A player the session server knows: their UUID and properties, under the name they gave,
+    // encrypted and compressed.
+    let a = online_start(net, mut web, mut s, port, mut clients, "Steve", key, secret)
+    var seen = String()
+    run_until(net, mut web, mut s, mut clients, a, "", mut seen)
+    check(seen, "User Authenticator #1: UUID of player Steve is 069a79f4-44e9-4726-a5be-fca90e38aaf5|")
+    // The keys and the check are asked for at once, once the discovery document is in.
+    check(web.asked[0], "/discovery")
+    assert(web.asked.contains("/hasJoined?serverId={hash}&username=Steve"), "the session server wasn't asked")
+    check(clients[a].next(), "3:8002")
+    clients[a].codec.start_compression(256)
+    let (profile, _) = clients[a].finished()
+    check(profile, "069a79f4-44e9-4726-a5be-fca90e38aaf5 Steve 3 textures=abc/c2ln textures=def/- other=x/-")
+    var keys_seen = false
+    for _ in 0..1000 {
+        if let k = s.service_keys() {
+            check("{k.profile_property.len()} {hex(k.profile_property[0])} {k.player_certificate.len()}", "1 414243 0")
+            keys_seen = true
+            break
+        }
+        web.serve(5)
+        s.tick(0)
+    }
+    assert(keys_seen and web.asked.contains("/keys"), "the services' keys never came")
+    net.close(clients[a].conn)
+    settle(net, mut s, mut clients)
+    _ = logs(mut s)
+
+    // The session server says they didn't join, or can't say.
+    let reasons: List<String> = [String("unverified_username"), String("authservers_down"), String("unverified_username"), String("authservers_down")]
+    let names: List<String> = [String("Nobody"), String("Down"), String("Banned"), String("Html")]
+    for i in 0..names.len() {
+        let name = names[i].copy()
+        let b = online_start(net, mut web, mut s, port, mut clients, name, key, secret)
+        var lines = String()
+        run_until(net, mut web, mut s, mut clients, b, "", mut lines)
+        check(clients[b].reason(), "\{\"translate\":\"multiplayer.disconnect.{reasons[i]}\"\}")
+        check(clients[b].next(), "closed")
+        let thread = "User Authenticator #{i + 2}: "
+        let user = "{name} ({clients[b].address})"
+        var want = String()
+        if name == "Html" {
+            want.push_str("{thread}Got an error with a html body connecting to {web.url("/hasJoined")}?serverId={hash}&username=Html: <h1>Bad Gateway</h1>|")
+        }
+        want.push_str("{thread}Disconnecting {user}: multiplayer.disconnect.{reasons[i]}|")
+        if reasons[i] == "unverified_username" {
+            want.push_str("{thread}Username '{name}' tried to join with an invalid session|")
+        } else {
+            want.push_str("{thread}Couldn't verify username because servers are unavailable|")
+        }
+        want.push_str("{user} lost connection: multiplayer.disconnect.{reasons[i]}|")
+        check(lines, want)
+    }
+
+    // A player who leaves while the session server is asked: it's still logged, as vanilla's
+    // authenticator logs it.
+    let c = online_start(net, mut web, mut s, port, mut clients, "Later", key, secret)
+    for _ in 0..20 {
+        web.serve(5)
+        s.tick(0)
+    }
+    net.close(clients[c].conn)
+    settle(net, mut s, mut clients)
+    check(logs(mut s), "Later ({clients[c].address}) lost connection: disconnect.endOfStream|")
+    web.release()
+    for _ in 0..200 {
+        web.serve(5)
+        s.tick(0)
+        let line = logs(mut s)
+        if not line.is_empty() {
+            check(line, "User Authenticator #6: UUID of player Later is 069a79f4-44e9-4726-a5be-fca90e38aaf5|")
+            break
+        }
+    }
+
+    // A challenge that isn't the server's, and a secret that isn't an AES-128 key.
+    let protocol_error = generic("java.lang.IllegalStateException: Protocol error")
+    for wrong in 0..2 {
+        let d = start(net, mut s, port, mut clients, "Steve")
+        var challenge = server_hello(mut clients[d], key)
+        var shared = secret.copy()
+        if wrong == 0 {
+            challenge[0] ^= 1
+        } else {
+            shared.push(17)
+        }
+        clients[d].send(net, packet(ServerboundKey { key_bytes: key.encrypt(shared)!, encrypted_challenge: key.encrypt(challenge)! }, State.Login))
+        settle(net, mut s, mut clients)
+        check(clients[d].reason(), protocol_error)
+        check(clients[d].next(), "closed")
+        check(logs(mut s), "Steve ({clients[d].address}) lost connection: Error: Internal Exception: java.lang.IllegalStateException: Protocol error|")
+    }
+    // An encrypted challenge with its leading zero byte left out still decrypts, as Java's
+    // cipher takes it.
+    let e = start(net, mut s, port, mut clients, "Steve")
+    let challenge = server_hello(mut clients[e], key)
+    var encrypted = key.encrypt(challenge)!
+    while encrypted[0] != 0 {
+        encrypted = key.encrypt(challenge)!
+    }
+    _ = encrypted.remove(0)
+    clients[e].send(net, packet(ServerboundKey { key_bytes: key.encrypt(secret)!, encrypted_challenge: encrypted }, State.Login))
+    clients[e].codec.start_encryption(secret)
+    var short = String()
+    run_until(net, mut web, mut s, mut clients, e, "", mut short)
+    check(clients[e].next(), "3:8002")
+    net.close(clients[e].conn)
+    settle(net, mut s, mut clients)
+    _ = logs(mut s)
+
+    // With `prevent-proxy-connections`, the session server is given the player's address.
+    var proxied = online_server(net, web.url("/discovery"), true, key)
+    let proxied_port = proxied.listen("127.0.0.1", 0)!
+    let f = online_start(net, mut web, mut proxied, proxied_port, mut clients, "Steve", key, secret)
+    var lines = String()
+    run_until(net, mut web, mut proxied, mut clients, f, "", mut lines)
+    assert(web.asked.contains("/hasJoined?ip=127.0.0.1&serverId={hash}&username=Steve"), "the session server wasn't given the address")
+    net.close(clients[f].conn)
+    settle(net, mut proxied, mut clients)
+}
+
+// Online, with services that can't be reached, as vanilla is with no internet: the discovery
+// document and the keys fail, and a login is told the authentication servers are down.
+fn unreachable(net: Net) {
+    var web = Web.new()
+    let key = RsaKey.generate(1024)
+    var s = online_server(net, web.url("/missing"), false, key)
+    let port = s.listen("127.0.0.1", 0)!
+    var clients = List<Client>()
+    let secret: List<u8> = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    let a = online_start(net, mut web, mut s, port, mut clients, "Steve", key, secret)
+    var seen = String()
+    run_until(net, mut web, mut s, mut clients, a, "", mut seen)
+    let discovery = "Minecraft Services Discovery: "
+    let thread = "User Authenticator #1: "
+    let user = "Steve ({clients[a].address})"
+    check(seen, "{discovery}Failed to connect|{discovery}Services are unavailable, unable to fetch uri for AUTHENTICATION/getPublicKeys|{discovery}Failed to connect|{thread}Services are unavailable, unable to fetch uri for SESSION/verify|{thread}Disconnecting {user}: multiplayer.disconnect.authservers_down|{thread}Couldn't verify username because servers are unavailable|{user} lost connection: multiplayer.disconnect.authservers_down|")
+    check(clients[a].reason(), "\{\"translate\":\"multiplayer.disconnect.authservers_down\"\}")
 }
 
 fn main() {
@@ -330,5 +659,7 @@ fn main() {
     offline(net)
     uncompressed(net)
     failures(net)
+    online(net)
+    unreachable(net)
     println("ok")
 }
