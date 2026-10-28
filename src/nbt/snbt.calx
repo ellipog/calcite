@@ -1,0 +1,1190 @@
+/// SNBT, the text form of NBT that commands and data packs write, read as vanilla's `TagParser`
+/// reads it: by `SnbtGrammar`'s rules, the way its packrat parser runs them. The same text gives
+/// the same tag, and text that isn't SNBT the same error at the same place. That place is the
+/// furthest any way of reading the text got to, and the error is the first thing that was
+/// expected there, as vanilla's `ErrorCollector.LongestOnly` keeps it, so `{a:1` fails with
+/// `Expected literal .` at position 4: a `.` is what the first rule to get that far wanted.
+///
+/// Positions count UTF-16 units, as Java's do. Two things differ from vanilla, where its
+/// behaviour can't be copied (rig/differences): nesting more than 512 deep is an error, where
+/// vanilla's parser overflows its stack, and an escape that makes half of a surrogate pair, as
+/// `\ud800` does, gives a `?`, since a `String` holds only Unicode.
+module nbt.snbt
+
+import chat.component.{Component}
+import chat.language.{Language}
+import java.character.{code_point_of, is_whitespace}
+import java.number.{parse_byte, parse_int, parse_long, parse_short, parse_unsigned_int, parse_unsigned_long}
+import java.uuid.{Uuid}
+import nbt.tag.{MAX_DEPTH, Tag}
+
+/// Why text isn't SNBT, as brigadier's `CommandSyntaxException` holds it: the message, the
+/// text, and where in it the problem is, in UTF-16 units.
+pub struct SyntaxError {
+    pub message: Component
+    pub input: String
+    pub cursor: usize
+}
+
+impl SyntaxError {
+    /// The error as `getMessage` says it, as `Expected literal . at position 4: {a:1<--[HERE]`:
+    /// the message in `lang`, where it is, then the text before that.
+    pub fn text(self, lang: Language) -> String {
+        return "{self.message.get_string(lang)} at position {self.cursor}: {self.context()}"
+    }
+
+    /// The text before the problem, as brigadier's `getContext` gives it: `...` if there are
+    /// more than ten units of it, then the last ten, then `<--[HERE]`.
+    pub fn context(self) -> String {
+        let units = units_of(self.input)
+        let end = if self.cursor < units.len() { self.cursor } else { units.len() }
+        var out = String()
+        if end > 10 {
+            out.push_str("...")
+        }
+        out.push_str(from_units(units, if end > 10 { end - 10 } else { 0 }, end))
+        out.push_str("<--[HERE]")
+        return out
+    }
+}
+
+/// The tag `text` holds, with nothing but white space after it, as vanilla's
+/// `TagParser.parseFully` reads it.
+pub fn parse(text: String) -> Tag ! SyntaxError {
+    var p = Parser.new(text)
+    let tag = try p.top(text)
+    return tag
+}
+
+/// The compound `text` holds, as vanilla's `TagParser.parseCompoundFully` reads it, as for an
+/// item's components in `/give`. Any other tag fails it, at the end of the text.
+pub fn parse_compound(text: String) -> Tag ! SyntaxError {
+    var p = Parser.new(text)
+    let tag = try p.top(text)
+    if tag.id() != 10 {
+        fail SyntaxError { message: Component.translatable("argument.nbt.expected.compound", List<Component>()), input: text.copy(), cursor: p.pos }
+    }
+    return tag
+}
+
+// An integer's type, from its suffix or from where it is.
+enum Kind {
+    Byte
+    Short
+    Int
+    Long
+}
+
+// vanilla's `integer_suffix`: whether it's signed, if it says, and the type.
+struct Suffix {
+    signed: bool?
+    kind: Kind
+}
+
+// vanilla's `IntegerLiteral`: an integer as written, which becomes a value only once its type is
+// known, which in an array is the array's.
+struct Integer {
+    negative: bool
+    radix: u32
+    digits: String
+    signed: bool?
+    kind: Kind?
+}
+
+// What `literal`'s first alternative found: no number, so the others are tried; a number whose
+// value fails it, which fails the literal; or the number.
+enum Number {
+    Not
+    Failed
+    Read(Tag)
+}
+
+// vanilla's `float_exponent_part`.
+struct Exponent {
+    negative: bool
+    digits: String
+}
+
+// The state of vanilla's `StringReaderParserState` over the text. Each rule is a method that
+// either reads what it matches and gives its value, or fails, leaving the position where it
+// was, as vanilla's terms put it back.
+struct Parser {
+    // The text in UTF-16 units, which vanilla's positions count.
+    text: List<char>
+    pos: usize
+    // The furthest place an error was stored at, and the first error stored there.
+    stored: bool
+    far: usize
+    key: String
+    arg: String?
+    // How many maps, lists and operations hold what's being read, and where they first held too
+    // many.
+    depth: i32
+    deep: usize?
+}
+
+impl Parser {
+    fn new(text: String) -> Parser {
+        return Parser { text: units_of(text), pos: 0, stored: false, far: 0, key: String(), arg: none, depth: 0, deep: none }
+    }
+
+    // vanilla's `TagParser.parseFully`: a literal, then white space to the end.
+    fn top(mut self, text: String) -> Tag ! SyntaxError {
+        let found = self.literal()
+        if let at = self.deep {
+            fail SyntaxError { message: Component.literal("Tried to read NBT tag with too high complexity, depth > {MAX_DEPTH}"), input: text.copy(), cursor: at }
+        }
+        let tag = found else {
+            var args = List<Component>()
+            if let a = self.arg {
+                args.push(Component.literal(a))
+            }
+            fail SyntaxError { message: Component.translatable(self.key, args), input: text.copy(), cursor: self.far }
+        }
+        self.skip_space()
+        if self.pos < self.text.len() {
+            fail SyntaxError { message: Component.translatable("argument.nbt.trailing", List<Component>()), input: text.copy(), cursor: self.pos }
+        }
+        return tag
+    }
+
+    // Keeps an error at `at`, a translation key and its argument, if no error is further on and
+    // none is there yet, as vanilla's `ErrorCollector.LongestOnly` keeps only the furthest, and
+    // the parser throws the first of those.
+    fn store(mut self, at: usize, key: own String, arg: own String?) {
+        if self.stored and at <= self.far {
+            return
+        }
+        self.stored = true
+        self.far = at
+        self.key = key
+        self.arg = arg
+    }
+
+    // Stores an error where the position is, as vanilla's actions do at the end of their rule.
+    fn store_here(mut self, key: own String, arg: own String?) {
+        let at = self.pos
+        self.store(at, key, arg)
+    }
+
+    // Stores that `a`, or `a` or `b`, was expected where the position is.
+    fn expected_here(mut self, a: char, b: char?) {
+        let at = self.pos
+        self.expected(at, a, b)
+    }
+
+    // Stores that `a`, or `a` or `b`, was expected at `at`, as vanilla's terminals do.
+    fn expected(mut self, at: usize, a: char, b: char?) {
+        if self.stored and at <= self.far {
+            return
+        }
+        var what = String()
+        what.push(rune.try_from(a) ?? '?')
+        if let other = b {
+            what.push('|')
+            what.push(rune.try_from(other) ?? '?')
+        }
+        self.store(at, "argument.literal.incorrect", some(what))
+    }
+
+    // Moves past white space, as Java's `Character.isWhitespace` has it.
+    fn skip_space(mut self) {
+        while self.pos < self.text.len() and is_whitespace(self.text[self.pos]) {
+            self.pos += 1
+        }
+    }
+
+    // The unit after any white space, without moving, as vanilla's lookaheads see it.
+    fn peek(self) -> char? {
+        var at = self.pos
+        while at < self.text.len() and is_whitespace(self.text[at]) {
+            at += 1
+        }
+        if at < self.text.len() {
+            return some(self.text[at])
+        }
+        return none
+    }
+
+    // vanilla's `character` terminal: white space, then `c`.
+    fn one(mut self, c: char) -> bool {
+        let start = self.pos
+        self.skip_space()
+        if self.pos < self.text.len() and self.text[self.pos] == c {
+            self.pos += 1
+            return true
+        }
+        self.expected_here(c, none)
+        self.pos = start
+        return false
+    }
+
+    // vanilla's `characters` terminal: white space, then `a` or `b`.
+    fn either(mut self, a: char, b: char) -> bool {
+        let start = self.pos
+        self.skip_space()
+        if self.pos < self.text.len() and (self.text[self.pos] == a or self.text[self.pos] == b) {
+            self.pos += 1
+            return true
+        }
+        self.expected_here(a, some(b))
+        self.pos = start
+        return false
+    }
+
+    // Counts one more map, list or operation around what's read next, which `bracket` opens.
+    // Past `MAX_DEPTH` the parse fails for good, where vanilla's own parser overflows its stack
+    // (rig/differences/snbt-depth.md).
+    fn enter(mut self, bracket: usize) -> bool {
+        if self.depth >= MAX_DEPTH {
+            if self.deep == none {
+                self.deep = some(bracket)
+            }
+            return false
+        }
+        self.depth += 1
+        return true
+    }
+
+    // vanilla's `literal`: a number, a quoted string, a compound, a list, or an unquoted string,
+    // `true`, `false` or an operation, as the next unit says.
+    fn literal(mut self) -> Tag? {
+        if self.deep != none {
+            return none
+        }
+        let next = self.peek() else return self.unquoted_or_builtin()
+        if can_start_number(next) {
+            match self.number() {
+                Number.Read(n) => return some(n),
+                Number.Failed => return none,
+                Number.Not => {},
+            }
+        }
+        // Past each of these lookaheads is a cut: it's that kind or nothing.
+        if next == '"' or next == '\'' {
+            let s = self.quoted() else return none
+            return some(Tag.Str(s))
+        }
+        if next == '{' {
+            return self.map()
+        }
+        if next == '[' {
+            return self.list()
+        }
+        return self.unquoted_or_builtin()
+    }
+
+    // The first of `literal`'s alternatives: a float, or else an integer, as its type. Nothing in
+    // a number nests, so it's read here, keeping the frames of the rules that do small.
+    fn number(mut self) -> Number {
+        if let f = self.float() {
+            return Number.Read(f)
+        }
+        let start = self.pos
+        let i = self.integer() else return Number.Not
+        let made = self.integer_tag(i) else {
+            self.pos = start
+            return Number.Failed
+        }
+        return Number.Read(made)
+    }
+
+    // vanilla's `sign`: whether it's `-`.
+    fn sign(mut self) -> bool? {
+        if self.one('+') {
+            return some(false)
+        }
+        if self.one('-') {
+            return some(true)
+        }
+        return none
+    }
+
+    // vanilla's `NumberRunParseRule`: white space, then digits of `radix` and underscores, at
+    // least one, not starting or ending with `_`.
+    fn numeral(mut self, radix: u32) -> String? {
+        let start = self.pos
+        self.skip_space()
+        let first = self.pos
+        var end = first
+        while end < self.text.len() and is_numeral(self.text[end], radix) {
+            end += 1
+        }
+        if end == first {
+            let key: String = match radix {
+                2 => "snbt.parser.expected_binary_numeral",
+                10 => "snbt.parser.expected_decimal_numeral",
+                _ => "snbt.parser.expected_hex_numeral",
+            }
+            self.store(first, key, none)
+            self.pos = start
+            return none
+        }
+        if self.text[first] == '_' or self.text[end - 1] == '_' {
+            self.store(first, "snbt.parser.underscore_not_allowed", none)
+            self.pos = start
+            return none
+        }
+        self.pos = end
+        return some(from_units(self.text, first, end))
+    }
+
+    // vanilla's `float_literal`: a sign, then digits with a `.` in or before them, or digits and
+    // an exponent, or digits and a suffix, `f` or `d`. Fails where it isn't one, or where its
+    // value is too big to be finite.
+    fn float(mut self) -> Tag? {
+        let start = self.pos
+        let negative = self.sign() ?? false
+        let body = self.pos
+        var whole: String? = none
+        var fraction: String? = none
+        var exponent: Exponent? = none
+        var single = false
+        var matched = false
+        // Each `.` and the exponent of `1e3` is a cut: past it, no other form is tried.
+        var cut = false
+        if let w = self.numeral(10) {
+            if self.one('.') {
+                cut = true
+                matched = true
+                whole = some(w)
+                fraction = self.numeral(10)
+                exponent = self.exponent()
+                single = self.float_suffix() ?? false
+            }
+        }
+        if not cut {
+            self.pos = body
+            if self.one('.') {
+                cut = true
+                if let f = self.numeral(10) {
+                    matched = true
+                    fraction = some(f)
+                    exponent = self.exponent()
+                    single = self.float_suffix() ?? false
+                }
+            }
+        }
+        if not cut {
+            self.pos = body
+            if let w2 = self.numeral(10) {
+                if let e = self.exponent() {
+                    cut = true
+                    matched = true
+                    whole = some(w2)
+                    exponent = some(e)
+                    single = self.float_suffix() ?? false
+                }
+            }
+        }
+        if not cut {
+            self.pos = body
+            if let w3 = self.numeral(10) {
+                let e3 = self.exponent()
+                if let s = self.float_suffix() {
+                    matched = true
+                    whole = some(w3)
+                    exponent = e3
+                    single = s
+                }
+            }
+        }
+        if not matched {
+            self.pos = start
+            return none
+        }
+        // vanilla's `createFloat`: the parts as Java's text for the number, without underscores.
+        var number = String()
+        if negative {
+            number.push('-')
+        }
+        if let w4 = whole {
+            push_digits(mut number, w4)
+        }
+        if let f2 = fraction {
+            number.push('.')
+            push_digits(mut number, f2)
+        }
+        if let e2 = exponent {
+            number.push('e')
+            if e2.negative {
+                number.push('-')
+            }
+            push_digits(mut number, e2.digits)
+        }
+        if single {
+            let v = f32.parse(number) ?? 0.0f32
+            if v == f32.INFINITY or v == f32.NEG_INFINITY {
+                self.store_here("snbt.parser.infinity_not_allowed", none)
+                self.pos = start
+                return none
+            }
+            return some(Tag.float(v))
+        }
+        let d = f64.parse(number) ?? 0.0
+        if d == f64.INFINITY or d == f64.NEG_INFINITY {
+            self.store_here("snbt.parser.infinity_not_allowed", none)
+            self.pos = start
+            return none
+        }
+        return some(Tag.double(d))
+    }
+
+    // vanilla's `float_exponent_part`: `e`, a sign, digits.
+    fn exponent(mut self) -> Exponent? {
+        let start = self.pos
+        if not self.either('e', 'E') {
+            return none
+        }
+        let negative = self.sign() ?? false
+        let digits = self.numeral(10) else {
+            self.pos = start
+            return none
+        }
+        return some(Exponent { negative: negative, digits: digits })
+    }
+
+    // vanilla's `float_type_suffix`: whether it's `f`, for a float, rather than `d`.
+    fn float_suffix(mut self) -> bool? {
+        if self.either('f', 'F') {
+            return some(true)
+        }
+        if self.either('d', 'D') {
+            return some(false)
+        }
+        return none
+    }
+
+    // vanilla's `integer_literal`: a sign, then digits, in base 10, or in 16 or 2 after `0x` or
+    // `0b`, then a suffix. A `0` is a cut: past it, the integer is read from there or not at all,
+    // and decimal digits after it fail it.
+    fn integer(mut self) -> Integer? {
+        let start = self.pos
+        let negative = self.sign() ?? false
+        var radix = 10u32
+        var digits = String("0")
+        if self.one('0') {
+            if self.either('x', 'X') {
+                // Another cut: past the `x`, hex digits or nothing.
+                let hex = self.numeral(16) else {
+                    self.pos = start
+                    return none
+                }
+                radix = 16
+                digits = hex
+            } else {
+                let zero = self.pos
+                var binary: String? = none
+                if self.either('b', 'B') {
+                    binary = self.numeral(2)
+                    if binary == none {
+                        self.pos = zero
+                    }
+                }
+                if let b = binary {
+                    radix = 2
+                    digits = b
+                } else if self.numeral(10) != none {
+                    self.store_here("snbt.parser.leading_zero_not_allowed", none)
+                    self.pos = start
+                    return none
+                }
+            }
+        } else {
+            let decimal = self.numeral(10) else {
+                self.pos = start
+                return none
+            }
+            digits = decimal
+        }
+        var signed: bool? = none
+        var kind: Kind? = none
+        if let s = self.suffix() {
+            signed = s.signed
+            kind = some(s.kind)
+        }
+        return some(Integer { negative: negative, radix: radix, digits: digits, signed: signed, kind: kind })
+    }
+
+    // vanilla's `integer_suffix`: `u` for unsigned or `s` for signed, then a type, or a type
+    // alone.
+    fn suffix(mut self) -> Suffix? {
+        let start = self.pos
+        if self.either('u', 'U') {
+            if let k = self.kind() {
+                return some(Suffix { signed: some(false), kind: k })
+            }
+            self.pos = start
+        }
+        if self.either('s', 'S') {
+            if let k2 = self.kind() {
+                return some(Suffix { signed: some(true), kind: k2 })
+            }
+            self.pos = start
+        }
+        let k3 = self.kind() else return none
+        return some(Suffix { signed: none, kind: k3 })
+    }
+
+    // A type's letter: `b`, `s`, `i` or `l`.
+    fn kind(mut self) -> Kind? {
+        if self.either('b', 'B') {
+            return some(Kind.Byte)
+        }
+        if self.either('s', 'S') {
+            return some(Kind.Short)
+        }
+        if self.either('i', 'I') {
+            return some(Kind.Int)
+        }
+        if self.either('l', 'L') {
+            return some(Kind.Long)
+        }
+        return none
+    }
+
+    // vanilla's `literal` action for an integer: its value as its suffix's type, or an `int`.
+    fn integer_tag(mut self, lit: Integer) -> Tag? {
+        let kind = lit.kind ?? Kind.Int
+        let v = self.value(lit, kind) else return none
+        return some(match kind {
+            Kind.Byte => Tag.Byte(i8.wrap(v)),
+            Kind.Short => Tag.Short(i16.wrap(v)),
+            Kind.Int => Tag.Int(i32.wrap(v)),
+            Kind.Long => Tag.Long(v),
+        })
+    }
+
+    // vanilla's `IntegerLiteral.create`: the value of `lit` as a `kind`, widened to an `i64`. It's
+    // signed if its suffix says so or it's in base 10, and a value that's out of range, or
+    // negative and unsigned, stores an error where the literal ends.
+    fn value(mut self, lit: Integer, kind: Kind) -> i64? {
+        let signed = lit.signed ?? (lit.radix == 10)
+        if not signed and lit.negative {
+            self.store_here("snbt.parser.expected_non_negative_number", none)
+            return none
+        }
+        var digits = String()
+        if lit.negative {
+            digits.push('-')
+        }
+        push_digits(mut digits, lit.digits)
+        match parse_as(digits, lit.radix, kind, signed) {
+            ok(v) => return some(v),
+            err(message) => {
+                self.store_here("snbt.parser.number_parse_failure", some(message))
+                return none
+            },
+        }
+    }
+
+    // vanilla's `quoted_string_literal`: text between `"`s or `'`s. A `"` is a cut.
+    fn quoted(mut self) -> String? {
+        let start = self.pos
+        var units = List<char>()
+        if self.one('"') {
+            self.contents('\'', mut units)
+            if not self.one('"') {
+                self.pos = start
+                return none
+            }
+            return some(from_units(units, 0, units.len()))
+        }
+        if self.one('\'') {
+            self.contents('"', mut units)
+            if self.one('\'') {
+                return some(from_units(units, 0, units.len()))
+            }
+        }
+        self.pos = start
+        return none
+    }
+
+    // vanilla's `double_quoted_string_contents` and `single_quoted_string_contents`: runs of
+    // anything but quotes and `\`, escapes, and the `other` quote, which needs no escape, added
+    // to `units`, as many as there are.
+    fn contents(mut self, other: char, units: mut List<char>) {
+        loop {
+            let at = self.pos
+            var end = at
+            while end < self.text.len() and not is_special(self.text[end]) {
+                end += 1
+            }
+            if end > at {
+                for i in at..end {
+                    units.push(self.text[i])
+                }
+                self.pos = end
+                continue
+            }
+            self.store(at, "snbt.parser.invalid_string_contents", none)
+            if self.one('\\') {
+                if self.escape(mut units) {
+                    continue
+                }
+                self.pos = at
+            }
+            if self.one(other) {
+                units.push(other)
+                continue
+            }
+            return
+        }
+    }
+
+    // vanilla's `string_escape_sequence`, after the `\`: a letter for a control character, a
+    // space or a quote, `x`, `u` or `U` and two, four or eight hex digits, or `N{`, a
+    // character's name, and `}`. Adds what it stands for to `units`.
+    fn escape(mut self, units: mut List<char>) -> bool {
+        let start = self.pos
+        let plain = "bstnfr\\'\""
+        let means = "\u{8} \t\n\u{c}\r\\'\""
+        for i in 0..plain.len() {
+            if self.one(char(plain.byte_at(i))) {
+                units.push(char(means.byte_at(i)))
+                return true
+            }
+        }
+        let sizes: List<usize> = [2, 4, 8]
+        let letters = "xuU"
+        for i in 0..letters.len() {
+            if self.one(char(letters.byte_at(i))) {
+                if let cp = self.hex(sizes[i]) {
+                    if cp > 0x10FFFF {
+                        self.store_here("snbt.parser.invalid_codepoint", some("U+{hex8(cp)}"))
+                        self.pos = start
+                        return false
+                    }
+                    push_code_point(mut units, cp)
+                    return true
+                }
+                self.pos = start
+            }
+        }
+        if self.one('N') and self.one('{') {
+            // A name, by vanilla's `[-a-zA-Z0-9 ]+`, with no white space skipped first.
+            let at = self.pos
+            var end = at
+            while end < self.text.len() and is_name(self.text[end]) {
+                end += 1
+            }
+            if end == at {
+                self.store(at, "snbt.parser.invalid_character_name", none)
+            } else {
+                self.pos = end
+                if self.one('}') {
+                    if let named = code_point_of(from_units(self.text, at, end)) {
+                        push_code_point(mut units, named)
+                        return true
+                    }
+                    self.store_here("snbt.parser.invalid_character_name", none)
+                }
+            }
+        }
+        self.pos = start
+        return false
+    }
+
+    // vanilla's `SimpleHexLiteralParseRule`: exactly `n` hex digits, with no white space before
+    // them, as a number.
+    fn hex(mut self, n: usize) -> u32? {
+        let at = self.pos
+        var v = 0u32
+        for i in 0..n {
+            if at + i >= self.text.len() {
+                self.store(at, "snbt.parser.expected_hex_escape", some("{n}"))
+                return none
+            }
+            let d = hex_digit(self.text[at + i]) else {
+                self.store(at, "snbt.parser.expected_hex_escape", some("{n}"))
+                return none
+            }
+            v = v * 16 + d
+        }
+        self.pos = at + n
+        return some(v)
+    }
+
+    // vanilla's `unquoted_string`: white space, then letters, digits, `_`, `-`, `.` and `+`, at
+    // least one, as brigadier's `readUnquotedString` reads them.
+    fn unquoted(mut self) -> String? {
+        let start = self.pos
+        self.skip_space()
+        let at = self.pos
+        var end = at
+        while end < self.text.len() and is_unquoted(self.text[end]) {
+            end += 1
+        }
+        if end == at {
+            self.store(at, "snbt.parser.expected_unquoted_string", none)
+            self.pos = start
+            return none
+        }
+        self.pos = end
+        return some(from_units(self.text, at, end))
+    }
+
+    // vanilla's `unquoted_string_or_builtin`: an unquoted string, `true` or `false`, or an
+    // operation, `bool(x)` or `uuid(x)`. A string that could start a number fails it.
+    fn unquoted_or_builtin(mut self) -> Tag? {
+        let start = self.pos
+        let name = self.unquoted() else return none
+        let after = self.pos
+        var args: List<Tag>? = none
+        if self.one('(') {
+            let bracket = self.pos - 1
+            if not self.enter(bracket) {
+                self.pos = start
+                return none
+            }
+            args = some(self.literals())
+            self.depth -= 1
+            // Without the `)`, vanilla goes back to the end of the name, but keeps the arguments.
+            if not self.one(')') {
+                self.pos = after
+            }
+        }
+        let made = self.builtin(name, args)
+        if made == none {
+            self.pos = start
+        }
+        return made
+    }
+
+    // vanilla's action for `unquoted_string_or_builtin`, kept out of the rule so that its frame,
+    // which nesting repeats, stays small: the operation `name` names, run on `args`, or `true`,
+    // `false` or the string. A name that could start a number fails it.
+    fn builtin(mut self, name: own String, args: own List<Tag>?) -> Tag? {
+        if can_start_number(char(name.byte_at(0))) {
+            self.store_here("snbt.parser.invalid_unquoted_start", none)
+            return none
+        }
+        if let a = args {
+            if a.len() == 1 and name == "bool" {
+                if let truth = truth_of(a[0]) {
+                    return some(Tag.Byte(if truth { 1 } else { 0 }))
+                }
+                self.store_here("snbt.parser.expected_number_or_boolean", none)
+            } else if a.len() == 1 and name == "uuid" {
+                if let u = uuid_of(a[0]) {
+                    return some(Tag.IntArray([i32.wrap(u.most >> 32), i32.wrap(u.most), i32.wrap(u.least >> 32), i32.wrap(u.least)]))
+                }
+                self.store_here("snbt.parser.expected_string_uuid", none)
+            } else {
+                self.store_here("snbt.parser.no_such_operation", some("{name}/{a.len()}"))
+            }
+            return none
+        }
+        if is_word(name, "true") {
+            return some(Tag.Byte(1))
+        }
+        if is_word(name, "false") {
+            return some(Tag.Byte(0))
+        }
+        return some(Tag.Str(name))
+    }
+
+    // vanilla's `arguments` and `list_entries`: literals with a `,` between each, and maybe one
+    // after the last.
+    fn literals(mut self) -> List<Tag> {
+        var out = List<Tag>()
+        loop {
+            if not out.is_empty() and not self.one(',') {
+                break
+            }
+            let after = self.pos
+            let item = self.literal() else {
+                self.pos = after
+                break
+            }
+            out.push(item)
+        }
+        return out
+    }
+
+    // vanilla's `int_array_entries`: integers, with a `,` between each, and maybe one after.
+    fn integers(mut self) -> List<Integer> {
+        var out = List<Integer>()
+        loop {
+            if not out.is_empty() and not self.one(',') {
+                break
+            }
+            let after = self.pos
+            let item = self.integer() else {
+                self.pos = after
+                break
+            }
+            out.push(item)
+        }
+        return out
+    }
+
+    // vanilla's `map_literal`: `{`, then entries with a `,` between each and maybe one after the
+    // last, then `}`. A key that comes again keeps its first place and takes the last value.
+    fn map(mut self) -> Tag? {
+        let start = self.pos
+        if not self.one('{') {
+            return none
+        }
+        let bracket = self.pos - 1
+        if not self.enter(bracket) {
+            self.pos = start
+            return none
+        }
+        var entries = JavaHashMap<String, Tag>()
+        var first = true
+        loop {
+            if not first and not self.one(',') {
+                break
+            }
+            let after = self.pos
+            if not self.entry(mut entries) {
+                self.pos = after
+                break
+            }
+            first = false
+        }
+        self.depth -= 1
+        if not self.one('}') {
+            self.pos = start
+            return none
+        }
+        return some(Tag.Compound(entries))
+    }
+
+    // vanilla's `map_entry`: a quoted or unquoted key, `:`, then a literal. An empty key fails it.
+    fn entry(mut self, entries: mut JavaHashMap<String, Tag>) -> bool {
+        let start = self.pos
+        var key = String()
+        if let q = self.quoted() {
+            key = q
+        } else {
+            let u = self.unquoted() else return false
+            key = u
+        }
+        if not self.one(':') {
+            self.pos = start
+            return false
+        }
+        let value = self.literal() else {
+            self.pos = start
+            return false
+        }
+        if key.is_empty() {
+            self.store_here("snbt.parser.empty_key", none)
+            self.pos = start
+            return false
+        }
+        entries.insert(key, value)
+        return true
+    }
+
+    // vanilla's `list_literal`: `[`, then `B;`, `I;` or `L;` and integers for an array, or
+    // literals for a list, then `]`.
+    fn list(mut self) -> Tag? {
+        let start = self.pos
+        if not self.one('[') {
+            return none
+        }
+        let inner = self.pos
+        var prefix: Kind? = none
+        if let p = self.array_prefix() {
+            if self.one(';') {
+                prefix = some(p)
+            } else {
+                self.pos = inner
+            }
+        }
+        if let typed = prefix {
+            let ints = self.integers()
+            if not self.one(']') {
+                self.pos = start
+                return none
+            }
+            let made = self.array(typed, ints)
+            if made == none {
+                self.pos = start
+            }
+            return made
+        }
+        if not self.enter(inner - 1) {
+            self.pos = start
+            return none
+        }
+        let items = self.literals()
+        self.depth -= 1
+        if not self.one(']') {
+            self.pos = start
+            return none
+        }
+        return some(Tag.List(items))
+    }
+
+    // vanilla's `array_prefix`: `B`, `L` or `I`.
+    fn array_prefix(mut self) -> Kind? {
+        if self.one('B') {
+            return some(Kind.Byte)
+        }
+        if self.one('L') {
+            return some(Kind.Long)
+        }
+        if self.one('I') {
+            return some(Kind.Int)
+        }
+        return none
+    }
+
+    // vanilla's `ArrayPrefix.create`: each integer made as its own type, which must be one the
+    // array takes, a byte array only bytes, an int array bytes, shorts and ints, and a long
+    // array any, then widened to the array's.
+    fn array(mut self, kind: Kind, ints: List<Integer>) -> Tag? {
+        var values = List<i64>()
+        values.reserve(ints.len())
+        for lit in ints {
+            let t = lit.kind ?? kind
+            let takes = match kind {
+                Kind.Byte => t == Kind.Byte,
+                Kind.Long => true,
+                _ => t != Kind.Long,
+            }
+            if not takes {
+                self.store_here("snbt.parser.invalid_array_element_type", none)
+                return none
+            }
+            let v = self.value(lit, t) else return none
+            values.push(v)
+        }
+        match kind {
+            Kind.Byte => {
+                var bytes = List<i8>()
+                bytes.reserve(values.len())
+                for b in values {
+                    bytes.push(i8.wrap(b))
+                }
+                return some(Tag.ByteArray(bytes))
+            },
+            Kind.Long => return some(Tag.LongArray(values)),
+            _ => {
+                var words = List<i32>()
+                words.reserve(values.len())
+                for w in values {
+                    words.push(i32.wrap(w))
+                }
+                return some(Tag.IntArray(words))
+            },
+        }
+    }
+}
+
+// The digits as a `kind`: signed as Java's `Byte.parseByte` and the rest read them, or unsigned
+// as Guava's `UnsignedBytes.parseUnsignedByte`, vanilla's own `parseUnsignedShort`, and Java's
+// `parseUnsignedInt` and `parseUnsignedLong` do, with the message of what they throw.
+fn parse_as(digits: String, radix: u32, kind: Kind, signed: bool) -> i64 ! String {
+    if signed {
+        match kind {
+            Kind.Byte => {
+                let b = try parse_byte(digits, radix)
+                return i64(b)
+            },
+            Kind.Short => {
+                let s = try parse_short(digits, radix)
+                return i64(s)
+            },
+            Kind.Int => {
+                let i = try parse_int(digits, radix)
+                return i64(i)
+            },
+            Kind.Long => {
+                let l = try parse_long(digits, radix)
+                return l
+            },
+        }
+    }
+    match kind {
+        Kind.Byte => {
+            let b = try parse_int(digits, radix)
+            if b >> 8 != 0 {
+                fail "out of range: {b}"
+            }
+            return i64(i8.wrap(b))
+        },
+        Kind.Short => {
+            let s = try parse_int(digits, radix)
+            if s >> 16 != 0 {
+                fail "out of range: {s}"
+            }
+            return i64(i16.wrap(s))
+        },
+        Kind.Int => {
+            let i = try parse_unsigned_int(digits, radix)
+            return i64(i)
+        },
+        Kind.Long => {
+            let l = try parse_unsigned_long(digits, radix)
+            return l
+        },
+    }
+}
+
+// What `bool(x)` makes of `x`, as vanilla's `NbtOps.getBooleanValue` does: whether a number
+// isn't 0, or `none` for anything else.
+fn truth_of(arg: Tag) -> bool? {
+    return match arg {
+        Tag.Byte(b) => some(b != 0),
+        Tag.Short(s) => some(s != 0),
+        Tag.Int(i) => some(i != 0),
+        Tag.Long(l) => some(l != 0),
+        Tag.Float(f) => some(f != 0.0f32),
+        Tag.Double(d) => some(d != 0.0),
+        _ => none,
+    }
+}
+
+// What `uuid(x)` makes of `x`: the UUID Java's `UUID.fromString` reads in a string.
+fn uuid_of(arg: Tag) -> Uuid? {
+    return match arg {
+        Tag.Str(s) => Uuid.parse(s),
+        _ => none,
+    }
+}
+
+// vanilla's `canStartNumber`, which decides whether a literal is tried as a number, and fails an
+// unquoted string that starts with it.
+fn can_start_number(c: char) -> bool {
+    let v = u32(c)
+    return v == 43 or v == 45 or v == 46 or (v >= 48 and v <= 57)
+}
+
+// Whether `c` is a digit of `radix` or `_`, as vanilla's numerals take them.
+fn is_numeral(c: char, radix: u32) -> bool {
+    let v = u32(c)
+    if v == 95 {
+        return true
+    }
+    if radix == 2 {
+        return v == 48 or v == 49
+    }
+    if v >= 48 and v <= 57 {
+        return true
+    }
+    return radix == 16 and ((v >= 65 and v <= 70) or (v >= 97 and v <= 102))
+}
+
+// A hex digit's value, in either case.
+fn hex_digit(c: char) -> u32? {
+    let v = u32(c)
+    if v >= 48 and v <= 57 {
+        return some(v - 48)
+    }
+    if v >= 65 and v <= 70 {
+        return some(v - 55)
+    }
+    if v >= 97 and v <= 102 {
+        return some(v - 87)
+    }
+    return none
+}
+
+// Whether `c` ends a run of plain text in a quoted string: a quote or `\`.
+fn is_special(c: char) -> bool {
+    return c == '"' or c == '\'' or c == '\\'
+}
+
+// Whether `c` can be in a character's name in `\N{...}`.
+fn is_name(c: char) -> bool {
+    let v = u32(c)
+    return v == 32 or v == 45 or (v >= 48 and v <= 57) or (v >= 65 and v <= 90) or (v >= 97 and v <= 122)
+}
+
+// Whether `c` can be in an unquoted string, as brigadier's `isAllowedInUnquotedString` has it.
+fn is_unquoted(c: char) -> bool {
+    let v = u32(c)
+    return (v >= 48 and v <= 57) or (v >= 65 and v <= 90) or (v >= 97 and v <= 122) or v == 95 or v == 45 or v == 46 or v == 43
+}
+
+// Whether `name` is `word`, which is in lowercase, in any case, as Java's `equalsIgnoreCase`
+// compares ASCII.
+fn is_word(name: String, word: String) -> bool {
+    if name.len() != word.len() {
+        return false
+    }
+    for i in 0..name.len() {
+        var b = name.byte_at(i)
+        if b >= 65 and b <= 90 {
+            b += 32
+        }
+        if b != word.byte_at(i) {
+            return false
+        }
+    }
+    return true
+}
+
+// Adds `digits` to `out` without its underscores.
+fn push_digits(out: mut String, digits: String) {
+    for i in 0..digits.len() {
+        let b = digits.byte_at(i)
+        if b != 95 {
+            out.push(rune(b))
+        }
+    }
+}
+
+// Adds a code point to `units` as UTF-16, as Java's `Character.toString` makes it: one unit, or a
+// surrogate pair past U+FFFF.
+fn push_code_point(units: mut List<char>, cp: u32) {
+    if cp < 0x10000 {
+        units.push(char.try_from(cp) ?? '?')
+        return
+    }
+    let v = cp - 0x10000
+    units.push(char.try_from(0xD800 + (v >> 10)) ?? '?')
+    units.push(char.try_from(0xDC00 + (v & 0x3FF)) ?? '?')
+}
+
+// A code point in eight uppercase hex digits, as `%08X` writes it.
+fn hex8(v: u32) -> String {
+    let digits = "0123456789ABCDEF"
+    var out = String()
+    var shift = 28u32
+    loop {
+        out.push(rune(digits.byte_at(usize((v >> shift) & 15))))
+        if shift == 0 {
+            break
+        }
+        shift -= 4
+    }
+    return out
+}
+
+// The text's UTF-16 units.
+fn units_of(text: String) -> List<char> {
+    var units = List<char>()
+    units.reserve(text.len())
+    for c in text.chars() {
+        units.push(c)
+    }
+    return units
+}
+
+// The text of `units[from..to]`. Half of a surrogate pair without its other half becomes `?`,
+// since a `String` holds only Unicode, as Java's UTF-8 encoder writes such a half too.
+fn from_units(units: List<char>, from: usize, to: usize) -> String {
+    var out = String()
+    out.reserve(to - from)
+    var i = from
+    while i < to {
+        let v = u32(units[i])
+        if v >= 0xD800 and v <= 0xDBFF and i + 1 < to {
+            let low = u32(units[i + 1])
+            if low >= 0xDC00 and low <= 0xDFFF {
+                out.push(rune.try_from(0x10000 + ((v - 0xD800) << 10) + (low - 0xDC00)) ?? '?')
+                i += 2
+                continue
+            }
+        }
+        out.push(rune.try_from(v) ?? '?')
+        i += 1
+    }
+    return out
+}

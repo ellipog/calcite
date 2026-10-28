@@ -19,19 +19,23 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `java.base64` | `encode`, Base64 with padding and no line breaks, and `decode`, which takes what Java's decoder takes | `java.util.Base64.getEncoder()`, `getDecoder()` |
 | `java.properties` | `Properties`, a `.properties` file read with Java's rules for escapes, continued lines and comments | `java.util.Properties.load` |
 | `java.uri` | `Uri`, a URI checked as Java's `new URI` checks it, with its messages, and `Uri.untrusted`, the links vanilla lets players open | `java.net.URI`, `Util.parseAndValidateUntrustedUri` |
+| `java.number` | `parse_int` and the rest: Java's integer parsing in radixes 2 to 36, signed and unsigned, with the messages of its `NumberFormatException`s | `Integer.parseInt`, `Long.parseLong`, `Byte`, `Short`, `parseUnsignedInt`, `parseUnsignedLong` |
+| `java.character` | `is_whitespace`, the units Java counts as white space, and `code_point_of`, the code point a character's name names | `Character.isWhitespace`, `Character.codePointOf` |
+| `java.names` | The names of the code points, JDK 25's, written by [`oracle/unicode/names.py`](../oracle/unicode/names.py) | `Character.getName` |
 | `json.gson` | `JsonWriter`, compact JSON with Gson's escapes | Gson's `JsonWriter`, with `disableHtmlEscaping` |
 | `json.tree` | `Json`, a JSON value, with a strict parser, a writer and lookups | |
 | `nbt.tag` | `Tag`, an NBT tag, read and written in network and file form with `Accounter`'s limits, and printed as SNBT | `Tag` and its types, `NbtIo`, `NbtAccounter`, `StringTagVisitor` |
+| `nbt.snbt` | `parse` and `parse_compound`: SNBT read into a tag, with vanilla's errors at vanilla's places, and `SyntaxError`, brigadier's message and context | `TagParser`, `SnbtGrammar`, `SnbtOperations`, the packrat parser in `util.parsing.packrat`, `CommandSyntaxException` |
 | `pack.zip` | `Zip`, a zip archive in memory: the central directory, Zip64, and entries stored or deflated, each checked against its CRC-32 | `java.util.zip.ZipFile` |
-| `pack.resources` | `Pack`, a data pack's files under `data/`, and `Resources`, the packs in order, whose `list` and `stacks` give files in vanilla's order, later packs over earlier ones, and `KnownPack` | `PackResources`, `MultiPackResourceManager`, `FileToIdConverter`, `KnownPack` |
-| `pack.vanilla` | `vanilla_pack`: the built-in data pack, from the jar bundled in Mojang's server jar, downloaded the first time and checked against its pins | `VanillaPackResources`, the bundler's `versions.list` |
+| `pack.resources` | `Pack`, a pack's files under `data/`, and under `assets/` with `read_file`, and `Resources`, the packs in order, whose `list` and `stacks` give files in vanilla's order, later packs over earlier ones, and `KnownPack` | `PackResources`, `MultiPackResourceManager`, `FileToIdConverter`, `KnownPack` |
+| `pack.vanilla` | `vanilla_pack`: the built-in data pack, from the jar bundled in Mojang's server jar, downloaded the first time and checked against its pins; `vanilla_language`, the server's language from the same jar | `VanillaPackResources`, the bundler's `versions.list`, `Language.loadDefault` |
 | `pack.pin` | Where the pinned server jar comes from, and its size and SHA-1, written by [`calx_tables.py`](../oracle/datagen/README.md#calx-modules) | |
 | `registry.builtin` | The 95 built-in registries and their entries in ID order, written by [`calx_tables.py`](../oracle/datagen/README.md#calx-modules) | `BuiltInRegistries` |
 | `registry.registry` | `Registry`, a registry's entries with their IDs and its tags, and `Tag` | `MappedRegistry`, `HolderSet.Named` |
 | `registry.tags` | `load_tags`: a registry's tags from the packs, read, merged and built in vanilla's order, with its log lines | `TagLoader`, `TagFile`, `TagEntry`, `DependencySorter` |
 | `registry.registries` | `Registries`: the synchronized registries, in the order they're sent, and the built-in ones, each with its tags | `RegistryDataLoader`, `RegistrySynchronization` |
 | `chat.component` | `Component`: text and translations with their arguments and siblings, their JSON and NBT, written and read, and `get_string`, their text | `Component`, `ComponentSerialization.CODEC`, `TranslatableContents` |
-| `chat.language` | `Language`, the text of each translation key, which the server's own text, such as its log, is made with | `Language` |
+| `chat.language` | `Language`, the text of each translation key, which the server's own text, such as its log and SNBT's errors, is made with; `from_json` makes it from en_us.json and deprecated.json | `Language`, `Language.loadDefault` |
 | `resources.identifier` | `Identifier`, a namespace and a path, parsed with vanilla's rules and messages | `Identifier` |
 | `auth.profile` | `GameProfile` and `ProfileProperty`, as the login sends them; offline profiles, and which names vanilla takes | authlib's `GameProfile` and `Property`, `ByteBufCodecs.GAME_PROFILE`, `UUIDUtil.createOfflineProfile`, `StringUtil.isValidPlayerName` |
 | `auth.session` | The server's hash, the session server's `hasJoined` URL, and what each answer of Mojang's services means | `Crypt.digestData`, authlib's `MinecraftClient`, `MinecraftServicesSessionService.hasJoinedServer`, `PropertyMap.Serializer` |
@@ -59,7 +63,7 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `rig.rng` | The `rng` probe | |
 | `rig.collections` | The `collections` probe: Calx's Java-ordered tables against Java's and fastutil's | |
 | `rig.registries` | The `registries` probe: the vanilla data pack's registries and tags against vanilla's | |
-| `rig.nbt` | The `nbt` probe: binary NBT read, printed and written back, against vanilla's | |
+| `rig.nbt` | The `nbt` probe: binary NBT read, printed and written back, and SNBT parsed, against vanilla's | |
 
 ## Random sources
 
@@ -228,7 +232,7 @@ fn main() {
 
 A member at its codec's default is left out, as vanilla's `lenientOptionalFieldOf` leaves it: an empty description or sample, no icon, and `enforcesSecureChat` when it's false. Plain text with no siblings is a bare string. [`test/status.calx`](test/status.calx) checks each case against what vanilla 26.3 gives, including Gson's escapes, which leave `<`, `>`, `&` and DEL as they are and escape U+2028 and U+2029.
 
-An offline player's UUID, and a component as text, which is how the log shows a disconnect's reason. The server's language has no translations until it's read from the jar (`P5.8`), so for now a key is its own text, as vanilla shows a key its language hasn't:
+An offline player's UUID, and a component as text, which is how the log shows a disconnect's reason. The server reads its language from the jar as it starts, as vanilla does: en_us.json, with the changes deprecated.json makes. A key the language hasn't is its own text, as in vanilla:
 
 ```calx
 import auth.profile.{GameProfile}
@@ -266,7 +270,6 @@ Where it differs from vanilla, for now:
 | Also logs to logs/latest.log | Logs to the console only | A later change |
 | `enforcesSecureChat` follows `enforce-secure-profile` and online mode | Always false, since nothing checks chat yet | Signed chat (`P4.5`) |
 | The status's player counts and sample come from who's online, rebuilt every 5 seconds | No one can be online, so it's built once | Play (`P4.5`) |
-| Reads its language, en_us.json, from the jar, so the log shows a reason's English text | Has no translations, so a translated reason shows its key, such as `multiplayer.disconnect.slow_login` | Reading the jar (`P5.8`) |
 | Checks bans, the whitelist and a full server before it lets a player in, and kicks a player already in the world with the same UUID | Lets every valid login in, since there's no player list yet | Play (`P4.5`) |
 | Logs an exception's stack trace after lines such as `Failed to connect` | Logs the line alone | A later change |
 | Fetches the services' public keys twice when it starts, once for its session service and once for itself, so with no internet it logs their failure twice | Fetches them once | Always |
@@ -286,6 +289,8 @@ Where it differs from vanilla, for now:
 | Has several messages for a mistake inside an IPv6 address in a link, such as `IPv6 address too long` | Says `Malformed IPv6 address`, at the address's start | Always |
 | Keeps a resource pack prompt's styles and other contents, such as key binds, and sends its number and boolean arguments as numbers | Keeps text and translations, with the arguments as text, and refuses other contents | Chat (`P4.5`) |
 | Logs a prompt that isn't JSON with Gson's exception, and one its codec refuses with the codec's message; reads one nested up to 255 deep | Logs the first without an exception, and the second with Calcite's own message, such as `No matching codec found`; reads one nested up to 64 deep | Always |
+| Reads SNBT nested as deep as its stack holds, then throws `StackOverflowError`, which nothing catches | Stops at 512 levels of compounds, lists and operations together, as binary NBT does, with `Tried to read NBT tag with too high complexity, depth > 512` at the bracket of the level too deep ([the difference](../rig/differences/snbt-depth.md)) | Always |
+| Makes a lone half of a surrogate pair from an SNBT escape such as `\ud800` | Makes a `?`, since a `String` holds only Unicode | Always |
 
 ## Tests
 
