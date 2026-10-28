@@ -1,0 +1,469 @@
+/// The attributes that write the protocol's code from declarations (D124):
+///
+/// - `@packet(bound, "name")` makes a struct a packet: its ID in each state is the named packet's
+///   place in `protocol.ids`, and its reader and writer follow its fields, in order.
+/// - `@wire` gives a struct inside packets a reader and writer the same way.
+/// - `@wire_enum("message")` writes an enum without data as a VarInt: each variant's value, or
+///   its place when it has none. An unknown one fails with the message and the number.
+/// - `@packets(state, bound)` makes an enum whose variants each hold a packet read the one a
+///   packet ID names. Each variant is named after its packet, `CookieResponse` for
+///   `cookie_response`, which gives its ID.
+///
+/// A field's type says how it goes over the wire: the numbers and `bool` as Netty writes them,
+/// `String` as vanilla's `Utf8String`, `Uuid` as two longs, `List<u8>` as a byte array, `List<T>`
+/// as a count and the elements, `T?` as a `bool` and then the value, and any other type through
+/// its own `Wire`. On a field, `@varint` makes an `i32` a VarInt and an `i64` a VarLong (on a
+/// list, its elements), `@max(n)` limits a string's UTF-16 units or a list's length, and `@rest`
+/// makes a `List<u8>` every byte left, at most `@max` of them when it has one.
+module protocol.codegen
+
+import std.meta.{StructDecl, EnumDecl, Field, TypeRef, TypeKind, Generated}
+import protocol.state.{State, Bound}
+import protocol.ids.{packet_names, game_version}
+
+/// Makes the struct the packet going `bound` that vanilla names `name`, without `minecraft:`:
+/// `@packet(Bound.Serverbound, "intention")`. Its ID in each state is its place there.
+@attribute("varint", "max", "rest")
+pub fn packet(decl: StructDecl, bound: Bound, name: String) -> Generated ! String {
+    let states: [State; 5] = [State.Handshake, State.Status, State.Login, State.Configuration, State.Play]
+    var arms = String()
+    var found = false
+    for state in states {
+        let id = id_of(state, bound, name)
+        found = found or id >= 0
+        arms.push_str("            State.{variant(state)} => {id},\n")
+    }
+    if not found {
+        fail "vanilla {game_version()} has no {bound_name(bound)} packet `{name}`; {near(all_names(bound), name)}"
+    }
+    var g = Generated.new()
+    g.add(#"import protocol.wire.{Reader, Writer, DecodeError, Wire, Packet}"#)
+    g.add(#"import protocol.state.{State}"#)
+    g.add(#"
+        impl Packet for #{decl.name} {
+            fn id(state: State) -> i32 {
+                return match state {
+        #{arms}        }
+            }
+        }
+        "#)
+    g.add(try struct_wire(decl))
+    return g
+}
+
+// The packet's ID in `state`, or -1.
+fn id_of(state: State, bound: Bound, name: String) -> i32 {
+    let names = packet_names(state, bound)
+    for i in 0..names.len() {
+        if names[i] == name {
+            return i32.wrap(i)
+        }
+    }
+    return -1
+}
+
+// Every packet going `bound`, in any state.
+fn all_names(bound: Bound) -> List<String> {
+    let states: [State; 5] = [State.Handshake, State.Status, State.Login, State.Configuration, State.Play]
+    var out = List<String>()
+    for state in states {
+        for n in packet_names(state, bound) {
+            if not out.contains(n) {
+                out.push(n.copy())
+            }
+        }
+    }
+    return out
+}
+
+/// Gives the struct a reader and writer from its fields, for a type inside packets.
+@attribute("varint", "max", "rest")
+pub fn wire(decl: StructDecl) -> Generated ! String {
+    var g = Generated.new()
+    g.add(#"import protocol.wire.{Reader, Writer, DecodeError, Wire}"#)
+    g.add(try struct_wire(decl))
+    return g
+}
+
+/// Writes the enum as a VarInt: each variant's value, or its place when the enum gives none. A
+/// number no variant has fails with `unknown`, a colon and the number, as vanilla's
+/// `Unknown connection intent: 4`.
+@attribute
+pub fn wire_enum(decl: EnumDecl, unknown: String) -> Generated ! String {
+    if decl.generics.len() > 0 {
+        fail "`@wire_enum` is for an enum without generic parameters"
+    }
+    var reads = String()
+    var writes = String()
+    var i: usize = 0
+    for v in decl.variants {
+        if v.payload.len() > 0 or v.fields.len() > 0 {
+            fail "`@wire_enum` is for an enum without data, and `{v.name}` has some"
+        }
+        let n = if v.value.is_empty() { "{i}" } else { v.value.copy() }
+        reads.push_str(#"
+                    if id == #{n} {
+                        return #{decl.name}.#{v.name}
+                    }
+            "#)
+        reads.push('\n')
+        writes.push_str("            {decl.name}.{v.name} => {n},\n")
+        i += 1
+    }
+    var g = Generated.new()
+    g.add(#"import protocol.wire.{Reader, Writer, DecodeError, Wire}"#)
+    g.add(#"
+        impl Wire for #{decl.name} {
+            fn read(r: mut Reader) -> #{decl.name} ! DecodeError {
+                let id = try r.varint()
+        #{reads}        fail DecodeError { message: "#{unknown}: {id}" }
+            }
+
+            fn write(self, w: mut Writer) {
+                w.varint(match self {
+        #{writes}        })
+            }
+        }
+        "#)
+    return g
+}
+
+/// Makes an enum whose variants each hold one of the packets of `state` going `bound` read a
+/// packet's ID and the packet it names, with `E.read(mut r)`, as vanilla's `PacketDecoder`: it
+/// fails on an ID it doesn't know, and on bytes left after the packet. Each variant is named
+/// after its packet, as `CookieResponse` for `cookie_response`, which gives the ID it's read
+/// for, and a debug build checks that its packet agrees.
+@attribute
+pub fn packets(decl: EnumDecl, state: State, bound: Bound) -> Generated ! String {
+    let names = packet_names(state, bound)
+    var arms = String()
+    for v in decl.variants {
+        if v.payload.len() != 1 or v.fields.len() > 0 {
+            fail "each variant of a `@packets` enum holds one packet, and `{v.name}` doesn't"
+        }
+        let name = snake(v.name)
+        let id = id_of(state, bound, name)
+        if id < 0 {
+            fail "`{v.name}` is named after the {state_name(state)} {bound_name(bound)} packet `{name}`, which vanilla {game_version()} hasn't; {near(names, name)}"
+        }
+        let t = v.payload[0].text.copy()
+        let kind = "{bound_name(bound)}/minecraft:{name}"
+        arms.push_str(#"
+                    if id == #{id} {
+                        assert(#{t}.id(State.#{variant(state)}) == #{id}, "`#{t}` isn't the packet `#{name}`")
+                        let decoded = match #{t}.read(mut r) {
+                            ok(p) => p,
+                            err(e) => {
+                                fail DecodeError { message: "Failed to decode packet '#{kind}': {e.message}" }
+                            },
+                        }
+                        if r.left() > 0 {
+                            fail DecodeError { message: "Packet #{state_name(state)}/#{kind} (#{t}Packet) was larger than I expected, found {r.left()} bytes extra whilst reading packet #{kind}" }
+                        }
+                        return #{decl.name}.#{v.name}(decoded)
+                    }
+            "#)
+        arms.push('\n')
+    }
+    var g = Generated.new()
+    g.add(#"import protocol.wire.{Reader, DecodeError, Wire, Packet}"#)
+    g.add(#"import protocol.state.{State}"#)
+    g.add(#"
+        impl #{decl.name} {
+            /// Reads a packet's ID, then the packet, which must end where `r` does.
+            pub fn read(r: mut Reader) -> #{decl.name} ! DecodeError {
+                let id = try r.varint()
+        #{arms}        fail DecodeError { message: "Received unknown packet id {id}" }
+            }
+        }
+        "#)
+    return g
+}
+
+// `Wire` for a struct: each field read in order into a local of its name, then the struct, and
+// each written in order.
+fn struct_wire(decl: StructDecl) -> String ! String {
+    if decl.generics.len() > 0 {
+        fail "a packet's struct can't be generic"
+    }
+    var reads = String()
+    var writes = String()
+    var fields = String()
+    for f in decl.fields {
+        let local = if f.name == "r" { String("r_field") } else { f.name.copy() }
+        reads.push_str(try read_field(f, local))
+        writes.push_str(try write_value(f.ty, try varint_of(f), try max_of(f), try rest_of(f), "self.{f.name}", "        ", 0))
+        if not fields.is_empty() {
+            fields.push_str(", ")
+        }
+        fields.push_str("{f.name}: {local}")
+    }
+    return #"
+        impl Wire for #{decl.name} {
+            fn read(r: mut Reader) -> #{decl.name} ! DecodeError {
+        #{reads}        return #{decl.name} { #{fields} }
+            }
+
+            fn write(self, w: mut Writer) {
+        #{writes}    }
+        }
+        "#
+}
+
+// Whether the field is `@varint`, which only an `i32`, an `i64` or a list of them can be.
+fn varint_of(f: Field) -> bool ! String {
+    if not has(f, "varint") {
+        return false
+    }
+    let t = if f.ty.kind == TypeKind.Named and f.ty.name == "List" and f.ty.args.len() == 1 { f.ty.args[0].text.copy() } else { f.ty.text.copy() }
+    if t != "i32" and t != "i64" {
+        fail "`@varint` is for an `i32` or an `i64`, or a list of them, and `{f.name}` is a `{f.ty.text}`"
+    }
+    return true
+}
+
+// The field's `@max`, as written, or `""`. Only a string or a list has one.
+fn max_of(f: Field) -> String ! String {
+    for a in f.attributes {
+        if a.name == "max" {
+            if a.args.len() != 1 {
+                fail "`@max` takes one argument, the most the field holds"
+            }
+            if not takes_max(f.ty) {
+                fail "`@max` is for a `String` or a `List`, or an optional one, and `{f.name}` is a `{f.ty.text}`"
+            }
+            return a.args[0].copy()
+        }
+    }
+    return String()
+}
+
+fn takes_max(t: TypeRef) -> bool {
+    if t.kind == TypeKind.Optional {
+        return takes_max(t.args[0])
+    }
+    return t.text == "String" or (t.kind == TypeKind.Named and t.name == "List")
+}
+
+// Whether the field is `@rest`, which only the last field, a `List<u8>`, can be.
+fn rest_of(f: Field) -> bool ! String {
+    if not has(f, "rest") {
+        return false
+    }
+    if f.ty.text != "List<u8>" {
+        fail "`@rest` is for a `List<u8>`, and `{f.name}` is a `{f.ty.text}`"
+    }
+    return true
+}
+
+fn has(f: Field, name: String) -> bool {
+    for a in f.attributes {
+        if a.name == name {
+            return true
+        }
+    }
+    return false
+}
+
+// The statements that read a field into `local`.
+fn read_field(f: Field, local: String) -> String ! String {
+    let varint = try varint_of(f)
+    let max = try max_of(f)
+    if f.ty.kind == TypeKind.Named and f.ty.name == "List" and f.ty.args.len() == 1 {
+        if f.ty.args[0].text == "u8" {
+            if try rest_of(f) {
+                if not max.is_empty() {
+                    return "        let {local} = try r.rest_at_most({max})\n"
+                }
+                return "        let {local} = r.rest()\n"
+            }
+            if not max.is_empty() {
+                return "        let {local} = try r.byte_array({max})\n"
+            }
+            return "        let {local} = try r.byte_array_in_left()\n"
+        }
+        let limit = if max.is_empty() { String("usize.MAX") } else { max.copy() }
+        let one = try read_expr(f.ty.args[0], varint, String(), f.name)
+        var out = #"
+                    let #{local}_count = try r.count(#{limit})
+                    var #{local} = List<#{f.ty.args[0].text}>()
+                    #{local}.reserve(#{local}_count)
+                    for _ in 0..#{local}_count {
+                        #{local}.push(#{one})
+                    }
+            "#
+        out.push('\n')
+        return out
+    }
+    _ = try rest_of(f)
+    return "        let {local} = {try read_expr(f.ty, varint, max, f.name)}\n"
+}
+
+// An expression that reads one value of type `t`.
+fn read_expr(t: TypeRef, varint: bool, max: String, field: String) -> String ! String {
+    if t.kind == TypeKind.Optional {
+        let inner = try read_expr(t.args[0], varint, max, field)
+        return "if try r.bool() \{ some({inner}) \} else \{ none \}"
+    }
+    if t.kind != TypeKind.Named {
+        fail "`{field}`'s type, `{t.text}`, has no wire format; give it a struct with `@wire`"
+    }
+    if t.name == "List" and t.args.len() == 1 and t.args[0].text == "u8" {
+        return if max.is_empty() { String("try r.byte_array_in_left()") } else { "try r.byte_array({max})" }
+    }
+    if t.args.len() > 0 {
+        fail "`{field}` holds a `{t.text}` inside another type, which has no wire format; put it in a struct with `@wire`"
+    }
+    let n = t.name.copy()
+    if n == "bool" or n == "i8" or n == "u8" or n == "i16" or n == "u16" or n == "f32" or n == "f64" {
+        return "try r.{n}()"
+    }
+    if n == "i32" {
+        return if varint { String("try r.varint()") } else { String("try r.i32()") }
+    }
+    if n == "i64" {
+        return if varint { String("try r.varlong()") } else { String("try r.i64()") }
+    }
+    if n == "String" {
+        let limit = if max.is_empty() { String("32767") } else { max.copy() }
+        return "try r.string({limit})"
+    }
+    if n == "Uuid" {
+        return String("try r.uuid()")
+    }
+    return "try {n}.read(mut r)"
+}
+
+// The statements that write `value`, of type `t`, each line indented by `indent`. `depth` names
+// the bindings of nested lists and optionals apart.
+fn write_value(t: TypeRef, varint: bool, max: String, rest: bool, value: String, indent: String, depth: i32) -> String ! String {
+    if t.kind == TypeKind.Optional {
+        let v = "value_{depth}"
+        let inner = try write_value(t.args[0], varint, max, false, v, "{indent}    ", depth + 1)
+        return "{indent}if let {v} = {value} \{\n{indent}    w.bool(true)\n{inner}{indent}\} else \{\n{indent}    w.bool(false)\n{indent}\}\n"
+    }
+    if t.kind == TypeKind.Named and t.name == "List" and t.args.len() == 1 {
+        if t.args[0].text == "u8" {
+            if rest {
+                return "{indent}w.raw({value})\n"
+            }
+            return if max.is_empty() { "{indent}w.byte_array({value})\n" } else { "{indent}w.byte_array_at_most({value}, {max})\n" }
+        }
+        let e = "element_{depth}"
+        let inner = try write_value(t.args[0], varint, String(), false, e, "{indent}    ", depth + 1)
+        let count = if max.is_empty() { "w.count({value}.len())" } else { "w.count_at_most({value}.len(), {max})" }
+        return "{indent}{count}\n{indent}for {e} in {value} \{\n{inner}{indent}\}\n"
+    }
+    if t.kind != TypeKind.Named or t.args.len() > 0 {
+        fail "`{t.text}` has no wire format; give it a struct with `@wire`"
+    }
+    let n = t.name.copy()
+    if n == "bool" or n == "i8" or n == "u8" or n == "i16" or n == "u16" or n == "f32" or n == "f64" or n == "Uuid" {
+        return "{indent}w.{n.to_lower_root()}({value})\n"
+    }
+    if n == "i32" {
+        return if varint { "{indent}w.varint({value})\n" } else { "{indent}w.i32({value})\n" }
+    }
+    if n == "i64" {
+        return if varint { "{indent}w.varlong({value})\n" } else { "{indent}w.i64({value})\n" }
+    }
+    if n == "String" {
+        let limit = if max.is_empty() { String("32767") } else { max.copy() }
+        return "{indent}w.string({value}, {limit})\n"
+    }
+    return "{indent}{value}.write(mut w)\n"
+}
+
+// `CookieResponse` as `cookie_response`.
+fn snake(name: String) -> String {
+    var out = String()
+    for i in 0..name.len() {
+        let c = name.byte_at(i)
+        if c >= 65 and c <= 90 {
+            if i > 0 {
+                out.push('_')
+            }
+            out.push(rune(c + 32))
+        } else {
+            out.push(rune(c))
+        }
+    }
+    return out
+}
+
+// The state's variant, as generated code names it.
+fn variant(s: State) -> String {
+    return match s {
+        State.Handshake => "Handshake",
+        State.Status => "Status",
+        State.Login => "Login",
+        State.Configuration => "Configuration",
+        State.Play => "Play",
+    }
+}
+
+fn state_name(s: State) -> String {
+    return match s {
+        State.Handshake => "handshake",
+        State.Status => "status",
+        State.Login => "login",
+        State.Configuration => "configuration",
+        State.Play => "play",
+    }
+}
+
+fn bound_name(b: Bound) -> String {
+    return match b {
+        Bound.Serverbound => "serverbound",
+        Bound.Clientbound => "clientbound",
+    }
+}
+
+// The names most like `name`, for a name that isn't there: those that hold it or that it holds,
+// or every name when there are few.
+// What to suggest for a name that isn't in `names`: the ones that hold it, or are held by it, or
+// are a typo away from it, or else all of them, if there are few.
+fn near(names: List<String>, name: String) -> String {
+    var like = String()
+    for n in names {
+        if n.contains(name) or name.contains(n) or distance(n, name) <= 2 {
+            if not like.is_empty() {
+                like.push_str(", ")
+            }
+            like.push_str("`{n}`")
+        }
+    }
+    if not like.is_empty() {
+        return "did you mean {like}?"
+    }
+    if names.len() > 12 {
+        return "it has {names.len()} of them, listed in protocol.ids"
+    }
+    var all = String()
+    for n in names {
+        if not all.is_empty() {
+            all.push_str(", ")
+        }
+        all.push_str("`{n}`")
+    }
+    return if all.is_empty() { String("it has none") } else { "they are {all}" }
+}
+
+// The Levenshtein distance between `a` and `b`, by bytes: packet names are ASCII.
+fn distance(a: String, b: String) -> usize {
+    var row = List<usize>()
+    for j in 0..b.len() + 1 {
+        row.push(j)
+    }
+    for i in 0..a.len() {
+        var diagonal = row[0]
+        row[0] = i + 1
+        for j in 0..b.len() {
+            let above = row[j + 1]
+            let cost: usize = if a.byte_at(i) == b.byte_at(j) { 0 } else { 1 }
+            row[j + 1] = (above + 1).min(row[j] + 1).min(diagonal + cost)
+            diagonal = above
+        }
+    }
+    return row[b.len()]
+}

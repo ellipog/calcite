@@ -5,7 +5,7 @@ description: How Calcite turns Mojang's server jar into the tables its codegen r
 
 # Data generator and tables
 
-Calcite's block states, registries, item defaults, packet IDs and command tree come from Mojang's own data generator, run on the official server jar (Phase 2). One command fetches the jar, runs the generator, and converts its reports into neutral tables that Calx codegen reads. None of it is committed: `generated/` is gitignored (D30).
+Calcite's block states, registries, item defaults, packet IDs and command tree come from Mojang's own data generator, run on the official server jar (Phase 2). One command fetches the jar, runs the generator, and converts its reports into neutral tables that Calx codegen reads. None of that is committed: `generated/` is gitignored (D30). What Calcite compiles in from the tables is committed as Calx, so it builds without the jar ([below](#calx-modules)).
 
 ```sh
 py -I oracle/datagen/datagen.py            # fetch, generate and convert into generated/26.3/
@@ -93,16 +93,32 @@ The report of what data packs can define (each registry's `elements`, `tags` and
 
 Calcite compiles in what vanilla defines in code: everything in `tables/`. Codegen turns it into constant arrays, so a state lookup is arithmetic and an array read, with nothing parsed at startup. What vanilla loads from its built-in data pack (data-driven registries such as biomes, dimension types and damage types, worldgen settings, tags, loot tables, recipes, advancements and structure templates) Calcite loads at startup from the jar, through the same loader user data packs go through, so a data pack can override it as it can in vanilla.
 
+## Calx modules
+
+[`calx_tables.py`](calx_tables.py) writes the Calx modules Calcite compiles in from `tables/` (D126):
+
+```sh
+py -I oracle/datagen/calx_tables.py            # write them from generated/26.3/tables
+py -I oracle/datagen/calx_tables.py --check    # fail if a committed one is out of date
+```
+
+| Module | From | What it holds |
+| --- | --- | --- |
+| `src/protocol/ids.calx` | `index.json`, `packets.json` | `PROTOCOL_VERSION`, `game_version()`, and `packet_names(state, bound)`, each state's packets in ID order, which `@packet` reads its IDs from |
+
+They're committed, and hold only the names and IDs the protocol needs, which every compatible server encodes. Don't edit one: change the script and run it again. A new game version that changes them changes Calcite's build, which is the point: `@packet` then fails to compile for a packet that was renamed or removed.
+
 ## Tests
 
 ```sh
 py -I -m unittest discover -s oracle/datagen/tests -v
 ```
 
-The tests use only the standard library and small made-up reports, so they never need the jar. They cover number text surviving conversion, the canonical layout, ID gap checks, the mixed-radix rule and what breaks it, property kinds, and the fetch step's checks offline. CI runs them with the rig's tests.
+The tests use only the standard library and small made-up reports, so they never need the jar. They cover number text surviving conversion, the canonical layout, ID gap checks, the mixed-radix rule and what breaks it, property kinds, the fetch step's checks offline, and the Calx modules `calx_tables.py` writes. Where the tables have been generated, they also check that the committed modules are current. CI runs them with the rig's tests.
 
 ## A new game version
 
 1. `py -I oracle/fetch.py --version <v> --pin` records the jar's URL, size and SHA-1 from Mojang's manifest in `versions.json`. Commit that.
 2. `py -I oracle/datagen/datagen.py --version <v>`. If the converter stops on a check, the game changed something codegen relies on: update the converter and this page together.
 3. `py -I oracle/datagen/datagen.py --version <v> --check`.
+4. `py -I oracle/datagen/calx_tables.py --version <v>`, then build Calcite and run its tests: a renamed or removed packet fails to compile where it's declared.

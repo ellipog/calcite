@@ -1,0 +1,458 @@
+/// The protocol's wire format: a `Reader` that takes values out of a packet's bytes, a `Writer`
+/// that puts them in, and the interfaces that `@packet` and `@wire` implement from a type's
+/// fields. Numbers are big-endian, as Netty's `ByteBuf` has them, and VarInts and strings follow
+/// vanilla's `VarInt`, `VarLong` and `Utf8String`, limits and error messages included.
+module protocol.wire
+
+import java.uuid.{Uuid}
+import protocol.state.{State}
+import resources.identifier.{Identifier}
+
+/// Why a packet couldn't be read. Where vanilla reports the same problem, the message is its.
+pub struct DecodeError {
+    pub message: String
+}
+
+/// A type that goes over the wire. `@packet` and `@wire` implement it from a type's fields.
+pub interface Wire {
+    /// Reads one, from where `r` is.
+    fn read(r: mut Reader) -> Self ! DecodeError
+    /// Writes it at the end of `w`.
+    fn write(self, w: mut Writer)
+}
+
+/// A packet. `@packet` implements it from the packet's places in `protocol.ids`.
+pub interface Packet {
+    /// Its ID in `state`, for its direction, or -1 if it isn't one of that state's packets. A
+    /// packet such as `keep_alive` is in more than one state, with a different ID in each.
+    fn id(state: State) -> i32
+}
+
+/// The longest string a packet's string field holds by default, in UTF-16 units, as vanilla's
+/// `readUtf()` allows.
+pub const MAX_STRING: i32 = 32767
+
+fn bad(message: own String) -> DecodeError {
+    return DecodeError { message: message }
+}
+
+/// A packet's ID in `state`, then the packet, as a frame holds them before compression. The
+/// packet must be one of the state's: writing one that isn't is a bug, so it panics.
+pub fn write_packet<T: Wire + Packet>(p: T, state: State, w: mut Writer) {
+    let id = T.id(state)
+    assert(id >= 0, "a packet was written in a state it isn't part of")
+    w.varint(id)
+    p.write(mut w)
+}
+
+/// An identifier as vanilla writes it: `namespace:path`, as a string of at most 32767 units.
+impl Wire for Identifier {
+    fn read(r: mut Reader) -> Identifier ! DecodeError {
+        let text = try r.string(MAX_STRING)
+        return match Identifier.parse(text) {
+            ok(id) => id,
+            err(message) => {
+                fail bad(message)
+            },
+        }
+    }
+
+    fn write(self, w: mut Writer) {
+        w.string(self.to_string(), MAX_STRING)
+    }
+}
+
+/// Reads values from a packet's bytes, front to back.
+pub struct Reader {
+    data: List<u8>
+    at: usize
+}
+
+impl Reader {
+    /// A reader at the start of the bytes.
+    pub fn new(data: own List<u8>) -> Reader {
+        return Reader { data: data, at: 0 }
+    }
+
+    /// How many bytes are left to read.
+    pub fn left(self) -> usize {
+        return self.data.len() - self.at
+    }
+
+    /// Gives back the bytes, so their memory can hold the next packet.
+    pub fn into_bytes(own self) -> List<u8> {
+        return self.data
+    }
+
+    // Fails unless `n` more bytes are there.
+    fn need(self, n: usize) ! DecodeError {
+        if self.data.len() - self.at < n {
+            fail bad("not enough bytes: {n} wanted, {self.data.len() - self.at} left")
+        }
+    }
+
+    pub fn u8(mut self) -> u8 ! DecodeError {
+        try self.need(1)
+        let b = self.data[self.at]
+        self.at += 1
+        return b
+    }
+
+    pub fn i8(mut self) -> i8 ! DecodeError {
+        return i8.wrap(try self.u8())
+    }
+
+    /// A byte, which is `true` unless it's 0, as Netty's `readBoolean`.
+    pub fn bool(mut self) -> bool ! DecodeError {
+        return try self.u8() != 0
+    }
+
+    pub fn u16(mut self) -> u16 ! DecodeError {
+        try self.need(2)
+        let v = (i32(self.data[self.at]) << 8) | i32(self.data[self.at + 1])
+        self.at += 2
+        return u16.wrap(v)
+    }
+
+    pub fn i16(mut self) -> i16 ! DecodeError {
+        return i16.wrap(try self.u16())
+    }
+
+    pub fn i32(mut self) -> i32 ! DecodeError {
+        try self.need(4)
+        let p = self.at
+        let v = (i32(self.data[p]) << 24) | (i32(self.data[p + 1]) << 16) | (i32(self.data[p + 2]) << 8) | i32(self.data[p + 3])
+        self.at += 4
+        return v
+    }
+
+    pub fn i64(mut self) -> i64 ! DecodeError {
+        try self.need(8)
+        var v: u64 = 0
+        for i in self.at..self.at + 8 {
+            v = (v << 8) | u64(self.data[i])
+        }
+        self.at += 8
+        return i64.wrap(v)
+    }
+
+    pub fn f32(mut self) -> f32 ! DecodeError {
+        return f32.from_bits(u32.wrap(try self.i32()))
+    }
+
+    pub fn f64(mut self) -> f64 ! DecodeError {
+        return f64.from_bits(u64.wrap(try self.i64()))
+    }
+
+    /// A VarInt: 7 bits a byte, least significant first, while the top bit is set. Like
+    /// vanilla's, it reads a sixth byte before it fails, and drops what doesn't fit in 32 bits.
+    pub fn varint(mut self) -> i32 ! DecodeError {
+        var out: i32 = 0
+        var bytes: i32 = 0
+        loop {
+            let b = try self.u8()
+            out |= i32(b & 0x7F) << (bytes * 7)
+            bytes += 1
+            if bytes > 5 {
+                fail bad("VarInt too big")
+            }
+            if b < 0x80 {
+                return out
+            }
+        }
+    }
+
+    /// A VarLong: a VarInt of up to 10 bytes.
+    pub fn varlong(mut self) -> i64 ! DecodeError {
+        var out: i64 = 0
+        var bytes: i64 = 0
+        loop {
+            let b = try self.u8()
+            out |= i64(b & 0x7F) << (bytes * 7)
+            bytes += 1
+            if bytes > 10 {
+                fail bad("VarLong too big")
+            }
+            if b < 0x80 {
+                return out
+            }
+        }
+    }
+
+    /// A string of at most `max` UTF-16 units: its length in bytes as a VarInt, then its UTF-8,
+    /// as vanilla's `Utf8String.read`. The byte length can't be over `3 * max`, Netty's most
+    /// bytes for that many units.
+    pub fn string(mut self, max: i32) -> String ! DecodeError {
+        let max_bytes = max * 3
+        let n = try self.varint()
+        if n > max_bytes {
+            fail bad("The received encoded string buffer length is longer than maximum allowed ({n} > {max_bytes})")
+        }
+        if n < 0 {
+            fail bad("The received encoded string buffer length is less than zero! Weird string!")
+        }
+        let len = usize.wrap(n)
+        if len > self.left() {
+            fail bad("Not enough bytes in buffer, expected {n}, but got {self.left()}")
+        }
+        let bytes = self.take(len)
+        // Vanilla decodes bad UTF-8 to U+FFFD, Java's way. Clients send none, so for now it's
+        // refused (CAL-43).
+        let s = String.from_utf8(bytes) ?? {
+            fail bad("The received string isn't UTF-8")
+        }
+        let units = s.utf16_len()
+        if units > usize.wrap(max) {
+            fail bad("The received string length is longer than maximum allowed ({units} > {max})")
+        }
+        return s
+    }
+
+    /// A UUID: two longs, most significant first.
+    pub fn uuid(mut self) -> Uuid ! DecodeError {
+        let most = try self.i64()
+        let least = try self.i64()
+        return Uuid { most: most, least: least }
+    }
+
+    /// Bytes after their count as a VarInt, at most `max` of them, as vanilla's
+    /// `readByteArray(max)`. Without a limit of its own, vanilla's is the bytes left.
+    pub fn byte_array(mut self, max: usize) -> List<u8> ! DecodeError {
+        let n = try self.varint()
+        if n < 0 {
+            fail bad("ByteArray with size {n} is negative")
+        }
+        let len = usize.wrap(n)
+        if len > max {
+            fail bad("ByteArray with size {n} is bigger than allowed {max}")
+        }
+        try self.need(len)
+        return self.take(len)
+    }
+
+    /// Bytes after their count as a VarInt, at most as many as are left, as vanilla's
+    /// `readByteArray()`.
+    pub fn byte_array_in_left(mut self) -> List<u8> ! DecodeError {
+        let max = self.left()
+        return try self.byte_array(max)
+    }
+
+    /// Every byte left, which can't be more than `max`, as vanilla's custom payloads.
+    pub fn rest_at_most(mut self, max: usize) -> List<u8> ! DecodeError {
+        if self.left() > max {
+            fail bad("Payload may not be larger than {max} bytes")
+        }
+        return self.rest()
+    }
+
+    /// Every byte left, for a packet whose last field runs to its end.
+    pub fn rest(mut self) -> List<u8> {
+        let n = self.left()
+        return self.take(n)
+    }
+
+    /// A count of elements before a list, as a VarInt: at most `max`, and never more than the
+    /// bytes left, since each element takes at least one.
+    pub fn count(mut self, max: usize) -> usize ! DecodeError {
+        let n = try self.varint()
+        if n < 0 {
+            fail bad("{n} elements is negative")
+        }
+        let len = usize.wrap(n)
+        if len > max {
+            fail bad("{n} elements exceeded max size of: {max}")
+        }
+        if len > self.left() {
+            fail bad("{n} elements, but only {self.left()} bytes left")
+        }
+        return len
+    }
+
+    // The next `n` bytes, which are there.
+    fn take(mut self, n: usize) -> List<u8> {
+        var out = List<u8>()
+        out.reserve(n)
+        unsafe {
+            let from = self.data.as_ptr().add(self.at)
+            let to = out.as_mut_ptr()
+            for i in 0..n {
+                to.add(i).write(from.add(i).read())
+            }
+            out.set_len(n)
+        }
+        self.at += n
+        return out
+    }
+}
+
+/// Writes values at the end of a packet's bytes. A value over its limit, such as a string with
+/// too many units, makes `problem` say so, and the bytes are then not a packet: vanilla
+/// disconnects the player rather than send it.
+pub struct Writer {
+    data: List<u8>
+    first_problem: String?
+}
+
+impl Writer {
+    pub fn new() -> Writer {
+        return Writer { data: List<u8>(), first_problem: none }
+    }
+
+    /// A writer that adds to the end of `data`, whose memory it reuses.
+    pub fn on(data: own List<u8>) -> Writer {
+        return Writer { data: data, first_problem: none }
+    }
+
+    /// How many bytes it holds.
+    pub fn len(self) -> usize {
+        return self.data.len()
+    }
+
+    /// The first value that couldn't be written, if there was one.
+    pub fn problem(self) -> String? {
+        return self.first_problem.copy()
+    }
+
+    /// The bytes written.
+    pub fn into_bytes(own self) -> List<u8> {
+        return self.data
+    }
+
+    pub fn u8(mut self, v: u8) {
+        self.data.push(v)
+    }
+
+    pub fn i8(mut self, v: i8) {
+        self.data.push(u8.wrap(v))
+    }
+
+    pub fn bool(mut self, v: bool) {
+        self.data.push(if v { 1 } else { 0 })
+    }
+
+    pub fn u16(mut self, v: u16) {
+        self.data.push(u8.wrap(i32(v) >> 8))
+        self.data.push(u8.wrap(v))
+    }
+
+    pub fn i16(mut self, v: i16) {
+        self.u16(u16.wrap(v))
+    }
+
+    pub fn i32(mut self, v: i32) {
+        self.data.push(u8.wrap(v >>> 24))
+        self.data.push(u8.wrap(v >>> 16))
+        self.data.push(u8.wrap(v >>> 8))
+        self.data.push(u8.wrap(v))
+    }
+
+    pub fn i64(mut self, v: i64) {
+        var shift: i64 = 56
+        while shift >= 0 {
+            self.data.push(u8.wrap(v >>> shift))
+            shift -= 8
+        }
+    }
+
+    pub fn f32(mut self, v: f32) {
+        self.i32(i32.wrap(v.to_bits()))
+    }
+
+    pub fn f64(mut self, v: f64) {
+        self.i64(i64.wrap(v.to_bits()))
+    }
+
+    pub fn varint(mut self, v: i32) {
+        var x = v
+        while (x & -128) != 0 {
+            self.data.push(u8.wrap((x & 0x7F) | 0x80))
+            x >>>= 7
+        }
+        self.data.push(u8.wrap(x))
+    }
+
+    pub fn varlong(mut self, v: i64) {
+        var x = v
+        while (x & -128) != 0 {
+            self.data.push(u8.wrap((x & 0x7F) | 0x80))
+            x >>>= 7
+        }
+        self.data.push(u8.wrap(x))
+    }
+
+    /// A string of at most `max` UTF-16 units, as vanilla's `Utf8String.write`: its UTF-8 length
+    /// as a VarInt, then its UTF-8.
+    pub fn string(mut self, s: String, max: i32) {
+        let units = s.utf16_len()
+        if units > usize.wrap(max) {
+            self.refuse("String too big (was {units} characters, max {max})")
+            return
+        }
+        self.varint(i32.wrap(s.len()))
+        let start = self.data.len()
+        self.data.reserve(s.len())
+        unsafe {
+            let from = s.as_ptr()
+            let to = self.data.as_mut_ptr().add(start)
+            for i in 0..s.len() {
+                to.add(i).write(from.add(i).read())
+            }
+            self.data.set_len(start + s.len())
+        }
+    }
+
+    pub fn uuid(mut self, v: Uuid) {
+        self.i64(v.most)
+        self.i64(v.least)
+    }
+
+    /// The bytes after their count as a VarInt.
+    pub fn byte_array(mut self, bytes: List<u8>) {
+        self.varint(i32.wrap(bytes.len()))
+        self.raw(bytes)
+    }
+
+    /// The bytes after their count, which can't be more than `max`, as vanilla's
+    /// `ByteBufCodecs.byteArray(max)`.
+    pub fn byte_array_at_most(mut self, bytes: List<u8>, max: usize) {
+        if bytes.len() > max {
+            self.refuse("ByteArray with size {bytes.len()} is bigger than allowed {max}")
+            return
+        }
+        self.byte_array(bytes)
+    }
+
+    /// The bytes as they are.
+    pub fn raw(mut self, bytes: List<u8>) {
+        let start = self.data.len()
+        self.data.reserve(bytes.len())
+        unsafe {
+            let from = bytes.as_ptr()
+            let to = self.data.as_mut_ptr().add(start)
+            for i in 0..bytes.len() {
+                to.add(i).write(from.add(i).read())
+            }
+            self.data.set_len(start + bytes.len())
+        }
+    }
+
+    /// A list's count, before its elements.
+    pub fn count(mut self, n: usize) {
+        self.varint(i32.wrap(n))
+    }
+
+    /// A list's count, which can't be more than `max`, as vanilla's `ByteBufCodecs.writeCount`.
+    pub fn count_at_most(mut self, n: usize, max: usize) {
+        if n > max {
+            self.refuse("{n} elements exceeded max size of: {max}")
+        }
+        self.count(n)
+    }
+
+    // Keeps the first problem.
+    fn refuse(mut self, message: own String) {
+        if self.first_problem == none {
+            self.first_problem = some(message)
+        }
+    }
+}
