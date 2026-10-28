@@ -16,6 +16,10 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `hash.md5` | MD5, for seeding from names and for offline players' UUIDs | Guava's `Hashing.md5()` |
 | `java.text` | `string_hash`, Java's `String.hashCode` over UTF-16 code units | `String.hashCode` |
 | `java.uuid` | `Uuid`, two `i64`s, written as Java writes them | `java.util.UUID` |
+| `java.base64` | `encode`, Base64 with padding and no line breaks | `java.util.Base64.getEncoder()` |
+| `java.properties` | `Properties`, a `.properties` file read with Java's rules for escapes, continued lines and comments | `java.util.Properties.load` |
+| `json.gson` | `JsonWriter`, compact JSON with Gson's escapes | Gson's `JsonWriter`, with `disableHtmlEscaping` |
+| `chat.component` | `Component`: text and translations with their arguments and siblings, and their JSON | `Component`, `ComponentSerialization.CODEC` |
 | `resources.identifier` | `Identifier`, a namespace and a path, parsed with vanilla's rules and messages | `Identifier` |
 | `auth.profile` | `GameProfile` and `ProfileProperty`, as the login sends them | authlib's `GameProfile` and `Property`, `ByteBufCodecs.GAME_PROFILE` |
 | `protocol.state` | `State`, the five protocol states, and `Bound`, a packet's direction | `ConnectionProtocol`, `PacketFlow` |
@@ -23,6 +27,13 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `protocol.wire` | `Reader` and `Writer`, the `Wire` and `Packet` interfaces, `write_packet` | `FriendlyByteBuf`, `VarInt`, `VarLong`, `Utf8String`, `ByteBufCodecs` |
 | `protocol.codegen` | The attributes that write packets' code: `@packet`, `@packets`, `@wire`, `@wire_enum` | Each packet's `STREAM_CODEC`, `IdDispatchCodec`, `PacketDecoder` |
 | `protocol.handshake`, `protocol.status`, `protocol.login` | Their states' packets | The packets in `network.protocol.handshake`, `.status`, `.login` and `.cookie` |
+| `protocol.frame` | `FrameReader`, which collects a connection's bytes and gives back whole frames, and `frame` | `Varint21FrameDecoder`, `Varint21LengthFieldPrepender` |
+| `protocol.legacy` | The server list ping of clients before 1.7, and its answer | `LegacyQueryHandler`, `LegacyProtocolUtils` |
+| `server.properties` | `ServerProperties`, the settings read so far, and `load`, which reads server.properties | `DedicatedServerProperties`, `Settings` |
+| `server.status` | `ServerStatus`, what the server list shows, and its JSON; `check_icon` | `ServerStatus`, `PngInfo`, `MinecraftServer.loadStatusIcon` |
+| `server.network` | `Network`: accepting connections, reading frames, the handshake, the status and ping, old pings, and the read timeout | `ServerConnectionListener`, `ServerHandshakePacketListenerImpl`, `ServerStatusPacketListenerImpl`, `ReadTimeoutHandler` |
+| `server.log` | `log` and `line`, the console's lines, and `Entry`, a line left for the caller to log | Mojang's log4j2 console pattern |
+| `calcite` | The server's `main` | `Main`, `DedicatedServer.initServer` |
 | `rig.adapter` | The rig adapter's main: answers `hello`, `run` and `bye` | |
 | `rig.frame`, `rig.json` | The rig's frames, and the JSON in their headers | |
 | `rig.rng` | The `rng` probe | |
@@ -111,12 +122,75 @@ fn main() {
 
 `read` takes a frame's bytes after its length and any compression, as vanilla's `PacketDecoder` does: the ID, then the packet, which must end where the frame does. It fails with vanilla's messages, such as `Received unknown packet id 5`, and says which packet failed to decode: `Failed to decode packet 'serverbound/minecraft:intention': Unknown connection intent: 4`.
 
+## The server
+
+```sh
+calx run --release src/calcite.calx     # in the folder that holds server.properties
+```
+
+It starts as vanilla's dedicated server does, with its log lines, and answers the server list: the status, with the description, player counts, version and icon, the ping, and the old pings of clients before 1.7. A client that tries to join is told `Calcite can't log players in yet` until the login is written (`P4.3`).
+
+- **server.properties** is read as vanilla reads it: UTF-8, or ISO-8859-1 if it isn't, with Java's `Properties` rules. A setting that's missing or doesn't parse is its default, as `Boolean.valueOf` and `Integer.parseInt` decide. The settings read so far are `online-mode`, `server-ip`, `server-port`, `motd`, `max-players`, `enable-status`, `hide-online-players`, `enforce-secure-profile`, `accepts-transfers`, `prevent-proxy-connections`, `network-compression-threshold`, `rate-limit` and `log-ips`.
+- **server-icon.png** must be a 64 by 64 PNG, checked as vanilla's `PngInfo` checks it, with its messages.
+- **The handshake** sends a client of another protocol version vanilla's `multiplayer.disconnect.outdated_client` or `multiplayer.disconnect.incompatible`, and a transfer, with `accepts-transfers` off, `multiplayer.disconnect.transfers_disabled`. A second status request closes the connection, and so does the pong.
+- **Broken input**, such as a frame of no bytes, a length longer than 3 bytes, an unknown packet or one with bytes left over, closes the connection without an answer and logs nothing, as vanilla does in these states: it has no disconnect packet to send, and logs the reason only at debug level.
+- **A connection that sends nothing for 30 seconds** is closed, as by vanilla's `ReadTimeoutHandler`.
+
+The status's JSON is what vanilla's codecs and Gson write, member for member:
+
+```calx
+import chat.component.{Component}
+import server.status.{ServerStatus}
+
+fn main() {
+    let status = ServerStatus {
+        description: Component.literal("A Minecraft Server"),
+        max_players: 20,
+        online: 0,
+        sample: [],
+        version_name: "26.3",
+        protocol: 777,
+        favicon: none,
+        enforces_secure_chat: false,
+    }
+    println(status.to_json())    // out: {"description":"A Minecraft Server","players":{"max":20,"online":0},"version":{"name":"26.3","protocol":777}}
+    let reason = Component.translatable("multiplayer.disconnect.incompatible", [Component.literal("26.3")])
+    println(reason.to_json())    // out: {"translate":"multiplayer.disconnect.incompatible","with":["26.3"]}
+}
+```
+
+A member at its codec's default is left out, as vanilla's `lenientOptionalFieldOf` leaves it: an empty description or sample, no icon, and `enforcesSecureChat` when it's false. Plain text with no siblings is a bare string. [`test/status.calx`](test/status.calx) checks each case against what vanilla 26.3 gives, including Gson's escapes, which leave `<`, `>`, `&` and DEL as they are and escape U+2028 and U+2029.
+
+The log's lines follow Mojang's console pattern, `[%d{HH:mm:ss}] [%t/%level]: %msg`, in the local time zone:
+
+```calx
+import server.log.{Level, line}
+import std.time.{Timestamp}
+
+fn main() {
+    let at = Timestamp { unix_ms: 1792540800000 }    // 2026-10-21 00:00 UTC
+    println(line(at, 7200, "Server thread", Level.Info, "Done (0.001s)! For help, type \"help\""))    // out: [02:00:00] [Server thread/INFO]: Done (0.001s)! For help, type "help"
+}
+```
+
+Where it differs from vanilla, for now:
+
+| Vanilla | Calcite | Until |
+| --- | --- | --- |
+| Asks you to agree to Mojang's EULA in eula.txt | Doesn't: Calcite isn't Mojang's software | Always |
+| Writes server.properties back on start, with every setting | Only reads it | A later change |
+| Also logs to logs/latest.log | Logs to the console only | A later change |
+| `enforcesSecureChat` follows `enforce-secure-profile` and online mode | Always false, since nothing checks chat yet | Signed chat (`P4.5`) |
+| The status's player counts and sample come from who's online, rebuilt every 5 seconds | No one can be online, so it's built once | The login (`P4.3`) |
+| Logs a connection by its address | `std.net` doesn't give addresses yet, and these states log nothing | The login (`P4.3`) |
+| `Done (...)` times loading the level | Times the whole start, since there's no level | Worlds (Phase 5) |
+
 ## Tests
 
 `src/test/` holds Calx tests that need no vanilla data, such as MD5's published test vectors. Each panics on a wrong result and prints `ok`:
 
 ```sh
-py -I src/test/run.py                   # every test and every example on this page, debug and release
+py -I src/test/run.py                   # every test and example on this page, debug and release, and builds the server
 py -I rig/runner/rig.py score           # everything the rig can check
 ```
 

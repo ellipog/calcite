@@ -1,0 +1,295 @@
+/// The server's connections: accepting them, reading their frames, and answering the handshake,
+/// the server list's status and ping, and the old ping of clients before 1.7, as vanilla's
+/// `ServerConnectionListener`, `ServerHandshakePacketListenerImpl` and
+/// `ServerStatusPacketListenerImpl` do.
+module server.network
+
+import chat.component.{Component}
+import protocol.frame.{FrameReader, frame}
+import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
+import protocol.ids.{PROTOCOL_VERSION, game_version}
+import protocol.legacy.{Legacy, classify, response}
+import protocol.login.{ClientboundLoginDisconnect}
+import protocol.state.{State}
+import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
+import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
+import server.log.{Entry}
+import std.net.{Net, Conn, Event, NetError}
+
+/// How long a connection may send nothing before it's closed, as vanilla's
+/// `ReadTimeoutHandler(30)`.
+pub const READ_TIMEOUT_NS: u64 = 30000000000
+
+/// What the server list shows, and how the server answers it.
+pub struct StatusInfo {
+    /// Whether the server answers the server list, from `enable-status`.
+    pub enabled: bool
+    /// The status response's JSON.
+    pub json: String
+    /// For the old ping: the description as text, and the player counts.
+    pub motd: String
+    pub online: i32
+    pub max_players: i32
+}
+
+/// What a connection is doing.
+enum Phase {
+    Handshake
+    Status
+    /// The login, which isn't written yet: such a connection is told so and closed.
+    Login
+}
+
+struct Connection {
+    conn: Conn
+    frames: FrameReader
+    phase: Phase
+    // Whether anything has arrived yet, since only the first read can be an old ping.
+    started: bool
+    status_requested: bool
+    // When the connection last sent something, in the caller's nanoseconds.
+    last_read: u64
+    // Whether the server has closed it, and waits for its `Closed` event.
+    closing: bool
+}
+
+/// Every connection the server accepted, on a `Net` that may hold other connections too, such
+/// as a test's client.
+pub struct Network {
+    net: Net
+    connections: List<Connection?>
+    status: StatusInfo
+    accepts_transfers: bool
+    logs: List<Entry>
+}
+
+impl Network {
+    pub fn new(net: Net, status: own StatusInfo, accepts_transfers: bool) -> Network {
+        return Network { net: net, connections: List<Connection?>(), status: status, accepts_transfers: accepts_transfers, logs: List<Entry>() }
+    }
+
+    /// Listens on `host` and `port`, as vanilla's `startTcpServerListener`. An empty host is
+    /// every address.
+    pub fn listen(self, host: String, port: u16) -> u16 ! NetError {
+        return try self.net.listen(host, port)
+    }
+
+    /// Replaces what the server list shows, as vanilla rebuilds it every 5 seconds.
+    pub fn set_status(mut self, status: own StatusInfo) {
+        self.status = status
+    }
+
+    /// What happened since the last call that's worth logging, oldest first.
+    pub fn take_logs(mut self) -> List<Entry> {
+        var out = List<Entry>()
+        for e in self.logs {
+            out.push(Entry { level: e.level, message: e.message.copy() })
+        }
+        self.logs.clear()
+        return out
+    }
+
+    /// How many connections are open.
+    pub fn open(self) -> usize {
+        var n: usize = 0
+        for c in self.connections {
+            if c != none {
+                n += 1
+            }
+        }
+        return n
+    }
+
+    /// Handles one event from the `Net`'s poll, at `now` nanoseconds on the caller's clock, and
+    /// says whether it was the server's: an event about any other connection is left alone.
+    pub fn handle(mut self, e: Event, now: u64) -> bool {
+        match e {
+            Event.Accepted(c) => {
+                let slot = c.slot()
+                while self.connections.len() <= slot {
+                    self.connections.push(none)
+                }
+                self.connections[slot] = some(Connection { conn: c, frames: FrameReader.new(), phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false })
+                return true
+            },
+            Event.Received(c) => {
+                if not self.owns(c) {
+                    return false
+                }
+                self.receive(c, now)
+                return true
+            },
+            Event.Closed(c) => {
+                if not self.owns(c) {
+                    return false
+                }
+                self.connections[c.slot()] = none
+                return true
+            },
+            Event.Connected(_) => return false,
+        }
+    }
+
+    /// Closes each connection that has sent nothing for 30 seconds, as of `now`.
+    pub fn sweep(mut self, now: u64) {
+        for i in 0..self.connections.len() {
+            var stale: Conn? = none
+            if let c = self.connections[i] {
+                if not c.closing and now > c.last_read and now - c.last_read >= READ_TIMEOUT_NS {
+                    stale = some(c.conn)
+                }
+            }
+            if let c = stale {
+                self.net.close(c)
+                self.connections.push(none)
+                var con = self.connections.swap_remove(i) else continue
+                con.closing = true
+                self.connections[i] = some(con)
+            }
+        }
+    }
+
+    fn owns(self, c: Conn) -> bool {
+        let slot = c.slot()
+        if slot >= self.connections.len() {
+            return false
+        }
+        if let mine = self.connections[slot] {
+            return mine.conn == c
+        }
+        return false
+    }
+
+    fn receive(mut self, c: Conn, now: u64) {
+        let slot = c.slot()
+        // Takes the connection out, leaving `none` in its slot, so the rest of `self` can be
+        // used while it changes.
+        self.connections.push(none)
+        var con = self.connections.swap_remove(slot) else return
+        if con.closing {
+            // What arrives after the server closed the connection is dropped.
+            var dropped = List<u8>()
+            _ = self.net.read(c, mut dropped)
+        } else if not self.serve(mut con, now) {
+            con.closing = true
+            self.net.close(c)
+        }
+        self.connections[slot] = some(con)
+    }
+
+    // Reads what arrived on the connection and answers it. False when it's to close.
+    fn serve(mut self, con: mut Connection, now: u64) -> bool {
+        _ = con.frames.read_from(self.net, con.conn)
+        con.last_read = now
+        if not con.started {
+            con.started = true
+            if self.status.enabled {
+                let kind = classify(con.frames.peek())
+                if kind != Legacy.Modern {
+                    let answer = response(kind, game_version(), self.status.motd, self.status.online, self.status.max_players)
+                    self.net.write(con.conn, answer)
+                    return false
+                }
+            }
+        }
+        // A frame or packet that can't be read closes the connection. In the handshake and status
+        // vanilla can't send the reason, since neither state has a disconnect packet, and logs
+        // it only at debug level, so it's dropped here.
+        loop {
+            let body = match con.frames.next() {
+                ok(some(b)) => b,
+                ok(none) => return true,
+                err(_) => return false,
+            }
+            if not self.packet(mut con, body) {
+                return false
+            }
+        }
+    }
+
+    // Handles one frame. False when the connection is to close.
+    fn packet(mut self, con: mut Connection, body: own List<u8>) -> bool {
+        var r = Reader.new(body)
+        match con.phase {
+            Phase.Handshake => {
+                let intention = match HandshakeIn.read(mut r) {
+                    ok(HandshakeIn.Intention(p)) => p,
+                    err(_) => return false,
+                }
+                return self.intention(mut con, intention)
+            },
+            Phase.Status => {
+                let p = match StatusIn.read(mut r) {
+                    ok(p) => p,
+                    err(_) => return false,
+                }
+                match p {
+                    StatusIn.StatusRequest(_) => {
+                        if con.status_requested {
+                            return false
+                        }
+                        con.status_requested = true
+                        let answer = ClientboundStatusResponse { json: self.status.json.copy() }
+                        self.send(con.conn, answer, State.Status)
+                        return true
+                    },
+                    StatusIn.PingRequest(ping) => {
+                        self.send(con.conn, ClientboundPongResponse { time: ping.time }, State.Status)
+                        return false
+                    },
+                }
+            },
+            Phase.Login => return false,
+        }
+    }
+
+    // The handshake, as `ServerHandshakePacketListenerImpl.handleIntention`.
+    fn intention(mut self, con: mut Connection, p: ClientIntention) -> bool {
+        match p.intention {
+            ClientIntent.Status => {
+                if not self.status.enabled {
+                    return false
+                }
+                con.phase = Phase.Status
+                return true
+            },
+            ClientIntent.Login => return self.begin_login(mut con, p),
+            ClientIntent.Transfer => {
+                if not self.accepts_transfers {
+                    self.disconnect_login(con.conn, Component.translatable("multiplayer.disconnect.transfers_disabled", []))
+                    return false
+                }
+                return self.begin_login(mut con, p)
+            },
+        }
+    }
+
+    fn begin_login(mut self, con: mut Connection, p: ClientIntention) -> bool {
+        if p.protocol_version != PROTOCOL_VERSION {
+            let key = if p.protocol_version < 754 { "multiplayer.disconnect.outdated_client" } else { "multiplayer.disconnect.incompatible" }
+            self.disconnect_login(con.conn, Component.translatable(String(key), [Component.literal(game_version())]))
+            return false
+        }
+        con.phase = Phase.Login
+        self.disconnect_login(con.conn, Component.literal("Calcite can't log players in yet"))
+        return false
+    }
+
+    fn disconnect_login(mut self, c: Conn, reason: Component) {
+        self.send(c, ClientboundLoginDisconnect { reason_json: reason.to_json() }, State.Login)
+    }
+
+    fn send<T: Wire + Packet>(mut self, c: Conn, p: T, state: State) {
+        var w = Writer.new()
+        write_packet(p, state, mut w)
+        if let problem = w.problem() {
+            self.logs.push(Entry.error("Failed to send packet: {problem}"))
+            return
+        }
+        match frame(w.into_bytes()) {
+            ok(bytes) => self.net.write(c, bytes),
+            err(message) => self.logs.push(Entry.error("Failed to send packet: {message}")),
+        }
+    }
+}
+

@@ -3,6 +3,7 @@
 - every .calx file in this folder. Each panics on a wrong result and prints `ok` at its end.
 - every ```calx block in src/README.md, whose `// out: ...` comments give the lines it prints,
   so the docs' examples can't go stale (D41).
+- the server, src/calcite.calx, which runs until it's stopped, so it's only built.
 
 Debug builds also check that everything allocated is freed (Calx's D79). calx is found as
 rig/calcite-adapter/launch.py finds it.
@@ -13,6 +14,7 @@ rig/calcite-adapter/launch.py finds it.
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -71,6 +73,13 @@ def main():
                 report(label, mode, r.returncode == 0 and [l.rstrip() for l in r.stdout.splitlines()] == want, r)
         finally:
             path.unlink()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for mode in ([], ["--release"]):
+            out = Path(tmp) / f"calcite{'-release' if mode else ''}{'.exe' if sys.platform == 'win32' else ''}"
+            r = subprocess.run([calx, "build", *mode, "src/calcite.calx", "-o", str(out)], cwd=CALCITE,
+                               capture_output=True, text=True, encoding="utf-8")
+            report("src/calcite.calx builds", mode, r.returncode == 0, r)
 
     print(f"{passed} passed, {failed} failed")
     return 1 if failed else 0

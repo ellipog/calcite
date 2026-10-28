@@ -1,0 +1,225 @@
+/// Checks server.network over real TCP on 127.0.0.1: the server and a client share one `Net`,
+/// and each case connects, sends bytes, and reads everything the server sends before it closes.
+module test.server
+
+import chat.component.{Component}
+import protocol.frame.{FrameReader, frame}
+import protocol.handshake.{ClientIntent, ClientIntention}
+import protocol.state.{State}
+import protocol.status.{ServerboundStatusRequest, ServerboundPingRequest}
+import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
+import server.network.{Network, StatusInfo, READ_TIMEOUT_NS}
+import server.status.{ServerStatus}
+import std.net.{Net, Event}
+
+fn hex(bytes: List<u8>) -> String {
+    let digits: [rune; 16] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']
+    var out = String()
+    for b in bytes {
+        out.push(digits[usize(b / 16)])
+        out.push(digits[usize(b % 16)])
+    }
+    return out
+}
+
+fn check(got: String, want: String) {
+    if got != want {
+        panic("got {got}, want {want}")
+    }
+}
+
+fn status_info(enabled: bool) -> StatusInfo {
+    let status = ServerStatus {
+        description: Component.literal("A Minecraft Server"),
+        max_players: 20,
+        online: 0,
+        sample: [],
+        version_name: "26.3",
+        protocol: 777,
+        favicon: none,
+        enforces_secure_chat: false,
+    }
+    return StatusInfo { enabled: enabled, json: status.to_json(), motd: "A Minecraft Server", online: 0, max_players: 20 }
+}
+
+// A packet as a frame.
+fn framed<T: Wire + Packet>(p: T, state: State, out: mut List<u8>) {
+    var w = Writer.new()
+    write_packet(p, state, mut w)
+    for b in frame(w.into_bytes())! {
+        out.push(b)
+    }
+}
+
+fn hello(intent: ClientIntent, protocol: i32, out: mut List<u8>) {
+    framed(ClientIntention { protocol_version: protocol, host_name: "localhost", port: 25565, intention: intent }, State.Handshake, mut out)
+}
+
+// Connects, sends `send` once the connection is open, and gives back what the server sent
+// before it closed the connection.
+fn talk(net: Net, server: mut Network, port: u16, send: List<u8>) -> List<u8> {
+    _ = net.connect("127.0.0.1", port)!
+    var got = List<u8>()
+    var events = List<Event>()
+    var done = false
+    var polls = 0
+    while not done {
+        net.poll(1000, mut events)
+        polls += 1
+        assert(polls < 30, "the server never closed the connection")
+        for e in events {
+            if server.handle(e, 0) {
+                continue
+            }
+            match e {
+                Event.Connected(c) => net.write(c, send),
+                Event.Received(c) => {
+                    _ = net.read(c, mut got)
+                },
+                Event.Closed(_) => {
+                    done = true
+                },
+                Event.Accepted(_) => {},
+            }
+        }
+    }
+    return got
+}
+
+// Each frame's packet ID and what follows it, as `id:hex`.
+fn packets(bytes: List<u8>) -> List<String> {
+    var frames = FrameReader.new()
+    frames.push(bytes)
+    var out = List<String>()
+    loop {
+        let body = frames.next()! else break
+        var r = Reader.new(body)
+        let id = r.varint()!
+        out.push("{id}:{hex(r.rest())}")
+    }
+    return out
+}
+
+// The string in a packet whose body is one string, such as the status response.
+fn only_string(bytes: List<u8>, want_id: i32) -> String {
+    var frames = FrameReader.new()
+    frames.push(bytes)
+    let body = frames.next()!!
+    var r = Reader.new(body)
+    assert(r.varint()! == want_id, "wrong packet ID")
+    return r.string(262144)!
+}
+
+// UTF-16BE, as the old ping's answer holds text.
+fn utf16(s: String) -> String {
+    var out = List<u8>()
+    for c in s.chars() {
+        let u = u16(c)
+        out.push(u8.wrap(i32(u) >> 8))
+        out.push(u8.wrap(u))
+    }
+    return hex(out)
+}
+
+fn main() {
+    let net = Net.new()!
+    var server = Network.new(net, status_info(true), false)
+    let port = server.listen("127.0.0.1", 0)!
+
+    // The server list: the status, then a ping, whose pong ends the connection.
+    var send = List<u8>()
+    hello(ClientIntent.Status, 777, mut send)
+    framed(ServerboundStatusRequest {}, State.Status, mut send)
+    framed(ServerboundPingRequest { time: 42 }, State.Status, mut send)
+    let reply = talk(net, mut server, port, send)
+    check(only_string(reply, 0), "\{\"description\":\"A Minecraft Server\",\"players\":\{\"max\":20,\"online\":0\},\"version\":\{\"name\":\"26.3\",\"protocol\":777\}\}")
+    let all = packets(reply)
+    check("{all.len()} {all[1]}", "2 1:000000000000002a")
+
+    // A second status request closes the connection, as vanilla's does.
+    send.clear()
+    hello(ClientIntent.Status, 777, mut send)
+    framed(ServerboundStatusRequest {}, State.Status, mut send)
+    framed(ServerboundStatusRequest {}, State.Status, mut send)
+    check("{packets(talk(net, mut server, port, send)).len()}", "1")
+
+    // Old clients' pings.
+    let motd = "A Minecraft Server"
+    check(hex(talk(net, mut server, port, [0xFE])), "ff0017{utf16("{motd}§0§20")}")
+    check(hex(talk(net, mut server, port, [0xFE, 0x01])), "ff0023{utf16("§1\0127\026.3\0{motd}\00\020")}")
+    // 1.6's, with its MC|PingHost payload: the host `a` and port 25565.
+    var ping_host: List<u8> = [0xFE, 0x01, 0xFA, 0x00, 0x0B]
+    for c in "MC|PingHost".chars() {
+        ping_host.push(0)
+        ping_host.push(u8.wrap(u16(c)))
+    }
+    let tail: List<u8> = [0x00, 0x09, 0x4A, 0x00, 0x01, 0x00, 0x61, 0x00, 0x00, 0x63, 0xDD]
+    for b in tail {
+        ping_host.push(b)
+    }
+    check(hex(talk(net, mut server, port, ping_host)), "ff0023{utf16("§1\0127\026.3\0{motd}\00\020")}")
+
+    // A login from another version is told which this is.
+    send.clear()
+    hello(ClientIntent.Login, 47, mut send)
+    check(only_string(talk(net, mut server, port, send), 0), "\{\"translate\":\"multiplayer.disconnect.outdated_client\",\"with\":[\"26.3\"]\}")
+    send.clear()
+    hello(ClientIntent.Login, 800, mut send)
+    check(only_string(talk(net, mut server, port, send), 0), "\{\"translate\":\"multiplayer.disconnect.incompatible\",\"with\":[\"26.3\"]\}")
+    send.clear()
+    hello(ClientIntent.Transfer, 777, mut send)
+    check(only_string(talk(net, mut server, port, send), 0), "\{\"translate\":\"multiplayer.disconnect.transfers_disabled\"\}")
+
+    // Broken input closes the connection without an answer, and nothing is logged: a frame of no
+    // bytes, a length longer than 3 bytes, an unknown packet, and a status request with a byte
+    // too many.
+    check(hex(talk(net, mut server, port, [0x00])), "")
+    check(hex(talk(net, mut server, port, [0xFF, 0xFF, 0xFF, 0x7F])), "")
+    check(hex(talk(net, mut server, port, [0x01, 0x05])), "")
+    send.clear()
+    hello(ClientIntent.Status, 777, mut send)
+    let extra: List<u8> = [0x02, 0x00, 0x00]
+    for b in extra {
+        send.push(b)
+    }
+    check(hex(talk(net, mut server, port, send)), "")
+    check("{server.take_logs().len()}", "0")
+
+    // With `enable-status=false`, a status handshake is closed without an answer.
+    var quiet = Network.new(net, status_info(false), false)
+    let quiet_port = quiet.listen("127.0.0.1", 0)!
+    send.clear()
+    hello(ClientIntent.Status, 777, mut send)
+    framed(ServerboundStatusRequest {}, State.Status, mut send)
+    check(hex(talk(net, mut quiet, quiet_port, send)), "")
+
+    // A connection that sends nothing for 30 seconds is closed.
+    _ = net.connect("127.0.0.1", port)!
+    var events = List<Event>()
+    var closed = false
+    var polls = 0
+    while not closed {
+        net.poll(1000, mut events)
+        polls += 1
+        assert(polls < 30, "the idle connection was never closed")
+        for e in events {
+            if server.handle(e, 0) {
+                continue
+            }
+            match e {
+                Event.Closed(_) => {
+                    closed = true
+                },
+                _ => {},
+            }
+        }
+        // A nanosecond short of 30 seconds isn't enough; 30 seconds is.
+        if polls < 3 {
+            server.sweep(READ_TIMEOUT_NS - 1)
+            assert(not closed, "closed before its time")
+        } else {
+            server.sweep(READ_TIMEOUT_NS)
+        }
+    }
+    println("ok")
+}
