@@ -15,25 +15,28 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `random.worldgen` | `WorldgenRandom<T>` over a legacy or xoroshiro source, with its chunk and feature seeding | `WorldgenRandom` |
 | `hash.md5` | MD5, for seeding from names and for offline players' UUIDs | Guava's `Hashing.md5()` |
 | `java.text` | `string_hash`, Java's `String.hashCode` over UTF-16 code units | `String.hashCode` |
-| `java.uuid` | `Uuid`, two `i64`s, written as Java writes them | `java.util.UUID` |
+| `java.uuid` | `Uuid`, two `i64`s, written as Java writes them; name-based (version 3) and random (version 4) UUIDs | `java.util.UUID` |
 | `java.base64` | `encode`, Base64 with padding and no line breaks | `java.util.Base64.getEncoder()` |
 | `java.properties` | `Properties`, a `.properties` file read with Java's rules for escapes, continued lines and comments | `java.util.Properties.load` |
 | `json.gson` | `JsonWriter`, compact JSON with Gson's escapes | Gson's `JsonWriter`, with `disableHtmlEscaping` |
-| `chat.component` | `Component`: text and translations with their arguments and siblings, and their JSON | `Component`, `ComponentSerialization.CODEC` |
+| `chat.component` | `Component`: text and translations with their arguments and siblings, their JSON, and `get_string`, their text | `Component`, `ComponentSerialization.CODEC`, `TranslatableContents` |
+| `chat.language` | `Language`, the text of each translation key, which the server's own text, such as its log, is made with | `Language` |
 | `resources.identifier` | `Identifier`, a namespace and a path, parsed with vanilla's rules and messages | `Identifier` |
-| `auth.profile` | `GameProfile` and `ProfileProperty`, as the login sends them | authlib's `GameProfile` and `Property`, `ByteBufCodecs.GAME_PROFILE` |
+| `auth.profile` | `GameProfile` and `ProfileProperty`, as the login sends them; offline profiles, and which names vanilla takes | authlib's `GameProfile` and `Property`, `ByteBufCodecs.GAME_PROFILE`, `UUIDUtil.createOfflineProfile`, `StringUtil.isValidPlayerName` |
 | `protocol.state` | `State`, the five protocol states, and `Bound`, a packet's direction | `ConnectionProtocol`, `PacketFlow` |
 | `protocol.ids` | The protocol version and each state's packet names in ID order, written by [`calx_tables.py`](../oracle/datagen/README.md#calx-modules) | The order packets register in each state's protocol |
 | `protocol.wire` | `Reader` and `Writer`, the `Wire` and `Packet` interfaces, `write_packet` | `FriendlyByteBuf`, `VarInt`, `VarLong`, `Utf8String`, `ByteBufCodecs` |
 | `protocol.codegen` | The attributes that write packets' code: `@packet`, `@packets`, `@wire`, `@wire_enum` | Each packet's `STREAM_CODEC`, `IdDispatchCodec`, `PacketDecoder` |
 | `protocol.handshake`, `protocol.status`, `protocol.login` | Their states' packets | The packets in `network.protocol.handshake`, `.status`, `.login` and `.cookie` |
 | `protocol.frame` | `FrameReader`, which collects a connection's bytes and gives back whole frames, and `frame` | `Varint21FrameDecoder`, `Varint21LengthFieldPrepender` |
+| `protocol.compression` | `compress` and `decompress`, a packet inside a frame once compression is on, with vanilla's checks and messages | `CompressionEncoder`, `CompressionDecoder` |
+| `protocol.codec` | `Codec`, a connection's frames and packets with its encryption and compression | The pipeline of `CipherDecoder`, `CipherEncoder` and the frame and compression handlers |
 | `protocol.legacy` | The server list ping of clients before 1.7, and its answer | `LegacyQueryHandler`, `LegacyProtocolUtils` |
 | `server.properties` | `ServerProperties`, the settings read so far, and `load`, which reads server.properties | `DedicatedServerProperties`, `Settings` |
 | `server.status` | `ServerStatus`, what the server list shows, and its JSON; `check_icon` | `ServerStatus`, `PngInfo`, `MinecraftServer.loadStatusIcon` |
-| `server.network` | `Network`: accepting connections, reading frames, the handshake, the status and ping, old pings, and the read timeout | `ServerConnectionListener`, `ServerHandshakePacketListenerImpl`, `ServerStatusPacketListenerImpl`, `ReadTimeoutHandler` |
+| `server.network` | `Network`: accepting connections, reading frames, the handshake, the status and ping, old pings, logins, and the read timeout | `ServerConnectionListener`, `ServerHandshakePacketListenerImpl`, `ServerStatusPacketListenerImpl`, `ServerLoginPacketListenerImpl`, `Connection`, `ReadTimeoutHandler` |
 | `server.log` | `log` and `line`, the console's lines, and `Entry`, a line left for the caller to log | Mojang's log4j2 console pattern |
-| `calcite` | The server's `main` | `Main`, `DedicatedServer.initServer` |
+| `calcite` | The server's `main`, and its loop of 20 ticks a second | `Main`, `DedicatedServer.initServer`, `MinecraftServer.runServer` |
 | `rig.adapter` | The rig adapter's main: answers `hello`, `run` and `bye` | |
 | `rig.frame`, `rig.json` | The rig's frames, and the JSON in their headers | |
 | `rig.rng` | The `rng` probe | |
@@ -128,13 +131,16 @@ fn main() {
 calx run --release src/calcite.calx     # in the folder that holds server.properties
 ```
 
-It starts as vanilla's dedicated server does, with its log lines, and answers the server list: the status, with the description, player counts, version and icon, the ping, and the old pings of clients before 1.7. A client that tries to join is told `Calcite can't log players in yet` until the login is written (`P4.3`).
+It starts as vanilla's dedicated server does, with its log lines, answers the server list: the status, with the description, player counts, version and icon, the ping, and the old pings of clients before 1.7, and logs players in. It ticks 20 times a second, as vanilla does, and like vanilla warns `Can't keep up!` when it's more than 2 seconds behind, at most once in 15 seconds, and skips the ticks it missed.
 
 - **server.properties** is read as vanilla reads it: UTF-8, or ISO-8859-1 if it isn't, with Java's `Properties` rules. A setting that's missing or doesn't parse is its default, as `Boolean.valueOf` and `Integer.parseInt` decide. The settings read so far are `online-mode`, `server-ip`, `server-port`, `motd`, `max-players`, `enable-status`, `hide-online-players`, `enforce-secure-profile`, `accepts-transfers`, `prevent-proxy-connections`, `network-compression-threshold`, `rate-limit` and `log-ips`.
 - **server-icon.png** must be a 64 by 64 PNG, checked as vanilla's `PngInfo` checks it, with its messages.
 - **The handshake** sends a client of another protocol version vanilla's `multiplayer.disconnect.outdated_client` or `multiplayer.disconnect.incompatible`, and a transfer, with `accepts-transfers` off, `multiplayer.disconnect.transfers_disabled`. A second status request closes the connection, and so does the pong.
 - **Broken input**, such as a frame of no bytes, a length longer than 3 bytes, an unknown packet or one with bytes left over, closes the connection without an answer and logs nothing, as vanilla does in these states: it has no disconnect packet to send, and logs the reason only at debug level.
 - **A connection that sends nothing for 30 seconds** is closed, as by vanilla's `ReadTimeoutHandler`.
+- **The login** gives a player in offline mode the profile vanilla gives, with the UUID made from `OfflinePlayer:` and their name. On the tick after the client's hello, it turns on compression if `network-compression-threshold` isn't negative and sends the profile, with a session ID shared by every login while the server has a connection open. A client that acknowledges it is in configuration, which isn't written yet (`P4.4`): it's told `Calcite can't configure players yet`. A login that takes more than 600 ticks is told `multiplayer.disconnect.slow_login`. With `online-mode=true` a player is told `Calcite can't authenticate players yet` until authentication is written.
+- **A login that goes wrong** ends as vanilla's does: a name vanilla doesn't take, or a packet out of order, sends `disconnect.genericReason` with Java's exception (`Internal Exception: java.lang.IllegalStateException: Unexpected hello packet`), and so does a packet that can't be read, with the exception vanilla's pipeline throws, such as `io.netty.handler.codec.DecoderException: Received unknown packet id 9` or `io.netty.handler.codec.CorruptedFrameException: length wider than 21-bit`. A compressed packet is checked as vanilla checks it, with its messages, and an answer to a query the server didn't send is `multiplayer.disconnect.unexpected_query_response`.
+- **The log** has vanilla's lines for logins: `Disconnecting Steve (/127.0.0.1:50412): ...` when the server ends a login, and `Steve (/127.0.0.1:50412) lost connection: ...` once it's gone, or the address alone before the client gives a name. The address is written as Java writes it, `/[0:0:0:0:0:0:0:1]:50412` for IPv6, or is `IP hidden` with `log-ips=false`. Once a player is in configuration, the line is `Steve (5627dd98-e6be-3c21-b8a8-e92344183641) lost connection: ...`.
 
 The status's JSON is what vanilla's codecs and Gson write, member for member:
 
@@ -161,6 +167,23 @@ fn main() {
 
 A member at its codec's default is left out, as vanilla's `lenientOptionalFieldOf` leaves it: an empty description or sample, no icon, and `enforcesSecureChat` when it's false. Plain text with no siblings is a bare string. [`test/status.calx`](test/status.calx) checks each case against what vanilla 26.3 gives, including Gson's escapes, which leave `<`, `>`, `&` and DEL as they are and escape U+2028 and U+2029.
 
+An offline player's UUID, and a component as text, which is how the log shows a disconnect's reason. The server's language has no translations until it's read from the jar (`P5.8`), so for now a key is its own text, as vanilla shows a key its language hasn't:
+
+```calx
+import auth.profile.{GameProfile}
+import chat.component.{Component}
+import chat.language.{Language}
+
+fn main() {
+    println(GameProfile.offline("Steve").id.to_string())    // out: 5627dd98-e6be-3c21-b8a8-e92344183641
+    let reason = Component.translatable("disconnect.genericReason", [Component.literal("Internal Exception: boom")])
+    var lang = Language.empty()
+    println(reason.get_string(lang))    // out: disconnect.genericReason
+    lang.add("disconnect.genericReason", "Oops: %s")
+    println(reason.get_string(lang))    // out: Oops: Internal Exception: boom
+}
+```
+
 The log's lines follow Mojang's console pattern, `[%d{HH:mm:ss}] [%t/%level]: %msg`, in the local time zone:
 
 ```calx
@@ -181,8 +204,11 @@ Where it differs from vanilla, for now:
 | Writes server.properties back on start, with every setting | Only reads it | A later change |
 | Also logs to logs/latest.log | Logs to the console only | A later change |
 | `enforcesSecureChat` follows `enforce-secure-profile` and online mode | Always false, since nothing checks chat yet | Signed chat (`P4.5`) |
-| The status's player counts and sample come from who's online, rebuilt every 5 seconds | No one can be online, so it's built once | The login (`P4.3`) |
-| Logs a connection by its address | `std.net` doesn't give addresses yet, and these states log nothing | The login (`P4.3`) |
+| The status's player counts and sample come from who's online, rebuilt every 5 seconds | No one can be online, so it's built once | Play (`P4.5`) |
+| Reads its language, en_us.json, from the jar, so the log shows a reason's English text | Has no translations, so a translated reason shows its key, such as `multiplayer.disconnect.slow_login` | Reading the jar (`P5.8`) |
+| Checks bans, the whitelist and a full server before it lets a player in, and kicks a player already in the world with the same UUID | Lets every valid login in, since there's no player list yet | Play (`P4.5`) |
+| Authenticates players with Mojang's session server in online mode | Refuses logins in online mode | Online mode (`P4.3`) |
+| zlib names what's wrong with deflate data it can't read, such as `invalid distance too far back` | Names a broken header and block type as zlib does, and anything past them `invalid deflate data` | A later change |
 | `Done (...)` times loading the level | Times the whole start, since there's no level | Worlds (Phase 5) |
 
 ## Tests

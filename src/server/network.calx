@@ -1,24 +1,31 @@
-/// The server's connections: accepting them, reading their frames, and answering the handshake,
-/// the server list's status and ping, and the old ping of clients before 1.7, as vanilla's
-/// `ServerConnectionListener`, `ServerHandshakePacketListenerImpl` and
-/// `ServerStatusPacketListenerImpl` do.
+/// The server's connections: accepting them, reading their frames, answering the handshake, the
+/// server list's status and ping and the old ping of clients before 1.7, and logging players in,
+/// as vanilla's `ServerConnectionListener`, `ServerHandshakePacketListenerImpl`,
+/// `ServerStatusPacketListenerImpl` and `ServerLoginPacketListenerImpl` do.
 module server.network
 
+import auth.profile.{GameProfile, is_valid_name}
 import chat.component.{Component}
-import protocol.frame.{FrameReader, frame}
+import chat.language.{Language}
+import java.uuid.{Uuid}
+import protocol.codec.{Codec}
 import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
-import protocol.ids.{PROTOCOL_VERSION, game_version}
+import protocol.ids.{PROTOCOL_VERSION, game_version, packet_names}
 import protocol.legacy.{Legacy, classify, response}
-import protocol.login.{ClientboundLoginDisconnect}
-import protocol.state.{State}
+import protocol.login.{ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundHello}
+import protocol.state.{State, Bound}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import server.log.{Entry}
-import std.net.{Net, Conn, Event, NetError}
+import std.net.{Net, Conn, Event, NetError, Address, Ip}
+import std.text.mutf8.{encode, encoded_len}
 
 /// How long a connection may send nothing before it's closed, as vanilla's
 /// `ReadTimeoutHandler(30)`.
 pub const READ_TIMEOUT_NS: u64 = 30000000000
+
+/// How many ticks a login may take before it's closed, as vanilla's `MAX_TICKS_BEFORE_LOGIN`.
+pub const MAX_LOGIN_TICKS: i32 = 600
 
 /// What the server list shows, and how the server answers it.
 pub struct StatusInfo {
@@ -32,17 +39,47 @@ pub struct StatusInfo {
     pub max_players: i32
 }
 
-/// What a connection is doing.
+/// How the server lets players in, from server.properties.
+pub struct LoginSettings {
+    /// Whether players are authenticated with Mojang's session server, from `online-mode`.
+    pub online_mode: bool
+    /// Whether players another server sends here are let in, from `accepts-transfers`.
+    pub accepts_transfers: bool
+    /// The length from which packets are compressed, or a negative number for no compression,
+    /// from `network-compression-threshold`.
+    pub compression_threshold: i32
+    /// Whether the log shows players' addresses, from `log-ips`.
+    pub log_ips: bool
+}
+
+/// What a connection is doing: which of vanilla's packet listeners it has.
 enum Phase {
     Handshake
     Status
-    /// The login, which isn't written yet: such a connection is told so and closed.
     Login
+    /// Configuration, which isn't written yet (CAL-38): a player who gets this far is told so.
+    Configuration
+}
+
+/// Where a login is, vanilla's `ServerLoginPacketListenerImpl.State`.
+enum LoginState {
+    /// Waiting for the client's hello.
+    Hello
+    /// Waiting for the client's encryption response.
+    Key
+    /// Waiting for Mojang's session server.
+    Authenticating
+    /// The player has a profile, which the next tick checks.
+    Verifying
+    /// The profile was sent, and the client is to acknowledge it.
+    ProtocolSwitching
+    /// The client is in configuration.
+    Accepted
 }
 
 struct Connection {
     conn: Conn
-    frames: FrameReader
+    codec: Codec
     phase: Phase
     // Whether anything has arrived yet, since only the first read can be an old ping.
     started: bool
@@ -51,6 +88,17 @@ struct Connection {
     last_read: u64
     // Whether the server has closed it, and waits for its `Closed` event.
     closing: bool
+    // The address as vanilla logs it, such as `/127.0.0.1:50412`, or `IP hidden`.
+    address: String
+    login: LoginState
+    login_ticks: i32
+    // Whether another server sent the player here.
+    transferred: bool
+    // The name the client gave, and the profile it's let in with.
+    name: String?
+    profile: GameProfile?
+    // Why the server ended it, which is logged once it's gone.
+    reason: Component?
 }
 
 /// Every connection the server accepted, on a `Net` that may hold other connections too, such
@@ -59,13 +107,17 @@ pub struct Network {
     net: Net
     connections: List<Connection?>
     status: StatusInfo
-    accepts_transfers: bool
+    settings: LoginSettings
+    lang: Language
+    // The session ID every login is given, made when the first needs it and dropped once there
+    // are no connections, as vanilla's `ServerConnectionListener.getSessionId`.
+    session: Uuid?
     logs: List<Entry>
 }
 
 impl Network {
-    pub fn new(net: Net, status: own StatusInfo, accepts_transfers: bool) -> Network {
-        return Network { net: net, connections: List<Connection?>(), status: status, accepts_transfers: accepts_transfers, logs: List<Entry>() }
+    pub fn new(net: Net, status: own StatusInfo, settings: own LoginSettings, lang: own Language) -> Network {
+        return Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, session: none, logs: List<Entry>() }
     }
 
     /// Listens on `host` and `port`, as vanilla's `startTcpServerListener`. An empty host is
@@ -109,7 +161,8 @@ impl Network {
                 while self.connections.len() <= slot {
                     self.connections.push(none)
                 }
-                self.connections[slot] = some(Connection { conn: c, frames: FrameReader.new(), phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false })
+                let address = if self.settings.log_ips { java_address(self.net.peer(c)) } else { String("IP hidden") }
+                self.connections[slot] = some(Connection { conn: c, codec: Codec.new(), phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false, address: address, login: LoginState.Hello, login_ticks: 0, transferred: false, name: none, profile: none, reason: none })
                 return true
             },
             Event.Received(c) => {
@@ -123,27 +176,44 @@ impl Network {
                 if not self.owns(c) {
                     return false
                 }
-                self.connections[c.slot()] = none
+                self.connections.push(none)
+                let con = self.connections.swap_remove(c.slot()) else return true
+                self.lost(con)
                 return true
             },
             Event.Connected(_) => return false,
         }
     }
 
+    /// One server tick, as vanilla's `ServerConnectionListener.tick`: each login moves on, as
+    /// its listener's `tick` moves it.
+    pub fn tick(mut self) {
+        for i in 0..self.connections.len() {
+            if not self.logging_in(i) {
+                continue
+            }
+            self.connections.push(none)
+            var con = self.connections.swap_remove(i) else continue
+            self.tick_login(mut con)
+            self.connections[i] = some(con)
+        }
+        if self.open() == 0 {
+            self.session = none
+        }
+    }
+
     /// Closes each connection that has sent nothing for 30 seconds, as of `now`.
     pub fn sweep(mut self, now: u64) {
         for i in 0..self.connections.len() {
-            var stale: Conn? = none
+            var stale = false
             if let c = self.connections[i] {
-                if not c.closing and now > c.last_read and now - c.last_read >= READ_TIMEOUT_NS {
-                    stale = some(c.conn)
-                }
+                stale = not c.closing and now > c.last_read and now - c.last_read >= READ_TIMEOUT_NS
             }
-            if let c = stale {
-                self.net.close(c)
+            if stale {
                 self.connections.push(none)
                 var con = self.connections.swap_remove(i) else continue
-                con.closing = true
+                con.reason = some(Component.translatable("disconnect.timeout", []))
+                self.close(mut con)
                 self.connections[i] = some(con)
             }
         }
@@ -160,6 +230,18 @@ impl Network {
         return false
     }
 
+    fn logging_in(self, slot: usize) -> bool {
+        if let c = self.connections[slot] {
+            return not c.closing and c.phase == Phase.Login
+        }
+        return false
+    }
+
+    fn close(self, con: mut Connection) {
+        con.closing = true
+        self.net.close(con.conn)
+    }
+
     fn receive(mut self, c: Conn, now: u64) {
         let slot = c.slot()
         // Takes the connection out, leaving `none` in its slot, so the rest of `self` can be
@@ -171,20 +253,19 @@ impl Network {
             var dropped = List<u8>()
             _ = self.net.read(c, mut dropped)
         } else if not self.serve(mut con, now) {
-            con.closing = true
-            self.net.close(c)
+            self.close(mut con)
         }
         self.connections[slot] = some(con)
     }
 
     // Reads what arrived on the connection and answers it. False when it's to close.
     fn serve(mut self, con: mut Connection, now: u64) -> bool {
-        _ = con.frames.read_from(self.net, con.conn)
+        _ = con.codec.read_from(self.net, con.conn)
         con.last_read = now
         if not con.started {
             con.started = true
             if self.status.enabled {
-                let kind = classify(con.frames.peek())
+                let kind = classify(con.codec.peek())
                 if kind != Legacy.Modern {
                     let answer = response(kind, game_version(), self.status.motd, self.status.online, self.status.max_players)
                     self.net.write(con.conn, answer)
@@ -194,12 +275,17 @@ impl Network {
         }
         // A frame or packet that can't be read closes the connection. In the handshake and status
         // vanilla can't send the reason, since neither state has a disconnect packet, and logs
-        // it only at debug level, so it's dropped here.
+        // it only at debug level, so it's dropped there. In the login the client is told.
         loop {
-            let body = match con.frames.next() {
+            let body = match con.codec.next() {
                 ok(some(b)) => b,
                 ok(none) => return true,
-                err(_) => return false,
+                err(e) => {
+                    if con.phase == Phase.Login {
+                        self.fault(mut con, decode_exception(e.message))
+                    }
+                    return false
+                },
             }
             if not self.packet(mut con, body) {
                 return false
@@ -207,7 +293,7 @@ impl Network {
         }
     }
 
-    // Handles one frame. False when the connection is to close.
+    // Handles one packet. False when the connection is to close.
     fn packet(mut self, con: mut Connection, body: own List<u8>) -> bool {
         var r = Reader.new(body)
         match con.phase {
@@ -230,16 +316,26 @@ impl Network {
                         }
                         con.status_requested = true
                         let answer = ClientboundStatusResponse { json: self.status.json.copy() }
-                        self.send(con.conn, answer, State.Status)
+                        self.send(mut con, answer, State.Status)
                         return true
                     },
                     StatusIn.PingRequest(ping) => {
-                        self.send(con.conn, ClientboundPongResponse { time: ping.time }, State.Status)
+                        self.send(mut con, ClientboundPongResponse { time: ping.time }, State.Status)
                         return false
                     },
                 }
             },
-            Phase.Login => return false,
+            Phase.Login => {
+                let p = match LoginIn.read(mut r) {
+                    ok(p) => p,
+                    err(e) => {
+                        self.fault(mut con, decode_exception(e.message))
+                        return false
+                    },
+                }
+                return self.login_packet(mut con, p)
+            },
+            Phase.Configuration => return false,
         }
     }
 
@@ -253,43 +349,282 @@ impl Network {
                 con.phase = Phase.Status
                 return true
             },
-            ClientIntent.Login => return self.begin_login(mut con, p),
+            ClientIntent.Login => return self.begin_login(mut con, p, false),
             ClientIntent.Transfer => {
-                if not self.accepts_transfers {
-                    self.disconnect_login(con.conn, Component.translatable("multiplayer.disconnect.transfers_disabled", []))
+                if not self.settings.accepts_transfers {
+                    self.refuse(mut con, Component.translatable("multiplayer.disconnect.transfers_disabled", []))
                     return false
                 }
-                return self.begin_login(mut con, p)
+                return self.begin_login(mut con, p, true)
             },
         }
     }
 
-    fn begin_login(mut self, con: mut Connection, p: ClientIntention) -> bool {
+    fn begin_login(mut self, con: mut Connection, p: ClientIntention, transferred: bool) -> bool {
         if p.protocol_version != PROTOCOL_VERSION {
             let key = if p.protocol_version < 754 { "multiplayer.disconnect.outdated_client" } else { "multiplayer.disconnect.incompatible" }
-            self.disconnect_login(con.conn, Component.translatable(String(key), [Component.literal(game_version())]))
+            self.refuse(mut con, Component.translatable(String(key), [Component.literal(game_version())]))
             return false
         }
         con.phase = Phase.Login
-        self.disconnect_login(con.conn, Component.literal("Calcite can't log players in yet"))
+        con.transferred = transferred
+        return true
+    }
+
+    // The handshake's refusal of a login, which vanilla sends without logging it.
+    fn refuse(mut self, con: mut Connection, reason: Component) {
+        self.send(mut con, ClientboundLoginDisconnect { reason_json: reason.to_json() }, State.Login)
+    }
+
+    // A login packet, as `ServerLoginPacketListenerImpl`'s handlers. False when it's to close.
+    fn login_packet(mut self, con: mut Connection, p: LoginIn) -> bool {
+        match p {
+            LoginIn.Hello(hello) => return self.hello(mut con, hello),
+            LoginIn.Key(_) => {
+                self.fault(mut con, "java.lang.IllegalStateException: Unexpected key packet")
+                return false
+            },
+            LoginIn.CustomQueryAnswer(_) => {
+                self.disconnect(mut con, Component.translatable("multiplayer.disconnect.unexpected_query_response", []))
+                return false
+            },
+            LoginIn.CookieResponse(_) => {
+                self.disconnect(mut con, Component.translatable("multiplayer.disconnect.unexpected_query_response", []))
+                return false
+            },
+            LoginIn.LoginAcknowledged(_) => {
+                if con.login != LoginState.ProtocolSwitching {
+                    self.fault(mut con, "java.lang.IllegalStateException: Unexpected login acknowledgement packet")
+                    return false
+                }
+                con.login = LoginState.Accepted
+                con.phase = Phase.Configuration
+                return self.configure(mut con)
+            },
+        }
+    }
+
+    // The client's name, as `handleHello`. Offline, the player gets the profile made from it.
+    fn hello(mut self, con: mut Connection, p: ServerboundHello) -> bool {
+        if con.login != LoginState.Hello {
+            self.fault(mut con, "java.lang.IllegalStateException: Unexpected hello packet")
+            return false
+        }
+        if not is_valid_name(p.name) {
+            self.fault(mut con, "java.lang.IllegalStateException: Invalid characters in username")
+            return false
+        }
+        con.name = some(p.name.copy())
+        if self.settings.online_mode {
+            // Authentication with Mojang's session server isn't written yet, and letting a player
+            // in unauthenticated would let anyone take any name.
+            self.disconnect(mut con, Component.literal("Calcite can't authenticate players yet; set online-mode=false to join"))
+            return false
+        }
+        con.profile = some(GameProfile.offline(p.name))
+        con.login = LoginState.Verifying
+        return true
+    }
+
+    // A login's tick, as the login listener's `tick`.
+    fn tick_login(mut self, con: mut Connection) {
+        if con.login == LoginState.Verifying {
+            self.verify(mut con)
+        }
+        let ticks = con.login_ticks
+        con.login_ticks += 1
+        if ticks == MAX_LOGIN_TICKS {
+            self.disconnect(mut con, Component.translatable("multiplayer.disconnect.slow_login", []))
+            self.close(mut con)
+        }
+    }
+
+    // Lets the player in, as `verifyLoginAndFinishConnectionSetup`: compression goes on if the
+    // server has it, then the client is sent its profile. Bans, the whitelist and a full
+    // server are checked here once there's a player list, and a player already in the world is
+    // kicked first.
+    fn verify(mut self, con: mut Connection) {
+        let threshold = self.settings.compression_threshold
+        if threshold >= 0 {
+            self.send(mut con, ClientboundLoginCompression { threshold: threshold }, State.Login)
+            con.codec.start_compression(threshold)
+        }
+        con.login = LoginState.ProtocolSwitching
+        let session = self.session_id()
+        var finished: ClientboundLoginFinished? = none
+        if let profile = con.profile {
+            finished = some(ClientboundLoginFinished { profile: profile.copy(), session_id: session })
+        }
+        if let f = finished {
+            self.send(mut con, f, State.Login)
+        }
+    }
+
+    // Configuration isn't written yet (CAL-38), so a player who gets there is told so, with the
+    // configuration state's disconnect, and the connection is closed.
+    fn configure(mut self, con: mut Connection) -> bool {
+        let text = String("Calcite can't configure players yet")
+        self.send_bytes(mut con, config_disconnect(text))
+        con.reason = some(Component.literal(text))
         return false
     }
 
-    fn disconnect_login(mut self, c: Conn, reason: Component) {
-        self.send(c, ClientboundLoginDisconnect { reason_json: reason.to_json() }, State.Login)
+    fn session_id(mut self) -> Uuid {
+        if let s = self.session {
+            return s
+        }
+        let s = Uuid.random()
+        self.session = some(s)
+        return s
     }
 
-    fn send<T: Wire + Packet>(mut self, c: Conn, p: T, state: State) {
+    // Tells the client why its login ends, as the login listener's `disconnect`. The caller
+    // closes the connection.
+    fn disconnect(mut self, con: mut Connection, reason: own Component) {
+        let line = "Disconnecting {user(con)}: {reason.get_string(self.lang)}"
+        self.logs.push(Entry.info(line))
+        self.send(mut con, ClientboundLoginDisconnect { reason_json: reason.to_json() }, State.Login)
+        con.reason = some(reason)
+    }
+
+    // What vanilla's `Connection.exceptionCaught` does in the login with the exception, as its
+    // `toString` writes it: the client is told, and the exception is logged only as the reason
+    // the connection was lost. The caller closes the connection.
+    fn fault(mut self, con: mut Connection, exception: String) {
+        let reason = Component.translatable("disconnect.genericReason", [Component.literal("Internal Exception: {exception}")])
+        self.send(mut con, ClientboundLoginDisconnect { reason_json: reason.to_json() }, State.Login)
+        con.reason = some(reason)
+    }
+
+    // What the connection's listener logs once it's gone, as its `onDisconnect`. The handshake
+    // and status listeners log nothing.
+    fn lost(mut self, con: Connection) {
+        let reason = match con.reason {
+            some(r) => r.get_string(self.lang),
+            none => Component.translatable("disconnect.endOfStream", []).get_string(self.lang),
+        }
+        var line: String? = none
+        match con.phase {
+            Phase.Login => line = some("{user(con)} lost connection: {reason}"),
+            Phase.Configuration => {
+                if let p = con.profile {
+                    line = some("{p.name} ({p.id.to_string()}) lost connection: {reason}")
+                }
+            },
+            _ => {},
+        }
+        if let l = line {
+            self.logs.push(Entry.info(l.copy()))
+        }
+    }
+
+    fn send<T: Wire + Packet>(mut self, con: mut Connection, p: T, state: State) {
         var w = Writer.new()
         write_packet(p, state, mut w)
         if let problem = w.problem() {
             self.logs.push(Entry.error("Failed to send packet: {problem}"))
             return
         }
-        match frame(w.into_bytes()) {
-            ok(bytes) => self.net.write(c, bytes),
+        self.send_bytes(mut con, w.into_bytes())
+    }
+
+    // Sends a packet's ID and fields, through the connection's compression and encryption.
+    fn send_bytes(mut self, con: mut Connection, packet: own List<u8>) {
+        match con.codec.encode(packet) {
+            ok(bytes) => self.net.write(con.conn, bytes),
             err(message) => self.logs.push(Entry.error("Failed to send packet: {message}")),
         }
     }
 }
 
+// The player as the login listener's `getUserName` gives them: the name they gave and the
+// address, or the address alone before the name came.
+fn user(con: Connection) -> String {
+    if let n = con.name {
+        return "{n} ({con.address})"
+    }
+    return con.address.copy()
+}
+
+// The exception vanilla's pipeline throws for what Calcite's reader couldn't read, as Java's
+// `toString` writes it, from the reader's message, which is vanilla's own.
+fn decode_exception(message: String) -> String {
+    if message == "length wider than 21-bit" or message == "Frame length cannot be zero" {
+        return "io.netty.handler.codec.CorruptedFrameException: {message}"
+    }
+    let failed = "Failed to decode packet '"
+    if message.starts_with(failed) {
+        // Vanilla's message stops at the packet's name, since the field's problem is its cause.
+        if let end = message[failed.len()..].find("'") {
+            return "io.netty.handler.codec.DecoderException: {message[..failed.len() + end + 1]}"
+        }
+    }
+    if message.starts_with("Packet ") and message.contains("was larger than I expected") {
+        return "io.netty.handler.codec.DecoderException: java.io.IOException: {message}"
+    }
+    if message == "VarInt too big" {
+        return "io.netty.handler.codec.DecoderException: java.lang.RuntimeException: {message}"
+    }
+    return "io.netty.handler.codec.DecoderException: {message}"
+}
+
+// The address as Java's `InetSocketAddress.toString` writes a connection's: `/127.0.0.1:50412`,
+// or `/[0:0:0:0:0:0:0:1]:50412`, with all eight groups of an IPv6 address.
+fn java_address(a: Address?) -> String {
+    let addr = a else return String("local")
+    return match addr.ip {
+        Ip.V4(b) => "/{b[0]}.{b[1]}.{b[2]}.{b[3]}:{addr.port}",
+        Ip.V6(b, scope) => {
+            var out = String("/[")
+            let groups: usize = 8
+            for i in 0..groups {
+                if i > 0 {
+                    out.push(':')
+                }
+                hex(mut out, (u32(b[2 * i]) << 8) | u32(b[2 * i + 1]))
+            }
+            if scope != 0 {
+                out.push_str("%{scope}")
+            }
+            out.push_str("]:{addr.port}")
+            out
+        },
+    }
+}
+
+// The number in lowercase hex, without leading zeros.
+fn hex(out: mut String, v: u32) {
+    let digits: [rune; 16] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']
+    var shift: i32 = 28
+    var started = false
+    loop {
+        let d = (v >> shift) & 15
+        if d != 0 or started or shift == 0 {
+            out.push(digits[usize(d)])
+            started = true
+        }
+        if shift == 0 {
+            return
+        }
+        shift -= 4
+    }
+}
+
+// The configuration state's `disconnect` with a plain text reason, which vanilla writes as NBT:
+// a text component with nothing else is a single string tag. CAL-38 writes every component.
+fn config_disconnect(text: String) -> List<u8> {
+    let names = packet_names(State.Configuration, Bound.Clientbound)
+    var id: i32 = -1
+    for i in 0..names.len() {
+        if names[i] == "disconnect" {
+            id = i32.wrap(i)
+        }
+    }
+    var w = Writer.new()
+    w.varint(id)
+    w.u8(8)
+    w.u16(u16.wrap(encoded_len(text)))
+    var out = w.into_bytes()
+    encode(text, mut out)
+    return out
+}

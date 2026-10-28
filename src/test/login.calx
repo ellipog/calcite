@@ -1,0 +1,334 @@
+/// Checks logins over real TCP on 127.0.0.1, as server.network runs them: offline profiles,
+/// compression, the session ID, every way vanilla ends a login, and what it logs.
+module test.login
+
+import chat.language.{Language}
+import java.uuid.{Uuid}
+import protocol.codec.{Codec}
+import protocol.handshake.{ClientIntent, ClientIntention}
+import protocol.login.{ServerboundHello, ServerboundKey, ServerboundLoginAcknowledged, ServerboundCustomQueryAnswer, ClientboundLoginFinished}
+import protocol.state.{State}
+import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
+import server.network.{Network, StatusInfo, LoginSettings, MAX_LOGIN_TICKS}
+import std.net.{Net, Conn, Event}
+
+fn check(got: String, want: String) {
+    if got != want {
+        panic("got {got}, want {want}")
+    }
+}
+
+fn hex(bytes: List<u8>) -> String {
+    let digits: [rune; 16] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']
+    var out = String()
+    for b in bytes {
+        out.push(digits[usize(b / 16)])
+        out.push(digits[usize(b % 16)])
+    }
+    return out
+}
+
+// A server with `threshold`, and an invented text for the generic reason, so the log shows how
+// a translation's argument goes in.
+fn new_server(net: Net, threshold: i32, log_ips: bool) -> Network {
+    let status = StatusInfo { enabled: true, json: "\{\}", motd: "A Minecraft Server", online: 0, max_players: 20 }
+    let settings = LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: threshold, log_ips: log_ips }
+    var lang = Language.empty()
+    lang.add("disconnect.genericReason", "Error: %s")
+    return Network.new(net, status, settings, lang)
+}
+
+fn packet<T: Wire + Packet>(p: T, state: State) -> List<u8> {
+    var w = Writer.new()
+    write_packet(p, state, mut w)
+    return w.into_bytes()
+}
+
+struct Client {
+    conn: Conn
+    codec: Codec
+    // The client's address as vanilla logs it.
+    address: String
+    closed: bool
+}
+
+impl Client {
+    fn send(mut self, net: Net, p: own List<u8>) {
+        net.write(self.conn, self.codec.encode(p)!)
+    }
+
+    fn send_raw(self, net: Net, bytes: List<u8>) {
+        net.write(self.conn, bytes)
+    }
+
+    // The next packet that came, as `id:hex of the rest`, or `closed` once the server closed
+    // the connection and nothing is left.
+    fn next(mut self) -> String {
+        let body = match self.codec.next()! {
+            some(b) => b,
+            none => return if self.closed { String("closed") } else { String("nothing") },
+        }
+        var r = Reader.new(body)
+        let id = r.varint()!
+        return "{id}:{hex(r.rest())}"
+    }
+
+    // The next packet, which must be a login disconnect, as its reason's JSON.
+    fn reason(mut self) -> String {
+        let body = self.codec.next()!!
+        var r = Reader.new(body)
+        check("{r.varint()!}", "0")
+        return r.string(262144)!
+    }
+
+    // The next packet, which must be the login's last, as its profile's UUID and name, and the
+    // session ID.
+    fn finished(mut self) -> (String, Uuid) {
+        let body = self.codec.next()!!
+        var r = Reader.new(body)
+        check("{r.varint()!}", "2")
+        let p = ClientboundLoginFinished.read(mut r)!
+        return ("{p.profile.id.to_string()} {p.profile.name} {p.profile.properties.len()}", p.session_id)
+    }
+}
+
+// Polls until nothing more comes for 50 ms, giving the server its events and each client what
+// it was sent.
+fn settle(net: Net, s: mut Network, clients: mut List<Client>) {
+    var events = List<Event>()
+    loop {
+        net.poll(50, mut events)
+        if events.is_empty() {
+            return
+        }
+        for e in events {
+            if s.handle(e, 0) {
+                continue
+            }
+            match e {
+                Event.Received(c) => {
+                    for i in 0..clients.len() {
+                        if clients[i].conn == c {
+                            _ = clients[i].codec.read_from(net, c)
+                        }
+                    }
+                },
+                Event.Closed(c) => {
+                    for i in 0..clients.len() {
+                        if clients[i].conn == c {
+                            clients[i].closed = true
+                        }
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+}
+
+// Connects a client, and gives back the clients with it last.
+fn connect(net: Net, s: mut Network, port: u16, clients: mut List<Client>) {
+    let conn = net.connect("127.0.0.1", port)!
+    var events = List<Event>()
+    var address = String()
+    var connected = false
+    while address.is_empty() or not connected {
+        net.poll(1000, mut events)
+        for e in events {
+            match e {
+                Event.Accepted(c) => {
+                    let a = net.peer(c)!
+                    address = "/{a.to_string()}"
+                },
+                Event.Connected(c) => connected = c == conn,
+                _ => {},
+            }
+            _ = s.handle(e, 0)
+        }
+    }
+    clients.push(Client { conn: conn, codec: Codec.new(), address: address, closed: false })
+}
+
+fn login_start(name: String) -> List<List<u8>> {
+    let intention = ClientIntention { protocol_version: 777, host_name: "localhost", port: 25565, intention: ClientIntent.Login }
+    return [packet(intention, State.Handshake), packet(ServerboundHello { name: name.copy(), profile_id: Uuid.new(0, 0) }, State.Login)]
+}
+
+// A new client that has sent the handshake and, unless `name` is empty, its hello.
+fn start(net: Net, s: mut Network, port: u16, clients: mut List<Client>, name: String) -> usize {
+    connect(net, mut s, port, mut clients)
+    let at = clients.len() - 1
+    var first = login_start(name)
+    if name.is_empty() {
+        first.truncate(1)
+    }
+    for p in first {
+        clients[at].send(net, p.copy())
+    }
+    settle(net, mut s, mut clients)
+    return at
+}
+
+fn logs(s: mut Network) -> String {
+    var out = String()
+    for e in s.take_logs() {
+        out.push_str("{e.message}|")
+    }
+    return out
+}
+
+fn offline(net: Net) {
+    var s = new_server(net, 256, true)
+    let port = s.listen("127.0.0.1", 0)!
+    var clients = List<Client>()
+    let a = start(net, mut s, port, mut clients, "Steve")
+    // The profile goes on the next tick, as vanilla's does.
+    check(clients[a].next(), "nothing")
+    s.tick()
+    settle(net, mut s, mut clients)
+    // Compression first, then the profile, compressed.
+    check(clients[a].next(), "3:8002")
+    clients[a].codec.start_compression(256)
+    let (profile, session) = clients[a].finished()
+    check(profile, "5627dd98-e6be-3c21-b8a8-e92344183641 Steve 0")
+    check("{clients[a].next()}", "nothing")
+
+    // A second login gets the same session ID while the first is open.
+    let b = start(net, mut s, port, mut clients, "Notch")
+    s.tick()
+    settle(net, mut s, mut clients)
+    check(clients[b].next(), "3:8002")
+    clients[b].codec.start_compression(256)
+    let (notch, again) = clients[b].finished()
+    check(notch, "b50ad385-829d-3141-a216-7e7d7539ba7f Notch 0")
+    assert(again == session, "two logins got different session IDs")
+    check(session.to_string()[14..15], "4")
+
+    // The acknowledgement moves to configuration, which isn't written yet.
+    clients[a].send(net, packet(ServerboundLoginAcknowledged {}, State.Login))
+    settle(net, mut s, mut clients)
+    let text = "Calcite can't configure players yet"
+    check(clients[a].next(), "2:0800{hex([u8.wrap(text.len())])}{hex(text.to_bytes())}")
+    check(clients[a].next(), "closed")
+    check(logs(mut s), "Steve (5627dd98-e6be-3c21-b8a8-e92344183641) lost connection: {text}|")
+
+    // A client that goes before it's let in.
+    net.close(clients[b].conn)
+    settle(net, mut s, mut clients)
+    check(logs(mut s), "Notch ({clients[b].address}) lost connection: disconnect.endOfStream|")
+
+    // With no connections, the session ID goes, so the next login gets a new one.
+    s.tick()
+    let c = start(net, mut s, port, mut clients, "Alex")
+    s.tick()
+    settle(net, mut s, mut clients)
+    check(clients[c].next(), "3:8002")
+    clients[c].codec.start_compression(256)
+    let (_, renewed) = clients[c].finished()
+    assert(renewed != session, "the session ID outlived every connection")
+    net.close(clients[c].conn)
+    settle(net, mut s, mut clients)
+    _ = logs(mut s)
+}
+
+fn uncompressed(net: Net) {
+    var s = new_server(net, -1, false)
+    let port = s.listen("127.0.0.1", 0)!
+    var clients = List<Client>()
+    let a = start(net, mut s, port, mut clients, "Steve")
+    s.tick()
+    settle(net, mut s, mut clients)
+    let (profile, _) = clients[a].finished()
+    check(profile, "5627dd98-e6be-3c21-b8a8-e92344183641 Steve 0")
+    // With `log-ips=false`, the log hides the address.
+    net.close(clients[a].conn)
+    settle(net, mut s, mut clients)
+    check(logs(mut s), "Steve (IP hidden) lost connection: disconnect.endOfStream|")
+}
+
+// A login the server ends at once after `send`, and the reason's JSON.
+fn refused(net: Net, s: mut Network, port: u16, name: String, send: List<u8>, raw: bool) -> (String, String) {
+    var clients = List<Client>()
+    let a = start(net, mut s, port, mut clients, name)
+    if raw {
+        clients[a].send_raw(net, send)
+    } else {
+        clients[a].send(net, send.copy())
+    }
+    settle(net, mut s, mut clients)
+    let reason = clients[a].reason()
+    check(clients[a].next(), "closed")
+    return (reason, clients[a].address.copy())
+}
+
+fn generic(exception: String) -> String {
+    return "\{\"translate\":\"disconnect.genericReason\",\"with\":[\"Internal Exception: {exception}\"]\}"
+}
+
+fn failures(net: Net) {
+    var s = new_server(net, 256, true)
+    let port = s.listen("127.0.0.1", 0)!
+
+    // A name vanilla doesn't take.
+    var clients = List<Client>()
+    let a = start(net, mut s, port, mut clients, "bad name")
+    let unexpected = "java.lang.IllegalStateException: "
+    check(clients[a].reason(), generic("{unexpected}Invalid characters in username"))
+    check(clients[a].next(), "closed")
+    check(logs(mut s), "{clients[a].address} lost connection: Error: Internal Exception: {unexpected}Invalid characters in username|")
+
+    // Packets out of order.
+    let hello = packet(ServerboundHello { name: "Steve", profile_id: Uuid.new(0, 0) }, State.Login)
+    let (r1, at1) = refused(net, mut s, port, "Steve", hello, false)
+    check(r1, generic("{unexpected}Unexpected hello packet"))
+    check(logs(mut s), "Steve ({at1}) lost connection: Error: Internal Exception: {unexpected}Unexpected hello packet|")
+    let key = packet(ServerboundKey { key_bytes: [1], encrypted_challenge: [2] }, State.Login)
+    let (r2, _) = refused(net, mut s, port, "Steve", key, false)
+    check(r2, generic("{unexpected}Unexpected key packet"))
+    _ = logs(mut s)
+    let ack = packet(ServerboundLoginAcknowledged {}, State.Login)
+    let (r3, _) = refused(net, mut s, port, "Steve", ack, false)
+    check(r3, generic("{unexpected}Unexpected login acknowledgement packet"))
+    _ = logs(mut s)
+
+    // A query answer the server never asked for.
+    let answer = packet(ServerboundCustomQueryAnswer { transaction_id: 1, payload: [] }, State.Login)
+    let (r4, at4) = refused(net, mut s, port, "", answer, false)
+    check(r4, "\{\"translate\":\"multiplayer.disconnect.unexpected_query_response\"\}")
+    check(logs(mut s), "Disconnecting {at4}: multiplayer.disconnect.unexpected_query_response|{at4} lost connection: multiplayer.disconnect.unexpected_query_response|")
+
+    // Packets that can't be read, as vanilla's pipeline reports them.
+    let (r5, _) = refused(net, mut s, port, "", [0x01, 0x09], true)
+    check(r5, generic("io.netty.handler.codec.DecoderException: Received unknown packet id 9"))
+    var long_hello = hello.copy()
+    long_hello.push(0)
+    let (r6, _) = refused(net, mut s, port, "", long_hello, false)
+    check(r6, generic("io.netty.handler.codec.DecoderException: java.io.IOException: Packet login/serverbound/minecraft:hello (ServerboundHelloPacket) was larger than I expected, found 1 bytes extra whilst reading packet serverbound/minecraft:hello"))
+    let (r7, _) = refused(net, mut s, port, "", [0x02, 0x00, 0x40], true)
+    check(r7, generic("io.netty.handler.codec.DecoderException: Failed to decode packet 'serverbound/minecraft:hello'"))
+    let (r8, _) = refused(net, mut s, port, "", [0xFF, 0xFF, 0xFF, 0x7F], true)
+    check(r8, generic("io.netty.handler.codec.CorruptedFrameException: length wider than 21-bit"))
+    _ = logs(mut s)
+
+    // A login that takes more than 600 ticks.
+    var slow = List<Client>()
+    let b = start(net, mut s, port, mut slow, "")
+    for _ in 0..MAX_LOGIN_TICKS {
+        s.tick()
+    }
+    settle(net, mut s, mut slow)
+    check(slow[b].next(), "nothing")
+    s.tick()
+    settle(net, mut s, mut slow)
+    check(slow[b].reason(), "\{\"translate\":\"multiplayer.disconnect.slow_login\"\}")
+    check(slow[b].next(), "closed")
+    check(logs(mut s), "Disconnecting {slow[b].address}: multiplayer.disconnect.slow_login|{slow[b].address} lost connection: multiplayer.disconnect.slow_login|")
+}
+
+fn main() {
+    let net = Net.new()!
+    offline(net)
+    uncompressed(net)
+    failures(net)
+    println("ok")
+}
