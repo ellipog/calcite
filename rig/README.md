@@ -142,7 +142,7 @@ The generators use SplitMix64 from the given seed. A range value is `min + (max 
 
 - calx is found from the `CALX` environment variable, then `PATH`, then `../calx/build/compiler/<platform>/` beside this repository. calx finds clang itself.
 - `CALCITE_DEBUG=1` builds the adapter in debug mode, where it checks that it frees everything it allocates and exits with status 102 if not.
-- It implements `ping`, `rng`, `collections` and `registries`, which pass 100% on Windows and Linux. Every other probe reports `unimplemented` until Calcite has the code behind it.
+- It implements `ping`, `rng`, `collections` and `registries`, which pass 100% on Windows and Linux, and `nbt` for binary input, whose 32 cases pass; its SNBT cases wait for the SNBT parser. Every other probe reports `unimplemented` until Calcite has the code behind it.
 - It runs from the repository's root. `registries` reads the vanilla data pack from the pinned jar in `oracle/jars/`, which [`fetch.py`](../oracle/fetch.py) gets.
 
 The adapter's parts are in [`src/`](../src/README.md): the frames in `rig.frame`, their JSON in `json.tree`, and one module per probe.

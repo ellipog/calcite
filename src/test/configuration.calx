@@ -1,0 +1,437 @@
+/// Checks configuration in server.network over real TCP on 127.0.0.1, with a small made-up set of
+/// registries: what a player is sent after their login, the tasks in order, the keep-alive, the
+/// code of conduct and the resource pack, and what vanilla does with packets that come at the
+/// wrong time.
+module test.configuration
+
+import auth.services.{Services}
+import chat.component.{Component}
+import chat.language.{Language}
+import java.uuid.{Uuid}
+import pack.resources.{KnownPack}
+import protocol.codec.{Codec}
+import protocol.common.{ChatVisibility, ClientInformation, HumanoidArm, ParticleStatus, ResourcePackAction, ServerboundClientInformation, ServerboundKeepAlive, ServerboundResourcePack}
+import protocol.configuration.{ServerboundAcceptCodeOfConduct, ServerboundFinishConfiguration, ServerboundSelectKnownPacks}
+import protocol.handshake.{ClientIntent, ClientIntention}
+import protocol.ids.{packet_names}
+import protocol.login.{ServerboundCookieResponse, ServerboundHello, ServerboundLoginAcknowledged}
+import protocol.state.{State, Bound}
+import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
+import registry.registries.{Registries}
+import registry.registry.{Registry, Tag}
+import resources.identifier.{Identifier}
+import server.configuration.{CodeOfConduct, Configuration, ResourcePack}
+import server.network.{Network, StatusInfo, LoginSettings}
+import std.crypto.{RsaKey}
+import std.net.{Net, Conn, Event}
+
+fn check(got: String, want: String) {
+    if got != want {
+        panic("got {got}, want {want}")
+    }
+}
+
+fn hex(bytes: List<u8>) -> String {
+    let digits: [rune; 16] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']
+    var out = String()
+    for b in bytes {
+        out.push(digits[usize(b / 16)])
+        out.push(digits[usize(b % 16)])
+    }
+    return out
+}
+
+// A string as a packet writes it, in hex: its length, then its bytes.
+fn s(text: String) -> String {
+    return "{hex([u8.wrap(text.len())])}{hex(text.to_bytes())}"
+}
+
+fn id(path: String) -> Identifier {
+    return Identifier { namespace: "minecraft", path: path.copy() }
+}
+
+// Two synchronized registries, one of them empty, both from the vanilla pack, and a built-in
+// one with tags, which it holds in order of their names.
+fn registries() -> Registries {
+    var cats = Registry.new(id("cat_variant"), true)
+    cats.add(id("black"), some(0))
+    cats.add(id("tabby"), some(0))
+    let dialogs = Registry.new(id("dialog"), true)
+    var blocks = Registry.new(id("block"), false)
+    blocks.add(id("stone"), none)
+    blocks.add(id("dirt"), none)
+    blocks.tags.push(Tag { name: id("base_stone_overworld"), values: [0] })
+    blocks.tags.push(Tag { name: id("dirt"), values: [1] })
+    blocks.tags.push(Tag { name: id("logs"), values: [] })
+    blocks.tags.push(Tag { name: id("mineable/shovel"), values: [1, 0] })
+    // A built-in registry with no tags isn't in `update_tags`.
+    let items = Registry.new(id("item"), false)
+    return Registries { synced: [cats, dialogs], builtin: [blocks, items] }
+}
+
+fn core() -> KnownPack {
+    return KnownPack { namespace: "minecraft", id: "core", version: "26.3" }
+}
+
+fn plain() -> Configuration {
+    let packs: List<KnownPack?> = [some(core())]
+    return Configuration.new("calcite", [], [id("vanilla")], registries(), packs)
+}
+
+fn new_server(net: Net, configuration: own Configuration) -> Network {
+    let settings = LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: -1, log_ips: true, prevent_proxy_connections: false, velocity_secret: none }
+    let status = StatusInfo { enabled: true, json: "\{\}", motd: "A Minecraft Server", online: 0, max_players: 20 }
+    var lang = Language.empty()
+    lang.add("disconnect.genericReason", "Error: %s")
+    return Network.new(net, status, settings, lang, Services.offline(), RsaKey.generate(1024), configuration)
+}
+
+fn packet<T: Wire + Packet>(p: T, state: State) -> List<u8> {
+    var w = Writer.new()
+    write_packet(p, state, mut w)
+    return w.into_bytes()
+}
+
+fn config<T: Wire + Packet>(p: T) -> List<u8> {
+    return packet(p, State.Configuration)
+}
+
+struct Client {
+    conn: Conn
+    codec: Codec
+    closed: bool
+}
+
+impl Client {
+    fn send(mut self, net: Net, p: own List<u8>) {
+        net.write(self.conn, self.codec.encode(p)!)
+    }
+
+    // The next packet that came, as `id:hex of the rest`, `nothing`, or `closed` once the
+    // server closed the connection and nothing is left.
+    fn next(mut self) -> String {
+        let body = match self.codec.next()! {
+            some(b) => b,
+            none => return if self.closed { String("closed") } else { String("nothing") },
+        }
+        var r = Reader.new(body)
+        let packet_id = r.varint()!
+        return "{packet_id}:{hex(r.rest())}"
+    }
+}
+
+// A server and its one client, on a clock the test moves.
+struct Rig {
+    net: Net
+    server: Network
+    client: Client
+    now: u64
+}
+
+impl Rig {
+    // Polls until nothing more comes for 50 ms, giving the server its events and the client
+    // what it was sent.
+    fn settle(mut self) {
+        loop {
+            var events = List<Event>()
+            self.net.poll(50, mut events)
+            if events.is_empty() {
+                return
+            }
+            for e in events {
+                if self.server.handle(e, self.now) {
+                    continue
+                }
+                match e {
+                    Event.Received(c) => {
+                        if c == self.client.conn {
+                            _ = self.client.codec.read_from(self.net, c)
+                        }
+                    },
+                    Event.Closed(c) => {
+                        if c == self.client.conn {
+                            self.client.closed = true
+                        }
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    fn send(mut self, p: own List<u8>) {
+        self.client.send(self.net, p)
+        self.settle()
+    }
+
+    // A server tick, `ms` milliseconds after the last.
+    fn tick(mut self, ms: u64) {
+        self.now += ms * 1000000
+        self.server.tick(self.now)
+        self.settle()
+    }
+
+    // The server's log since the last call.
+    fn logs(mut self) -> String {
+        var out = String()
+        for e in self.server.take_logs() {
+            out.push_str("{e.message}|")
+        }
+        return out
+    }
+}
+
+// A server with `configuration`, and Steve, logged in and in configuration, having been sent
+// what comes before the first task's answer.
+fn joined(configuration: own Configuration) -> Rig {
+    let net = Net.new()!
+    let server = new_server(net, configuration)
+    let port = server.listen("127.0.0.1", 0)!
+    let conn = net.connect("127.0.0.1", port)!
+    var rig = Rig { net: net, server: server, client: Client { conn: conn, codec: Codec.new(), closed: false }, now: 0 }
+    rig.settle()
+    let intention = ClientIntention { protocol_version: 777, host_name: "localhost", port: 25565, intention: ClientIntent.Login }
+    rig.client.send(net, packet(intention, State.Handshake))
+    rig.send(packet(ServerboundHello { name: "Steve", profile_id: Uuid.new(0, 0) }, State.Login))
+    rig.tick(50)
+    check(rig.client.next()[..2], "2:")
+    rig.send(packet(ServerboundLoginAcknowledged {}, State.Login))
+    return rig
+}
+
+// The player as the configuration listener logs them: their name and UUID.
+fn steve() -> String {
+    return String("Steve (5627dd98-e6be-3c21-b8a8-e92344183641)")
+}
+
+fn brand() -> String {
+    return "1:{s("minecraft:brand")}{s("calcite")}"
+}
+
+fn features() -> String {
+    return "13:01{s("minecraft:vanilla")}"
+}
+
+fn offer() -> String {
+    return "15:01{s("minecraft")}{s("core")}{s("26.3")}"
+}
+
+fn registry_data() -> List<String> {
+    return [
+        "7:{s("minecraft:cat_variant")}02{s("minecraft:black")}00{s("minecraft:tabby")}00",
+        "7:{s("minecraft:dialog")}00",
+        // The tags in the order of Java's `HashMap` of their names.
+        "14:01{s("minecraft:block")}04{s("minecraft:base_stone_overworld")}0100{s("minecraft:logs")}00{s("minecraft:dirt")}0101{s("minecraft:mineable/shovel")}020100",
+    ]
+}
+
+fn opening(rig: mut Rig) {
+    check(rig.client.next(), brand())
+    check(rig.client.next(), features())
+    check(rig.client.next(), offer())
+    check(rig.client.next(), "nothing")
+}
+
+// The client has the vanilla pack, so it's sent the registries without their contents.
+fn accept_packs(rig: mut Rig) {
+    rig.send(config(ServerboundSelectKnownPacks { packs: [core()] }))
+    for want in registry_data() {
+        check(rig.client.next(), want)
+    }
+}
+
+// A disconnect in `state` with a plain text reason, which goes as a string tag.
+fn disconnect(state: State, text: String) -> String {
+    let names = packet_names(state, Bound.Clientbound)
+    var at: usize = 0
+    for i in 0..names.len() {
+        if names[i] == "disconnect" {
+            at = i
+        }
+    }
+    return "{at}:08{n(text)}"
+}
+
+fn information(language: String) -> ClientInformation {
+    return ClientInformation { language: language.copy(), view_distance: 12, chat_visibility: ChatVisibility.Full, chat_colors: true, model_customisation: 127, main_hand: HumanoidArm.Right, text_filtering_enabled: false, allows_listing: true, particle_status: ParticleStatus.All }
+}
+
+fn flow() {
+    var rig = joined(plain())
+    opening(mut rig)
+    rig.send(config(ServerboundClientInformation { information: information("en_us") }))
+    accept_packs(mut rig)
+    check(rig.client.next(), "nothing")
+    // Preparing the spawn takes a tick, then configuration ends.
+    rig.tick(50)
+    check(rig.client.next(), "3:")
+    check(rig.client.next(), "nothing")
+    // The keep-alive is 15 seconds after configuration started, at 50 ms, its challenge the
+    // time.
+    rig.tick(14900)
+    check(rig.client.next(), "nothing")
+    rig.tick(50)
+    check(rig.client.next(), "4:0000000000003aca")
+    rig.send(config(ServerboundKeepAlive { challenge: 15050 }))
+    rig.tick(15000)
+    check(rig.client.next(), "4:0000000000007562")
+    rig.send(config(ServerboundKeepAlive { challenge: 30050 }))
+    // Play is next, which isn't written yet, so the player is told so in play's disconnect.
+    rig.send(config(ServerboundFinishConfiguration {}))
+    let text = String("Calcite can't run the play state yet")
+    check(rig.client.next(), disconnect(State.Play, text))
+    check(rig.client.next(), "closed")
+    check(rig.logs(), "{steve()} lost connection: {text}|")
+}
+
+fn timeout() {
+    var rig = joined(plain())
+    opening(mut rig)
+    rig.tick(15000)
+    check(rig.client.next(), "4:0000000000003aca")
+    // Unanswered when the next is due.
+    rig.tick(15000)
+    check(rig.client.next(), translated("disconnect.timeout"))
+    check(rig.client.next(), "closed")
+    check(rig.logs(), "{steve()} lost connection: disconnect.timeout|")
+
+    // A keep-alive no one asked for.
+    var other = joined(plain())
+    opening(mut other)
+    other.send(config(ServerboundKeepAlive { challenge: 0 }))
+    check(other.client.next(), translated("disconnect.timeout"))
+    check(other.client.next(), "closed")
+    _ = other.logs()
+}
+
+// A string as NBT writes it, in hex: its length in two bytes, then its bytes.
+fn n(text: String) -> String {
+    let len = text.len()
+    return "{hex([u8.wrap(len / 256), u8.wrap(len % 256)])}{hex(text.to_bytes())}"
+}
+
+// A configuration disconnect whose reason is the translation of `key`, a compound of it alone.
+fn translated(key: String) -> String {
+    return "2:0a08{n("translate")}{n(key)}00"
+}
+
+// A configuration disconnect whose reason is `disconnect.genericReason` with "Internal
+// Exception: " and `exception`: a compound, whose keys are in the order of Java's `HashMap`.
+fn generic(exception: String) -> String {
+    let with = "09{n("with")}0800000001{n("Internal Exception: {exception}")}"
+    return "2:0a{with}08{n("translate")}{n("disconnect.genericReason")}00"
+}
+
+fn wrong_times() {
+    // Finishing before configuration has ended is logged, and the connection goes on.
+    var rig = joined(plain())
+    opening(mut rig)
+    rig.send(config(ServerboundFinishConfiguration {}))
+    check(rig.logs(), "Failed to handle packet net.minecraft.network.protocol.configuration.ServerboundFinishConfigurationPacket, suppressing error\njava.lang.IllegalStateException: Unexpected request for task finish, current task: synchronize_registries, requested: join_world|")
+    accept_packs(mut rig)
+    check(rig.client.next(), "nothing")
+    // A second answer gets the registries again, then is logged.
+    rig.send(config(ServerboundSelectKnownPacks { packs: [core()] }))
+    for want in registry_data() {
+        check(rig.client.next(), want)
+    }
+    check(rig.logs(), "Failed to handle packet ServerboundSelectKnownPacks[knownPacks=[minecraft:core:26.3]], suppressing error\njava.lang.IllegalStateException: Unexpected request for task finish, current task: prepare_spawn, requested: synchronize_registries|")
+    // Accepting a code of conduct there isn't is an exception as the packet's read, which ends
+    // the connection.
+    rig.send(config(ServerboundAcceptCodeOfConduct {}))
+    let problem = String("java.lang.IllegalStateException: Unexpected request for task finish, current task: prepare_spawn, requested: server_code_of_conduct")
+    check(rig.client.next(), generic(problem))
+    check(rig.client.next(), "closed")
+    check(rig.logs(), "{steve()} lost connection: Error: Internal Exception: {problem}|")
+
+    // A client without the vanilla pack needs the registries' contents.
+    var bare = joined(plain())
+    opening(mut bare)
+    bare.send(config(ServerboundSelectKnownPacks { packs: [] }))
+    let text = String("Calcite can't send the registries' contents yet, so it needs a client with vanilla's own data")
+    check(bare.client.next(), disconnect(State.Configuration, text))
+    check(bare.client.next(), "closed")
+    check(bare.logs(), "{steve()} lost connection: {text}|")
+
+    // The server asked for no cookie.
+    var cookie = joined(plain())
+    opening(mut cookie)
+    cookie.send(config(ServerboundCookieResponse { key: id("x"), payload: none }))
+    check(cookie.client.next(), translated("multiplayer.disconnect.unexpected_query_response"))
+    check(cookie.client.next(), "closed")
+    check(cookie.logs(), "{steve()} lost connection: multiplayer.disconnect.unexpected_query_response|")
+
+    // A packet that can't be read: a known packs answer whose count is cut off.
+    var broken = joined(plain())
+    opening(mut broken)
+    broken.send([7, 128])
+    check(broken.client.next(), generic("io.netty.handler.codec.DecoderException: Failed to decode packet 'serverbound/minecraft:select_known_packs'"))
+    check(broken.client.next(), "closed")
+    _ = broken.logs()
+}
+
+fn pack(required: bool) -> Configuration {
+    var c = plain()
+    c.codes = [CodeOfConduct { language: "en_us", text: "Be kind." }, CodeOfConduct { language: "fr_fr", text: "Soyez gentils." }]
+    c.pack = some(ResourcePack { id: Uuid.new(1, 2), url: "https://example.com/pack.zip", hash: "", required: required, prompt: some(Component.literal("Please")) })
+    return c
+}
+
+fn tasks() {
+    var rig = joined(pack(true))
+    opening(mut rig)
+    // The code of conduct is in the client's language, in any case, and comes once the
+    // registries are done.
+    rig.send(config(ServerboundClientInformation { information: information("FR_fr") }))
+    accept_packs(mut rig)
+    check(rig.client.next(), "20:{s("Soyez gentils.")}")
+    rig.send(config(ServerboundAcceptCodeOfConduct {}))
+    let push = "9:00000000000000010000000000000002{s("https://example.com/pack.zip")}00010108{n("Please")}"
+    check(rig.client.next(), push)
+    // Steps on the way don't finish the task; the client being done with the pack does.
+    rig.send(config(ServerboundResourcePack { pack: Uuid.new(1, 2), action: ResourcePackAction.Accepted }))
+    rig.send(config(ServerboundResourcePack { pack: Uuid.new(1, 2), action: ResourcePackAction.Downloaded }))
+    rig.tick(50)
+    check(rig.client.next(), "nothing")
+    rig.send(config(ServerboundResourcePack { pack: Uuid.new(1, 2), action: ResourcePackAction.SuccessfullyLoaded }))
+    rig.tick(50)
+    check(rig.client.next(), "3:")
+    // Another answer, with no task waiting for one, is logged.
+    rig.send(config(ServerboundResourcePack { pack: Uuid.new(1, 2), action: ResourcePackAction.Discarded }))
+    check(rig.logs(), "Failed to handle packet ServerboundResourcePackPacket[id=00000000-0000-0001-0000-000000000002, action=DISCARDED], suppressing error\njava.lang.IllegalStateException: Unexpected request for task finish, current task: join_world, requested: server_resource_pack|")
+
+    // A required pack declined ends the connection.
+    var declined = joined(pack(true))
+    opening(mut declined)
+    accept_packs(mut declined)
+    check(declined.client.next()[..3], "20:")
+    declined.send(config(ServerboundAcceptCodeOfConduct {}))
+    check(declined.client.next()[..2], "9:")
+    declined.send(config(ServerboundResourcePack { pack: Uuid.new(1, 2), action: ResourcePackAction.Declined }))
+    check(declined.client.next(), translated("multiplayer.requiredTexturePrompt.disconnect"))
+    check(declined.client.next(), "closed")
+    check(declined.logs(), "Disconnecting Steve due to resource pack 00000000-0000-0001-0000-000000000002 rejection|{steve()} lost connection: multiplayer.requiredTexturePrompt.disconnect|")
+
+    // One that isn't required may be declined, which finishes the task.
+    var optional = joined(pack(false))
+    opening(mut optional)
+    accept_packs(mut optional)
+    // With no language from the client, the code of conduct is the default's, `en_us`.
+    check(optional.client.next(), "20:{s("Be kind.")}")
+    optional.send(config(ServerboundAcceptCodeOfConduct {}))
+    check(optional.client.next()[..2], "9:")
+    optional.send(config(ServerboundResourcePack { pack: Uuid.new(1, 2), action: ResourcePackAction.Declined }))
+    optional.tick(50)
+    check(optional.client.next(), "3:")
+    optional.net.close(optional.client.conn)
+    optional.settle()
+    check(optional.logs(), "{steve()} lost connection: disconnect.endOfStream|")
+}
+
+fn main() {
+    flow()
+    timeout()
+    wrong_times()
+    tasks()
+    println("ok")
+}

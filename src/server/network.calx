@@ -1,7 +1,8 @@
 /// The server's connections: accepting them, reading their frames, answering the handshake, the
-/// server list's status and ping and the old ping of clients before 1.7, and logging players in,
-/// as vanilla's `ServerConnectionListener`, `ServerHandshakePacketListenerImpl`,
-/// `ServerStatusPacketListenerImpl` and `ServerLoginPacketListenerImpl` do.
+/// server list's status and ping and the old ping of clients before 1.7, logging players in and
+/// configuring them, as vanilla's `ServerConnectionListener`, `ServerHandshakePacketListenerImpl`,
+/// `ServerStatusPacketListenerImpl`, `ServerLoginPacketListenerImpl` and
+/// `ServerConfigurationPacketListenerImpl` do.
 module server.network
 
 import auth.profile.{GameProfile, is_valid_name}
@@ -12,18 +13,20 @@ import chat.component.{Component}
 import chat.language.{Language}
 import java.uuid.{Uuid}
 import protocol.codec.{Codec}
+import protocol.common.{ClientInformation, ClientboundDisconnect, ClientboundKeepAlive, ClientboundResourcePackPush, ResourcePackAction}
+import protocol.configuration.{ClientboundCodeOfConduct, ClientboundFinishConfiguration, ConfigurationIn}
 import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
-import protocol.ids.{PROTOCOL_VERSION, game_version, packet_names}
+import protocol.ids.{PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
-import protocol.state.{State, Bound}
+import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import resources.identifier.{Identifier}
+import server.configuration.{Configuration}
 import server.log.{Entry}
 import std.crypto.{RsaKey, random_bytes}
 import std.net.{Net, Conn, Event, NetError, Address, Ip}
-import std.text.mutf8.{encode, encoded_len}
 
 /// How long a connection may send nothing before it's closed, as vanilla's
 /// `ReadTimeoutHandler(30)`.
@@ -31,6 +34,10 @@ pub const READ_TIMEOUT_NS: u64 = 30000000000
 
 /// How many ticks a login may take before it's closed, as vanilla's `MAX_TICKS_BEFORE_LOGIN`.
 pub const MAX_LOGIN_TICKS: i32 = 600
+
+/// How often a player is sent a keep-alive, in milliseconds, as vanilla's
+/// `LATENCY_CHECK_INTERVAL`. One still unanswered when the next is due ends the connection.
+pub const KEEP_ALIVE_MS: i64 = 15000
 
 /// What the server list shows, and how the server answers it.
 pub struct StatusInfo {
@@ -68,8 +75,41 @@ enum Phase {
     Handshake
     Status
     Login
-    /// Configuration, which isn't written yet (CAL-38): a player who gets this far is told so.
     Configuration
+}
+
+/// A step of configuration, one of vanilla's `ConfigurationTask`s, in the order they run.
+enum Task {
+    /// The registries: the client says which of the server's packs it has, then gets what it
+    /// lacks.
+    SynchronizeRegistries
+    /// The code of conduct, which the player accepts.
+    CodeOfConduct
+    /// The resource pack, which the client loads or declines.
+    ResourcePack
+    /// The player's place in the world, made ready.
+    PrepareSpawn
+    /// Configuration ends, and the client says it's ready to play.
+    JoinWorld
+}
+
+// The task as vanilla's `ConfigurationTask.Type` writes it, or `null` for none.
+fn task_name(t: Task?) -> String {
+    let task = t else return String("null")
+    return match task {
+        Task.SynchronizeRegistries => String("synchronize_registries"),
+        Task.CodeOfConduct => String("server_code_of_conduct"),
+        Task.ResourcePack => String("server_resource_pack"),
+        Task.PrepareSpawn => String("prepare_spawn"),
+        Task.JoinWorld => String("join_world"),
+    }
+}
+
+fn is(t: Task?, want: Task) -> bool {
+    if let task = t {
+        return task == want
+    }
+    return false
 }
 
 /// Where a login is, vanilla's `ServerLoginPacketListenerImpl.State`.
@@ -116,6 +156,17 @@ struct Connection {
     profile: GameProfile?
     // Why the server ended it, which is logged once it's gone.
     reason: Component?
+    // In configuration: the tasks to come and the one going, and what the client said of itself.
+    tasks: List<Task>
+    task: Task?
+    information: ClientInformation
+    // The last keep-alive, in milliseconds on the caller's clock, which is its challenge too,
+    // whether it's unanswered, and the connection's latency, as vanilla's listener keeps them.
+    keep_alive_time: i64
+    keep_alive_pending: bool
+    latency: i32
+    // The state of what the server sends, which is play's once configuration is done.
+    outbound: State
 }
 
 // A login's check with the session server. It goes on if the player leaves, as vanilla's
@@ -148,15 +199,17 @@ pub struct Network {
     // The session ID every login is given, made when the first needs it and dropped once there
     // are no connections, as vanilla's `ServerConnectionListener.getSessionId`.
     session: Uuid?
+    // What configuration sends every player.
+    configuration: Configuration
     logs: List<Entry>
 }
 
 impl Network {
     /// The network, which authenticates players with `services` in online mode, with `key` as
-    /// the server's key pair.
-    pub fn new(net: Net, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, key: own RsaKey) -> Network {
+    /// the server's key pair, and configures them with `configuration`.
+    pub fn new(net: Net, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, key: own RsaKey, configuration: own Configuration) -> Network {
         let public_key = key.public_der()
-        return Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, key: key, public_key: public_key, checks: List<Check>(), authenticators: 0, session: none, logs: List<Entry>() }
+        return Network { net: net, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, key: key, public_key: public_key, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, logs: List<Entry>() }
     }
 
     /// Listens on `host` and `port`, as vanilla's `startTcpServerListener`. An empty host is
@@ -206,7 +259,7 @@ impl Network {
                     self.connections.push(none)
                 }
                 let address = if self.settings.log_ips { java_address(self.net.peer(c)) } else { String("IP hidden") }
-                self.connections[slot] = some(Connection { conn: c, codec: Codec.new(), phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false, address: address, login: LoginState.Hello, login_ticks: 0, transferred: false, challenge: List<u8>(), query_id: 0, name: none, profile: none, reason: none })
+                self.connections[slot] = some(Connection { conn: c, codec: Codec.new(), phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false, address: address, login: LoginState.Hello, login_ticks: 0, transferred: false, challenge: List<u8>(), query_id: 0, name: none, profile: none, reason: none, tasks: List<Task>(), task: none, information: ClientInformation.default(), keep_alive_time: 0, keep_alive_pending: false, latency: 0, outbound: State.Login })
                 return true
             },
             Event.Received(c) => {
@@ -230,19 +283,21 @@ impl Network {
     }
 
     /// One server tick, at `now` nanoseconds on the caller's clock, as vanilla's
-    /// `ServerConnectionListener.tick`: each login moves on, as its listener's `tick` moves it,
-    /// once the checks with the session server that are done have been acted on. Mojang's
-    /// services are fetched from as they're due.
+    /// `ServerConnectionListener.tick`: each login and configuration moves on, as its listener's
+    /// `tick` moves it, once the checks with the session server that are done have been acted
+    /// on. Mojang's services are fetched from as they're due.
     pub fn tick(mut self, now: u64) {
         self.services.tick(now, mut self.logs)
         self.authenticate()
         for i in 0..self.connections.len() {
-            if not self.logging_in(i) {
-                continue
-            }
+            let phase = self.ticking(i) else continue
             self.connections.push(none)
             var con = self.connections.swap_remove(i) else continue
-            self.tick_login(mut con)
+            if phase == Phase.Login {
+                self.tick_login(mut con)
+            } else {
+                self.tick_configuration(mut con, now)
+            }
             self.connections[i] = some(con)
         }
         if self.open() == 0 {
@@ -278,11 +333,15 @@ impl Network {
         return false
     }
 
-    fn logging_in(self, slot: usize) -> bool {
+    // The phase of the connection in `slot` if its listener ticks: a login or a configuration
+    // that's still open.
+    fn ticking(self, slot: usize) -> Phase? {
         if let c = self.connections[slot] {
-            return not c.closing and c.phase == Phase.Login
+            if not c.closing and (c.phase == Phase.Login or c.phase == Phase.Configuration) {
+                return some(c.phase)
+            }
         }
-        return false
+        return none
     }
 
     fn close(self, con: mut Connection) {
@@ -323,26 +382,26 @@ impl Network {
         }
         // A frame or packet that can't be read closes the connection. In the handshake and status
         // vanilla can't send the reason, since neither state has a disconnect packet, and logs
-        // it only at debug level, so it's dropped there. In the login the client is told.
+        // it only at debug level, so it's dropped there. Later the client is told.
         loop {
             let body = match con.codec.next() {
                 ok(some(b)) => b,
                 ok(none) => return true,
                 err(e) => {
-                    if con.phase == Phase.Login {
+                    if con.phase == Phase.Login or con.phase == Phase.Configuration {
                         self.fault(mut con, decode_exception(e.message))
                     }
                     return false
                 },
             }
-            if not self.packet(mut con, body) {
+            if not self.packet(mut con, body, now) {
                 return false
             }
         }
     }
 
     // Handles one packet. False when the connection is to close.
-    fn packet(mut self, con: mut Connection, body: own List<u8>) -> bool {
+    fn packet(mut self, con: mut Connection, body: own List<u8>, now: u64) -> bool {
         var r = Reader.new(body)
         match con.phase {
             Phase.Handshake => {
@@ -381,9 +440,18 @@ impl Network {
                         return false
                     },
                 }
-                return self.login_packet(mut con, p)
+                return self.login_packet(mut con, p, now)
             },
-            Phase.Configuration => return false,
+            Phase.Configuration => {
+                let p = match ConfigurationIn.read(mut r) {
+                    ok(p) => p,
+                    err(e) => {
+                        self.fault(mut con, decode_exception(e.message))
+                        return false
+                    },
+                }
+                return self.configuration_packet(mut con, p, now)
+            },
         }
     }
 
@@ -426,7 +494,7 @@ impl Network {
     }
 
     // A login packet, as `ServerLoginPacketListenerImpl`'s handlers. False when it's to close.
-    fn login_packet(mut self, con: mut Connection, p: LoginIn) -> bool {
+    fn login_packet(mut self, con: mut Connection, p: LoginIn, now: u64) -> bool {
         match p {
             LoginIn.Hello(hello) => return self.hello(mut con, hello),
             LoginIn.Key(k) => return self.key_packet(mut con, k),
@@ -448,7 +516,8 @@ impl Network {
                 }
                 con.login = LoginState.Accepted
                 con.phase = Phase.Configuration
-                return self.configure(mut con)
+                self.configure(mut con, now)
+                return true
             },
         }
     }
@@ -666,13 +735,219 @@ impl Network {
         }
     }
 
-    // Configuration isn't written yet (CAL-38), so a player who gets there is told so, with the
-    // configuration state's disconnect, and the connection is closed.
-    fn configure(mut self, con: mut Connection) -> bool {
-        let text = String("Calcite can't configure players yet")
-        self.send_bytes(mut con, config_disconnect(text))
-        con.reason = some(Component.literal(text))
-        return false
+    // The login is acknowledged, so configuration starts, at `now`, as vanilla's
+    // `startConfiguration`: the brand, the links and the enabled features, then the tasks, the
+    // first of which starts.
+    fn configure(mut self, con: mut Connection, now: u64) {
+        con.outbound = State.Configuration
+        con.keep_alive_time = millis(now)
+        for i in 0..self.configuration.opening.len() {
+            let p = self.configuration.opening[i].copy()
+            self.send_bytes(mut con, p)
+        }
+        con.tasks = [Task.SynchronizeRegistries]
+        if not self.configuration.codes.is_empty() {
+            con.tasks.push(Task.CodeOfConduct)
+        }
+        if self.configuration.pack != none {
+            con.tasks.push(Task.ResourcePack)
+        }
+        con.tasks.push(Task.PrepareSpawn)
+        con.tasks.push(Task.JoinWorld)
+        self.next_task(mut con)
+    }
+
+    // Starts the next task, if there is one, as `startNextTask`.
+    fn next_task(mut self, con: mut Connection) {
+        if con.closing or con.tasks.is_empty() {
+            return
+        }
+        let task = con.tasks.remove(0)
+        con.task = some(task)
+        match task {
+            Task.SynchronizeRegistries => {
+                let offer = self.configuration.offer.copy()
+                self.send_bytes(mut con, offer)
+            },
+            Task.CodeOfConduct => {
+                let code = self.configuration.code_for(con.information.language)
+                self.send(mut con, ClientboundCodeOfConduct { code: code }, State.Configuration)
+            },
+            Task.ResourcePack => {
+                var push: ClientboundResourcePackPush? = none
+                if let pack = self.configuration.pack {
+                    push = some(ClientboundResourcePackPush { pack: pack.id, url: pack.url.copy(), hash: pack.hash.copy(), required: pack.required, prompt: pack.prompt.copy() })
+                }
+                if let p = push {
+                    self.send(mut con, p, State.Configuration)
+                }
+            },
+            Task.PrepareSpawn => {},
+            Task.JoinWorld => self.send(mut con, ClientboundFinishConfiguration {}, State.Configuration),
+        }
+    }
+
+    // Finishes the current task, which must be `t`, and starts the next, as `finishCurrentTask`.
+    // The exception vanilla throws if `t` isn't the current task, as its `toString` writes it.
+    fn finish_task(mut self, con: mut Connection, t: Task) -> String? {
+        if not is(con.task, t) {
+            return some("java.lang.IllegalStateException: Unexpected request for task finish, current task: {task_name(con.task)}, requested: {task_name(some(t))}")
+        }
+        con.task = none
+        self.next_task(mut con)
+        return none
+    }
+
+    // A configuration's tick at `now`, as the configuration listener's `tick`: a keep-alive if
+    // one is due, then the current task's tick.
+    fn tick_configuration(mut self, con: mut Connection, now: u64) {
+        let ms = millis(now)
+        if ms - con.keep_alive_time >= KEEP_ALIVE_MS {
+            if con.keep_alive_pending {
+                self.disconnect(mut con, Component.translatable("disconnect.timeout", []))
+                self.close(mut con)
+                return
+            }
+            con.keep_alive_pending = true
+            con.keep_alive_time = ms
+            self.send(mut con, ClientboundKeepAlive { challenge: ms }, State.Configuration)
+        }
+        if is(con.task, Task.PrepareSpawn) {
+            // There's no world to load the player's chunks in until CAL-39, so their place is
+            // ready on the first tick, which is as soon as vanilla's can be.
+            con.task = none
+            self.next_task(mut con)
+        }
+    }
+
+    // A configuration packet, at `now`, as the configuration listener's handlers and those it
+    // shares with play. False when the connection is to close. Vanilla handles the packets
+    // that change what the server holds on its own thread, where an exception is logged and
+    // the connection goes on, and the rest as they're read, where an exception ends it.
+    fn configuration_packet(mut self, con: mut Connection, p: ConfigurationIn, now: u64) -> bool {
+        match p {
+            ConfigurationIn.ClientInformation(c) => {
+                con.information = c.information.copy()
+                return true
+            },
+            ConfigurationIn.CookieResponse(_) => {
+                // The server asks for no cookies.
+                self.disconnect(mut con, Component.translatable("multiplayer.disconnect.unexpected_query_response", []))
+                return false
+            },
+            // Plugin channels, pongs and custom click actions are for plugins, so far.
+            ConfigurationIn.CustomPayload(_) => return true,
+            ConfigurationIn.Pong(_) => return true,
+            ConfigurationIn.CustomClickAction(_) => return true,
+            ConfigurationIn.KeepAlive(k) => {
+                if con.keep_alive_pending and k.challenge == con.keep_alive_time {
+                    let time = i32.wrap(millis(now) - con.keep_alive_time)
+                    con.latency = (con.latency * 3 + time) / 4
+                    con.keep_alive_pending = false
+                    return true
+                }
+                self.disconnect(mut con, Component.translatable("disconnect.timeout", []))
+                return false
+            },
+            ConfigurationIn.AcceptCodeOfConduct(_) => {
+                if let problem = self.finish_task(mut con, Task.CodeOfConduct) {
+                    self.fault(mut con, problem)
+                    return false
+                }
+                return true
+            },
+            ConfigurationIn.SelectKnownPacks(answer) => {
+                // Vanilla sends the registries for each answer, even one it didn't ask for.
+                let known = self.configuration.accepts(answer.packs)
+                if not self.synchronize(mut con, known) {
+                    return false
+                }
+                if let problem = self.finish_task(mut con, Task.SynchronizeRegistries) {
+                    var packs = String()
+                    for k in answer.packs {
+                        if not packs.is_empty() {
+                            packs.push_str(", ")
+                        }
+                        packs.push_str("{k.namespace}:{k.id}:{k.version}")
+                    }
+                    self.suppress("ServerboundSelectKnownPacks[knownPacks=[{packs}]]", problem)
+                }
+                return true
+            },
+            ConfigurationIn.ResourcePack(r) => {
+                var required = false
+                if let pack = self.configuration.pack {
+                    required = pack.required
+                }
+                if r.action == ResourcePackAction.Declined and required {
+                    var name = String()
+                    if let profile = con.profile {
+                        name = profile.name.copy()
+                    }
+                    self.logs.push(Entry.info("Disconnecting {name} due to resource pack {r.pack.to_string()} rejection"))
+                    self.disconnect(mut con, Component.translatable("multiplayer.requiredTexturePrompt.disconnect", []))
+                    return false
+                }
+                if r.action.is_terminal() {
+                    if let problem = self.finish_task(mut con, Task.ResourcePack) {
+                        self.suppress("ServerboundResourcePackPacket[id={r.pack.to_string()}, action={action_name(r.action)}]", problem)
+                    }
+                }
+                return true
+            },
+            ConfigurationIn.FinishConfiguration(_) => {
+                if let problem = self.finish_task(mut con, Task.JoinWorld) {
+                    // Vanilla's packet has no `toString` of its own, so it names its class and
+                    // the instance's hash code, which changes from run to run and is left out.
+                    self.suppress("net.minecraft.network.protocol.configuration.ServerboundFinishConfigurationPacket", problem)
+                    return true
+                }
+                self.join(mut con)
+                return false
+            },
+        }
+    }
+
+    // Sends the registries, as `SynchronizeRegistriesTask.handleResponse`: their entries
+    // without their contents if `known`, as the client has every pack it was asked about, and
+    // with them if not. Calcite can't write an entry's contents yet, so a client that needs them
+    // is told so. False when the connection is to close.
+    fn synchronize(mut self, con: mut Connection, known: bool) -> bool {
+        var n: usize = 0
+        var complete = false
+        if known {
+            if let synced = self.configuration.synced {
+                n = synced.len()
+                complete = true
+            }
+        }
+        if not complete {
+            self.disconnect(mut con, Component.literal("Calcite can't send the registries' contents yet, so it needs a client with vanilla's own data"))
+            return false
+        }
+        for i in 0..n {
+            var p = List<u8>()
+            if let synced = self.configuration.synced {
+                p = synced[i].copy()
+            }
+            self.send_bytes(mut con, p)
+        }
+        return true
+    }
+
+    // What vanilla's `ServerPacketListener.onPacketError` logs of an exception handling a packet
+    // on its own thread, before it goes on: the packet as its `toString` writes it, then the
+    // exception's first line, which its stack trace would follow.
+    fn suppress(mut self, packet: String, exception: String) {
+        self.logs.push(Entry.error("Failed to handle packet {packet}, suppressing error\n{exception}"))
+    }
+
+    // The client has finished configuring, so what the server sends is play's, as vanilla's
+    // `handleConfigurationFinished` switches it, and the player would be placed in the world.
+    // There's no world until CAL-39, so they're told so.
+    fn join(mut self, con: mut Connection) {
+        con.outbound = State.Play
+        self.disconnect(mut con, Component.literal("Calcite can't run the play state yet"))
     }
 
     fn session_id(mut self) -> Uuid {
@@ -684,21 +959,34 @@ impl Network {
         return s
     }
 
-    // Tells the client why its login ends, as the login listener's `disconnect`, on the server
-    // thread. The caller closes the connection.
+    // Tells the client why the connection ends, as its listener's `disconnect` does. The login's
+    // logs it first, on the server thread; configuration's doesn't. The caller closes the
+    // connection.
     fn disconnect(mut self, con: mut Connection, reason: own Component) {
-        let line = "Disconnecting {user(con)}: {reason.get_string(self.lang)}"
-        self.logs.push(Entry.info(line))
-        self.send(mut con, ClientboundLoginDisconnect { reason_json: reason.to_json() }, State.Login)
-        con.reason = some(reason)
+        if con.phase == Phase.Login {
+            let line = "Disconnecting {user(con)}: {reason.get_string(self.lang)}"
+            self.logs.push(Entry.info(line))
+        }
+        self.tell(mut con, reason)
     }
 
-    // What vanilla's `Connection.exceptionCaught` does in the login with the exception, as its
-    // `toString` writes it: the client is told, and the exception is logged only as the reason
-    // the connection was lost. The caller closes the connection.
+    // What vanilla's `Connection.exceptionCaught` does with the exception, as its `toString`
+    // writes it: the client is told, and the exception is logged only as the reason the
+    // connection was lost. The caller closes the connection.
     fn fault(mut self, con: mut Connection, exception: String) {
         let reason = Component.translatable("disconnect.genericReason", [Component.literal("Internal Exception: {exception}")])
-        self.send(mut con, ClientboundLoginDisconnect { reason_json: reason.to_json() }, State.Login)
+        self.tell(mut con, reason)
+    }
+
+    // Sends the reason the connection ends: in the login's disconnect packet as JSON, and
+    // later in the disconnect packet of the state the server sends in, as NBT.
+    fn tell(mut self, con: mut Connection, reason: own Component) {
+        if con.phase == Phase.Login {
+            self.send(mut con, ClientboundLoginDisconnect { reason_json: reason.to_json() }, State.Login)
+        } else {
+            let state = con.outbound
+            self.send(mut con, ClientboundDisconnect { reason: reason.copy() }, state)
+        }
         con.reason = some(reason)
     }
 
@@ -834,21 +1122,21 @@ fn hex(out: mut String, v: u32) {
     }
 }
 
-// The configuration state's `disconnect` with a plain text reason, which vanilla writes as NBT:
-// a text component with nothing else is a single string tag. CAL-38 writes every component.
-fn config_disconnect(text: String) -> List<u8> {
-    let names = packet_names(State.Configuration, Bound.Clientbound)
-    var id: i32 = -1
-    for i in 0..names.len() {
-        if names[i] == "disconnect" {
-            id = i32.wrap(i)
-        }
-    }
-    var w = Writer.new()
-    w.varint(id)
-    w.u8(8)
-    w.u16(u16.wrap(encoded_len(text)))
-    var out = w.into_bytes()
-    encode(text, mut out)
-    return out
+// Nanoseconds on the caller's clock in milliseconds, as vanilla's `Util.getMillis` gives them.
+fn millis(now: u64) -> i64 {
+    return i64.wrap(now / 1000000)
+}
+
+// An action as Java's `Enum.toString` writes it.
+fn action_name(a: ResourcePackAction) -> String {
+    return String(match a {
+        ResourcePackAction.SuccessfullyLoaded => "SUCCESSFULLY_LOADED",
+        ResourcePackAction.Declined => "DECLINED",
+        ResourcePackAction.FailedDownload => "FAILED_DOWNLOAD",
+        ResourcePackAction.Accepted => "ACCEPTED",
+        ResourcePackAction.Downloaded => "DOWNLOADED",
+        ResourcePackAction.InvalidUrl => "INVALID_URL",
+        ResourcePackAction.FailedReload => "FAILED_RELOAD",
+        ResourcePackAction.Discarded => "DISCARDED",
+    })
 }

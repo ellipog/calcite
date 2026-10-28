@@ -1,0 +1,803 @@
+/// NBT, vanilla's tags: the `Tag` tree, read and written in binary as vanilla's `NbtIo` reads and
+/// writes it, with `NbtAccounter`'s limits, and printed as SNBT as vanilla's `Tag.toString`
+/// prints it. Text components on the wire, chunks, items, entities and saves are all made of it.
+module nbt.tag
+
+import std.text.mutf8.{decode, encode, encoded_len}
+
+/// A tag, vanilla's `Tag`.
+pub enum Tag {
+    /// No tag, vanilla's `EndTag`: in binary, what ends a compound.
+    End
+    Byte(i8)
+    Short(i16)
+    Int(i32)
+    Long(i64)
+    Float(f32)
+    Double(f64)
+    ByteArray(List<i8>)
+    Str(String)
+    /// A list, vanilla's `ListTag`. Since 1.21.5 its elements can be of different types. A list
+    /// in binary holds one type, so such a list is written as a list of compounds, with each
+    /// element that isn't a compound in one of its own under the key `""`, and those are
+    /// unwrapped again when it's read.
+    List(List<Tag>)
+    /// Tags by name, vanilla's `CompoundTag`. Vanilla's is a `HashMap`, whose order is the order
+    /// a compound is written in, so this is a `JavaHashMap`.
+    Compound(JavaHashMap<String, Tag>)
+    IntArray(List<i32>)
+    LongArray(List<i64>)
+}
+
+/// Why NBT couldn't be read or written: the exception vanilla throws, by its class's simple
+/// name, such as `ReportedNbtException`, and its message.
+pub struct NbtError {
+    pub exception: String
+    pub message: String
+}
+
+/// How much memory reading NBT may take, and how deeply it may nest, vanilla's `NbtAccounter`.
+/// Each tag counts the bytes vanilla's object for it takes, and a read that would go past
+/// either limit fails.
+pub struct Accounter {
+    quota: i64
+    usage: i64
+    max_depth: i32
+    depth: i32
+}
+
+/// The most a packet's NBT may take, vanilla's `NbtAccounter.DEFAULT_NBT_QUOTA`.
+pub const DEFAULT_QUOTA: i64 = 2097152
+
+/// How deeply NBT may nest, vanilla's `MAX_STACK_DEPTH`.
+pub const MAX_DEPTH: i32 = 512
+
+impl Accounter {
+    /// At most `quota` bytes and `max_depth` levels, as `new NbtAccounter(quota, maxDepth)`.
+    pub fn new(quota: i64, max_depth: i32) -> Accounter {
+        return Accounter { quota: quota, usage: 0, max_depth: max_depth, depth: 0 }
+    }
+
+    /// At most `quota` bytes and 512 levels, as `NbtAccounter.create(quota)`.
+    pub fn with_quota(quota: i64) -> Accounter {
+        return Accounter.new(quota, MAX_DEPTH)
+    }
+
+    /// 512 levels and no limit on bytes, as `NbtAccounter.unlimitedHeap()`.
+    pub fn unlimited() -> Accounter {
+        return Accounter.new(9223372036854775807, MAX_DEPTH)
+    }
+
+    /// The bytes it has counted, as `getUsage`.
+    pub fn used(self) -> i64 {
+        return self.usage
+    }
+
+    fn account(mut self, size: i64) ! NbtError {
+        if size < 0 {
+            fail runtime("IllegalArgumentException", "Tried to account NBT tag with negative size: {size}")
+        }
+        if self.usage + size > self.quota {
+            fail runtime("NbtAccounterException", "Tried to read NBT tag that was too big; tried to allocate: {self.usage} + {size} bytes where max allowed: {self.quota}")
+        }
+        self.usage += size
+    }
+
+    fn push(mut self) ! NbtError {
+        if self.depth >= self.max_depth {
+            fail runtime("NbtAccounterException", "Tried to read NBT tag with too high complexity, depth > {self.max_depth}")
+        }
+        self.depth += 1
+    }
+
+    fn pop(mut self) {
+        self.depth -= 1
+    }
+}
+
+fn runtime(exception: str, message: own String) -> NbtError {
+    return NbtError { exception: String(exception), message: message }
+}
+
+// Java's `DataInput` at the end of its bytes.
+fn eof() -> NbtError {
+    return runtime("EOFException", String())
+}
+
+// Whether vanilla throws it as an `IOException`, which reading a tag wraps in a crash report.
+fn is_io(e: NbtError) -> bool {
+    return e.exception == "EOFException" or e.exception == "UTFDataFormatException" or e.exception == "IOException"
+}
+
+/// Reads a tag in network form, as `NbtIo.readAnyTag` does: its type, then its payload, with no
+/// name. `at` is where it starts, and is moved past it. As in vanilla, a problem inside the tag
+/// that Java reports as an `IOException`, such as the bytes ending, is a `ReportedNbtException`
+/// with the message `Loading NBT data`.
+pub fn read_any(bytes: List<u8>, at: mut usize, accounter: mut Accounter) -> Tag ! NbtError {
+    let kind = try byte(bytes, mut at)
+    if kind == 0 {
+        return Tag.End
+    }
+    return try read_payload(kind, bytes, mut at, mut accounter)
+}
+
+/// Reads a tag in file form, as `NbtIo.readUnnamedTag` does: its type, a name that's skipped,
+/// then its payload.
+pub fn read_unnamed(bytes: List<u8>, at: mut usize, accounter: mut Accounter) -> Tag ! NbtError {
+    let kind = try byte(bytes, mut at)
+    if kind == 0 {
+        return Tag.End
+    }
+    // `skipBytes` skips what's there, without failing at the end.
+    let n = usize(try short(bytes, mut at))
+    at = if bytes.len() - at < n { bytes.len() } else { at + n }
+    return try read_payload(kind, bytes, mut at, mut accounter)
+}
+
+fn read_payload(kind: u8, bytes: List<u8>, at: mut usize, accounter: mut Accounter) -> Tag ! NbtError {
+    match load(kind, bytes, mut at, mut accounter) {
+        ok(tag) => return tag,
+        err(e) => {
+            if is_io(e) {
+                fail runtime("ReportedNbtException", String("Loading NBT data"))
+            }
+            fail e
+        },
+    }
+}
+
+// A payload of type `kind`, as that type's `TagType.load` reads it.
+fn load(kind: u8, bytes: List<u8>, at: mut usize, accounter: mut Accounter) -> Tag ! NbtError {
+    if kind == 0 {
+        try accounter.account(8)
+        return Tag.End
+    }
+    if kind == 1 {
+        try accounter.account(9)
+        return Tag.Byte(i8.wrap(try byte(bytes, mut at)))
+    }
+    if kind == 2 {
+        try accounter.account(10)
+        return Tag.Short(i16.wrap(try short(bytes, mut at)))
+    }
+    if kind == 3 {
+        try accounter.account(12)
+        return Tag.Int(try int(bytes, mut at))
+    }
+    if kind == 4 {
+        try accounter.account(16)
+        return Tag.Long(try long(bytes, mut at))
+    }
+    if kind == 5 {
+        try accounter.account(12)
+        return Tag.float(f32.from_bits(u32.wrap(try int(bytes, mut at))))
+    }
+    if kind == 6 {
+        try accounter.account(16)
+        return Tag.double(f64.from_bits(u64.wrap(try long(bytes, mut at))))
+    }
+    if kind == 7 {
+        try accounter.account(24)
+        let n = try int(bytes, mut at)
+        try accounter.account(i64(n))
+        let count = usize.wrap(n)
+        if bytes.len() - at < count {
+            fail eof()
+        }
+        var values = List<i8>()
+        values.reserve(count)
+        for i in 0..count {
+            values.push(i8.wrap(bytes[at + i]))
+        }
+        at += count
+        return Tag.ByteArray(values)
+    }
+    if kind == 8 {
+        try accounter.account(36)
+        let s = try utf(bytes, mut at)
+        try accounter.account(2 * i64.wrap(s.utf16_len()))
+        return Tag.Str(s)
+    }
+    if kind == 9 {
+        try accounter.push()
+        match load_list(bytes, mut at, mut accounter) {
+            ok(list) => {
+                accounter.pop()
+                return list
+            },
+            err(e) => {
+                accounter.pop()
+                fail e
+            },
+        }
+    }
+    if kind == 10 {
+        try accounter.push()
+        match load_compound(bytes, mut at, mut accounter) {
+            ok(compound) => {
+                accounter.pop()
+                return compound
+            },
+            err(e) => {
+                accounter.pop()
+                fail e
+            },
+        }
+    }
+    if kind == 11 {
+        try accounter.account(24)
+        let n = try int(bytes, mut at)
+        try accounter.account(4 * i64(n))
+        let count = usize.wrap(n)
+        if (bytes.len() - at) / 4 < count {
+            fail eof()
+        }
+        var values = List<i32>()
+        values.reserve(count)
+        for _ in 0..count {
+            values.push(try int(bytes, mut at))
+        }
+        return Tag.IntArray(values)
+    }
+    if kind == 12 {
+        try accounter.account(24)
+        let n = try int(bytes, mut at)
+        try accounter.account(8 * i64(n))
+        let count = usize.wrap(n)
+        if (bytes.len() - at) / 8 < count {
+            fail eof()
+        }
+        var values = List<i64>()
+        values.reserve(count)
+        for _ in 0..count {
+            values.push(try long(bytes, mut at))
+        }
+        return Tag.LongArray(values)
+    }
+    fail runtime("IOException", "Invalid tag id: {i8.wrap(kind)}")
+}
+
+fn load_list(bytes: List<u8>, at: mut usize, accounter: mut Accounter) -> Tag ! NbtError {
+    try accounter.account(36)
+    let kind = try byte(bytes, mut at)
+    let count = try int(bytes, mut at)
+    if count < 0 {
+        fail runtime("NbtFormatException", "ListTag length cannot be negative: {count}")
+    }
+    if kind == 0 and count > 0 {
+        fail runtime("NbtFormatException", String("Missing type on ListTag"))
+    }
+    try accounter.account(4 * i64(count))
+    var items = List<Tag>()
+    // Not all of `count` up front: the bytes may end long before it.
+    items.reserve(if usize.wrap(count) < bytes.len() - at { usize.wrap(count) } else { bytes.len() - at })
+    for _ in 0..usize.wrap(count) {
+        let tag = try load(kind, bytes, mut at, mut accounter)
+        items.push(unwrap(tag))
+    }
+    return Tag.List(items)
+}
+
+fn load_compound(bytes: List<u8>, at: mut usize, accounter: mut Accounter) -> Tag ! NbtError {
+    try accounter.account(48)
+    var tags = JavaHashMap<String, Tag>()
+    loop {
+        let kind = try byte(bytes, mut at)
+        if kind == 0 {
+            return Tag.Compound(tags)
+        }
+        let key = try utf(bytes, mut at)
+        try accounter.account(28)
+        try accounter.account(2 * i64.wrap(key.utf16_len()))
+        let tag = try load(kind, bytes, mut at, mut accounter)
+        let fresh = not tags.contains(key)
+        tags.insert(key, tag)
+        if fresh {
+            try accounter.account(36)
+        }
+    }
+}
+
+// An element of a list as vanilla's `addAndUnwrap` adds it: a compound holding only `""` is the
+// element it wraps.
+fn unwrap(tag: own Tag) -> Tag {
+    match tag {
+        Tag.Compound(tags) => {
+            var m = tags
+            if m.len() == 1 {
+                if let inner = m.remove("") {
+                    return inner
+                }
+            }
+            return Tag.Compound(m)
+        },
+        _ => return tag,
+    }
+}
+
+fn byte(bytes: List<u8>, at: mut usize) -> u8 ! NbtError {
+    if at >= bytes.len() {
+        fail eof()
+    }
+    let b = bytes[at]
+    at += 1
+    return b
+}
+
+fn short(bytes: List<u8>, at: mut usize) -> u16 ! NbtError {
+    if bytes.len() - at < 2 {
+        fail eof()
+    }
+    let v = u16(bytes[at]) * 256 + u16(bytes[at + 1])
+    at += 2
+    return v
+}
+
+fn int(bytes: List<u8>, at: mut usize) -> i32 ! NbtError {
+    if bytes.len() - at < 4 {
+        fail eof()
+    }
+    var v: u32 = 0
+    for _ in 0..4 {
+        v = (v << 8) | u32(bytes[at])
+        at += 1
+    }
+    return i32.wrap(v)
+}
+
+fn long(bytes: List<u8>, at: mut usize) -> i64 ! NbtError {
+    if bytes.len() - at < 8 {
+        fail eof()
+    }
+    var v: u64 = 0
+    for _ in 0..8 {
+        v = (v << 8) | u64(bytes[at])
+        at += 1
+    }
+    return i64.wrap(v)
+}
+
+// A string as Java's `readUTF` reads it: a two-byte length, then that many bytes of modified
+// UTF-8.
+fn utf(bytes: List<u8>, at: mut usize) -> String ! NbtError {
+    let n = usize(try short(bytes, mut at))
+    if bytes.len() - at < n {
+        fail eof()
+    }
+    let from = at
+    at += n
+    return match decode(bytes, from, from + n) {
+        ok(s) => s,
+        err(_) => {
+            fail runtime("UTFDataFormatException", String("malformed input"))
+        },
+    }
+}
+
+impl Tag {
+    /// A float as vanilla's `FloatTag.valueOf` makes its tag, which is the one for `0.0` when
+    /// the float equals it, so `-0.0` becomes `0.0`.
+    pub fn float(v: f32) -> Tag {
+        return Tag.Float(if v == 0.0f32 { 0.0f32 } else { v })
+    }
+
+    /// A double as vanilla's `DoubleTag.valueOf` makes its tag: `-0.0` becomes `0.0`.
+    pub fn double(v: f64) -> Tag {
+        return Tag.Double(if v == 0.0 { 0.0 } else { v })
+    }
+
+    /// The tag's type, vanilla's `getId`: 0 for `End`, then 1 to 12 in the order of `Tag`'s
+    /// variants.
+    pub fn id(self) -> u8 {
+        return match self {
+            Tag.End => 0,
+            Tag.Byte(_) => 1,
+            Tag.Short(_) => 2,
+            Tag.Int(_) => 3,
+            Tag.Long(_) => 4,
+            Tag.Float(_) => 5,
+            Tag.Double(_) => 6,
+            Tag.ByteArray(_) => 7,
+            Tag.Str(_) => 8,
+            Tag.List(_) => 9,
+            Tag.Compound(_) => 10,
+            Tag.IntArray(_) => 11,
+            Tag.LongArray(_) => 12,
+        }
+    }
+
+    /// Writes the tag in network form, as `NbtIo.writeAnyTag` and so `FriendlyByteBuf.writeNbt`
+    /// write it: its type, then its payload, with no name. A string longer than 65,535 bytes
+    /// fails it as Java's `writeUTF` fails, with `UTFDataFormatException`'s message, and `out` is
+    /// left as it was.
+    pub fn write_any(self, out: mut List<u8>) ! String {
+        let start = out.len()
+        out.push(self.id())
+        match self.payload(mut out, false) {
+            ok => {},
+            err(message) => {
+                out.truncate(start)
+                fail message
+            },
+        }
+    }
+
+    /// Writes the tag in file form, as `NbtIo.write` writes a save's root: its type, an empty
+    /// name, then its payload, with any string longer than 65,535 bytes written as `""`.
+    pub fn write_unnamed(self, out: mut List<u8>) {
+        out.push(self.id())
+        if self.id() != 0 {
+            out.push(0)
+            out.push(0)
+            // With the fallback nothing fails.
+            match self.payload(mut out, true) {
+                ok => {},
+                err(_) => {},
+            }
+        }
+    }
+
+    fn payload(self, out: mut List<u8>, fallback: bool) ! String {
+        match self {
+            Tag.End => {},
+            Tag.Byte(v) => out.push(u8.wrap(v)),
+            Tag.Short(v) => put16(mut out, u16.wrap(v)),
+            Tag.Int(v) => put32(mut out, u32.wrap(v)),
+            Tag.Long(v) => put64(mut out, u64.wrap(v)),
+            // As `writeFloat` and `writeDouble`, which write every NaN as the one Java makes.
+            Tag.Float(v) => put32(mut out, if v.is_nan() { 0x7fc00000u32 } else { v.to_bits() }),
+            Tag.Double(v) => put64(mut out, if v.is_nan() { 0x7ff8000000000000u64 } else { v.to_bits() }),
+            Tag.ByteArray(values) => {
+                put32(mut out, u32.wrap(values.len()))
+                for v in values {
+                    out.push(u8.wrap(v))
+                }
+            },
+            Tag.Str(s) => try put_utf(s, mut out, fallback),
+            Tag.List(items) => {
+                let kind = element_type(items)
+                out.push(kind)
+                put32(mut out, u32.wrap(items.len()))
+                for item in items {
+                    if kind == 10 and not is_compound(item) {
+                        // In a compound of its own under `""`, as `wrapIfNeeded` writes it.
+                        try write_named(String(), item, mut out, fallback)
+                        out.push(0)
+                    } else {
+                        try item.payload(mut out, fallback)
+                    }
+                }
+            },
+            Tag.Compound(tags) => {
+                for (key, tag) in tags {
+                    try write_named(key, tag, mut out, fallback)
+                }
+                out.push(0)
+            },
+            Tag.IntArray(values) => {
+                put32(mut out, u32.wrap(values.len()))
+                for v in values {
+                    put32(mut out, u32.wrap(v))
+                }
+            },
+            Tag.LongArray(values) => {
+                put32(mut out, u32.wrap(values.len()))
+                for v in values {
+                    put64(mut out, u64.wrap(v))
+                }
+            },
+        }
+    }
+
+    /// The tag as SNBT, as vanilla's `toString` prints it with `StringTagVisitor`: a compound's
+    /// keys in the order of Java's `String.compareTo`, unquoted where they can be, and strings in
+    /// whichever quotes need fewer escapes, double ones when it's even.
+    pub fn to_snbt(self) -> String {
+        var out = String()
+        self.print(mut out)
+        return out
+    }
+
+    fn print(self, out: mut String) {
+        match self {
+            Tag.End => out.push_str("END"),
+            Tag.Byte(v) => out.push_str("{v}b"),
+            Tag.Short(v) => out.push_str("{v}s"),
+            Tag.Int(v) => out.push_str("{v}"),
+            Tag.Long(v) => out.push_str("{v}L"),
+            Tag.Float(v) => out.push_str("{v}f"),
+            Tag.Double(v) => out.push_str("{v}d"),
+            Tag.ByteArray(values) => {
+                out.push_str("[B;")
+                for i in 0..values.len() {
+                    if i != 0 {
+                        out.push(',')
+                    }
+                    out.push_str("{values[i]}B")
+                }
+                out.push(']')
+            },
+            Tag.Str(s) => quote(s, mut out),
+            Tag.List(items) => {
+                out.push('[')
+                for i in 0..items.len() {
+                    if i != 0 {
+                        out.push(',')
+                    }
+                    items[i].print(mut out)
+                }
+                out.push(']')
+            },
+            Tag.Compound(tags) => {
+                out.push('{')
+                let keys = sorted_keys(tags)
+                for i in 0..keys.len() {
+                    if i != 0 {
+                        out.push(',')
+                    }
+                    print_key(keys[i], mut out)
+                    out.push(':')
+                    tags[keys[i]].print(mut out)
+                }
+                out.push('}')
+            },
+            Tag.IntArray(values) => {
+                out.push_str("[I;")
+                for i in 0..values.len() {
+                    if i != 0 {
+                        out.push(',')
+                    }
+                    out.push_str("{values[i]}")
+                }
+                out.push(']')
+            },
+            Tag.LongArray(values) => {
+                out.push_str("[L;")
+                for i in 0..values.len() {
+                    if i != 0 {
+                        out.push(',')
+                    }
+                    out.push_str("{values[i]}L")
+                }
+                out.push(']')
+            },
+        }
+    }
+}
+
+fn is_compound(tag: Tag) -> bool {
+    return match tag {
+        Tag.Compound(tags) => not (tags.len() == 1 and tags.contains("")),
+        _ => false,
+    }
+}
+
+// The type a list is written with, as vanilla's `identifyRawElementType`: its elements' type if
+// they share one, and compounds if they don't.
+fn element_type(items: List<Tag>) -> u8 {
+    var kind: u8 = 0
+    for item in items {
+        let k = item.id()
+        if kind == 0 {
+            kind = k
+        } else if kind != k {
+            return 10
+        }
+    }
+    return kind
+}
+
+// A compound's entry, as vanilla's `writeNamedTag`: the type, then, unless it's `End`, the name
+// and the payload.
+fn write_named(name: String, tag: Tag, out: mut List<u8>, fallback: bool) ! String {
+    out.push(tag.id())
+    if tag.id() != 0 {
+        try put_utf(name, mut out, fallback)
+        try tag.payload(mut out, fallback)
+    }
+}
+
+fn put16(out: mut List<u8>, v: u16) {
+    out.push(u8.wrap(v / 256))
+    out.push(u8.wrap(v % 256))
+}
+
+fn put32(out: mut List<u8>, v: u32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}
+
+fn put64(out: mut List<u8>, v: u64) {
+    put32(mut out, u32.wrap(v >> 32))
+    put32(mut out, u32.wrap(v))
+}
+
+// A string as Java's `writeUTF` writes it: a two-byte length, then modified UTF-8. One longer
+// than 65,535 bytes fails it, or with `fallback` is written as `""`, as vanilla's
+// `StringFallbackDataOutput` writes it.
+fn put_utf(s: String, out: mut List<u8>, fallback: bool) ! String {
+    let n = encoded_len(s)
+    if n > 65535 {
+        if fallback {
+            put16(mut out, 0)
+            return
+        }
+        fail "encoded string ({head(s)}...{tail(s)}) too long: {n} bytes"
+    }
+    put16(mut out, u16.wrap(n))
+    encode(s, mut out)
+}
+
+// The first 8 UTF-16 units, as Java's message has them. Half a surrogate pair is a `?`, as Java
+// writes one in UTF-8.
+fn head(s: String) -> String {
+    var out = String()
+    var units: usize = 0
+    for r in s.runes() {
+        let n: usize = if u32(r) > 0xFFFF { 2 } else { 1 }
+        if units + n > 8 {
+            if units < 8 {
+                out.push('?')
+            }
+            return out
+        }
+        out.push(r)
+        units += n
+    }
+    return out
+}
+
+// The last 8 UTF-16 units.
+fn tail(s: String) -> String {
+    var runes = List<rune>()
+    for r in s.runes() {
+        runes.push(r)
+    }
+    var units: usize = 0
+    var start = runes.len()
+    var half = false
+    while start > 0 {
+        let n: usize = if u32(runes[start - 1]) > 0xFFFF { 2 } else { 1 }
+        if units + n > 8 {
+            half = units < 8
+            break
+        }
+        units += n
+        start -= 1
+    }
+    var out = String()
+    if half {
+        out.push('?')
+    }
+    for i in start..runes.len() {
+        out.push(runes[i])
+    }
+    return out
+}
+
+// The string in quotes, as vanilla's `StringTag.quoteAndEscape`: in single quotes if the first
+// quote in it is a double one, else in double quotes, with the quote used, backslashes and
+// control characters escaped.
+fn quote(s: String, out: mut String) {
+    var body = String()
+    var mark: rune = '"'
+    var chosen = false
+    for r in s.runes() {
+        if r == '\\' {
+            body.push_str("\\\\")
+        } else if r == '"' or r == '\'' {
+            if not chosen {
+                mark = if r == '"' { '\'' } else { '"' }
+                chosen = true
+            }
+            if mark == r {
+                body.push('\\')
+            }
+            body.push(r)
+        } else {
+            let c = u32(r)
+            if c < 0x20 {
+                body.push('\\')
+                body.push_str(control_escape(c))
+            } else {
+                body.push(r)
+            }
+        }
+    }
+    out.push(mark)
+    out.push_str(body)
+    out.push(mark)
+}
+
+// A control character's escape, as vanilla's `SnbtGrammar.escapeControlCharacters`.
+fn control_escape(c: u32) -> String {
+    if c == 8 {
+        return String("b")
+    }
+    if c == 9 {
+        return String("t")
+    }
+    if c == 10 {
+        return String("n")
+    }
+    if c == 12 {
+        return String("f")
+    }
+    if c == 13 {
+        return String("r")
+    }
+    let digits = "0123456789ABCDEF"
+    var out = String("x")
+    out.push_str(digits[usize(c / 16)..usize(c / 16) + 1])
+    out.push_str(digits[usize(c % 16)..usize(c % 16) + 1])
+    return out
+}
+
+// A compound's key as `StringTagVisitor.handleKeyEscape` writes it: as it is if it matches
+// `[A-Za-z._]+[A-Za-z0-9._+-]*` and isn't `true` or `false` in any case, and quoted otherwise.
+fn print_key(key: String, out: mut String) {
+    if is_plain_key(key) {
+        let lower = key.to_lower_root()
+        if lower != "true" and lower != "false" {
+            out.push_str(key)
+            return
+        }
+    }
+    quote(key, mut out)
+}
+
+fn is_plain_key(key: String) -> bool {
+    if key.is_empty() {
+        return false
+    }
+    for i in 0..key.len() {
+        let b = key.byte_at(i)
+        let letter = (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 46 or b == 95
+        let digit = b >= 48 and b <= 57
+        if i == 0 {
+            if not letter {
+                return false
+            }
+        } else if not (letter or digit or b == 43 or b == 45) {
+            return false
+        }
+    }
+    return true
+}
+
+// The compound's keys in the order of Java's `String.compareTo`, which compares UTF-16 units.
+fn sorted_keys(tags: JavaHashMap<String, Tag>) -> List<String> {
+    var keys = List<String>()
+    var wide = false
+    for (key, _) in tags {
+        keys.push(key.copy())
+        // Lead bytes from 0xEE start U+E000 and up, where UTF-8's order can differ from UTF-16's.
+        for i in 0..key.len() {
+            if key.byte_at(i) >= 0xEE {
+                wide = true
+            }
+        }
+    }
+    keys.sort()
+    if wide {
+        // UTF-8's order is the order of code points, which differs from UTF-16's only where a
+        // rune past U+FFFF meets one from U+E000 to U+FFFF: such keys are put in order by unit.
+        var units = List<(List<char>, usize)>()
+        for i in 0..keys.len() {
+            var u = List<char>()
+            for c in keys[i].chars() {
+                u.push(c)
+            }
+            units.push((u, i))
+        }
+        units.sort()
+        var out = List<String>()
+        for (_, i) in units {
+            out.push(keys[i].copy())
+        }
+        return out
+    }
+    return keys
+}
