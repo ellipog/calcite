@@ -1,0 +1,282 @@
+/// Velocity's modern forwarding: the player data a Velocity proxy sends the server it logs a
+/// player into, in answer to a query on `velocity:player_info`, signed with HMAC-SHA256 and the
+/// secret the two share. Vanilla has no proxy support, so this is Calcite's own (D12).
+module auth.velocity
+
+import auth.profile.{GameProfile, ProfileProperty}
+import protocol.wire.{Reader}
+import std.hash.{hmac_sha256}
+import std.net.{Ip}
+
+/// The newest version of the data Calcite reads, Velocity's `MODERN_LAZY_SESSION`: the player's
+/// address and profile and no chat key, since a 26.3 client sends its chat session in play.
+/// Older versions, which a proxy that has no newer sends, add a chat key after, which is skipped.
+pub const VERSION: i32 = 4
+
+/// The channel the server asks on.
+pub fn channel() -> String {
+    return String("velocity:player_info")
+}
+
+/// The query's payload: the newest version the server reads.
+pub fn request() -> List<u8> {
+    return [4]
+}
+
+/// What Velocity forwarded: the player's address and their profile, which it authenticated.
+pub struct Forwarded {
+    pub address: Ip
+    pub profile: GameProfile
+}
+
+/// Why an answer lets no one in.
+pub enum Problem {
+    /// It has no data: the client answered the query itself, so it didn't come through Velocity.
+    Direct
+    /// The data isn't signed with the server's secret.
+    Unsigned
+    /// The data is a newer version than Calcite reads.
+    Version(i32)
+    /// The data can't be read.
+    Malformed
+}
+
+impl Problem {
+    /// What the player is told, and the log shows.
+    pub fn message(self) -> String {
+        return match self {
+            Problem.Direct => String("This server only lets players in through its Velocity proxy"),
+            Problem.Unsigned => String("The server couldn't verify the player data Velocity sent: its velocity-secret isn't Velocity's forwarding secret"),
+            Problem.Version(v) => "Velocity sent version {v} of its player data, and the server reads up to {VERSION}",
+            Problem.Malformed => String("The server couldn't read the player data Velocity sent"),
+        }
+    }
+}
+
+/// The player data in a query answer's payload, which starts with vanilla's flag for whether
+/// there is any, checked against `secret`: 32 bytes of HMAC-SHA256 of the rest, then the version,
+/// the address, the UUID, the name and the properties.
+pub fn read(payload: List<u8>, secret: String) -> Forwarded ! Problem {
+    if payload.is_empty() or payload[0] == 0 {
+        fail Problem.Direct
+    }
+    let signed: usize = 33
+    if payload.len() < signed {
+        fail Problem.Unsigned
+    }
+    var data = List<u8>()
+    data.reserve(payload.len() - signed)
+    for i in signed..payload.len() {
+        data.push(payload[i])
+    }
+    let expected = hmac_sha256(secret.to_bytes(), data)
+    // Compared in the same time however many bytes match, so a client can't learn the signature
+    // a byte at a time.
+    var difference: u8 = 0
+    for i in 0..expected.len() {
+        difference |= expected[i] ^ payload[i + 1]
+    }
+    if difference != 0 {
+        fail Problem.Unsigned
+    }
+    var r = Reader.new(data)
+    let version = match r.varint() {
+        ok(v) => v,
+        err(_) => fail Problem.Malformed,
+    }
+    if version > VERSION {
+        fail Problem.Version(version)
+    }
+    if version < 1 {
+        fail Problem.Malformed
+    }
+    let text = match r.string(32767) {
+        ok(s) => s,
+        err(_) => fail Problem.Malformed,
+    }
+    let address = parse_ip(text) else fail Problem.Malformed
+    let id = match r.uuid() {
+        ok(u) => u,
+        err(_) => fail Problem.Malformed,
+    }
+    let name = match r.string(16) {
+        ok(n) => n,
+        err(_) => fail Problem.Malformed,
+    }
+    let count = match r.count(16) {
+        ok(n) => n,
+        err(_) => fail Problem.Malformed,
+    }
+    var properties = List<ProfileProperty>()
+    for _ in 0..count {
+        let property = match read_property(mut r) {
+            some(p) => p,
+            none => fail Problem.Malformed,
+        }
+        properties.push(property)
+    }
+    return Forwarded { address: address, profile: GameProfile { id: id, name: name, properties: properties } }
+}
+
+fn read_property(r: mut Reader) -> ProfileProperty? {
+    let name = match r.string(64) {
+        ok(n) => n,
+        err(_) => return none,
+    }
+    let value = match r.string(32767) {
+        ok(v) => v,
+        err(_) => return none,
+    }
+    let signed = match r.bool() {
+        ok(b) => b,
+        err(_) => return none,
+    }
+    var signature: String? = none
+    if signed {
+        signature = match r.string(1024) {
+            ok(s) => some(s),
+            err(_) => return none,
+        }
+    }
+    return some(ProfileProperty { name: name, value: value, signature: signature })
+}
+
+/// The address Velocity writes, as Java's `getHostAddress` gives it: `127.0.0.1`, or IPv6 in
+/// eight groups or with `::` for zeros, perhaps ending in an IPv4 address, and perhaps a numeric
+/// `%` scope.
+pub fn parse_ip(text: String) -> Ip? {
+    if not text.contains(":") {
+        let b = ipv4(text) else return none
+        return some(Ip.V4(b))
+    }
+    var host = text.copy()
+    var scope: u32 = 0
+    if let mark = text.find("%") {
+        host = text[..mark]
+        let s = u32.parse(text[mark + 1..]) else return none
+        scope = s
+    }
+    // The groups before `::` and after it, each 16 bits.
+    var before = List<u32>()
+    var after = List<u32>()
+    var compressed = false
+    var rest = host.copy()
+    if let gap = host.find("::") {
+        compressed = true
+        let g = try_groups(host[..gap]) else return none
+        before = g
+        rest = host[gap + 2..]
+    }
+    var tail = List<u32>()
+    if not rest.is_empty() {
+        // A last part with dots is an IPv4 address, the last two groups.
+        var last = rest.copy()
+        var front = String()
+        var i = rest.len()
+        while i > 0 {
+            i -= 1
+            if rest.byte_at(i) == 58 {
+                last = rest[i + 1..]
+                front = rest[..i]
+                break
+            }
+        }
+        if last.contains(".") {
+            let v4 = ipv4(last) else return none
+            if not front.is_empty() {
+                let g = try_groups(front) else return none
+                tail = g
+            }
+            tail.push((u32(v4[0]) << 8) | u32(v4[1]))
+            tail.push((u32(v4[2]) << 8) | u32(v4[3]))
+        } else {
+            let g = try_groups(rest) else return none
+            tail = g
+        }
+    }
+    after = tail
+    let n = before.len() + after.len()
+    if (compressed and n > 7) or (not compressed and n != 8) {
+        return none
+    }
+    var b: [u8; 16] = [0; 16]
+    for i in 0..before.len() {
+        b[2 * i] = u8.wrap(before[i] >> 8)
+        b[2 * i + 1] = u8.wrap(before[i])
+    }
+    let start: usize = 8 - after.len()
+    for i in 0..after.len() {
+        b[2 * (start + i)] = u8.wrap(after[i] >> 8)
+        b[2 * (start + i) + 1] = u8.wrap(after[i])
+    }
+    return some(Ip.V6(b, scope))
+}
+
+// Groups of 1 to 4 hex digits joined by `:`, or none at all for an empty text.
+fn try_groups(text: String) -> List<u32>? {
+    var out = List<u32>()
+    if text.is_empty() {
+        return some(out)
+    }
+    var start: usize = 0
+    let n = text.len()
+    for i in 0..n + 1 {
+        if i < n and text.byte_at(i) != 58 {
+            continue
+        }
+        if i == start or i - start > 4 {
+            return none
+        }
+        var v: u32 = 0
+        for j in start..i {
+            let c = text.byte_at(j)
+            let d: u32 = if c >= 48 and c <= 57 {
+                u32(c - 48)
+            } else if c >= 97 and c <= 102 {
+                u32(c - 87)
+            } else if c >= 65 and c <= 70 {
+                u32(c - 55)
+            } else {
+                return none
+            }
+            v = v * 16 + d
+        }
+        out.push(v)
+        start = i + 1
+    }
+    return some(out)
+}
+
+// Four decimal numbers from 0 to 255 joined by `.`.
+fn ipv4(text: String) -> [u8; 4]? {
+    var out: [u8; 4] = [0; 4]
+    var part: usize = 0
+    var start: usize = 0
+    let n = text.len()
+    for i in 0..n + 1 {
+        if i < n and text.byte_at(i) != 46 {
+            continue
+        }
+        if part == 4 or i == start or i - start > 3 {
+            return none
+        }
+        var v: u32 = 0
+        for j in start..i {
+            let c = text.byte_at(j)
+            if c < 48 or c > 57 {
+                return none
+            }
+            v = v * 10 + u32(c - 48)
+        }
+        if v > 255 {
+            return none
+        }
+        out[part] = u8.wrap(v)
+        part += 1
+        start = i + 1
+    }
+    if part != 4 {
+        return none
+    }
+    return some(out)
+}

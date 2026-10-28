@@ -7,6 +7,7 @@ module server.network
 import auth.profile.{GameProfile, is_valid_name}
 import auth.services.{JoinCheck, KeySet, Services}
 import auth.session.{Joined, server_hash}
+import auth.velocity.{channel, request, read}
 import chat.component.{Component}
 import chat.language.{Language}
 import java.uuid.{Uuid}
@@ -14,10 +15,11 @@ import protocol.codec.{Codec}
 import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{PROTOCOL_VERSION, game_version, packet_names}
 import protocol.legacy.{Legacy, classify, response}
-import protocol.login.{ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundHello, ServerboundKey}
+import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
 import protocol.state.{State, Bound}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
+import resources.identifier.{Identifier}
 import server.log.{Entry}
 import std.crypto.{RsaKey, random_bytes}
 import std.net.{Net, Conn, Event, NetError, Address, Ip}
@@ -56,6 +58,9 @@ pub struct LoginSettings {
     /// Whether the session server is given a player's address, so it can refuse a player who
     /// joins from another address than they logged in from, from `prevent-proxy-connections`.
     pub prevent_proxy_connections: bool
+    /// The secret of the Velocity proxy players are let in through, with the player data its
+    /// modern forwarding sends, or `none` to let them in as vanilla does, from calcite.properties.
+    pub velocity_secret: String?
 }
 
 /// What a connection is doing: which of vanilla's packet listeners it has.
@@ -73,6 +78,8 @@ enum LoginState {
     Hello
     /// Waiting for the client's encryption response.
     Key
+    /// Waiting for the player data a Velocity proxy forwards.
+    Forwarding
     /// Waiting for Mojang's session server.
     Authenticating
     /// The player has a profile, which the next tick checks.
@@ -102,6 +109,8 @@ struct Connection {
     transferred: bool
     // The 4 random bytes the client is to send back encrypted, as vanilla's `challenge`.
     challenge: List<u8>
+    // The transaction ID of the query that asks a Velocity proxy for the player's data.
+    query_id: i32
     // The name the client gave, and the profile it's let in with.
     name: String?
     profile: GameProfile?
@@ -197,7 +206,7 @@ impl Network {
                     self.connections.push(none)
                 }
                 let address = if self.settings.log_ips { java_address(self.net.peer(c)) } else { String("IP hidden") }
-                self.connections[slot] = some(Connection { conn: c, codec: Codec.new(), phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false, address: address, login: LoginState.Hello, login_ticks: 0, transferred: false, challenge: List<u8>(), name: none, profile: none, reason: none })
+                self.connections[slot] = some(Connection { conn: c, codec: Codec.new(), phase: Phase.Handshake, started: false, status_requested: false, last_read: now, closing: false, address: address, login: LoginState.Hello, login_ticks: 0, transferred: false, challenge: List<u8>(), query_id: 0, name: none, profile: none, reason: none })
                 return true
             },
             Event.Received(c) => {
@@ -421,7 +430,10 @@ impl Network {
         match p {
             LoginIn.Hello(hello) => return self.hello(mut con, hello),
             LoginIn.Key(k) => return self.key_packet(mut con, k),
-            LoginIn.CustomQueryAnswer(_) => {
+            LoginIn.CustomQueryAnswer(a) => {
+                if con.login == LoginState.Forwarding and a.transaction_id == con.query_id {
+                    return self.forwarded(mut con, a)
+                }
                 self.disconnect(mut con, Component.translatable("multiplayer.disconnect.unexpected_query_response", []))
                 return false
             },
@@ -453,6 +465,15 @@ impl Network {
             return false
         }
         con.name = some(p.name.copy())
+        if self.settings.velocity_secret != none {
+            // Behind Velocity, the proxy has authenticated the player, and is asked who they are.
+            let id = random_bytes(4)
+            con.query_id = (i32(id[0]) << 24) | (i32(id[1]) << 16) | (i32(id[2]) << 8) | i32(id[3])
+            con.login = LoginState.Forwarding
+            let query = ClientboundCustomQuery { transaction_id: con.query_id, channel: Identifier.parse(channel())!, payload: request() }
+            self.send(mut con, query, State.Login)
+            return true
+        }
         if self.settings.online_mode {
             con.login = LoginState.Key
             let hello = ClientboundHello { server_id: String(), public_key: self.public_key.copy(), challenge: con.challenge.copy(), should_authenticate: true }
@@ -497,6 +518,32 @@ impl Network {
         let join = JoinCheck.new(name, hash, ip)
         self.checks.push(Check { conn: con.conn, thread: "User Authenticator #{self.authenticators}", user: user(con), name: name, join: join })
         return true
+    }
+
+    // Velocity's answer: the player is let in with the profile it forwards, and logged with the
+    // address it forwards, or told why not.
+    fn forwarded(mut self, con: mut Connection, a: ServerboundCustomQueryAnswer) -> bool {
+        let secret = self.settings.velocity_secret.copy() ?? String()
+        match read(a.payload, secret) {
+            ok(f) => {
+                if self.settings.log_ips {
+                    var port: u16 = 0
+                    if let peer = self.net.peer(con.conn) {
+                        port = peer.port
+                    }
+                    con.address = socket_text(f.address, port)
+                }
+                self.logs.push(Entry.info("UUID of player {f.profile.name} is {f.profile.id.to_string()}"))
+                con.name = some(f.profile.name.copy())
+                con.profile = some(f.profile)
+                con.login = LoginState.Verifying
+                return true
+            },
+            err(problem) => {
+                self.disconnect(mut con, Component.literal(problem.message()))
+                return false
+            },
+        }
     }
 
     // What the client encrypted with the server's public key, as Java's `RSA` cipher decrypts
@@ -731,10 +778,14 @@ fn decode_exception(message: String) -> String {
 // or `/[0:0:0:0:0:0:0:1]:50412`, with all eight groups of an IPv6 address.
 fn java_address(a: Address?) -> String {
     let addr = a else return String("local")
-    let text = ip_text(addr.ip)
-    return match addr.ip {
-        Ip.V4(_) => "/{text}:{addr.port}",
-        Ip.V6(_, _) => "/[{text}]:{addr.port}",
+    return socket_text(addr.ip, addr.port)
+}
+
+fn socket_text(ip: Ip, port: u16) -> String {
+    let text = ip_text(ip)
+    return match ip {
+        Ip.V4(_) => "/{text}:{port}",
+        Ip.V6(_, _) => "/[{text}]:{port}",
     }
 }
 

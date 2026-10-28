@@ -1,6 +1,6 @@
 /// Checks logins over real TCP on 127.0.0.1, as server.network runs them: offline profiles,
 /// compression, the session ID, online mode with encryption and a web server standing in for
-/// Mojang's services, every way vanilla ends a login, and what it logs.
+/// Mojang's services, Velocity's modern forwarding, every way a login ends, and what it logs.
 module test.login
 
 import auth.services.{Environment, Services}
@@ -14,6 +14,7 @@ import protocol.state.{State}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import server.network.{Network, StatusInfo, LoginSettings, MAX_LOGIN_TICKS}
 import std.crypto.{RsaKey}
+import std.hash.{hmac_sha256}
 import std.net.{Net, Conn, Event}
 
 fn check(got: String, want: String) {
@@ -35,15 +36,22 @@ fn hex(bytes: List<u8>) -> String {
 // An offline server with `threshold`, and an invented text for the generic reason, so the log
 // shows how a translation's argument goes in.
 fn new_server(net: Net, threshold: i32, log_ips: bool) -> Network {
-    let settings = LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: threshold, log_ips: log_ips, prevent_proxy_connections: false }
+    let settings = LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: threshold, log_ips: log_ips, prevent_proxy_connections: false, velocity_secret: none }
     return with_settings(net, settings, Services.offline(), RsaKey.generate(1024))
 }
 
 // A server in online mode, with the services the discovery document at `discovery` gives.
 fn online_server(net: Net, discovery: String, prevent_proxy_connections: bool, key: RsaKey) -> Network {
-    let settings = LoginSettings { online_mode: true, accepts_transfers: false, compression_threshold: 256, log_ips: true, prevent_proxy_connections: prevent_proxy_connections }
+    let settings = LoginSettings { online_mode: true, accepts_transfers: false, compression_threshold: 256, log_ips: true, prevent_proxy_connections: prevent_proxy_connections, velocity_secret: none }
     let services = Services.new(Environment.from_properties(none, some(discovery.copy())))
     return with_settings(net, settings, services, key.copy())
+}
+
+// A server behind Velocity, with the forwarding secret `secret`. It's in online mode, which
+// forwarding overrides.
+fn velocity_server(net: Net, secret: String) -> Network {
+    let settings = LoginSettings { online_mode: true, accepts_transfers: false, compression_threshold: 256, log_ips: true, prevent_proxy_connections: false, velocity_secret: some(secret.copy()) }
+    return with_settings(net, settings, Services.offline(), RsaKey.generate(1024))
 }
 
 fn with_settings(net: Net, settings: own LoginSettings, services: own Services, key: own RsaKey) -> Network {
@@ -108,6 +116,17 @@ impl Client {
             out.push_str(" {property.name}={property.value}/{property.signature.copy() ?? String("-")}")
         }
         return (out, p.session_id)
+    }
+
+    // The next packet, which must be the query for Velocity's player data, as its transaction ID.
+    fn query(mut self) -> i32 {
+        let body = self.codec.next()!!
+        var r = Reader.new(body)
+        check("{r.varint()!}", "4")
+        let id = r.varint()!
+        check(r.string(32767)!, "velocity:player_info")
+        check(hex(r.rest()), "04")
+        return id
     }
 
     // Whether nothing has come, and the connection is open.
@@ -654,6 +673,111 @@ fn unreachable(net: Net) {
     check(clients[a].reason(), "\{\"translate\":\"multiplayer.disconnect.authservers_down\"\}")
 }
 
+// Player data as Velocity forwards it, signed with `secret`: `version`, `address`, Notch's UUID,
+// `name`, and a signed property.
+fn forwarded(secret: String, version: i32, address: String, name: String) -> List<u8> {
+    var w = Writer.new()
+    w.varint(version)
+    w.string(address, 32767)
+    w.uuid(Uuid.parse("069a79f4-44e9-4726-a5be-fca90e38aaf5")!)
+    w.string(name, 16)
+    w.varint(1)
+    w.string("textures", 64)
+    w.string("abc", 32767)
+    w.bool(true)
+    w.string("c2ln", 1024)
+    return signed(secret, w.into_bytes())
+}
+
+// `data` as Velocity sends it: the flag that there's an answer, and its signature first.
+fn signed(secret: String, data: List<u8>) -> List<u8> {
+    var out: List<u8> = [1]
+    for b in hmac_sha256(secret.to_bytes(), data) {
+        out.push(b)
+    }
+    for b in data {
+        out.push(b)
+    }
+    return out
+}
+
+// A login through Velocity as `name`, answering the query with `payload`, under the wrong
+// transaction ID if `wrong_id`.
+fn velocity_start(net: Net, s: mut Network, port: u16, clients: mut List<Client>, name: String, payload: List<u8>, wrong_id: bool) -> usize {
+    let a = start(net, mut s, port, mut clients, name)
+    let id = clients[a].query()
+    let answer_id = if wrong_id { id ^ 1 } else { id }
+    clients[a].send(net, packet(ServerboundCustomQueryAnswer { transaction_id: answer_id, payload: payload.copy() }, State.Login))
+    settle(net, mut s, mut clients)
+    return a
+}
+
+fn velocity(net: Net) {
+    let secret = String("hunter2")
+    var s = velocity_server(net, secret)
+    let port = s.listen("127.0.0.1", 0)!
+    var clients = List<Client>()
+
+    // The player Velocity forwards is let in, with the profile it sent, and logged with the
+    // address it sent and the port the proxy connected from.
+    let a = velocity_start(net, mut s, port, mut clients, "Steve", forwarded(secret, 4, "203.0.113.7", "Notch"), false)
+    s.tick(0)
+    settle(net, mut s, mut clients)
+    check(clients[a].next(), "3:8002")
+    clients[a].codec.start_compression(256)
+    let (profile, _) = clients[a].finished()
+    check(profile, "069a79f4-44e9-4726-a5be-fca90e38aaf5 Notch 1 textures=abc/c2ln")
+    let local = clients[a].address[clients[a].address.find(":")! + 1..]
+    net.close(clients[a].conn)
+    settle(net, mut s, mut clients)
+    check(logs(mut s), "UUID of player Notch is 069a79f4-44e9-4726-a5be-fca90e38aaf5|Notch (/203.0.113.7:{local}) lost connection: disconnect.endOfStream|")
+
+    // An older version, which a chat key follows, and an IPv6 address.
+    var older = Writer.new()
+    older.varint(3)
+    older.string("2001:db8::1", 32767)
+    older.uuid(Uuid.new(1, 2))
+    older.string("Alex", 16)
+    older.varint(0)
+    older.bool(false)
+    let b = velocity_start(net, mut s, port, mut clients, "Alex", signed(secret, older.into_bytes()), false)
+    s.tick(0)
+    settle(net, mut s, mut clients)
+    check(clients[b].next(), "3:8002")
+    clients[b].codec.start_compression(256)
+    let (alex, _) = clients[b].finished()
+    check(alex, "00000000-0000-0001-0000-000000000002 Alex 0")
+    let alex_port = clients[b].address[clients[b].address.find(":")! + 1..]
+    net.close(clients[b].conn)
+    settle(net, mut s, mut clients)
+    check(logs(mut s), "UUID of player Alex is 00000000-0000-0001-0000-000000000002|Alex (/[2001:db8:0:0:0:0:0:1]:{alex_port}) lost connection: disconnect.endOfStream|")
+
+    // Answers that let no one in: a client's own, which has no data, data signed with another
+    // secret, a newer version, data that can't be read, and a query answered under another ID.
+    var bad_address = Writer.new()
+    bad_address.varint(4)
+    bad_address.string("not an address", 32767)
+    let answers: List<List<u8>> = [[0], forwarded("hunter3", 4, "203.0.113.7", "Notch"), forwarded(secret, 5, "203.0.113.7", "Notch"), signed(secret, bad_address.into_bytes()), [1, 2, 3]]
+    let messages: List<String> = [
+        String("This server only lets players in through its Velocity proxy"),
+        String("The server couldn't verify the player data Velocity sent: its velocity-secret isn't Velocity's forwarding secret"),
+        String("Velocity sent version 5 of its player data, and the server reads up to 4"),
+        String("The server couldn't read the player data Velocity sent"),
+        String("The server couldn't verify the player data Velocity sent: its velocity-secret isn't Velocity's forwarding secret"),
+    ]
+    for i in 0..answers.len() {
+        let c = velocity_start(net, mut s, port, mut clients, "Steve", answers[i], false)
+        check(clients[c].reason(), "\"{messages[i]}\"")
+        check(clients[c].next(), "closed")
+        let user = "Steve ({clients[c].address})"
+        check(logs(mut s), "Disconnecting {user}: {messages[i]}|{user} lost connection: {messages[i]}|")
+    }
+    let d = velocity_start(net, mut s, port, mut clients, "Steve", forwarded(secret, 4, "203.0.113.7", "Notch"), true)
+    check(clients[d].reason(), "\{\"translate\":\"multiplayer.disconnect.unexpected_query_response\"\}")
+    check(clients[d].next(), "closed")
+    _ = logs(mut s)
+}
+
 fn main() {
     let net = Net.new()!
     offline(net)
@@ -661,5 +785,6 @@ fn main() {
     failures(net)
     online(net)
     unreachable(net)
+    velocity(net)
     println("ok")
 }
