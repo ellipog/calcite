@@ -4,18 +4,27 @@
 /// packs the client is asked about, the registries and every registry's tags, then the code of
 /// conduct and the resource pack, if the server has them. Each packet is its ID and fields, ready
 /// for a connection's compression and encryption.
+///
+/// The links, the code of conduct and the resource pack come from server.properties and the
+/// `codeofconduct` folder, read as vanilla's `DedicatedServer` and `DedicatedServerProperties`
+/// read them, with their warnings and errors.
 module server.configuration
 
 import chat.component.{Component}
+import java.uri.{Uri}
 import java.uuid.{Uuid}
+import json.tree.{parse}
 import pack.resources.{KnownPack}
-import protocol.common.{ClientboundCustomPayload, ClientboundServerLinks, ClientboundUpdateTags, RegistryTags, ServerLink, TagIds}
+import protocol.common.{ClientboundCustomPayload, ClientboundServerLinks, ClientboundUpdateTags, LinkKind, RegistryTags, ServerLink, TagIds}
 import protocol.configuration.{ClientboundRegistryData, ClientboundSelectKnownPacks, ClientboundUpdateEnabledFeatures, RegistryEntry}
 import protocol.state.{State}
 import protocol.wire.{Packet, Wire, Writer, write_packet}
 import registry.registries.{Registries}
 import registry.registry.{Registry}
 import resources.identifier.{Identifier}
+import server.log.{Entry}
+import server.properties.{ServerProperties}
+import std.fs.{Kind, kind, list, read, real_path}
 
 /// A code of conduct, in one language, which a player accepts before they join.
 pub struct CodeOfConduct {
@@ -104,6 +113,230 @@ impl Configuration {
         }
         return true
     }
+}
+
+/// The server's links, as vanilla's `createServerLinks` makes them: the bug report link, if
+/// server.properties has one and it's an `http` or `https` URI. One that isn't is logged in
+/// `lines`, with why.
+pub fn server_links(props: ServerProperties, lines: mut List<Entry>) -> List<ServerLink> {
+    let link = props.bug_report_link.copy()
+    if link.is_empty() {
+        return []
+    }
+    return match Uri.untrusted(link) {
+        ok(uri) => [ServerLink { kind: LinkKind.Known(0), link: uri.text }],
+        err(e) => {
+            lines.push(Entry.warn("Failed to parse bug link {link}\n{e}"))
+            []
+        },
+    }
+}
+
+/// The resource pack server.properties offers, as vanilla's `getServerPackInfo` reads it, with
+/// the warnings it logs in `lines`: none without a URL, or with an ID that isn't a UUID. A pack
+/// with no ID gets one made from its URL.
+pub fn resource_pack(props: ServerProperties, lines: mut List<Entry>) -> ResourcePack? {
+    let url = props.resource_pack.copy()
+    if url.is_empty() {
+        return none
+    }
+    let legacy = props.resource_pack_hash.copy() ?? String()
+    var hash = String()
+    if not props.resource_pack_sha1.is_empty() {
+        hash = props.resource_pack_sha1.copy()
+        if not legacy.is_empty() {
+            lines.push(Entry.warn(String("resource-pack-hash is deprecated and found along side resource-pack-sha1. resource-pack-hash will be ignored.")))
+        }
+    } else if not legacy.is_empty() {
+        lines.push(Entry.warn(String("resource-pack-hash is deprecated. Please use resource-pack-sha1 instead.")))
+        hash = legacy.copy()
+    }
+    if hash.is_empty() {
+        lines.push(Entry.warn(String("You specified a resource pack without providing a sha1 hash. Pack will be updated on the client only if you change the name of the pack.")))
+    } else if not is_sha1(hash) {
+        lines.push(Entry.warn(String("Invalid sha1 for resource-pack-sha1")))
+    }
+    let prompt = parse_prompt(props.resource_pack_prompt, mut lines)
+    var id = Uuid.name_based(url.to_bytes())
+    if props.resource_pack_id.is_empty() {
+        lines.push(Entry.warn("resource-pack-id missing, using default of {id.to_string()}"))
+    } else {
+        let parsed = Uuid.parse(props.resource_pack_id) else {
+            lines.push(Entry.warn("Failed to parse '{props.resource_pack_id}' into UUID"))
+            return none
+        }
+        id = parsed
+    }
+    return some(ResourcePack { id: id, url: url, hash: hash, required: props.require_resource_pack, prompt: prompt })
+}
+
+/// The code of conduct in each language, from the `.txt` files in the folder at `folder`, as
+/// vanilla's `readCodeOfConducts` reads them: each file's lines, joined by `\n`, without `§`
+/// formatting codes, in the language its name gives. The exception that stops the server, as
+/// Java's `toString` writes it, if the folder isn't there, a file links out of it, a file can't
+/// be read as UTF-8, or two give the same language.
+pub fn read_codes(folder: String) -> List<CodeOfConduct> ! String {
+    let is_folder = match kind(folder) {
+        ok(some(Kind.Dir)) => true,
+        _ => false,
+    }
+    if not is_folder {
+        fail "java.lang.IllegalArgumentException: Code of Conduct folder does not exist: {folder}"
+    }
+    let names = match list(folder) {
+        ok(n) => n,
+        err(_) => {
+            fail unreadable()
+        },
+    }
+    let real = match real_path(folder) {
+        ok(r) => r,
+        err(_) => {
+            fail unreadable()
+        },
+    }
+    var codes = List<CodeOfConduct>()
+    for name in names {
+        if not name.ends_with(".txt") {
+            continue
+        }
+        let path = "{folder}/{name}"
+        let target = match real_path(path) {
+            ok(t) => t,
+            err(_) => {
+                fail unreadable()
+            },
+        }
+        if parent(target) != real {
+            fail "java.lang.IllegalArgumentException: Failed to read Code of Conduct file \"{name}\" because it links to a file outside the allowed directory"
+        }
+        let bytes = match read(path) {
+            ok(b) => b,
+            err(_) => {
+                fail unreadable_file(name)
+            },
+        }
+        let text = String.from_utf8(bytes) else {
+            fail unreadable_file(name)
+        }
+        let language = name[..name.len() - 4].to_lower_root()
+        let code = strip_color(joined_lines(text))
+        for c in codes {
+            if c.language == language {
+                fail "java.lang.IllegalArgumentException: Multiple entries with same key: {language}={c.text} and {language}={code}"
+            }
+        }
+        codes.push(CodeOfConduct { language: language, text: code })
+    }
+    return codes
+}
+
+// The exception for a folder that couldn't be listed, or a file in it whose real path couldn't
+// be found, such as a link to nothing.
+fn unreadable() -> String {
+    return String("java.lang.IllegalArgumentException: Failed to read Code of Conduct folder")
+}
+
+// The exception for a file that couldn't be read, or isn't UTF-8.
+fn unreadable_file(name: String) -> String {
+    return "java.lang.IllegalArgumentException: Failed to read Code of Conduct file {name}"
+}
+
+// The prompt's component, from its JSON, or `none` if there's none or it isn't one, which is
+// logged.
+fn parse_prompt(text: String, lines: mut List<Entry>) -> Component? {
+    if text.is_empty() {
+        return none
+    }
+    let json = parse(text) else {
+        lines.push(Entry.warn("Failed to parse resource pack prompt '{text}'"))
+        return none
+    }
+    return match Component.from_json(json) {
+        ok(c) => some(c),
+        err(message) => {
+            lines.push(Entry.warn("Failed to parse resource pack prompt '{text}': {message}"))
+            none
+        },
+    }
+}
+
+// Whether `hash` is 40 hex digits, as vanilla's `^[a-fA-F0-9]{40}$` matches it.
+fn is_sha1(hash: String) -> bool {
+    if hash.len() != 40 {
+        return false
+    }
+    for i in 0..hash.len() {
+        let b = hash.byte_at(i)
+        if not ((b >= 48 and b <= 57) or (b >= 65 and b <= 70) or (b >= 97 and b <= 102)) {
+            return false
+        }
+    }
+    return true
+}
+
+// The folder a real path is in: up to its last separator.
+fn parent(path: String) -> String {
+    var i = path.len()
+    while i > 0 {
+        i -= 1
+        let b = path.byte_at(i)
+        if b == 47 or b == 92 {
+            return path[..i]
+        }
+    }
+    return String()
+}
+
+// The text's lines joined by `\n`, as Java's `Files.readAllLines` splits them, at `\n`, `\r`
+// or `\r\n`, and `String.join` joins them: so `\r`s become `\n`s and a last line's end goes.
+fn joined_lines(text: String) -> String {
+    var out = String()
+    var i: usize = 0
+    var start: usize = 0
+    while i < text.len() {
+        let b = text.byte_at(i)
+        if b == 13 or b == 10 {
+            out.push_str(text[start..i])
+            if b == 13 and i + 1 < text.len() and text.byte_at(i + 1) == 10 {
+                i += 1
+            }
+            if i + 1 < text.len() {
+                out.push('\n')
+            }
+            start = i + 1
+        }
+        i += 1
+    }
+    out.push_str(text[start..])
+    return out
+}
+
+// The text without its formatting codes, as vanilla's `StringUtil.stripColor` removes them:
+// each `§` and the digit or letter from `a` to `f`, `k` to `o` or `r` after it, in any case.
+fn strip_color(text: String) -> String {
+    var out = String()
+    var section = false
+    for r in text.runes() {
+        if section {
+            section = false
+            let c = u32(r)
+            let lower = c | 32
+            if (c >= 48 and c <= 57) or (lower >= 97 and lower <= 102) or (lower >= 107 and lower <= 111) or lower == 114 {
+                continue
+            }
+            out.push('§')
+        }
+        if r == '§' {
+            section = true
+            continue
+        }
+        out.push(r)
+    }
+    if section {
+        out.push('§')
+    }
+    return out
 }
 
 fn packet<T: Wire + Packet>(p: T) -> List<u8> {
