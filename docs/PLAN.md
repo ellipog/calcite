@@ -241,7 +241,7 @@ Make the world real: storage that vanilla can read, Folia-style regions on a loc
 - **P5.5** Chunk tickets and load levels as vanilla has them: view distance, simulation distance, entity ticking range, forced chunks, and portal and ender pearl tickets. What's loaded and ticking decides how farms behave, so this gets its own parity suite.
 - **P5.6** Chunk loading and generation run as jobs off the region threads, and their completions go into the input log (D21).
 - **P5.7** Lighting: sky light and block light, checked by the light probe.
-- **P5.8** Load data packs at startup: the built-in pack read from the jar (D30), plus the world's own packs.
+- **P5.8** Load data packs at startup: the built-in pack from the client jar's data (D30, D140), plus the world's own packs. They mustn't slow the start much. The boot cache's key takes in each pack's path, size and modification time, and each file's for a pack that's a folder, so an unchanged world still starts from the cache. On a miss, the packs' files are read and parsed in parallel, and the cache is written again.
 - **P5.9** Worldgen in vanilla's stage order, with a probe per stage: noise and density functions, biomes, terrain shape, surface, carvers, features, then structures. Features are decorated in the 3×3-colored order (D29), and the rig drives vanilla in the same order.
 - **P5.10** The Overworld first, then the Nether and the End.
 - **P5.11** Cache chunk packets: encode each chunk once and send the same bytes to every player who needs it.
@@ -282,7 +282,7 @@ Plugins come in two kinds, both built against one host API. Native Calx plugins 
 **How**
 
 - **P7.1** Generate both bindings and the reference docs from the one host API definition: a Calx interface for native plugins and WASM imports for addons (D41).
-- **P7.2** Native Calx plugins: compile each to a shared library against the host API and load it at startup. Calx's type checker enforces region scoping at compile time.
+- **P7.2** Native Calx plugins: compile each to a shared library against the host API and load it at startup. Calx's type checker enforces region scoping at compile time. Plugins mustn't slow the start much either: their libraries load in parallel, each one's start is timed and a slow one is named in the log, and work a plugin can leave for later runs after the server listens.
 - **P7.3** Tick budgets for native plugins: have the compiler insert cheap budget checks at loop back-edges in plugin builds, so a runaway plugin can be stopped without a sandbox.
 - **P7.4** Native plugin limits and isolation: a plugin gets only the host API unless it's marked trusted, and a panic stops only that plugin's instance (D15, D25).
 - **P7.5** Hot reload for native plugins: load the new library, run a state-migration hook, and swap between ticks.
