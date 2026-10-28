@@ -276,7 +276,7 @@ Where it differs from vanilla, for now:
 | Has no proxy support: a server behind one sees every player at the proxy's address, with the profile the proxy sends in its hello | Reads Velocity's modern forwarding, as Paper does, with Calcite's own messages and settings | Always |
 | `Done (...)` times loading the level | Times the whole start, since there's no level | Worlds (Phase 5) |
 | Sends its brand as `vanilla` | Sends `calcite` | Always |
-| Sends a client without `minecraft:core` the registries' contents | Disconnects it, saying it can't yet | Registry contents (`P4.4`) |
+| Sends a client without `minecraft:core` the registries' contents | Disconnects it, saying it can't yet; no 26.3 client lacks it while the server's data is vanilla's alone (D134) | The world's data packs (`P5.8`) |
 | Puts the registries in `update_tags` in an order that changes from run to run, from a `HashMap` of their keys | Keeps theirs, the synchronized ones first, then the built-in ones; the tags in each are in vanilla's order | Always |
 | Handles some packets on the server thread, at its next chance, and the rest as they're read | Handles each as it's read, in order, with the error handling vanilla gives it on its thread | Always |
 | Logs a packet that failed on the server thread with Java's `toString`, which names `finish_configuration` by its class and the instance's hash code, then the stack trace | Leaves out the hash code, which changes from run to run, and logs the exception's first line alone | Always |
