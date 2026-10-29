@@ -14,15 +14,16 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `random.xoroshiro` | `XoroshiroRandom` on xoroshiro128++, and `XoroshiroPositional` | `XoroshiroRandomSource`, `Xoroshiro128PlusPlus`, `RandomSupport`'s seeding |
 | `random.worldgen` | `WorldgenRandom<T>` over a legacy or xoroshiro source, with its chunk and feature seeding | `WorldgenRandom` |
 | `hash.md5` | MD5, for seeding from names and for offline players' UUIDs | Guava's `Hashing.md5()` |
-| `java.text` | `string_hash`, Java's `String.hashCode` over UTF-16 code units | `String.hashCode` |
+| `java.text` | `string_hash`, Java's `String.hashCode` over UTF-16 code units, and `compare_to`, its `compareTo` | `String.hashCode`, `String.compareTo` |
+| `java.date` | `to_string`, a moment as `Date.toString` writes it, and `zone_name`, the zone's name there | `java.util.Date.toString` |
 | `java.uuid` | `Uuid`, two `i64`s, written and read as Java writes and reads them; name-based (version 3) and random (version 4) UUIDs | `java.util.UUID` |
 | `java.base64` | `encode`, Base64 with padding and no line breaks, and `decode`, which takes what Java's decoder takes | `java.util.Base64.getEncoder()`, `getDecoder()` |
-| `java.properties` | `Properties`, a `.properties` file read with Java's rules for escapes, continued lines and comments | `java.util.Properties.load` |
+| `java.properties` | `Properties`, a `.properties` file read with Java's rules for escapes, continued lines and comments, and written as `store` writes it | `java.util.Properties.load`, `store` |
 | `java.uri` | `Uri`, a URI checked as Java's `new URI` checks it, with its messages, and `Uri.untrusted`, the links vanilla lets players open | `java.net.URI`, `Util.parseAndValidateUntrustedUri` |
 | `java.number` | `parse_int` and the rest: Java's integer parsing in radixes 2 to 36, signed and unsigned, with the messages of its `NumberFormatException`s | `Integer.parseInt`, `Long.parseLong`, `Byte`, `Short`, `parseUnsignedInt`, `parseUnsignedLong` |
 | `java.character` | `is_whitespace`, the units Java counts as white space, and `code_point_of`, the code point a character's name names | `Character.isWhitespace`, `Character.codePointOf` |
 | `java.names` | The names of the code points, JDK 25's, written by [`oracle/unicode/names.py`](../oracle/unicode/names.py) | `Character.getName` |
-| `json.gson` | `JsonWriter`, compact JSON with Gson's escapes | Gson's `JsonWriter`, with `disableHtmlEscaping` |
+| `json.gson` | `JsonWriter`, compact JSON with Gson's escapes, and a `Json` tree as Gson's `JsonObject` writes it | Gson's `JsonWriter`, with `disableHtmlEscaping`, and `JsonElement.toString` |
 | `json.tree` | `Json`, a JSON value, with a strict parser, a writer and lookups | |
 | `nbt.tag` | `Tag`, an NBT tag, read and written in network and file form with `Accounter`'s limits, and printed as SNBT | `Tag` and its types, `NbtIo`, `NbtAccounter`, `StringTagVisitor` |
 | `nbt.snbt` | `parse` and `parse_compound`: SNBT read into a tag, with vanilla's errors at vanilla's places, and `SyntaxError`, brigadier's message and context | `TagParser`, `SnbtGrammar`, `SnbtOperations`, the packrat parser in `util.parsing.packrat`, `CommandSyntaxException` |
@@ -59,7 +60,7 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `protocol.compression` | `compress` and `decompress`, a packet inside a frame once compression is on, with vanilla's checks and messages | `CompressionEncoder`, `CompressionDecoder` |
 | `protocol.codec` | `Decoder` and `Encoder`, what a connection receives and sends, with its encryption and compression, apart so an encoder can move to another thread; `Codec`, both, for a client | The pipeline of `CipherDecoder`, `CipherEncoder` and the frame and compression handlers |
 | `protocol.legacy` | The server list ping of clients before 1.7, and its answer | `LegacyQueryHandler`, `LegacyProtocolUtils` |
-| `server.properties` | `ServerProperties`, the settings read so far, and `load`, which reads server.properties | `DedicatedServerProperties`, `Settings` |
+| `server.properties` | `ServerProperties`, the settings read so far; `load`, which reads server.properties; and `settled`, what vanilla writes back to it | `DedicatedServerProperties`, `Settings`, `Settings.store` |
 | `server.config` | `CalciteConfig`, the settings in calcite.properties, and the text of a new one | |
 | `server.status` | `ServerStatus`, what the server list shows, and its JSON, which the network rebuilds every 5 seconds; `check_icon` | `ServerStatus`, `PngInfo`, `MinecraftServer.loadStatusIcon` |
 | `server.configuration` | `Configuration`: what configuration sends every player, encoded once; the server's links, its resource pack and its code of conduct, from server.properties and the `codeofconduct` folder | `startConfiguration`, `SynchronizeRegistriesTask`, `TagNetworkSerialization`, `getServerPackInfo`, `createServerLinks`, `readCodeOfConducts` |
@@ -200,6 +201,13 @@ calx run --release src/calcite.calx -- --replay recordings/2026-10-28-1.inputs  
 It starts as vanilla's dedicated server does, with its log lines, loads the vanilla data pack, answers the server list: the status, with the description, player counts, version and icon, the ping, and the old pings of clients before 1.7, logs players in, configures them, and lets them into a flat world. It ticks 20 times a second, as vanilla does, and like vanilla warns `Can't keep up!` when it's more than 2 seconds behind, at most once in 15 seconds, and skips the ticks it missed.
 
 - **server.properties** is read as vanilla reads it: UTF-8, or ISO-8859-1 if it isn't, with Java's `Properties` rules. A setting that's missing or doesn't parse is its default, as `Boolean.valueOf` and `Integer.parseInt` decide. The settings read so far are `online-mode`, `server-ip`, `server-port`, `motd`, `max-players`, `enable-status`, `hide-online-players`, `enforce-secure-profile`, `accepts-transfers`, `prevent-proxy-connections`, `network-compression-threshold`, `rate-limit`, `log-ips`, `chat-spam-threshold-seconds`, `command-spam-threshold-seconds`, `enable-code-of-conduct`, `bug-report-link`, `resource-pack`, `resource-pack-id`, `resource-pack-sha1`, the older `resource-pack-hash`, `require-resource-pack`, `resource-pack-prompt`, `view-distance`, `simulation-distance`, `gamemode`, `difficulty`, `hardcore` and `level-seed`. `gamemode` and `difficulty` are a name, such as `creative`, or an ID, as vanilla reads them.
+- **server.properties is written back** as the server starts, as vanilla's `Settings.store` writes it, so a new server gets one with every setting vanilla knows, at its default. It matches what the 26.3 jar writes byte for byte, but for the line ends: `#Minecraft server properties`, the date as Java's `Date.toString` writes it, then every key in Java's `String.compareTo` order, with Java's escapes.
+  - Each setting vanilla reads is written as it read it: `TRUE` is `true`, `difficulty=2` is `normal`, `+5` is `5`, a number that doesn't parse is its default, `max-world-size` and the permission levels are kept in range, and `level-type` is in lower case.
+  - `generator-settings` is written again as Gson writes the JSON object vanilla reads from it: compact, a key given twice in the place of its first with the value of its last, and anything after the object gone. A value that isn't a JSON object stops the server, as it stops vanilla.
+  - `resource-pack-hash` and `announce-player-achievements` are gone, as vanilla reads them only to replace them. Keys vanilla doesn't read stay as they are.
+  - `management-server-secret` is 40 letters and digits from the system's secure generator, where there's none.
+  - The date names the zone as Java does, by tzdata's abbreviation, such as `CET`. Windows has none, so there it's the offset, such as `GMT+01:00` ([properties-on-windows](../rig/differences/properties-on-windows.md)).
+  - A file that can't be written is logged as vanilla logs it, `Failed to store properties to file: server.properties`, and the server carries on. A replay leaves the file be.
 - **calcite.properties** holds Calcite's own settings, those server.properties hasn't, in the same format, and is read the same way. A server that has none writes one, with each setting at its default and a comment on what it does. A setting that stops the server, such as forwarding with no secret, is logged as `Failed to start the minecraft server: ...` on `main`.
 
   | Setting | Default | What it does |
@@ -331,9 +339,10 @@ Where it differs from vanilla, for now:
 | Vanilla | Calcite | Until |
 | --- | --- | --- |
 | Asks you to agree to Mojang's EULA in eula.txt | Doesn't: Calcite isn't Mojang's software | Always |
-| Writes server.properties back on start, with every setting | Only reads it | A later change |
 | Rolls logs/latest.log a second time at its first line after starting, with nothing to archive, which still moves the day's archives down, and can remove one | Rolls once ([log-second-roll](../rig/differences/log-second-roll.md)) | Always |
 | Ends each line of logs/latest.log with the system's line break, `\r\n` on Windows | Ends each with `\n` ([log-line-endings](../rig/differences/log-line-endings.md)) | Always |
+| On Windows, ends each line of server.properties with `\r\n`, and names the zone in its date, such as `CET` | Ends each with `\n`, and names the zone by its offset, such as `GMT+01:00` ([properties-on-windows](../rig/differences/properties-on-windows.md)) | Always |
+| Doesn't start when `entity-broadcast-range-percentage` isn't a number | Takes the default, 100, as for every other number ([properties-range-percentage](../rig/differences/properties-range-percentage.md)) | Always |
 | Shows vanilla's lines on the console | Shows Calcite's own look and words on a terminal, and vanilla's lines in a file or a pipe, or with `console-style=vanilla` | Always |
 | The status's player counts and sample come from who's online, rebuilt every 5 seconds | Rebuilt every 5 seconds too, but it shows no one online | The player list (`P4.5`) |
 | Checks bans, the whitelist and a full server before it lets a player in, and kicks a player already in the world with the same UUID | Lets every valid login in, since there's no player list yet | Play (`P4.5`) |
