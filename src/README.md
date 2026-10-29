@@ -71,7 +71,7 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `server.boot` | `Boot`, what the data packs make as the server starts, and the boot cache that keeps it, keyed by the build and the data | |
 | `server.sending` | `Outbox`, what a connection has queued to send, in order, with where its compression and encryption start, and `Sending`, which encodes it at a flush, on the tick thread if it's small and on a codec thread otherwise | `Connection`'s sending and flushing, the server's `suspendFlushing` and `resumeFlushing`, and Netty's event loops |
 | `server.link` | `Link`, everything from outside the server, as it asks for it: the network's events and bytes, the ticks' times, the wall clock, connections' addresses, the system's random bytes, the key pair and the answers of Mojang's services, passed through, recorded to an input log, or replayed from one; and `Report`, what a replay found ([D144](../docs/decisions.md)) | |
-| `server.log` | `Log`, where the server's lines go: the console, in its `Style`, and logs/latest.log on a thread of its own; `line`, a line in Mojang's pattern; `styled`, one in Calcite's; `Look`, how a line shows in Calcite's style; and `Entry`, a line left for the caller to log, with the thread vanilla logs it on | Mojang's log4j2.xml: its console pattern and its `RollingRandomAccessFile` |
+| `server.log` | `Log`, where the server's lines go: the console, in its `Style`, and logs/latest.log on a thread of its own; `line`, a line in Mojang's pattern; `styled`, one in Calcite's, and `card`, what it shows when the server is ready; `Look`, how a line shows in Calcite's style; `Colors`, what the terminal takes; and `Entry`, a line left for the caller to log, with the thread vanilla logs it on | Mojang's log4j2.xml: its console pattern and its `RollingRandomAccessFile` |
 | `server.log_file` | `LogFile`, latest.log and its archives, rolled at start and at midnight and numbered as log4j numbers them; `FileWriter`, the thread that writes it and compresses each archive | log4j's `OnStartupTriggeringPolicy`, `TimeBasedTriggeringPolicy`, `DefaultRolloverStrategy` and `GzCompressAction` |
 | `calcite` | The server's `main`, which loads the vanilla data pack or the boot cache, and its loop of 20 ticks a second | `Main`, `DedicatedServer.initServer`, `MinecraftServer.runServer` |
 | `rig.adapter` | The rig adapter's main: answers `hello`, `run` and `bye` | |
@@ -299,14 +299,24 @@ These rules were measured by running log4j 2.26.0 with Mojang's own configuratio
 The console has two styles:
 
 - **Vanilla's** lines, exactly. Hosting panels such as Pterodactyl, AMP and Crafty, and wrappers, read the console for lines such as `Done (...)! For help` and `joined the game`. So it's vanilla's style when the output is a file or a pipe, which is how they run a server.
-- **Calcite's**, on a terminal. The time is dimmed, and each line has a colored tag:
-  - `INFO`, `WARN` or `ERROR` for its level.
-  - `READY` when players can join.
-  - `JOIN`, `LEAVE` and `CHAT` for what players do.
+- **Calcite's**, on a terminal. When the server is ready it shows a card, in place of vanilla's lines from `Starting minecraft server version` to `Done`:
 
-  A thread is named only when it isn't the server's own. Each later line of a message, such as an exception's, starts under its first. Calcite has its own words where they read better: `Ready for players on 127.0.0.1:25565, 5.0 ms after starting` for `Done`, one line for a join, and two for offline mode's four warnings. Lines that tell whoever runs the server nothing new aren't shown, such as `Loading properties`, a login's `UUID of player`, and the `System chat` that repeats a join or a leave.
+  ```text
+     calcite   Minecraft 26.3 · ready in 4.8 ms
 
-`console-style` in calcite.properties picks one. Until the server has read that file, it's Calcite's on a terminal. On Windows, the console's reading of ANSI codes is turned on first, and a console that can't read them gets vanilla's style. Calcite's words are its own, not Mojang's en_us text. `styled` writes the style's lines, and [`test/console.calx`](test/console.calx) checks each look.
+    ›  Address    localhost:25565
+    ›  Accounts   checked with Mojang
+    ›  World      flat, 32 chunks in view, 10 simulated
+    ›  Players    up to 20
+  ```
+
+  `calcite` is a badge in the logo's ink on the calcite block's off-white. Offline mode is amber on the card, with how to turn it off under it, and where the server made server.properties or calcite.properties because they weren't there, a note under the rows says so, instead of vanilla's `Failed to load properties from file`.
+
+  After the card, each line is the time, faint, a mark for what happened, and the words: a green `→` for a player coming in, a muted `←` for one going or turned away, an amber `▲` for a warning and a red `×` for an error, whose words are amber or red too. Chat is the player's name in bold, then what they said, with `unsigned` after it, muted, where Mojang didn't sign it. Threads aren't named. Each later line of a message, such as an exception's, starts under its first, muted. Lines that tell whoever runs the server nothing new aren't shown, such as `Loading properties`, a login's `UUID of player`, and the `System chat` that repeats a join or a leave.
+
+  The colors are GitHub's Primer palette, which reads on dark and light backgrounds alike, exact in 24-bit color on Windows and where `COLORTERM` is `truecolor` or `24bit`, the nearest of xterm's 256 elsewhere, and the 16 basic ones on the Linux console. `NO_COLOR`, or `TERM=dumb`, turns them off and keeps the layout.
+
+`console-style` in calcite.properties picks one. Until the server has read that file, it's Calcite's on a terminal. On Windows, the console's reading of ANSI codes is turned on first, and a console that can't read them gets vanilla's style. Calcite's words are its own, not Mojang's en_us text. `styled` and `card` write the style's lines, and [`test/console.calx`](test/console.calx) checks each look, with color and without.
 
 
 ```calx
