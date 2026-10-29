@@ -16,6 +16,9 @@
 /// recorded where the network, the clock, Mojang's services and the system's random numbers would
 /// be, and checks it sends and logs what it did as it was recorded: it says what it found, and
 /// fails if it went another way (D21).
+///
+/// Lines typed into its console run as commands, as vanilla's do. `stop` stops it: it tells its
+/// players, waits for them to go, and ends.
 module calcite
 
 import auth.services.{Environment, Services}
@@ -32,6 +35,7 @@ import resources.identifier.{Identifier}
 import server.boot.{Boot, cache_key, cache_path, load_boot, save_boot}
 import server.config.{CalciteConfig, default_text}
 import server.configuration.{CodeOfConduct, Configuration, ResourcePack, read_codes, resource_pack, server_links}
+import server.console.{ConsoleInput, ConsoleReader}
 import server.link.{Link}
 import server.log.{Accounts, Card, Entry, Level, Log, Look, Style}
 import server.network.{LoginSettings, Network, StatusInfo}
@@ -237,7 +241,7 @@ fn two(n: i32) -> String {
 // A link recording what the server is handed to a new input log in recordings/, named for the
 // day as vanilla names its old logs, `2026-10-28-1.inputs` and on, which the `Recorder` thread
 // writes to. If the log can't be started, that's logged, and the server runs without one.
-fn record_link(net: Net, recorder: mut Sender<List<u8>>?, out: mut Log) -> Link {
+fn record_link(net: Net, recorder: mut Sender<List<u8>>?, writer: mut Thread?, out: mut Log) -> Link {
     let now = unsafe { Timestamp.now() }
     let t = now.date_time(unsafe { now.local_offset() })
     let day = "{t.year}-{two(t.month)}-{two(t.day)}"
@@ -261,7 +265,7 @@ fn record_link(net: Net, recorder: mut Sender<List<u8>>?, out: mut Log) -> Link 
     out.log("ServerMain", Level.Warn, "Recording every input to {path}, which holds what players send and the server's private key")
     let pieces = Receiver<List<u8>>()
     recorder = some(pieces.sender())
-    _ = unsafe { Thread.spawn(Recorder { path: path, pieces: pieces, out: out.share() }) }
+    writer = some(unsafe { Thread.spawn(Recorder { path: path, pieces: pieces, out: out.share() }) })
     return link
 }
 
@@ -457,7 +461,10 @@ fn serve(arguments: List<String>, replaying: String?, out: mut Log) ! String {
     let start = unsafe { Instant.now() }
     var net: Net? = none
     var recorder: Sender<List<u8>>? = none
+    var recorder_thread: Thread? = none
     var made: Link? = none
+    // What's typed into the console, which a replay has in its log instead.
+    let typed = Receiver<ConsoleInput>()
     if let path = replaying {
         made = some(try replay_link(path))
     } else {
@@ -468,8 +475,14 @@ fn serve(arguments: List<String>, replaying: String?, out: mut Log) ! String {
                 return
             },
         }
-        made = some(if config.record_inputs { record_link(n, mut recorder, mut out) } else { Link.live(n) })
+        made = some(if config.record_inputs { record_link(n, mut recorder, mut recorder_thread, mut out) } else { Link.live(n) })
         net = some(n)
+        // Vanilla reads the console on a thread of its own from the start, and runs what's typed
+        // once its loop runs.
+        match n.waker() {
+            ok(waker) => _ = unsafe { Thread.spawn(ConsoleReader { to: typed.sender(), waker: waker }) },
+            err(e) => out.log("ServerMain", Level.Warn, "Failed to read the console: {bind_error(e)}"),
+        }
     }
     var link = made else return
     // Vanilla draws a random seed as it reads server.properties, if `level-seed` is empty.
@@ -563,7 +576,12 @@ fn serve(arguments: List<String>, replaying: String?, out: mut Log) ! String {
         try replay(mut network, path, mut out)
         return
     }
-    run(net!, mut network, start, mut recorder, mut out)
+    run(net!, mut network, start, typed, mut recorder, mut out)
+    // The last of the input log is written before the server ends.
+    recorder = none
+    if let t = recorder_thread.take() {
+        t.join()
+    }
 }
 
 // Replays the rest of the input log at `path`, logging what the server logs, then what the replay
@@ -584,42 +602,67 @@ fn replay(network: mut Network, path: String, out: mut Log) ! String {
 // 50 ms, the length of a tick at 20 ticks a second.
 const TICK_NS: u64 = 50000000
 
+// How long a stopping server waits for the players it told to go.
+const DRAIN_NS: u64 = 3000000000
+
 // The server's ticks, 20 a second, with the network's events handled as they come between them,
-// as vanilla's `runServer` runs them. A server more than 2 seconds behind warns, at most once in
-// 15 seconds, and skips the ticks it missed. What the link records goes to `recorder`, after each
-// turn of the loop.
-fn run(net: Net, network: mut Network, start: Instant, recorder: mut Sender<List<u8>>?, out: mut Log) {
+// as vanilla's `runServer` runs them, and what's typed into the console, as `tickConnection` runs
+// it. A server more than 2 seconds behind warns, at most once in 15 seconds, and skips the ticks
+// it missed. What the link records goes to `recorder`, after each turn of the loop. Once the
+// server is stopping, it ticks no more, and waits up to 3 seconds for the players it told to go.
+fn run(net: Net, network: mut Network, start: Instant, typed: own Receiver<ConsoleInput>, recorder: mut Sender<List<u8>>?, out: mut Log) {
+    var console = typed
     var events = List<Event>()
     var next = unsafe { Instant.now() }.nanos_since(start) + TICK_NS
     var last_warning: u64 = 0
+    var deadline: u64 = 0
     loop {
         let before = unsafe { Instant.now() }.nanos_since(start)
-        let wait = if next > before { i64.wrap((next - before + 999999) / 1000000) } else { 0 }
+        let until = if network.stopping() { deadline } else { next }
+        let wait = if until > before { i64.wrap((until - before + 999999) / 1000000) } else { 0 }
         net.poll(wait, mut events)
         let now = unsafe { Instant.now() }.nanos_since(start)
         network.set_clock(unsafe { Timestamp.now() })
         for e in events {
             _ = network.handle(e, now)
         }
-        if now >= next {
-            let behind = now - next
-            if behind > 2000000000 and (last_warning == 0 or next - last_warning >= 15000000000) {
-                let ticks = behind / TICK_NS
-                say(mut out, Level.Warn, "Can't keep up! Is the server overloaded? Running {behind / 1000000}ms or {ticks} ticks behind", Look.Words("{behind / 1000000} ms behind, so {ticks} ticks are skipped. Is the machine too busy?"))
-                next += ticks * TICK_NS
-                last_warning = next
+        if not network.stopping() {
+            while let input = console.next() {
+                match input {
+                    ConsoleInput.Line(line) => network.command(line),
+                    ConsoleInput.Halt => network.halt(),
+                }
             }
-            next += TICK_NS
-            network.tick(now)
-            network.sweep(now)
+            if network.stopping() {
+                deadline = now + DRAIN_NS
+            } else if now >= next {
+                let behind = now - next
+                if behind > 2000000000 and (last_warning == 0 or next - last_warning >= 15000000000) {
+                    let ticks = behind / TICK_NS
+                    say(mut out, Level.Warn, "Can't keep up! Is the server overloaded? Running {behind / 1000000}ms or {ticks} ticks behind", Look.Words("{behind / 1000000} ms behind, so {ticks} ticks are skipped. Is the machine too busy?"))
+                    next += ticks * TICK_NS
+                    last_warning = next
+                }
+                next += TICK_NS
+                network.tick(now)
+                network.sweep(now)
+            }
         }
         for e in network.take_logs() {
             out.entry("Server thread", e)
         }
-        if let to = recorder.take() {
-            var pieces = to
-            pieces.send(network.take_log())
-            recorder = some(pieces)
+        record(mut network, mut recorder)
+        if network.stopping() and (network.closing() == 0 or now >= deadline) {
+            return
         }
+    }
+}
+
+// Sends what the link recorded since the last turn of the loop to the input log's thread.
+fn record(network: mut Network, recorder: mut Sender<List<u8>>?) {
+    if let to = recorder.take() {
+        var pieces = to
+        pieces.send(network.take_log())
+        recorder = some(pieces)
     }
 }
