@@ -47,19 +47,19 @@ On the reference machine, an i9-13900K, the medians of 5 runs, recorded in [`res
 
 | Measure | Windows 11 | Linux |
 | --- | --- | --- |
-| MSPT, mean | 0.508 ms | 0.459 ms |
-| MSPT, p99 | 1.787 ms | 1.237 ms |
-| MSPT, max | 2.085 ms | 2.176 ms |
-| TPS | 20.01 | 20.00 |
-| MSPT while joining, mean | 1.099 ms | 1.495 ms |
-| MSPT while joining, max | 2.529 ms | 3.496 ms |
-| Join to all chunks, median | 1097 ms | 1098 ms |
-| Join to all chunks, max | 1116 ms | 1101 ms |
-| CPU time | 2.98 s | 2.40 s |
-| Peak memory | 46.9 MiB | 44.7 MiB |
+| MSPT, mean | 0.455 ms | 0.452 ms |
+| MSPT, p99 | 1.479 ms | 1.133 ms |
+| MSPT, max | 1.967 ms | 1.750 ms |
+| TPS | 20.02 | 20.00 |
+| MSPT while joining, mean | 0.964 ms | 1.314 ms |
+| MSPT while joining, max | 2.224 ms | 3.830 ms |
+| Join to all chunks, median | 1100 ms | 1097 ms |
+| Join to all chunks, max | 1121 ms | 1099 ms |
+| CPU time | 3.25 s | 2.06 s |
+| Peak memory | 47.2 MiB | 44.3 MiB |
 | Chunks sent | 79952 | 79975 |
 | Bytes to the bots | 21.2 MiB | 21.2 MiB |
 
-Commit 08e6657, Calx f6ad008. A join takes about 1.1 s because the client's first batch is 9 chunks, then 25 a tick as the bots ask for, so 473 chunks take about 20 ticks; it's the protocol's pace, not the server's.
+Commit 1195b56, Calx f6ad008, after the chunk sender stopped sorting every chunk waiting each tick ([D155](../docs/decisions.md)); at 08e6657, the first recorded, the mean MSPT was 0.508 ms on Windows and 0.459 ms on Linux. A join takes about 1.1 s because the client's first batch is 9 chunks, then 25 a tick as the bots ask for, so 473 chunks take about 20 ticks; it's the protocol's pace, not the server's.
 
-The runs are noisy: one run's mean MSPT is from 0.46 to 0.56 ms on Windows, about ±10%, from the system and the other threads. So before looking into a number flagged as more than 5% worse, run it again with `--runs 10`, and look into it if it stays.
+The runs are noisy, from the system and the other threads: one run's mean MSPT is from 0.46 to 0.56 ms on Windows, about ±10%. CPU time on Windows varies more, from 2.3 to 3.6 s in one set of runs, and a worst tick can be one the system held up, such as 18 ms while joining in one run on Linux where the others were 2 to 4. So before looking into a number flagged as more than 5% worse, run it again with `--runs 10`, and look into it if it stays.
