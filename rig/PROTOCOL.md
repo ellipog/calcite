@@ -366,6 +366,25 @@ Input `{"min_y": y, "sections": n, "ops": [...]}` runs a chunk whose `n` section
 
 A place outside the chunk, a state or heightmap that isn't one, and an operation it doesn't have are an `error` status.
 
+### `region` (v1)
+
+Region files, as vanilla's `RegionFile` reads and writes them: operations on one file, `r.0.0.mca`, in a new folder of its own. A chunk's bytes come from the case compressed already, so the files compare byte for byte. Results go into one blob, as `palette`'s do. Each operation's result comes after what it logged: an `int` count of lines, then for each its level as a byte, 1 for a warning and 2 for an error, and its message, with the folder taken out of the paths in it, so `r.0.0.mca` and `c.3.4.mcc` stand alone.
+
+Input `{"ops": [...]}`, with blobs. A chunk is at `x` and `z` in the region, 0 to 31, and a blob is its index in the case's list.
+
+| Operation | Result |
+| --- | --- |
+| `["put", blob]` | nothing: the region file's bytes become the blob |
+| `["put_external", x, z, blob]` | nothing: `c.x.z.mcc` holds the blob |
+| `["open"]` | nothing: closes the file if it's open, then opens it, as `new RegionFile(info, path, folder, VERSION_DEFLATE, false)`, which makes it if it isn't there |
+| `["write", x, z, blob]` | nothing: writes the chunk whose bytes are the blob, its compression's byte and then its stream, as `ChunkBuffer.close` writes them, with their length before them |
+| `["clear", x, z]` | nothing: `clear` |
+| `["has", x, z]` | a byte, 1 if `hasChunk` |
+| `["read", x, z]` | a byte: 0 if `getChunkDataInputStream` gives null; 1, then an `int` length and the bytes read from it; or 2, then the simple class name of what it throws, as a message. Only the class, since zlib words its messages its own way |
+| `["close"]` | `close`, then every file in the folder, by name: an `int` count, then for each its name as a message, an `int` length and its bytes. In `r.0.0.mca`, each of the header's times becomes 1 if it isn't 0, since they're the clock's |
+
+A chunk of 256 sectors or more goes in its own file, with a stub that names the region file's compression, deflate, so its bytes must be deflate's, as they always are in a world that saves with it. An operation on a file that isn't open, a chunk outside the region, a blob that isn't there and an operation it doesn't have are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

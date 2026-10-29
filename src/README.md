@@ -39,6 +39,7 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `world.flat` | `FlatWorld`: the classic flat world's chunk, built as a `Chunk` and encoded once, with its light | `FlatLevelSource`, `ClientboundLevelChunkPacketData`, `ClientboundLightUpdatePacketData` |
 | `world.blocks` | Each block's first state ID and default state, written by [`calx_tables.py`](../oracle/datagen/README.md#calx-modules) | `Block.BLOCK_STATE_REGISTRY` |
 | `world.block_flags` | What each block state is, as vanilla's state cache holds it: air, random ticks, fluids, light and the rest, written by [`calx_tables.py`](../oracle/datagen/README.md#calx-modules) | `BlockBehaviour.BlockStateBase.Cache` |
+| `storage.region` | `RegionFile`, one region file: its header, kept in memory, and its chunks, read and written where vanilla puts them, in the first free sectors that fit, with those of 256 sectors or more in files of their own; `encode`, a chunk's bytes as a region file holds them, in each `Compression` ([D166](../docs/decisions.md)); [`test/region.calx`](test/region.calx) checks its lines, its files of their own and its padding, and the rig's `region` probe the rest | `RegionFile`, `RegionFileVersion`, `RegionBitmap` |
 | `registry.registry` | `Registry`, a registry's entries with their IDs and its tags, and `Tag` | `MappedRegistry`, `HolderSet.Named` |
 | `registry.tags` | `load_tags`: a registry's tags from the packs, read, merged and built in vanilla's order, with its log lines | `TagLoader`, `TagFile`, `TagEntry`, `DependencySorter` |
 | `registry.registries` | `Registries`: the synchronized registries, in the order they're sent, and the built-in ones, each with its tags | `RegistryDataLoader`, `RegistrySynchronization` |
@@ -86,6 +87,7 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `rig.collections` | The `collections` probe: Calx's Java-ordered tables against Java's and fastutil's | |
 | `rig.palette` | The `palette` probe: std.palette's containers and bit storage against vanilla's `PalettedContainer` and `SimpleBitStorage` | |
 | `rig.chunk` | The `chunk` probe: `world.chunk`'s sections and heightmaps against vanilla's `LevelChunkSection` and `Heightmap` | |
+| `rig.region` | The `region` probe: `storage.region`'s region files against vanilla's `RegionFile` | |
 | `rig.registries` | The `registries` probe: the vanilla data pack's registries and tags against vanilla's | |
 | `rig.nbt` | The `nbt` probe: binary NBT read, printed and written back, and SNBT parsed, against vanilla's | |
 | `rig.swarm` | The bot benchmark's players: bots that join a running server, walk and chat, and say how it went ([D154](../docs/decisions.md)). Its flags try wide views, as with `force-view-distance` | |

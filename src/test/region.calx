@@ -1,0 +1,197 @@
+/// Checks `storage.region`: chunks written in each compression and read back, where vanilla's
+/// order puts them in the file, chunks that grow, move and go in files of their own, clearing,
+/// a header read again, and one whose places can't be right. The rig's `region` probe checks the
+/// bytes against vanilla's `RegionFile`.
+module test.region
+
+import server.log.{Entry}
+import std.fs.{is_file, metadata, read, remove_dir_all, temp_dir, write_parts}
+import storage.region.{Compression, RegionFile, encode, file_name, index_of}
+import world.pos.{ChunkPos}
+
+fn check(got: i64, want: i64, what: String) {
+    if got != want {
+        panic("{what}: got {got}, want {want}")
+    }
+}
+
+fn check_bool(got: bool, want: bool, what: String) {
+    if got != want {
+        panic("{what}: got {got}, want {want}")
+    }
+}
+
+// `n` bytes that don't compress, from a 64-bit LCG.
+fn noise(seed: i64, n: usize) -> List<u8> {
+    var x = seed
+    var out = List<u8>()
+    out.reserve(n)
+    for _ in 0..n {
+        x = x * 6364136223846793005 + 1442695040888963407
+        out.push(u8.wrap(x >>> 56))
+    }
+    return out
+}
+
+// Bytes that compress well.
+fn text(n: usize) -> List<u8> {
+    var out = List<u8>()
+    for i in 0..n {
+        out.push(u8.wrap(97 + i % 7))
+    }
+    return out
+}
+
+fn same(a: List<u8>, b: List<u8>) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn read_back(region: RegionFile, pos: ChunkPos, want: List<u8>, what: String) {
+    var lines: List<Entry> = []
+    match region.read(pos, mut lines) {
+        ok(some(got)) => check_bool(same(got, want), true, what),
+        ok(none) => panic("{what}: not there"),
+        err(e) => panic("{what}: {e.exception}: {e.message}"),
+    }
+    check(i64.wrap(lines.len()), 0, "{what}: lines")
+}
+
+fn check_sectors(region: RegionFile, want: List<i32>, what: String) {
+    let got = region.used_sectors()
+    if got != want {
+        panic("{what}: got {got}, want {want}")
+    }
+}
+
+fn one(pos: ChunkPos, data: own List<u8>) -> List<(ChunkPos, List<u8>)> {
+    let chunks: List<(ChunkPos, List<u8>)> = [(pos, data)]
+    return chunks
+}
+
+fn main() {
+    let dir = temp_dir()!
+    let a = ChunkPos { x: 33, z: -2 }
+    let b = ChunkPos { x: 34, z: -2 }
+    let c = ChunkPos { x: 63, z: -32 }
+    check(i64.wrap(index_of(a)), 1 + 30 * 32, "a's index")
+    check_bool(file_name(a) == "r.1.-1.mca", true, "a's file")
+    let path = "{dir}/{file_name(a)}"
+    var lines: List<Entry> = []
+    var region = RegionFile.open(path, dir, mut lines)!
+    check_bool(is_file(path), true, "made when it's opened")
+    check_bool(region.has_chunk(a), false, "a in an empty region")
+
+    // A chunk in each compression, read back, each in the first free sectors.
+    let small = text(10000)
+    let wide = noise(7, 9000)
+    region.write(one(a, encode(small, Compression.Deflate)), 1000, false, mut lines)!
+    region.write(one(b, encode(wide, Compression.Stored)), 1001, true, mut lines)!
+    region.write(one(c, encode(small, Compression.Lz4)), 1002, false, mut lines)!
+    read_back(region, a, small, "deflate")
+    read_back(region, b, wide, "stored")
+    read_back(region, c, small, "lz4")
+    // The header's two, then a in one sector, b in three, c in one.
+    check_sectors(region, [0, 1, 2, 3, 4, 5, 6], "sectors after three")
+    check(i64.wrap(metadata(path)!.size), 7 * 4096, "padded to whole sectors")
+    check(i64(region.timestamp(b)), 1001, "b's time")
+
+    // b grows: it goes past the end while its old sectors are taken, and they're freed after.
+    let wider = noise(8, 13000)
+    region.write(one(b, encode(wider, Compression.Gzip)), 1003, false, mut lines)!
+    read_back(region, b, wider, "gzip")
+    check_sectors(region, [0, 1, 2, 6, 7, 8, 9, 10], "sectors after b grew")
+    // a, rewritten, takes the first free sector: one of b's old ones.
+    region.write(one(a, encode(small, Compression.Deflate)), 1004, false, mut lines)!
+    check_sectors(region, [0, 1, 3, 6, 7, 8, 9, 10], "sectors after a moved")
+
+    // Two at once: neither goes where the other's old bytes are.
+    let both: List<(ChunkPos, List<u8>)> = [(a, encode(wide, Compression.Stored)), (c, encode(small, Compression.Stored))]
+    region.write(both, 1005, false, mut lines)!
+    read_back(region, a, wide, "a in a batch")
+    read_back(region, c, small, "c in a batch")
+    check_sectors(region, [0, 1, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], "sectors after a batch")
+
+    // One of 256 sectors or more goes in a file of its own, and comes back when it shrinks.
+    let huge = noise(9, 256 * 4096)
+    region.write(one(b, encode(huge, Compression.Stored)), 1006, false, mut lines)!
+    check(i64.wrap(lines.len()), 1, "the oversized line")
+    check_bool(lines[0].message == "Saving oversized chunk [34, -2] (1048581 bytes\} to external file {dir}/c.34.-2.mcc", true, "the oversized line's words")
+    check_bool(is_file("{dir}/c.34.-2.mcc"), true, "the chunk's own file")
+    read_back(region, b, huge, "external")
+    lines.clear()
+    region.write(one(b, encode(small, Compression.Deflate)), 1007, false, mut lines)!
+    check_bool(is_file("{dir}/c.34.-2.mcc"), false, "the chunk's own file, after")
+    read_back(region, b, small, "back inside")
+
+    // Cleared, it's gone, with its time.
+    region.clear(c, 1008, true)!
+    check_bool(region.has_chunk(c), false, "c cleared")
+    check(i64(region.timestamp(c)), 1008, "c's time")
+    match region.read(c, mut lines) {
+        ok(none) => {},
+        _ => panic("c read after it was cleared"),
+    }
+
+    // The header read again is the same.
+    let again = RegionFile.open(path, dir, mut lines)!
+    check(i64.wrap(lines.len()), 0, "lines opening it again")
+    check_sectors(again, region.used_sectors(), "sectors read again")
+    read_back(again, a, wide, "a read again")
+    read_back(again, b, small, "b read again")
+    check(i64(again.timestamp(a)), 1005, "a's time read again")
+
+    // Places that can't be right are dropped, as vanilla says.
+    let bad = "{dir}/r.0.0.mca"
+    var header: List<u8> = [0; 8192]
+    // Chunk 0 in sector 1, chunk 1 with no sectors, chunk 2 past the end, chunk 3 in sector 2.
+    header[2] = 1
+    header[3] = 1
+    header[6] = 2
+    header[10] = 9
+    header[11] = 1
+    header[14] = 2
+    header[15] = 1
+    var content: List<u8> = [0; 8192 + 4096]
+    for i in 0..16usize {
+        content[i] = header[i]
+    }
+    // Chunk 3's sector says 0 bytes, which vanilla reads as allocated but missing.
+    let parts: List<(u64, List<u8>)> = [(0, content)]
+    write_parts(bad, parts, false)!
+    lines.clear()
+    let damaged = RegionFile.open(bad, dir, mut lines)!
+    check(i64.wrap(lines.len()), 3, "lines for a damaged header")
+    check_bool(lines[0].message == "Region file {bad} has invalid sector at index: 0; sector 1 overlaps with header", true, "overlap line")
+    check_bool(lines[1].message == "Region file {bad} has an invalid sector at index: 1; size has to be > 0", true, "size line")
+    check_bool(lines[2].message == "Region file {bad} has an invalid sector at index: 2; sector 9 is out of bounds", true, "bounds line")
+    check_sectors(damaged, [0, 1, 2], "sectors of a damaged file")
+    lines.clear()
+    match damaged.read(ChunkPos { x: 3, z: 0 }, mut lines) {
+        ok(none) => {},
+        _ => panic("a chunk with no stream read"),
+    }
+    check_bool(lines[0].message == "Chunk [3, 0] is allocated, but stream is missing", true, "missing stream line")
+
+    // A file shorter than its header.
+    let short = "{dir}/r.5.5.mca"
+    let few: List<(u64, List<u8>)> = [(0, [0, 0, 0, 0, 0, 0, 0, 0])]
+    write_parts(short, few, false)!
+    lines.clear()
+    _ = RegionFile.open(short, dir, mut lines)!
+    check_bool(lines[0].message == "Region file {short} has truncated header: 8", true, "truncated header line")
+    check_bool(read(short)!.len() == 8, true, "a short file left alone")
+    var opened = RegionFile.open(short, dir, mut lines)!
+    opened.close()!
+    check_bool(read(short)!.len() == 4096, true, "a short file padded when it's closed")
+
+    remove_dir_all(dir)!
+    println("ok")
+}

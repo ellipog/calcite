@@ -1,0 +1,283 @@
+/// The `region` probe (rig/PROTOCOL.md): `storage.region`'s region files, run by a list of
+/// operations on `r.0.0.mca` in a new folder, each result written to one blob, which the rig
+/// compares with what vanilla's `RegionFile` gives for the same operations.
+module rig.region
+
+import json.tree.{Json, Member, as_i32, as_string, take}
+import rig.frame.{Outcome}
+import server.log.{Entry, Level}
+import std.fs.{FsError, list, read, remove_dir_all, temp_dir, write}
+import std.time.{Timestamp}
+import storage.region.{RegionFile}
+import world.pos.{ChunkPos}
+
+pub fn run_region(input: own List<Member>, blobs: List<List<u8>>) -> Outcome {
+    var fields = input
+    let ops_value = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let ops = match ops_value {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    let dir = match temp_dir() {
+        ok(d) => d,
+        err(e) => return Outcome.Failed("no temporary folder: {describe(e)}"),
+    }
+    var out: List<u8> = []
+    let failed: String? = match region(dir, ops, blobs, mut out) {
+        ok => none,
+        err(Problem.Case(message)) => some(message),
+        err(Problem.Files(e)) => some(describe(e)),
+    }
+    match remove_dir_all(dir) {
+        ok => {},
+        err(e) => return Outcome.Failed("the folder wasn't removed: {describe(e)}"),
+    }
+    if let message = failed {
+        return Outcome.Failed(message)
+    }
+    return Outcome.Done { output: [], blobs: [out] }
+}
+
+fn region(dir: String, ops: List<Json>, blobs: List<List<u8>>, out: mut List<u8>) ! Problem {
+    let path = "{dir}/r.0.0.mca"
+    var file: RegionFile? = none
+    var lines: List<Entry> = []
+    for k in 0..ops.len() {
+        let items = try items_of(ops, k)
+        let name = as_string(items[0]) ?? String()
+        lines.clear()
+        if name == "put" {
+            try expect(items, k, 1)
+            try write(path, try blob(blobs, items, k, 1))
+        } else if name == "put_external" {
+            try expect(items, k, 3)
+            let x = as_i32(items[1]) else fail Problem.Case("{what(k, 1)} must be a 32-bit integer")
+            let z = as_i32(items[2]) else fail Problem.Case("{what(k, 2)} must be a 32-bit integer")
+            try write("{dir}/c.{x}.{z}.mcc", try blob(blobs, items, k, 3))
+        } else if name == "open" {
+            try expect(items, k, 0)
+            if let old = file.take() {
+                var closing = old
+                try closing.close()
+            }
+            file = some(try RegionFile.open(path, dir, mut lines))
+        } else if name == "write" {
+            try expect(items, k, 3)
+            let pos = try pos_of(items, k)
+            let chunk = try blob(blobs, items, k, 3)
+            if chunk.is_empty() {
+                fail Problem.Case("operation {k}: a chunk needs its compression's byte")
+            }
+            var data = List<u8>()
+            data.reserve(chunk.len() + 4)
+            put_i32(mut data, i32.wrap(chunk.len()))
+            for b in chunk {
+                data.push(b)
+            }
+            var r = file.take() else fail Problem.Case("operation {k}: no region file is open")
+            let chunks: List<(ChunkPos, List<u8>)> = [(pos, data)]
+            try r.write(chunks, now(), false, mut lines)
+            file = some(r)
+        } else if name == "clear" {
+            try expect(items, k, 2)
+            let pos = try pos_of(items, k)
+            var r = file.take() else fail Problem.Case("operation {k}: no region file is open")
+            try r.clear(pos, now(), false)
+            file = some(r)
+        } else if name == "has" {
+            try expect(items, k, 2)
+            let pos = try pos_of(items, k)
+            let r = file.take() else fail Problem.Case("operation {k}: no region file is open")
+            put_lines(mut out, lines, dir)
+            out.push(if r.has_chunk(pos) { 1 } else { 0 })
+            file = some(r)
+            continue
+        } else if name == "read" {
+            try expect(items, k, 2)
+            let pos = try pos_of(items, k)
+            let r = file.take() else fail Problem.Case("operation {k}: no region file is open")
+            var thrown: String? = none
+            let got: List<u8>? = match r.read(pos, mut lines) {
+                ok(bytes) => bytes,
+                err(e) => {
+                    thrown = some(e.exception.copy())
+                    none
+                },
+            }
+            file = some(r)
+            put_lines(mut out, lines, dir)
+            if let exception = thrown {
+                out.push(2)
+                put_message(mut out, exception)
+            } else if let bytes = got {
+                out.push(1)
+                put_i32(mut out, i32.wrap(bytes.len()))
+                for b in bytes {
+                    out.push(b)
+                }
+            } else {
+                out.push(0)
+            }
+            continue
+        } else if name == "close" {
+            try expect(items, k, 0)
+            var r = file.take() else fail Problem.Case("operation {k}: no region file is open")
+            try r.close()
+            put_lines(mut out, lines, dir)
+            try files(dir, mut out)
+            continue
+        } else {
+            fail Problem.Case("operation {k}: no operation `{name}`")
+        }
+        put_lines(mut out, lines, dir)
+    }
+    if let r = file.take() {
+        var closing = r
+        try closing.close()
+    }
+}
+
+// Every file in the folder by name, the region file's timestamps each 0, or 1 if set. The
+// region file is `r.0.0.mca`.
+fn files(dir: String, out: mut List<u8>) ! FsError {
+    let names = try list(dir)
+    put_i32(mut out, i32.wrap(names.len()))
+    for name in names {
+        var content = try read("{dir}/{name}")
+        if name == "r.0.0.mca" {
+            var i: usize = 4096
+            while i + 4 <= content.len() and i + 4 <= 8192 {
+                let set = content[i] != 0 or content[i + 1] != 0 or content[i + 2] != 0 or content[i + 3] != 0
+                content[i] = 0
+                content[i + 1] = 0
+                content[i + 2] = 0
+                content[i + 3] = if set { 1 } else { 0 }
+                i += 4
+            }
+        }
+        put_message(mut out, name)
+        put_i32(mut out, i32.wrap(content.len()))
+        for b in content {
+            out.push(b)
+        }
+    }
+}
+
+// Seconds since 1970, as vanilla's region files keep them.
+fn now() -> i32 {
+    return i32.wrap(unsafe { Timestamp.now() }.unix_ms / 1000)
+}
+
+// What an operation logged, each line's level and its words, with the folder taken out of the
+// paths in them, since each adapter's folder is its own.
+fn put_lines(out: mut List<u8>, lines: List<Entry>, dir: String) {
+    put_i32(mut out, i32.wrap(lines.len()))
+    let folder = "{dir}/"
+    for line in lines {
+        out.push(match line.level {
+            Level.Warn => 1,
+            Level.Error => 2,
+            _ => 0,
+        })
+        put_message(mut out, without(line.message, folder))
+    }
+}
+
+fn without(text: String, part: String) -> String {
+    var out = String()
+    var at: usize = 0
+    loop {
+        let rest = text[at..]
+        let i = rest.find(part) else {
+            out.push_str(rest)
+            return out
+        }
+        out.push_str(rest[..i])
+        at += i + part.len()
+    }
+}
+
+fn put_message(out: mut List<u8>, text: String) {
+    let bytes = text.to_bytes()
+    put_i32(mut out, i32.wrap(bytes.len()))
+    for b in bytes {
+        out.push(b)
+    }
+}
+
+fn put_i32(out: mut List<u8>, v: i32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}
+
+// Why a case didn't run: it's wrong, or a file couldn't be read or written.
+enum Problem {
+    Case(String)
+    Files(FsError)
+}
+
+impl From<String> for Problem {
+    fn from(value: own String) -> Problem {
+        return Problem.Case(value)
+    }
+}
+
+impl From<FsError> for Problem {
+    fn from(value: own FsError) -> Problem {
+        return Problem.Files(value)
+    }
+}
+
+fn describe(e: FsError) -> String {
+    return match e {
+        FsError.NotFound => String("not found"),
+        FsError.Denied => String("access denied"),
+        FsError.Exists => String("exists"),
+        FsError.BadPath => String("bad path"),
+        FsError.IsDirectory => String("is a directory"),
+        FsError.NotEmpty => String("not empty"),
+        FsError.Os(code) => "system error {code}",
+    }
+}
+
+fn items_of(ops: List<Json>, k: usize) -> List<Json> ! String {
+    match ops[k] {
+        Json.Array(items) => {
+            if not items.is_empty() and as_string(items[0]) != none {
+                return items.copy()
+            }
+        },
+        _ => {},
+    }
+    fail "operation {k} must be a non-empty array named by a string"
+}
+
+fn what(k: usize, i: usize) -> String {
+    return "operation {k}'s argument {i}"
+}
+
+fn expect(items: List<Json>, k: usize, n: usize) ! String {
+    if items.len() != n + 1 {
+        fail "operation {k}: `{as_string(items[0]) ?? String()}` takes {n} arguments, got {items.len() - 1}"
+    }
+}
+
+// A chunk in the region file, as `x` and `z` from 0 to 31.
+fn pos_of(items: List<Json>, k: usize) -> ChunkPos ! String {
+    let x = as_i32(items[1]) else fail "{what(k, 1)} must be a 32-bit integer"
+    let z = as_i32(items[2]) else fail "{what(k, 2)} must be a 32-bit integer"
+    if x < 0 or x > 31 or z < 0 or z > 31 {
+        fail "operation {k}: a chunk in r.0.0.mca has x and z from 0 to 31"
+    }
+    return ChunkPos { x: x, z: z }
+}
+
+fn blob(blobs: List<List<u8>>, items: List<Json>, k: usize, i: usize) -> List<u8> ! String {
+    let n = as_i32(items[i]) else fail "{what(k, i)} must be a 32-bit integer"
+    if n < 0 or usize.wrap(n) >= blobs.len() {
+        fail "operation {k}: there's no blob {n}"
+    }
+    return blobs[usize.wrap(n)].copy()
+}

@@ -1,0 +1,569 @@
+/// Region files, as vanilla's `RegionFile` keeps them: the chunks of 32 × 32 columns in one file
+/// of 4 KiB sectors, after a header of where each chunk is and when it was saved. A chunk takes
+/// as many sectors as its compressed bytes need, and one that needs 256 or more goes in a file
+/// of its own beside it, `c.X.Z.mcc`.
+///
+/// The header is kept in memory, and the file is only opened to read or write it, so nothing is
+/// left open (D165). Writes follow vanilla's order (D166): each chunk goes into the first free sectors
+/// that fit it while its old ones are still taken, so a crash leaves the old chunk where the
+/// header says it is, and then the header is written. With `sync`, the chunks are on the disk
+/// before the header is written.
+module storage.region
+
+import resources.identifier.{Identifier}
+import server.log.{Entry}
+import std.fs.{FsError, is_file, metadata, read, read_part, remove_file, rename, write, write_parts}
+import std.lz4.{Error as Lz4Error, compress_into as lz4_compress, decompress_into as lz4_decompress}
+import std.text.mutf8.{decode as utf_decode}
+import std.zlib.{Error as ZipError, Format, compress_into as zlib_compress, decompress_into as zlib_decompress}
+import world.pos.{ChunkPos}
+
+/// The bytes in a sector.
+pub const SECTOR: i64 = 4096
+// The header's two tables, of 1,024 ints each: where each chunk is, then when it was saved.
+const HEADER: usize = 8192
+// A chunk of this many sectors or more goes in its own file.
+const EXTERNAL_SECTORS: i64 = 256
+// The flag on a chunk's compression byte that says its bytes are in its own file.
+const EXTERNAL_FLAG: u8 = 128
+
+/// How a chunk's bytes are compressed, vanilla's `RegionFileVersion`, which server.properties
+/// picks by `region-file-compression`.
+pub enum Compression {
+    /// 1, gzip, which no option picks but every server reads.
+    Gzip
+    /// 2, zlib, `deflate`: the default.
+    Deflate
+    /// 3, none, `none`.
+    Stored
+    /// 4, lz4's blocks, `lz4`.
+    Lz4
+}
+
+impl Compression {
+    /// Its ID, the byte before a chunk's bytes.
+    pub fn id(self) -> u8 {
+        return match self {
+            Compression.Gzip => 1,
+            Compression.Deflate => 2,
+            Compression.Stored => 3,
+            Compression.Lz4 => 4,
+        }
+    }
+
+    /// The compression with the ID, if it's one of the four. 127, vanilla's custom compression,
+    /// isn't, since vanilla reads no chunk that has it.
+    pub fn from_id(id: u8) -> Compression? {
+        return match id {
+            1 => some(Compression.Gzip),
+            2 => some(Compression.Deflate),
+            3 => some(Compression.Stored),
+            4 => some(Compression.Lz4),
+            _ => none,
+        }
+    }
+
+    /// The compression `region-file-compression` names: `deflate`, `none` or `lz4`.
+    pub fn from_name(name: String) -> Compression? {
+        if name == "deflate" {
+            return some(Compression.Deflate)
+        }
+        if name == "none" {
+            return some(Compression.Stored)
+        }
+        if name == "lz4" {
+            return some(Compression.Lz4)
+        }
+        return none
+    }
+}
+
+/// A chunk's bytes as a region file holds them, vanilla's `ChunkBuffer`: their length plus one,
+/// as 4 bytes, the compression's ID, then `payload` compressed, as vanilla's streams compress
+/// it. Encoding takes the time, so it can be done on many threads, and the results written
+/// together.
+pub fn encode(payload: List<u8>, compression: Compression) -> List<u8> {
+    var out: List<u8> = [0, 0, 0, 0, compression.id()]
+    match compression {
+        Compression.Gzip => zlib_compress(payload, 0, payload.len(), Format.Gzip, 6, mut out),
+        Compression.Deflate => zlib_compress(payload, 0, payload.len(), Format.Zlib, 6, mut out),
+        Compression.Stored => {
+            out.reserve(payload.len())
+            for b in payload {
+                out.push(b)
+            }
+        },
+        Compression.Lz4 => lz4_compress(payload, 0, payload.len(), mut out),
+    }
+    let n = u32.wrap(out.len() - 4)
+    out[0] = u8.wrap(n >> 24)
+    out[1] = u8.wrap(n >> 16)
+    out[2] = u8.wrap(n >> 8)
+    out[3] = u8.wrap(n)
+    return out
+}
+
+/// Why a chunk couldn't be read: the exception vanilla's streams throw, by its class's simple
+/// name, and its message.
+pub struct ReadError {
+    pub exception: String
+    pub message: String
+}
+
+/// One region file: its header, and which of its sectors are taken.
+pub struct RegionFile {
+    path: String
+    folder: String
+    // Each chunk's place, its first sector shifted left by 8 and its sector count, or 0 for
+    // none, by `x + z * 32` in the region.
+    offsets: List<i32>
+    // When each was saved, in seconds since 1970.
+    timestamps: List<i32>
+    // A bit for each sector, set if it's taken.
+    used: List<u64>
+    // How long the file is.
+    size: i64
+}
+
+impl RegionFile {
+    /// The region file at `path`, in `folder`, where its chunks that have files of their own
+    /// are, as vanilla's constructor reads it: the header, with each chunk whose place can't be
+    /// right dropped, as `lines` says. A file that isn't there is made, empty, as vanilla's
+    /// is, and is a region with no chunks.
+    pub fn open(path: String, folder: String, lines: mut List<Entry>) -> RegionFile ! FsError {
+        var region = RegionFile { path: path.copy(), folder: folder.copy(), offsets: [0; 1024], timestamps: [0; 1024], used: [], size: 0 }
+        region.take(0, 2)
+        if not is_file(path) {
+            let empty: List<u8> = []
+            try write(path, empty)
+            return region
+        }
+        let header = try read_part(path, 0, HEADER)
+        if header.is_empty() {
+            return region
+        }
+        if header.len() != HEADER {
+            lines.push(Entry.warn("Region file {path} has truncated header: {header.len()}"))
+        }
+        region.size = try file_size(path)
+        for i in 0..1024usize {
+            region.offsets[i] = int_at(header, i * 4)
+            region.timestamps[i] = int_at(header, 4096 + i * 4)
+        }
+        for i in 0..1024usize {
+            let offset = region.offsets[i]
+            if offset == 0 {
+                continue
+            }
+            let sector = sector_of(offset)
+            let count = count_of(offset)
+            if sector < 2 {
+                lines.push(Entry.warn("Region file {path} has invalid sector at index: {i}; sector {sector} overlaps with header"))
+                region.offsets[i] = 0
+            } else if count == 0 {
+                lines.push(Entry.warn("Region file {path} has an invalid sector at index: {i}; size has to be > 0"))
+                region.offsets[i] = 0
+            } else if i64(sector) * SECTOR > region.size {
+                lines.push(Entry.warn("Region file {path} has an invalid sector at index: {i}; sector {sector} is out of bounds"))
+                region.offsets[i] = 0
+            } else {
+                region.take(sector, count)
+            }
+        }
+        return region
+    }
+
+    /// Whether the header has a place for the chunk, as `hasChunk`.
+    pub fn has_chunk(self, pos: ChunkPos) -> bool {
+        return self.offsets[index_of(pos)] != 0
+    }
+
+    /// When the chunk was last saved or cleared, in seconds since 1970, or 0 if it never was.
+    pub fn timestamp(self, pos: ChunkPos) -> i32 {
+        return self.timestamps[index_of(pos)]
+    }
+
+    /// The chunk's bytes, uncompressed, as `getChunkDataInputStream` gives them: none if it
+    /// isn't there, or if its place or its compression is wrong, with what `lines` says.
+    pub fn read(self, pos: ChunkPos, lines: mut List<Entry>) -> List<u8>? ! ReadError {
+        let offset = self.offsets[index_of(pos)]
+        if offset == 0 {
+            return none
+        }
+        let length = i64(count_of(offset)) * SECTOR
+        let sectors = match read_part(self.path, u64.wrap(i64(sector_of(offset)) * SECTOR), usize.wrap(length)) {
+            ok(bytes) => bytes,
+            err(e) => fail io(e),
+        }
+        if sectors.len() < 5 {
+            lines.push(Entry.error("Chunk {show(pos)} header is truncated: expected {length} but read {sectors.len()}"))
+            return none
+        }
+        let declared = int_at(sectors, 0)
+        let id = sectors[4]
+        if declared == 0 {
+            lines.push(Entry.warn("Chunk {show(pos)} is allocated, but stream is missing"))
+            return none
+        }
+        let stream = declared - 1
+        if id & EXTERNAL_FLAG != 0 {
+            if stream != 0 {
+                lines.push(Entry.warn("Chunk has both internal and external streams"))
+            }
+            let external = self.external_path(pos)
+            if not is_file(external) {
+                lines.push(Entry.error("External chunk path {external} is not file"))
+                return none
+            }
+            let bytes = match read(external) {
+                ok(b) => b,
+                err(e) => fail io(e),
+            }
+            return try uncompress(pos, id & ~EXTERNAL_FLAG, bytes, 0, bytes.len(), mut lines)
+        }
+        let remaining = sectors.len() - 5
+        if stream > 0 and usize.wrap(stream) > remaining {
+            lines.push(Entry.error("Chunk {show(pos)} stream is truncated: expected {stream} but read {remaining}"))
+            return none
+        }
+        if stream < 0 {
+            lines.push(Entry.error("Declared size {declared} of chunk {show(pos)} is negative"))
+            return none
+        }
+        return try uncompress(pos, id, sectors, 5, 5 + usize.wrap(stream), mut lines)
+    }
+
+    /// Writes each of `chunks`, its position and its bytes as `encode` gives them, as `write`
+    /// writes them one after another, with `now` their time, in seconds since 1970. A chunk of
+    /// 256 sectors or more goes in its own file, as `lines` says. With `sync`, the chunks are on
+    /// the disk before the header that points at them is written, and the header before it
+    /// returns.
+    ///
+    /// Each chunk's old sectors are freed once they're all written, not after each, so no chunk
+    /// goes where another's old bytes are while the header on the disk still points at them.
+    /// One chunk at a time, this is vanilla's order, and the file comes out the same.
+    pub fn write(mut self, chunks: List<(ChunkPos, List<u8>)>, now: i32, sync: bool, lines: mut List<Entry>) ! FsError {
+        if chunks.is_empty() {
+            return
+        }
+        var parts: List<(u64, List<u8>)> = []
+        var freed: List<i32> = []
+        var gone: List<String> = []
+        for (pos, data) in chunks {
+            let i = index_of(pos)
+            let old = self.offsets[i]
+            var count = sectors_for(data.len())
+            var at = 0
+            if count >= EXTERNAL_SECTORS {
+                let external = self.external_path(pos)
+                lines.push(Entry.warn("Saving oversized chunk {show(pos)} ({data.len()} bytes\} to external file {external}"))
+                count = 1
+                at = self.allocate(1)
+                // Vanilla moves it into place once the header is written; before is as safe, since
+                // a header that still points at the old place doesn't read it.
+                var outside = List<u8>()
+                outside.reserve(data.len() - 5)
+                for k in 5..data.len() {
+                    outside.push(data[k])
+                }
+                let temporary = "{external}.tmp"
+                try write(temporary, outside)
+                try rename(temporary, external)
+                let stub: List<u8> = [0, 0, 0, 1, data[4] | EXTERNAL_FLAG]
+                parts.push((u64.wrap(i64(at) * SECTOR), stub))
+                self.grow(i64(at) * SECTOR + 5)
+            } else {
+                at = self.allocate(i32.wrap(count))
+                parts.push((u64.wrap(i64(at) * SECTOR), data.copy()))
+                self.grow(i64(at) * SECTOR + i64.wrap(data.len()))
+                gone.push(self.external_path(pos))
+            }
+            self.offsets[i] = (at << 8) | i32.wrap(count)
+            self.timestamps[i] = now
+            if old != 0 {
+                freed.push(old)
+            }
+        }
+        self.pad(mut parts)
+        try write_parts(self.path, parts, sync)
+        try self.write_header(sync)
+        for external in gone {
+            try remove_if_there(external)
+        }
+        for old in freed {
+            self.free(sector_of(old), count_of(old))
+        }
+    }
+
+    /// Takes the chunk out, as `clear`: its place in the header goes, its time is `now`, and its
+    /// own file, if it has one, is removed.
+    pub fn clear(mut self, pos: ChunkPos, now: i32, sync: bool) ! FsError {
+        let i = index_of(pos)
+        let old = self.offsets[i]
+        if old == 0 {
+            return
+        }
+        self.offsets[i] = 0
+        self.timestamps[i] = now
+        try self.write_header(sync)
+        try remove_if_there(self.external_path(pos))
+        self.free(sector_of(old), count_of(old))
+    }
+
+    /// Pads the file to whole sectors, as vanilla does when it closes one. Each write pads it, so
+    /// this only changes a file that was short of a sector when it was opened.
+    pub fn close(mut self) ! FsError {
+        var parts: List<(u64, List<u8>)> = []
+        self.pad(mut parts)
+        if not parts.is_empty() {
+            try write_parts(self.path, parts, true)
+        }
+    }
+
+    /// The file's sectors that are taken, from the first, the header's two included.
+    pub fn used_sectors(self) -> List<i32> {
+        var out: List<i32> = []
+        for w in 0..self.used.len() {
+            for b in 0..64usize {
+                if (self.used[w] >> u64(b)) & 1 != 0 {
+                    out.push(i32.wrap(w * 64 + b))
+                }
+            }
+        }
+        return out
+    }
+
+    fn write_header(self, sync: bool) ! FsError {
+        var header = List<u8>()
+        header.reserve(HEADER)
+        for v in self.offsets {
+            put_int(mut header, v)
+        }
+        for v in self.timestamps {
+            put_int(mut header, v)
+        }
+        let parts: List<(u64, List<u8>)> = [(0, header)]
+        try write_parts(self.path, parts, sync)
+    }
+
+    fn external_path(self, pos: ChunkPos) -> String {
+        return "{self.folder}/c.{pos.x}.{pos.z}.mcc"
+    }
+
+    fn grow(mut self, end: i64) {
+        if end > self.size {
+            self.size = end
+        }
+    }
+
+    // Pads the file to a whole number of sectors, as vanilla does when it closes one, with a
+    // zero at its last byte.
+    fn pad(mut self, parts: mut List<(u64, List<u8>)>) {
+        let padded = (self.size + SECTOR - 1) / SECTOR * SECTOR
+        if padded != self.size {
+            let zero: List<u8> = [0]
+            parts.push((u64.wrap(padded - 1), zero))
+            self.size = padded
+        }
+    }
+
+    // The first free run of `count` sectors, or the sectors from the last taken one on, taken,
+    // as `RegionBitmap.allocate`.
+    fn allocate(mut self, count: i32) -> i32 {
+        var current = 0
+        loop {
+            let start = self.next_clear(current)
+            let end = self.next_set(start)
+            if end < 0 or end - start >= count {
+                self.take(start, count)
+                return start
+            }
+            current = end
+        }
+    }
+
+    fn take(mut self, from: i32, count: i32) {
+        for s in from..from + count {
+            let w = usize.wrap(s >> 6)
+            while self.used.len() <= w {
+                self.used.push(0)
+            }
+            self.used[w] = self.used[w] | (1u64 << u64.wrap(s & 63))
+        }
+    }
+
+    fn free(mut self, from: i32, count: i32) {
+        for s in from..from + count {
+            let w = usize.wrap(s >> 6)
+            if w < self.used.len() {
+                self.used[w] = self.used[w] & ~(1u64 << u64.wrap(s & 63))
+            }
+        }
+    }
+
+    fn is_taken(self, s: i32) -> bool {
+        let w = usize.wrap(s >> 6)
+        return w < self.used.len() and (self.used[w] >> u64.wrap(s & 63)) & 1 != 0
+    }
+
+    fn next_clear(self, from: i32) -> i32 {
+        var s = from
+        while self.is_taken(s) {
+            s += 1
+        }
+        return s
+    }
+
+    // The first taken sector from `from` on, or -1 if there's none.
+    fn next_set(self, from: i32) -> i32 {
+        let last = i32.wrap(self.used.len() * 64)
+        var s = from
+        while s < last {
+            if self.is_taken(s) {
+                return s
+            }
+            s += 1
+        }
+        return -1
+    }
+}
+
+// The bytes from `from` to `to` uncompressed by the compression with ID `id`, as
+// `createChunkInputStream` reads them.
+fn uncompress(pos: ChunkPos, id: u8, bytes: List<u8>, from: usize, to: usize, lines: mut List<Entry>) -> List<u8>? ! ReadError {
+    if id == 127 {
+        // Vanilla reads the compression's name, with `readUTF`, and reads no further.
+        if to - from < 2 {
+            fail ReadError { exception: String("EOFException"), message: String() }
+        }
+        let n = usize((u32(bytes[from]) << 8) | u32(bytes[from + 1]))
+        if from + 2 + n > to {
+            fail ReadError { exception: String("EOFException"), message: String() }
+        }
+        let text = match utf_decode(bytes, from + 2, from + 2 + n) {
+            ok(s) => s,
+            err(_) => fail ReadError { exception: String("UTFDataFormatException"), message: String("malformed input") },
+        }
+        match Identifier.parse(text) {
+            ok(named) => lines.push(Entry.error("Unrecognized custom compression {named.to_string()}")),
+            err(_) => lines.push(Entry.error("Invalid custom compression id {text}")),
+        }
+        return none
+    }
+    let compression = Compression.from_id(id) else {
+        lines.push(Entry.error("Chunk {show(pos)} has invalid chunk stream version {i8.wrap(id)}"))
+        return none
+    }
+    let limit: usize = 2147483648
+    var out = List<u8>()
+    match compression {
+        // A stream that wants a dictionary ends where it asks, as `InflaterInputStream` ends it.
+        Compression.Gzip => match zlib_decompress(bytes, from, to, Format.Gzip, limit, mut out) {
+            ok(_) => {},
+            err(ZipError.Dictionary) => {},
+            err(e) => fail zip_error(e, true),
+        },
+        Compression.Deflate => match zlib_decompress(bytes, from, to, Format.Zlib, limit, mut out) {
+            ok(_) => {},
+            err(ZipError.Dictionary) => {},
+            err(e) => fail zip_error(e, false),
+        },
+        Compression.Stored => {
+            out.reserve(to - from)
+            for k in from..to {
+                out.push(bytes[k])
+            }
+        },
+        Compression.Lz4 => match lz4_decompress(bytes, from, to, limit, mut out) {
+            ok(_) => {},
+            err(Lz4Error.Truncated) => fail ReadError { exception: String("EOFException"), message: String("Stream ended prematurely") },
+            err(_) => fail ReadError { exception: String("IOException"), message: String("Stream is corrupted") },
+        },
+    }
+    return some(out)
+}
+
+fn zip_error(e: ZipError, gzip: bool) -> ReadError {
+    return match e {
+        ZipError.Truncated => ReadError { exception: String("EOFException"), message: String("Unexpected end of ZLIB input stream") },
+        ZipError.Checksum => if gzip {
+            ReadError { exception: String("ZipException"), message: String("Corrupt GZIP trailer") }
+        } else {
+            ReadError { exception: String("ZipException"), message: String("incorrect data check") }
+        },
+        _ => if gzip {
+            ReadError { exception: String("ZipException"), message: String("Not in GZIP format") }
+        } else {
+            ReadError { exception: String("ZipException"), message: String("invalid stored block lengths") }
+        },
+    }
+}
+
+fn io(e: FsError) -> ReadError {
+    return ReadError { exception: String("IOException"), message: describe(e) }
+}
+
+fn describe(e: FsError) -> String {
+    return match e {
+        FsError.NotFound => String("not found"),
+        FsError.Denied => String("access denied"),
+        FsError.Exists => String("exists"),
+        FsError.BadPath => String("bad path"),
+        FsError.IsDirectory => String("is a directory"),
+        FsError.NotEmpty => String("not empty"),
+        FsError.Os(code) => "system error {code}",
+    }
+}
+
+fn remove_if_there(path: String) ! FsError {
+    match remove_file(path) {
+        ok => {},
+        err(FsError.NotFound) => {},
+        err(e) => fail e,
+    }
+}
+
+fn file_size(path: String) -> i64 ! FsError {
+    return i64.wrap((try metadata(path)).size)
+}
+
+/// How vanilla writes a chunk's position in its log lines, `ChunkPos.toString`: `[1, -2]`.
+pub fn show(pos: ChunkPos) -> String {
+    return "[{pos.x}, {pos.z}]"
+}
+
+/// The chunk's place in its region's header.
+pub fn index_of(pos: ChunkPos) -> usize {
+    return usize.wrap((pos.x & 31) + (pos.z & 31) * 32)
+}
+
+/// The name of the region file that holds the chunk, `r.X.Z.mca`.
+pub fn file_name(pos: ChunkPos) -> String {
+    return "r.{pos.x >> 5}.{pos.z >> 5}.mca"
+}
+
+fn sector_of(offset: i32) -> i32 {
+    return (offset >> 8) & 0xFFFFFF
+}
+
+fn count_of(offset: i32) -> i32 {
+    return offset & 0xFF
+}
+
+fn sectors_for(n: usize) -> i64 {
+    return (i64.wrap(n) + SECTOR - 1) / SECTOR
+}
+
+fn int_at(bytes: List<u8>, at: usize) -> i32 {
+    if at + 4 > bytes.len() {
+        return 0
+    }
+    return (i32(bytes[at]) << 24) | (i32(bytes[at + 1]) << 16) | (i32(bytes[at + 2]) << 8) | i32(bytes[at + 3])
+}
+
+fn put_int(out: mut List<u8>, v: i32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}
