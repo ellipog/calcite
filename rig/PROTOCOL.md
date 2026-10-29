@@ -395,6 +395,16 @@ The result is one blob. First what was logged while it was read and written: an 
 
 A `min_y` that isn't a multiple of 16, sections outside the range, blobs and SNBT that isn't a compound are an `error` status.
 
+### `level_data` (v1)
+
+The `Data` compound of a world's `level.dat`, read as a server reads it as it starts, by vanilla's `LevelStorageSource.readDataConfig`, `LevelSettings.parse` and `PrimaryLevelData.parse`, and written back by `PrimaryLevelData.createTag`, as it saves.
+
+Input `{"snbt": "{...}"}`, with no blobs: the compound as SNBT.
+
+The result is one blob: what was logged while it was read and written, as `chunk_nbt` writes it, then an `int` length and the NBT written, as `NbtIo.write` writes a file's root. `LastPlayed`, the clock's, is written as 0.
+
+Blobs and SNBT that isn't a compound are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

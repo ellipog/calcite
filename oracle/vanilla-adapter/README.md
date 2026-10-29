@@ -65,6 +65,7 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `PaletteProbe.java` | `palette`: `PalettedContainer` and `SimpleBitStorage`, over a registry of objects compared by identity, as block states are |
 | `ChunkProbe.java` | `chunk`: `LevelChunkSection` and `Heightmap` in a `ProtoChunk`, with blocks set as `LevelChunk.setBlockState` sets them |
 | `RegionProbe.java` | `region`: a `RegionFile` in a new folder, with chunks written as the case gives their bytes, and what it logs, caught by an appender on its logger |
+| `LevelDataProbe.java` | `level_data`: the `Data` of a `level.dat` read by `readDataConfig`, `LevelSettings.parse` and `PrimaryLevelData.parse` and written back by `createTag`, with `LastPlayed` as 0 |
 | `ChunkNbtProbe.java` | `chunk_nbt`: a chunk's NBT read by `SerializableChunkData.parse` and written back by its `write`, with the data pack's biomes, and what it logs, caught by an appender on the root logger |
 | `BlockFlags.java` | Not a probe: writes each block state's flags from vanilla's state cache, run by `oracle/datagen/block_flags.py` |
 | `PacketCheck.java` | Vanilla reading Calcite's packets, run by `check_packets.py` |

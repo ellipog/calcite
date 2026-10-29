@@ -49,6 +49,7 @@ public final class Main {
                 new ChunkProbe(),
                 new RegionProbe(),
                 new ChunkNbtProbe(),
+                new LevelDataProbe(),
                 new RegistriesProbe())) {
             probes.put(probe.name(), probe);
         }
