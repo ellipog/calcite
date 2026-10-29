@@ -1,0 +1,339 @@
+/// logs/latest.log, as Mojang's log4j2.xml, in `com.mojang:logging`, has log4j write it: a
+/// `RollingRandomAccessFile` in the console's pattern, archived to `logs/yyyy-MM-dd-N.log.gz`
+/// when the server starts, by `OnStartupTriggeringPolicy`, and at the first line of each new day,
+/// by `TimeBasedTriggeringPolicy`, numbered as `DefaultRolloverStrategy` numbers them. Those rules
+/// were measured by running log4j 2.26.0 with Mojang's configuration (CAL-46):
+///
+/// - An archive is named for the day its lines are from: the day latest.log was last written,
+///   when the server starts, and the day of the last line before midnight, at midnight.
+/// - Its number is one more than the highest that day has, so gaps stay, and a day keeps 7. With
+///   7 already, the lowest is removed and the rest move down one, so the new one is 7. With a
+///   number of 7 or more there, every one moves down one.
+/// - An empty latest.log is never archived.
+///
+/// Vanilla's log4j also rolls again at the first line after it starts, with nothing to archive,
+/// and still moves the day's archives down, which can remove one. Calcite doesn't
+/// (rig/differences/log-second-roll.md).
+module server.log_file
+
+import std.fs.{FsError, append, is_file, list, make_dir_all, metadata, read, remove_file, rename, write}
+import std.thread.{Task}
+import std.time.{Timestamp}
+import std.zlib.{Format, compress}
+
+// The most archives a day keeps, `DefaultRolloverStrategy`'s `max`.
+const MAX_PER_DAY: i32 = 7
+
+// How many milliseconds a day has, in local time.
+const DAY_MS: i64 = 86400000
+
+/// How far ahead of UTC local time is: by the system's time zone, summer time included, or by a
+/// fixed offset, as tests have it.
+pub struct Zone {
+    offset_seconds: i32?
+}
+
+impl Zone {
+    /// The system's time zone, as log4j's `%d` uses it.
+    pub fn local() -> Zone {
+        return Zone { offset_seconds: none }
+    }
+
+    /// Always `offset` seconds ahead of UTC.
+    pub fn fixed(offset: i32) -> Zone {
+        return Zone { offset_seconds: some(offset) }
+    }
+
+    /// The seconds the zone is ahead of UTC at `at`.
+    pub fn offset(self, at: Timestamp) -> i32 {
+        if let f = self.offset_seconds {
+            return f
+        }
+        return unsafe { at.local_offset() }
+    }
+
+    /// The day `at` falls on here, counted from 1970-01-01.
+    pub fn day(self, at: Timestamp) -> i64 {
+        return (at.unix_ms + i64(self.offset(at)) * 1000).floor_div(DAY_MS)
+    }
+
+    /// The day `at` falls on here, as `%d{yyyy-MM-dd}` writes it.
+    pub fn day_name(self, at: Timestamp) -> String {
+        let t = at.date_time(self.offset(at))
+        return "{t.year}-{two(t.month)}-{two(t.day)}"
+    }
+}
+
+fn two(n: i32) -> String {
+    return if n < 10 { "0{n}" } else { "{n}" }
+}
+
+/// A line for the file, with the time it was logged, which says which day it's from.
+pub struct FileLine {
+    pub at: Timestamp
+    /// The line, with its line break.
+    pub text: String
+}
+
+// One of a day's archives: its number, and its file's name.
+struct Archive {
+    number: i32
+    name: String
+}
+
+/// latest.log in a folder, and its archives beside it.
+pub struct LogFile {
+    dir: String
+    zone: Zone
+    // The day latest.log's lines are from, which names its archive, as log4j's
+    // `PatternProcessor` keeps it: the day it was last written, or the day the server started if
+    // there was none, and after each roll the day of the line that rolled it.
+    day: i64
+    day_name: String
+    // Whether latest.log holds anything.
+    written: bool
+    // The archives made since `take_archived`, each a `.log` to compress.
+    archived: List<String>
+}
+
+impl LogFile {
+    /// The log in `dir`, which is made if it isn't there, for a server that started at `start`.
+    /// A latest.log left from before then, with something in it, is archived.
+    pub fn open(dir: String, start: Timestamp, zone: own Zone) -> LogFile ! FsError {
+        try make_dir_all(dir)
+        let latest = "{dir}/latest.log"
+        var at = start
+        var size: u64 = 0
+        if is_file(latest) {
+            let m = try metadata(latest)
+            at = m.modified
+            size = m.size
+        }
+        var file = LogFile { dir: dir.copy(), zone: zone, day: 0, day_name: String(), written: size > 0, archived: [] }
+        file.day = file.zone.day(at)
+        file.day_name = file.zone.day_name(at)
+        if file.written and at.unix_ms < start.unix_ms {
+            try file.roll()
+        }
+        return file
+    }
+
+    /// The path of latest.log.
+    pub fn latest(self) -> String {
+        return "{self.dir}/latest.log"
+    }
+
+    /// Adds `lines` to latest.log, in one write for each day they're from. The first line from a
+    /// later day than the file's archives what the file holds first.
+    pub fn write(mut self, lines: List<FileLine>) ! FsError {
+        var bytes = List<u8>()
+        for l in lines {
+            let day = self.zone.day(l.at)
+            if day > self.day {
+                if not bytes.is_empty() {
+                    try append(self.latest(), bytes)
+                    bytes = List<u8>()
+                    self.written = true
+                }
+                if self.written {
+                    try self.roll()
+                }
+                self.day = day
+                self.day_name = self.zone.day_name(l.at)
+            }
+            for b in l.text.to_bytes() {
+                bytes.push(b)
+            }
+        }
+        if not bytes.is_empty() {
+            try append(self.latest(), bytes)
+            self.written = true
+        }
+    }
+
+    /// The archives made since the last call, each a `.log` for `compress_archive`.
+    pub fn take_archived(mut self) -> List<String> {
+        let out = self.archived.copy()
+        self.archived.clear()
+        return out
+    }
+
+    // Moves latest.log to the next archive of its day, after making room for it.
+    fn roll(mut self) ! FsError {
+        let prefix = "{self.day_name}-"
+        // The day's archives, lowest first. Of two with one number, such as `1` and `01`, the
+        // later name counts, as it would for log4j's `TreeMap`.
+        var found = List<Archive>()
+        for name in try list(self.dir) {
+            let n = archive_number(name, prefix) else continue
+            var at = found.len()
+            while at > 0 and found[at - 1].number >= n {
+                at -= 1
+            }
+            if at < found.len() and found[at].number == n {
+                found[at] = Archive { number: n, name: name.copy() }
+            } else {
+                found.insert(at, Archive { number: n, name: name.copy() })
+            }
+        }
+        var first: usize = 0
+        var shift = not found.is_empty() and found[found.len() - 1].number >= MAX_PER_DAY
+        while i32.wrap(found.len() - first) >= MAX_PER_DAY {
+            try remove_file("{self.dir}/{found[first].name}")
+            first += 1
+            shift = true
+        }
+        if shift {
+            for i in first..found.len() {
+                let name = found[i].name.copy()
+                let ending = if compressed(name) { ".log.gz" } else { ".log" }
+                try rename("{self.dir}/{name}", "{self.dir}/{prefix}{found[i].number - 1}{ending}")
+            }
+        }
+        var number = 1
+        if first < found.len() {
+            let last = found[found.len() - 1].number
+            number = if last < MAX_PER_DAY { last + 1 } else { MAX_PER_DAY }
+        }
+        let to = "{self.dir}/{prefix}{number}.log"
+        try rename(self.latest(), to)
+        self.archived.push(to)
+        self.written = false
+    }
+}
+
+// The number of the archive `name` if it's one of the day's whose names start with `prefix`:
+// digits, then `.log`, then anything, as log4j's pattern `<day>-(0?\d+)\.log.*` matches them.
+fn archive_number(name: String, prefix: String) -> i32? {
+    if not name.starts_with(prefix) {
+        return none
+    }
+    let from = prefix.len()
+    var i = from
+    var n: i64 = 0
+    while i < name.len() and name.byte_at(i) >= 48 and name.byte_at(i) <= 57 {
+        n = n * 10 + i64(name.byte_at(i) - 48)
+        // Past `Integer.parseInt`'s reach, which fails the roll in log4j.
+        if n > 2147483647 {
+            return none
+        }
+        i += 1
+    }
+    if i == from or not name[i..].starts_with(".log") {
+        return none
+    }
+    return some(i32.wrap(n))
+}
+
+// Whether `name` ends as a compressed file does, by log4j's `FileExtension`s. A moved archive
+// keeps the `.gz`, or else has none.
+fn compressed(name: String) -> bool {
+    for ending in [".gz", ".zip", ".bz2", ".deflate", ".pack200", ".xz", ".zst"] {
+        if name.ends_with(ending) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Compresses the archive at `path`, a `.log`, to `path` with `.gz` added, as log4j's
+/// `GzCompressAction` does with Java's default level, then removes the `.log`.
+pub fn compress_archive(path: String) ! FsError {
+    let bytes = try read(path)
+    try write("{path}.gz", compress(bytes, Format.Gzip, 6))
+    try remove_file(path)
+}
+
+/// What the log file's thread is sent.
+pub enum ToFile {
+    /// A line to write.
+    Line(FileLine)
+    /// Write what came before, wait for the archives being compressed, and end.
+    Stop
+}
+
+/// Opens the log file in `dir` and writes the lines it's sent, on its own thread, so the server
+/// never waits for the disk. Each archive is compressed on a thread of its own, as log4j's
+/// asynchronous actions are, so latest.log never waits for that either. If the file can't be
+/// opened or written, that's printed once, and the lines go to the console alone.
+pub struct FileWriter {
+    pub dir: String
+    pub start: Timestamp
+    pub lines: Receiver<ToFile>
+}
+
+// Compresses one archive.
+struct Compressor {
+    path: String
+}
+
+impl Task for Compressor {
+    fn run(own self) {
+        match compress_archive(self.path) {
+            ok => {},
+            err(e) => println("Failed to compress {self.path}: {reason(e)}"),
+        }
+    }
+}
+
+impl Task for FileWriter {
+    fn run(own self) {
+        var lines = self.lines
+        var compressors = List<Thread>()
+        var file: LogFile? = none
+        match LogFile.open(self.dir, self.start, Zone.local()) {
+            ok(f) => file = some(f),
+            err(e) => println("Failed to open {self.dir}/latest.log: {reason(e)}"),
+        }
+        start_compressing(mut file, mut compressors)
+        var stopped = false
+        while not stopped {
+            let first = lines.wait() else break
+            // Whatever else has come, in one write.
+            var batch = List<FileLine>()
+            var next: ToFile? = some(first)
+            while let m = next {
+                match m {
+                    ToFile.Line(l) => batch.push(l),
+                    ToFile.Stop => stopped = true,
+                }
+                next = if stopped { none } else { lines.next() }
+            }
+            if let open = file.take() {
+                var f = open
+                match f.write(batch) {
+                    ok => file = some(f),
+                    err(e) => println("Failed to write {f.latest()}: {reason(e)}"),
+                }
+            }
+            start_compressing(mut file, mut compressors)
+        }
+        while let t = compressors.pop() {
+            t.join()
+        }
+    }
+}
+
+// Starts compressing each archive `file` has made, on a thread of its own.
+fn start_compressing(file: mut LogFile?, compressors: mut List<Thread>) {
+    if let open = file.take() {
+        var f = open
+        for path in f.take_archived() {
+            compressors.push(unsafe { Thread.spawn(Compressor { path: path.copy() }) })
+        }
+        file = some(f)
+    }
+}
+
+// What went wrong, as a few words.
+fn reason(e: FsError) -> String {
+    return match e {
+        FsError.NotFound => String("not found"),
+        FsError.Denied => String("access denied"),
+        FsError.Exists => String("already exists"),
+        FsError.BadPath => String("bad path"),
+        FsError.IsDirectory => String("is a directory"),
+        FsError.NotEmpty => String("not empty"),
+        FsError.Os(code) => "system error {code}",
+    }
+}

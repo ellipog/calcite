@@ -42,4 +42,6 @@ The body says what vanilla does, what Calcite does, and why the difference is wo
 
 | File | Kind | What changes |
 | --- | --- | --- |
+| [`log-line-endings.md`](log-line-endings.md) | platform | logs/latest.log ends its lines with `\n` on Windows too |
+| [`log-second-roll.md`](log-second-roll.md) | bug | logs/latest.log rolls once at start, so an archive isn't lost |
 | [`snbt-depth.md`](snbt-depth.md) | bug | Deeply nested SNBT is rejected at depth 512, instead of overflowing the stack |

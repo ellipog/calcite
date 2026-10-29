@@ -70,7 +70,8 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `server.boot` | `Boot`, what the data packs make as the server starts, and the boot cache that keeps it, keyed by the build and the data | |
 | `server.sending` | `Outbox`, what a connection has queued to send, in order, with where its compression and encryption start, and `Sending`, which encodes it at a flush, on the tick thread if it's small and on a codec thread otherwise | `Connection`'s sending and flushing, the server's `suspendFlushing` and `resumeFlushing`, and Netty's event loops |
 | `server.link` | `Link`, everything from outside the server, as it asks for it: the network's events and bytes, the ticks' times, the wall clock, connections' addresses, the system's random bytes, the key pair and the answers of Mojang's services, passed through, recorded to an input log, or replayed from one; and `Report`, what a replay found ([D144](../docs/decisions.md)) | |
-| `server.log` | `log` and `line`, the console's lines, and `Entry`, a line left for the caller to log, with the thread vanilla logs it on | Mojang's log4j2 console pattern |
+| `server.log` | `Log`, where the server's lines go: the console, and logs/latest.log on a thread of its own; `line`, a line in Mojang's pattern; and `Entry`, a line left for the caller to log, with the thread vanilla logs it on | Mojang's log4j2.xml: its console pattern and its `RollingRandomAccessFile` |
+| `server.log_file` | `LogFile`, latest.log and its archives, rolled at start and at midnight and numbered as log4j numbers them; `FileWriter`, the thread that writes it and compresses each archive | log4j's `OnStartupTriggeringPolicy`, `TimeBasedTriggeringPolicy`, `DefaultRolloverStrategy` and `GzCompressAction` |
 | `calcite` | The server's `main`, which loads the vanilla data pack or the boot cache, and its loop of 20 ticks a second | `Main`, `DedicatedServer.initServer`, `MinecraftServer.runServer` |
 | `rig.adapter` | The rig adapter's main: answers `hello`, `run` and `bye` | |
 | `rig.frame` | The rig's frames, whose headers are JSON | |
@@ -275,7 +276,17 @@ fn main() {
 }
 ```
 
-The log's lines follow Mojang's console pattern, `[%d{HH:mm:ss}] [%t/%level]: %msg`, in the local time zone:
+The log's lines follow Mojang's console pattern, `[%d{HH:mm:ss}] [%t/%level]: %msg`, in the local time zone. Each goes to the console, and to logs/latest.log as Mojang's log4j2.xml has log4j write it:
+
+- **When it rolls.** A latest.log left from before the server started, with something in it, is archived as it starts. So is the file at the first line of each new day.
+- **What an archive is named.** It's `logs/<day>-<N>.log.gz`, for the day its lines are from: the day the file was last written, at the start, or the day before the first line after midnight. N is one more than the highest that day already has, so gaps stay.
+- **7 a day.** With 7 already, the lowest is removed and the rest move down one. A number of 7 or more there also moves every one down.
+- **An empty latest.log** is never archived.
+- **The work is off the server thread.** The file is opened, written and rolled on a thread of its own, so a slow disk never holds the server up, and each archive is compressed on another, as log4j's asynchronous actions are. When `main` returns, it waits until every line is written and every archive compressed.
+- **A replay** (`--replay`) logs to the console alone, so it never rolls the log of the server it replays.
+
+These rules were measured by running log4j 2.26.0 with Mojang's own configuration. [`test/log_file.calx`](test/log_file.calx) checks each case it was run on.
+
 
 ```calx
 import server.log.{Level, line}
@@ -308,7 +319,8 @@ Where it differs from vanilla, for now:
 | --- | --- | --- |
 | Asks you to agree to Mojang's EULA in eula.txt | Doesn't: Calcite isn't Mojang's software | Always |
 | Writes server.properties back on start, with every setting | Only reads it | A later change |
-| Also logs to logs/latest.log | Logs to the console only | A later change |
+| Rolls logs/latest.log a second time at its first line after starting, with nothing to archive, which still moves the day's archives down, and can remove one | Rolls once ([log-second-roll](../rig/differences/log-second-roll.md)) | Always |
+| Ends each line of logs/latest.log with the system's line break, `\r\n` on Windows | Ends each with `\n` ([log-line-endings](../rig/differences/log-line-endings.md)) | Always |
 | The status's player counts and sample come from who's online, rebuilt every 5 seconds | Rebuilt every 5 seconds too, but it shows no one online | The player list (`P4.5`) |
 | Checks bans, the whitelist and a full server before it lets a player in, and kicks a player already in the world with the same UUID | Lets every valid login in, since there's no player list yet | Play (`P4.5`) |
 | Logs an exception's stack trace after lines such as `Failed to connect` | Logs the line alone | A later change |
