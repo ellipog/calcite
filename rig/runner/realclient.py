@@ -1,15 +1,22 @@
 """A real client's join: Mojang's own 26.3 client joins Calcite, walks, jumps and chats.
 
-    py -I rig/runner/realclient.py [--server PATH] [--message TEXT] [--keep-open SECONDS]
+    py -I rig/runner/realclient.py [--online NAME] [--server PATH] [--message TEXT] [--keep-open SECONDS]
 
 The protocol suites and the tests play the client's side with Calcite's own code, so this is
-the one check where the other end is the game itself. Calcite runs offline from its release
-build, build/server/calcite.exe, in a fresh folder under build/rig/realclient/. The client runs
-from the files of a launcher that has run 26.3 once: the official launcher's .minecraft, the
-Modrinth App or Prism Launcher, each checked against the SHA-1 in 26.3's version file, with JDK
-25, as player RealClient, in a game folder of its own beside the server's, with its sound off
-and the first-run screens skipped. It joins with --quickPlayMultiplayer. Nothing of Mojang's is
-copied: the client runs from the launcher's files.
+the one check where the other end is the game itself. Calcite runs from its release build,
+build/server/calcite.exe, in a fresh folder under build/rig/realclient/. The client runs from
+the files of a launcher that has run 26.3 once: the official launcher's .minecraft, the Modrinth
+App or Prism Launcher, each checked against the SHA-1 in 26.3's version file, with JDK 25, in a
+game folder of its own beside the server's, with its sound off and the first-run screens
+skipped. It joins with --quickPlayMultiplayer. Nothing of Mojang's is copied: the client runs
+from the launcher's files.
+
+Without --online, the server is offline and the client is player RealClient, with no account.
+With --online NAME, the server is in online mode, and the client plays as the Modrinth App's
+account NAME, which must be the player's own: its session is renewed from the launcher's
+Microsoft refresh token, as the launcher renews it, and kept in memory. No token is printed or
+written, and nothing is written back to the launcher. The client then signs its chat, and the
+message must come through signed, without [Not Secure], on both sides.
 
 On Windows, realclient_keys.ps1 then sends the client's window its keys: F3 for the debug
 screen, F2 for a screenshot, W held for 2.5 seconds and Space, F2, then T, the message and
@@ -19,9 +26,8 @@ show the coordinates before and after the walk, and the message in the client's 
 
 It passes if the server logged the join and the message, the client logged the message as it
 came back, nobody was disconnected before the client was stopped, and the client logged no error
-but the ones its offline account always gets, from Mojang's services and Realms. The client has
-no account, so the server can't be in online mode and chat isn't signed: that half of G4.1 needs
-a player with an account (rig/README.md, "A real client").
+but the ones on its download threads, which, with no account, Mojang's services and Realms
+always give (rig/README.md, "A real client").
 """
 
 import argparse
@@ -29,12 +35,17 @@ import hashlib
 import json
 import os
 import platform
+import sqlite3
 import shutil
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -43,7 +54,6 @@ sys.path.insert(0, str(CALCITE / "oracle"))
 from jdk import find_java_home, java  # noqa: E402
 
 VERSION = "26.3"
-NAME = "RealClient"
 PORT = 25600
 OUT = CALCITE / "build" / "rig" / "realclient"
 EXE = ".exe" if os.name == "nt" else ""
@@ -143,7 +153,73 @@ def offline_uuid(name):
     return uuid.UUID(bytes=bytes(digest))
 
 
-def client_command(spec, java_home, game):
+@dataclass
+class Player:
+    """Who the client plays as. The token never shows in a repr."""
+    name: str
+    uuid: str
+    token: str = field(repr=False)
+
+
+def offline_player():
+    return Player("RealClient", offline_uuid("RealClient").hex, "0")
+
+
+def post(url, body, form=False):
+    data = urllib.parse.urlencode(body).encode() if form else json.dumps(body).encode()
+    kind = "application/x-www-form-urlencoded" if form else "application/json"
+    request = urllib.request.Request(url, data=data, headers={"Content-Type": kind, "Accept": "application/json"})
+    try:
+        with urllib.request.urlopen(request, timeout=20) as r:
+            return r.status, json.load(r)
+    except urllib.error.HTTPError as e:
+        # An error's body names the problem; only its error fields are kept, to be shown.
+        try:
+            body = json.loads(e.read())
+            return e.code, {k: body[k] for k in ("error", "error_description", "XErr", "errorMessage") if k in body}
+        except ValueError:
+            return e.code, {}
+
+
+def online_player(name):
+    """The Modrinth App's account `name`, with a session renewed as the launcher renews one: its
+    Microsoft refresh token gives an Xbox Live token, that an XSTS token for Minecraft's services,
+    and that a Minecraft access token. Every token stays in memory."""
+    db = Path(os.environ.get("APPDATA", Path.home() / ".local/share")) / "ModrinthApp" / "app.db"
+    if not db.is_file():
+        sys.exit("--online needs the Modrinth App, signed in to the account")
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
+        row = con.execute("select refresh_token from minecraft_users where username = ?", (name,)).fetchone()
+    if not row:
+        sys.exit(f"the Modrinth App has no account {name}")
+    # The Minecraft launcher's Microsoft account client, which the Modrinth App signs in with.
+    status, answer = post("https://login.live.com/oauth20_token.srf", {
+        "client_id": "00000000402b5328", "grant_type": "refresh_token", "refresh_token": row[0],
+        "redirect_uri": "https://login.live.com/oauth20_desktop.srf",
+        "scope": "service::user.auth.xboxlive.com::MBI_SSL"}, form=True)
+    if status == 200:
+        status, answer = post("https://user.auth.xboxlive.com/user/authenticate", {
+            "Properties": {"AuthMethod": "RPS", "SiteName": "user.auth.xboxlive.com",
+                           "RpsTicket": f"t={answer['access_token']}"},
+            "RelyingParty": "http://auth.xboxlive.com", "TokenType": "JWT"})
+    if status == 200:
+        status, answer = post("https://xsts.auth.xboxlive.com/xsts/authorize", {
+            "Properties": {"SandboxId": "RETAIL", "UserTokens": [answer["Token"]]},
+            "RelyingParty": "rp://api.minecraftservices.com/", "TokenType": "JWT"})
+    if status == 200:
+        uhs = answer["DisplayClaims"]["xui"][0]["uhs"]
+        status, answer = post("https://api.minecraftservices.com/authentication/login_with_xbox",
+                              {"identityToken": f"XBL3.0 x={uhs};{answer['Token']}"})
+    if status != 200:
+        sys.exit(f"couldn't renew {name}'s session: {status} {answer}. Sign in again in the Modrinth App")
+    request = urllib.request.Request("https://api.minecraftservices.com/minecraft/profile",
+                                     headers={"Authorization": f"Bearer {answer['access_token']}"})
+    with urllib.request.urlopen(request, timeout=20) as r:
+        profile = json.load(r)
+    return Player(profile["name"], profile["id"], answer["access_token"])
+
+
+def client_command(spec, java_home, game, player):
     natives = OUT / "natives"
     jar_label, jar = client_jar(spec)
     asset_root, index = assets(spec)
@@ -156,9 +232,9 @@ def client_command(spec, java_home, game):
            f"-Dio.netty.native.workdir={natives / 'netty'}",
            "-Dminecraft.launcher.brand=calcite-rig", "-Dminecraft.launcher.version=1",
            "-cp", os.pathsep.join(classpath)]
-    args = ["--username", NAME, "--version", VERSION, "--gameDir", str(game),
+    args = ["--username", player.name, "--version", VERSION, "--gameDir", str(game),
             "--assetsDir", str(asset_root), "--assetIndex", index,
-            "--uuid", offline_uuid(NAME).hex, "--accessToken", "0", "--clientId", "0", "--xuid", "0",
+            "--uuid", player.uuid, "--accessToken", player.token, "--clientId", "0", "--xuid", "0",
             "--versionType", "release", "--width", "854", "--height", "480",
             "--quickPlayMultiplayer", f"127.0.0.1:{PORT}"]
     return [str(java(java_home))] + jvm + [spec["mainClass"]] + args
@@ -193,13 +269,13 @@ class Process:
         return None
 
 
-def prepare(server_dir, game):
+def prepare(server_dir, game, online):
     for folder in (server_dir, game / "screenshots"):
         if folder.exists():
             shutil.rmtree(folder)
     server_dir.mkdir(parents=True)
     (server_dir / "server.properties").write_text(
-        f"online-mode=false\nserver-ip=127.0.0.1\nserver-port={PORT}\ngamemode=creative\n"
+        f"online-mode={str(online).lower()}\nserver-ip=127.0.0.1\nserver-port={PORT}\ngamemode=creative\n"
         "white-list=false\nview-distance=8\nmotd=Calcite and a real client\n", encoding="utf-8")
     (server_dir / "calcite.properties").write_text("console-dashboard=off\n", encoding="utf-8")
     game.mkdir(parents=True, exist_ok=True)
@@ -234,6 +310,7 @@ def stop(server, client):
 
 def main():
     parser = argparse.ArgumentParser(description="Mojang's 26.3 client joins Calcite, walks and chats.")
+    parser.add_argument("--online", metavar="NAME", help="play as the Modrinth App's account NAME, in online mode")
     parser.add_argument("--server", default=str(CALCITE / "build" / "server" / f"calcite{EXE}"))
     parser.add_argument("--message", default="hello from a real client",
                         help="what the client says: small letters and spaces")
@@ -248,8 +325,10 @@ def main():
     spec = version_file()
     java_home = find_java_home()
     server_dir, game = OUT / "server", OUT / "game"
-    command = client_command(spec, java_home, game)
-    prepare(server_dir, game)
+    player = online_player(args.online) if args.online else offline_player()
+    print(f"player: {player.name}, {'online, with a renewed session' if args.online else 'offline'}")
+    command = client_command(spec, java_home, game, player)
+    prepare(server_dir, game, bool(args.online))
 
     server = Process([str(server_exe)], server_dir, OUT / "server.log")
     done = server.wait_for("Done (", 60)
@@ -259,30 +338,37 @@ def main():
     client = Process(command, game, OUT / "client.log")
     keyed = False
     try:
-        joined = server.wait_for(f"{NAME} joined the game", 180)
+        joined = server.wait_for(f"{player.name} joined the game", 180)
         if joined:
             time.sleep(4)
             keyed = send_keys(client, args.message)
             if keyed:
-                server.wait_for(f"<{NAME}> {args.message}", 10)
-                client.wait_for(f"[CHAT] <{NAME}> {args.message}", 5)
+                server.wait_for(f"<{player.name}> {args.message}", 10)
+                client.wait_for(f"[CHAT] <{player.name}> {args.message}", 5)
             time.sleep(args.keep_open)
         gone_early = server.find("lost connection") or client.find("Disconnected") or client.p.poll() is not None
     finally:
         stop(server, client)
 
     # Each check: what it is, and the line that shows it, or None.
-    checks = [("the server logged the join", server.find(f"{NAME}[/127.0.0.1:"))]
+    checks = [("the server logged the join", server.find(f"{player.name}[/127.0.0.1:"))]
     if os.name == "nt":
+        said = server.find(f"<{player.name}> {args.message}")
+        back = client.find(f"[CHAT] <{player.name}> {args.message}")
         checks += [
             ("the keys went to the client's window", keyed and "sent"),
-            ("the server logged the message", server.find(f"<{NAME}> {args.message}")),
-            ("the client got the message back", client.find(f"[CHAT] <{NAME}> {args.message}")),
+            ("the server logged the message", said),
+            ("the client got the message back", back),
         ]
+        if args.online:
+            checks += [
+                ("the server took it as signed", said and "[Not Secure]" not in said and said),
+                ("the client took it as signed", back and "[Not Secure]" not in back and back),
+            ]
     checks.append(("nobody was disconnected before the client was stopped", not gone_early and "-"))
-    # With no account, the client's calls to Mojang's services and Realms fail on their threads.
+    # With no account, the client's calls to Mojang's services and Realms fail on these threads.
     errors = [line for line in client.lines if "/ERROR]" in line and "[Download-" not in line]
-    checks.append(("the client logged no error but its offline account's", not errors and "-"))
+    checks.append(("the client logged no error but its download threads'", not errors and "-"))
     for what, line in checks:
         shown = f": {line.split(']: ', 1)[-1]}" if line and line not in ("sent", "-") else ""
         print(f"{'ok  ' if line else 'FAIL'} {what}{shown}")

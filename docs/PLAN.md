@@ -215,7 +215,7 @@ Get a real 26.3 client connected and walking around before any real world exists
 
 **Done when**
 
-- [ ] **G4.1** A real client joins in online mode, walks around and chats, with signed chat on
+- [x] **G4.1** A real client joins in online mode, walks around and chats, with signed chat on
 - [x] **G4.2** The login and configuration protocol suites pass
 - [x] **G4.3** A recorded session replays to identical output
 

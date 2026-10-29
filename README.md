@@ -8,7 +8,7 @@ Goals:
 - **Performance.** Folia-style regions on every core, ticking in lockstep so results never depend on the thread count.
 - **Vanilla parity.** Worldgen matches block for block and behavior matches vanilla, checked bit for bit by an oracle rig. Bugs and exploits are fixed and listed.
 
-Status: Phases 0 to 3 have passed their gates: the design, the oracle rig, the data tables generated from the vanilla jar, and the Calx compiler core. Phase 3 is done, and Phases 0 to 2 are in review. Calcite's first Calx code, vanilla's random sources, passes the rig's `rng` probe bit for bit on Windows and Linux. Calx runs the Phase 3 tick-loop benchmark in about 0.7× the time of its Rust reference ([results](https://github.com/ellipog/calx#performance)). Phase 4 is under way: the protocol, and a flat world a real client can join.
+Status: Phases 0 to 3 have passed their gates: the design, the oracle rig, the data tables generated from the vanilla jar, and the Calx compiler core. Phase 3 is done, and Phases 0 to 2 are in review. Calcite's first Calx code, vanilla's random sources, passes the rig's `rng` probe bit for bit on Windows and Linux. Calx runs the Phase 3 tick-loop benchmark in about 0.7× the time of its Rust reference ([results](https://github.com/ellipog/calx#performance)). Phase 4 has passed its gate: Mojang's own 26.3 client joins a flat world in online mode, walks and chats with signed chat, the login and configuration suites match vanilla packet for packet, and a recorded session replays exactly.
 
 Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calcite)). Calx has its own board, aaen-studios/clx ([open](https://acta.aaenz.no/aaen-studios/clx)). The phase gates live here.
 
