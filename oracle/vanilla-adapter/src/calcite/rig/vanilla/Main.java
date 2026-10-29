@@ -48,6 +48,7 @@ public final class Main {
                 new PaletteProbe(),
                 new ChunkProbe(),
                 new RegionProbe(),
+                new ChunkNbtProbe(),
                 new RegistriesProbe())) {
             probes.put(probe.name(), probe);
         }

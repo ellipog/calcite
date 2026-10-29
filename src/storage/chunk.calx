@@ -1,0 +1,1035 @@
+/// Chunks as vanilla 26.3 saves them in region files: the NBT of `SerializableChunkData`, read
+/// as its `parse` reads it and written as its `write` writes it, so a chunk read and saved again
+/// comes out as vanilla's would.
+///
+/// Reading is as lenient as vanilla's. A field that's missing or of the wrong type takes its
+/// default, a palette entry that isn't a block or a biome becomes air or plains, and a list keeps
+/// the elements that can be read, each problem logged with vanilla's line. What vanilla can't
+/// read it throws, and so does this, with the same exception and message: `ChunkReadException`
+/// for a container with no palette or whose data doesn't fit it, `IllegalArgumentException` for
+/// light that isn't 2,048 bytes, and `MissingPaletteEntryException` or `IllegalStateException`
+/// for a value past its palette's end, found as late as vanilla finds it, which for a section's
+/// biomes is when the chunk is written.
+module storage.chunk
+
+import nbt.tag.{Tag}
+import protocol.ids.{DATA_VERSION}
+import registry.names.{Names}
+import registry.registries.{Registries}
+import server.log.{Entry}
+import std.palette.{BitStorage, Error, Packed, PalettedContainer, Strategy}
+import world.blocks.{STATE_COUNT}
+import world.chunk.{AIR_STATE}
+import world.pos.{ChunkPos}
+import world.states.{StateCodec}
+
+/// The heightmaps' names in saves, in the order of `world.chunk`'s heightmap kinds, which is the
+/// order of vanilla's `Heightmap.Types`.
+pub fn heightmap_names() -> List<String> {
+    return ["WORLD_SURFACE_WG", "WORLD_SURFACE", "OCEAN_FLOOR_WG", "OCEAN_FLOOR", "MOTION_BLOCKING", "MOTION_BLOCKING_NO_LEAVES"]
+}
+
+/// What reading or writing a chunk throws in vanilla: the exception, by its class's simple name,
+/// and its message.
+pub struct ChunkError {
+    pub exception: String
+    pub message: String
+}
+
+/// The registries a chunk's NBT names things from: blocks and their states, fluids, chunk
+/// statuses and biomes.
+pub struct ChunkFormat {
+    pub states: StateCodec
+    pub fluids: Names
+    pub statuses: Names
+    pub biomes: Names
+    /// The biome a section without biomes has, `minecraft:plains`.
+    pub plains: u32
+    air_block: u32
+    empty_fluid: u32
+    empty_status: u32
+    full_status: u32
+}
+
+impl ChunkFormat {
+    /// The format of the built-in `block`, `fluid` and `chunk_status` registries of `registries`
+    /// and its `worldgen/biome`, or what's missing.
+    pub fn new(registries: Registries) -> ChunkFormat ! String {
+        let block = try builtin(registries, "block")
+        let fluid = try builtin(registries, "fluid")
+        let status = try builtin(registries, "chunk_status")
+        let b = registries.find(String("worldgen/biome")) else fail "there's no biome registry"
+        let states = StateCodec.new(registries.builtin[block])
+        let fluids = Names.from(registries.builtin[fluid])
+        let statuses = Names.from(registries.builtin[status])
+        let biomes = Names.from(registries.synced[b])
+        let plains = try biomes.parse("minecraft:plains")
+        let air_block = try states.blocks.parse("minecraft:air")
+        let empty_fluid = try fluids.parse("minecraft:empty")
+        let empty_status = try statuses.parse("minecraft:empty")
+        let full_status = try statuses.parse("minecraft:full")
+        return ChunkFormat {
+            states: states,
+            fluids: fluids,
+            statuses: statuses,
+            biomes: biomes,
+            plains: plains,
+            air_block: air_block,
+            empty_fluid: empty_fluid,
+            empty_status: empty_status,
+            full_status: full_status,
+        }
+    }
+
+    fn biome_strategy(self) -> Strategy {
+        return Strategy.biomes(self.biomes.len())
+    }
+}
+
+fn block_strategy() -> Strategy {
+    return Strategy.block_states(STATE_COUNT)
+}
+
+/// A block or fluid tick waiting in a save, vanilla's `SavedTick`: what's ticked, where, in how
+/// many ticks, and its priority, from -3, first, to 3.
+pub struct SavedTick {
+    /// The block's or the fluid's ID.
+    pub kind: u32
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub delay: i32
+    pub priority: i32
+}
+
+/// What the blender needs of a chunk from before the world grew, vanilla's `BlendingData.Packed`.
+pub struct Blending {
+    pub min_section: i32
+    pub max_section: i32
+    /// The old terrain's heights at 16 places around the chunk, if they're saved.
+    pub heights: List<f32>?
+}
+
+/// A chunk from before the world grew down that's still being generated below zero, vanilla's
+/// `BelowZeroRetrogen`.
+pub struct Retrogen {
+    /// The status the chunk is generated to, never `minecraft:empty`.
+    pub target_status: u32
+    /// The columns whose bedrock is missing, a bit each, as `BitSet.toLongArray` gives them:
+    /// with no zero words at the end.
+    pub missing_bedrock: List<i64>
+}
+
+/// What's left of a chunk's upgrade from before 1.13, vanilla's `UpgradeData`.
+pub struct Upgrade {
+    /// Each section's blocks to fix, by section from the bottom, or `none`.
+    pub indices: List<List<i32>?>
+    /// The neighbours to fix it against, a bit each for the 8 directions of vanilla's
+    /// `Direction8`.
+    pub sides: u8
+    pub neighbor_block_ticks: List<SavedTick>
+    pub neighbor_fluid_ticks: List<SavedTick>
+}
+
+impl Upgrade {
+    /// Whether there's nothing to fix, as vanilla's `isEmpty` has it, which leaves out the
+    /// ticks: then it isn't saved.
+    pub fn is_empty(self) -> bool {
+        for i in self.indices {
+            if i != none {
+                return false
+            }
+        }
+        return self.sides == 0
+    }
+}
+
+/// A section as a save holds it.
+pub struct SectionData {
+    /// Its height in sections.
+    pub y: i32
+    /// Its block states and biomes, or `none` for a section outside the world, which keeps only
+    /// its light.
+    pub blocks: PalettedContainer?
+    pub biomes: PalettedContainer?
+    /// Its light, 2,048 bytes of 4 bits each, if it's saved.
+    pub block_light: List<i8>?
+    pub sky_light: List<i8>?
+    // What vanilla throws when it writes the biomes, for biomes with a value past their palette's
+    // end, which are plains here.
+    broken: ChunkError?
+}
+
+/// A chunk as a save holds it, vanilla's `SerializableChunkData`.
+pub struct ChunkData {
+    pub pos: ChunkPos
+    /// The world's lowest section, which is what's saved, not what was read.
+    pub min_section: i32
+    pub last_update: i64
+    pub inhabited_time: i64
+    pub status: u32
+    pub blending: Blending?
+    pub retrogen: Retrogen?
+    /// The upgrade data, if there's a compound of it, even an empty one.
+    pub upgrade: Upgrade?
+    /// Each heightmap by kind, as `heightmap_names` orders them, if it's saved.
+    pub heightmaps: List<List<i64>?>
+    /// The ticks in the chunk.
+    pub block_ticks: List<SavedTick>
+    pub fluid_ticks: List<SavedTick>
+    /// The blocks to update after generation in each section from the bottom, each a packed
+    /// position in the section, or `none` for none.
+    pub post_processing: List<List<i16>?>
+    pub light_correct: bool
+    /// The sections in the order they're saved, which can be any order and can repeat a height.
+    pub sections: List<SectionData>
+    /// Entities, saved in a chunk only until it's full, and block entities, each a compound.
+    pub entities: List<Tag>
+    pub block_entities: List<Tag>
+    /// The structures' starts and references, a compound kept as it is.
+    pub structures: Tag
+}
+
+impl ChunkData {
+    /// The chunk `root` holds, as vanilla's `parse` reads it for a world of `sections` sections
+    /// from `min_section` up, with what it logs added to `lines`: `none` if there's no `Status`
+    /// string, and what vanilla throws if it can't be read.
+    pub fn parse(format: ChunkFormat, min_section: i32, sections: i32, root: own JavaHashMap<String, Tag>, lines: mut List<Entry>) -> ChunkData? ! ChunkError {
+        var tags = root
+        if not tags.contains("Status") or not is_string(tags["Status"]) {
+            return none
+        }
+        let pos = ChunkPos { x: int_or(tags, "xPos", 0), z: int_or(tags, "zPos", 0) }
+        let last_update = long_or(tags, "LastUpdate", 0)
+        let inhabited_time = long_or(tags, "InhabitedTime", 0)
+        var status = format.empty_status
+        match format.statuses.decode(tags["Status"]) {
+            ok(s) => status = s,
+            err(message) => lines.push(Entry.error(field_error("Status", tags["Status"], message))),
+        }
+        var upgrade: Upgrade? = none
+        if tags.contains("UpgradeData") {
+            match tags["UpgradeData"] {
+                Tag.Compound(fields) => upgrade = some(read_upgrade(format, fields, sections, mut lines)),
+                _ => {},
+            }
+        }
+        let light_correct = byte_or(tags, "isLightOn", 0) != 0
+        var blending: Blending? = none
+        if tags.contains("blending_data") {
+            match read_blending(tags["blending_data"]) {
+                ok(b) => blending = some(b),
+                err(message) => lines.push(Entry.error(field_error("blending_data", tags["blending_data"], message))),
+            }
+        }
+        var retrogen: Retrogen? = none
+        if tags.contains("below_zero_retrogen") {
+            match read_retrogen(format, tags["below_zero_retrogen"]) {
+                ok(r) => retrogen = some(r),
+                err(message) => lines.push(Entry.error(field_error("below_zero_retrogen", tags["below_zero_retrogen"], message))),
+            }
+        }
+        var heightmaps = List<List<i64>?>()
+        match tags.remove("Heightmaps") {
+            some(Tag.Compound(fields)) => {
+                var maps = fields
+                for name in heightmap_names() {
+                    match maps.remove(name) {
+                        some(Tag.LongArray(longs)) => heightmaps.push(some(longs)),
+                        _ => heightmaps.push(none),
+                    }
+                }
+            },
+            _ => {
+                for _ in 0..heightmap_names().len() {
+                    heightmaps.push(none)
+                }
+            },
+        }
+        let block_ticks = in_chunk(read_ticks(tags, "block_ticks", format.states.blocks, none, mut lines), pos)
+        let fluid_ticks = in_chunk(read_ticks(tags, "fluid_ticks", format.fluids, none, mut lines), pos)
+        var post_processing = List<List<i16>?>()
+        if tags.contains("PostProcessing") {
+            match tags["PostProcessing"] {
+                Tag.List(items) => {
+                    for item in items {
+                        post_processing.push(offsets(item))
+                    }
+                },
+                _ => {},
+            }
+        }
+        let entities = compounds(tags.remove("entities"))
+        let block_entities = compounds(tags.remove("block_entities"))
+        let structures = match tags.remove("structures") {
+            some(Tag.Compound(fields)) => Tag.Compound(fields),
+            _ => Tag.Compound(JavaHashMap<String, Tag>()),
+        }
+        var section_list = List<SectionData>()
+        match tags.remove("sections") {
+            some(Tag.List(items)) => {
+                var rest = reversed(items)
+                while let item = rest.pop() {
+                    match item {
+                        Tag.Compound(fields) => section_list.push(try read_section(format, min_section, sections, fields, pos, mut lines)),
+                        _ => {},
+                    }
+                }
+            },
+            _ => {},
+        }
+        return some(ChunkData {
+            pos: pos,
+            min_section: min_section,
+            last_update: last_update,
+            inhabited_time: inhabited_time,
+            status: status,
+            blending: blending,
+            retrogen: retrogen,
+            upgrade: upgrade,
+            heightmaps: heightmaps,
+            block_ticks: block_ticks,
+            fluid_ticks: fluid_ticks,
+            post_processing: post_processing,
+            light_correct: light_correct,
+            sections: section_list,
+            entities: entities,
+            block_entities: block_entities,
+            structures: structures,
+        })
+    }
+
+    /// The chunk's NBT as vanilla's `write` writes it, or what vanilla throws: a section's
+    /// biomes with a value past their palette's end, which vanilla finds only then.
+    pub fn write(own self, format: ChunkFormat) -> Tag ! ChunkError {
+        var me = self
+        var root = JavaHashMap<String, Tag>()
+        root.insert("DataVersion", Tag.Int(DATA_VERSION))
+        root.insert("xPos", Tag.Int(me.pos.x))
+        root.insert("yPos", Tag.Int(me.min_section))
+        root.insert("zPos", Tag.Int(me.pos.z))
+        root.insert("LastUpdate", Tag.Long(me.last_update))
+        root.insert("InhabitedTime", Tag.Long(me.inhabited_time))
+        root.insert("Status", format.statuses.encode(me.status))
+        if let b = me.blending {
+            root.insert("blending_data", blending_tag(b))
+        }
+        if let r = me.retrogen {
+            root.insert("below_zero_retrogen", retrogen_tag(format, r))
+        }
+        if let u = me.upgrade {
+            if not u.is_empty() {
+                root.insert("UpgradeData", upgrade_tag(format, u))
+            }
+        }
+        var section_tags = List<Tag>()
+        for i in 0..me.sections.len() {
+            var fields = JavaHashMap<String, Tag>()
+            if let blocks = me.sections[i].blocks {
+                fields.insert("block_states", container_tag(format, true, blocks.pack()))
+            }
+            if let biomes = me.sections[i].biomes {
+                if let e = me.sections[i].broken.take() {
+                    fail e
+                }
+                fields.insert("biomes", container_tag(format, false, biomes.pack()))
+            }
+            if let bytes = me.sections[i].block_light.take() {
+                fields.insert("BlockLight", Tag.ByteArray(bytes))
+            }
+            if let bytes = me.sections[i].sky_light.take() {
+                fields.insert("SkyLight", Tag.ByteArray(bytes))
+            }
+            if not fields.is_empty() {
+                fields.insert("Y", Tag.Byte(i8.wrap(me.sections[i].y)))
+                section_tags.push(Tag.Compound(fields))
+            }
+        }
+        root.insert("sections", Tag.List(section_tags))
+        if me.light_correct {
+            root.insert("isLightOn", Tag.Byte(1))
+        }
+        root.insert("block_entities", Tag.List(me.block_entities))
+        if me.status != format.full_status {
+            root.insert("entities", Tag.List(me.entities))
+        }
+        root.insert("block_ticks", ticks_tag(me.block_ticks, format.states.blocks))
+        root.insert("fluid_ticks", ticks_tag(me.fluid_ticks, format.fluids))
+        var post = List<Tag>()
+        for section in me.post_processing {
+            var list = List<Tag>()
+            if let packed = section {
+                for o in packed {
+                    list.push(Tag.Short(o))
+                }
+            }
+            post.push(Tag.List(list))
+        }
+        root.insert("PostProcessing", Tag.List(post))
+        var maps = JavaHashMap<String, Tag>()
+        let names = heightmap_names()
+        for k in 0..me.heightmaps.len() {
+            if let longs = me.heightmaps[k].take() {
+                maps.insert(names[k].copy(), Tag.LongArray(longs))
+            }
+        }
+        root.insert("Heightmaps", Tag.Compound(maps))
+        root.insert("structures", me.structures)
+        return Tag.Compound(root)
+    }
+}
+
+// A section from its compound, as `parse` reads one: its containers, if it's inside the world,
+// then its light.
+fn read_section(format: ChunkFormat, min_section: i32, sections: i32, fields: own JavaHashMap<String, Tag>, pos: ChunkPos, lines: mut List<Entry>) -> SectionData ! ChunkError {
+    var tags = fields
+    let y = i32(byte_or(tags, "Y", 0))
+    var blocks: PalettedContainer? = none
+    var biomes: PalettedContainer? = none
+    var broken: ChunkError? = none
+    if y >= min_section and y < min_section + sections {
+        var blocks_broken: ChunkError? = none
+        let block_values = match tags.remove("block_states") {
+            some(Tag.Compound(container)) => try read_container(format, true, container, pos, y, mut lines, mut blocks_broken),
+            _ => PalettedContainer.new(AIR_STATE, block_strategy()),
+        }
+        let biome_values = match tags.remove("biomes") {
+            some(Tag.Compound(container)) => try read_container(format, false, container, pos, y, mut lines, mut broken),
+            _ => PalettedContainer.new(format.plains, format.biome_strategy()),
+        }
+        // Vanilla counts the blocks once it has both, which is when it meets a value past the
+        // palette's end.
+        if let e = blocks_broken.take() {
+            fail e
+        }
+        blocks = some(block_values)
+        biomes = some(biome_values)
+    }
+    let block_light = try light(tags.remove("BlockLight"))
+    let sky_light = try light(tags.remove("SkyLight"))
+    return SectionData { y: y, blocks: blocks, biomes: biomes, block_light: block_light, sky_light: sky_light, broken: broken }
+}
+
+// Light as vanilla's `DataLayer` takes it: a byte array of 2,048 bytes, and nothing for anything
+// else.
+fn light(taken: own Tag?) -> List<i8>? ! ChunkError {
+    match taken {
+        some(Tag.ByteArray(bytes)) => {
+            if bytes.len() != 2048 {
+                fail ChunkError { exception: "IllegalArgumentException", message: "DataLayer should be 2048 bytes not: {bytes.len()}" }
+            }
+            return some(bytes)
+        },
+        _ => return none,
+    }
+}
+
+// A section's block states, or its biomes for `blocks` false, from their compound `fields`, as
+// the codecs of vanilla's `PalettedContainerFactory` read them and `parse` logs and throws what
+// they fail with. An entry that isn't a block or a biome becomes air or plains, logged. What
+// vanilla throws only when it reads the values, for a palette that's empty or that a value is
+// past the end of, goes in `broken`, with a container of air or plains in its place.
+fn read_container(format: ChunkFormat, blocks: bool, fields: own JavaHashMap<String, Tag>, pos: ChunkPos, y: i32, lines: mut List<Entry>, broken: mut ChunkError?) -> PalettedContainer ! ChunkError {
+    var tags = fields
+    let strategy = if blocks { block_strategy() } else { format.biome_strategy() }
+    let fallback = if blocks { AIR_STATE } else { format.plains }
+    if not tags.contains("palette") {
+        let message = "No key palette in MapLike[{Tag.Compound(tags).to_snbt()}]"
+        fail unreadable(pos, y, message, mut lines)
+    }
+    var data: List<i64>? = none
+    if let d = tags.remove("data") {
+        data = longs_of(d)
+    }
+    var entries = List<u32>()
+    var errors = List<String>()
+    match tags["palette"] {
+        Tag.List(items) => {
+            for item in items {
+                entry(format, blocks, item, mut entries, mut errors)
+            }
+        },
+        Tag.ByteArray(values) => {
+            for v in values {
+                entry(format, blocks, Tag.Byte(v), mut entries, mut errors)
+            }
+        },
+        Tag.IntArray(values) => {
+            for v in values {
+                entry(format, blocks, Tag.Int(v), mut entries, mut errors)
+            }
+        },
+        Tag.LongArray(values) => {
+            for v in values {
+                entry(format, blocks, Tag.Long(v), mut entries, mut errors)
+            }
+        },
+        _ => {
+            let message = "Not a list: {tags["palette"].to_snbt()}"
+            fail unreadable(pos, y, message, mut lines)
+        },
+    }
+    // The bits a palette of this size takes on disk, and whether it's an indexed one.
+    let count = entries.len()
+    let bits = ceil_log2(count)
+    let global = if blocks { bits > 8 } else { bits > 3 }
+    let stored = if blocks { bits.max(4) } else { bits.max(1) }
+    // Vanilla meets a block state past an indexed palette's end when it counts them, in the order
+    // of a fastutil map of the values, so those need the values again.
+    var kept: List<i64>? = none
+    if blocks and not global and count > 1 and (1u64 << stored) > u64(count) {
+        if let d = data {
+            kept = some(d.copy())
+        }
+    }
+    match PalettedContainer.unpack(strategy, Packed { palette: entries, data: data }) {
+        ok(container) => {
+            if not errors.is_empty() {
+                lines.push(Entry.error(recoverable(pos, y, newest_first(errors))))
+            }
+            return container
+        },
+        err(Error.Empty) => {
+            broken = some(ChunkError { exception: "IllegalStateException", message: "Missing Palette entry for id 0." })
+            return PalettedContainer.new(fallback, strategy)
+        },
+        err(Error.Index { index, .. }) => {
+            // With no palette, vanilla turns the indices into IDs as it reads them, and fails
+            // there, before it logs anything.
+            if global {
+                fail missing_entry(index)
+            }
+            if not errors.is_empty() {
+                lines.push(Entry.error(recoverable(pos, y, newest_first(errors))))
+            }
+            var first = index
+            if let longs = kept.take() {
+                first = first_counted_past(stored, strategy.size(), longs, count)
+            }
+            broken = some(missing_entry(first))
+            return PalettedContainer.new(fallback, strategy)
+        },
+        err(Error.MissingData) => {
+            let message = with_errors(errors, "Missing values for non-zero storage")
+            fail unreadable(pos, y, message, mut lines)
+        },
+        err(Error.Length { got, expected }) => {
+            let message = with_errors(errors, "Failed to read PalettedContainer: Invalid length given for storage, got: {got} but expected: {expected}")
+            fail unreadable(pos, y, message, mut lines)
+        },
+    }
+}
+
+// Adds the palette entry `tag` to `entries`: the block state or biome it names, or air or
+// plains, with why in `errors`.
+fn entry(format: ChunkFormat, blocks: bool, tag: Tag, entries: mut List<u32>, errors: mut List<String>) {
+    if blocks {
+        match format.states.decode(tag) {
+            ok(state) => entries.push(state),
+            err(message) => {
+                entries.push(AIR_STATE)
+                errors.push("({message} -> using default)")
+            },
+        }
+    } else {
+        match format.biomes.decode(tag) {
+            ok(biome) => entries.push(biome),
+            err(message) => {
+                entries.push(format.plains)
+                errors.push("({message} -> using default)")
+            },
+        }
+    }
+}
+
+// The first value past a palette of `count` entries among the `n` values in `longs`, `bits` bits
+// each, in the order vanilla's `PalettedContainer.count` meets them: its `Int2IntOpenHashMap`
+// of each value's count, in fastutil's order.
+fn first_counted_past(bits: i32, n: usize, longs: own List<i64>, count: usize) -> u32 {
+    let storage = match BitStorage.from_longs(bits, n, longs) {
+        ok(s) => s,
+        err(_) => return 0,
+    }
+    var seen = OpenHashSet<i32>()
+    for v in storage.values() {
+        seen.insert(i32.wrap(v))
+    }
+    for k in seen {
+        if usize.wrap(k) >= count {
+            return u32.wrap(k)
+        }
+    }
+    return 0
+}
+
+fn missing_entry(index: u32) -> ChunkError {
+    return ChunkError { exception: "MissingPaletteEntryException", message: "Missing Palette entry for index {index}." }
+}
+
+// The section's container couldn't be read: vanilla logs why, then throws it.
+fn unreadable(pos: ChunkPos, y: i32, message: own String, lines: mut List<Entry>) -> ChunkError {
+    lines.push(Entry.error(recoverable(pos, y, message)))
+    return ChunkError { exception: "ChunkReadException", message: message }
+}
+
+fn recoverable(pos: ChunkPos, y: i32, message: String) -> String {
+    return "Recoverable errors when loading section [{pos.x}, {y}, {pos.z}]: {message}"
+}
+
+// A container written as its codec writes it: the palette, then the data if there's any.
+fn container_tag(format: ChunkFormat, blocks: bool, packed: own Packed) -> Tag {
+    var p = packed
+    var palette = List<Tag>()
+    for v in p.palette {
+        palette.push(if blocks { format.states.encode(v) } else { format.biomes.encode(v) })
+    }
+    var fields = JavaHashMap<String, Tag>()
+    fields.insert("palette", Tag.List(palette))
+    if let longs = p.data.take() {
+        fields.insert("data", Tag.LongArray(longs))
+    }
+    return Tag.Compound(fields)
+}
+
+// The ticks at `key`, as `CompoundTag.read` reads them with their codec: those that can be read,
+// and why the rest can't, logged. `fallback`, for the upgrade data's ticks, is what one names
+// when its `i` can't be read.
+fn read_ticks(tags: JavaHashMap<String, Tag>, key: String, names: Names, fallback: u32?, lines: mut List<Entry>) -> List<SavedTick> {
+    var out = List<SavedTick>()
+    if not tags.contains(key) {
+        return out
+    }
+    var errors = List<String>()
+    match tags[key] {
+        Tag.List(items) => {
+            for item in items {
+                read_tick(item, names, fallback, mut out, mut errors)
+            }
+        },
+        Tag.ByteArray(values) => {
+            for v in values {
+                errors.push("Not a map: {Tag.Byte(v).to_snbt()}")
+            }
+        },
+        Tag.IntArray(values) => {
+            for v in values {
+                errors.push("Not a map: {Tag.Int(v).to_snbt()}")
+            }
+        },
+        Tag.LongArray(values) => {
+            for v in values {
+                errors.push("Not a map: {Tag.Long(v).to_snbt()}")
+            }
+        },
+        _ => errors.push("Not a list: {tags[key].to_snbt()}"),
+    }
+    if not errors.is_empty() {
+        lines.push(Entry.error(field_error(key, tags[key], newest_first(errors))))
+    }
+    return out
+}
+
+// Adds the tick `tag` to `out` as vanilla's `SavedTick.codec` reads it, or why it can't be read
+// to `errors`: each of its fields that can't be, the last first.
+fn read_tick(tag: Tag, names: Names, fallback: u32?, out: mut List<SavedTick>, errors: mut List<String>) {
+    match tag {
+        Tag.Compound(fields) => {
+            var problems = List<String>()
+            var kind: u32 = 0
+            if not fields.contains("i") {
+                problems.push(no_key("i", tag))
+            } else {
+                match names.decode(fields["i"]) {
+                    ok(k) => kind = k,
+                    err(message) => {
+                        if let f = fallback {
+                            kind = f
+                        } else {
+                            problems.push(message)
+                        }
+                    },
+                }
+            }
+            let x = int_field(tag, fields, "x", mut problems)
+            let y = int_field(tag, fields, "y", mut problems)
+            let z = int_field(tag, fields, "z", mut problems)
+            let delay = int_field(tag, fields, "t", mut problems)
+            let priority = int_field(tag, fields, "p", mut problems)
+            if not problems.is_empty() {
+                errors.push(newest_first(problems))
+                return
+            }
+            out.push(SavedTick { kind: kind, x: x, y: y, z: z, delay: delay, priority: priority.max(-3).min(3) })
+        },
+        _ => errors.push("Not a map: {tag.to_snbt()}"),
+    }
+}
+
+// The ticks of `ticks` in the chunk at `pos`, as `filterTickListForChunk` keeps them.
+fn in_chunk(ticks: own List<SavedTick>, pos: ChunkPos) -> List<SavedTick> {
+    var out = List<SavedTick>()
+    for t in ticks {
+        if t.x >> 4 == pos.x and t.z >> 4 == pos.z {
+            out.push(SavedTick { kind: t.kind, x: t.x, y: t.y, z: t.z, delay: t.delay, priority: t.priority })
+        }
+    }
+    return out
+}
+
+fn ticks_tag(ticks: List<SavedTick>, names: Names) -> Tag {
+    var out = List<Tag>()
+    for t in ticks {
+        var fields = JavaHashMap<String, Tag>()
+        fields.insert("i", names.encode(t.kind))
+        fields.insert("x", Tag.Int(t.x))
+        fields.insert("y", Tag.Int(t.y))
+        fields.insert("z", Tag.Int(t.z))
+        fields.insert("t", Tag.Int(t.delay))
+        fields.insert("p", Tag.Int(t.priority))
+        out.push(Tag.Compound(fields))
+    }
+    return Tag.List(out)
+}
+
+// The upgrade data in `fields`, as vanilla's `UpgradeData` reads it for a world of `sections`
+// sections.
+fn read_upgrade(format: ChunkFormat, fields: JavaHashMap<String, Tag>, sections: i32, lines: mut List<Entry>) -> Upgrade {
+    var indices = List<List<i32>?>()
+    for i in 0..sections {
+        var index: List<i32>? = none
+        if fields.contains("Indices") {
+            match fields["Indices"] {
+                Tag.Compound(by_section) => {
+                    let key = "{i}"
+                    if by_section.contains(key) {
+                        match by_section[key] {
+                            Tag.IntArray(values) => index = some(values.copy()),
+                            _ => {},
+                        }
+                    }
+                },
+                _ => {},
+            }
+        }
+        indices.push(index)
+    }
+    let sides = u8.wrap(int_or(fields, "Sides", 0) & 0xFF)
+    let block_ticks = read_ticks(fields, "neighbor_block_ticks", format.states.blocks, some(format.air_block), mut lines)
+    let fluid_ticks = read_ticks(fields, "neighbor_fluid_ticks", format.fluids, some(format.empty_fluid), mut lines)
+    return Upgrade { indices: indices, sides: sides, neighbor_block_ticks: block_ticks, neighbor_fluid_ticks: fluid_ticks }
+}
+
+fn upgrade_tag(format: ChunkFormat, upgrade: Upgrade) -> Tag {
+    var fields = JavaHashMap<String, Tag>()
+    var indices = JavaHashMap<String, Tag>()
+    for i in 0..upgrade.indices.len() {
+        if let values = upgrade.indices[i] {
+            if not values.is_empty() {
+                indices.insert("{i}", Tag.IntArray(values.copy()))
+            }
+        }
+    }
+    if not indices.is_empty() {
+        fields.insert("Indices", Tag.Compound(indices))
+    }
+    fields.insert("Sides", Tag.Byte(i8.wrap(upgrade.sides)))
+    if not upgrade.neighbor_block_ticks.is_empty() {
+        fields.insert("neighbor_block_ticks", ticks_tag(upgrade.neighbor_block_ticks, format.states.blocks))
+    }
+    if not upgrade.neighbor_fluid_ticks.is_empty() {
+        fields.insert("neighbor_fluid_ticks", ticks_tag(upgrade.neighbor_fluid_ticks, format.fluids))
+    }
+    return Tag.Compound(fields)
+}
+
+// Blending data as `BlendingData.Packed.CODEC` reads it, or why it can't be.
+fn read_blending(tag: Tag) -> Blending ! String {
+    match tag {
+        Tag.Compound(fields) => {
+            var problems = List<String>()
+            let min_section = int_field(tag, fields, "min_section", mut problems)
+            let max_section = int_field(tag, fields, "max_section", mut problems)
+            if not problems.is_empty() {
+                fail newest_first(problems)
+            }
+            // A list of heights that isn't all numbers is left out, as if it weren't there.
+            var heights: List<f32>? = none
+            if fields.contains("heights") {
+                heights = floats_of(fields["heights"])
+            }
+            if let h = heights {
+                if h.len() != 16 {
+                    fail "heights has to be of length 16"
+                }
+            }
+            return Blending { min_section: min_section, max_section: max_section, heights: heights }
+        },
+        _ => fail "Not a map: {tag.to_snbt()}",
+    }
+}
+
+fn blending_tag(blending: Blending) -> Tag {
+    var fields = JavaHashMap<String, Tag>()
+    fields.insert("min_section", Tag.Int(blending.min_section))
+    fields.insert("max_section", Tag.Int(blending.max_section))
+    if let heights = blending.heights {
+        var list = List<Tag>()
+        for h in heights {
+            list.push(Tag.float(h))
+        }
+        fields.insert("heights", Tag.List(list))
+    }
+    return Tag.Compound(fields)
+}
+
+// Below-zero retrogen as `BelowZeroRetrogen.CODEC` reads it, or why it can't be.
+fn read_retrogen(format: ChunkFormat, tag: Tag) -> Retrogen ! String {
+    match tag {
+        Tag.Compound(fields) => {
+            if not fields.contains("target_status") {
+                fail no_key("target_status", tag)
+            }
+            let status = try format.statuses.decode(fields["target_status"])
+            if status == format.empty_status {
+                fail "target_status cannot be empty"
+            }
+            // Missing bedrock that isn't a list of numbers is left out, as if it weren't there.
+            var bedrock = List<i64>()
+            if fields.contains("missing_bedrock") {
+                if let longs = longs_view(fields["missing_bedrock"]) {
+                    bedrock = longs
+                }
+            }
+            while bedrock.len() > 0 and bedrock[bedrock.len() - 1] == 0 {
+                _ = bedrock.pop()
+            }
+            return Retrogen { target_status: status, missing_bedrock: bedrock }
+        },
+        _ => fail "Not a map: {tag.to_snbt()}",
+    }
+}
+
+fn retrogen_tag(format: ChunkFormat, retrogen: Retrogen) -> Tag {
+    var fields = JavaHashMap<String, Tag>()
+    fields.insert("target_status", format.statuses.encode(retrogen.target_status))
+    if not retrogen.missing_bedrock.is_empty() {
+        fields.insert("missing_bedrock", Tag.LongArray(retrogen.missing_bedrock.copy()))
+    }
+    return Tag.Compound(fields)
+}
+
+// A section's blocks to update after generation, as `parse` reads them: a list's numbers as
+// shorts, 0 for anything else, and none for anything but a list, or an empty one.
+fn offsets(tag: Tag) -> List<i16>? {
+    match tag {
+        Tag.List(items) => {
+            if items.is_empty() {
+                return none
+            }
+            var out = List<i16>()
+            for item in items {
+                out.push(item.short_value() ?? 0i16)
+            }
+            return some(out)
+        },
+        _ => return none,
+    }
+}
+
+// The compounds in a list, as `getList(...).stream().flatMap(ListTag::compoundStream)` keeps
+// them, or none for anything but a list.
+fn compounds(taken: own Tag?) -> List<Tag> {
+    var out = List<Tag>()
+    match taken {
+        some(Tag.List(items)) => {
+            var rest = reversed(items)
+            while let t = rest.pop() {
+                if is_compound(t) {
+                    out.push(t)
+                }
+            }
+        },
+        _ => {},
+    }
+    return out
+}
+
+// `items` the other way round, so that popping them gives them in their order.
+fn reversed(items: own List<Tag>) -> List<Tag> {
+    var rest = items
+    var out = List<Tag>()
+    out.reserve(rest.len())
+    while let t = rest.pop() {
+        out.push(t)
+    }
+    return out
+}
+
+// The numbers `Codec.LONG_STREAM` reads from `tag`, for a container's data: a long array as it
+// is, without a copy, the other arrays widened, and a list's numbers if every element is one.
+fn longs_of(tag: own Tag) -> List<i64>? {
+    match tag {
+        Tag.LongArray(values) => return some(values),
+        _ => return longs_view(tag),
+    }
+}
+
+fn longs_view(tag: Tag) -> List<i64>? {
+    var out = List<i64>()
+    match tag {
+        Tag.LongArray(values) => return some(values.copy()),
+        Tag.IntArray(values) => {
+            for v in values {
+                out.push(i64(v))
+            }
+        },
+        Tag.ByteArray(values) => {
+            for v in values {
+                out.push(i64(v))
+            }
+        },
+        Tag.List(items) => {
+            for item in items {
+                let v = item.number_long() else return none
+                out.push(v)
+            }
+        },
+        _ => return none,
+    }
+    return some(out)
+}
+
+// The numbers `Codec.FLOAT.listOf()` reads from `tag`, if every element is one.
+fn floats_of(tag: Tag) -> List<f32>? {
+    var out = List<f32>()
+    match tag {
+        Tag.List(items) => {
+            for item in items {
+                let v = item.number_float() else return none
+                out.push(v)
+            }
+        },
+        Tag.ByteArray(values) => {
+            for v in values {
+                out.push(f32(v))
+            }
+        },
+        Tag.IntArray(values) => {
+            for v in values {
+                out.push(f32.nearest(v))
+            }
+        },
+        Tag.LongArray(values) => {
+            for v in values {
+                out.push(f32.nearest(v))
+            }
+        },
+        _ => return none,
+    }
+    return some(out)
+}
+
+// The field `key` of the compound `map`, whose tags are `fields`, as `Codec.INT.fieldOf` reads it,
+// or 0 with why it can't be in `problems`.
+fn int_field(map: Tag, fields: JavaHashMap<String, Tag>, key: String, problems: mut List<String>) -> i32 {
+    if not fields.contains(key) {
+        problems.push(no_key(key, map))
+        return 0
+    }
+    if let v = fields[key].number_int() {
+        return v
+    }
+    problems.push(String("Not a number"))
+    return 0
+}
+
+fn no_key(key: String, map: Tag) -> String {
+    return "No key {key} in MapLike[{map.to_snbt()}]"
+}
+
+// What `CompoundTag.read` logs when the field `key`, holding `tag`, can't be read.
+fn field_error(key: String, tag: Tag, message: String) -> String {
+    return "Failed to read field ({key}={tag.to_logged()}): {message}"
+}
+
+// Errors as DataFixerUpper joins those of a record's fields or a list's elements: the last first.
+fn newest_first(errors: List<String>) -> String {
+    var out = String()
+    var i = errors.len()
+    while i > 0 {
+        i -= 1
+        out.push_str(errors[i])
+        if i > 0 {
+            out.push_str("; ")
+        }
+    }
+    return out
+}
+
+// `message` after a list's errors, as `DataResult.flatMap` appends a failure to a partial result.
+fn with_errors(errors: List<String>, message: String) -> String {
+    if errors.is_empty() {
+        return message.copy()
+    }
+    return "{newest_first(errors)}; {message}"
+}
+
+fn int_or(tags: JavaHashMap<String, Tag>, key: String, fallback: i32) -> i32 {
+    if tags.contains(key) {
+        if let v = tags[key].int_value() {
+            return v
+        }
+    }
+    return fallback
+}
+
+fn long_or(tags: JavaHashMap<String, Tag>, key: String, fallback: i64) -> i64 {
+    if tags.contains(key) {
+        if let v = tags[key].long_value() {
+            return v
+        }
+    }
+    return fallback
+}
+
+fn byte_or(tags: JavaHashMap<String, Tag>, key: String, fallback: i8) -> i8 {
+    if tags.contains(key) {
+        if let v = tags[key].byte_value() {
+            return v
+        }
+    }
+    return fallback
+}
+
+fn is_string(tag: Tag) -> bool {
+    return match tag {
+        Tag.Str(_) => true,
+        _ => false,
+    }
+}
+
+fn is_compound(tag: Tag) -> bool {
+    return match tag {
+        Tag.Compound(_) => true,
+        _ => false,
+    }
+}
+
+// The fewest bits that number `n` values.
+fn ceil_log2(n: usize) -> i32 {
+    var bits: i32 = 0
+    while (1u64 << bits) < u64(n) {
+        bits += 1
+    }
+    return bits
+}
+
+// Where the built-in registry `name` is among those of `registries`.
+fn builtin(registries: Registries, name: String) -> usize ! String {
+    for i in 0..registries.builtin.len() {
+        if registries.builtin[i].name.path == name {
+            return i
+        }
+    }
+    fail "there's no {name} registry"
+}

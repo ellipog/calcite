@@ -46,6 +46,10 @@ def ids_module(index, packets):
         f"/// The protocol version a {index['game_version']} client sends in its handshake.",
         f"pub const PROTOCOL_VERSION: i32 = {int(index['protocol_version'])}",
         "",
+        f"/// The data version {index['game_version']} writes in its saves as `DataVersion`, which says which version wrote",
+        "/// them.",
+        f"pub const DATA_VERSION: i32 = {int(index['world_version'])}",
+        "",
         "/// The game version, as the server list shows it.",
         f"pub fn game_version() -> String {{",
         f"    return \"{index['game_version']}\"",
@@ -136,6 +140,25 @@ def blocks_module(index, blocks):
         raise ValueError(f"blocks.json's blocks have {first} states, not the {blocks['state_count']} it says")
     firsts = ", ".join(str(b["first_state"]) for b in entries)
     defaults = ", ".join(str(b["default_state"] - b["first_state"]) for b in entries)
+    properties = blocks["properties"]
+    for b in entries:
+        names = [properties[i]["name"] for i in b["properties"]]
+        if names != sorted(names) or len(set(names)) != len(names):
+            raise ValueError(f"{b['name']}'s properties aren't in name order")
+        count = 1
+        for i in b["properties"]:
+            count *= len(properties[i]["values"])
+        if count != b["state_count"]:
+            raise ValueError(f"{b['name']}'s properties make {count} states, not {b['state_count']}")
+    for prop in properties:
+        for v in [prop["name"], *prop["values"]]:
+            if '"' in v or "\\" in v or "{" in v:
+                raise ValueError(f"{v!r} can't be written in a Calx string")
+    starts = [0]
+    for b in entries:
+        starts.append(starts[-1] + len(b["properties"]))
+    listed = ", ".join(str(i) for b in entries for i in b["properties"])
+    values = ", ".join(f"[{strings(prop['values'])}]" for prop in properties)
     lines = [
         f"/// Vanilla {index['game_version']}'s block state IDs: a block's states are numbered on from the last",
         "/// state of the block before it, in block ID order, which is the order of `registry.builtin`'s",
@@ -154,6 +177,31 @@ def blocks_module(index, blocks):
         "/// Where each block's default state is among its states, in block ID order.",
         "pub fn default_offsets() -> List<u32> {",
         f"    return [{defaults}]",
+        "}",
+        "",
+        "/// The properties of blocks' states, by name. Several share a name, such as `age`, with other",
+        "/// values.",
+        "pub fn property_names() -> List<String> {",
+        f"    return [{strings(prop['name'] for prop in properties)}]",
+        "}",
+        "",
+        "/// Each property's values, in vanilla's order, which is the order of the states: `true` before",
+        "/// `false`, and an integer's from the least.",
+        "pub fn property_values() -> List<List<String>> {",
+        f"    return [{values}]",
+        "}",
+        "",
+        "/// Where each block's properties start in `block_properties`, in block ID order, and where the",
+        "/// last one's end.",
+        "pub fn property_starts() -> List<u32> {",
+        f"    return [{', '.join(str(s) for s in starts)}]",
+        "}",
+        "",
+        "/// Each block's properties, by their index in `property_names`, in name order. A state's ID is",
+        "/// its block's first state's plus, for each property, its value's index times the states the",
+        "/// properties after it make, so the last one's changes fastest.",
+        "pub fn block_properties() -> List<u32> {",
+        f"    return [{listed}]",
         "}",
         "",
     ]

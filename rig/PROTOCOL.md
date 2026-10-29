@@ -385,6 +385,16 @@ Input `{"ops": [...]}`, with blobs. A chunk is at `x` and `z` in the region, 0 t
 
 A chunk of 256 sectors or more goes in its own file, with a stub that names the region file's compression, deflate, so its bytes must be deflate's, as they always are in a world that saves with it. An operation on a file that isn't open, a chunk outside the region, a blob that isn't there and an operation it doesn't have are an `error` status.
 
+### `chunk_nbt` (v1)
+
+A chunk's NBT as a region file holds it, read by vanilla's `SerializableChunkData.parse` and written back by its `write`, as a chunk is loaded and saved again. The containers' block states come from the built-in registry and their biomes from the vanilla data pack's, as `registries` loads them.
+
+Input `{"min_y": -64, "sections": 24, "snbt": "{...}"}`, with no blobs: the world's lowest block, a multiple of 16, how many sections high it is, the sections within -2032 to 2032, and the chunk's NBT as SNBT, which must be a compound.
+
+The result is one blob. First what was logged while it was read and written: an `int` count of lines, then for each its level as a byte, 1 for a warning and 2 for an error, and its message as `region` writes one. Then a byte: 0 if `parse` gives null, for a chunk without a `Status` string; 1, then an `int` length and the NBT written, as `NbtIo.write` writes a file's root, its type, an empty name and its payload; or 2, then the simple class name of what was thrown and its message, each as a message, the message empty if it has none. A chunk can throw as it's read or as it's written: a section's biomes with a value past their palette's end throw only when it's written.
+
+A `min_y` that isn't a multiple of 16, sections outside the range, blobs and SNBT that isn't a compound are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

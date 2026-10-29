@@ -115,10 +115,10 @@ py -I oracle/datagen/calx_tables.py --check    # fail if a committed one is out 
 
 | Module | From | What it holds |
 | --- | --- | --- |
-| `src/protocol/ids.calx` | `index.json`, `packets.json` | `PROTOCOL_VERSION`, `game_version()`, and `packet_names(state, bound)`, each state's packets in ID order, which `@packet` reads its IDs from |
+| `src/protocol/ids.calx` | `index.json`, `packets.json` | `PROTOCOL_VERSION`, `DATA_VERSION`, the data version saves are written with, `game_version()`, and `packet_names(state, bound)`, each state's packets in ID order, which `@packet` reads its IDs from |
 | `src/registry/builtin.calx` | `registries.json` | `builtin_names()`, the 95 built-in registries in the order of their IDs, and `builtin_entries(i)`, each one's entries in ID order |
 | `src/pack/pin.calx` | `../versions.json` | `jar_version()`, `jar_url()`, `jar_sha1()` and `JAR_SIZE`: the pinned server jar, which the rig checks; `client_url()`, `CLIENT_SIZE`, `DATA_OFFSET`, `DATA_LENGTH` and `data_sha256()`: the pinned client jar and the stretch of it holding the vanilla data, which the server reads or downloads and checks (D140) |
-| `src/world/blocks.calx` | `blocks.json` | `STATE_COUNT`, `first_states()`, each block's first state ID, and `default_offsets()`, where its default state is among its states, in block ID order |
+| `src/world/blocks.calx` | `blocks.json` | `STATE_COUNT`, `first_states()`, each block's first state ID, and `default_offsets()`, where its default state is among its states, in block ID order; `property_names()` and `property_values()`, every property and its values in vanilla's order, and `property_starts()` and `block_properties()`, each block's properties by name, which `world.states` names states with |
 | `src/world/block_flags.calx` | `../block_flags.json` | The flags' constants, and `state_flags()`, each state's flags in ID order. The 35,723 states are a printable character each, an index into the 102 different values, commonest first, in lines of 96; the 13 rarest take two, after `~`. It's decoded once, as the server starts |
 
 They're committed, and hold only the names, IDs and facts about states the protocol and the world need, which every compatible server encodes. Don't edit one: change the script and run it again. A new game version that changes them changes Calcite's build, which is the point: `@packet` then fails to compile for a packet that was renamed or removed.
