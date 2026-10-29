@@ -1,0 +1,264 @@
+/// Feeds every decoder of what a client sends bytes no client would: random bodies after each
+/// packet ID of each state, then those that decoded, changed a byte at a time, cut short and run
+/// on; and random streams to the frame reader and the decompressor. Each must give a packet or
+/// an error. A panic, an overflow or an allocation sized by a length the bytes claim would end
+/// the server, and ends this test instead. The random source is seeded, so a failure repeats.
+module test.fuzz
+
+import protocol.compression.{compress, decompress}
+import protocol.configuration.{ConfigurationIn}
+import protocol.frame.{FrameReader}
+import protocol.handshake.{HandshakeIn}
+import protocol.ids.{packet_names}
+import protocol.login.{LoginIn}
+import protocol.play.{PlayIn}
+import protocol.state.{State, Bound}
+import protocol.status.{StatusIn}
+import protocol.wire.{Reader, Writer}
+import random.legacy.{LegacyRandom}
+
+// Random bodies for each packet ID, and changed copies of those that decode.
+const BODIES_PER_ID: i32 = 300
+const MUTATIONS: i32 = 6000
+
+// Bytes that mean the most to a decoder: a VarInt that goes on, one that ends, the largest
+// byte, the sign bit, and a length of 1.
+const SPECIAL: [u8; 6] = [0x80, 0x7F, 0xFF, 0x00, 0x01, 0xC0]
+
+// Whether `bytes`, a packet's ID then its fields, decodes in `state`.
+fn decodes(state: State, bytes: own List<u8>) -> bool {
+    var r = Reader.new(bytes)
+    return match state {
+        State.Handshake => match HandshakeIn.read(mut r) { ok(_) => true, err(_) => false },
+        State.Status => match StatusIn.read(mut r) { ok(_) => true, err(_) => false },
+        State.Login => match LoginIn.read(mut r) { ok(_) => true, err(_) => false },
+        State.Configuration => match ConfigurationIn.read(mut r) { ok(_) => true, err(_) => false },
+        State.Play => match PlayIn.read(mut r) { ok(_) => true, err(_) => false },
+    }
+}
+
+// A random byte, a special one a third of the time.
+fn byte(rng: mut LegacyRandom) -> u8 {
+    if rng.next_int_below(3) == 0 {
+        return SPECIAL[usize.wrap(rng.next_int_below(6))]
+    }
+    return u8.wrap(rng.next_int())
+}
+
+// A random length: mostly short, sometimes long enough for a string or a key.
+fn length(rng: mut LegacyRandom) -> i32 {
+    return match rng.next_int_below(20) {
+        0 => rng.next_int_below(4096),
+        1 | 2 | 3 | 4 => rng.next_int_below(512),
+        _ => rng.next_int_below(48),
+    }
+}
+
+// The packet ID, then `n` random bytes.
+fn body(rng: mut LegacyRandom, id: i32, n: i32) -> List<u8> {
+    var w = Writer.new()
+    w.varint(id)
+    for _ in 0..n {
+        w.u8(byte(mut rng))
+    }
+    return w.into_bytes()
+}
+
+// A copy of `bytes` changed one way: bytes overwritten, cut short, run on, a stretch repeated,
+// or a VarInt-sized hole of 0xFF.
+fn mutate(rng: mut LegacyRandom, bytes: List<u8>) -> List<u8> {
+    var out = bytes.copy()
+    let n = i32.wrap(out.len())
+    match rng.next_int_below(5) {
+        0 => {
+            for _ in 0..1 + rng.next_int_below(4) {
+                if n > 0 {
+                    out[usize.wrap(rng.next_int_below(n))] = byte(mut rng)
+                }
+            }
+        },
+        1 => {
+            if n > 1 {
+                out.truncate(usize.wrap(1 + rng.next_int_below(n - 1)))
+            }
+        },
+        2 => {
+            for _ in 0..1 + rng.next_int_below(16) {
+                out.push(byte(mut rng))
+            }
+        },
+        3 => {
+            if n > 2 {
+                let from = rng.next_int_below(n)
+                let len = 1 + rng.next_int_below(n - from)
+                for i in from..from + len {
+                    out.push(bytes[usize.wrap(i)])
+                }
+            }
+        },
+        _ => {
+            if n > 1 {
+                let at = usize.wrap(1 + rng.next_int_below(n - 1))
+                for k in 0..5usize {
+                    if at + k < out.len() {
+                        out[at + k] = 0xFF
+                    }
+                }
+            }
+        },
+    }
+    return out
+}
+
+fn decoders() {
+    var rng = LegacyRandom.new(26)
+    var tried = 0
+    var decoded = 0
+    for state in [State.Handshake, State.Status, State.Login, State.Configuration, State.Play] {
+        let count = i32.wrap(packet_names(state, Bound.Serverbound).len())
+        // Each packet's ID, and some that aren't any packet's.
+        var ids: List<i32> = [-1, count, 127, 128, 0x7FFFFFFF]
+        for id in 0..count {
+            ids.push(id)
+        }
+        var good = List<List<u8>>()
+        for id in ids {
+            for _ in 0..BODIES_PER_ID {
+                let n = length(mut rng)
+                let bytes = body(mut rng, id, n)
+                tried += 1
+                if decodes(state, bytes.copy()) {
+                    decoded += 1
+                    if good.len() < 512 {
+                        good.push(bytes)
+                    }
+                }
+            }
+            // The fields with nothing after them: an empty packet decodes only if it has none.
+            tried += 1
+            if decodes(state, body(mut rng, id, 0)) {
+                decoded += 1
+            }
+        }
+        if good.is_empty() {
+            continue
+        }
+        for _ in 0..MUTATIONS {
+            let from = good[usize.wrap(rng.next_int_below(i32.wrap(good.len())))].copy()
+            tried += 1
+            if decodes(state, mutate(mut rng, from)) {
+                decoded += 1
+            }
+        }
+    }
+    println("{tried} packets, {decoded} decoded")
+}
+
+// Streams of frames, some whole and some random bytes, arriving in pieces of any size: the
+// reader gives whole frames, waits for more, or fails, after which a connection is closed, so a
+// new reader starts.
+fn frame_streams() {
+    var rng = LegacyRandom.new(27)
+    var frames = 0
+    var failures = 0
+    var stalled = 0
+    var reader = FrameReader.new()
+    var stream = List<u8>()
+    for _ in 0..20000 {
+        if rng.next_int_below(4) == 0 {
+            for _ in 0..length(mut rng) {
+                stream.push(byte(mut rng))
+            }
+        } else {
+            let n = rng.next_int_below(300)
+            var w = Writer.new()
+            w.varint(n)
+            for _ in 0..n {
+                w.u8(byte(mut rng))
+            }
+            for b in w.into_bytes() {
+                stream.push(b)
+            }
+        }
+        // A piece of what's come so far arrives.
+        let piece = usize.wrap(rng.next_int_below(i32.wrap(stream.len()) + 1))
+        var chunk = List<u8>()
+        for i in 0..piece {
+            chunk.push(stream[i])
+        }
+        var rest = List<u8>()
+        for i in piece..stream.len() {
+            rest.push(stream[i])
+        }
+        stream = rest
+        reader.push(chunk)
+        loop {
+            match reader.next() {
+                ok(some(_)) => frames += 1,
+                ok(none) => break,
+                err(_) => {
+                    failures += 1
+                    reader = FrameReader.new()
+                    break
+                },
+            }
+        }
+        // A frame that claims more than ever comes waits until the read timeout closes its
+        // connection.
+        if reader.waiting() > 4096 {
+            stalled += 1
+            reader = FrameReader.new()
+        }
+    }
+    println("{frames} frames, {failures} broken streams, {stalled} timed out")
+}
+
+// Compressed bodies, with the server's threshold: real ones, changed as packets are, and ones
+// that claim any length and hold anything.
+fn compressed() {
+    var rng = LegacyRandom.new(28)
+    var inflated = 0
+    for _ in 0..20000 {
+        if rng.next_boolean() {
+            let n = 256 + rng.next_int_below(2048)
+            var packet = List<u8>()
+            for _ in 0..n {
+                packet.push(if rng.next_boolean() { 0 } else { byte(mut rng) })
+            }
+            let real = compress(packet, 256)!
+            match decompress(mutate(mut rng, real), 256) {
+                ok(_) => inflated += 1,
+                err(_) => {},
+            }
+            continue
+        }
+        var w = Writer.new()
+        // A claimed length: none, under the threshold, over the maximum, or anything.
+        w.varint(match rng.next_int_below(4) {
+            0 => 0,
+            1 => rng.next_int_below(256),
+            2 => 8388608 + rng.next_int_below(1000),
+            _ => rng.next_int(),
+        })
+        // A zlib header half the time, so the inflater gets past it.
+        if rng.next_boolean() {
+            w.u8(0x78)
+            w.u8(0x9C)
+        }
+        for _ in 0..length(mut rng) {
+            w.u8(byte(mut rng))
+        }
+        match decompress(w.into_bytes(), 256) {
+            ok(_) => inflated += 1,
+            err(_) => {},
+        }
+    }
+    println("{inflated} inflated")
+}
+
+fn main() {
+    decoders()
+    frame_streams()
+    compressed()
+    println("ok")
+}
