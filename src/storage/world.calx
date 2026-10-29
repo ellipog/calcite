@@ -1,0 +1,386 @@
+/// A world's folder, as vanilla's `LevelStorageSource` and its `LevelStorageAccess` keep one:
+/// locked with `session.lock` while a server has it, its `level.dat` read with the
+/// `level.dat_old` fallback and replaced safely, 26.3's layout of folders, and NBT files gzipped
+/// as `NbtIo` writes them. Paths are written as Java's `Path` writes them, with the system's
+/// separator, as vanilla's messages show them.
+///
+/// Vanilla also refuses a world folder with a symbolic link in it that `allowed_symlinks.txt`
+/// doesn't allow, which Calcite doesn't check yet (CAL-73).
+module storage.world
+
+import nbt.tag.{Accounter, Tag, read_unnamed}
+import resources.identifier.{Identifier}
+import server.log.{Entry}
+import std.crypto.{random_bytes}
+import std.fs.{FileLock, FsError, Kind, is_dir, is_file, kind, make_dir_all, read, real_path, remove_dir, remove_file, rename, separator, try_lock, write, write_parts}
+import std.time.{DateTime}
+import std.zlib.{Error, Format, compress, decompress_into}
+
+/// How much reading `level.dat` may take, vanilla's `NbtAccounter.uncompressedQuota()`: 100 MiB.
+pub const LEVEL_QUOTA: i64 = 104857600
+
+// The most an NBT file is inflated to, the most a Java array holds.
+const MOST: usize = 2147483647
+
+/// A world's folder, locked while it's held, as vanilla's `LevelStorageAccess`.
+pub struct WorldFolder {
+    /// The folder, as Java's `Path` writes it, such as `.\world` or `./world`.
+    pub path: String
+    /// The world's name, `level-name`, vanilla's level ID.
+    pub name: String
+    lock: FileLock
+}
+
+impl WorldFolder {
+    /// The folder `name` in `universe`, as `LevelStorageSource.validateAndCreateAccess` opens
+    /// it: made if it's missing, then locked with `session.lock` as `DirectoryLock.create` locks
+    /// it, writing `☃` at its start. Fails with the exception vanilla's `Main` logs, such as
+    /// `net.minecraft.util.DirectoryLock$LockException: C:\srv\.\world\session.lock: already
+    /// locked (possibly by other Minecraft instance?)` if another server has it.
+    pub fn open(universe: String, name: String) -> WorldFolder ! String {
+        let path = if name.is_empty() { universe.copy() } else { join(universe, name) }
+        match kind(path) {
+            ok(some(Kind.File)) => {
+                fail "java.io.IOException: Path {path} is not a directory"
+            },
+            _ => {},
+        }
+        match make_dir_all(path) {
+            ok => {},
+            err(e) => {
+                fail exception(e, path)
+            },
+        }
+        let lock_path = join(path, "session.lock")
+        let snowman: List<u8> = [226, 152, 131]
+        let lock = match try_lock(lock_path, snowman) {
+            ok(some(l)) => l,
+            ok(none) => {
+                fail "net.minecraft.util.DirectoryLock$LockException: {absolute(lock_path)}: already locked (possibly by other Minecraft instance?)"
+            },
+            err(e) => {
+                fail exception(e, lock_path)
+            },
+        }
+        return WorldFolder { path: path, name: name.copy(), lock: lock }
+    }
+
+    /// Lets the lock go, as `safeClose` does, logging vanilla's warning if it can't.
+    pub fn close(own self, lines: mut List<Entry>) {
+        let name = self.name.copy()
+        match self.lock.release() {
+            ok => {},
+            err(_) => lines.push(Entry.warn("Failed to unlock access to level {name}")),
+        }
+    }
+
+    /// What's at `resource` in the folder, a path such as `players/data`, vanilla's
+    /// `getLevelPath`.
+    pub fn resource(self, resource: String) -> String {
+        return join(self.path, resource)
+    }
+
+    /// The folder of a dimension's region files, entities and data, as
+    /// `DimensionType.getStorageFolder` names it: `dimensions/minecraft/overworld` and the like.
+    pub fn dimension(self, id: Identifier) -> String {
+        return join(self.path, "dimensions/{id.namespace}/{id.path}")
+    }
+
+    /// Whether there's a world here already, a `level.dat` or a `level.dat_old`, as
+    /// `hasWorldData` asks.
+    pub fn has_level(self) -> bool {
+        return exists(self.resource("level.dat")) or exists(self.resource("level.dat_old"))
+    }
+
+    /// The `Data` of the world's `level.dat`, as `getUnfixedDataTagWithFallback` reads it: if
+    /// `level.dat` can't be read, `level.dat_old` is, and moved over it once the one that
+    /// couldn't be is kept as `level.dat_corrupted_` and the time `now`, local, as vanilla does,
+    /// with its lines. `none` if neither can be read, which stops the server, as vanilla's
+    /// `Main` stops, logging the error "Failed to load world data. World files may be
+    /// corrupted. Shutting down.".
+    pub fn load_level(self, now: DateTime, lines: mut List<Entry>) -> JavaHashMap<String, Tag>? {
+        let main = self.resource("level.dat")
+        match read_level(main) {
+            ok(data) => return some(data),
+            err(_) => {},
+        }
+        let old = self.resource("level.dat_old")
+        lines.push(Entry.warn("Failed to load world data from {main}"))
+        lines.push(Entry.info("Attempting to use fallback {old}"))
+        let data = match read_level(old) {
+            ok(d) => d,
+            err(_) => return none,
+        }
+        let corrupted = join(self.path, "level.dat_corrupted_{file_date(now)}")
+        _ = safe_replace(main, old, corrupted, true, mut lines)
+        return some(data)
+    }
+
+    /// Writes `data` as the world's `level.dat`, under `Data`, as `saveLevelData` does: to a new
+    /// file in the folder, then moved over `level.dat` with `safe_replace`, the old one kept as
+    /// `level.dat_old`. What goes wrong is logged, as vanilla logs it.
+    pub fn save_level(self, data: own Tag, lines: mut List<Entry>) {
+        var root = JavaHashMap<String, Tag>()
+        root.insert(String("Data"), data)
+        let temp = match write_temp(self.path, "level", ".dat", Tag.Compound(root)) {
+            ok(t) => t,
+            err(_) => {
+                lines.push(Entry.error("Failed to save level {self.path}"))
+                return
+            },
+        }
+        _ = safe_replace(self.resource("level.dat"), temp, self.resource("level.dat_old"), false, mut lines)
+    }
+}
+
+// The `Data` of a `level.dat`, as `getUnfixedDataTag` reads it, an empty compound if it isn't
+// one.
+fn read_level(path: String) -> JavaHashMap<String, Tag> ! String {
+    var accounter = Accounter.with_quota(LEVEL_QUOTA)
+    let root = try read_compressed(path, mut accounter)
+    if root.contains("Data") {
+        match root["Data"] {
+            Tag.Compound(data) => return data.copy(),
+            _ => {},
+        }
+    }
+    return JavaHashMap<String, Tag>()
+}
+
+/// The compound a gzipped NBT file holds, as `NbtIo.readCompressed` reads it, or why it can't
+/// be read. Like Java's `GZIPInputStream`, which checks a stream's length and CRC-32 only once
+/// it's read to the end, and vanilla stops reading at the end of the NBT, a stream whose end is
+/// cut off or wrong is read as far as it goes.
+pub fn read_compressed(path: String, accounter: mut Accounter) -> JavaHashMap<String, Tag> ! String {
+    let bytes = match read(path) {
+        ok(b) => b,
+        err(e) => {
+            fail exception(e, path)
+        },
+    }
+    var raw = List<u8>()
+    match decompress_into(bytes, 0, bytes.len(), Format.Gzip, MOST, mut raw) {
+        ok(_) => {},
+        err(Error.Truncated) => {},
+        err(Error.Checksum) => {},
+        err(_) => {
+            fail String("java.util.zip.ZipException: the file isn't gzip, or is corrupt")
+        },
+    }
+    var at: usize = 0
+    return match read_unnamed(raw, mut at, mut accounter) {
+        ok(Tag.Compound(tags)) => tags,
+        ok(_) => {
+            fail String("java.io.IOException: Root tag must be a named compound tag")
+        },
+        err(e) => {
+            fail "{e.exception}: {e.message}"
+        },
+    }
+}
+
+/// `root` as a gzipped NBT file, as `NbtIo.writeCompressed` writes it: unnamed, at level 6,
+/// and on the disk before it returns, as its `SYNC` asks.
+pub fn write_compressed(root: Tag, path: String) ! FsError {
+    try write(path, gzipped(root))
+    try write_parts(path, [], true)
+}
+
+fn gzipped(root: Tag) -> List<u8> {
+    var raw = List<u8>()
+    root.write_unnamed(mut raw)
+    return compress(raw, Format.Gzip, 6)
+}
+
+/// `root` written with `write_compressed` to a new file in `folder`, named as
+/// `Files.createTempFile` names one, `prefix`, a random unsigned long, then `suffix`, and its
+/// path.
+pub fn write_temp(folder: String, prefix: String, suffix: String, root: Tag) -> String ! FsError {
+    var path = String()
+    loop {
+        let r = random_bytes(8)
+        var n: u64 = 0
+        for b in r {
+            n = (n << 8) | u64(b)
+        }
+        path = join(folder, "{prefix}{n}{suffix}")
+        if not exists(path) {
+            break
+        }
+    }
+    // A file of its own, so one sync writes it.
+    try write_parts(path, [(0, gzipped(root))], true)
+    return path
+}
+
+/// Moves `new` over `target`, keeping what was there as `backup`, as vanilla's
+/// `Util.safeReplaceOrMoveFile` does: each step tried 10 times, with its lines, and if `new`
+/// can't be moved, `backup` moved back unless `no_rollback`. Whether it worked.
+pub fn safe_replace(target: String, new: String, backup: String, no_rollback: bool, lines: mut List<Entry>) -> bool {
+    if exists(target) {
+        let steps: List<Step> = [Step.Delete(backup.copy()), Step.Rename(target.copy(), backup.copy()), Step.Present(backup.copy())]
+        if not with_retries("create backup {backup}", steps, mut lines) {
+            return false
+        }
+    }
+    let removing: List<Step> = [Step.Delete(target.copy()), Step.Deleted(target.copy())]
+    if not with_retries("remove old {target}", removing, mut lines) {
+        return false
+    }
+    let moving: List<Step> = [Step.Rename(new.copy(), target.copy()), Step.Present(target.copy())]
+    if not with_retries("replace {target} with {new}", moving, mut lines) and not no_rollback {
+        let restoring: List<Step> = [Step.Rename(backup.copy(), target.copy()), Step.Present(target.copy())]
+        _ = with_retries("restore {target} from {backup}", restoring, mut lines)
+        return false
+    }
+    return true
+}
+
+// A step of `safe_replace`, one of `Util`'s `BooleanSupplier`s.
+enum Step {
+    // `createDeleter`: `Files.deleteIfExists`.
+    Delete(String)
+    // `createRenamer`: `Files.move`, which doesn't replace what's there.
+    Rename(String, String)
+    // `createFileCreatedCheck`: `Files.isRegularFile`.
+    Present(String)
+    // `createFileDeletedCheck`: not `Files.exists`.
+    Deleted(String)
+}
+
+// What the step is, as its `toString` says.
+fn describe(step: Step) -> String {
+    return match step {
+        Step.Delete(p) => "delete old {p}",
+        Step.Rename(from, to) => "rename {from} to {to}",
+        Step.Present(p) => "verify that {p} is present",
+        Step.Deleted(p) => "verify that {p} is deleted",
+    }
+}
+
+// Runs the step, with the line vanilla logs if it fails.
+fn run(step: Step, lines: mut List<Entry>) -> bool {
+    match step {
+        Step.Delete(p) => {
+            if not delete_if_exists(p) {
+                lines.push(Entry.warn("Failed to delete"))
+                return false
+            }
+            return true
+        },
+        Step.Rename(from, to) => {
+            let moved = match kind(to) {
+                ok(none) => match rename(from, to) {
+                    ok => true,
+                    err(_) => false,
+                },
+                _ => false,
+            }
+            if not moved {
+                lines.push(Entry.error("Failed to rename"))
+            }
+            return moved
+        },
+        Step.Present(p) => return is_file(p),
+        Step.Deleted(p) => return not exists(p),
+    }
+}
+
+// `Util.runWithRetries`: the steps in order, 10 times at most, until each works.
+fn with_retries(description: String, steps: List<Step>, lines: mut List<Entry>) -> bool {
+    let tries = 10
+    for attempt in 0..tries {
+        var all = true
+        for step in steps {
+            if not run(step, mut lines) {
+                lines.push(Entry.warn("Failed to execute {describe(step)}"))
+                all = false
+                break
+            }
+        }
+        if all {
+            return true
+        }
+        lines.push(Entry.error("Failed to {description}, retrying {attempt}/{tries}"))
+    }
+    lines.push(Entry.error("Failed to {description}, aborting, progress might be lost"))
+    return false
+}
+
+// `Files.deleteIfExists`: a file, a link, or an empty folder. Whether nothing went wrong.
+fn delete_if_exists(path: String) -> bool {
+    let folder = match kind(path) {
+        ok(none) => return true,
+        ok(some(Kind.Dir)) => true,
+        ok(some(_)) => match remove_file(path) {
+            ok => return true,
+            // A link to a folder on Windows is removed as a folder.
+            err(FsError.IsDirectory) => true,
+            err(_) => return false,
+        },
+        err(_) => return false,
+    }
+    return match remove_dir(path) {
+        ok => folder,
+        err(_) => false,
+    }
+}
+
+/// Whether something is at `path`, following links, as `Files.exists` says.
+pub fn exists(path: String) -> bool {
+    return is_file(path) or is_dir(path) or match kind(path) {
+        ok(some(Kind.Other)) => true,
+        _ => false,
+    }
+}
+
+/// `path` with `more` after it, as Java's `Path.resolve` writes it: with the system's
+/// separator between, and in `more`.
+pub fn join(path: String, more: String) -> String {
+    let sep = separator()
+    var out = path.copy()
+    out.push_str(sep)
+    var start: usize = 0
+    for i in 0..more.len() {
+        if more.byte_at(i) == 47 {
+            out.push_str(more[start..i])
+            out.push_str(sep)
+            start = i + 1
+        }
+    }
+    out.push_str(more[start..])
+    return out
+}
+
+/// `path` as Java's `toAbsolutePath` writes it: after the folder the server started in, if
+/// it's relative.
+pub fn absolute(path: String) -> String {
+    if path.starts_with("/") or path.starts_with("\\") or (path.len() > 1 and path.byte_at(1) == 58) {
+        return path.copy()
+    }
+    return match real_path(".") {
+        ok(here) => "{here}{separator()}{path}",
+        err(_) => path.copy(),
+    }
+}
+
+/// The time as vanilla's `FileNameDateFormatter` writes it in a file's name, such as
+/// `2026-10-30_14-05-09`.
+pub fn file_date(t: DateTime) -> String {
+    return "{t.year}-{two(t.month)}-{two(t.day)}_{two(t.hour)}-{two(t.minute)}-{two(t.second)}"
+}
+
+fn two(n: i32) -> String {
+    return if n < 10 { "0{n}" } else { "{n}" }
+}
+
+// The exception Java throws for what went wrong at `path`.
+fn exception(e: FsError, path: String) -> String {
+    return match e {
+        FsError.NotFound => "java.nio.file.NoSuchFileException: {path}",
+        FsError.Denied => "java.nio.file.AccessDeniedException: {path}",
+        FsError.Exists => "java.nio.file.FileAlreadyExistsException: {path}",
+        FsError.IsDirectory => "java.io.IOException: Is a directory: {path}",
+        _ => "java.nio.file.FileSystemException: {path}",
+    }
+}

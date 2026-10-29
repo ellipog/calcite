@@ -1,0 +1,407 @@
+/// The `world_folder` probe (rig/PROTOCOL.md): `storage.world`'s world folder, `world` in a new
+/// folder of its own, run by a list of operations, opening and locking it, reading `level.dat`
+/// with its fallback, checking its version as a server starting does, saving it, and the files
+/// left, each result written to one blob after what was logged, which the rig compares with what
+/// vanilla's `LevelStorageSource` gives for the same operations.
+module rig.world_folder
+
+import json.tree.{Json, Member, as_i32, as_string, take}
+import nbt.tag.{Tag}
+import rig.frame.{Outcome}
+import server.log.{Entry, Level}
+import std.fs.{FsError, Kind, kind, list, make_dir_all, read, remove_dir_all, separator, temp_dir, write}
+import std.time.{DateTime}
+import std.zlib.{Format, decompress}
+import storage.level.{Openable, data_version, openable}
+import storage.world.{WorldFolder, join}
+
+// The time a corrupt `level.dat` is kept with, written as `<time>` in what's compared.
+const YEAR: i32 = 2000
+
+// The most a gzipped file is inflated to, the most a Java array holds.
+const MOST: usize = 2147483647
+
+pub fn run_world_folder(input: own List<Member>, blobs: List<List<u8>>) -> Outcome {
+    var fields = input
+    let ops_value = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let ops = match ops_value {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    let universe = match temp_dir() {
+        ok(d) => d,
+        err(e) => return Outcome.Failed("no temporary folder: {describe(e)}"),
+    }
+    var out: List<u8> = []
+    let failed: String? = match world_folder(universe, ops, blobs, mut out) {
+        ok => none,
+        err(Problem.Case(message)) => some(message),
+        err(Problem.Files(e)) => some(describe(e)),
+    }
+    match remove_dir_all(universe) {
+        ok => {},
+        err(e) => return Outcome.Failed("the folder wasn't removed: {describe(e)}"),
+    }
+    if let message = failed {
+        return Outcome.Failed(message)
+    }
+    return Outcome.Done { output: [], blobs: [out] }
+}
+
+fn world_folder(universe: String, ops: List<Json>, blobs: List<List<u8>>, out: mut List<u8>) ! Problem {
+    let world = join(universe, "world")
+    let normal = Normal { folder: "{universe}{separator()}", sep: separator() }
+    let now = DateTime { year: YEAR, month: 1, day: 1, hour: 0, minute: 0, second: 0, milli: 0 }
+    var folder: WorldFolder? = none
+    var data: JavaHashMap<String, Tag>? = none
+    var lines: List<Entry> = []
+    for k in 0..ops.len() {
+        let items = try items_of(ops, k)
+        let name = as_string(items[0]) ?? String()
+        lines.clear()
+        if name == "put" {
+            try expect(items, k, 2)
+            let file = try inside(items, k)
+            try make_dir_all(join(world, parent(file)))
+            try write(join(world, file), try blob(blobs, items, k, 2))
+        } else if name == "dir" {
+            try expect(items, k, 1)
+            try make_dir_all(join(world, try inside(items, k)))
+        } else if name == "open" {
+            try expect(items, k, 0)
+            if folder != none {
+                fail Problem.Case("operation {k}: the folder is open already")
+            }
+            match WorldFolder.open(universe, String("world")) {
+                ok(w) => {
+                    folder = some(w)
+                    put_lines(mut out, lines, normal)
+                    out.push(1)
+                },
+                err(e) => {
+                    put_lines(mut out, lines, normal)
+                    out.push(0)
+                    put_message(mut out, normal.of(e))
+                },
+            }
+            continue
+        } else if name == "has" {
+            try expect(items, k, 0)
+            let w = folder.take() else fail Problem.Case("operation {k}: the folder isn't open")
+            put_lines(mut out, lines, normal)
+            out.push(if w.has_level() { 1 } else { 0 })
+            folder = some(w)
+            continue
+        } else if name == "load" {
+            try expect(items, k, 0)
+            let w = folder.take() else fail Problem.Case("operation {k}: the folder isn't open")
+            data = w.load_level(now, mut lines)
+            folder = some(w)
+            put_lines(mut out, lines, normal)
+            match data {
+                some(d) => {
+                    var nbt = List<u8>()
+                    Tag.Compound(d.copy()).write_unnamed(mut nbt)
+                    out.push(1)
+                    put_i32(mut out, i32.wrap(nbt.len()))
+                    for b in nbt {
+                        out.push(b)
+                    }
+                },
+                none => out.push(0),
+            }
+            continue
+        } else if name == "check" {
+            try expect(items, k, 0)
+            if folder == none {
+                fail Problem.Case("operation {k}: the folder isn't open")
+            }
+            let d = data.copy() else fail Problem.Case("operation {k}: nothing was loaded")
+            put_lines(mut out, lines, normal)
+            match openable(d) {
+                ok(Openable.Yes) => {
+                    out.push(3)
+                    put_i32(mut out, data_version(d))
+                },
+                ok(Openable.Old) => out.push(1),
+                ok(Openable.Incompatible) => out.push(2),
+                err(e) => {
+                    out.push(0)
+                    put_message(mut out, e)
+                },
+            }
+            continue
+        } else if name == "save" {
+            try expect(items, k, 0)
+            let w = folder.take() else fail Problem.Case("operation {k}: the folder isn't open")
+            let d = data.copy() else fail Problem.Case("operation {k}: nothing was loaded")
+            w.save_level(Tag.Compound(d), mut lines)
+            folder = some(w)
+        } else if name == "close" {
+            try expect(items, k, 0)
+            let w = folder.take() else fail Problem.Case("operation {k}: the folder isn't open")
+            w.close(mut lines)
+            put_lines(mut out, lines, normal)
+            var found = List<Found>()
+            try walk(world, String(), mut found)
+            put_i32(mut out, i32.wrap(found.len()))
+            for f in found {
+                put_message(mut out, f.name)
+                let path = join(world, f.path)
+                match try kind(path) {
+                    some(Kind.Dir) => out.push(1),
+                    _ => {
+                        // No two deflaters write the same bytes, so a gzipped file is compared by
+                        // what it holds.
+                        let content = try read(path)
+                        var inflated: List<u8>? = none
+                        if content.len() >= 2 and content[0] == 31 and content[1] == 139 {
+                            inflated = match decompress(content, Format.Gzip, MOST) {
+                                ok(raw) => some(raw),
+                                err(_) => none,
+                            }
+                        }
+                        out.push(if inflated == none { 0 } else { 2 })
+                        let shown = inflated ?? content
+                        put_i32(mut out, i32.wrap(shown.len()))
+                        for b in shown {
+                            out.push(b)
+                        }
+                    },
+                }
+            }
+            continue
+        } else {
+            fail Problem.Case("operation {k}: no operation `{name}`")
+        }
+        put_lines(mut out, lines, normal)
+    }
+    if let w = folder.take() {
+        var ignored: List<Entry> = []
+        w.close(mut ignored)
+    }
+}
+
+// A file or folder in `world`: its path there, with `/` between names, and that path with the
+// times and numbers in it written as vanilla's probe writes them.
+struct Found {
+    name: String
+    path: String
+}
+
+// The files and folders under `dir`, which is `world` and then `at` in it, in `found` in the
+// order of their names.
+fn walk(world: String, at: String, found: mut List<Found>) ! FsError {
+    let dir = if at.is_empty() { world.copy() } else { join(world, at) }
+    for name in try list(dir) {
+        let path = if at.is_empty() { name.copy() } else { "{at}/{name}" }
+        let f = Found { name: normal_names(path), path: path.copy() }
+        // Few enough for each to go in its place.
+        var i = found.len()
+        while i > 0 and found[i - 1].name > f.name {
+            i -= 1
+        }
+        found.insert(i, f)
+        match try kind(join(dir, name)) {
+            some(Kind.Dir) => try walk(world, path, mut found),
+            _ => {},
+        }
+    }
+}
+
+// The folder the file's in, `""` if it's in `world` itself.
+fn parent(file: String) -> String {
+    var last: usize? = none
+    for i in 0..file.len() {
+        if file.byte_at(i) == 47 {
+            last = some(i)
+        }
+    }
+    return match last {
+        some(i) => file[..i],
+        none => String(),
+    }
+}
+
+// The file the operation names in `world`, which mustn't leave it.
+fn inside(items: List<Json>, k: usize) -> String ! String {
+    let name = as_string(items[1]) else fail "operation {k}'s name must be a string"
+    if name.is_empty() or name.starts_with("/") or name.contains("..") or name.contains("\\") or name.contains(":") {
+        fail "operation {k}: `{name}` isn't in the world's folder"
+    }
+    return name
+}
+
+// What vanilla's probe changes in what's logged, as it does: the folder each run's world is in
+// taken out, `/` between names, and the time and the random number in names written as `<time>`
+// and `<n>`.
+struct Normal {
+    folder: String
+    sep: String
+}
+
+impl Normal {
+    fn of(self, text: String) -> String {
+        var plain = without(text, self.folder)
+        if self.sep != "/" {
+            plain = replaced(plain, self.sep, "/")
+        }
+        return normal_names(plain)
+    }
+}
+
+// `_corrupted_` and a time, and `level`, digits and `.dat`, written as `_corrupted_<time>` and
+// `level<n>.dat`.
+fn normal_names(text: String) -> String {
+    var out = String()
+    var i: usize = 0
+    let mark = "_corrupted_"
+    while i < text.len() {
+        if text[i..].starts_with(mark) and is_time(text, i + mark.len()) {
+            out.push_str("_corrupted_<time>")
+            i += mark.len() + 19
+            continue
+        }
+        if text[i..].starts_with("level") {
+            var j = i + 5
+            while j < text.len() and is_digit(text.byte_at(j)) {
+                j += 1
+            }
+            if j > i + 5 and text[j..].starts_with(".dat") {
+                out.push_str("level<n>.dat")
+                i = j + 4
+                continue
+            }
+        }
+        out.push(rune(text.byte_at(i)))
+        i += 1
+    }
+    return out
+}
+
+// Whether `yyyy-MM-dd_HH-mm-ss` is at `at`.
+fn is_time(text: String, at: usize) -> bool {
+    let shape = "dddd-dd-dd_dd-dd-dd"
+    if at + shape.len() > text.len() {
+        return false
+    }
+    for i in 0..shape.len() {
+        let c = text.byte_at(at + i)
+        let want = shape.byte_at(i)
+        if want == 100 {
+            if not is_digit(c) {
+                return false
+            }
+        } else if c != want {
+            return false
+        }
+    }
+    return true
+}
+
+fn is_digit(c: u8) -> bool {
+    return c >= 48 and c <= 57
+}
+
+fn replaced(text: String, part: String, with: String) -> String {
+    var out = String()
+    var at: usize = 0
+    loop {
+        let rest = text[at..]
+        let i = rest.find(part) else {
+            out.push_str(rest)
+            return out
+        }
+        out.push_str(rest[..i])
+        out.push_str(with)
+        at += i + part.len()
+    }
+}
+
+fn without(text: String, part: String) -> String {
+    return replaced(text, part, "")
+}
+
+// What an operation logged, each line's level and its words, made the same everywhere.
+fn put_lines(out: mut List<u8>, lines: List<Entry>, normal: Normal) {
+    put_i32(mut out, i32.wrap(lines.len()))
+    for line in lines {
+        out.push(match line.level {
+            Level.Warn => 1,
+            Level.Error => 2,
+            _ => 0,
+        })
+        put_message(mut out, normal.of(line.message))
+    }
+}
+
+fn put_message(out: mut List<u8>, text: String) {
+    let bytes = text.to_bytes()
+    put_i32(mut out, i32.wrap(bytes.len()))
+    for b in bytes {
+        out.push(b)
+    }
+}
+
+fn put_i32(out: mut List<u8>, v: i32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}
+
+// Why a case didn't run: it's wrong, or a file couldn't be read or written.
+enum Problem {
+    Case(String)
+    Files(FsError)
+}
+
+impl From<String> for Problem {
+    fn from(value: own String) -> Problem {
+        return Problem.Case(value)
+    }
+}
+
+impl From<FsError> for Problem {
+    fn from(value: own FsError) -> Problem {
+        return Problem.Files(value)
+    }
+}
+
+fn describe(e: FsError) -> String {
+    return match e {
+        FsError.NotFound => String("not found"),
+        FsError.Denied => String("access denied"),
+        FsError.Exists => String("exists"),
+        FsError.BadPath => String("bad path"),
+        FsError.IsDirectory => String("is a directory"),
+        FsError.NotEmpty => String("not empty"),
+        FsError.Os(code) => "system error {code}",
+    }
+}
+
+fn items_of(ops: List<Json>, k: usize) -> List<Json> ! String {
+    match ops[k] {
+        Json.Array(items) => {
+            if not items.is_empty() and as_string(items[0]) != none {
+                return items.copy()
+            }
+        },
+        _ => {},
+    }
+    fail "operation {k} must be a non-empty array named by a string"
+}
+
+fn expect(items: List<Json>, k: usize, args: usize) ! String {
+    if items.len() != args + 1 {
+        fail "operation {k} takes {args} arguments"
+    }
+}
+
+fn blob(blobs: List<List<u8>>, items: List<Json>, k: usize, i: usize) -> List<u8> ! String {
+    let n = as_i32(items[i]) else fail "operation {k}'s blob must be a 32-bit integer"
+    if n < 0 or usize.wrap(n) >= blobs.len() {
+        fail "operation {k}: no blob {n}"
+    }
+    return blobs[usize.wrap(n)].copy()
+}

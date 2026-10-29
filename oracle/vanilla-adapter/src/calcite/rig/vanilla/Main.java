@@ -50,6 +50,7 @@ public final class Main {
                 new RegionProbe(),
                 new ChunkNbtProbe(),
                 new LevelDataProbe(),
+                new WorldFolderProbe(),
                 new RegistriesProbe())) {
             probes.put(probe.name(), probe);
         }
