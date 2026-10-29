@@ -1,0 +1,292 @@
+/// The bot benchmark's players (D154): `BOTS` clients that join a running server over TCP, `RATE`
+/// a second, in offline mode, as a vanilla client would, with compression if the server turns it
+/// on. Each accepts its teleport and its chunks, answers keep-alives and ends a tick every 50 ms.
+/// Once it has every chunk of its view, it walks at a player's walking speed on a heading of its
+/// own, its index times the golden angle, so the players spread out and the server keeps sending
+/// chunks, and every 10 seconds it says something in chat, which everyone is sent. It runs for
+/// `SECONDS`, then prints what happened as one line of JSON, with times in milliseconds since
+/// it started:
+///
+///     calx run --release src/rig/swarm.calx -- PORT BOTS RATE SECONDS VIEW
+///
+/// `VIEW` is the server's view distance, which gives the chunks each player should have. It's
+/// the same each run, so runs can be compared, and isn't a test: bench/run.py runs it.
+module rig.swarm
+
+import java.uuid.{Uuid}
+import pack.resources.{KnownPack}
+import protocol.chat.{LastSeenUpdate, ServerboundChat}
+import protocol.codec.{Codec}
+import protocol.common.{ChatVisibility, ClientInformation, HumanoidArm, ParticleStatus, ServerboundClientInformation, ServerboundKeepAlive}
+import protocol.configuration.{ServerboundFinishConfiguration, ServerboundSelectKnownPacks}
+import protocol.handshake.{ClientIntent, ClientIntention}
+import protocol.ids.{packet_names}
+import protocol.login.{ServerboundHello, ServerboundLoginAcknowledged}
+import protocol.play.{ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundMovePlayerPos, ON_GROUND}
+import protocol.state.{State, Bound}
+import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
+import server.chunks.{in_view_all}
+import std.env.{args}
+import std.math.{cos, sin}
+import std.net.{Net, Conn, Event}
+import std.time.{Instant}
+import world.pos.{ChunkPos}
+
+// A player's walking speed, in blocks a tick: vanilla's 0.1 movement speed, as the client moves it.
+const WALK: f64 = 0.21585
+
+// The golden angle, in radians, which spreads the headings evenly however many players there are.
+const GOLDEN: f64 = 2.399963229728653
+
+const TICK_NS: u64 = 50000000
+const SECOND: u64 = 1000000000
+
+fn number(s: String) -> u64 {
+    var n: u64 = 0
+    for i in 0..s.len() {
+        let b = s.byte_at(i)
+        if b < 48 or b > 57 {
+            panic("{s} isn't a number")
+        }
+        n = n * 10 + u64(b - 48)
+    }
+    return n
+}
+
+fn packet<T: Wire + Packet>(p: T, state: State) -> List<u8> {
+    var w = Writer.new()
+    write_packet(p, state, mut w)
+    return w.into_bytes()
+}
+
+struct Bot {
+    index: u64
+    conn: Conn
+    codec: Codec
+    state: State
+    closed: bool
+    // Why the server disconnected it, if it did.
+    kicked: String? = none
+    // When it connected, and when it had every chunk of its view.
+    connected_at: u64
+    loaded_at: u64? = none
+    placed: bool = false
+    x: f64 = 0.0
+    y: f64 = 0.0
+    z: f64 = 0.0
+    dx: f64 = 0.0
+    dz: f64 = 0.0
+    chunks: u64 = 0
+    chats: u64 = 0
+    next_chat: u64 = 0
+}
+
+impl Bot {
+    fn send(mut self, net: Net, p: own List<u8>) {
+        if not self.closed {
+            net.write(self.conn, self.codec.encode(p)!)
+        }
+    }
+
+    // Answers what came, at `now`, and counts what's measured: the chunks and the chat.
+    fn handle(mut self, net: Net, now: u64, view_chunks: u64) {
+        loop {
+            let body = match self.codec.next() {
+                ok(some(b)) => b,
+                ok(none) => return,
+                err(_) => {
+                    self.kicked = some(String("a packet that didn't decode"))
+                    self.closed = true
+                    return
+                },
+            }
+            var r = Reader.new(body)
+            let id = usize.wrap(r.varint()!)
+            let name = packet_names(self.state, Bound.Clientbound)[id].copy()
+            match self.state {
+                State.Login => {
+                    if name == "login_compression" {
+                        self.codec.start_compression(r.varint()!)
+                    } else if name == "login_finished" {
+                        self.send(net, packet(ServerboundLoginAcknowledged {}, State.Login))
+                        self.state = State.Configuration
+                        let info = ClientInformation { language: "en_us", view_distance: 32, chat_visibility: ChatVisibility.Full, chat_colors: true, model_customisation: 127, main_hand: HumanoidArm.Right, text_filtering_enabled: false, allows_listing: true, particle_status: ParticleStatus.All }
+                        self.send(net, packet(ServerboundClientInformation { information: info }, State.Configuration))
+                        self.send(net, packet(ServerboundSelectKnownPacks { packs: [KnownPack { namespace: "minecraft", id: "core", version: "26.3" }] }, State.Configuration))
+                    } else if name == "login_disconnect" {
+                        self.kicked = some(String("turned away at login"))
+                    }
+                },
+                State.Configuration => {
+                    if name == "finish_configuration" {
+                        self.send(net, packet(ServerboundFinishConfiguration {}, State.Configuration))
+                        self.state = State.Play
+                    } else if name == "keep_alive" {
+                        self.send(net, packet(ServerboundKeepAlive { challenge: r.i64()! }, State.Configuration))
+                    } else if name == "disconnect" {
+                        self.kicked = some(String("disconnected in configuration"))
+                    }
+                },
+                State.Play => {
+                    if name == "keep_alive" {
+                        self.send(net, packet(ServerboundKeepAlive { challenge: r.i64()! }, State.Play))
+                    } else if name == "player_position" {
+                        let teleport = r.varint()!
+                        self.x = r.f64()!
+                        self.y = r.f64()!
+                        self.z = r.f64()!
+                        let accept = packet(ServerboundAcceptTeleportation { teleport_id: teleport, x: self.x, y: self.y, z: self.z, y_rot: 0.0, x_rot: 0.0 }, State.Play)
+                        self.send(net, accept)
+                        self.placed = true
+                    } else if name == "level_chunk_with_light" {
+                        self.chunks += 1
+                        if self.loaded_at == none and self.chunks >= view_chunks {
+                            self.loaded_at = some(now)
+                            self.next_chat = now + (self.index % 10) * SECOND
+                        }
+                    } else if name == "chunk_batch_finished" {
+                        self.send(net, packet(ServerboundChunkBatchReceived { desired_chunks_per_tick: 25.0 }, State.Play))
+                    } else if name == "player_chat" {
+                        self.chats += 1
+                    } else if name == "disconnect" {
+                        self.kicked = some(String("disconnected in play"))
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+
+    // A tick of the client's: a step on its heading once it has its chunks, and a chat message
+    // when one is due.
+    fn tick(mut self, net: Net, now: u64) {
+        if not self.placed or self.closed {
+            return
+        }
+        match self.state {
+            State.Play => {},
+            _ => return,
+        }
+        if self.loaded_at != none {
+            self.x += self.dx
+            self.z += self.dz
+            let step = ServerboundMovePlayerPos { x: self.x, y: self.y, z: self.z, flags: ON_GROUND }
+            self.send(net, packet(step, State.Play))
+            if now >= self.next_chat {
+                self.next_chat += 10 * SECOND
+                let said = ServerboundChat { message: "hello from bot {self.index}", time_stamp: i64.wrap(now / 1000000), salt: 0, signature: none, last_seen: LastSeenUpdate.empty() }
+                self.send(net, packet(said, State.Play))
+            }
+        }
+        self.send(net, packet(ServerboundClientTickEnd {}, State.Play))
+    }
+}
+
+fn main() {
+    let given = args()
+    if given.len() != 5 {
+        panic("usage: swarm PORT BOTS RATE SECONDS VIEW")
+    }
+    let port = u16.wrap(number(given[0]))
+    let count = number(given[1])
+    let rate = number(given[2])
+    let seconds = number(given[3])
+    let view_chunks = u64(in_view_all(ChunkPos { x: 0, z: 0 }, i32.wrap(number(given[4]))).len())
+    let net = Net.new()!
+    var bots = List<Bot>()
+    var bytes: u64 = 0
+    let start = unsafe { Instant.now() }
+    var next_tick: u64 = 0
+    var all_loaded: u64? = none
+    loop {
+        let now = unsafe { Instant.now() }.nanos_since(start)
+        // The next player joins once its turn has come.
+        while u64(bots.len()) < count and u64(bots.len()) * SECOND / rate <= now {
+            let i = u64(bots.len())
+            let conn = net.connect("127.0.0.1", port)!
+            let angle = GOLDEN * f64.nearest(i)
+            bots.push(Bot { index: i, conn: conn, codec: Codec.new(), state: State.Login, closed: false, connected_at: now, dx: WALK * cos(angle), dz: WALK * sin(angle) })
+            let at = bots.len() - 1
+            bots[at].send(net, packet(ClientIntention { protocol_version: 777, host_name: "localhost", port: port, intention: ClientIntent.Login }, State.Handshake))
+            bots[at].send(net, packet(ServerboundHello { name: "bot{i}", profile_id: Uuid.new(0, 0) }, State.Login))
+        }
+        var events = List<Event>()
+        let wait = if next_tick > now { i64.wrap((next_tick - now + 999999) / 1000000) } else { 0 }
+        net.poll(wait, mut events)
+        for e in events {
+            match e {
+                Event.Received(c) => {
+                    for i in 0..bots.len() {
+                        if c == bots[i].conn {
+                            bytes += u64(bots[i].codec.read_from(net, c))
+                        }
+                    }
+                },
+                Event.Closed(c) => {
+                    for i in 0..bots.len() {
+                        if c == bots[i].conn {
+                            bots[i].closed = true
+                        }
+                    }
+                },
+                _ => {},
+            }
+        }
+        let after = unsafe { Instant.now() }.nanos_since(start)
+        for i in 0..bots.len() {
+            bots[i].handle(net, after, view_chunks)
+        }
+        if after >= next_tick {
+            next_tick += TICK_NS
+            if next_tick < after {
+                next_tick = after + TICK_NS
+            }
+            for i in 0..bots.len() {
+                bots[i].tick(net, after)
+            }
+        }
+        if all_loaded == none and u64(bots.len()) == count {
+            var loaded = true
+            for b in bots {
+                if b.loaded_at == none {
+                    loaded = false
+                }
+            }
+            if loaded {
+                all_loaded = some(after)
+            }
+        }
+        if after >= seconds * SECOND {
+            report(bots, bytes, all_loaded, after)
+            return
+        }
+    }
+}
+
+// The run as one line of JSON.
+fn report(bots: List<Bot>, bytes: u64, all_loaded: u64?, end: u64) {
+    var joins = String()
+    var chunks: u64 = 0
+    var chats: u64 = 0
+    var joined: u64 = 0
+    var kicked = String()
+    for b in bots {
+        chunks += b.chunks
+        chats += b.chats
+        if let at = b.loaded_at {
+            if joined > 0 {
+                joins.push(',')
+            }
+            joins.push_str("{(at - b.connected_at) / 1000000}")
+            joined += 1
+        }
+        if let why = b.kicked {
+            if not kicked.is_empty() {
+                kicked.push(',')
+            }
+            kicked.push_str("\"bot{b.index}: {why}\"")
+        }
+    }
+    let loaded = if let at = all_loaded { "{at / 1000000}" } else { String("null") }
+    println("\{\"bots\":{bots.len()},\"joined\":{joined},\"join_ms\":[{joins}],\"all_loaded_ms\":{loaded},\"end_ms\":{end / 1000000},\"chunks\":{chunks},\"chats_received\":{chats},\"bytes\":{bytes},\"kicked\":[{kicked}]\}")
+}
