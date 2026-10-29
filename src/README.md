@@ -82,6 +82,7 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `rig.frame` | The rig's frames, whose headers are JSON | |
 | `rig.rng` | The `rng` probe | |
 | `rig.collections` | The `collections` probe: Calx's Java-ordered tables against Java's and fastutil's | |
+| `rig.palette` | The `palette` probe: std.palette's containers and bit storage against vanilla's `PalettedContainer` and `SimpleBitStorage` | |
 | `rig.registries` | The `registries` probe: the vanilla data pack's registries and tags against vanilla's | |
 | `rig.nbt` | The `nbt` probe: binary NBT read, printed and written back, and SNBT parsed, against vanilla's | |
 | `rig.swarm` | The bot benchmark's players: bots that join a running server, walk and chat, and say how it went ([D154](../docs/decisions.md)). Its flags try wide views, as with `force-view-distance` | |

@@ -312,6 +312,38 @@ What a server with only the vanilla data pack sends a client in configuration: i
 | `{"op": "synced"}` | `registries`: each synchronized registry in the order the server sends them, `{name, entries}`, with `entries` in ID order, each `[id, sent_with_data]`. An entry from a pack the client knows goes without its data |
 | `{"op": "tags", "registry": name}` | `tags`: the registry's tags as `update_tags` sends them, by name in string order, each `[name, ids]` with the entries' IDs in the order sent. An empty list for a registry it sends no tags for |
 
+### `palette` (v1)
+
+A chunk section's paletted containers, as vanilla keeps, sends and saves them, and the packed longs under them. Each operation's result goes into one blob, big-endian: an `int` is 4 bytes, a `long` 8, a byte 1, and a *message* an `int` length and then its UTF-8 bytes.
+
+Input `{"of": "container", "strategy": s, "registry": n, "value": v, "ops": [...]}` runs `new PalettedContainer(v, strategy)`, with `strategy` `block_states` or `biomes` for `Strategy.createForBlockStates` or `createForBiomes`. The registry holds `n` values, 1 to 1,048,576: objects compared by identity, as block states and biomes are, the value with ID `i` written as `i`. An index `i` is a position among the container's 4,096 or 64 values, which vanilla's `set` and `get` take as its `x`, `y` and `z`: `i` is `(y << b | z) << b | x`, with `b` 4 for block states and 2 for biomes.
+
+| Operation | Result |
+| --- | --- |
+| `["set", i, v]` | nothing |
+| `["get", i]` | `int`, the value |
+| `["get_and_set", i, v]` | `int`, the value it had |
+| `["random_sets", seed, count, low, high]` | nothing. `count` sets, each at an index and to a value from `low` up to but not including `high`, drawn from a 64-bit LCG whose state starts at `seed`, a decimal string: each draw steps the state to `x * 6364136223846793005 + 1442695040888963407`, wrapping, and takes `x >>> 33`. A set draws its index, modulo the container's size, and then its value, modulo `high - low`, plus `low` |
+| `["bits"]` | `int`, `bitsPerEntry` |
+| `["write"]` | `int` length and the bytes `write` sends |
+| `["pack"]` | `pack`: an `int` count and the palette's values as `int`s, then a byte 0 if there's no data, or a 1, an `int` count and the `long`s |
+| `["unpack", palette, data]` | `PalettedContainer.unpack` of the values `palette`, and `data`, the longs as decimal strings, or null for no data. A byte 0 if it unpacked, and the container is the one it gave, or a 1 and the message of vanilla's error |
+| `["repack"]` | `pack`, then `unpack` of what it gave, as `unpack` |
+| `["counts"]` | `count`: an `int` number of pairs, then each value and how many times it's there, as `int`s, by value and then by count |
+
+Input `{"of": "storage", "bits": b, "size": n, "ops": [...]}` runs a `SimpleBitStorage` of `n` values, 0 to 4,096, of `b` bits each, 1 to 32, all 0. A value is a non-negative `int`, since vanilla checks it as one.
+
+| Operation | Result |
+| --- | --- |
+| `["set", i, v]`, `["fill", v]` | nothing |
+| `["get", i]`, `["get_and_set", i, v]` | `int` |
+| `["random_sets", seed, count, low, high]` | nothing, with draws as on a container |
+| `["longs"]` | an `int` count and the `long`s, `getRaw` |
+| `["values"]` | an `int` count and each value as an `int`, `unpack` |
+| `["load", data]` | `new SimpleBitStorage(b, n, data)`, with `data` decimal strings: a byte 0 if it loaded, and the storage is that one, or a 1 and the message of vanilla's exception |
+
+An index or value out of range is an `error` status, as is an operation the input doesn't have.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.
