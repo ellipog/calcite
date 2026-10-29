@@ -19,6 +19,7 @@ The rig runs the same inputs through vanilla and through Calcite and compares th
 | Differences | [`differences/`](differences/) | The registry of places Calcite deliberately differs |
 | Math comparison | [`runner/mathcmp.py`](runner/mathcmp.py) | `Math` against `StrictMath` on large sweeps (`P1.5`) |
 | Protocol suites | [`runner/sessions.py`](runner/sessions.py) | The protocol bot against vanilla and Calcite, packet by packet (`P4.8`) |
+| A real client | [`runner/realclient.py`](runner/realclient.py) | Mojang's 26.3 client joins Calcite, walks and chats (`G4.1`) |
 
 The runner needs only Python 3.10 or newer, with no packages. Run it from anywhere. Paths are relative to the repo.
 
@@ -194,6 +195,17 @@ Status, login and configuration pass in both configurations, with the server's [
 - vanilla's three dimensions, where Calcite has one (Phase 5)
 - the 25 chunks within 2 of the spawn, which vanilla loads as it starts, saves and drops. Their blocks are the same, but vanilla's sections list their blocks in the order they first come, bedrock first, as a section read back from a region file does, where a new section, Calcite's or vanilla's, lists air first. Every other chunk matches byte for byte. Matching these needs the world on disk (Phase 5, P5.2)
 - recipes, the command tree, the player's entity data, advancements, health, experience and attributes (Phase 6)
+
+## A real client
+
+```sh
+py -I rig/runner/realclient.py
+py -I rig/runner/realclient.py --message "anyone here" --keep-open 30
+```
+
+Everything else here plays the client's side with Calcite's own code. [`realclient.py`](runner/realclient.py) runs the game itself instead: Mojang's 26.3 client, from the files of a launcher that has run 26.3 once (the official launcher, the Modrinth App or Prism Launcher), each checked against the SHA-1 in 26.3's version file, with JDK 25 ([D162](../docs/decisions.md)). It starts Calcite's release build, `build/server/calcite.exe`, offline in a fresh folder under `build/rig/realclient/`, and the client as player `RealClient` in a game folder beside it, with its sound off and the first-run screens skipped, joining with `--quickPlayMultiplayer`. On Windows, [`realclient_keys.ps1`](runner/realclient_keys.ps1) then plays it a little: the debug screen on, a screenshot, a walk of about 11 blocks and a jump, a screenshot, a chat message and a last screenshot. It sends a key only while the client's window is in front and stops if it isn't, so nothing is typed into another window; it does take the focus for about 10 seconds. It passes if Calcite logs the join and the message, the client gets the message back, nobody is disconnected before the client is stopped, and the client logs no error but the ones its offline account always gets, from Mojang's services and Realms. The screenshots show the coordinates before and after the walk. It needs a desktop and a launcher's files, so it isn't in CI.
+
+The client has no account, so Calcite can't be in online mode and chat isn't signed. The online half of `G4.1` is a player with an account joining a server with `online-mode=true`. What that player's client checks of signed chat, `ChatCheck` checks after the tests, as vanilla's client checks it (see [the adapter](../oracle/vanilla-adapter/README.md#checking-calcites-packets)).
 
 ## Tests and CI
 
