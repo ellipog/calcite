@@ -27,7 +27,7 @@ import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, Stat
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import resources.identifier.{Identifier}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
-import server.chunks.{ChunkSender, in_view, in_view_all}
+import server.chunks.{ChunkSender, Spiral, chunks_held, column}
 import server.configuration.{Configuration}
 import server.link.{Input, Link, Report}
 import server.log.{Entry, Look}
@@ -227,6 +227,8 @@ struct Player {
     center_z: i32 = 0
     view: i32 = 0
     sender: ChunkSender = ChunkSender()
+    // The view distance the client last asked for that was logged, for `force-view-distance`.
+    asked: i32 = -1
     // The signed messages the player was sent that their messages say they've seen, the place
     // of the next message they're sent among all those they were, and how fast they've sent
     // messages and commands lately.
@@ -282,6 +284,8 @@ pub struct Network {
     configuration: Configuration
     // The world players join, the last entity ID given out, and the server's ticks.
     world: World
+    // Every player's chunks nearest first, for the widest view yet.
+    spiral: Spiral
     entity_ids: i32
     ticks: i32
     // The wall clock's time, which players' messages are stamped with.
@@ -310,7 +314,7 @@ impl Network {
     /// and lets them into `world`. Only an online login needs the key pair, so the first waits
     /// for it, and the server can listen while another thread makes it.
     pub fn new(link: own Link, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, keys: own Receiver<RsaKey>, configuration: own Configuration, world: own World) -> Network {
-        var network = Network { link: link, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>(), sending: Sending.new(), to_flush: List<Conn>(), last_logins: Map<String, u64>(), halted: false }
+        var network = Network { link: link, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, spiral: Spiral(), entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>(), sending: Sending.new(), to_flush: List<Conn>(), last_logins: Map<String, u64>(), halted: false }
         network.rebuild_status()
         return network
     }
@@ -450,23 +454,15 @@ impl Network {
     /// loaded ones: vanilla keeps a chunk loaded while a player's view holds it, and the flat
     /// world has no others.
     pub fn chunks_in_view(self) -> usize {
-        var seen = Set<i64>()
+        var views = List<(ChunkPos, i32)>()
         for c in self.connections {
             if let con = c {
                 if not con.closing and con.phase == Phase.Play and con.player.view > 0 {
-                    let center = ChunkPos { x: con.player.center_x, z: con.player.center_z }
-                    let view = con.player.view
-                    for x in center.x - view - 1..center.x + view + 2 {
-                        for z in center.z - view - 1..center.z + view + 2 {
-                            if in_view(center, view, x, z) {
-                                seen.insert((i64(x) << 32) | (i64(z) & 4294967295))
-                            }
-                        }
-                    }
+                    views.push((ChunkPos { x: con.player.center_x, z: con.player.center_z }, con.player.view))
                 }
             }
         }
-        return seen.len()
+        return chunks_held(views)
     }
 
     /// How many connections the server has closed that aren't gone yet.
@@ -1415,7 +1411,7 @@ impl Network {
         let mode = self.world.settings.game_type
         let spawn = SpawnInfo { dimension_type: self.world.settings.dimension_type, dimension: overworld(), seed: self.world.settings.hashed_seed, game_type: mode, previous_game_type: PreviousGameType { mode: none }, is_debug: false, is_flat: true, last_death_location: none, portal_cooldown: 0, sea_level: -63 }
         let secure = self.enforces_secure_chat()
-        let login = ClientboundLogin { player_id: id, hardcore: self.world.settings.hardcore, levels: [overworld()], max_players: self.world.settings.max_players, chunk_radius: self.world.settings.view_distance, simulation_distance: self.world.settings.simulation_distance, reduced_debug_info: false, show_death_screen: true, do_limited_crafting: false, spawn: spawn, online_mode: self.settings.online_mode, enforces_secure_chat: secure }
+        let login = ClientboundLogin { player_id: id, hardcore: self.world.settings.hardcore, levels: [overworld()], max_players: self.world.settings.max_players, chunk_radius: self.world.settings.chunk_radius(), simulation_distance: self.world.settings.simulation_distance, reduced_debug_info: false, show_death_screen: true, do_limited_crafting: false, spawn: spawn, online_mode: self.settings.online_mode, enforces_secure_chat: secure }
         self.send(mut con, login, State.Play)
         let difficulty = self.world.settings.difficulty
         self.send(mut con, ClientboundChangeDifficulty { difficulty: difficulty, locked: false }, State.Play)
@@ -1492,13 +1488,20 @@ impl Network {
     }
 
     // Moves the player's view to the chunk they're in, at the distance the client asks for up
-    // to the server's, as `ChunkMap.updateChunkTracking` and `applyChunkTrackingView`: the client
-    // is told its new center, the chunks that came into view are queued, and those that left
-    // are dropped, and forgotten if the client has them. `first` is for a player who had no
-    // view, as one joining.
+    // to the server's, as `ChunkMap.updateChunkTracking` and `applyChunkTrackingView`, or at
+    // `force-view-distance` if it's set: the client is told its new center, the chunks that
+    // left the view are dropped, and forgotten if the client has them, and those that came into
+    // it are queued. `first` is for a player who had no view, as one joining. The views are
+    // walked a column at a time, so a move costs the chunks that change, not the view's area.
     fn track(mut self, con: mut Connection, first: bool) {
         let center = ChunkPos.containing(con.player.x, con.player.z)
-        let view = clamp(i32(con.information.view_distance), 2, self.world.settings.view_distance)
+        let asked = i32(con.information.view_distance)
+        let forced = self.world.settings.force_view_distance
+        let view = if forced > 0 { forced } else { clamp(asked, 2, self.world.settings.view_distance) }
+        if forced > 0 and asked != con.player.asked {
+            con.player.asked = asked
+            self.logs.push(Entry.info("{player_name(con)} asks for a view distance of {asked} and is sent {view}, from force-view-distance"))
+        }
         let old = ChunkPos { x: con.player.center_x, z: con.player.center_z }
         let old_view = con.player.view
         if not first and old.x == center.x and old.z == center.z and old_view == view {
@@ -1510,40 +1513,51 @@ impl Network {
         if first or old.x != center.x or old.z != center.z {
             self.send(mut con, ClientboundSetChunkCacheCenter { x: center.x, z: center.z }, State.Play)
         }
+        self.spiral.fit(view)
         if first {
-            for c in in_view_all(center, view) {
-                con.player.sender.mark_pending(c)
-            }
+            con.player.sender.move_to(center, view)
+            con.player.sender.mark_all()
             return
         }
         // The squares a chunk beyond each view, as `ChunkTrackingView.difference` walks them
-        // when they overlap.
+        // when they overlap: by `x`, then `z`. Those that left go first, then those that came,
+        // as a chunk coming in can have the sender's bit of one going out.
         let min_x = min(old.x - old_view, center.x - view) - 1
         let max_x = max(old.x + old_view, center.x + view) + 1
-        let min_z = min(old.z - old_view, center.z - view) - 1
-        let max_z = max(old.z + old_view, center.z + view) + 1
         let overlap = old.x - old_view - 1 <= center.x + view + 1 and old.x + old_view + 1 >= center.x - view - 1 and old.z - old_view - 1 <= center.z + view + 1 and old.z + old_view + 1 >= center.z - view - 1
-        if overlap {
-            for x in min_x..max_x + 1 {
-                for z in min_z..max_z + 1 {
-                    let saw = in_view(old, old_view, x, z)
-                    let sees = in_view(center, view, x, z)
-                    if saw != sees {
-                        if sees {
-                            con.player.sender.mark_pending(ChunkPos { x: x, z: z })
-                        } else {
-                            self.forget(mut con, ChunkPos { x: x, z: z })
-                        }
-                    }
+        if not overlap {
+            for x in old.x - old_view - 1..old.x + old_view + 2 {
+                let (lo, hi) = column(old, old_view, x)
+                for z in lo..hi + 1 {
+                    self.forget(mut con, ChunkPos { x: x, z: z })
                 }
             }
+            con.player.sender.move_to(center, view)
+            con.player.sender.mark_all()
             return
         }
-        for c in in_view_all(old, old_view) {
-            self.forget(mut con, c)
+        // In each column, what one view holds and the other doesn't is below the other's
+        // column, then above it.
+        for x in min_x..max_x + 1 {
+            let (was_lo, was_hi) = column(old, old_view, x)
+            let (now_lo, now_hi) = column(center, view, x)
+            for z in was_lo..min(was_hi, now_lo - 1) + 1 {
+                self.forget(mut con, ChunkPos { x: x, z: z })
+            }
+            for z in max(was_lo, now_hi + 1)..was_hi + 1 {
+                self.forget(mut con, ChunkPos { x: x, z: z })
+            }
         }
-        for c in in_view_all(center, view) {
-            con.player.sender.mark_pending(c)
+        con.player.sender.move_to(center, view)
+        for x in min_x..max_x + 1 {
+            let (was_lo, was_hi) = column(old, old_view, x)
+            let (now_lo, now_hi) = column(center, view, x)
+            for z in now_lo..min(now_hi, was_lo - 1) + 1 {
+                con.player.sender.mark_pending(ChunkPos { x: x, z: z })
+            }
+            for z in max(now_lo, was_hi + 1)..now_hi + 1 {
+                con.player.sender.mark_pending(ChunkPos { x: x, z: z })
+            }
         }
     }
 
@@ -1565,7 +1579,7 @@ impl Network {
 
     // Sends the player the chunks due this tick, as a batch, as `sendNextChunks`.
     fn send_chunks(mut self, con: mut Connection) {
-        let batch = con.player.sender.next_batch(ChunkPos { x: con.player.center_x, z: con.player.center_z })
+        let batch = con.player.sender.next_batch(mut self.spiral)
         if batch.is_empty() {
             return
         }

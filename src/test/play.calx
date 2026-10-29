@@ -25,13 +25,13 @@ import protocol.configuration.{ServerboundFinishConfiguration, ServerboundSelect
 import protocol.handshake.{ClientIntent, ClientIntention}
 import protocol.ids.{packet_names}
 import protocol.login.{ServerboundHello, ServerboundLoginAcknowledged}
-import protocol.play.{ClientboundPlayerInfoUpdate, ClientboundSystemChat, INITIALIZE_CHAT, PlayerEntry, PlayerInfo, ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundMovePlayerPos, ON_GROUND}
+import protocol.play.{ClientboundLogin, ClientboundPlayerInfoUpdate, ClientboundSystemChat, INITIALIZE_CHAT, PlayerEntry, PlayerInfo, ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundMovePlayerPos, ON_GROUND}
 import protocol.state.{State, Bound}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import registry.registries.{Registries}
 import resources.identifier.{Identifier}
 import server.chat.{MessageBody, checksum, key_payload, signed_payload}
-import server.chunks.{in_view, in_view_all}
+import server.chunks.{in_view, in_view_all, in_view_count}
 import server.configuration.{Configuration}
 import server.link.{Link}
 import server.network.{LoginSettings, Network, StatusInfo, key_ready}
@@ -60,7 +60,7 @@ fn core() -> KnownPack {
     return KnownPack { namespace: "minecraft", id: "core", version: "26.3" }
 }
 
-fn new_server(link: own Link, services: own Services, rate_limit: i32, login_throttle: i32) -> Network {
+fn new_server(link: own Link, services: own Services, rate_limit: i32, login_throttle: i32, force_view: i32) -> Network {
     let packs: List<KnownPack?> = [some(core())]
     let configuration = Configuration.new("calcite", [], [Identifier { namespace: "minecraft", path: "vanilla" }], Registries { synced: [], builtin: [] }, packs)
     let settings = LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: -1, log_ips: true, prevent_proxy_connections: false, velocity_secret: none, rate_limit: rate_limit, login_throttle: login_throttle }
@@ -71,7 +71,9 @@ fn new_server(link: own Link, services: own Services, rate_limit: i32, login_thr
     // Not vanilla's text, which stays out of the repository, but in the same form.
     lang.add("chat.type.text", "%s says %s")
     lang.add("chat.disabled.missingProfileKey", "no key")
-    return Network.new(link, status, settings, lang, services, key_ready(RsaKey.generate(1024)), configuration, World.defaults())
+    var world = World.defaults()
+    world.settings.force_view_distance = force_view
+    return Network.new(link, status, settings, lang, services, key_ready(RsaKey.generate(1024)), configuration, world)
 }
 
 fn packet<T: Wire + Packet>(p: T, state: State) -> List<u8> {
@@ -173,9 +175,11 @@ struct Rig {
     port: u16
     clients: List<Client>
     now: u64
-    // The server's `rate-limit` and `login-throttle`, which its replay has too.
+    // The server's `rate-limit`, `login-throttle` and `force-view-distance`, which its replay
+    // has too.
     rate_limit: i32
     login_throttle: i32
+    force_view: i32
 }
 
 impl Rig {
@@ -238,7 +242,7 @@ impl Rig {
     // which must send and log what this one did.
     fn replays(mut self, services: own Services) {
         _ = self.server.take_logs()
-        var replay = new_server(Link.replay(self.server.take_log())!, services, self.rate_limit, self.login_throttle)
+        var replay = new_server(Link.replay(self.server.take_log())!, services, self.rate_limit, self.login_throttle, self.force_view)
         let report = replay.replay_all()
         assert(report.same(), "the replay differs: {report.to_string()}")
     }
@@ -324,10 +328,14 @@ fn new_rig_with(services: own Services) -> Rig {
 }
 
 fn new_rig_limited(services: own Services, rate_limit: i32, login_throttle: i32) -> Rig {
+    return new_rig_settings(services, rate_limit, login_throttle, 0)
+}
+
+fn new_rig_settings(services: own Services, rate_limit: i32, login_throttle: i32, force_view: i32) -> Rig {
     let net = Net.new()!
-    let server = new_server(Link.record(net), services, rate_limit, login_throttle)
+    let server = new_server(Link.record(net), services, rate_limit, login_throttle, force_view)
     let port = server.listen("127.0.0.1", 0)!
-    return Rig { net: net, server: server, port: port, clients: [], now: 0, rate_limit: rate_limit, login_throttle: login_throttle }
+    return Rig { net: net, server: server, port: port, clients: [], now: 0, rate_limit: rate_limit, login_throttle: login_throttle, force_view: force_view }
 }
 
 // Everything that's sent as a player joins, in vanilla's order, before their chunks.
@@ -470,6 +478,84 @@ fn moving() {
     check(rig.next(steve).name, "disconnect")
     rig.replays(Services.offline())
     println("ok moving")
+}
+
+fn forced_view() {
+    // With force-view-distance at 16, a client that asks for 12, on a server whose
+    // view-distance is 10, is sent 16, and told so in the login.
+    var rig = new_rig_settings(Services.offline(), 0, 0, 16)
+    let steve = rig.join("Steve")
+    let login = rig.next(steve)
+    check(login.name, "login")
+    var r = Reader.new(login.body)
+    check_int(i64(ClientboundLogin.read(mut r)!.chunk_radius), 16)
+    rig.clients[steve].drain()
+    let log = rig.logs()
+    if log.find("|Steve asks for a view distance of 12 and is sent 16, from force-view-distance|") == none {
+        panic("no forced view in {log}")
+    }
+    let have = load_all(mut rig, steve)
+    let view = in_view_all(ChunkPos { x: 0, z: 0 }, 16)
+    check_int(i64.wrap(have.len()), i64.wrap(view.len()))
+    check_int(i64.wrap(in_view_count(16)), i64.wrap(view.len()))
+    for c in view {
+        if not have.contains(c) {
+            panic("{c.x}, {c.z} wasn't sent")
+        }
+    }
+    check("{rig.server.chunks_in_view()}", "{view.len()}")
+    // Asking for less changes nothing but the log.
+    var less = information()
+    less.view_distance = 2
+    rig.send(steve, play(ServerboundClientInformation { information: less }))
+    rig.tick(50)
+    check(rig.next(steve).name, "nothing")
+    check(rig.logs(), "Steve asks for a view distance of 2 and is sent 16, from force-view-distance|")
+    // Once the client accepts its position, a move a chunk south and east forgets and sends
+    // the chunks at the view's edge alone.
+    rig.send(steve, play(ServerboundMovePlayerPos { x: 16.5, y: -60.0, z: 16.5, flags: ON_GROUND }))
+    rig.send(steve, play(ServerboundClientTickEnd {}))
+    let again = rig.next(steve)
+    check(again.name, "player_position")
+    var t = Reader.new(again.body)
+    let teleport = t.varint()!
+    rig.send(steve, play(ServerboundAcceptTeleportation { teleport_id: teleport, x: 0.5, y: -60.0, z: 0.5, y_rot: 0.0, x_rot: 0.0 }))
+    rig.send(steve, play(ServerboundMovePlayerPos { x: 16.5, y: -60.0, z: 16.5, flags: ON_GROUND }))
+    check(rig.next(steve).name, "set_chunk_cache_center")
+    let new = ChunkPos { x: 1, z: 1 }
+    var forgotten = 0
+    loop {
+        let got = rig.next(steve)
+        if got.name == "nothing" {
+            break
+        }
+        check(got.name, "forget_level_chunk")
+        var f = Reader.new(got.body)
+        let packed = f.i64()!
+        if in_view(new, 16, i32.wrap(packed), i32.wrap(packed >> 32)) {
+            panic("a chunk still in view was forgotten")
+        }
+        forgotten += 1
+    }
+    var left = 0
+    var came = 0
+    for x in -19..20 {
+        for z in -19..20 {
+            let saw = in_view(ChunkPos { x: 0, z: 0 }, 16, x, z)
+            let sees = in_view(new, 16, x, z)
+            if saw and not sees {
+                left += 1
+            } else if sees and not saw {
+                came += 1
+            }
+        }
+    }
+    check_int(i64(forgotten), i64(left))
+    rig.send(steve, play(ServerboundChunkBatchReceived { desired_chunks_per_tick: 25.0 }))
+    let sent = load_all(mut rig, steve)
+    check_int(i64.wrap(sent.len()), i64(came))
+    rig.replays(Services.offline())
+    println("ok forced view")
 }
 
 fn others() {
@@ -1063,6 +1149,7 @@ fn main() {
     write(capture_path(), [])!
     join()
     moving()
+    forced_view()
     others()
     keep_alive()
     chatting()
