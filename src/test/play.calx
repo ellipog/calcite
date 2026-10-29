@@ -5,6 +5,10 @@
 /// signed chat, with chat sessions whose keys a test key signs where Mojang's would. Each server
 /// records what it's handed, and a server made the same way replays it at the end, sending and
 /// logging the same (D21).
+///
+/// Every packet a client is sent goes to `build/packets/play.bin` too, for vanilla's own codecs
+/// to read: a test client made from Calcite's code agrees with Calcite on every mistake, and
+/// vanilla's doesn't (D145).
 module test.play
 
 import auth.profile.{GameProfile}
@@ -34,6 +38,7 @@ import server.play.{World, display_name}
 import server.status.{ServerStatus}
 import std.crypto.{RsaKey}
 import std.hash.{Algorithm}
+import std.fs.{append, make_dir_all, write}
 import std.net.{Net, Conn, Event}
 import std.time.{Timestamp}
 import world.pos.{ChunkPos}
@@ -54,10 +59,10 @@ fn core() -> KnownPack {
     return KnownPack { namespace: "minecraft", id: "core", version: "26.3" }
 }
 
-fn new_server(link: own Link, services: own Services) -> Network {
+fn new_server(link: own Link, services: own Services, rate_limit: i32) -> Network {
     let packs: List<KnownPack?> = [some(core())]
     let configuration = Configuration.new("calcite", [], [Identifier { namespace: "minecraft", path: "vanilla" }], Registries { synced: [], builtin: [] }, packs)
-    let settings = LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: -1, log_ips: true, prevent_proxy_connections: false, velocity_secret: none }
+    let settings = LoginSettings { online_mode: false, accepts_transfers: false, compression_threshold: -1, log_ips: true, prevent_proxy_connections: false, velocity_secret: none, rate_limit: rate_limit }
     let status = StatusInfo { enabled: true, status: ServerStatus.starting(Component.literal("A Minecraft Server"), 20, none), motd: "A Minecraft Server" }
     var lang = Language.empty()
     lang.add("multiplayer.player.joined", "%s joined the game")
@@ -103,6 +108,7 @@ impl Client {
             some(b) => b,
             none => return Got { name: if self.closed { String("closed") } else { String("nothing") }, body: [] },
         }
+        capture(self.state, body)
         var r = Reader.new(body)
         let id = usize.wrap(r.varint()!)
         let names = packet_names(self.state, Bound.Clientbound)
@@ -136,6 +142,29 @@ impl Client {
     }
 }
 
+// Where the packets clients are sent go, for `oracle/vanilla-adapter`'s `PacketCheck`.
+fn capture_path() -> String {
+    return String("build/packets/play.bin")
+}
+
+// Adds a packet a client was sent in `state` to the capture: its state's number, as vanilla's
+// `ConnectionProtocol` orders them from handshake at 0, its length as 4 bytes, big-endian, then
+// its ID and fields.
+fn capture(state: State, sent: List<u8>) {
+    let number: u8 = match state {
+        State.Handshake => 0,
+        State.Status => 1,
+        State.Login => 2,
+        State.Configuration => 3,
+        State.Play => 4,
+    }
+    var w = Writer.new()
+    w.u8(number)
+    w.i32(i32.wrap(sent.len()))
+    w.raw(sent)
+    append(capture_path(), w.into_bytes())!
+}
+
 // A server and its clients, on a clock the test moves.
 struct Rig {
     net: Net
@@ -143,6 +172,8 @@ struct Rig {
     port: u16
     clients: List<Client>
     now: u64
+    // The server's `rate-limit`, which its replay has too.
+    rate_limit: i32
 }
 
 impl Rig {
@@ -205,7 +236,7 @@ impl Rig {
     // which must send and log what this one did.
     fn replays(mut self, services: own Services) {
         _ = self.server.take_logs()
-        var replay = new_server(Link.replay(self.server.take_log())!, services)
+        var replay = new_server(Link.replay(self.server.take_log())!, services, self.rate_limit)
         let report = replay.replay_all()
         assert(report.same(), "the replay differs: {report.to_string()}")
     }
@@ -276,10 +307,14 @@ fn new_rig() -> Rig {
 }
 
 fn new_rig_with(services: own Services) -> Rig {
+    return new_rig_limited(services, 0)
+}
+
+fn new_rig_limited(services: own Services, rate_limit: i32) -> Rig {
     let net = Net.new()!
-    let server = new_server(Link.record(net), services)
+    let server = new_server(Link.record(net), services, rate_limit)
     let port = server.listen("127.0.0.1", 0)!
-    return Rig { net: net, server: server, port: port, clients: [], now: 0 }
+    return Rig { net: net, server: server, port: port, clients: [], now: 0, rate_limit: rate_limit }
 }
 
 // Everything that's sent as a player joins, in vanilla's order, before their chunks.
@@ -899,7 +934,43 @@ fn chat_sessions() {
     println("ok chat sessions")
 }
 
+fn rate_limited() {
+    var rig = new_rig_limited(Services.offline(), 10)
+    let steve = rig.join("Steve")
+    rig.clients[steve].drain()
+    // His first tick averaged in the handshake and the hello, 2 packets, to 0.5. Since then he's
+    // sent configuration's 4 and 60 more, which go into the average at his 21st tick, when it's
+    // 64 + 0.75 * (0.5 - 64) = 16.375, over the 10 allowed; until then nothing's checked.
+    for _ in 0..60 {
+        rig.send(steve, play(ServerboundClientTickEnd {}))
+    }
+    for _ in 0..18 {
+        rig.tick(50)
+    }
+    rig.clients[steve].drain()
+    if rig.clients[steve].closed {
+        panic("Steve was kicked before his 21st tick")
+    }
+    rig.tick(50)
+    check(rig.clients[steve].after(["chunk_batch_start", "level_chunk_with_light", "chunk_batch_finished", "set_time"]).name, "disconnect")
+    rig.clients[steve].drain()
+    if not rig.clients[steve].closed {
+        panic("Steve wasn't kicked")
+    }
+    let log = rig.logs()
+    if log.find("Player exceeded rate-limit (sent 16.375 packets per second)|") == none {
+        panic("no rate-limit warning: {log}")
+    }
+    if log.find("Steve lost connection: disconnect.exceeded_packet_rate|") == none {
+        panic("Steve wasn't kicked for his rate: {log}")
+    }
+    rig.replays(Services.offline())
+    println("ok rate limit")
+}
+
 fn main() {
+    make_dir_all("build/packets")!
+    write(capture_path(), [])!
     join()
     moving()
     others()
@@ -910,5 +981,6 @@ fn main() {
     acknowledgements()
     signed_chat()
     chat_sessions()
+    rate_limited()
     println("ok")
 }

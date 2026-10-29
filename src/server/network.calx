@@ -84,6 +84,9 @@ pub struct LoginSettings {
     /// The secret of the Velocity proxy players are let in through, with the player data its
     /// modern forwarding sends, or `none` to let them in as vanilla does, from calcite.properties.
     pub velocity_secret: String?
+    /// The packets a second a connection may average before it's kicked, or 0 for no limit, from
+    /// `rate-limit`.
+    pub rate_limit: i32 = 0
 }
 
 /// What a connection is doing: which of vanilla's packet listeners it has.
@@ -191,6 +194,11 @@ struct Connection {
     outbound: State
     // In play: the player in the world.
     player: Player
+    // The ticks it's had, the packets it was handled since its last second, and their average
+    // a second, as vanilla's `Connection` counts them for `rate-limit`.
+    ticks: i32 = 0
+    received: i32 = 0
+    average_received: f32 = 0.0
 }
 
 // A player in the world, as their `ServerPlayer` and its listener hold them.
@@ -440,8 +448,8 @@ impl Network {
     /// `MinecraftServer.tickChildren` runs the parts this has: every 20 ticks the players are
     /// told the world's time, which then moves on a tick; each login, configuration and player
     /// moves on, as its listener's `tick` moves it, once the checks with the session server that
-    /// are done have been acted on; then each player is sent the chunks that are due. Mojang's
-    /// services are fetched from as they're due.
+    /// are done have been acted on, and every connection ticks its second; then each player is
+    /// sent the chunks that are due. Mojang's services are fetched from as they're due.
     pub fn tick(mut self, now: u64) {
         self.link.tick(now)
         self.services.tick(now, mut self.logs, mut self.link)
@@ -458,12 +466,15 @@ impl Network {
         }
         self.world.game_time += 1
         for i in 0..self.connections.len() {
-            let phase = self.ticking(i) else continue
             var con = self.connections[i].take() else continue
-            match phase {
-                Phase.Login => self.tick_login(mut con),
-                Phase.Configuration => self.tick_configuration(mut con, now),
-                _ => self.tick_play(mut con, now),
+            if not con.closing {
+                match con.phase {
+                    Phase.Login => self.tick_login(mut con),
+                    Phase.Configuration => self.tick_configuration(mut con, now),
+                    Phase.Play => self.tick_play(mut con, now),
+                    _ => {},
+                }
+                self.tick_second(mut con)
             }
             self.connections[i] = some(con)
         }
@@ -510,15 +521,31 @@ impl Network {
         return false
     }
 
-    // The phase of the connection in `slot` if its listener ticks: a login, a configuration or
-    // a player that's still open.
-    fn ticking(self, slot: usize) -> Phase? {
-        if let c = self.connections[slot] {
-            if not c.closing and (c.phase == Phase.Login or c.phase == Phase.Configuration or c.phase == Phase.Play) {
-                return some(c.phase)
-            }
+    // The end of a connection's tick, as vanilla's `Connection.tick` ends: on its first and every
+    // 20th after, `tickSecond` averages in the packets it was handled since, a quarter of them to
+    // three quarters of the average before. With `rate-limit` set, a connection whose average is
+    // over it is kicked then, as `RateKickingConnection` kicks it. Only one in configuration or
+    // play can be: before them a connection is handed at most 3 packets, which average under 1 a
+    // second.
+    fn tick_second(mut self, con: mut Connection) {
+        let second = con.ticks % 20 == 0
+        con.ticks = con.ticks.wrapping_add(1)
+        if not second {
+            return
         }
-        return none
+        let received = f32.nearest(con.received)
+        con.average_received = received + 0.75f32 * (con.average_received - received)
+        con.received = 0
+        let limit = self.settings.rate_limit
+        if limit <= 0 or not (con.average_received > f32.nearest(limit)) {
+            return
+        }
+        self.logs.push(Entry.warn("Player exceeded rate-limit (sent {con.average_received} packets per second)"))
+        let reason = Component.translatable("disconnect.exceeded_packet_rate", [])
+        let state = con.outbound
+        self.send(mut con, ClientboundDisconnect { reason: reason.copy() }, state)
+        con.reason = some(reason)
+        self.close(mut con)
     }
 
     // Whether the connection in `slot` is a player in the world who's still connected.
@@ -592,7 +619,8 @@ impl Network {
         }
     }
 
-    // Handles one packet. False when the connection is to close.
+    // Handles one packet. False when the connection is to close. Each packet that decodes counts
+    // toward `rate-limit`, as vanilla counts those its `Connection` hands its listener.
     fn packet(mut self, con: mut Connection, body: own List<u8>, now: u64) -> bool {
         var r = Reader.new(body)
         match con.phase {
@@ -601,6 +629,7 @@ impl Network {
                     ok(HandshakeIn.Intention(p)) => p,
                     err(_) => return false,
                 }
+                con.received += 1
                 return self.intention(mut con, intention)
             },
             Phase.Status => {
@@ -608,6 +637,7 @@ impl Network {
                     ok(p) => p,
                     err(_) => return false,
                 }
+                con.received += 1
                 match p {
                     StatusIn.StatusRequest(_) => {
                         if con.status_requested {
@@ -632,6 +662,7 @@ impl Network {
                         return false
                     },
                 }
+                con.received += 1
                 return self.login_packet(mut con, p, now)
             },
             Phase.Configuration => {
@@ -642,12 +673,14 @@ impl Network {
                         return false
                     },
                 }
+                con.received += 1
                 return self.configuration_packet(mut con, p, now)
             },
             Phase.Play => {
                 // A packet Calcite doesn't read yet is skipped whole.
                 let id = r.peek_varint() ?? -1
                 if not PlayIn.reads(id) {
+                    con.received += 1
                     return true
                 }
                 let p = match PlayIn.read(mut r) {
@@ -657,6 +690,7 @@ impl Network {
                         return false
                     },
                 }
+                con.received += 1
                 return self.play_packet(mut con, p, now)
             },
         }

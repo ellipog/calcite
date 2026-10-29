@@ -4,6 +4,8 @@
 - every ```calx block in src/README.md, whose `// out: ...` comments give the lines it prints,
   so the docs' examples can't go stale (D41).
 - the server, src/calcite.calx, which runs until it's stopped, so it's only built.
+- vanilla's own codecs on every packet the network tests' clients were sent, if the vanilla
+  adapter is built (oracle/vanilla-adapter/check_packets.py, D145). Without it, that's skipped.
 
 Debug builds also check that everything allocated is freed (Calx's D79). calx is found as
 rig/calcite-adapter/launch.py finds it.
@@ -80,6 +82,15 @@ def main():
             r = subprocess.run([calx, "build", *mode, "src/calcite.calx", "-o", str(out)], cwd=CALCITE,
                                capture_output=True, text=True, encoding="utf-8")
             report("src/calcite.calx builds", mode, r.returncode == 0, r)
+
+    check = subprocess.run([sys.executable, "-I", str(CALCITE / "oracle" / "vanilla-adapter" / "check_packets.py")],
+                           cwd=CALCITE, capture_output=True, text=True, encoding="utf-8")
+    if check.returncode == 2:
+        print(f"skip vanilla reads the tests' packets: {check.stdout.strip()}")
+    else:
+        lines = check.stdout.splitlines()
+        report(f"vanilla reads the tests' packets: {lines[-1] if lines else 'no output'}", ["--release"],
+               check.returncode == 0, check)
 
     print(f"{passed} passed, {failed} failed")
     return 1 if failed else 0

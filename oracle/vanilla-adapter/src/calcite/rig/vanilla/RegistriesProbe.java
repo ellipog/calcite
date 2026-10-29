@@ -59,6 +59,12 @@ final class RegistriesProbe implements Probe {
         };
     }
 
+    /** Every registry the server has, with the vanilla data pack's, as a client is sent them. */
+    static RegistryAccess.Frozen access() {
+        load();
+        return layers.compositeAccess();
+    }
+
     private static synchronized void load() {
         if (layers != null) {
             return;

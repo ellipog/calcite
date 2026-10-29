@@ -39,6 +39,10 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 - **Logs go to stderr.** [`log4j2.xml`](log4j2.xml) sends every log there, and the runner saves it.
 - **Startup takes about 3 seconds**, mostly `Bootstrap.bootStrap()`. The first `text` case takes a little longer, since it builds the registry lookup.
 
+## Checking Calcite's packets
+
+[`PacketCheck`](src/calcite/rig/vanilla/PacketCheck.java) is a second entry point, not a probe ([D145](../../docs/decisions.md)). Calcite's network tests write every packet their clients get to `build/packets/`, and [`check_packets.py`](check_packets.py) runs `PacketCheck` on them with the adapter's command line. It reads each packet with the codec vanilla's client reads it with: `StatusProtocols`, `LoginProtocols`, `ConfigurationProtocols` or `GameProtocols`, bound to the vanilla data pack's registries. A packet passes if it decodes, leaves no bytes over and encodes back to the same bytes. `set_time` and `update_tags` are compared as values instead, since their maps are keyed by identity-hashed objects and vanilla's order changes from run to run. It prints a line for each kind of packet and exits with 1 if any failed. `src/test/run.py` runs it at its end.
+
 ## Layout
 
 | File | Role |
@@ -54,6 +58,7 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `MthProbe.java` | `mth` |
 | `BlockStateProbe.java` | `block_state` |
 | `CollectionsProbe.java` | `collections` |
+| `PacketCheck.java` | Vanilla reading Calcite's packets, run by `check_packets.py` |
 | `RegistriesProbe.java` | `registries`: the vanilla data pack's registries and tags, loaded once as `WorldLoader.load` loads them |
 
 ## Rules for probes
