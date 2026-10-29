@@ -1,0 +1,1308 @@
+/// The console's dashboard (CAL-55, D153): a bar pinned to the bottom or the top of the
+/// terminal that shows how the server is doing, its ticks a second and their time, its players,
+/// its memory and CPU, its chunks and how long it's been up, with the line commands are typed on
+/// beside it, while the log scrolls past.
+///
+/// A thread of its own draws it, so drawing never holds up a tick. Everything the console shows
+/// goes through it: the log's lines, and what's typed, which a second thread reads a key at a
+/// time. The server thread hands it each tick's times and, each second, its players and chunks.
+/// It reads the process's memory and CPU time itself, at each beat of a third thread, once a
+/// second, so the bar keeps time even while the server thread is stuck.
+///
+/// At the bottom, the panel sits under the log's last line, at the foot of the terminal, and is
+/// drawn again under each new line, so every line goes into the terminal's scrollback as it would
+/// without it. At the top, the log scrolls in a region under the panel, which most terminals
+/// don't keep in their scrollback; latest.log has every line either way.
+module server.dashboard
+
+import java.text.{decode_utf8}
+import server.console.{ConsoleInput}
+import server.paint.{Colors, Hue, badge, paint}
+import std.env.{variable}
+import std.io.{flush, is_terminal}
+import std.net.{Waker}
+import std.process.{cpu_time, exit, memory, memory_limit, processors}
+import std.term.{at_exit, cooked, read, size}
+import std.thread.{Task, sleep}
+import std.time.{Instant, Timestamp}
+
+/// What the dashboard's thread is handed.
+pub enum ToConsole {
+    /// Text to show in the log: a line, or the card, which can hold line breaks.
+    Line(String)
+    /// A tick the server ran: when it started, in nanoseconds since the server did, and how long
+    /// the server thread worked since the tick before, handling the network's events and ticking.
+    Tick { at: u64, busy: u64 }
+    /// Each second, from the server thread: the players in the world, `max-players`, the chunks
+    /// their views hold, and whether the server is stopping.
+    World { players: usize, max: i32, chunks: usize, stopping: bool }
+    /// Bytes typed, from the key reader.
+    Keys(List<u8>)
+    /// A second went by, from the beat's thread.
+    Beat
+    /// The server is done: put the terminal back, and end.
+    Stop
+}
+
+/// Where the panel goes: `console-dashboard` in calcite.properties.
+pub enum Place {
+    Bottom
+    Top
+}
+
+/// The place `console-dashboard` names, or `none` for `off` or anything else.
+pub fn place_of(setting: String) -> Place? {
+    if setting == "bottom" {
+        return some(Place.Bottom)
+    }
+    if setting == "top" {
+        return some(Place.Top)
+    }
+    return none
+}
+
+/// Whether the console is a terminal the dashboard can draw on: standard output is one, of a
+/// known size, and isn't `dumb` or a hosting panel's. Pterodactyl and Pelican give the server a
+/// terminal but show its output in a console of their own, which keeps every byte, escape codes
+/// and all, so where `P_SERVER_UUID` says it's one of theirs, it's the plain log.
+pub unsafe fn can_draw() -> bool {
+    if not is_terminal() {
+        return false
+    }
+    if variable("TERM") == some(String("dumb")) {
+        return false
+    }
+    if variable("P_SERVER_UUID") != none {
+        return false
+    }
+    return unsafe { size() } != none
+}
+
+// A tick's length, at 20 a second.
+const TICK_NS: u64 = 50000000
+
+// A second, in nanoseconds.
+const SECOND: u64 = 1000000000
+
+// How many ticks the numbers are over: 5 seconds' worth, as vanilla's `tickTimesNanos` keeps
+// for its average.
+const TICKS: usize = 100
+
+/// The last 100 ticks' times, which the bar's TPS and MSPT come from.
+pub struct Ticks {
+    at: List<u64> = []
+    busy: List<u64> = []
+    // Where the next goes, once there are 100.
+    next: usize = 0
+}
+
+impl Ticks {
+    /// Adds a tick that started at `at` and took the server thread `busy` nanoseconds of work.
+    pub fn push(mut self, at: u64, busy: u64) {
+        if self.at.len() < TICKS {
+            self.at.push(at)
+            self.busy.push(busy)
+            return
+        }
+        self.at[self.next] = at
+        self.busy[self.next] = busy
+        self.next = (self.next + 1) % TICKS
+    }
+
+    // The oldest tick's start, and the newest's.
+    fn ends(self) -> (u64, u64) {
+        let n = self.at.len()
+        if n < TICKS {
+            return (self.at[0], self.at[n - 1])
+        }
+        return (self.at[self.next], self.at[(self.next + TICKS - 1) % TICKS])
+    }
+
+    /// Ticks a second at `now`, to the nearest tenth, at most 200: over the last 100 ticks, and
+    /// the time since the last of them too where that's over two ticks, so a server that's stuck
+    /// shows it before any tick says so. `none` before two ticks.
+    pub fn tps(self, now: u64) -> u64? {
+        let n = self.at.len()
+        if n < 2 {
+            return none
+        }
+        let (first, last) = self.ends()
+        var span = last - first
+        if now > last + 2 * TICK_NS {
+            span = now - first - TICK_NS
+        }
+        if span == 0 {
+            return some(200)
+        }
+        let rate = (u64(n - 1) * 10 * SECOND + span / 2) / span
+        return some(if rate > 200 { 200 } else { rate })
+    }
+
+    /// The server thread's work a tick, in nanoseconds, over the last 100 ticks, or the time
+    /// since the last tick, where it's more than two ticks and longer: a tick that's still going.
+    /// `none` before the first.
+    pub fn mspt(self, now: u64) -> u64? {
+        let n = self.at.len()
+        if n == 0 {
+            return none
+        }
+        var sum: u64 = 0
+        for b in self.busy {
+            sum += b
+        }
+        let mean = sum / u64(n)
+        let (_, last) = self.ends()
+        if now > last + 2 * TICK_NS and now - last > mean {
+            return some(now - last)
+        }
+        return some(mean)
+    }
+}
+
+/// What the bar shows.
+pub struct Shown {
+    /// Ticks a second, in tenths, or `none` before the server has ticked.
+    pub tps: u64?
+    /// The server thread's work a tick, in nanoseconds.
+    pub mspt: u64?
+    pub players: usize
+    pub max_players: i32
+    pub chunks: usize
+    /// The bytes of memory the process holds, and that it may: 0 where the system can't say.
+    pub memory: u64
+    pub memory_limit: u64
+    /// The share of the processors the process used over the last second, in tenths of a
+    /// percent, or `none` before a second has gone.
+    pub cpu: u64?
+    /// Nanoseconds since the server started.
+    pub uptime: u64
+    pub stopping: bool
+}
+
+// One of the bar's numbers, as it shows, and how many columns it takes.
+struct Item {
+    text: String
+    width: usize
+}
+
+// The columns `s` takes: one for each code point.
+fn columns(s: String) -> usize {
+    var n: usize = 0
+    for i in 0..s.len() {
+        if not continuation(s.byte_at(i)) {
+            n += 1
+        }
+    }
+    return n
+}
+
+fn continuation(b: u8) -> bool {
+    return b >= 128 and b < 192
+}
+
+// `value`, in `hue` where it's given, between the muted words `before` and `after`.
+fn item(colors: Colors, before: str, value: String, after: str, hue: Hue?) -> Item {
+    var text = String()
+    var width = columns(value)
+    if not before.is_empty() {
+        text.push_str(paint(colors, Hue.Muted, false, String(before)))
+        text.push(' ')
+        width += columns(String(before)) + 1
+    }
+    if let h = hue {
+        text.push_str(paint(colors, h, false, value))
+    } else {
+        text.push_str(value)
+    }
+    if not after.is_empty() {
+        text.push(' ')
+        text.push_str(paint(colors, Hue.Muted, false, String(after)))
+        width += columns(String(after)) + 1
+    }
+    return Item { text: text, width: width }
+}
+
+// The amber or red a value takes once it reaches `amber` or `red`, or none below them.
+fn hue_from(value: u64, amber: u64, red: u64) -> Hue? {
+    if value >= red {
+        return some(Hue.Red)
+    }
+    if value >= amber {
+        return some(Hue.Amber)
+    }
+    return none
+}
+
+// Tenths, as `20.0`.
+fn tenths(t: u64) -> String {
+    return "{t / 10}.{t % 10}"
+}
+
+// Milliseconds from nanoseconds: to a hundredth under 1, to a tenth under 100, else whole.
+fn millis(ns: u64) -> String {
+    if ns < 995000 {
+        let h = (ns + 5000) / 10000
+        return if h < 10 { "0.0{h}" } else { "0.{h}" }
+    }
+    let t = (ns + 50000) / 100000
+    if t < 1000 {
+        return tenths(t)
+    }
+    return "{(ns + 500000) / 1000000}"
+}
+
+// Bytes of RAM, in MB under a GB, then in GB to a tenth under 10, as Task Manager and `top`
+// count them, in 1024s.
+fn ram(n: u64) -> String {
+    let mib = n / 1048576
+    if mib < 1024 {
+        return "{mib} MB"
+    }
+    let t = (n / 1048576 * 10 + 512) / 1024
+    if t < 100 {
+        return "{tenths(t)} GB"
+    }
+    return "{(mib + 512) / 1024} GB"
+}
+
+// A share in tenths of a percent, as `3.2%` under 10%, else whole.
+fn percent(t: u64) -> String {
+    return if t < 100 { "{tenths(t)}%" } else { "{t / 10}%" }
+}
+
+// How long the server's been up: seconds under a minute, then minutes and seconds, hours and
+// minutes, and days and hours.
+fn uptime(ns: u64) -> String {
+    let s = ns / SECOND
+    if s < 60 {
+        return "{s}s"
+    }
+    if s < 3600 {
+        return "{s / 60}m {s % 60}s"
+    }
+    if s < 86400 {
+        return "{s / 3600}h {s / 60 % 60}m"
+    }
+    return "{s / 86400}d {s / 3600 % 24}h"
+}
+
+// The items that fit in `room` columns, from the first, with a muted dot between each two.
+fn fit(items: List<Item>, room: usize, colors: Colors) -> String {
+    var out = String()
+    var used: usize = 0
+    for i in 0..items.len() {
+        let gap: usize = if i > 0 { 3 } else { 0 }
+        if used + gap + items[i].width > room {
+            break
+        }
+        if i > 0 {
+            out.push_str(paint(colors, Hue.Muted, false, " · "))
+        }
+        out.push_str(items[i].text)
+        used += gap + items[i].width
+    }
+    return out
+}
+
+fn widths(items: List<Item>) -> usize {
+    var n: usize = 0
+    for i in 0..items.len() {
+        n += items[i].width + if i > 0 { 3 } else { 0 }
+    }
+    return n
+}
+
+/// The bar's lines in `width` columns, starting with Calcite's badge: one line where it all
+/// fits, else two, how the server keeps up and what it costs on the first, its world on the
+/// second, each cut where it would run over. A number that looks bad is amber, or red where it's
+/// worse:
+///
+/// - TPS under 19.5, or under 15
+/// - MSPT over 40 ms, or 50, the length of a tick
+/// - RAM at 80% of what the process may use, or 90%
+/// - CPU at 80% of the processors, or 95%
+///
+/// In Calcite's style the numbers start where the log's words do.
+pub fn bar(s: Shown, width: usize, colors: Colors, calcite: bool) -> List<String> {
+    var speed = List<Item>()
+    var world = List<Item>()
+    if s.stopping {
+        speed.push(item(colors, "", String("stopping"), "", some(Hue.Amber)))
+        speed.push(item(colors, "", String("Ctrl+C ends it at once"), "", some(Hue.Muted)))
+    } else if let tps = s.tps {
+        let slow = if tps < 150 { some(Hue.Red) } else if tps < 195 { some(Hue.Amber) } else { none }
+        speed.push(item(colors, "", tenths(tps), "TPS", slow))
+        if let ns = s.mspt {
+            speed.push(item(colors, "", millis(ns), "MSPT", if ns > 50000000 { some(Hue.Red) } else if ns > 40000000 { some(Hue.Amber) } else { none }))
+        }
+    } else {
+        speed.push(item(colors, "", String("starting"), "", some(Hue.Muted)))
+    }
+    if let cpu = s.cpu {
+        speed.push(item(colors, "", percent(cpu), "CPU", hue_from(cpu, 800, 950)))
+    }
+    if s.memory_limit > 0 {
+        let share = s.memory * 100 / s.memory_limit
+        speed.push(item(colors, "", "{ram(s.memory)} / {ram(s.memory_limit)}", "RAM", hue_from(share, 80, 90)))
+    } else if s.memory > 0 {
+        speed.push(item(colors, "", ram(s.memory), "RAM", none))
+    }
+    world.push(item(colors, "", "{s.players}/{s.max_players}", "players", none))
+    world.push(item(colors, "", "{s.chunks}", if s.chunks == 1 { "chunk" } else { "chunks" }, none))
+    world.push(item(colors, "up", uptime(s.uptime), "", none))
+
+    let room = if width > 0 { width - 1 } else { 0 }
+    // The badge, and the room before the numbers, which in Calcite's style start where the log's
+    // words do: 15 columns in.
+    var lead = String()
+    var lead_width: usize = if calcite { 15 } else { 11 }
+    if room >= lead_width + 24 {
+        let before: usize = if calcite { 4 } else { 0 }
+        for _ in 0..before {
+            lead.push(' ')
+        }
+        lead.push_str(badge(colors))
+        let badge_width: usize = match colors {
+            Colors.Off => 7,
+            _ => 9,
+        }
+        for _ in before + badge_width..lead_width {
+            lead.push(' ')
+        }
+    } else {
+        lead_width = 0
+    }
+    var out = List<String>()
+    if lead_width + widths(speed) + 3 + widths(world) <= room {
+        out.push("{lead}{fit(speed, room, colors)}{paint(colors, Hue.Muted, false, " · ")}{fit(world, room, colors)}")
+        return out
+    }
+    out.push("{lead}{fit(speed, room - lead_width, colors)}")
+    var indent = String()
+    for _ in 0..lead_width {
+        indent.push(' ')
+    }
+    out.push("{indent}{fit(world, room - lead_width, colors)}")
+    return out
+}
+
+/// What a key typed does, beyond changing the line.
+pub enum Edit {
+    /// Enter: the line, to run as a command.
+    Run(String)
+    /// Ctrl+C: stop the server, as vanilla's shutdown hook does at Ctrl+C.
+    Halt
+    /// The terminal's answer to where the cursor is: its row, from 1.
+    At(usize)
+}
+
+/// The line being typed, as the dashboard edits it: the terminal's own echo and editing are off
+/// in raw mode, so these are Calcite's. Left and right, Home and End, Backspace and Delete, the
+/// word moves of Ctrl+Left and Ctrl+Right, up and down for the lines typed before, and the
+/// shell's Ctrl+A, E, B, F, P, N, K, U and W. Esc clears the line, as it does in Windows' console.
+pub struct Editor {
+    text: String = String()
+    // The cursor's byte offset in the line.
+    cursor: usize = 0
+    history: List<String> = []
+    // Which line of the history shows: `history.len()` for the one being typed.
+    browsing: usize = 0
+    // The line being typed, while the history shows another.
+    draft: String = String()
+    // The first bytes of a key or a character whose rest hasn't come yet.
+    pending: List<u8> = []
+    // Whether the last key was a carriage return, so a line feed right after it is the same Enter.
+    after_cr: bool = false
+}
+
+impl Editor {
+    /// The line as it is now.
+    pub fn line(self) -> String {
+        return self.text.copy()
+    }
+
+    /// The cursor's place in the line, in bytes.
+    pub fn cursor_at(self) -> usize {
+        return self.cursor
+    }
+
+    /// Takes the bytes the terminal sent for the keys typed, and gives what they do beyond editing
+    /// the line, in order.
+    pub fn keys(mut self, bytes: List<u8>) -> List<Edit> {
+        var all = List<u8>()
+        for b in self.pending {
+            all.push(b)
+        }
+        for b in bytes {
+            all.push(b)
+        }
+        self.pending.clear()
+        var out = List<Edit>()
+        let n = all.len()
+        var i: usize = 0
+        while i < n {
+            let b = all[i]
+            let was_cr = self.after_cr
+            self.after_cr = b == 13
+            if b == 13 or (b == 10 and not was_cr) {
+                self.enter(mut out)
+                i += 1
+            } else if b == 10 {
+                i += 1
+            } else if b == 27 {
+                let used = self.escape(all, i, mut out)
+                if used == 0 {
+                    for k in i..n {
+                        self.pending.push(all[k])
+                    }
+                    return out
+                }
+                i += used
+            } else if b < 32 or b == 127 {
+                self.control(b, mut out)
+                i += 1
+            } else {
+                // Text, up to the next control byte, less a character cut off at the end.
+                var j = i
+                while j < n and all[j] >= 32 and all[j] != 127 {
+                    j += 1
+                }
+                let end = if j == n { whole_end(all, i, j) } else { j }
+                var piece = List<u8>()
+                for k in i..end {
+                    piece.push(all[k])
+                }
+                self.insert(decode_utf8(piece))
+                if end < j {
+                    for k in end..j {
+                        self.pending.push(all[k])
+                    }
+                    return out
+                }
+                i = j
+            }
+        }
+        return out
+    }
+
+    fn enter(mut self, out: mut List<Edit>) {
+        let typed = self.text.copy()
+        if not typed.is_empty() {
+            let n = self.history.len()
+            if n == 0 or self.history[n - 1] != typed {
+                self.history.push(typed.copy())
+            }
+        }
+        self.text = String()
+        self.cursor = 0
+        self.draft = String()
+        self.browsing = self.history.len()
+        out.push(Edit.Run(typed))
+    }
+
+    // A control key.
+    fn control(mut self, b: u8, out: mut List<Edit>) {
+        if b == 3 {
+            out.push(Edit.Halt)
+        } else if b == 1 {
+            self.cursor = 0
+        } else if b == 5 {
+            self.cursor = self.text.len()
+        } else if b == 2 {
+            let at = self.cursor
+            self.cursor = self.before(at)
+        } else if b == 6 {
+            let at = self.cursor
+            self.cursor = self.after(at)
+        } else if b == 8 or b == 127 {
+            let from = self.before(self.cursor)
+            let at = self.cursor
+            self.cut(from, at)
+        } else if b == 4 {
+            let to = self.after(self.cursor)
+            let at = self.cursor
+            self.cut(at, to)
+        } else if b == 11 {
+            let at = self.cursor
+            let end = self.text.len()
+            self.cut(at, end)
+        } else if b == 21 {
+            let at = self.cursor
+            self.cut(0, at)
+        } else if b == 23 {
+            let from = self.word_before(self.cursor)
+            let at = self.cursor
+            self.cut(from, at)
+        } else if b == 16 {
+            self.up()
+        } else if b == 14 {
+            self.down()
+        }
+    }
+
+    // An escape sequence at `i`, and how many bytes it took, or 0 if it hasn't all come.
+    fn escape(mut self, all: List<u8>, i: usize, out: mut List<Edit>) -> usize {
+        let n = all.len()
+        if i + 1 == n {
+            // Esc alone: a key's sequence comes whole, so nothing after it is the key itself.
+            self.text = String()
+            self.cursor = 0
+            return 1
+        }
+        let kind = all[i + 1]
+        if kind == 91 {
+            // CSI: parameters and intermediates from 0x20 to 0x3F, then a final byte.
+            var j = i + 2
+            while j < n and all[j] >= 32 and all[j] < 64 {
+                j += 1
+            }
+            if j == n {
+                return 0
+            }
+            var params = List<u8>()
+            for k in i + 2..j {
+                params.push(all[k])
+            }
+            self.csi(String.from_utf8(params) ?? String(), all[j], mut out)
+            return j - i + 1
+        }
+        if kind == 79 {
+            if i + 2 == n {
+                return 0
+            }
+            self.csi(String(), all[i + 2], mut out)
+            return 3
+        }
+        if kind == 98 {
+            let at = self.cursor
+            self.cursor = self.word_before(at)
+        } else if kind == 102 {
+            let at = self.cursor
+            self.cursor = self.word_after(at)
+        } else if kind == 127 or kind == 8 {
+            let from = self.word_before(self.cursor)
+            let at = self.cursor
+            self.cut(from, at)
+        }
+        return 2
+    }
+
+    // A CSI or SS3 key with its parameters, such as `1;5` for Ctrl.
+    fn csi(mut self, params: String, last: u8, out: mut List<Edit>) {
+        let semi = params.find(";")
+        let first = usize.parse(params[..semi ?? params.len()]) ?? 1
+        // The modifiers, after the `;`: 3 is Alt, 5 Ctrl.
+        var held: usize = 1
+        if let s = semi {
+            held = usize.parse(params[s + 1..]) ?? 1
+        }
+        let word = held == 3 or held == 5
+        if last == 65 {
+            self.up()
+        } else if last == 66 {
+            self.down()
+        } else if last == 67 {
+            let at = self.cursor
+            self.cursor = if word { self.word_after(at) } else { self.after(at) }
+        } else if last == 68 {
+            let at = self.cursor
+            self.cursor = if word { self.word_before(at) } else { self.before(at) }
+        } else if last == 72 {
+            self.cursor = 0
+        } else if last == 70 {
+            self.cursor = self.text.len()
+        } else if last == 82 {
+            out.push(Edit.At(first))
+        } else if last == 126 {
+            if first == 1 or first == 7 {
+                self.cursor = 0
+            } else if first == 4 or first == 8 {
+                self.cursor = self.text.len()
+            } else if first == 3 {
+                let to = self.after(self.cursor)
+                let at = self.cursor
+                self.cut(at, to)
+            }
+        }
+    }
+
+    fn insert(mut self, s: String) {
+        var t = String()
+        t.push_str(self.text[..self.cursor])
+        t.push_str(s)
+        t.push_str(self.text[self.cursor..])
+        self.text = t
+        self.cursor += s.len()
+    }
+
+    // Removes the bytes from `from` up to `to`, and puts the cursor where they were.
+    fn cut(mut self, from: usize, to: usize) {
+        if from >= to {
+            return
+        }
+        var t = String()
+        t.push_str(self.text[..from])
+        t.push_str(self.text[to..])
+        self.text = t
+        self.cursor = from
+    }
+
+    // Where the character before `at` starts.
+    fn before(self, at: usize) -> usize {
+        if at == 0 {
+            return 0
+        }
+        var j = at - 1
+        while j > 0 and continuation(self.text.byte_at(j)) {
+            j -= 1
+        }
+        return j
+    }
+
+    // Where the character after the one at `at` starts.
+    fn after(self, at: usize) -> usize {
+        let n = self.text.len()
+        if at >= n {
+            return n
+        }
+        var j = at + 1
+        while j < n and continuation(self.text.byte_at(j)) {
+            j += 1
+        }
+        return j
+    }
+
+    // The start of the word before `at`, past the spaces before it.
+    fn word_before(self, at: usize) -> usize {
+        var j = at
+        while j > 0 and self.text.byte_at(j - 1) == 32 {
+            j -= 1
+        }
+        while j > 0 and self.text.byte_at(j - 1) != 32 {
+            j -= 1
+        }
+        return j
+    }
+
+    // The end of the word after `at`, past the spaces before it.
+    fn word_after(self, at: usize) -> usize {
+        let n = self.text.len()
+        var j = at
+        while j < n and self.text.byte_at(j) == 32 {
+            j += 1
+        }
+        while j < n and self.text.byte_at(j) != 32 {
+            j += 1
+        }
+        return j
+    }
+
+    fn up(mut self) {
+        if self.browsing == 0 {
+            return
+        }
+        if self.browsing == self.history.len() {
+            self.draft = self.text.copy()
+        }
+        self.browsing -= 1
+        self.text = self.history[self.browsing].copy()
+        self.cursor = self.text.len()
+    }
+
+    fn down(mut self) {
+        if self.browsing >= self.history.len() {
+            return
+        }
+        self.browsing += 1
+        self.text = if self.browsing == self.history.len() { self.draft.copy() } else { self.history[self.browsing].copy() }
+        self.cursor = self.text.len()
+    }
+}
+
+// Where the text in `all` from `from` up to `to`, the end of what came, stops being whole: before
+// a UTF-8 sequence that its lead byte says is cut off.
+fn whole_end(all: List<u8>, from: usize, to: usize) -> usize {
+    var j = to
+    var back: usize = 0
+    while j > from and back < 3 and continuation(all[j - 1]) {
+        j -= 1
+        back += 1
+    }
+    if j == from {
+        return to
+    }
+    let lead = all[j - 1]
+    let wanted: usize = if lead >= 240 and lead < 248 { 4 } else if lead >= 224 { 3 } else if lead >= 192 { 2 } else { 1 }
+    return if wanted > back + 1 and lead >= 192 and lead < 248 { j - 1 } else { to }
+}
+
+/// The rows `text` takes on a terminal `width` columns wide: each of its lines one for each
+/// `width` columns or part, and at least one. Escape codes take none, and each code point one
+/// column.
+pub fn rows_of(text: String, width: usize) -> usize {
+    var rows: usize = 0
+    var cols: usize = 0
+    let n = text.len()
+    var i: usize = 0
+    while i < n {
+        let b = text.byte_at(i)
+        if b == 27 {
+            i += 1
+            if i < n and text.byte_at(i) == 91 {
+                i += 1
+                while i < n and (text.byte_at(i) < 64 or text.byte_at(i) > 126) {
+                    i += 1
+                }
+            }
+            i += 1
+        } else {
+            if b == 10 {
+                rows += if cols == 0 { 1 } else { (cols + width - 1) / width }
+                cols = 0
+            } else if b != 13 and not continuation(b) {
+                cols += 1
+            }
+            i += 1
+        }
+    }
+    return rows + if cols == 0 { 1 } else { (cols + width - 1) / width }
+}
+
+// Where the prompt's text starts in Calcite's style: where the log's words do.
+const PROMPT: usize = 15
+
+/// The line being typed as the dashboard shows it, in `width` columns: the prompt, then the line,
+/// or as much of it as fits around the cursor, or a hint where it's empty. Then the column the
+/// cursor is in, from 0.
+pub fn input_row(e: Editor, width: usize, colors: Colors, calcite: bool) -> (String, usize) {
+    var out = String()
+    let prompt: usize = if calcite { PROMPT } else { 2 }
+    if calcite {
+        for _ in 0..PROMPT - 3 {
+            out.push(' ')
+        }
+        out.push_str(paint(colors, Hue.Muted, true, "›"))
+        out.push_str("  ")
+    } else {
+        out.push_str("> ")
+    }
+    if e.text.is_empty() {
+        let hint = String("type a command, such as stop")
+        if prompt + hint.len() < width {
+            out.push_str(paint(colors, Hue.Faint, false, hint))
+        }
+        return (out, prompt)
+    }
+    let room = if width > prompt + 2 { width - prompt - 1 } else { 1 }
+    var starts = List<usize>()
+    for i in 0..e.text.len() {
+        if not continuation(e.text.byte_at(i)) {
+            starts.push(i)
+        }
+    }
+    let count = starts.len()
+    var at: usize = 0
+    while at < count and starts[at] < e.cursor {
+        at += 1
+    }
+    var first: usize = 0
+    if count >= room and at >= room {
+        first = at - room + 1
+    }
+    let last = if first + room < count { first + room } else { count }
+    let end = if last < count { starts[last] } else { e.text.len() }
+    out.push_str(e.text[starts[first]..end])
+    return (out, prompt + at - first)
+}
+
+fn two(n: i32) -> String {
+    return if n < 10 { "0{n}" } else { "{n}" }
+}
+
+// What the log shows for a line that was typed: in Calcite's style as its lines show, the time,
+// then a muted `›`, as the prompt has it, then the line, and in vanilla's as a terminal echoes it
+// after the prompt.
+fn echo(line: String, colors: Colors, calcite: bool) -> String {
+    if not calcite {
+        return "> {line}"
+    }
+    let now = unsafe { Timestamp.now() }
+    let t = now.date_time(unsafe { now.local_offset() })
+    return "  {paint(colors, Hue.Faint, false, "{two(t.hour)}:{two(t.minute)}:{two(t.second)}")}  {paint(colors, Hue.Muted, true, "›")}  {line}"
+}
+
+// The dashboard's thread: what it draws, and from what.
+struct Panel {
+    to_server: Sender<ConsoleInput>
+    waker: Waker
+    start: Instant
+    place: Place
+    colors: Colors
+    calcite: bool
+    editor: Editor = Editor()
+    ticks: Ticks = Ticks()
+    players: usize = 0
+    max_players: i32 = 0
+    chunks: usize = 0
+    // Whether the server says it's stopping, and whether Ctrl+C asked it to.
+    stopping: bool = false
+    halted: bool = false
+    memory: u64 = 0
+    limit: u64 = 0
+    cpu: u64? = none
+    // The CPU time at the last beat, and when it was.
+    cpu_then: u64 = 0
+    wall_then: Instant
+    processors: u64 = 1
+    // The lines to show, at the next frame.
+    lines: List<String> = []
+    // The terminal's size at the last frame.
+    width: usize = 80
+    height: usize = 24
+    // At the bottom: the rows the panel took at the last frame, 0 before the first, and the row
+    // the log's next line goes on, 0 before the terminal says where the cursor is.
+    drawn: usize = 0
+    log_row: usize = 0
+    // The row the terminal said the cursor is on, for the next frame to start from, and after the
+    // terminal changed height, the rows between the log's end and the panel then.
+    pin: usize? = none
+    gap: usize? = none
+    // Whether the terminal was asked where the cursor is and hasn't said, and for how many beats.
+    asking: bool = false
+    asked: usize = 0
+    // At the top: whether the log's region is set, the rows the panel takes, the terminal's
+    // height it was set for, and whether the log has a line yet, whose end the terminal keeps
+    // with DECSC.
+    ready: bool = false
+    top_rows: usize = 0
+    region: usize = 0
+    region_width: usize = 0
+    logged: bool = false
+    stop: bool = false
+    quit: bool = false
+}
+
+impl Panel {
+    fn take(mut self, m: own ToConsole) {
+        match m {
+            ToConsole.Line(text) => self.lines.push(text.copy()),
+            ToConsole.Tick { at, busy } => self.ticks.push(at, busy),
+            ToConsole.World { players, max, chunks, stopping } => {
+                self.players = players
+                self.max_players = max
+                self.chunks = chunks
+                self.stopping = stopping
+            },
+            ToConsole.Keys(bytes) => {
+                for e in self.editor.keys(bytes) {
+                    match e {
+                        Edit.Run(line) => {
+                            self.lines.push(echo(line, self.colors, self.calcite))
+                            self.to_server.send(ConsoleInput.Line(line.copy()))
+                            self.waker.wake()
+                        },
+                        Edit.Halt => {
+                            if self.halted or self.stopping {
+                                self.quit = true
+                            } else {
+                                self.halted = true
+                                self.to_server.send(ConsoleInput.Halt)
+                                self.waker.wake()
+                            }
+                        },
+                        Edit.At(row) => {
+                            if self.asking {
+                                self.asking = false
+                                self.pin = some(row)
+                            }
+                        },
+                    }
+                }
+            },
+            ToConsole.Beat => {
+                let cpu = unsafe { cpu_time() }
+                let wall = unsafe { Instant.now() }
+                let took = wall.nanos_since(self.wall_then)
+                if took > 0 and cpu >= self.cpu_then {
+                    let share = (cpu - self.cpu_then) * 1000 / (took * self.processors)
+                    self.cpu = some(if share > 1000 { 1000 } else { share })
+                }
+                self.cpu_then = cpu
+                self.wall_then = wall
+                self.memory = unsafe { memory() }
+                self.limit = unsafe { memory_limit() }
+                // A terminal that doesn't say where the cursor is gets the panel at its foot.
+                if self.asking {
+                    self.asked += 1
+                    if self.asked >= 2 {
+                        self.asking = false
+                    }
+                }
+            },
+            ToConsole.Stop => self.stop = true,
+        }
+    }
+
+    // Asks the terminal where the cursor is, which it answers as if typed: where the log goes on.
+    fn ask(mut self) {
+        self.asking = true
+        self.asked = 0
+        print("\u{1B}[6n")
+        flush()
+    }
+
+    // What at_exit writes, to leave the terminal as the panel found it however the program ends.
+    fn exit_text(self) -> String {
+        var out = String()
+        match self.place {
+            Place.Bottom => {
+                // The panel goes, and the cursor goes where the log's next line would have.
+                if self.drawn > 0 {
+                    out.push_str("\u{1B}[{self.height + 1 - self.drawn};1H\u{1B}[J")
+                    if self.log_row > 0 and self.log_row < self.height + 1 - self.drawn {
+                        out.push_str("\u{1B}[{self.log_row};1H")
+                    }
+                }
+            },
+            Place.Top => {
+                out.push_str("\u{1B}[r")
+                for r in 1..self.top_rows + 1 {
+                    out.push_str("\u{1B}[{r};1H\u{1B}[2K")
+                }
+                out.push_str("\u{1B}8\r\n")
+            },
+        }
+        out.push_str("\u{1B}[0m\u{1B}[?25h\u{1B}[?2026l")
+        return out
+    }
+
+    fn draw(mut self) {
+        if self.asking {
+            return
+        }
+        if let s = unsafe { size() } {
+            let width = usize(s.columns)
+            let height = usize(s.rows)
+            let bottom = match self.place {
+                Place.Bottom => true,
+                Place.Top => false,
+            }
+            if bottom and (width != self.width or height != self.height) and self.drawn > 0 {
+                // The terminal may have moved its lines as it changed size, so the panel goes,
+                // and is drawn again from where the terminal says the cursor is, its top row.
+                // Where only its height changed, its lines didn't move, and the log goes on as
+                // far above the panel as it was.
+                self.gap = if width == self.width { some(self.height + 1 - self.drawn - self.log_row) } else { none }
+                self.width = width
+                self.height = height
+                self.drawn = 0
+                self.log_row = 0
+                print("\r\u{1B}[J")
+                self.ask()
+                return
+            }
+            self.width = width
+            self.height = height
+        }
+        let now = unsafe { Instant.now() }.nanos_since(self.start)
+        let shown = Shown {
+            tps: self.ticks.tps(now),
+            mspt: self.ticks.mspt(now),
+            players: self.players,
+            max_players: self.max_players,
+            chunks: self.chunks,
+            memory: self.memory,
+            memory_limit: self.limit,
+            cpu: self.cpu,
+            uptime: now,
+            stopping: self.stopping or self.halted,
+        }
+        let lines = if self.height >= 6 and self.width >= 30 { bar(shown, self.width, self.colors, self.calcite) } else { List<String>() }
+        let (input, col) = input_row(self.editor, self.width, self.colors, self.calcite)
+        // Each frame is drawn at once where the terminal can, without the cursor showing as it moves.
+        var out = String("\u{1B}[?2026h\u{1B}[?25l")
+        match self.place {
+            Place.Bottom => self.bottom(mut out, lines, input, col),
+            Place.Top => self.top(mut out, lines, input, col),
+        }
+        out.push_str("\u{1B}[?25h\u{1B}[?2026l")
+        print(out)
+        flush()
+        at_exit(self.exit_text())
+    }
+
+    // The panel in the rows at the terminal's foot, and the log's new lines above it: they go on
+    // from its last line, down to the panel, and once they reach it the screen scrolls, so each
+    // goes into the scrollback as it would without the panel.
+    fn bottom(mut self, out: mut String, strip: List<String>, input: String, col: usize) {
+        let k = 1 + strip.len()
+        let foot = self.height + 1 - k
+        if let row = self.pin.take() {
+            self.log_row = row
+            if let g = self.gap.take() {
+                if row > g {
+                    self.log_row = row - g
+                }
+            }
+        } else if self.log_row == 0 {
+            // The terminal didn't say where the cursor is: the panel goes under it, at the foot.
+            for _ in 0..k {
+                out.push_str("\n")
+            }
+            self.log_row = foot
+        }
+        let fresh = not self.lines.is_empty() or k != self.drawn
+        if self.log_row > foot {
+            // The panel grew, or there wasn't room under the cursor: the log moves up for it.
+            out.push_str("\u{1B}[{self.height};1H")
+            for _ in 0..self.log_row - foot {
+                out.push_str("\n")
+            }
+            self.log_row = foot
+        }
+        if fresh {
+            out.push_str("\u{1B}[{self.log_row};1H\u{1B}[J")
+            var rows: usize = 0
+            for i in 0..self.lines.len() {
+                out.push_str(self.lines[i])
+                out.push_str("\r\n")
+                rows += rows_of(self.lines[i], self.width)
+            }
+            self.lines.clear()
+            let reached = if self.log_row + rows < self.height { self.log_row + rows } else { self.height }
+            if reached <= foot {
+                self.log_row = reached
+                out.push_str("\u{1B}[{foot};1H")
+            } else {
+                // The log reached the panel: the panel goes under its last line, scrolling the
+                // screen as it's drawn, to the foot.
+                self.log_row = foot
+            }
+        } else {
+            out.push_str("\u{1B}[{foot};1H")
+        }
+        out.push_str(input)
+        out.push_str("\u{1B}[K")
+        for b in strip {
+            out.push_str("\r\n")
+            out.push_str(b)
+            out.push_str("\u{1B}[K")
+        }
+        out.push_str("\u{1B}[{foot};{col + 1}H")
+        self.drawn = k
+    }
+
+    // The panel in the top rows, the bar then the input line, and the log's new lines in the
+    // region under it.
+    fn top(mut self, out: mut String, strip: List<String>, input: String, col: usize) {
+        let k = 1 + strip.len()
+        if not self.ready {
+            if let row = self.pin.take() {
+                // What's on the screen moves down under the panel, up first where there isn't
+                // room under it, and the log goes on from the cursor.
+                var at = row
+                if at + k > self.height {
+                    let up = at + k - self.height
+                    out.push_str("\u{1B}[{self.height};1H")
+                    for _ in 0..up {
+                        out.push_str("\n")
+                    }
+                    at -= up
+                }
+                out.push_str("\u{1B}[1;1H\u{1B}[{k}L")
+                out.push_str("\u{1B}[{k + 1};{self.height}r\u{1B}[{at + k};1H\u{1B}7")
+            } else {
+                // The terminal didn't say where the cursor is: what's on the screen goes into the
+                // scrollback, so the panel and the log start clear.
+                out.push_str("\u{1B}[{self.height};1H")
+                for _ in 1..self.height {
+                    out.push_str("\n")
+                }
+                out.push_str("\u{1B}[{k + 1};{self.height}r\u{1B}[{k + 1};1H\u{1B}7")
+            }
+            self.ready = true
+            self.logged = false
+            self.top_rows = k
+        } else if k != self.top_rows or self.height != self.region or self.width != self.region_width {
+            // The panel or the window changed size: the region follows. Where the window only
+            // grew taller, the log goes on where it was, else at the region's foot, since the
+            // terminal may have moved its lines.
+            let most = if k > self.top_rows { k } else { self.top_rows }
+            for r in 1..most + 1 {
+                out.push_str("\u{1B}[{r};1H\u{1B}[2K")
+            }
+            out.push_str("\u{1B}[{k + 1};{self.height}r")
+            if self.height < self.region or self.width != self.region_width {
+                out.push_str("\u{1B}[{self.height};1H\u{1B}7")
+                self.logged = true
+            }
+            self.top_rows = k
+        }
+        self.region = self.height
+        self.region_width = self.width
+        if not self.lines.is_empty() {
+            out.push_str("\u{1B}8")
+            for i in 0..self.lines.len() {
+                if self.logged or i > 0 {
+                    out.push_str("\r\n")
+                }
+                out.push_str(self.lines[i])
+            }
+            self.logged = true
+            self.lines.clear()
+            out.push_str("\u{1B}7")
+        }
+        for i in 0..strip.len() {
+            out.push_str("\u{1B}[{i + 1};1H")
+            out.push_str(strip[i])
+            out.push_str("\u{1B}[K")
+        }
+        out.push_str("\u{1B}[{k};1H")
+        out.push_str(input)
+        out.push_str("\u{1B}[K\u{1B}[{k};{col + 1}H")
+    }
+
+    // Takes the panel away, shows the lines still to show under the log's last, and puts the
+    // terminal back as it was.
+    fn finish(mut self) {
+        var out = String()
+        match self.place {
+            Place.Bottom => {
+                if self.drawn > 0 {
+                    let foot = self.height + 1 - self.drawn
+                    out.push_str("\u{1B}[{foot};1H\u{1B}[J")
+                    if self.log_row > 0 and self.log_row < foot {
+                        out.push_str("\u{1B}[{self.log_row};1H")
+                    }
+                }
+            },
+            Place.Top => {
+                if self.ready {
+                    out.push_str("\u{1B}[r")
+                    for r in 1..self.top_rows + 1 {
+                        out.push_str("\u{1B}[{r};1H\u{1B}[2K")
+                    }
+                    out.push_str("\u{1B}8")
+                    if self.logged {
+                        out.push_str("\r\n")
+                    }
+                }
+            },
+        }
+        for i in 0..self.lines.len() {
+            out.push_str(self.lines[i])
+            out.push_str("\r\n")
+        }
+        self.lines.clear()
+        out.push_str("\u{1B}[0m\u{1B}[?25h\u{1B}[?2026l")
+        print(out)
+        flush()
+        at_exit(String())
+        cooked()
+    }
+}
+
+// The dashboard's thread, as it starts.
+struct Dashboard {
+    inbox: Receiver<ToConsole>
+    to_server: Sender<ConsoleInput>
+    waker: Waker
+    start: Instant
+    place: Place
+    colors: Colors
+    calcite: bool
+}
+
+impl Task for Dashboard {
+    fn run(own self) {
+        var inbox = self.inbox
+        var p = Panel {
+            to_server: self.to_server,
+            waker: self.waker,
+            start: self.start,
+            place: self.place,
+            colors: self.colors,
+            calcite: self.calcite,
+            wall_then: unsafe { Instant.now() },
+            cpu_then: unsafe { cpu_time() },
+            processors: u64(unsafe { processors() }),
+            memory: unsafe { memory() },
+            limit: unsafe { memory_limit() },
+        }
+        if let s = unsafe { size() } {
+            p.width = usize(s.columns)
+            p.height = usize(s.rows)
+        }
+        p.ask()
+        loop {
+            let first = inbox.wait() else break
+            p.take(first)
+            while let m = inbox.next() {
+                p.take(m)
+            }
+            if p.quit {
+                p.lines.push(paint(p.colors, Hue.Muted, false, "Ended at a second Ctrl+C, without waiting for the server to stop"))
+                p.finish()
+                exit(130)
+            }
+            if p.stop {
+                p.finish()
+                return
+            }
+            p.draw()
+        }
+    }
+}
+
+// The thread that reads what's typed, as it's typed, for the dashboard. It ends at the end of
+// the input.
+struct KeyReader {
+    to: Sender<ToConsole>
+}
+
+impl Task for KeyReader {
+    fn run(own self) {
+        var to = self.to
+        loop {
+            var bytes = List<u8>()
+            if read(mut bytes, 256) == 0 {
+                return
+            }
+            to.send(ToConsole.Keys(bytes))
+        }
+    }
+}
+
+// The thread that beats each second, on the second since the server started, so the uptime
+// moves evenly.
+struct Beat {
+    to: Sender<ToConsole>
+    start: Instant
+}
+
+impl Task for Beat {
+    fn run(own self) {
+        var to = self.to
+        let start = self.start
+        loop {
+            let since = unsafe { Instant.now() }.nanos_since(start)
+            unsafe {
+                sleep(SECOND - since % SECOND)
+            }
+            to.send(ToConsole.Beat)
+        }
+    }
+}
+
+/// Starts the dashboard at `place`, for a server that started at `began`, with standard input
+/// already in raw mode: its thread, the key reader's and the beat's. What's typed goes to `to`,
+/// waking `waker`. Gives where the console's lines go from now on, and the dashboard's thread,
+/// which ends once it's sent `Stop`.
+pub unsafe fn draw_dashboard(place: own Place, colors: Colors, calcite: bool, began: Instant, to: own Sender<ConsoleInput>, waker: own Waker) -> (Sender<ToConsole>, Thread) {
+    let inbox = Receiver<ToConsole>()
+    let lines = inbox.sender()
+    _ = unsafe { Thread.spawn(KeyReader { to: inbox.sender() }) }
+    _ = unsafe { Thread.spawn(Beat { to: inbox.sender(), start: began }) }
+    let thread = unsafe { Thread.spawn(Dashboard { inbox: inbox, to_server: to, waker: waker, start: began, place: place, colors: colors, calcite: calcite }) }
+    return (lines, thread)
+}

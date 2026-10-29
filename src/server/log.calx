@@ -3,13 +3,17 @@
 /// then the message. The console has them too, in vanilla's style, which hosting panels and
 /// wrappers read. In Calcite's style, the default on a terminal, it has Calcite's own look and
 /// words instead: a card when the server is ready, then a line for each thing that happens
-/// (CAL-50, D150).
+/// (CAL-50, D150). With `console-dashboard`, a bar pinned to the terminal shows how the server is
+/// doing as the lines scroll past, and its thread draws them (`server.dashboard`).
 module server.log
 
+import server.console.{ConsoleInput}
+import server.dashboard.{Place, ToConsole, draw_dashboard}
 import server.log_file.{FileLine, FileWriter, ToFile}
-import std.env.{variable}
+import server.paint.{Colors, Hue, badge, paint, strong, terminal_colors}
 import std.io.{flush, is_terminal}
-import std.time.{Timestamp}
+import std.net.{Waker}
+import std.time.{Instant, Timestamp}
 
 /// How much a line matters, as log4j's levels name them.
 pub enum Level {
@@ -95,105 +99,6 @@ pub enum Style {
     /// Calcite's own: a card when the server is ready, then a line for each thing that happens,
     /// with a mark for what kind of thing it is, in Calcite's words where it has them.
     Calcite
-}
-
-/// How Calcite's style colors the console.
-pub enum Colors {
-    /// None, where `NO_COLOR` is set or the terminal is `dumb`.
-    Off
-    /// The 16 basic colors, on the Linux console.
-    Basic
-    /// The nearest of xterm's 256, where the terminal doesn't say it takes more.
-    Palette
-    /// Exact, in 24-bit color: on Windows, whose console takes it, and where `COLORTERM` is
-    /// `truecolor` or `24bit`.
-    Exact
-}
-
-/// The colors the terminal takes, by the conventions terminals follow.
-pub fn terminal_colors() -> Colors {
-    if let no = variable("NO_COLOR") {
-        if not no.is_empty() {
-            return Colors.Off
-        }
-    }
-    let term = variable("TERM") ?? String()
-    if term == "dumb" {
-        return Colors.Off
-    }
-    if variable("OS") == some(String("Windows_NT")) {
-        return Colors.Exact
-    }
-    let color_term = variable("COLORTERM") ?? String()
-    if color_term == "truecolor" or color_term == "24bit" {
-        return Colors.Exact
-    }
-    return if term == "linux" { Colors.Basic } else { Colors.Palette }
-}
-
-/// The colors of Calcite's style, from GitHub's Primer palette, which reads on dark and light
-/// backgrounds alike. Calcite's own, the off-white of the calcite block, is the card's badge.
-pub enum Hue {
-    /// A player coming in.
-    Green
-    /// An error.
-    Red
-    /// A warning.
-    Amber
-    /// What's said about something: the card's marks and labels, a player going.
-    Muted
-    /// The time.
-    Faint
-}
-
-// `text` in `hue`, bold where `bold`.
-fn paint(colors: Colors, hue: Hue, bold: bool, text: String) -> String {
-    let code = match colors {
-        Colors.Off => return text.copy(),
-        Colors.Basic => match hue {
-            Hue.Green => "32",
-            Hue.Red => "31",
-            Hue.Amber => "33",
-            Hue.Muted => "90",
-            Hue.Faint => "90",
-        },
-        Colors.Palette => match hue {
-            Hue.Green => "38;5;71",
-            Hue.Red => "38;5;203",
-            Hue.Amber => "38;5;178",
-            Hue.Muted => "38;5;246",
-            Hue.Faint => "38;5;243",
-        },
-        Colors.Exact => match hue {
-            Hue.Green => "38;2;63;185;80",
-            Hue.Red => "38;2;248;81;73",
-            Hue.Amber => "38;2;210;153;34",
-            Hue.Muted => "38;2;139;148;158",
-            Hue.Faint => "38;2;110;118;129",
-        },
-    }
-    let weight = if bold { "1;" } else { "" }
-    return "\u{1B}[{weight}{code}m{text}\u{1B}[0m"
-}
-
-// `text` in bold, in the terminal's own color.
-fn strong(colors: Colors, text: String) -> String {
-    return match colors {
-        Colors.Off => text.copy(),
-        _ => "\u{1B}[1m{text}\u{1B}[0m",
-    }
-}
-
-// Calcite's name as the card shows it: bold, in the logo's ink, on the off-white of the calcite
-// block.
-fn badge(colors: Colors) -> String {
-    let code = match colors {
-        Colors.Off => return String("calcite"),
-        Colors.Basic => "1;30;47",
-        Colors.Palette => "1;38;5;235;48;5;255",
-        Colors.Exact => "1;38;2;30;31;36;48;2;237;236;230",
-    }
-    return "\u{1B}[{code}m calcite \u{1B}[0m"
 }
 
 // Where a line's words start, after its indent, the time and the mark, and where their later
@@ -342,11 +247,16 @@ fn row(out: mut String, colors: Colors, label: str, value: String) {
 }
 
 /// Where the server's lines go: the console, in its style, and the log file, which a thread of
-/// its own writes (`server.log_file`).
+/// its own writes (`server.log_file`). Where the dashboard is drawn, the console's lines go to its
+/// thread, which shows them above the bar.
 pub struct Log {
     file: Sender<ToFile>?
     // The file's thread, which the `Log` that opened it waits for as it closes.
     writer: Thread?
+    // The dashboard's thread, and where the console's lines go to it, once it's drawn. The `Log`
+    // that started it stops it as it closes.
+    screen: Sender<ToConsole>?
+    drawer: Thread?
     style: Style
     colors: Colors
 }
@@ -360,7 +270,7 @@ fn default_style() -> Style {
 impl Log {
     /// The console alone, as a replay logs, so it never touches the log of the server it replays.
     pub fn console() -> Log {
-        return Log { file: none, writer: none, style: default_style(), colors: terminal_colors() }
+        return Log { file: none, writer: none, screen: none, drawer: none, style: default_style(), colors: terminal_colors() }
     }
 
     /// The console, and latest.log in `dir`, for a server that started at `start`. The file is
@@ -369,7 +279,7 @@ impl Log {
         let lines = Receiver<ToFile>()
         let file = lines.sender()
         let writer = unsafe { Thread.spawn(FileWriter { dir: dir.copy(), start: start, lines: lines }) }
-        return Log { file: some(file), writer: some(writer), style: default_style(), colors: terminal_colors() }
+        return Log { file: some(file), writer: some(writer), screen: none, drawer: none, style: default_style(), colors: terminal_colors() }
     }
 
     /// Shows the console's lines in `style` from now on: Calcite's on a terminal, and vanilla's
@@ -378,18 +288,47 @@ impl Log {
         self.style = style
     }
 
-    /// Another handle to the same log, for another thread. Closing it leaves the file open.
+    /// Draws the dashboard at `place` from now on, for a server that started at `began`, with
+    /// standard input already in raw mode: the console's lines go to its thread, and what's typed
+    /// goes to `to`, waking `waker`. Logs shared after this go through it too.
+    pub unsafe fn draw(mut self, place: own Place, began: Instant, to: own Sender<ConsoleInput>, waker: own Waker) {
+        let calcite = match self.style {
+            Style.Vanilla => false,
+            Style.Calcite => true,
+        }
+        let (lines, thread) = unsafe { draw_dashboard(place, self.colors, calcite, began, to, waker) }
+        self.screen = some(lines)
+        self.drawer = some(thread)
+    }
+
+    /// Where the dashboard's numbers go, where it's drawn.
+    pub fn dashboard(mut self) -> Sender<ToConsole>? {
+        if let to = self.screen.take() {
+            let shared = to.share()
+            self.screen = some(to)
+            return some(shared)
+        }
+        return none
+    }
+
+    /// Another handle to the same log, for another thread. Closing it leaves the file open, and
+    /// the dashboard drawn.
     pub fn share(mut self) -> Log {
         var shared: Sender<ToFile>? = none
         if let to = self.file.take() {
             shared = some(to.share())
             self.file = some(to)
         }
+        var drawn: Sender<ToConsole>? = none
+        if let to = self.screen.take() {
+            drawn = some(to.share())
+            self.screen = some(to)
+        }
         let style = match self.style {
             Style.Vanilla => Style.Vanilla,
             Style.Calcite => Style.Calcite,
         }
-        return Log { file: shared, writer: none, style: style, colors: self.colors }
+        return Log { file: shared, writer: none, screen: drawn, drawer: none, style: style, colors: self.colors }
     }
 
     /// Logs `message`, with vanilla's words in Calcite's style too.
@@ -403,21 +342,21 @@ impl Log {
     }
 
     /// Logs `message` at the wall clock's time now: to the console in its style, where `look` is
-    /// how Calcite's shows it, and to the log file as vanilla's line. Each is printed at once, so
-    /// the console and anything reading it see it as it happens, and sent to the file's thread.
+    /// how Calcite's shows it, and to the log file as vanilla's line. Each is printed at once, or
+    /// handed to the dashboard's thread where it's drawn, so the console and anything reading it
+    /// see it as it happens, and sent to the file's thread.
     pub fn write(mut self, thread: String, level: Level, message: String, look: Look) {
         let now = unsafe { Timestamp.now() }
         let offset = unsafe { now.local_offset() }
         let text = line(now, offset, thread, level, message)
         match self.style {
-            Style.Vanilla => println(text),
+            Style.Vanilla => self.show(text.copy()),
             Style.Calcite => {
                 if let shown = styled(now, offset, level, message, look, self.colors) {
-                    println(shown)
+                    self.show(shown)
                 }
             },
         }
-        flush()
         if let to = self.file.take() {
             var s = to
             s.send(ToFile.Line(FileLine { at: now, text: "{text}\n" }))
@@ -427,20 +366,41 @@ impl Log {
 
     /// Shows the card in Calcite's style. Vanilla's style and the log file have vanilla's lines
     /// for the same things instead.
-    pub fn show_card(self, c: Card) {
+    pub fn show_card(mut self, c: Card) {
         match self.style {
             Style.Vanilla => {},
             Style.Calcite => {
-                println(card(c, self.colors))
-                flush()
+                let text = card(c, self.colors)
+                self.show(text)
             },
         }
     }
 
-    /// Waits for every line logged so far to be in the file, and for its archives to be
-    /// compressed, if this `Log` opened it. Lines that other handles log after this go to the
-    /// console alone.
+    // Shows `text` on the console: through the dashboard where it's drawn, or else printed now.
+    fn show(mut self, text: own String) {
+        if let to = self.screen.take() {
+            var s = to
+            s.send(ToConsole.Line(text))
+            self.screen = some(s)
+            return
+        }
+        println(text)
+        flush()
+    }
+
+    /// Takes the dashboard away, if this `Log` drew it, putting the terminal back, then waits for
+    /// every line logged so far to be in the file, and for its archives to be compressed, if this
+    /// `Log` opened it. Lines that other handles log after this go to the console alone.
     pub fn close(own self) {
+        var screen = self.screen
+        var drawer = self.drawer
+        if let d = drawer.take() {
+            if let to = screen.take() {
+                var s = to
+                s.send(ToConsole.Stop)
+            }
+            d.join()
+        }
         var file = self.file
         var writer = self.writer
         if let t = writer.take() {
