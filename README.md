@@ -19,6 +19,7 @@ Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calc
 - [Host API sketch](plugins/api/HOST_API.md): the plugin contract
 - [Source](src/README.md): Calcite's Calx modules and their tests
 - [Oracle rig](rig/README.md): how Calcite is checked against vanilla, bit for bit
+- [Bot benchmark](bench/README.md): the server timed with 100 players, per commit
 - [Data generator and tables](oracle/datagen/README.md): the tables Calcite's codegen reads, generated from the jar
 
 ## License
