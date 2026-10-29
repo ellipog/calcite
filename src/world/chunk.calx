@@ -1,0 +1,512 @@
+/// Chunks as vanilla's `LevelChunk` holds them: a section for each 16 blocks of height, with its
+/// block states and biomes in paletted containers and the counts vanilla keeps of them, and the
+/// heightmaps, kept as blocks change and sent as the client reads them.
+module world.chunk
+
+import protocol.play.{ChunkData, Heightmap as SentHeightmap}
+import std.palette.{BitStorage, PalettedContainer, Strategy}
+import world.block_flags.{AIR, FLUID, FLUID_RANDOMLY_TICKING, RANDOMLY_TICKING, state_flags}
+import world.blocks.{first_states}
+
+/// The heightmaps, by vanilla's IDs for `Heightmap.Types`. Each column's height is one above the
+/// highest block the heightmap counts there, or the bottom of the world with none. The two
+/// `_WG` ones are kept while a chunk generates; a chunk in the world keeps the other four, and
+/// sends `WORLD_SURFACE` and the two `MOTION_BLOCKING` ones to clients.
+pub const WORLD_SURFACE_WG: i32 = 0
+pub const WORLD_SURFACE: i32 = 1
+pub const OCEAN_FLOOR_WG: i32 = 2
+pub const OCEAN_FLOOR: i32 = 3
+pub const MOTION_BLOCKING: i32 = 4
+pub const MOTION_BLOCKING_NO_LEAVES: i32 = 5
+pub const HEIGHTMAP_KINDS: i32 = 6
+
+/// The state of `minecraft:air`, the only state of the first block.
+pub const AIR_STATE: u32 = 0
+
+// Where in a state's entry in `BlockStates` the heightmaps that count it are, a bit for each
+// kind from here up.
+const HEIGHTMAP_SHIFT: i32 = 24
+
+/// What chunks need to know of each block state: its flags (`world.block_flags`), and which
+/// heightmaps count it, which depends on the data pack's block tags. It's built once, when the
+/// registries are loaded.
+pub struct BlockStates {
+    // Each state's flags, with a bit for each heightmap that counts it from HEIGHTMAP_SHIFT up.
+    entries: List<u32>
+    firsts: List<u32>
+    biome_count: u32
+}
+
+impl BlockStates {
+    /// The table, with `motion` and `motion_no_leaves` the IDs of the blocks in the tags
+    /// `minecraft:blocks_motion_in_heightmap` and `minecraft:blocks_motion_in_heightmap_no_leaves`,
+    /// and `biomes` how many biomes there are. As vanilla's `Heightmap.Types` says:
+    ///
+    /// - the two `WORLD_SURFACE` heightmaps count every state that isn't air;
+    /// - the two `OCEAN_FLOOR` ones count the blocks in the first tag;
+    /// - `MOTION_BLOCKING` counts those and every state with a fluid, and
+    ///   `MOTION_BLOCKING_NO_LEAVES` the second tag's blocks and every state with a fluid.
+    ///
+    /// Panics if a block ID isn't one of vanilla's blocks, or there are no biomes.
+    @track_caller
+    pub fn new(motion: List<i32>, motion_no_leaves: List<i32>, biomes: u32) -> BlockStates {
+        if biomes == 0 {
+            panic("there are no biomes")
+        }
+        var flags = state_flags()
+        let surface = heightmap_bit(WORLD_SURFACE_WG) | heightmap_bit(WORLD_SURFACE)
+        let fluid = heightmap_bit(MOTION_BLOCKING) | heightmap_bit(MOTION_BLOCKING_NO_LEAVES)
+        for i in 0..flags.len() {
+            let f = flags[i]
+            if f & AIR == 0 {
+                flags[i] = flags[i] | surface
+            }
+            if f & FLUID != 0 {
+                flags[i] = flags[i] | fluid
+            }
+        }
+        let firsts = first_states()
+        mark(mut flags, firsts, motion, heightmap_bit(OCEAN_FLOOR_WG) | heightmap_bit(OCEAN_FLOOR) | heightmap_bit(MOTION_BLOCKING))
+        mark(mut flags, firsts, motion_no_leaves, heightmap_bit(MOTION_BLOCKING_NO_LEAVES))
+        return BlockStates { entries: flags, firsts: firsts, biome_count: biomes }
+    }
+
+    /// How many block states there are.
+    pub fn len(self) -> u32 {
+        return u32.wrap(self.entries.len())
+    }
+
+    /// The state's flags, as `world.block_flags` names them. Panics past the last state.
+    @track_caller
+    pub fn flags(self, state: u32) -> u32 {
+        return self.entries[usize(state)] & ((1u32 << HEIGHTMAP_SHIFT) - 1)
+    }
+
+    /// Whether the state is air, cave air or void air: `isAir`.
+    @track_caller
+    pub fn is_air(self, state: u32) -> bool {
+        return self.entries[usize(state)] & AIR != 0
+    }
+
+    /// Whether heightmap `kind` counts the state.
+    @track_caller
+    pub fn counts_in(self, kind: i32, state: u32) -> bool {
+        return self.entries[usize(state)] & heightmap_bit(kind) != 0
+    }
+
+    /// The block whose state `state` is, by its ID. Panics past the last state.
+    @track_caller
+    pub fn block_of(self, state: u32) -> u32 {
+        if state >= self.len() {
+            panic("{state} isn't one of the {self.len()} block states")
+        }
+        // The last block whose first state isn't past `state`.
+        var low: usize = 0
+        var high = self.firsts.len()
+        while high - low > 1 {
+            let mid = (low + high) / 2
+            if self.firsts[mid] <= state {
+                low = mid
+            } else {
+                high = mid
+            }
+        }
+        return u32.wrap(low)
+    }
+
+    /// How a section holds its block states and its biomes.
+    pub fn block_strategy(self) -> Strategy {
+        return Strategy.block_states(self.len())
+    }
+
+    pub fn biome_strategy(self) -> Strategy {
+        return Strategy.biomes(self.biome_count)
+    }
+}
+
+// A heightmap's bit in `BlockStates`' entries. Panics unless `kind` is one of the six.
+@track_caller
+fn heightmap_bit(kind: i32) -> u32 {
+    if kind < 0 or kind >= HEIGHTMAP_KINDS {
+        panic("{kind} isn't a heightmap")
+    }
+    return 1u32 << (HEIGHTMAP_SHIFT + kind)
+}
+
+// Adds `bits` to every state of each block in `blocks`.
+@track_caller
+fn mark(flags: mut List<u32>, firsts: List<u32>, blocks: List<i32>, bits: u32) {
+    for block in blocks {
+        if block < 0 or usize.wrap(block) >= firsts.len() {
+            panic("{block} isn't one of the {firsts.len()} blocks")
+        }
+        let b = usize.wrap(block)
+        let end = if b + 1 < firsts.len() { firsts[b + 1] } else { u32.wrap(flags.len()) }
+        for state in firsts[b]..end {
+            flags[usize(state)] = flags[usize(state)] | bits
+        }
+    }
+}
+
+/// 16 × 16 × 16 blocks of a chunk, as vanilla's `LevelChunkSection`: their states and the
+/// biomes of each 4 × 4 × 4, in paletted containers, and how many blocks aren't air, how many
+/// of those take random ticks, how many hold a fluid and how many of those take random ticks.
+pub struct Section {
+    block_container: PalettedContainer
+    biome_container: PalettedContainer
+    non_empty_count: i32
+    ticking_count: i32
+    fluid_count: i32
+    ticking_fluid_count: i32
+}
+
+impl Section {
+    /// A section of air, with `biome` everywhere.
+    pub fn new(table: BlockStates, biome: u32) -> Section {
+        return Section { block_container: PalettedContainer.new(AIR_STATE, table.block_strategy()), biome_container: PalettedContainer.new(biome, table.biome_strategy()), non_empty_count: 0, ticking_count: 0, fluid_count: 0, ticking_fluid_count: 0 }
+    }
+
+    /// A section of the given containers, counted as `recalcBlockCounts` counts them.
+    pub fn from(table: BlockStates, states: own PalettedContainer, biomes: own PalettedContainer) -> Section {
+        var s = Section { block_container: states, biome_container: biomes, non_empty_count: 0, ticking_count: 0, fluid_count: 0, ticking_fluid_count: 0 }
+        s.recount(table)
+        return s
+    }
+
+    /// The state at `x`, `y`, `z`, each from 0 to 15.
+    @track_caller
+    pub fn block(self, x: i32, y: i32, z: i32) -> u32 {
+        return self.block_container.get(x, y, z)
+    }
+
+    /// Sets the state at `x`, `y`, `z`, and gives the one it replaced, keeping the counts as
+    /// `LevelChunkSection.setBlockState` does.
+    @track_caller
+    pub fn set_block(mut self, table: BlockStates, x: i32, y: i32, z: i32, state: u32) -> u32 {
+        let old = self.block_container.get_and_set(x, y, z, state)
+        self.count(table.flags(old), -1)
+        self.count(table.flags(state), 1)
+        return old
+    }
+
+    // Adds `by` to the counts that a state of `flags` is in.
+    fn count(mut self, flags: u32, by: i32) {
+        if flags & AIR != 0 {
+            return
+        }
+        self.non_empty_count += by
+        if flags & RANDOMLY_TICKING != 0 {
+            self.ticking_count += by
+        }
+        if flags & FLUID != 0 {
+            self.fluid_count += by
+            if flags & FLUID_RANDOMLY_TICKING != 0 {
+                self.ticking_fluid_count += by
+            }
+        }
+    }
+
+    /// Counts the blocks again from the states, as `recalcBlockCounts`.
+    pub fn recount(mut self, table: BlockStates) {
+        self.non_empty_count = 0
+        self.ticking_count = 0
+        self.fluid_count = 0
+        self.ticking_fluid_count = 0
+        for (state, n) in self.block_container.counts() {
+            self.count(table.flags(state), i32.wrap(n))
+        }
+    }
+
+    /// The biome at `x`, `y`, `z`, in quarters of the section, each from 0 to 3.
+    @track_caller
+    pub fn biome(self, x: i32, y: i32, z: i32) -> u32 {
+        return self.biome_container.get(x, y, z)
+    }
+
+    @track_caller
+    pub fn set_biome(mut self, x: i32, y: i32, z: i32, biome: u32) {
+        self.biome_container.set(x, y, z, biome)
+    }
+
+    /// Whether every block is air, cave air or void air: `hasOnlyAir`.
+    pub fn only_air(self) -> bool {
+        return self.non_empty_count == 0
+    }
+
+    /// How many blocks aren't air, take random ticks, hold a fluid, and hold a fluid that takes
+    /// random ticks.
+    pub fn non_empty(self) -> i32 {
+        return self.non_empty_count
+    }
+
+    pub fn ticking(self) -> i32 {
+        return self.ticking_count
+    }
+
+    pub fn fluids(self) -> i32 {
+        return self.fluid_count
+    }
+
+    pub fn ticking_fluids(self) -> i32 {
+        return self.ticking_fluid_count
+    }
+
+    /// The block states and biomes.
+    pub fn states(self) -> PalettedContainer {
+        return self.block_container.copy()
+    }
+
+    pub fn biomes(self) -> PalettedContainer {
+        return self.biome_container.copy()
+    }
+
+    /// Adds the section to `out` as `LevelChunkSection.write` sends it: the blocks that aren't
+    /// air and those with a fluid as shorts, then the states and the biomes.
+    pub fn write(self, out: mut List<u8>) {
+        put_i16(mut out, self.non_empty_count)
+        put_i16(mut out, self.fluid_count)
+        self.block_container.write(mut out)
+        self.biome_container.write(mut out)
+    }
+}
+
+fn put_i16(out: mut List<u8>, v: i32) {
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}
+
+/// A column of sections from the bottom of a dimension to its top, and its heightmaps, as
+/// vanilla's `LevelChunk` holds them. Positions in it are a block's `x` and `z` in the chunk,
+/// each 0 to 15, and its `y` in the world.
+pub struct Chunk {
+    bottom: i32
+    sections: List<Section>
+    // A heightmap for each kind, by its ID: each column's height above `min_y`, `x` + 16 `z`.
+    heightmaps: List<BitStorage>
+}
+
+impl Chunk {
+    /// A chunk of air with `biome` everywhere, `sections` sections up from `min_y`, which is a
+    /// multiple of 16. Every heightmap is at the bottom. Panics unless there's at least one
+    /// section and `min_y` is a multiple of 16.
+    @track_caller
+    pub fn new(table: BlockStates, min_y: i32, sections: i32, biome: u32) -> Chunk {
+        if sections < 1 or min_y & 15 != 0 {
+            panic("a chunk needs a section or more from a multiple of 16, not {sections} from {min_y}")
+        }
+        var list = List<Section>()
+        for _ in 0..sections {
+            list.push(Section.new(table, biome))
+        }
+        // As vanilla's `Heightmap`: as many bits as the heights from 0 to the dimension's height
+        // take, 9 for the overworld's 384.
+        let height = sections * 16
+        var bits = 0
+        while (1 << bits) < height + 1 {
+            bits += 1
+        }
+        var heightmaps = List<BitStorage>()
+        for _ in 0..HEIGHTMAP_KINDS {
+            heightmaps.push(BitStorage.new(bits, 256))
+        }
+        return Chunk { bottom: min_y, sections: list, heightmaps: heightmaps }
+    }
+
+    /// The lowest block's `y`, and the sections from it up.
+    pub fn min_y(self) -> i32 {
+        return self.bottom
+    }
+
+    pub fn section_count(self) -> usize {
+        return self.sections.len()
+    }
+
+    /// The section at `index`, from the bottom.
+    @track_caller
+    pub fn section(self, index: usize) -> Section {
+        return self.sections[index].copy()
+    }
+
+    // The section that `y` is in. Panics if it's outside the chunk.
+    @track_caller
+    fn section_index(self, y: i32) -> usize {
+        let i = (y >> 4) - (self.bottom >> 4)
+        if i < 0 or usize.wrap(i) >= self.sections.len() {
+            panic("{y} is outside a chunk from {self.bottom} up {self.sections.len() * 16}")
+        }
+        return usize.wrap(i)
+    }
+
+    /// The state at `x`, `y`, `z`, as `LevelChunk.getBlockState`: air outside the chunk, and in
+    /// a section of only air, where cave and void air read as air too.
+    @track_caller
+    pub fn block(self, x: i32, y: i32, z: i32) -> u32 {
+        let i = (y >> 4) - (self.bottom >> 4)
+        if i >= 0 and usize.wrap(i) < self.sections.len() {
+            let section = usize.wrap(i)
+            if not self.sections[section].only_air() {
+                return self.sections[section].block(x, y & 15, z)
+            }
+        }
+        return AIR_STATE
+    }
+
+    /// Sets the state at `x`, `y`, `z`, and the heightmaps a chunk in the world keeps, as
+    /// `LevelChunk.setBlockState` does, and gives the state it replaced. Nothing changes, and
+    /// it gives `none`, when the state is already there, or is air in a section of only air.
+    /// Light, block entities and neighbours are left to the world.
+    @track_caller
+    pub fn set_block(mut self, table: BlockStates, x: i32, y: i32, z: i32, state: u32) -> u32? {
+        let i = self.section_index(y)
+        if self.sections[i].only_air() and table.is_air(state) {
+            return none
+        }
+        let old = self.sections[i].set_block(table, x, y & 15, z, state)
+        if old == state {
+            return none
+        }
+        for kind in [MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, WORLD_SURFACE] {
+            _ = self.update_heightmap(table, kind, x, y, z, state)
+        }
+        return some(old)
+    }
+
+    /// The height of the column at `x`, `z` in heightmap `kind`: one above the highest block it
+    /// counts, as `getFirstAvailable`.
+    @track_caller
+    pub fn height(self, kind: i32, x: i32, z: i32) -> i32 {
+        return i32.wrap(self.heightmaps[heightmap_index(kind)].get(column(x, z))) + self.bottom
+    }
+
+    fn set_height(mut self, kind: i32, x: i32, z: i32, height: i32) {
+        self.heightmaps[heightmap_index(kind)].set(column(x, z), u32.wrap(height - self.bottom))
+    }
+
+    /// Updates heightmap `kind` for `state` set at `x`, `y`, `z`, as `Heightmap.update`, and
+    /// says whether the height changed: up to above a block it counts, or, where the block it
+    /// replaced was the column's highest, down to above the next one below.
+    @track_caller
+    pub fn update_heightmap(mut self, table: BlockStates, kind: i32, x: i32, y: i32, z: i32, state: u32) -> bool {
+        let top = self.height(kind, x, z)
+        if y <= top - 2 {
+            return false
+        }
+        if table.counts_in(kind, state) {
+            if y >= top {
+                self.set_height(kind, x, z, y + 1)
+                return true
+            }
+        } else if top - 1 == y {
+            var below = y - 1
+            while below >= self.bottom {
+                if table.counts_in(kind, self.block(x, below, z)) {
+                    self.set_height(kind, x, z, below + 1)
+                    return true
+                }
+                below -= 1
+            }
+            let bottom = self.bottom
+            self.set_height(kind, x, z, bottom)
+            return true
+        }
+        return false
+    }
+
+    /// Counts each section's blocks again from its states, as `recalcBlockCounts`.
+    pub fn recount(mut self, table: BlockStates) {
+        for i in 0..self.sections.len() {
+            self.sections[i].recount(table)
+        }
+    }
+
+    /// The bottom of the highest section that isn't only air, or the chunk's bottom if they all
+    /// are: `getHighestSectionPosition`.
+    pub fn highest_section_y(self) -> i32 {
+        var i = self.sections.len()
+        while i > 0 {
+            i -= 1
+            if not self.sections[i].only_air() {
+                return self.bottom + i32.wrap(i) * 16
+            }
+        }
+        return self.bottom
+    }
+
+    /// Works out the heightmaps of `kinds` from the blocks, as `Heightmap.primeHeightmaps`: down
+    /// each column from the top of the highest section that isn't only air, past `minecraft:air`
+    /// (but not cave or void air), each takes the height above the first block it counts. A
+    /// column with none it counts keeps the height it had.
+    @track_caller
+    pub fn prime_heightmaps(mut self, table: BlockStates, kinds: List<i32>) {
+        var all: u32 = 0
+        for kind in kinds {
+            all |= heightmap_bit(kind)
+        }
+        if all == 0 {
+            return
+        }
+        let top = self.highest_section_y() + 16
+        for x in 0..16 {
+            for z in 0..16 {
+                var left = all
+                var y = top - 1
+                while y >= self.bottom {
+                    let state = self.block(x, y, z)
+                    if state != AIR_STATE {
+                        for kind in 0..HEIGHTMAP_KINDS {
+                            let bit = heightmap_bit(kind)
+                            if left & bit != 0 and table.counts_in(kind, state) {
+                                self.set_height(kind, x, z, y + 1)
+                                left &= ~bit
+                            }
+                        }
+                        if left == 0 {
+                            break
+                        }
+                    }
+                    y -= 1
+                }
+            }
+        }
+    }
+
+    /// Heightmap `kind`'s longs, as `getRawData` gives them: 256 heights above the bottom, from
+    /// `x` 0, `z` 0 along `x` first, in as many bits as the dimension's heights take.
+    @track_caller
+    pub fn heightmap_longs(self, kind: i32) -> List<i64> {
+        return self.heightmaps[heightmap_index(kind)].longs()
+    }
+
+    /// The chunk as a `level_chunk_with_light` sends it, as `ClientboundLevelChunkPacketData`
+    /// makes it: the heightmaps clients get, the sections from the bottom up, and no block
+    /// entities yet. Vanilla sends the heightmaps in an order that changes from run to run; this
+    /// sends them by kind.
+    pub fn chunk_data(self) -> ChunkData {
+        var heightmaps = List<SentHeightmap>()
+        for kind in [WORLD_SURFACE, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES] {
+            heightmaps.push(SentHeightmap { kind: kind, data: self.heightmap_longs(kind) })
+        }
+        var sections = List<u8>()
+        for s in self.sections {
+            s.write(mut sections)
+        }
+        return ChunkData { heightmaps: heightmaps, sections: sections, block_entities: [] }
+    }
+}
+
+@track_caller
+fn heightmap_index(kind: i32) -> usize {
+    if kind < 0 or kind >= HEIGHTMAP_KINDS {
+        panic("{kind} isn't a heightmap")
+    }
+    return usize.wrap(kind)
+}
+
+// A column's place in a heightmap. Panics unless `x` and `z` are from 0 to 15.
+@track_caller
+fn column(x: i32, z: i32) -> usize {
+    if x < 0 or x > 15 or z < 0 or z > 15 {
+        panic("({x}, {z}) is outside a chunk")
+    }
+    return usize.wrap(x + z * 16)
+}

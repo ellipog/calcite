@@ -10,6 +10,8 @@ IDs the protocol needs, which every compatible server encodes:
 - `registry.builtin`: the built-in registries and their entries in ID order.
 - `pack.pin`: where the pinned server jar comes from, and its size and SHA-1, from versions.json.
 - `world.blocks`: each block's first state ID and default state, in block ID order.
+- `world.block_flags`: what each block state is, as vanilla's state cache holds it, from
+  block_flags.json, which oracle/datagen/block_flags.py writes beside the tables (D164).
 """
 
 import argparse
@@ -219,17 +221,127 @@ def pin_module(version, pin):
     return "\n".join(lines)
 
 
+# The flags block_flags.json gives each state, as calcite.rig.vanilla.BlockFlags sets them.
+FLAGS = [
+    ("AIR", 1, "`isAir`: air, cave air and void air"),
+    ("RANDOMLY_TICKING", 1 << 1, "`isRandomlyTicking`: the state takes random ticks"),
+    ("FLUID", 1 << 2, "The state's fluid isn't empty: water, lava, or a waterlogged block"),
+    ("FLUID_RANDOMLY_TICKING", 1 << 3, "The state's fluid takes random ticks: lava"),
+    ("PROPAGATES_SKYLIGHT_DOWN", 1 << 4, "`propagatesSkylightDown`: skylight goes down through it undimmed"),
+    ("SHAPE_FOR_LIGHT_OCCLUSION", 1 << 5, "`useShapeForLightOcclusion`: light is stopped by its faces, not the whole block"),
+    ("CAN_OCCLUDE", 1 << 6, "`canOcclude`"),
+    ("SOLID_RENDER", 1 << 7, "`isSolidRender`: a full, opaque cube"),
+    ("BLOCK_ENTITY", 1 << 8, "`hasBlockEntity`"),
+]
+LOW_MASK = (1 << 12) - 1
+LIGHT_EMISSION_SHIFT = 12
+LIGHT_DAMPENING_SHIFT = 16
+
+# The characters the encoded flags are written in: printable ASCII but for a space and the four a
+# Calx string treats specially. The last starts a pair, for the rarest values.
+ALPHABET = "".join(chr(c) for c in range(0x21, 0x7F) if chr(c) not in '"\\{}')
+SINGLE = len(ALPHABET) - 1
+LINE = 96
+
+
+def block_flags_module(index, flags):
+    """The text of src/world/block_flags.calx."""
+    values = flags["flags"]
+    if flags["game_version"] != index["game_version"]:
+        raise ValueError(f"block_flags.json is {flags['game_version']}, the tables {index['game_version']}")
+    if len(values) != flags["states"]:
+        raise ValueError(f"block_flags.json has {len(values)} flags for {flags['states']} states")
+    known = sum(bit for _, bit, _ in FLAGS)
+    for state, v in enumerate(values):
+        if v & LOW_MASK & ~known or v >> 24:
+            raise ValueError(f"state {state}'s flags {v:#x} have bits this script doesn't know")
+    counts = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    # The commonest first, so they take one character.
+    palette = sorted(counts, key=lambda v: (-counts[v], v))
+    if len(palette) > SINGLE + len(ALPHABET):
+        raise ValueError(f"{len(palette)} different flags are more than the encoding holds")
+    where = {v: i for i, v in enumerate(palette)}
+    text = []
+    for v in values:
+        i = where[v]
+        text.append(ALPHABET[i] if i < SINGLE else ALPHABET[SINGLE] + ALPHABET[i - SINGLE])
+    # Strings of up to LINE characters, with no pair split between two.
+    chunks = [""]
+    for t in text:
+        if len(chunks[-1]) + len(t) > LINE:
+            chunks.append("")
+        chunks[-1] += t
+    lines = [
+        f"/// What each of vanilla {index['game_version']}'s block states is, as the game's state cache holds it, in state ID",
+        "/// order. Written by oracle/datagen/calx_tables.py from block_flags.json (D164): don't edit it.",
+        "module world.block_flags",
+        "",
+    ]
+    for name, bit, what in FLAGS:
+        lines += [f"/// {what}.", f"pub const {name}: u32 = {bit}"]
+    lines += [
+        "",
+        "/// Where a state's light emission, 0 to 15, is in its flags.",
+        f"pub const LIGHT_EMISSION_SHIFT: u32 = {LIGHT_EMISSION_SHIFT}",
+        "/// Where a state's light dampening, 0 to 15, is in its flags: how much light it takes away.",
+        f"pub const LIGHT_DAMPENING_SHIFT: u32 = {LIGHT_DAMPENING_SHIFT}",
+        "",
+        "/// Each state's flags, in state ID order.",
+        "pub fn state_flags() -> List<u32> {",
+        "    // The different flags, the commonest first, and an index into them for each state, a",
+        f"    // character each, from `alphabet`. Its last character starts a pair, for the {len(palette) - SINGLE} rarest.",
+        f"    let values: List<u32> = [{', '.join(str(v) for v in palette)}]",
+        "    let lines: List<String> = [",
+    ]
+    lines += [f'        "{c}",' for c in chunks]
+    lines += [
+        "    ]",
+        f'    let alphabet = "{ALPHABET}"',
+        "    var digit: List<u32> = []",
+        "    for _ in 0..128 {",
+        "        digit.push(0)",
+        "    }",
+        "    for i in 0..alphabet.len() {",
+        "        digit[usize(alphabet.byte_at(i))] = u32.wrap(i)",
+        "    }",
+        f"    let pair = alphabet.byte_at({SINGLE})",
+        "    var flags: List<u32> = []",
+        f"    flags.reserve({len(values)})",
+        "    for line in lines {",
+        "        var i: usize = 0",
+        "        while i < line.len() {",
+        "            let b = line.byte_at(i)",
+        "            if b == pair {",
+        f"                flags.push(values[usize({SINGLE} + digit[usize(line.byte_at(i + 1))])])",
+        "                i += 2",
+        "            } else {",
+        "                flags.push(values[usize(digit[usize(b)])])",
+        "                i += 1",
+        "            }",
+        "        }",
+        "    }",
+        "    return flags",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def outputs(tables, version=VERSION):
     index = json.loads((tables / "index.json").read_text(encoding="utf-8"))
     packets = json.loads((tables / "packets.json").read_text(encoding="utf-8"))
     registries = json.loads((tables / "registries.json").read_text(encoding="utf-8"))
     blocks = json.loads((tables / "blocks.json").read_text(encoding="utf-8"))
     pins = json.loads((CALCITE / "oracle" / "versions.json").read_text(encoding="utf-8"))
+    flags = json.loads((tables.parent / "block_flags.json").read_text(encoding="utf-8"))
     return {
         CALCITE / "src" / "protocol" / "ids.calx": ids_module(index, packets),
         CALCITE / "src" / "registry" / "builtin.calx": builtin_module(index, registries),
         CALCITE / "src" / "pack" / "pin.calx": pin_module(version, pins[version]),
         CALCITE / "src" / "world" / "blocks.calx": blocks_module(index, blocks),
+        CALCITE / "src" / "world" / "block_flags.calx": block_flags_module(index, flags),
     }
 
 
@@ -243,6 +355,9 @@ def main():
         args.tables = CALCITE / "generated" / args.version / "tables"
     if not (args.tables / "index.json").exists():
         print(f"no tables at {args.tables}: run oracle/datagen/datagen.py first", file=sys.stderr)
+        return 2
+    if not (args.tables.parent / "block_flags.json").exists():
+        print(f"no block_flags.json beside {args.tables}: run oracle/datagen/block_flags.py first", file=sys.stderr)
         return 2
     stale = []
     for path, text in outputs(args.tables, args.version).items():

@@ -1,0 +1,225 @@
+/// The `chunk` probe (rig/PROTOCOL.md): `world.chunk`'s sections and heightmaps, with the vanilla
+/// data pack's block tags, run by a list of operations, each result written to one blob, which
+/// the rig compares with what vanilla's `LevelChunkSection` and `Heightmap` give for the same
+/// operations.
+module rig.chunk
+
+import json.tree.{Json, Member, as_i32, as_string, take}
+import rig.frame.{Outcome}
+import world.chunk.{BlockStates, Chunk, HEIGHTMAP_KINDS}
+
+/// `plains` is the plains biome's ID, which vanilla's `PalettedContainerFactory` fills a new
+/// section's biomes with.
+pub fn run_chunk(input: own List<Member>, blobs: List<List<u8>>, table: BlockStates, plains: u32) -> Outcome {
+    if not blobs.is_empty() {
+        return Outcome.Failed("`chunk` takes no blobs")
+    }
+    var fields = input
+    let ops_value = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let ops = match ops_value {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    let min_y = as_i32(take(mut fields, "min_y") ?? Json.Null) else return Outcome.Failed("`min_y` must be a 32-bit integer")
+    let sections = as_i32(take(mut fields, "sections") ?? Json.Null) else return Outcome.Failed("`sections` must be a 32-bit integer")
+    if min_y & 15 != 0 or min_y < -2032 or sections < 1 or sections > 254 or min_y + sections * 16 > 2032 {
+        return Outcome.Failed("`min_y` must be a multiple of 16 and the sections inside -2032 to 2032")
+    }
+    var out: List<u8> = []
+    match chunk(table, plains, min_y, sections, ops, mut out) {
+        ok => {},
+        err(message) => return Outcome.Failed(message),
+    }
+    return Outcome.Done { output: [], blobs: [out] }
+}
+
+/// The probe's 64-bit LCG, as `palette`'s.
+struct Draws {
+    x: i64
+}
+
+impl Draws {
+    fn next(mut self) -> i32 {
+        self.x = self.x * 6364136223846793005 + 1442695040888963407
+        return i32.wrap(self.x >>> 33)
+    }
+}
+
+fn chunk(table: BlockStates, plains: u32, min_y: i32, sections: i32, ops: List<Json>, out: mut List<u8>) ! String {
+    var c = Chunk.new(table, min_y, sections, plains)
+    let top = min_y + sections * 16 - 1
+    let states = i32.wrap(table.len())
+    for k in 0..ops.len() {
+        let items = try items_of(ops, k)
+        let name = as_string(items[0]) ?? String()
+        if name == "set" {
+            try expect(items, k, 4)
+            let x = try within(items, k, 1, 0, 15)
+            let y = try within(items, k, 2, min_y, top)
+            let z = try within(items, k, 3, 0, 15)
+            let state = u32.wrap(try within(items, k, 4, 0, states - 1))
+            match c.set_block(table, x, y, z, state) {
+                some(old) => put_i32(mut out, i32.wrap(old)),
+                none => put_i32(mut out, -1),
+            }
+        } else if name == "fill" {
+            // Every block from one corner to the other, y, then x, then z.
+            try expect(items, k, 7)
+            let x0 = try within(items, k, 1, 0, 15)
+            let y0 = try within(items, k, 2, min_y, top)
+            let z0 = try within(items, k, 3, 0, 15)
+            let x1 = try within(items, k, 4, x0, 15)
+            let y1 = try within(items, k, 5, y0, top)
+            let z1 = try within(items, k, 6, z0, 15)
+            let state = u32.wrap(try within(items, k, 7, 0, states - 1))
+            for y in y0..y1 + 1 {
+                for x in x0..x1 + 1 {
+                    for z in z0..z1 + 1 {
+                        _ = c.set_block(table, x, y, z, state)
+                    }
+                }
+            }
+        } else if name == "random_sets" {
+            // `count` states from the list, each at a column and a height from `low` to `high`;
+            // it gives how many changed a block.
+            try expect(items, k, 5)
+            let seed = i64.parse(as_string(items[1]) ?? String()) else fail "{what(k, 1)} must be a long written as a string"
+            var draws = Draws { x: seed }
+            let count = try within(items, k, 2, 0, 1 << 20)
+            var list: List<u32> = []
+            match items[3] {
+                Json.Array(values) => {
+                    for v in values {
+                        let id = as_i32(v) ?? -1
+                        if id < 0 or id >= states {
+                            fail "{what(k, 3)}'s entries must be block state IDs, from 0 to {states - 1}"
+                        }
+                        list.push(u32.wrap(id))
+                    }
+                },
+                _ => {},
+            }
+            if list.is_empty() {
+                fail "{what(k, 3)} must be a non-empty array of block state IDs"
+            }
+            let low = try within(items, k, 4, min_y, top)
+            let high = try within(items, k, 5, low, top)
+            let n = i32.wrap(list.len())
+            var changed = 0
+            for _ in 0..count {
+                let x = draws.next() % 16
+                let z = draws.next() % 16
+                let y = low + draws.next() % (high - low + 1)
+                let state = list[usize.wrap(draws.next() % n)]
+                if c.set_block(table, x, y, z, state) != none {
+                    changed += 1
+                }
+            }
+            put_i32(mut out, changed)
+        } else if name == "block" {
+            try expect(items, k, 3)
+            let x = try within(items, k, 1, 0, 15)
+            let y = try within(items, k, 2, min_y, top)
+            let z = try within(items, k, 3, 0, 15)
+            put_i32(mut out, i32.wrap(c.block(x, y, z)))
+        } else if name == "update" {
+            // A heightmap told of a state set at a place, as generation tells the `_WG` ones.
+            try expect(items, k, 5)
+            let kind = try within(items, k, 1, 0, HEIGHTMAP_KINDS - 1)
+            let x = try within(items, k, 2, 0, 15)
+            let y = try within(items, k, 3, min_y, top)
+            let z = try within(items, k, 4, 0, 15)
+            let state = u32.wrap(try within(items, k, 5, 0, states - 1))
+            out.push(if c.update_heightmap(table, kind, x, y, z, state) { 1 } else { 0 })
+        } else if name == "prime" {
+            try expect(items, k, 1)
+            var kinds: List<i32> = []
+            match items[1] {
+                Json.Array(values) => {
+                    for v in values {
+                        let id = as_i32(v) ?? -1
+                        if id < 0 or id >= HEIGHTMAP_KINDS {
+                            fail "{what(k, 1)}'s entries must be from 0 to {HEIGHTMAP_KINDS - 1}"
+                        }
+                        kinds.push(id)
+                    }
+                },
+                _ => fail "{what(k, 1)} must be an array of heightmap IDs",
+            }
+            c.prime_heightmaps(table, kinds)
+        } else if name == "heightmap" {
+            try expect(items, k, 1)
+            let longs = c.heightmap_longs(try within(items, k, 1, 0, HEIGHTMAP_KINDS - 1))
+            put_i32(mut out, i32.wrap(longs.len()))
+            for l in longs {
+                put_i32(mut out, i32.wrap(l >> 32))
+                put_i32(mut out, i32.wrap(l))
+            }
+        } else if name == "highest" {
+            try expect(items, k, 0)
+            put_i32(mut out, c.highest_section_y())
+        } else if name == "counts" {
+            try expect(items, k, 0)
+            for i in 0..c.section_count() {
+                let s = c.section(i)
+                put_i32(mut out, s.non_empty())
+                put_i32(mut out, s.ticking())
+                put_i32(mut out, s.fluids())
+                put_i32(mut out, s.ticking_fluids())
+            }
+        } else if name == "recount" {
+            try expect(items, k, 0)
+            c.recount(table)
+        } else if name == "write" {
+            try expect(items, k, 0)
+            var sent: List<u8> = []
+            for i in 0..c.section_count() {
+                c.section(i).write(mut sent)
+            }
+            put_i32(mut out, i32.wrap(sent.len()))
+            for b in sent {
+                out.push(b)
+            }
+        } else {
+            fail "operation {k}: unknown `{name}`"
+        }
+    }
+}
+
+fn items_of(ops: List<Json>, k: usize) -> List<Json> ! String {
+    match ops[k] {
+        Json.Array(items) => {
+            if not items.is_empty() and as_string(items[0]) != none {
+                return items.copy()
+            }
+        },
+        _ => {},
+    }
+    fail "operation {k} must be a non-empty array named by a string"
+}
+
+fn what(k: usize, i: usize) -> String {
+    return "operation {k}'s argument {i}"
+}
+
+fn expect(items: List<Json>, k: usize, n: usize) ! String {
+    if items.len() != n + 1 {
+        fail "operation {k}: `{as_string(items[0]) ?? String()}` takes {n} arguments, got {items.len() - 1}"
+    }
+}
+
+/// Argument `i`, a number from `low` to `high`, both included.
+fn within(items: List<Json>, k: usize, i: usize, low: i32, high: i32) -> i32 ! String {
+    let n = as_i32(items[i]) else fail "{what(k, i)} must be a 32-bit integer"
+    if n < low or n > high {
+        fail "{what(k, i)} must be from {low} to {high}"
+    }
+    return n
+}
+
+fn put_i32(out: mut List<u8>, v: i32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}

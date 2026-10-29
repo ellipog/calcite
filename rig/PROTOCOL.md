@@ -344,6 +344,28 @@ Input `{"of": "storage", "bits": b, "size": n, "ops": [...]}` runs a `SimpleBitS
 
 An index or value out of range is an `error` status, as is an operation the input doesn't have.
 
+### `chunk` (v1)
+
+A chunk's sections and heightmaps, as a chunk in the world keeps them while blocks are set, with the vanilla data pack's block tags. Results go into one blob, as `palette`'s do.
+
+Input `{"min_y": y, "sections": n, "ops": [...]}` runs a chunk whose `n` sections go up from `y`, a multiple of 16, all inside -2032 to 2032, as a dimension's are. It starts all air, in plains, with all six heightmaps at the bottom. A `LevelChunk` needs a whole level, so vanilla's side is a `ProtoChunk`, whose sections, heightmaps and `getBlockState` are the same, and `set` does to it what `LevelChunk.setBlockState` does. A block is at `x` and `z` in the chunk, 0 to 15, and `y` in the world; a state is its ID; a heightmap is its ID in `Heightmap.Types`, 0 for `WORLD_SURFACE_WG` to 5 for `MOTION_BLOCKING_NO_LEAVES`.
+
+| Operation | Result |
+| --- | --- |
+| `["set", x, y, z, state]` | `int`, the state that was there, or -1 if nothing changed. The state goes into its section, and `MOTION_BLOCKING`, `MOTION_BLOCKING_NO_LEAVES`, `OCEAN_FLOOR` and `WORLD_SURFACE` are told of it, in that order |
+| `["fill", x0, y0, z0, x1, y1, z1, state]` | nothing: `set` on every block from one corner to the other, both included, by `y`, then `x`, then `z` |
+| `["random_sets", seed, count, states, low, high]` | `int`, how many `set`s changed something. `count` sets, each drawing `x` and `z` modulo 16, `y` from `low` to `high`, both included, and a state from the list `states`, in that order, from `palette`'s LCG |
+| `["block", x, y, z]` | `int`, `getBlockState` |
+| `["update", kind, x, y, z, state]` | a byte, 1 if `Heightmap.update` changed the heightmap. Nothing is set: it's how generation tells the `_WG` heightmaps of a state |
+| `["prime", kinds]` | nothing: `Heightmap.primeHeightmaps` of the heightmaps listed |
+| `["heightmap", kind]` | an `int` count and the heightmap's `long`s |
+| `["highest"]` | `int`, `getHighestSectionPosition` |
+| `["counts"]` | for each section from the bottom, four `int`s: the blocks that aren't air, those that take random ticks, those with a fluid, and those whose fluid takes random ticks |
+| `["recount"]` | nothing: `recalcBlockCounts` on every section |
+| `["write"]` | `int` length and the bytes every section's `write` sends, from the bottom |
+
+A place outside the chunk, a state or heightmap that isn't one, and an operation it doesn't have are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

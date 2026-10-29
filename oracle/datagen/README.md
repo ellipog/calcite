@@ -35,6 +35,7 @@ py -I oracle/fetch.py --jar <path>         # or install a jar you already have, 
 | `generated/26.3/datagen/reports/` | The generator's reports: the input to `convert.py` |
 | `generated/26.3/datagen/data/` | Vanilla's built-in data pack as the generator writes it. Calcite doesn't read this copy: at runtime it reads the data pack from the jar (D61) |
 | `generated/26.3/tables/` | The converted tables, described below |
+| `generated/26.3/block_flags.json` | What each block state is, from vanilla's state cache, by [`block_flags.py`](block_flags.py) ([below](#block_flagsjson)) |
 
 ## Table format
 
@@ -89,6 +90,16 @@ The multi-noise biome parameter lists vanilla defines in code rather than in its
 
 The report of what data packs can define (each registry's `elements`, `tags` and `stable` flags), and the JSON-RPC schema of the server management API.
 
+### `block_flags.json`
+
+What each block state is that the reports don't say: whether it's air, takes random ticks, holds a fluid and whether that ticks, lets skylight down undimmed, uses its shape to stop light, can occlude, renders as a solid cube or has a block entity, and the light it gives and takes away. Vanilla works these out once for each state, in its state cache, so [`block_flags.py`](block_flags.py) asks the game: it runs the vanilla adapter's `BlockFlags`, which reads each state in ID order and writes `{"game_version", "states", "flags"}`, with `flags` a number for each state, its bits as `world.block_flags` names them (D164). It's beside `tables/`, not in it, since `convert.py` replaces that folder whole, and it needs the [vanilla adapter](../vanilla-adapter/README.md) built first:
+
+```sh
+py -I oracle/datagen/block_flags.py
+```
+
+Which heightmaps count a state isn't here: in 26.3 that comes from the data pack's tags, which Calcite reads as it starts.
+
 ## What's compiled in and what's loaded (D61)
 
 Calcite compiles in what vanilla defines in code: everything in `tables/`. Codegen turns it into constant arrays, so a state lookup is arithmetic and an array read, with nothing parsed at startup. What vanilla loads from its built-in data pack (data-driven registries such as biomes, dimension types and damage types, worldgen settings, tags, loot tables, recipes, advancements and structure templates) Calcite loads at startup from the jar, through the same loader user data packs go through, so a data pack can override it as it can in vanilla.
@@ -108,8 +119,9 @@ py -I oracle/datagen/calx_tables.py --check    # fail if a committed one is out 
 | `src/registry/builtin.calx` | `registries.json` | `builtin_names()`, the 95 built-in registries in the order of their IDs, and `builtin_entries(i)`, each one's entries in ID order |
 | `src/pack/pin.calx` | `../versions.json` | `jar_version()`, `jar_url()`, `jar_sha1()` and `JAR_SIZE`: the pinned server jar, which the rig checks; `client_url()`, `CLIENT_SIZE`, `DATA_OFFSET`, `DATA_LENGTH` and `data_sha256()`: the pinned client jar and the stretch of it holding the vanilla data, which the server reads or downloads and checks (D140) |
 | `src/world/blocks.calx` | `blocks.json` | `STATE_COUNT`, `first_states()`, each block's first state ID, and `default_offsets()`, where its default state is among its states, in block ID order |
+| `src/world/block_flags.calx` | `../block_flags.json` | The flags' constants, and `state_flags()`, each state's flags in ID order. The 35,723 states are a printable character each, an index into the 102 different values, commonest first, in lines of 96; the 13 rarest take two, after `~`. It's decoded once, as the server starts |
 
-They're committed, and hold only the names and IDs the protocol needs, which every compatible server encodes. Don't edit one: change the script and run it again. A new game version that changes them changes Calcite's build, which is the point: `@packet` then fails to compile for a packet that was renamed or removed.
+They're committed, and hold only the names, IDs and facts about states the protocol and the world need, which every compatible server encodes. Don't edit one: change the script and run it again. A new game version that changes them changes Calcite's build, which is the point: `@packet` then fails to compile for a packet that was renamed or removed.
 
 ## Tests
 

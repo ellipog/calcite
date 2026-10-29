@@ -46,6 +46,7 @@ public final class Main {
                 new BlockStateProbe(),
                 new CollectionsProbe(),
                 new PaletteProbe(),
+                new ChunkProbe(),
                 new RegistriesProbe())) {
             probes.put(probe.name(), probe);
         }

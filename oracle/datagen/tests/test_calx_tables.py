@@ -58,7 +58,7 @@ class IdsModule(unittest.TestCase):
 
     def test_committed_modules_are_current(self):
         tables = calx_tables.CALCITE / "generated" / calx_tables.VERSION / "tables"
-        if not (tables / "index.json").exists():
+        if not (tables / "index.json").exists() or not (tables.parent / "block_flags.json").exists():
             self.skipTest("no generated tables")
         for path, text in calx_tables.outputs(tables).items():
             self.assertEqual(path.read_text(encoding="utf-8"), text, f"{path} is out of date: run calx_tables.py")
@@ -136,6 +136,67 @@ class BlocksModule(unittest.TestCase):
             calx_tables.blocks_module(INDEX, {"state_count": 1, "blocks": [self.block(0, "minecraft:air", 0, 1, 1)]})
         with self.assertRaisesRegex(ValueError, "not the 3"):
             calx_tables.blocks_module(INDEX, {"state_count": 3, "blocks": [self.block(0, "minecraft:air", 0, 1, 0)]})
+
+
+class BlockFlagsModule(unittest.TestCase):
+    @staticmethod
+    def decode(text):
+        """The flags, read back from the module as its `state_flags` reads them."""
+        lines = text.splitlines()
+        values = [int(v) for v in next(l for l in lines if "let values" in l).split("[")[1].rstrip("]").split(", ")]
+        alphabet = next(l for l in lines if "let alphabet" in l).split('"')[1]
+        start = lines.index("    let lines: List<String> = [") + 1
+        encoded = []
+        for line in lines[start:lines.index("    ]", start)]:
+            encoded.append(line.strip().removeprefix('"').removesuffix('",'))
+        out = []
+        for chunk in encoded:
+            i = 0
+            while i < len(chunk):
+                if chunk[i] == alphabet[-1]:
+                    out.append(values[len(alphabet) - 1 + alphabet.index(chunk[i + 1])])
+                    i += 2
+                else:
+                    out.append(values[alphabet.index(chunk[i])])
+                    i += 1
+        return out, encoded
+
+    def test_the_flags_read_back(self):
+        # More different flags than one character holds, so the rarest take pairs, and enough
+        # states to fill several lines.
+        flags = [17] * 3 + [(i % 120) << 12 | (i % 120) % 7 for i in range(1000)]
+        text = calx_tables.block_flags_module(INDEX, {"game_version": "1.0", "states": len(flags), "flags": flags})
+        decoded, encoded = self.decode(text)
+        self.assertEqual(decoded, flags)
+        self.assertGreater(len(encoded), 1)
+        self.assertTrue(all(len(c) <= calx_tables.LINE for c in encoded))
+        self.assertTrue(any(calx_tables.ALPHABET[-1] in c for c in encoded))
+        self.assertTrue(all(not c.endswith(calx_tables.ALPHABET[-1]) for c in encoded))
+        self.assertIn("pub const AIR: u32 = 1\n", text)
+        self.assertIn("pub const LIGHT_DAMPENING_SHIFT: u32 = 16\n", text)
+        self.assertIn(f"    flags.reserve({len(flags)})\n", text)
+
+    def test_rejects_what_it_cant_represent(self):
+        with self.assertRaisesRegex(ValueError, "the tables 1.0"):
+            calx_tables.block_flags_module(INDEX, {"game_version": "2.0", "states": 1, "flags": [17]})
+        with self.assertRaisesRegex(ValueError, "1 flags for 2 states"):
+            calx_tables.block_flags_module(INDEX, {"game_version": "1.0", "states": 2, "flags": [17]})
+        with self.assertRaisesRegex(ValueError, "bits this script doesn't know"):
+            calx_tables.block_flags_module(INDEX, {"game_version": "1.0", "states": 1, "flags": [1 << 9]})
+        with self.assertRaisesRegex(ValueError, "bits this script doesn't know"):
+            calx_tables.block_flags_module(INDEX, {"game_version": "1.0", "states": 1, "flags": [1 << 24]})
+        with self.assertRaisesRegex(ValueError, "more than the encoding holds"):
+            many = list(range(0, 200 << 12, 1 << 12))
+            calx_tables.block_flags_module(INDEX, {"game_version": "1.0", "states": len(many), "flags": many})
+
+    def test_the_committed_table_reads_back(self):
+        path = calx_tables.CALCITE / "generated" / calx_tables.VERSION / "block_flags.json"
+        if not path.exists():
+            self.skipTest("no block_flags.json")
+        import json
+        flags = json.loads(path.read_text(encoding="utf-8"))
+        text = (calx_tables.CALCITE / "src" / "world" / "block_flags.calx").read_text(encoding="utf-8")
+        self.assertEqual(self.decode(text)[0], flags["flags"])
 
 
 if __name__ == "__main__":
