@@ -245,6 +245,12 @@ Make the world real: storage that vanilla can read, Folia-style regions on a loc
 - **P5.9** Worldgen in vanilla's stage order, with a probe per stage: noise and density functions, biomes, terrain shape, surface, carvers, features, then structures. Features are decorated in the 3×3-colored order (D29), and the rig drives vanilla in the same order.
 - **P5.10** The Overworld first, then the Nether and the End.
 - **P5.11** Cache chunk packets: encode each chunk once and send the same bytes to every player who needs it.
+- **P5.12** Pregenerate chunks, built in, as the Chunky mod does: `/pregen` with Chunky's subcommands generates every chunk in an area, a center and radius or the world border, in any of the usual shapes, region by region or in rings or a spiral.
+  - Progress, rate, time spent and time left go to the console dashboard, chat and a boss bar.
+  - Chunks generate as jobs within a tick budget, so ticks stay on time, and are saved and unloaded as they finish. Generated chunks are skipped.
+  - A task's state is saved beside the world, so it resumes after a pause, a restart or a crash.
+  - A pregenerated chunk is the chunk a player walking there would have generated (D29).
+  - Phase 8 times it against Chunky on Paper and Folia.
 
 **Done when**
 
@@ -311,7 +317,7 @@ Measure Calcite against the servers it would replace, then run it for real.
 **How**
 
 - **P8.1** Reuse the rig's bot as a swarm of 25, 50, 100 and 200 bots that walk, explore new chunks, build and fight.
-- **P8.2** Run the same seed and script on Calcite, Paper, Folia and Pumpkin. Record MSPT (mean and 99th percentile), memory and CPU use per core.
+- **P8.2** Run the same seed and script on Calcite, Paper, Folia and Pumpkin. Record MSPT (mean and 99th percentile), memory and CPU use per core. Time pregenerating the same area against Chunky on Paper and Folia, in chunks a second (P5.12).
 - **P8.3** Profile the slowest systems and fix them, rerunning the rig after every fix.
 - **P8.4** Soak test: run the bot swarm for a full day to catch memory leaks and slow drift in tick time.
 - **P8.5** Operations: read vanilla's server.properties, ops, whitelist and ban files so a server folder moves over unchanged, and add the console, RCON, logs, metrics and crash reports.
