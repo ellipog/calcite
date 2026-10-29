@@ -1,0 +1,233 @@
+/// A folder of region files, as vanilla's `RegionFileStorage` keeps one: `region/`, `entities/`
+/// or `poi/`, each chunk's NBT in the file of its region of 32 × 32 chunks, `r.X.Z.mca`. The
+/// region files used last are kept, 256 of them, with their headers, as vanilla keeps its open
+/// files, and so is a region whose file wasn't there when a chunk was read from it, which isn't
+/// looked for again until a chunk is written to it or it's dropped.
+///
+/// Reading and writing are one thread's, as vanilla's `IOWorker` has them. Encoding a chunk's NBT,
+/// which takes the time, can be done on any thread first, with `encode_tag`.
+module storage.regions
+
+import nbt.tag.{Accounter, Tag, read_unnamed}
+import server.log.{Entry}
+import std.fs.{FsError, is_file, make_dir_all}
+import storage.region.{Compression, ReadError, RegionFile, encode}
+import world.pos.{ChunkPos}
+
+/// How many region files are kept, vanilla's `MAX_CACHE_SIZE`.
+pub const KEPT: usize = 256
+
+// A region file kept, or a region whose file wasn't there.
+enum Kept {
+    Missing
+    Open(RegionFile)
+}
+
+/// The region files in one folder.
+pub struct RegionStorage {
+    folder: String
+    sync: bool
+    // By region, packed as `ChunkPos.pack` packs one, the one used last first.
+    kept: LinkedMap<i64, Kept>
+}
+
+/// A chunk's NBT as `RegionStorage.write` takes it: `root`, a compound, written as `NbtIo.write`
+/// writes a save's root, then encoded in `compression` as `storage.region.encode` encodes it.
+pub fn encode_tag(root: Tag, compression: Compression) -> List<u8> {
+    var payload: List<u8> = []
+    root.write_unnamed(mut payload)
+    return encode(payload, compression)
+}
+
+impl RegionStorage {
+    /// The region files in `folder`, which is made when a chunk is first written to it. With
+    /// `sync`, `sync-chunk-writes`, each write is on the disk before it returns.
+    pub fn new(folder: String, sync: bool) -> RegionStorage {
+        return RegionStorage { folder: folder.copy(), sync: sync, kept: LinkedMap<i64, Kept>() }
+    }
+
+    /// The chunk's NBT, a compound, as `read` reads it: none if its region file or the chunk
+    /// isn't there, or if its place or its compression is wrong, with what `lines` says. Bytes
+    /// that aren't NBT, or whose root isn't a compound, fail it as vanilla's `NbtIo.read` does.
+    pub fn read(mut self, pos: ChunkPos, lines: mut List<Entry>) -> Tag? ! ReadError {
+        let key = region_of(pos).pack()
+        let file = match self.find(key, pos, false, mut lines) {
+            ok(some(f)) => f,
+            ok(none) => return none,
+            err(e) => fail io_error(e),
+        }
+        var thrown: ReadError? = none
+        let got: List<u8>? = match file.read(pos, mut lines) {
+            ok(bytes) => bytes,
+            err(e) => {
+                thrown = some(e)
+                none
+            },
+        }
+        self.kept.insert_first(key, Kept.Open(file))
+        if let e = thrown {
+            fail e
+        }
+        let bytes = got else return none
+        var at: usize = 0
+        var accounter = Accounter.unlimited()
+        let root = match read_unnamed(bytes, mut at, mut accounter) {
+            ok(tag) => tag,
+            err(e) => fail ReadError { exception: e.exception.copy(), message: e.message.copy() },
+        }
+        if root.id() != 10 {
+            fail ReadError { exception: String("IOException"), message: String("Root tag must be a named compound tag") }
+        }
+        return some(root)
+    }
+
+    /// Writes each of `chunks`, its position and either its bytes from `encode_tag` or none to
+    /// clear it, as `write` writes them one after another, with `now` their time, in seconds
+    /// since 1970. A region's file is made if it isn't there, even to clear a chunk, as
+    /// vanilla's is. Each region's chunks are written together, between its clears, as
+    /// `RegionFile.write` takes them (D166).
+    pub fn write(mut self, chunks: List<(ChunkPos, List<u8>?)>, now: i32, lines: mut List<Entry>) ! FsError {
+        var regions = LinkedMap<i64, List<usize>>()
+        for i in 0..chunks.len() {
+            let key = region_of(chunks[i].0).pack()
+            if regions.contains(key) {
+                regions[key].push(i)
+            } else {
+                regions.insert(key, [i])
+            }
+        }
+        for (key, which) in regions {
+            let made = try self.find(key, chunks[which[0]].0, true, mut lines)
+            var file = made else continue
+            var failed: FsError? = none
+            match write_region(mut file, chunks, which, now, self.sync, mut lines) {
+                ok => {},
+                err(e) => failed = some(e),
+            }
+            self.kept.insert_first(key, Kept.Open(file))
+            if let e = failed {
+                fail e
+            }
+        }
+    }
+
+    /// Closes every region file kept, as `close` does, each padded to whole sectors: the first
+    /// that fails is what fails it, after the rest are closed.
+    pub fn close(mut self) ! FsError {
+        var failed: FsError? = none
+        loop {
+            let entry = self.kept.pop_first() else break
+            let (_, kept) = entry
+            match kept {
+                Kept.Open(f) => {
+                    var file = f
+                    match file.close() {
+                        ok => {},
+                        err(e) => {
+                            if let first = failed.take() {
+                                failed = some(first)
+                            } else {
+                                failed = some(e)
+                            }
+                        },
+                    }
+                },
+                Kept.Missing => {},
+            }
+        }
+        if let e = failed {
+            fail e
+        }
+    }
+
+    /// How many region files and missing regions are kept.
+    pub fn regions_kept(self) -> usize {
+        return self.kept.len()
+    }
+
+    // The region file `pos` is in, as `getRegionFile` finds it, taken out to be used and put back
+    // first after: the one kept, or none if the region is kept as missing and `create` is false,
+    // or else the file, opened, or made if `create`, or none if it isn't there. A region found
+    // missing is kept so.
+    fn find(mut self, key: i64, pos: ChunkPos, create: bool, lines: mut List<Entry>) -> RegionFile? ! FsError {
+        if let kept = self.kept.remove(key) {
+            match kept {
+                Kept.Open(file) => return some(file),
+                Kept.Missing => {
+                    // Kept where it was, first, as `getAndMoveToFirst` keeps it, until a file
+                    // takes its place.
+                    self.kept.insert_first(key, Kept.Missing)
+                    if not create {
+                        return none
+                    }
+                },
+            }
+        }
+        let region = region_of(pos)
+        let path = "{self.folder}/r.{region.x}.{region.z}.mca"
+        if not create and not is_file(path) {
+            self.kept.insert_first(key, Kept.Missing)
+            try self.make_room()
+            return none
+        }
+        try make_dir_all(self.folder)
+        let file = try RegionFile.open(path, self.folder, mut lines)
+        self.kept.insert_first(key, Kept.Open(file))
+        try self.make_room()
+        return match self.kept.remove(key) {
+            some(Kept.Open(f)) => some(f),
+            _ => none,
+        }
+    }
+
+    // Drops the region file used longest ago, closing it, once there are more than are kept, as
+    // vanilla drops one once it's put a new one first.
+    fn make_room(mut self) ! FsError {
+        if self.kept.len() <= KEPT {
+            return
+        }
+        let entry = self.kept.pop_last() else return
+        let (_, kept) = entry
+        match kept {
+            Kept.Open(f) => {
+                var file = f
+                try file.close()
+            },
+            Kept.Missing => {},
+        }
+    }
+}
+
+// Writes one region's chunks, `which` of `chunks`, in their order, those between clears together.
+fn write_region(file: mut RegionFile, chunks: List<(ChunkPos, List<u8>?)>, which: List<usize>, now: i32, sync: bool, lines: mut List<Entry>) ! FsError {
+    var batch: List<(ChunkPos, List<u8>)> = []
+    for i in which {
+        let pos = chunks[i].0
+        match chunks[i].1 {
+            some(bytes) => batch.push((pos, bytes.copy())),
+            none => {
+                try file.write(batch, now, sync, mut lines)
+                batch.clear()
+                try file.clear(pos, now, sync)
+            },
+        }
+    }
+    try file.write(batch, now, sync, mut lines)
+}
+
+// The region a chunk is in, as `getRegionX` and `getRegionZ` give it.
+fn region_of(pos: ChunkPos) -> ChunkPos {
+    return ChunkPos { x: pos.x >> 5, z: pos.z >> 5 }
+}
+
+fn io_error(e: FsError) -> ReadError {
+    return ReadError { exception: String("IOException"), message: match e {
+        FsError.NotFound => String("not found"),
+        FsError.Denied => String("access denied"),
+        FsError.Exists => String("exists"),
+        FsError.BadPath => String("bad path"),
+        FsError.IsDirectory => String("is a directory"),
+        FsError.NotEmpty => String("not empty"),
+        FsError.Os(code) => "system error {code}",
+    } }
+}
