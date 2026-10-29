@@ -216,8 +216,8 @@ Get a real 26.3 client connected and walking around before any real world exists
 **Done when**
 
 - [ ] **G4.1** A real client joins in online mode, walks around and chats, with signed chat on
-- [ ] **G4.2** The login and configuration protocol suites pass
-- [ ] **G4.3** A recorded session replays to identical output
+- [x] **G4.2** The login and configuration protocol suites pass
+- [x] **G4.3** A recorded session replays to identical output
 
 ## Phase 5: Chunks, storage, regions and worldgen
 
@@ -387,6 +387,7 @@ calx/
 
 calcite/
 ├─ src/                  # Calcite, written in Calx
+│  └─ rig/               # the Calcite adapter, the protocol bot (session.calx) and the benchmark swarm (swarm.calx)
 ├─ plugins/
 │  ├─ api/               # the host API; bindings and reference docs are generated from it
 │  └─ samples/           # the five sample addons
@@ -399,7 +400,6 @@ calcite/
 │  └─ vanilla-adapter/   # Java 25 harness and agent
 ├─ rig/
 │  ├─ runner/            # Python: dispatch, goldens, diff, scoreboard
-│  ├─ bot/               # protocol bot, reused as the benchmark swarm
 │  ├─ differences/       # registry of deliberate differences
 │  └─ PROTOCOL.md        # adapter wire format and probe signatures
 ├─ cases/                # committed: inputs only

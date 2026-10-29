@@ -26,8 +26,8 @@ What vanilla does, what Calcite does instead, and why.
 | Field | Meaning |
 | --- | --- |
 | `title` | One line saying what Calcite does differently |
-| `kind` | `bug` (a vanilla bug Calcite fixes), `exploit` (one it closes), `performance` (an unobservable shortcut that the rig can still see), or `platform` (where vanilla depends on its JVM or OS) |
-| `cases` | The cases it covers, as `probe:case-id` globs. At least one |
+| `kind` | `bug` (a vanilla bug Calcite fixes), `exploit` (one it closes), `identity` (where Calcite says what it is), `performance` (an unobservable shortcut that the rig can still see), or `platform` (where vanilla depends on its JVM or OS) |
+| `cases` | The cases it covers, as `probe:case-id` globs, or `session:SCENARIO/STEP/KIND` for the protocol suites. At least one |
 
 The body says what vanilla does, what Calcite does, and why the difference is worth it. Link the decision if there is one.
 
@@ -42,6 +42,9 @@ The body says what vanilla does, what Calcite does, and why the difference is wo
 
 | File | Kind | What changes |
 | --- | --- | --- |
+| [`ban-ended.md`](ban-ended.md) | bug | A ban that has ended lets the player in, where vanilla's login throws once |
+| [`brand.md`](brand.md) | identity | The server's brand, which a client shows, is `calcite` |
+| [`lists-kept.md`](lists-kept.md) | bug | A player list that can't be read is left as it is, where vanilla writes what it read over it |
 | [`log-line-endings.md`](log-line-endings.md) | platform | logs/latest.log ends its lines with `\n` on Windows too |
 | [`log-second-roll.md`](log-second-roll.md) | bug | logs/latest.log rolls once at start, so an archive isn't lost |
 | [`properties-on-windows.md`](properties-on-windows.md) | platform | server.properties ends its lines with `\n` on Windows, and its date names the zone by its offset there |

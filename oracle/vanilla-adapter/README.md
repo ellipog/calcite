@@ -43,7 +43,9 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 
 [`PacketCheck`](src/calcite/rig/vanilla/PacketCheck.java) is a second entry point, not a probe ([D145](../../docs/decisions.md)). Calcite's network tests write every packet their clients get to `build/packets/`, and [`check_packets.py`](check_packets.py) runs `PacketCheck` on them with the adapter's command line. It reads each packet with the codec vanilla's client reads it with: `StatusProtocols`, `LoginProtocols`, `ConfigurationProtocols` or `GameProtocols`, bound to the vanilla data pack's registries. A packet passes if it decodes, leaves no bytes over and encodes back to the same bytes. `set_time` and `update_tags` are compared as values instead, since their maps are keyed by identity-hashed objects and vanilla's order changes from run to run. It prints a line for each kind of packet and exits with 1 if any failed. `src/test/run.py` runs it at its end.
 
-## Layout
+## Reading sessions
+
+[`SessionDump`](src/calcite/rig/vanilla/SessionDump.java) is a third entry point, for the [protocol suites](../../rig/README.md#protocol-suites). The protocol bot records every packet a server sends it, with the state it came in, and `SessionDump` reads each with the same codecs as `PacketCheck`, writing a `.jsonl` beside each recording: one line a packet, with its state, its size, the start of its SHA-256, its kind, such as `login_finished`, and its value as a tree. Records and Minecraft's objects are written field by field, by reflection, with their class's simple name under `@`; maps and sets are sorted, so their order doesn't count; an entry of a built-in registry is its name, such as `#item/stone`; a component, a UUID or an identifier is its `toString`; NBT is a tree; and a byte array of more than 64 bytes is its size and hash. A lambda inside a value is `<function>`, and a packet whose tree would pass a million nodes, or that leaves bytes over, says so in an `error`. The bot's marks, such as `step join` or `closed`, are lines of their own.
 
 | File | Role |
 | --- | --- |
@@ -59,6 +61,7 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `BlockStateProbe.java` | `block_state` |
 | `CollectionsProbe.java` | `collections` |
 | `PacketCheck.java` | Vanilla reading Calcite's packets, run by `check_packets.py` |
+| `SessionDump.java` | Vanilla reading the protocol bot's sessions, as trees, run by `rig/runner/sessions.py` |
 | `RegistriesProbe.java` | `registries`: the vanilla data pack's registries and tags, loaded once as `WorldLoader.load` loads them |
 
 ## Rules for probes

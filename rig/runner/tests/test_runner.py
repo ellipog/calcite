@@ -20,6 +20,7 @@ sys.path.insert(0, str(RUNNER))
 
 import cases  # noqa: E402
 import differences  # noqa: E402
+import sessiondiff  # noqa: E402
 from protocol import Adapter, Result, canonical_json, read_frame, result_hash, write_frame  # noqa: E402
 from store import Store  # noqa: E402
 
@@ -150,6 +151,81 @@ class Differences(unittest.TestCase):
             (Path(tmp) / "x.md").write_text("---\ntitle: X\nkind: whim\ncases:\n  - a:b\n---\n", encoding="utf-8")
             with self.assertRaises(differences.DifferenceError):
                 differences.load(tmp)
+
+
+class Sessions(unittest.TestCase):
+    """The protocol suites' comparison, on sessions written by hand as SessionDump writes them."""
+
+    @staticmethod
+    def packet(state, kind, value, sha="00"):
+        return {"state": state, "size": 1, "sha256": sha, "kind": kind, "value": value}
+
+    def compare(self, vanilla, calcite, differences_md=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for side, lines in (("vanilla", vanilla), ("calcite", calcite)):
+                folder = root / "c" / side
+                folder.mkdir(parents=True)
+                (folder / "join.jsonl").write_text("".join(json.dumps(r) + "\n" for r in lines), encoding="utf-8")
+            (root / "differences").mkdir()
+            if differences_md:
+                (root / "differences" / "x.md").write_text(differences_md, encoding="utf-8")
+            printed = []
+            report = sessiondiff.run(root, ["c"], ["join"], root / "differences", out=printed.append, complete=True)
+            return report, printed
+
+    def test_same_sessions_pass(self):
+        session = [
+            {"mark": "step configuration"},
+            self.packet("configuration", "custom_payload", {"brand": "vanilla"}),
+            {"mark": "step join"},
+            self.packet("play", "set_time", {"gameTime": 5}, "aa"),
+            self.packet("play", "login", {"playerId": 1}),
+        ]
+        later = [dict(r) for r in session]
+        later[3] = self.packet("play", "set_time", {"gameTime": 9}, "bb")
+        report, _ = self.compare(session, later)
+        self.assertTrue(report.passed)
+        self.assertFalse(report.findings)
+
+    def test_differences_and_masks(self):
+        vanilla = [
+            {"mark": "step login"},
+            self.packet("login", "login_finished", {"sessionId": "a", "profile": "Bot"}, "11"),
+            {"mark": "step configuration"},
+            self.packet("configuration", "custom_payload", {"brand": "vanilla"}),
+            {"mark": "step join"},
+            self.packet("play", "level_chunk_with_light", {"x": 0, "z": 0, "data": 1}, "c1"),
+            self.packet("play", "level_chunk_with_light", {"x": 1, "z": 0, "data": 1}, "c2"),
+            self.packet("play", "chunk_batch_finished", {"batchSize": 2}),
+            self.packet("play", "commands", {"entries": 3}),
+        ]
+        calcite = [
+            {"mark": "step login"},
+            self.packet("login", "login_finished", {"sessionId": "b", "profile": "Bot"}, "22"),
+            {"mark": "step configuration"},
+            self.packet("configuration", "custom_payload", {"brand": "calcite"}),
+            {"mark": "step join"},
+            self.packet("play", "level_chunk_with_light", {"x": 1, "z": 0, "data": 1}, "c9"),
+            self.packet("play", "level_chunk_with_light", {"x": 0, "z": 0, "data": 1}, "c8"),
+            self.packet("play", "chunk_batch_finished", {"batchSize": 2}),
+        ]
+        report, _ = self.compare(vanilla, calcite)
+        keys = sorted((f.key, f.what) for f in report.findings)
+        # The session ID is drawn, and chunks are a set whose bytes vanilla doesn't fix.
+        self.assertEqual(keys, [("session:join/configuration/custom_payload", "differs"), ("session:join/join/commands", "only vanilla sends it")])
+        self.assertFalse(report.passed)
+        brand = "---\ntitle: Brand\nkind: identity\ncases:\n  - session:*/configuration/custom_payload\n---\n"
+        report, printed = self.compare(vanilla, calcite, brand)
+        self.assertTrue(report.passed)
+        self.assertIn("  [c] session:join/configuration/custom_payload: differs (deliberate: x)", printed)
+
+    def test_stale_difference_is_noted(self):
+        session = [{"mark": "step configuration"}, self.packet("configuration", "custom_payload", {"brand": "x"})]
+        stale = "---\ntitle: Brand\nkind: identity\ncases:\n  - session:*/configuration/custom_payload\n---\n"
+        report, printed = self.compare(session, session, stale)
+        self.assertTrue(report.passed)
+        self.assertIn("note: x covers no session that differs, so it may be out of date", printed)
 
 
 class StoreFiles(unittest.TestCase):

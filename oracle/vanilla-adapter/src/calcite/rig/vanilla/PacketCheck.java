@@ -100,7 +100,7 @@ public final class PacketCheck {
     // Decodes one packet, checks nothing is left, encodes it back and compares. A kind's first
     // failure is the one kept.
     private static void check(int state, byte[] bytes, Map<String, Integer> passed, Map<String, String> failed) {
-        StreamCodec<ByteBuf, Packet<?>> codec = codec(state);
+        StreamCodec<ByteBuf, Packet<?>> codec = codecOf(state);
         String kind = stateName(state) + "/id " + idOf(bytes);
         ByteBuf in = Unpooled.wrappedBuffer(bytes);
         Packet<?> packet;
@@ -194,7 +194,7 @@ public final class PacketCheck {
     // Each state's codec, bound once.
     private static final Map<Integer, StreamCodec<ByteBuf, Packet<?>>> CODECS = new TreeMap<>();
 
-    private static StreamCodec<ByteBuf, Packet<?>> codec(int state) {
+    static StreamCodec<ByteBuf, Packet<?>> codecOf(int state) {
         return CODECS.computeIfAbsent(state, PacketCheck::bind);
     }
 
@@ -221,7 +221,7 @@ public final class PacketCheck {
     }
 
     // The packet's ID, its leading VarInt.
-    private static int idOf(byte[] bytes) {
+    static int idOf(byte[] bytes) {
         int value = 0;
         for (int i = 0; i < Math.min(bytes.length, 5); i++) {
             value |= (bytes[i] & 0x7F) << (7 * i);

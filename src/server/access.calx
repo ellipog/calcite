@@ -1,0 +1,396 @@
+/// Who may join, as vanilla's `PlayerList.canPlayerLogin` decides as a player logs in, from the
+/// lists vanilla's `DedicatedPlayerList` reads from the server's folder as it starts:
+/// banned-players.json, banned-ips.json, ops.json and whitelist.json, each a JSON array of
+/// objects. A player is found by their UUID as Java writes it, and an address by the IP that
+/// `IpBanList` cuts from the connection's, as vanilla's `StoredUserList` keys them.
+///
+/// The lists are read once, at start. Vanilla writes the first three back as it starts, and the
+/// whitelist if it isn't there. Calcite writes each one that isn't there, as `[]`, and leaves the
+/// rest as they are, since writing them back only formats them again, until commands change
+/// them (P8.5). Vanilla also writes a list it couldn't read back as `[]`, losing it, which
+/// Calcite doesn't.
+module server.access
+
+import chat.component.{Component}
+import java.date.{zone_name}
+import java.uuid.{Uuid}
+import json.tree.{Json, Member, get, parse}
+import server.log.{Entry}
+import std.fs.{is_file, read, write}
+import std.time.{Timestamp}
+
+/// A ban from banned-players.json or banned-ips.json, as vanilla's `BanListEntry` reads one.
+pub struct Ban {
+    /// `reason`, or `none` for the default reason.
+    pub reason: String?
+    /// `expires`, in milliseconds since 1970, or `none` where it's `forever` or a date that
+    /// doesn't parse, which never ends.
+    pub expires: i64?
+}
+
+/// Who may join: the four lists and `white-list`.
+pub struct Access {
+    /// `white-list` from server.properties, default `true`: whether only ops and the players on
+    /// the whitelist may join.
+    pub whitelist_on: bool
+    whitelist: Set<String>
+    /// Each op's `bypassesPlayerLimit`. Their permission levels wait for commands.
+    ops: Map<String, bool>
+    bans: Map<String, Ban>
+    ip_bans: Map<String, Ban>
+}
+
+impl Access {
+    /// No one on any list.
+    pub fn empty(whitelist_on: bool) -> Access {
+        return Access { whitelist_on: whitelist_on, whitelist: Set<String>(), ops: Map<String, bool>(), bans: Map<String, Ban>(), ip_bans: Map<String, Ban>() }
+    }
+
+    /// The lists in `folder`, the server's, with a warning in `lines` for each that can't be
+    /// read, as vanilla's are. The entries before one that isn't an object are kept, as vanilla
+    /// keeps them, and one without a player or an address is passed over.
+    pub fn load(folder: String, whitelist_on: bool, lines: mut List<Entry>) -> Access {
+        var access = Access.empty(whitelist_on)
+        for o in entries(folder, "banned-players.json", "user banlist", mut lines) {
+            if let id = user(o) {
+                access.bans.insert(id, ban(o))
+            }
+        }
+        for o in entries(folder, "banned-ips.json", "ip banlist", mut lines) {
+            if let ip = string_of(o, "ip") {
+                access.ip_bans.insert(ip, ban(o))
+            }
+        }
+        for o in entries(folder, "ops.json", "operators list", mut lines) {
+            if let id = user(o) {
+                access.ops.insert(id, flag(o, "bypassesPlayerLimit"))
+            }
+        }
+        for o in entries(folder, "whitelist.json", "white-list", mut lines) {
+            if let id = user(o) {
+                access.whitelist.insert(id)
+            }
+        }
+        return access
+    }
+
+    /// How many players the whitelist lets in: those on it, and the ops, who needn't be.
+    pub fn listed(self) -> usize {
+        var n = self.whitelist.len()
+        for (id, _) in self.ops {
+            if not self.whitelist.contains(id) {
+                n += 1
+            }
+        }
+        return n
+    }
+
+    /// Writes each list that isn't in `folder` as an empty one, as vanilla does as it starts,
+    /// with a warning in `lines` for each that can't be written.
+    pub fn make_missing(folder: String, lines: mut List<Entry>) {
+        let files = [("banned-players.json", "user banlist"), ("banned-ips.json", "ip banlist"), ("ops.json", "operators list"), ("whitelist.json", "white-list")]
+        for (name, what) in files {
+            let path = "{folder}/{name}"
+            if is_file(path) {
+                continue
+            }
+            match write(path, String("[]").to_bytes()) {
+                ok => {},
+                err(_) => lines.push(Entry.warn("Failed to save {what}: {name} can't be written")),
+            }
+        }
+    }
+
+    /// Why the player `id`, from the address `ip`, may not join, as `canPlayerLogin` says it, or
+    /// `none` if they may: a ban, then the whitelist, which lets ops past, then a ban of the
+    /// address, then a full server, with `online` playing and room for `max`, which an op may be
+    /// let past. `now` is the wall clock, which ends a ban that expires.
+    ///
+    /// Vanilla finds a ban that has expired as it checks, then throws when it asks for its
+    /// reason, as asking for it is what drops it; the login fails, and the next one goes in. Here
+    /// a ban that has expired is no ban.
+    pub fn refusal(self, id: Uuid, ip: String, online: usize, max: i32, now: Timestamp) -> Component? {
+        let key = id.to_string()
+        if self.bans.contains(key) {
+            if let reason = banned(self.bans[key], "multiplayer.disconnect.banned", now) {
+                return some(reason)
+            }
+        }
+        if self.whitelist_on and not self.ops.contains(key) and not self.whitelist.contains(key) {
+            return some(Component.translatable("multiplayer.disconnect.not_whitelisted", []))
+        }
+        if self.ip_bans.contains(ip) {
+            if let reason = banned(self.ip_bans[ip], "multiplayer.disconnect.banned_ip", now) {
+                return some(reason)
+            }
+        }
+        let full = max <= 0 or online >= usize.wrap(max)
+        if full and not (self.ops.get(key) ?? false) {
+            return some(Component.translatable("multiplayer.disconnect.server_full", []))
+        }
+        return none
+    }
+}
+
+/// The IP an address is banned by, as `IpBanList` cuts it from the address's `toString`, such as
+/// `/127.0.0.1:50412`: what's after the `/`, up to a `:`. So an IPv6 address, which Java writes
+/// in brackets, is cut to `[` and its first group, as it is in vanilla, and only a ban of that
+/// matches it.
+pub fn ban_ip(address: String) -> String {
+    var ip = address.copy()
+    if let slash = ip.find("/") {
+        ip = ip[slash + 1..]
+    }
+    if let colon = ip.find(":") {
+        ip = ip[..colon]
+    }
+    return ip
+}
+
+// The reason a ban gives, `key` with its reason and, if it expires, `key.expiration` with the
+// date, or `none` if it has expired.
+fn banned(b: Ban, key: str, now: Timestamp) -> Component? {
+    var reason_message = Component.translatable("multiplayer.disconnect.banned.reason.default", [])
+    if let r = b.reason {
+        reason_message = Component.literal(r)
+    }
+    var reason = Component.translatable("{key}.reason", [reason_message])
+    if let at = b.expires {
+        if at < now.unix_ms {
+            return none
+        }
+        reason.extra.push(Component.translatable("{key}.expiration", [Component.literal(ban_date(Timestamp { unix_ms: at }))]))
+    }
+    return some(reason)
+}
+
+// The date a ban ends, as `PlayerList`'s `yyyy-MM-dd 'at' HH:mm:ss z` writes it, in the
+// system's time zone, which vanilla's JVM has too.
+fn ban_date(at: Timestamp) -> String {
+    let offset = unsafe { at.local_offset() }
+    let zone = zone_name(unsafe { at.zone_abbreviation() }, offset)
+    let d = at.date_time(offset)
+    return "{d.year}-{two(d.month)}-{two(d.day)} at {two(d.hour)}:{two(d.minute)}:{two(d.second)} {zone}"
+}
+
+// The objects in the list `path` in `folder`: none if it isn't there or is empty, none with a
+// warning if it isn't a JSON array, and the objects before the first value that isn't one, with
+// a warning.
+fn entries(folder: String, path: str, what: str, lines: mut List<Entry>) -> List<List<Member>> {
+    var objects = List<List<Member>>()
+    let file = "{folder}/{path}"
+    if not is_file(file) {
+        return objects
+    }
+    let bytes = match read(file) {
+        ok(b) => b,
+        err(_) => {
+            lines.push(Entry.warn("Failed to load {what}: {path} can't be read"))
+            return objects
+        },
+    }
+    let text = String.from_utf8(bytes) else {
+        lines.push(Entry.warn("Failed to load {what}: {path} isn't UTF-8"))
+        return objects
+    }
+    // Gson reads an empty file, or `null`, as no list at all.
+    if blank(text) {
+        return objects
+    }
+    let json = parse(text) else {
+        lines.push(Entry.warn("Failed to load {what}: {path} isn't JSON"))
+        return objects
+    }
+    match json {
+        Json.Null => {},
+        Json.Array(values) => {
+            for v in values {
+                match v {
+                    Json.Object(members) => objects.push(members.copy()),
+                    _ => {
+                        lines.push(Entry.warn("Failed to load {what}: an entry in {path} isn't an object"))
+                        return objects
+                    },
+                }
+            }
+        },
+        _ => lines.push(Entry.warn("Failed to load {what}: {path} isn't a JSON array")),
+    }
+    return objects
+}
+
+// The player an entry names, as `NameAndId.fromJson` reads them, by their UUID: `none` if it
+// hasn't both `uuid` and `name`, or the UUID doesn't parse.
+fn user(o: List<Member>) -> String? {
+    let id = string_of(o, "uuid") else return none
+    if string_of(o, "name") == none {
+        return none
+    }
+    let uuid = Uuid.parse(id) else return none
+    return some(uuid.to_string())
+}
+
+// A ban's reason and when it ends, as `BanListEntry` reads them.
+fn ban(o: List<Member>) -> Ban {
+    var expires: i64? = none
+    if let date = string_of(o, "expires") {
+        expires = parse_date(date)
+    }
+    return Ban { reason: string_of(o, "reason"), expires: expires }
+}
+
+// A member as `getAsString` gives it: a string's text, or a number's or a boolean's as Java
+// writes it.
+fn string_of(o: List<Member>, key: str) -> String? {
+    let v = get(o, String(key)) else return none
+    return match v {
+        Json.Str(s) => some(s.copy()),
+        Json.Number(n) => some(n.copy()),
+        Json.Bool(b) => some(String(if b { "true" } else { "false" })),
+        _ => none,
+    }
+}
+
+// A member as `getAsBoolean` reads it: `true`, or a string that's `true` in any case.
+fn flag(o: List<Member>, key: str) -> bool {
+    let v = get(o, String(key)) else return false
+    return match v {
+        Json.Bool(b) => b,
+        Json.Str(s) => s.to_lower_root() == "true",
+        _ => false,
+    }
+}
+
+/// A date as `BanListEntry`'s `yyyy-MM-dd HH:mm:ss Z` reads it, such as
+/// `2026-10-29 12:00:00 +0100`, in milliseconds since 1970, or `none` if it doesn't parse.
+/// `SimpleDateFormat` is lenient, so each number may have any count of digits, a number past its
+/// field's end carries into the next, as the 32nd of a month is the 1st of the next, and what
+/// follows the zone is ignored. The zone is an offset, `+HHMM` or `-HHMM`, or `GMT` or `UTC`
+/// with or without one, as `+HH:MM`; zones by name, such as `CET`, aren't read.
+pub fn parse_date(text: String) -> i64? {
+    var at: usize = 0
+    let year = number(text, mut at) else return none
+    if not expect(text, mut at, 45) {
+        return none
+    }
+    let month = number(text, mut at) else return none
+    if not expect(text, mut at, 45) {
+        return none
+    }
+    let day = number(text, mut at) else return none
+    if not expect(text, mut at, 32) {
+        return none
+    }
+    let hour = number(text, mut at) else return none
+    if not expect(text, mut at, 58) {
+        return none
+    }
+    let minute = number(text, mut at) else return none
+    if not expect(text, mut at, 58) {
+        return none
+    }
+    let second = number(text, mut at) else return none
+    if not expect(text, mut at, 32) {
+        return none
+    }
+    let offset = zone_offset(text, mut at) else return none
+    // The month carries into the year, then the day counts on from the month's first.
+    let months = year * 12 + month - 1
+    let days = civil_days(months.floor_div(12), months.floor_mod(12) + 1) + day - 1
+    let seconds = days * 86400 + hour * 3600 + minute * 60 + second - offset
+    return some(seconds * 1000)
+}
+
+// Digits at `at`, at least one, as a number.
+fn number(text: String, at: mut usize) -> i64? {
+    let start = at
+    var n: i64 = 0
+    while at < text.len() {
+        let b = text.byte_at(at)
+        if b < 48 or b > 57 {
+            break
+        }
+        if n > 100000000000 {
+            return none
+        }
+        n = n * 10 + i64(b - 48)
+        at += 1
+    }
+    return if at == start { none } else { some(n) }
+}
+
+// Whether the byte at `at` is `b`, which it steps past if it is.
+fn expect(text: String, at: mut usize, b: u8) -> bool {
+    if at >= text.len() or text.byte_at(at) != b {
+        return false
+    }
+    at += 1
+    return true
+}
+
+// Whether the text is only JSON's white space, or nothing.
+fn blank(text: String) -> bool {
+    for i in 0..text.len() {
+        let b = text.byte_at(i)
+        if b != 32 and b != 9 and b != 10 and b != 13 {
+            return false
+        }
+    }
+    return true
+}
+
+// A zone's offset from UTC in seconds: `+0100`, `GMT`, `UTC`, or either with `+01:00`.
+fn zone_offset(text: String, at: mut usize) -> i64? {
+    let rest = text[at..]
+    if rest.starts_with("GMT") or rest.starts_with("UTC") {
+        at += 3
+        if at >= text.len() {
+            return some(0)
+        }
+        let sign = text.byte_at(at)
+        if sign != 43 and sign != 45 {
+            return some(0)
+        }
+        at += 1
+        let hours = number(text, mut at) else return none
+        var minutes: i64 = 0
+        if at < text.len() and text.byte_at(at) == 58 {
+            at += 1
+            let m = number(text, mut at) else return none
+            minutes = m
+        }
+        let s = (hours * 60 + minutes) * 60
+        return some(if sign == 45 { -s } else { s })
+    }
+    if at + 5 > text.len() {
+        return none
+    }
+    let sign = text.byte_at(at)
+    if sign != 43 and sign != 45 {
+        return none
+    }
+    at += 1
+    let start = at
+    let n = number(text, mut at) else return none
+    if at - start != 4 {
+        return none
+    }
+    let s = (n / 100 * 60 + n % 100) * 60
+    return some(if sign == 45 { -s } else { s })
+}
+
+// Days from 1970-01-01 to the first of `month` in `year`, on the Gregorian calendar.
+fn civil_days(year: i64, month: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year }
+    let era = y.floor_div(400)
+    let year_of_era = y - era * 400
+    let m = if month > 2 { month - 3 } else { month + 9 }
+    let day_of_year = (153 * m + 2) / 5
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year
+    return era * 146097 + day_of_era - 719468
+}
+
+// `n` in two digits at least.
+fn two(n: i32) -> String {
+    return if n < 10 { "0{n}" } else { "{n}" }
+}

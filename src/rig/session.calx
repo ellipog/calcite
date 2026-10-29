@@ -1,0 +1,379 @@
+/// The rig's protocol bot (P4.8, CAL-42): one player who runs a scenario against a running
+/// server, as a vanilla 26.3 client would, and writes down every packet the server sends, so
+/// `rig/runner/sessions.py` can compare what vanilla and Calcite each sent. It's made from
+/// Calcite's protocol code, as the bot benchmark's players are, but what it's sent is read with
+/// vanilla's own codecs (D145), so it agrees with neither server on a mistake.
+///
+///     calx run --release src/rig/session.calx -- PORT VIEW SCENARIO OUT
+///
+/// The scenarios:
+///
+/// - `status`: the server list's query, then a ping.
+/// - `outdated`: a login from a client one protocol version behind.
+/// - `bad-name`: a login with a name no vanilla client sends.
+/// - `stranger`: a login from a player who isn't on the whitelist.
+/// - `join`: an offline login, configuration knowing vanilla's core pack, then play: the bot
+///   loads its view, `VIEW` chunks from the center, walks into the next chunk a block a tick,
+///   says something, types a command no server has, and leaves.
+///
+/// OUT gets each packet in the order it came: its state's number, as vanilla's
+/// `ConnectionProtocol` orders them from handshake at 0, its length as 4 bytes, big-endian, then
+/// its ID and fields, as `src/test/play.calx` writes them for `PacketCheck`. A record whose
+/// state is 255 is a mark instead, whose bytes are text: `step NAME` as the bot starts each step,
+/// `closed` when the server closes the connection, and `timeout` if a step waited too long.
+/// The bot ends a step once the server has sent nothing for a second but the time and
+/// keep-alives, which vanilla sends on a clock, so both servers' steps hold the same packets.
+module rig.session
+
+import java.uuid.{Uuid}
+import pack.resources.{KnownPack}
+import protocol.chat.{LastSeenUpdate, ServerboundChat, ServerboundChatCommand}
+import protocol.codec.{Codec}
+import protocol.common.{ChatVisibility, ClientInformation, HumanoidArm, ParticleStatus, ServerboundClientInformation, ServerboundCustomPayload, ServerboundKeepAlive, ServerboundPong}
+import protocol.configuration.{ServerboundFinishConfiguration, ServerboundSelectKnownPacks}
+import protocol.handshake.{ClientIntent, ClientIntention}
+import protocol.ids.{PROTOCOL_VERSION, packet_names}
+import protocol.login.{ServerboundHello, ServerboundLoginAcknowledged}
+import protocol.play.{ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundPlayerLoaded, ON_GROUND}
+import protocol.state.{State, Bound}
+import protocol.status.{ServerboundPingRequest, ServerboundStatusRequest}
+import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
+import resources.identifier.{Identifier}
+import server.chunks.{in_view_count}
+import std.env.{args}
+import std.fs.{write}
+import std.net.{Net, Conn, Event}
+import std.time.{Instant}
+
+const TICK_NS: u64 = 50000000
+const MS: u64 = 1000000
+// How long the server must send nothing but its clock's packets for a step to end.
+const SETTLE: u64 = 1000000000
+// How long a step may take before the bot gives up on it.
+const STEP_LIMIT: u64 = 20000000000
+// The chunks a tick the bot asks for, as the bot benchmark's players do.
+const DESIRED: f32 = 25.0
+// The blocks the bot walks, a block a tick, which takes it into the next chunk.
+const WALK: i32 = 16
+// When the bot says it sent its chat message, in milliseconds since 1970: a fixed time, so both
+// servers are sent the same message.
+const CHAT_TIME: i64 = 1800000000000
+
+fn number(s: String) -> u64 {
+    var n: u64 = 0
+    for i in 0..s.len() {
+        let b = s.byte_at(i)
+        if b < 48 or b > 57 {
+            panic("{s} isn't a number")
+        }
+        n = n * 10 + u64(b - 48)
+    }
+    return n
+}
+
+fn packet<T: Wire + Packet>(p: T, state: State) -> List<u8> {
+    var w = Writer.new()
+    write_packet(p, state, mut w)
+    return w.into_bytes()
+}
+
+fn state_number(state: State) -> u8 {
+    return match state {
+        State.Handshake => 0,
+        State.Status => 1,
+        State.Login => 2,
+        State.Configuration => 3,
+        State.Play => 4,
+    }
+}
+
+// What the bot is doing in play.
+enum Phase {
+    // Not in play yet, or not in a scenario that plays.
+    Before
+    // Loading its view after joining.
+    Join
+    // Walking, with how many blocks are left.
+    Walk
+    Chat
+    Command
+    // It has closed the connection.
+    Leave
+}
+
+struct Bot {
+    scenario: String
+    conn: Conn
+    codec: Codec
+    state: State
+    closed: bool = false
+    // Every record, as the file gets them.
+    out: Writer
+    phase: Phase = Phase.Before
+    // When the current step began, and when the server last sent something off its clock.
+    step_at: u64 = 0
+    heard_at: u64 = 0
+    placed: bool = false
+    loaded: bool = false
+    x: f64 = 0.0
+    y: f64 = 0.0
+    z: f64 = 0.0
+    chunks: u64 = 0
+    walked: i32 = 0
+    done: bool = false
+}
+
+impl Bot {
+    fn send(mut self, net: Net, p: own List<u8>) {
+        if not self.closed {
+            net.write(self.conn, self.codec.encode(p)!)
+        }
+    }
+
+    fn record(mut self, state: u8, bytes: List<u8>) {
+        self.out.u8(state)
+        self.out.i32(i32.wrap(bytes.len()))
+        self.out.raw(bytes)
+    }
+
+    fn mark(mut self, text: String) {
+        self.record(255, text.to_bytes())
+    }
+
+    fn step(mut self, name: String, now: u64) {
+        self.mark("step {name}")
+        self.step_at = now
+        self.heard_at = now
+    }
+
+    // Opens the connection the way the scenario starts.
+    fn start(mut self, net: Net, port: u16) {
+        if self.scenario == "status" {
+            self.step(String("status"), 0)
+            self.send(net, packet(ClientIntention { protocol_version: PROTOCOL_VERSION, host_name: "localhost", port: port, intention: ClientIntent.Status }, State.Handshake))
+            self.state = State.Status
+            self.send(net, packet(ServerboundStatusRequest {}, State.Status))
+            return
+        }
+        let version = if self.scenario == "outdated" { PROTOCOL_VERSION - 1 } else { PROTOCOL_VERSION }
+        let name = if self.scenario == "bad-name" { String("bad name!") } else if self.scenario == "stranger" { String("Stranger") } else { String("Bot") }
+        self.step(String("login"), 0)
+        self.send(net, packet(ClientIntention { protocol_version: version, host_name: "localhost", port: port, intention: ClientIntent.Login }, State.Handshake))
+        self.state = State.Login
+        self.send(net, packet(ServerboundHello { name: name, profile_id: Uuid.new(0, 0) }, State.Login))
+    }
+
+    // Records and answers what came, at `now`.
+    fn handle(mut self, net: Net, now: u64) {
+        loop {
+            let body = match self.codec.next() {
+                ok(some(b)) => b,
+                ok(none) => return,
+                err(_) => {
+                    self.mark(String("undecodable"))
+                    self.closed = true
+                    self.done = true
+                    return
+                },
+            }
+            let at = state_number(self.state)
+            self.record(at, body)
+            var r = Reader.new(body)
+            let id = usize.wrap(r.varint()!)
+            let names = packet_names(self.state, Bound.Clientbound)
+            let name = if id < names.len() { names[id].copy() } else { String("?") }
+            if name != "set_time" and name != "keep_alive" {
+                self.heard_at = now
+            }
+            match self.state {
+                State.Status => {
+                    if name == "status_response" {
+                        self.send(net, packet(ServerboundPingRequest { time: 1234 }, State.Status))
+                    } else if name == "pong_response" {
+                        net.close(self.conn)
+                        self.closed = true
+                    }
+                },
+                State.Login => {
+                    if name == "login_compression" {
+                        self.codec.start_compression(r.varint()!)
+                    } else if name == "login_finished" {
+                        // A vanilla client acknowledges, then sends its brand and settings.
+                        self.send(net, packet(ServerboundLoginAcknowledged {}, State.Login))
+                        self.state = State.Configuration
+                        self.step(String("configuration"), now)
+                        var brand = Writer.new()
+                        brand.string("vanilla", 32767)
+                        self.send(net, packet(ServerboundCustomPayload { channel: Identifier { namespace: "minecraft", path: "brand" }, payload: brand.into_bytes() }, State.Configuration))
+                        let info = ClientInformation { language: "en_us", view_distance: 12, chat_visibility: ChatVisibility.Full, chat_colors: true, model_customisation: 127, main_hand: HumanoidArm.Right, text_filtering_enabled: false, allows_listing: true, particle_status: ParticleStatus.All }
+                        self.send(net, packet(ServerboundClientInformation { information: info }, State.Configuration))
+                    }
+                },
+                State.Configuration => {
+                    if name == "select_known_packs" {
+                        self.send(net, packet(ServerboundSelectKnownPacks { packs: [KnownPack { namespace: "minecraft", id: "core", version: "26.3" }] }, State.Configuration))
+                    } else if name == "keep_alive" {
+                        self.send(net, packet(ServerboundKeepAlive { challenge: r.i64()! }, State.Configuration))
+                    } else if name == "ping" {
+                        self.send(net, packet(ServerboundPong { token: r.i32()! }, State.Configuration))
+                    } else if name == "finish_configuration" {
+                        self.send(net, packet(ServerboundFinishConfiguration {}, State.Configuration))
+                        self.state = State.Play
+                        self.phase = Phase.Join
+                        self.step(String("join"), now)
+                    }
+                },
+                State.Play => {
+                    if name == "keep_alive" {
+                        self.send(net, packet(ServerboundKeepAlive { challenge: r.i64()! }, State.Play))
+                    } else if name == "ping" {
+                        self.send(net, packet(ServerboundPong { token: r.i32()! }, State.Play))
+                    } else if name == "player_position" {
+                        // A vanilla client accepts the teleport, then says where it is.
+                        let teleport = r.varint()!
+                        self.x = r.f64()!
+                        self.y = r.f64()!
+                        self.z = r.f64()!
+                        let accept = packet(ServerboundAcceptTeleportation { teleport_id: teleport, x: self.x, y: self.y, z: self.z, y_rot: 0.0, x_rot: 0.0 }, State.Play)
+                        self.send(net, accept)
+                        let moved = packet(ServerboundMovePlayerPosRot { x: self.x, y: self.y, z: self.z, y_rot: 0.0, x_rot: 0.0, flags: ON_GROUND }, State.Play)
+                        self.send(net, moved)
+                        self.placed = true
+                    } else if name == "level_chunk_with_light" {
+                        self.chunks += 1
+                    } else if name == "chunk_batch_finished" {
+                        self.send(net, packet(ServerboundChunkBatchReceived { desired_chunks_per_tick: DESIRED }, State.Play))
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+
+    // A tick of the client's: the next block of the walk, and the step's end once the server
+    // has settled.
+    fn tick(mut self, net: Net, now: u64, view_chunks: u64) {
+        if self.done {
+            return
+        }
+        if now - self.step_at > STEP_LIMIT {
+            self.mark(String("timeout"))
+            self.done = true
+            return
+        }
+        let settled = now - self.heard_at >= SETTLE
+        match self.phase {
+            Phase.Before => {
+                if self.closed and settled {
+                    self.done = true
+                }
+                return
+            },
+            Phase.Join => {
+                if self.chunks >= view_chunks and not self.loaded {
+                    self.loaded = true
+                    self.send(net, packet(ServerboundPlayerLoaded {}, State.Play))
+                }
+                if self.loaded and settled {
+                    self.phase = Phase.Walk
+                    self.step(String("walk"), now)
+                }
+            },
+            Phase.Walk => {
+                if self.walked < WALK {
+                    self.walked += 1
+                    self.x += 1.0
+                    let step = packet(ServerboundMovePlayerPos { x: self.x, y: self.y, z: self.z, flags: ON_GROUND }, State.Play)
+                    self.send(net, step)
+                } else if settled {
+                    self.phase = Phase.Chat
+                    self.step(String("chat"), now)
+                    let said = ServerboundChat { message: "hello", time_stamp: CHAT_TIME, salt: 0, signature: none, last_seen: LastSeenUpdate.empty() }
+                    self.send(net, packet(said, State.Play))
+                }
+            },
+            Phase.Chat => {
+                if settled {
+                    self.phase = Phase.Command
+                    self.step(String("command"), now)
+                    self.send(net, packet(ServerboundChatCommand { command: "nonexistent" }, State.Play))
+                }
+            },
+            Phase.Command => {
+                if settled {
+                    self.phase = Phase.Leave
+                    self.step(String("leave"), now)
+                    net.close(self.conn)
+                    self.closed = true
+                    self.done = true
+                }
+            },
+            Phase.Leave => {},
+        }
+        if self.placed and not self.closed {
+            self.send(net, packet(ServerboundClientTickEnd {}, State.Play))
+        }
+    }
+}
+
+fn main() {
+    let given = args()
+    if given.len() != 4 {
+        panic("usage: session PORT VIEW SCENARIO OUT")
+    }
+    let port = u16.wrap(number(given[0]))
+    let view_chunks = u64(in_view_count(i32.wrap(number(given[1]))))
+    let scenario = given[2].copy()
+    if scenario != "status" and scenario != "outdated" and scenario != "bad-name" and scenario != "stranger" and scenario != "join" {
+        panic("session: what's the scenario {scenario}?")
+    }
+    let net = Net.new()!
+    let start = unsafe { Instant.now() }
+    let conn = net.connect("127.0.0.1", port)!
+    var bot = Bot { scenario: scenario, conn: conn, codec: Codec.new(), state: State.Handshake, out: Writer.new() }
+    bot.start(net, port)
+    var next_tick: u64 = TICK_NS
+    var events = List<Event>()
+    while not bot.done {
+        let now = unsafe { Instant.now() }.nanos_since(start)
+        let wait = if next_tick > now { i64.wrap((next_tick - now + MS - 1) / MS) } else { 0 }
+        net.poll(wait, mut events)
+        var closed = false
+        for e in events {
+            match e {
+                Event.Received(c) => {
+                    if c == bot.conn {
+                        _ = bot.codec.read_from(net, c)
+                    }
+                },
+                Event.Closed(c) => {
+                    if c == bot.conn {
+                        closed = true
+                    }
+                },
+                _ => {},
+            }
+        }
+        let after = unsafe { Instant.now() }.nanos_since(start)
+        bot.handle(net, after)
+        if closed and not bot.done {
+            if not bot.closed {
+                bot.mark(String("closed"))
+            }
+            bot.closed = true
+            if bot.phase != Phase.Leave {
+                bot.phase = Phase.Before
+            }
+        }
+        if after >= next_tick {
+            next_tick += TICK_NS
+            if next_tick < after {
+                next_tick = after + TICK_NS
+            }
+            bot.tick(net, after, view_chunks)
+        }
+    }
+    let chunks = bot.chunks
+    write(given[3], bot.out.into_bytes())!
+    println("{chunks} chunks")
+}

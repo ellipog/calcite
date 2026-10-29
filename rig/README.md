@@ -18,6 +18,7 @@ The rig runs the same inputs through vanilla and through Calcite and compares th
 | Goldens | `../golden/26.3/` | Gitignored: vanilla's full results, for `diff` |
 | Differences | [`differences/`](differences/) | The registry of places Calcite deliberately differs |
 | Math comparison | [`runner/mathcmp.py`](runner/mathcmp.py) | `Math` against `StrictMath` on large sweeps (`P1.5`) |
+| Protocol suites | [`runner/sessions.py`](runner/sessions.py) | The protocol bot against vanilla and Calcite, packet by packet (`P4.8`) |
 
 The runner needs only Python 3.10 or newer, with no packages. Run it from anywhere. Paths are relative to the repo.
 
@@ -157,6 +158,43 @@ The adapter's parts are in [`src/`](../src/README.md): the frames in `rig.frame`
 
 Calcite's adapter reports the new probe as unimplemented until Calcite can run it. To implement it there, add a module under `src/rig/` and list the probe in `hello` in `src/rig/adapter.calx`.
 
+## Protocol suites
+
+The probes check Calcite's parts. The protocol suites check the server as a client sees it (`P4.8`): the [protocol bot](../src/rig/session.calx), one player made from Calcite's protocol code, runs the same scenarios against vanilla 26.3 and against Calcite, writes down every packet each sends, and the two sessions are compared packet by packet.
+
+```sh
+py -I rig/runner/sessions.py                       # both configurations, every scenario
+py -I rig/runner/sessions.py --config compressed --scenario join
+py -I rig/runner/sessions.py --compare-only --show 0
+```
+
+[`sessions.py`](runner/sessions.py) builds Calcite and the bot with `calx build --release`, then, for each configuration, starts vanilla in a fresh folder under `build/rig/sessions/CONFIG/vanilla/`, runs the bot once for each scenario, and stops it; then the same for Calcite. Both servers get the same `server.properties`: offline, a flat world named by its seed with no structures, peaceful, a view of 4 chunks, and the default `white-list=true`, with a `whitelist.json` that lists the bot. The configurations are `compressed`, at the default threshold, and `uncompressed`, at `-1`. Vanilla runs from the jar's own classes, which [`build.py`](../oracle/vanilla-adapter/build.py) unpacks, with Mojang's EULA accepted in its scratch folder only; it needs the vanilla adapter built, and never runs in CI. What vanilla draws at random that Calcite doesn't yet, the spawn's spread, is set from its console as it starts. `--compare-only` compares what the last run recorded.
+
+The scenarios:
+
+| Scenario | What the bot does |
+| --- | --- |
+| `status` | The server list's query, then a ping |
+| `outdated` | A login from a client one protocol version behind |
+| `bad-name` | A login with a name no vanilla client sends |
+| `stranger` | A login from a player the whitelist doesn't list |
+| `join` | A login, configuration knowing vanilla's core pack, then play: it loads its view, walks into the next chunk a block a tick, says something, types a command no server has, and leaves |
+
+The bot cuts its session into steps, `login`, `configuration`, `join`, `walk`, `chat`, `command` and `leave`, and ends a step once the server has sent nothing for a second but its clock. The vanilla adapter's [`SessionDump`](../oracle/vanilla-adapter/README.md#reading-sessions) reads both servers' packets with vanilla's own codecs, so the bot's reading agrees with neither server on a mistake, and [`sessiondiff.py`](runner/sessiondiff.py) lines each step's packets up by kind, as `diff` lines up text. Two lined-up packets match when their values are the same tree and their bytes are the same. What depends on timing rather than on the server is taken out first:
+
+- **The clock.** `set_time` and keep-alives come every so many ticks or milliseconds, so each side's are compared once a step, by their values with the times taken out.
+- **Chunks.** Vanilla sends the chunks that are ready, nearest first, from worker threads, so its batches and their order change from run to run. A step's chunks are compared as a set, by position.
+- **Unfixed bytes.** Where vanilla itself writes the same value in other bytes from run to run, only the values must match: tags, `set_time`, and a chunk's heightmaps, which vanilla keeps in a `HashMap` keyed by an enum, so they come out in another order each run.
+- **What vanilla draws.** The session ID a server draws as it starts, which `login_finished` carries, and the time on a chat message without a signature are left out of both sides.
+
+Each packet that differs is keyed `session:SCENARIO/STEP/KIND`, such as `session:join/configuration/custom_payload`, which a file in [`differences/`](differences/) can cover, with `*` for any scenario. The status scenario and the login and configuration steps are the suites the Phase 4 gate needs (`G4.2`): `sessions.py` exits with 1 if one of them has a difference no file covers. Play is reported, not gated, until Calcite sends what vanilla sends there. A run of every scenario also notes a difference file whose session cases covered nothing, as `score` does.
+
+Status, login and configuration pass in both configurations, with the server's [brand](differences/brand.md) the one deliberate difference. Play matches in its positions, its chat, the unknown command's answer and nearly every chunk, and differs where Calcite has yet to do what vanilla does, each with the phase that brings it:
+
+- vanilla's three dimensions, where Calcite has one (Phase 5)
+- the 25 chunks within 2 of the spawn, which vanilla loads as it starts, saves and drops. Their blocks are the same, but vanilla's sections list their blocks in the order they first come, bedrock first, as a section read back from a region file does, where a new section, Calcite's or vanilla's, lists air first. Every other chunk matches byte for byte. Matching these needs the world on disk (Phase 5, P5.2)
+- recipes, the command tree, the player's entity data, advancements, health, experience and attributes (Phase 6)
+
 ## Tests and CI
 
 ```sh
@@ -171,6 +209,7 @@ The runner's tests use only the standard library and never need the vanilla jar.
 - that every case has an expected hash
 - the differences registry and the store
 - a ping-only test adapter, end to end through `score`
+- the protocol suites' comparison, on sessions made up for it
 
 The data converter and the jar fetch step have their own tests, which don't need the jar either ([`oracle/datagen/`](../oracle/datagen/README.md#tests)):
 
@@ -193,3 +232,6 @@ CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Wi
 - **The block state NBT reader never fails.** An unknown or malformed block name reads as air, and an unknown property, a value of the wrong type or a value out of range is skipped, leaving the default. 26.3 stores states as `{id, properties}`; the old `{Name, Properties}` form reads as air.
 - **Registry IDs and tags come out of the data pack exactly as vanilla builds them.** All 129 `registries` cases match: the 32 synchronized registries' entries in vanilla's order, and the tags of every registry the server sends, 773 in all, with their entries in vanilla's order. Entries of a data-driven registry take IDs in the order of their files' identifiers, which vanilla sorts by path and then namespace, and a tag's tags go in where they're listed, each entry once.
 - **Calx's Java-ordered tables iterate exactly as Java's do.** `JavaHashMap`, `LinkedMap`, `SortedMap`, `OpenHashMap`, their sets, `PriorityQueue` and `Deque` give the same results and the same order as `HashMap`, `LinkedHashMap`, `TreeMap`, fastutil's open tables, `PriorityQueue` and `ArrayDeque` in all 180 `collections` cases. Those cases include keys whose hashes all collide, so `HashMap`'s bins turn into trees, fastutil tables that shrink and `trim`, and removal through a priority queue's iterator.
+- **The whitelist is on by default.** A new 26.3 server has `white-list=true` and an empty `whitelist.json`, so it lets no one in until someone is listed or made an op. The protocol suites' `stranger` found it: Calcite let the stranger in, where vanilla told them `multiplayer.disconnect.not_whitelisted`.
+- **A chunk's heightmaps come in another order each run.** Vanilla collects them into a `HashMap` keyed by an enum, which hashes by identity, so the same chunk is written in other bytes from one run to the next. The client reads them into an `EnumMap`, so the order means nothing, and the suites compare a chunk by its value.
+- **A ban that has ended throws once.** `canPlayerLogin` asks the ban list whether it holds the player, which an ended ban still answers yes, then gets the ban, which first drops every ended one and so returns null, and reads its reason from that. The login fails with a `NullPointerException`, and the next finds no ban. In Calcite a ban that has ended is no ban.
