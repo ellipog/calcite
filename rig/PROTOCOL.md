@@ -473,6 +473,25 @@ The result is one blob. As a listener is told of a chunk, the blob gets a byte 1
 
 `ChunkLevel.MAX_LEVEL` must be 44, for which the cases are written; the vanilla adapter checks it. Blobs, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, a chunk that isn't a decimal `long`, a coordinate, level or radius that isn't an `int`, a type that isn't one, and SNBT that isn't a compound are an `error` status.
 
+### `levels` (v1)
+
+The graph every chunk tracker is, vanilla's own `ChunkTracker`, through a list of operations, with each level it sets written as it's set.
+
+Input `{"level_count": n, "unset": u, "keep_below": k, "no_source": s, "ops": [...]}`, with no blobs. The vanilla adapter's tracker is a subclass with its levels and sources in two `Long2IntOpenHashMap`s, made with fastutil's defaults: `getLevel` gives a chunk's level, or `u` if it has none; `setLevel` takes the chunk out at `k` or above, and puts it in below; `getLevelFromSource` gives the chunk's source, or `s` if it has none. The loading tracker is `46, 45, 45, 45`, the simulation tracker `34, 33, 33, 45`, the natural spawn counter `10, 10, 9, 2147483647` and the player ticket tracker `34, 34, 33, 2147483647`. A chunk is its `x` and `z`, each an `int`, packed with `ChunkPos.pack`.
+
+The result is one blob. As the tracker sets a level, the blob gets a byte 1, then the chunk as a `long` and the level as an `int`. After each operation, the blob gets a byte 0, then its result.
+
+| Operation | Result |
+| --- | --- |
+| `["source", x, z, level]` | nothing: the chunk's source is `level`, and the tracker isn't told |
+| `["unsource", x, z]` | nothing: the chunk has no source, and the tracker isn't told |
+| `["update", x, z, level, only_decreased]` | nothing: `update` |
+| `["set", x, z, level]` | nothing: the chunk's level is `level`, kept or taken out as `setLevel` does, without the tracker, as a chunk holder's removal changes the loading tracker's levels |
+| `["run", count]` | `runUpdates(count)`, an `int`, how many of `count` are left |
+| `["dump"]` | a byte for `hasWork`, an `int` for `getQueueSize`, then the levels in the map's order: an `int` count, then each chunk as a `long` and its level as an `int` |
+
+Blobs, a `level_count` that isn't from 2 to 253, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, a coordinate, level or count that isn't an `int`, and an `only_decreased` that isn't a boolean are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.
