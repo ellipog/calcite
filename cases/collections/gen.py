@@ -1,9 +1,11 @@
 """Writes cases/collections/generated.json: random operations on every collection, with every
-key type, and the iteration order checked as they go.
+key type, and the iteration order checked as they go. And cases/collections/removal.json: more
+of fastutil's open tables, with many loops that remove keys with the iterator.
 
     py -I cases/collections/gen.py
 
-Deterministic: everything comes from SplitMix64 seeded with SEED, so rerunning it gives the same file.
+Deterministic: everything comes from SplitMix64 seeded with SEED, and the removal cases with
+REMOVAL_SEED, so rerunning it gives the same files.
 
 Each case alternates phases that mostly add, which grow the table, with phases that mostly remove,
 which shrink fastutil's, and looks at the order every few operations. The keys come from one of a
@@ -20,6 +22,11 @@ from cases import splitmix64, write_file  # noqa: E402
 
 SEED = 20261028
 CASES_PER_PAIR = 6
+# A loop that removes with fastutil's iterator goes over a key that a removal moved past the end of
+# the table after the rest, and halves the table only in that last part, so it takes many loops to
+# see both: in its 240 cases, 152 loops go out of the table's order and 13 halve it.
+REMOVAL_SEED = 7777031
+REMOVAL_CASES_PER_PAIR = 40
 KEYS = ["int", "long", "string"]
 COLLECTIONS = ["hash_map", "linked_hash_map", "tree_map", "open_hash_map", "hash_set", "linked_hash_set",
                "tree_set", "open_hash_set", "priority_queue", "array_deque"]
@@ -106,7 +113,7 @@ def value(g):
     return int(g.below(2000)) - 1000
 
 
-def ops_for(g, collection, keys, count):
+def ops_for(g, collection, keys, count, removal=False):
     ops = []
     adding = True
     phase = 0
@@ -118,13 +125,13 @@ def ops_for(g, collection, keys, count):
         if i % 37 == 36:
             ops.append(["iter"])
             continue
-        ops.append(op(g, collection, keys, adding))
+        ops.append(op(g, collection, keys, adding, removal))
     ops.append(["size"])
     ops.append(["iter"])
     return ops
 
 
-def op(g, collection, keys, adding):
+def op(g, collection, keys, adding, removal=False):
     roll = g.below(100)
     if collection == "priority_queue":
         if roll < (55 if adding else 15):
@@ -166,7 +173,12 @@ def op(g, collection, keys, adding):
     if roll < 90:
         return ["clear"] if g.chance(25) else ["size"]
     if collection.startswith("open"):
-        return ["trim"] if roll < 93 else ["size"]
+        # A loop that removes with the iterator, as vanilla's TicketStorage.removeTicketIf does.
+        if roll < (91 if removal else 92):
+            return ["trim"]
+        if roll < (99 if removal else 97):
+            return ["remove_iter", 2 + int(g.below(5)), int(g.below(2))]
+        return ["size"]
     if collection.startswith("linked"):
         pick = g.below(6)
         if pick < 2:
@@ -184,12 +196,12 @@ def op(g, collection, keys, adding):
     return ["size"]
 
 
-def main():
-    g = Gen(SEED)
+def generate(seed, collections, per_pair, prefix, removal):
+    g = Gen(seed)
     cases = []
-    for collection in COLLECTIONS:
+    for collection in collections:
         for kind in KEYS:
-            for n in range(CASES_PER_PAIR):
+            for n in range(per_pair):
                 keys = Keys(g, kind)
                 # Mostly short cases, and one long one per pair, which grows big tables.
                 count = 1500 if n == 0 else 150 + int(g.below(350))
@@ -198,10 +210,17 @@ def main():
                 inp = {"collection": collection, "key": kind}
                 if collection in SIZED and g.chance(40):
                     inp["capacity"] = [0, 1, 3, 12, 17, 64, 100, 1000][g.below(8)]
-                inp["ops"] = ops_for(g, collection, keys, count)
-                name = f"{collection.replace('_', '-')}-{kind}-{keys.style}-{n}"
+                inp["ops"] = ops_for(g, collection, keys, count, removal)
+                name = f"{prefix}{collection.replace('_', '-')}-{kind}-{keys.style}-{n}"
                 cases.append({"id": name, "input": inp})
-    write_file(HERE / "generated.json", "collections", f"cases/collections/gen.py, seed {SEED}", cases)
+    return cases
+
+
+def main():
+    write_file(HERE / "generated.json", "collections", f"cases/collections/gen.py, seed {SEED}",
+               generate(SEED, COLLECTIONS, CASES_PER_PAIR, "", False))
+    write_file(HERE / "removal.json", "collections", f"cases/collections/gen.py, seed {REMOVAL_SEED}",
+               generate(REMOVAL_SEED, ["open_hash_map", "open_hash_set"], REMOVAL_CASES_PER_PAIR, "removal-", True))
 
 
 if __name__ == "__main__":

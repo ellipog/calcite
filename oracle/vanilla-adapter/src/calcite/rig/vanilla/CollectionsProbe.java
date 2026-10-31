@@ -231,6 +231,30 @@ final class CollectionsProbe implements Probe {
         }
     }
 
+    /**
+     * `remove_iter` on one of fastutil's tables: a loop that removes the picked keys with the
+     * iterator, as vanilla's `TicketStorage.removeTicketIf` and `ChunkMap.processUnloads` do. It
+     * writes how many keys there were, then each in the order the loop went over them, which
+     * isn't the table's order when a removal moves a key the loop hasn't reached past its end.
+     */
+    private static void removeIter(Op op, DataOutputStream out, Kind kind, int size, Iterator<?> keys,
+                                   java.util.function.Function<Object, Object> keyOf) throws IOException {
+        op.expect(2);
+        int m = op.value(1);
+        int r = op.value(2);
+        if (m <= 0) {
+            throw new CaseError("operation " + op.index() + ": the modulus must be positive");
+        }
+        out.writeInt(size);
+        while (keys.hasNext()) {
+            Object k = keyOf.apply(keys.next());
+            kind.write(out, k);
+            if (kind.picks(k, m, r)) {
+                keys.remove();
+            }
+        }
+    }
+
     // --- java.util maps -------------------------------------------------------------------------
 
     private record JavaMap(Map<Object, Integer> map, Kind kind) implements Target {
@@ -504,6 +528,8 @@ final class CollectionsProbe implements Probe {
                     op.expect(0);
                     map.trim();
                 }
+                case "remove_iter" -> removeIter(op, out, Kind.INT, map.size(), map.int2IntEntrySet().fastIterator(),
+                    e -> ((Int2IntMap.Entry) e).getIntKey());
                 case "iter" -> {
                     op.expect(0);
                     out.writeInt(map.size());
@@ -559,6 +585,8 @@ final class CollectionsProbe implements Probe {
                     op.expect(0);
                     map.trim();
                 }
+                case "remove_iter" -> removeIter(op, out, Kind.LONG, map.size(), map.long2IntEntrySet().fastIterator(),
+                    e -> ((Long2IntMap.Entry) e).getLongKey());
                 case "iter" -> {
                     op.expect(0);
                     out.writeInt(map.size());
@@ -614,6 +642,8 @@ final class CollectionsProbe implements Probe {
                     op.expect(0);
                     map.trim();
                 }
+                case "remove_iter" -> removeIter(op, out, Kind.STRING, map.size(), map.object2IntEntrySet().fastIterator(),
+                    e -> ((Object2IntMap.Entry<?>) e).getKey());
                 case "iter" -> {
                     op.expect(0);
                     out.writeInt(map.size());
@@ -678,6 +708,7 @@ final class CollectionsProbe implements Probe {
                         default -> strings().trim();
                     }
                 }
+                case "remove_iter" -> removeIter(op, out, kind, ((Set<?>) set).size(), ((Set<?>) set).iterator(), k -> k);
                 case "iter" -> {
                     op.expect(0);
                     out.writeInt(((Set<?>) set).size());

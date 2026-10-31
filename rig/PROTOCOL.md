@@ -286,7 +286,7 @@ On linked maps, `["put_first", k, v]` and `["put_last", k, v]` give maybe the pr
 
 On tree maps and sets, `["floor", k]`, `["ceiling", k]`, `["lower", k]` and `["higher", k]` give maybe the key, and `["range", a, b]` gives an iteration of the keys from `a` up to but not including `b`, with no values. A range whose end is before its start is an `error` status.
 
-On open maps and sets, `["trim"]` gives nothing. It shrinks the table to fit, which changes the iteration order.
+On open maps and sets, `["trim"]` gives nothing. It shrinks the table to fit, which changes the iteration order. `["remove_iter", m, r]` gives an iteration of every key, without values, in the order a loop over fastutil's iterator goes over them while it removes each key whose number, or string length, is `r` modulo `m` (`Math.floorMod`), as `TicketStorage.removeTicketIf` and `ChunkMap.processUnloads` do. A map's loop goes over its `fastIterator`. That order isn't always the table's, since a removal can move a key the loop hasn't reached past the table's end. `m` is positive.
 
 On `priority_queue`:
 
