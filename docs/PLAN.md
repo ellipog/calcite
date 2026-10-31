@@ -340,7 +340,7 @@ Make Calcite the best server to write plugins for. Determinism (D21) is the secr
   - a plugin manifest with dependencies on other plugins
 - **P9.2** A Calx language server (diagnostics, completion, go-to-definition, hover docs from the host API), which the VS Code extension from P3.10 switches to (D65).
 - **P9.3** A plugin test harness: headless Calcite, scripted bots (the rig's bot) and recorded input logs replayed against the plugin, with assertions on world state and packets.
-- **P9.4** The docs website, built from the Markdown both repos have been keeping since Phase 0 (D40). Pick the site generator then. It covers the Calx guide and reference, the plugin guide, and the generated host API reference. The five samples become tutorials. The Calx part came earlier: the Calx website is built now, in `calx/site/`, on its own track (D174, CLX-60), and P9.4 adds the plugin guide and the host API reference to it.
+- **P9.4** The docs website, built from the Markdown both repos have been keeping since Phase 0 (D40). Pick the site generator then. It covers the Calx guide and reference, the plugin guide, and the generated host API reference. The five samples become tutorials. The Calx part came earlier: the Calx website is built now, in `calx/site/`, on its own track (D174, CLX-60), and is live at https://calxlang.com. P9.4 adds the plugin guide and the host API reference to it.
 - **P9.5** A profiler view for the per-plugin data from P7.6.
 - **P9.6** SDKs for WASM addons in other languages, Rust first, generated from the host API.
 - **P9.7** Custom content without client mods: helpers for data components, item models, dialogs and data-pack registries.

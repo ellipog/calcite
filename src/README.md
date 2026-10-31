@@ -5,7 +5,7 @@ description: The Calx modules in src/, what each matches in vanilla, and how the
 
 # Calcite's source
 
-Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is the file `src/a/b.calx` ([modules](https://github.com/ellipog/calx/blob/main/docs/reference/modules.md)). Every module that reproduces vanilla behavior is checked bit for bit by the [oracle rig](../rig/README.md).
+Calcite is written in [Calx](https://calxlang.com). Module `a.b` is the file `src/a/b.calx` ([modules](https://calxlang.com/reference/modules/)). Every module that reproduces vanilla behavior is checked bit for bit by the [oracle rig](../rig/README.md).
 
 | Module | What it is | Vanilla's |
 | --- | --- | --- |
