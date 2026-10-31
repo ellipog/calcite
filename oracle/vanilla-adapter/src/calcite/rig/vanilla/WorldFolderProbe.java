@@ -1,18 +1,31 @@
 package calcite.rig.vanilla;
 
+import com.google.gson.Gson;
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonIOException;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonParser;
+import com.mojang.authlib.GameProfile;
 import com.mojang.datafixers.util.Pair;
+import com.mojang.logging.LogUtils;
 import com.mojang.serialization.Codec;
 import com.mojang.serialization.DataResult;
 import com.mojang.serialization.Dynamic;
 import com.mojang.serialization.DynamicOps;
+import com.mojang.serialization.JsonOps;
 import java.io.DataInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
+import java.io.Reader;
+import java.io.Writer;
+import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -25,6 +38,7 @@ import java.util.concurrent.CompletionException;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
 import net.minecraft.IdentifierException;
+import net.minecraft.SharedConstants;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
@@ -34,7 +48,15 @@ import net.minecraft.nbt.NbtUtils;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.PlayerAdvancements;
+import net.minecraft.server.dedicated.DedicatedPlayerList;
+import net.minecraft.server.dedicated.DedicatedServer;
 import net.minecraft.server.players.NameAndId;
+import net.minecraft.server.players.PlayerList;
+import net.minecraft.stats.ServerStatsCounter;
+import net.minecraft.util.FileUtil;
+import net.minecraft.util.StrictJsonParser;
 import net.minecraft.util.datafix.DataFixTypes;
 import net.minecraft.util.datafix.DataFixers;
 import net.minecraft.world.level.saveddata.SavedData;
@@ -54,8 +76,10 @@ import org.apache.logging.log4j.core.config.Property;
  * `world_folder`: operations on a world's folder, `world`, in a new folder of its own, with
  * vanilla's {@link LevelStorageSource} and its access: opening and locking it, reading
  * `level.dat` with its fallback, checking the version as `Main` does, saving it, reading a
- * player's data as they join, reading and writing saved data with {@link SavedDataStorage}, and
- * the files left. Each result goes into one blob, after what was logged.
+ * player's data as they join, reading and writing saved data with {@link SavedDataStorage},
+ * reading and writing players' advancements and statistics as {@link PlayerAdvancements} and
+ * {@link ServerStatsCounter} do, finding a player's statistics with {@link PlayerList}'s
+ * `locateStatsFile`, and the files left. Each result goes into one blob, after what was logged.
  */
 final class WorldFolderProbe implements Probe {
     @Override
@@ -65,8 +89,11 @@ final class WorldFolderProbe implements Probe {
 
     @Override
     public int version() {
-        return 3;
+        return 4;
     }
+
+    // Logs as `PlayerAdvancements` and `ServerStatsCounter` log, for the parts of them run here.
+    private static final org.slf4j.Logger LOGGER = LogUtils.getLogger();
 
     @Override
     public Result run(JsonObject input, List<byte[]> blobs) throws Exception {
@@ -255,6 +282,63 @@ final class WorldFolderProbe implements Probe {
                             text(out, lines.normal(thrown));
                         }
                     }
+                    case "progress_load" -> {
+                        expect(op, k, 2);
+                        boolean stats = kind(op, k);
+                        Path file = progressFile(open(access, k), stats, op, k);
+                        JsonElement json = stats ? readStats(file) : readAdvancements(file);
+                        lines.write(out);
+                        if (json == null) {
+                            out.writeByte(0);
+                        } else {
+                            out.writeByte(1);
+                            text(out, json.toString());
+                            Integer version;
+                            try {
+                                version = stats ? NbtUtils.getDataVersion(new Dynamic<>(JsonOps.INSTANCE, json), 1343) : advancementsVersion(json);
+                            } catch (NumberFormatException e) {
+                                version = null;
+                            }
+                            if (version == null) {
+                                out.writeByte(0);
+                            } else {
+                                out.writeByte(1);
+                                out.writeInt(version);
+                            }
+                        }
+                    }
+                    case "progress_save" -> {
+                        expect(op, k, 3);
+                        boolean stats = kind(op, k);
+                        Path file = progressFile(open(access, k), stats, op, k);
+                        int blob = Args.asInt(op.get(3), "operation " + k + "'s blob");
+                        if (blob < 0 || blob >= blobs.size()) {
+                            throw new CaseError("operation " + k + ": no blob " + blob);
+                        }
+                        JsonElement members = JsonParser.parseString(new String(blobs.get(blob), StandardCharsets.UTF_8));
+                        if (!members.isJsonObject()) {
+                            throw new CaseError("operation " + k + ": blob " + blob + " isn't a JSON object");
+                        }
+                        if (stats) {
+                            saveStats(file, members);
+                        } else {
+                            saveAdvancements(file, members);
+                        }
+                        lines.write(out);
+                    }
+                    case "stats_locate" -> {
+                        expect(op, k, 2);
+                        UUID id;
+                        try {
+                            id = UUID.fromString(Args.asString(op.get(1), "operation " + k + "'s UUID"));
+                        } catch (IllegalArgumentException e) {
+                            throw new CaseError("operation " + k + ": the UUID isn't one");
+                        }
+                        String player = Args.asString(op.get(2), "operation " + k + "'s name");
+                        Path found = locateStatsFile(open(access, k), new GameProfile(id, player));
+                        lines.write(out);
+                        text(out, lines.normal(found.toString()));
+                    }
                     case "close" -> {
                         expect(op, k, 0);
                         open(access, k).close();
@@ -278,6 +362,126 @@ final class WorldFolderProbe implements Probe {
                     Files.delete(p);
                 }
             }
+        }
+    }
+
+    // Whether the operation is on statistics rather than advancements.
+    private static boolean kind(JsonArray op, int k) {
+        String kind = Args.asString(op.get(1), "operation " + k + "'s kind");
+        return switch (kind) {
+            case "advancements" -> false;
+            case "stats" -> true;
+            default -> throw new CaseError("operation " + k + ": `" + kind + "` isn't advancements or stats");
+        };
+    }
+
+    // `<uuid>.json` in the world's advancements or statistics, for the operation's UUID, which
+    // is any name here, since what's in the folder is what's tried.
+    private static Path progressFile(LevelStorageSource.LevelStorageAccess access, boolean stats, JsonArray op, int k) {
+        String uuid = Args.asString(op.get(2), "operation " + k + "'s UUID");
+        if (uuid.isEmpty() || uuid.contains("/") || uuid.contains("\\") || uuid.contains("..") || uuid.contains(":")) {
+            throw new CaseError("operation " + k + ": `" + uuid + "` isn't a name in the folder");
+        }
+        return access.getLevelPath(stats ? LevelResource.PLAYER_STATS_DIR : LevelResource.PLAYER_ADVANCEMENTS_DIR).resolve(uuid + ".json");
+    }
+
+    // What `PlayerAdvancements.load` reads before its codec, with its lines.
+    private static JsonElement readAdvancements(Path path) {
+        if (Files.isRegularFile(path)) {
+            try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
+                return StrictJsonParser.parse(reader);
+            } catch (IOException | JsonIOException e) {
+                LOGGER.error("Couldn't access player advancements in {}", path, e);
+            } catch (JsonParseException e) {
+                LOGGER.error("Couldn't parse player advancements in {}", path, e);
+            }
+        }
+        return null;
+    }
+
+    // What `ServerStatsCounter`'s constructor reads before `parse`, with its lines.
+    private static JsonElement readStats(Path file) {
+        if (Files.isRegularFile(file)) {
+            try (Reader reader = Files.newBufferedReader(file, StandardCharsets.UTF_8)) {
+                return StrictJsonParser.parse(reader);
+            } catch (IOException e) {
+                LOGGER.error("Couldn't read statistics file {}", file, e);
+            } catch (JsonParseException e) {
+                LOGGER.error("Couldn't parse statistics file {}", file, e);
+            }
+        }
+        return null;
+    }
+
+    // The version `DataFixTypes.wrapCodec` reads advancements as from.
+    private static int advancementsVersion(JsonElement json) {
+        JsonOps ops = JsonOps.INSTANCE;
+        return ops.get(json, "DataVersion").flatMap(ops::getNumberValue).map(Number::intValue).result().orElse(1343);
+    }
+
+    // `PlayerAdvancements.save`, given what its codec encodes: the version merged in as
+    // `wrapCodec` merges it, then written with its `GSON`.
+    private static void saveAdvancements(Path path, JsonElement members) throws Exception {
+        JsonOps ops = JsonOps.INSTANCE;
+        JsonElement json = ops.mergeToMap(members, ops.createString("DataVersion"), ops.createInt(SharedConstants.getCurrentVersion().dataVersion().version())).getOrThrow();
+        Gson gson = gson(PlayerAdvancements.class);
+        try {
+            FileUtil.createDirectoriesSafe(path.getParent());
+            try (Writer outputWriter = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
+                gson.toJson(json, gson.newJsonWriter(outputWriter));
+            }
+        } catch (IOException | JsonIOException e) {
+            LOGGER.error("Couldn't save player advancements to {}", path, e);
+        }
+    }
+
+    // `ServerStatsCounter.save`, given what its codec encodes, put in an object as `toJson` puts
+    // it, and written with its `GSON`.
+    private static void saveStats(Path file, JsonElement stats) throws Exception {
+        JsonObject result = new JsonObject();
+        result.add("stats", stats);
+        result.addProperty("DataVersion", SharedConstants.getCurrentVersion().dataVersion().version());
+        Gson gson = gson(ServerStatsCounter.class);
+        try {
+            FileUtil.createDirectoriesSafe(file.getParent());
+            try (Writer writer = Files.newBufferedWriter(file, StandardCharsets.UTF_8)) {
+                gson.toJson(result, gson.newJsonWriter(writer));
+            }
+        } catch (IOException | JsonIOException e) {
+            LOGGER.error("Couldn't save stats to {}", file, e);
+        }
+    }
+
+    // The class's own `GSON`.
+    private static Gson gson(Class<?> owner) throws Exception {
+        Field field = owner.getDeclaredField("GSON");
+        field.setAccessible(true);
+        return (Gson) field.get(null);
+    }
+
+    // `PlayerList.locateStatsFile` itself, on a player list and server made without their
+    // constructors, which hold only what it reads: the server, and the server's folder.
+    private static Path locateStatsFile(LevelStorageSource.LevelStorageAccess access, GameProfile profile) throws Exception {
+        // `sun.misc.Unsafe`, found by name, since the build takes no warnings.
+        Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
+        Field theUnsafe = unsafeClass.getDeclaredField("theUnsafe");
+        theUnsafe.setAccessible(true);
+        Object unsafe = theUnsafe.get(null);
+        Method allocate = unsafeClass.getMethod("allocateInstance", Class.class);
+        DedicatedServer server = (DedicatedServer) allocate.invoke(unsafe, DedicatedServer.class);
+        Field storage = MinecraftServer.class.getDeclaredField("storageSource");
+        storage.setAccessible(true);
+        storage.set(server, access);
+        DedicatedPlayerList list = (DedicatedPlayerList) allocate.invoke(unsafe, DedicatedPlayerList.class);
+        Field owner = PlayerList.class.getDeclaredField("server");
+        owner.setAccessible(true);
+        owner.set(list, server);
+        Method locate = PlayerList.class.getDeclaredMethod("locateStatsFile", GameProfile.class);
+        locate.setAccessible(true);
+        try {
+            return (Path) locate.invoke(list, profile);
+        } catch (InvocationTargetException e) {
+            throw new CaseError("locateStatsFile threw " + e.getCause());
         }
     }
 

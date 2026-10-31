@@ -326,9 +326,140 @@ def saved():
     ]
 
 
+ADVANCEMENTS = f"players/advancements/{UUID}.json"
+STATS = f"players/stats/{UUID}.json"
+
+
+def progress():
+    """Players' advancements and statistics: files read as StrictJsonParser reads them through a
+    buffered UTF-8 reader, with the data version each kind's codec would read, written pretty as
+    their Gson writes them, and statistics under a player's name moved to their UUID's file."""
+    def load(kind="advancements", uuid=UUID):
+        return ["progress_load", kind, uuid]
+
+    def save(blob, kind="advancements", uuid=UUID):
+        return ["progress_save", kind, uuid, blob]
+
+    def locate(name, uuid=UUID):
+        return ["stats_locate", uuid, name]
+
+    def text(s):
+        return s.encode()
+
+    open_ = [["open"]]
+    good = text('{"minecraft:story/root":{"criteria":{"crafting_table":"2026-10-31 12:00:00 +0000"},"done":true},"DataVersion":5023}')
+    stats = text('{"stats":{"minecraft:custom":{"minecraft:jump":3,"minecraft:play_time":1200}},"DataVersion":5023}')
+    # A 4-byte character across the reader's 8192-character buffer, and bytes that aren't UTF-8
+    # after it, then far after the document's end.
+    wide = chr(0x1F600).encode()
+    pad = 8192 - len('{"a":"') - 2
+    across = text('{"a":"' + "x" * pad) + wide + text('"}')
+    files = {
+        "good": good,
+        "empty": b"",
+        "spaces": text(" \n\t\r "),
+        "bom": b"\xef\xbb\xbf" + good,
+        "not-json": text('{"a":'),
+        "trailing": good + text(" x"),
+        "two-documents": text("{}{}"),
+        "lenient": text("{a:1}"),
+        "comment": text('{"a":1 /* no */}'),
+        "single-quotes": text("{'a':1}"),
+        "nan": text('{"a":NaN}'),
+        "root-array": text('[1,"two",null,true]'),
+        "root-string": text('"just text"'),
+        "root-number": text("42"),
+        "root-null": text("null"),
+        "bad-utf8": text('{"a":"') + b"\xff" + text('"}'),
+        "bad-utf8-far": text("{}" + " " * 9000) + b"\xff",
+        "syntax-before-far-bad": text("{]" + " " * 9000) + b"\xff",
+        "null-before-bad": text("null ") + b"\xff",
+        "truncated-char": text('{"a":"') + wide[:2],
+        "overlong": text('{"a":"') + b"\xc0\xaf" + text('"}'),
+        "encoded-surrogate": text('{"a":"') + b"\xed\xa0\x80" + text('"}'),
+        "past-max": text('{"a":"') + b"\xf4\x90\x80\x80" + text('"}'),
+        "four-bytes": text('{"a":"') + wide + text('"}'),
+        "across-buffer": across,
+        "across-buffer-bad": across[:8190] + b"\xff" + across[8191:],
+        "escapes": text('{"a":"\\"\\\\\\/\\b\\f\\n\\r\\t\\u00e9\\u2028\\ud83d\\ude00"}'),
+        "raw-controls": text('{"a":"tab\there"}'),
+        "duplicate-keys": text('{"a":1,"b":2,"a":3}'),
+        "deep-255": text("[" * 255 + "]" * 255),
+        "deep-256": text("[" * 256 + "]" * 256),
+        "long-number": text('{"n":' + "1" * 1024 + "}"),
+        "numbers": text('{"a":-0,"b":1.50,"c":1E+2,"d":0.1e-3}'),
+        "leading-zero": text('{"a":01}'),
+        "html": text('{"<a>":"&=\'"}'),
+    }
+    versions = {
+        "old": "100",
+        "negative": "-1",
+        "fraction": "5023.9",
+        "long": "4294972319",
+        "exponent": "5.023e3",
+        "huge": "1e10000",
+        "string": '"5023"',
+        "true": "true",
+        "false": "false",
+        "null": "null",
+        "object": "{}",
+    }
+    for name, v in versions.items():
+        files["version-" + name] = text('{"DataVersion":' + v + "}")
+    files["version-twice"] = text('{"DataVersion":1,"DataVersion":2}')
+    files["version-missing"] = text('{"a":1}')
+
+    cases = [
+        case("progress-none", open_ + [load(), load("stats")] + CLOSE, []),
+        case("progress-folder", [["dir", ADVANCEMENTS], ["dir", STATS]] + open_ + [load(), load("stats")] + CLOSE, []),
+        case("progress-someone-else", [put("players/advancements/853c80ef-3c37-49fd-aa49-938b674adae6.json", 0)] + open_ + [load()] + CLOSE, [good]),
+        case("progress-stats-file", [put(STATS, 0)] + open_ + [load("stats")] + CLOSE, [stats]),
+    ]
+    for name, blob in files.items():
+        cases.append(case("progress-" + name, [put(ADVANCEMENTS, 0), put(STATS, 0)] + open_ + [load(), load("stats")] + CLOSE, [blob]))
+
+    # Statistics kept under a player's name, from before 1.7.6.
+    named = "players/stats/notch.json"
+    cases += [
+        case("locate-none", open_ + [locate("notch")] + CLOSE, []),
+        case("locate-uuid", [put(STATS, 0)] + open_ + [locate("notch")] + CLOSE, [stats]),
+        case("locate-moved", [put(named, 0)] + open_ + [locate("notch"), load("stats")] + CLOSE, [stats]),
+        case("locate-both", [put(STATS, 0), put(named, 1)] + open_ + [locate("notch")] + CLOSE, [stats, good]),
+        case("locate-capitals", [put("players/stats/Notch.json", 0)] + open_ + [locate("Notch")] + CLOSE, [stats]),
+        case("locate-name-folder", [["dir", named]] + open_ + [locate("notch")] + CLOSE, []),
+        case("locate-dotted", [put("players/stats/a.b-c_9.json", 0)] + open_ + [locate("a.b-c_9")] + CLOSE, [stats]),
+        case("locate-empty-name", [put("players/stats/.json", 0)] + open_ + [locate("")] + CLOSE, [stats]),
+        case("locate-dots", [put("players/stats/...json", 0)] + open_ + [locate("..")] + CLOSE, [stats]),
+        case("locate-slash", [put("players/x.json", 0)] + open_ + [locate("../x")] + CLOSE, [stats]),
+        case("locate-uppercase-uuid", [put(STATS, 0)] + open_ + [locate("notch", UUID.upper())] + CLOSE, [stats]),
+        case("locate-stats-is-a-file", [put("players/stats", 0)] + open_ + [locate("notch")] + CLOSE, [stats]),
+        case("locate-twice", [put(named, 0)] + open_ + [locate("notch"), locate("notch")] + CLOSE, [stats]),
+    ]
+
+    # Saves, of what the codecs would give.
+    rich = text('{"minecraft:recipes/misc/<x>":{"criteria":{"has_it":"2026-10-31 12:00:00 +0000"},"done":false},'
+                '"list":[1,"two",null,true,[],{},{"x":null}],"gone":null,"n":{"a":-0,"b":1.50,"c":1E+2,"d":12345678901234567890}}')
+    odd = '{"s":"\\u00e9 ' + "\\u2028\\u2029" + ' \\ud83d\\ude00 \\u0001\\u001f\\t\\n\\"\\\\ \\u007f <>&=\'"}'
+    cases += [
+        case("progress-save", open_ + [save(0)] + CLOSE, [rich]),
+        case("progress-save-empty", open_ + [save(0), save(0, "stats")] + CLOSE, [text("{}")]),
+        case("progress-save-strings", open_ + [save(0), save(0, "stats")] + CLOSE, [text(odd)]),
+        case("progress-save-version-in-place", open_ + [save(0)] + CLOSE, [text('{"DataVersion":1,"a":true}')]),
+        case("progress-save-version-string", open_ + [save(0)] + CLOSE, [text('{"a":true,"DataVersion":"x"}')]),
+        case("progress-save-stats", open_ + [save(0, "stats")] + CLOSE, [text('{"minecraft:custom":{"minecraft:jump":3}}')]),
+        case("progress-save-stats-version", open_ + [save(0, "stats")] + CLOSE, [text('{"DataVersion":1}')]),
+        case("progress-save-over", [put(ADVANCEMENTS, 0)] + open_ + [save(1)] + CLOSE, [text("x" * 500), text('{"a":1}')]),
+        case("progress-save-then-load", open_ + [save(0), load(), save(1, "stats"), load("stats")] + CLOSE, [rich, text('{"minecraft:custom":{"minecraft:jump":3}}')]),
+        case("progress-save-folder-in-way", [["dir", ADVANCEMENTS], ["dir", STATS]] + open_ + [save(0), save(0, "stats")] + CLOSE, [text("{}")]),
+        case("progress-save-file-in-way", [put("players/advancements", 0), put("players/stats", 0)] + open_ + [save(1), save(1, "stats")] + CLOSE, [text("a file"), text("{}")]),
+        case("progress-save-players-is-a-file", [put("players", 0)] + open_ + [save(1), save(1, "stats")] + CLOSE, [text("a file"), text("{}")]),
+    ]
+    return cases
+
+
 def main():
-    cases = folders() + broken() + versions() + players() + saved()
-    write_file(HERE / "generated.json", "world_folder", "cases/world_folder/gen.py", cases, probe_version=3)
+    cases = folders() + broken() + versions() + players() + saved() + progress()
+    write_file(HERE / "generated.json", "world_folder", "cases/world_folder/gen.py", cases, probe_version=4)
 
 
 if __name__ == "__main__":

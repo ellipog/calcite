@@ -405,9 +405,9 @@ The result is one blob: what was logged while it was read and written, as `chunk
 
 Blobs and SNBT that isn't a compound are an `error` status.
 
-### `world_folder` (v3)
+### `world_folder` (v4)
 
-A world's folder, as vanilla's `LevelStorageSource` and its `LevelStorageAccess` keep it, its players' data, as `PlayerDataStorage` keeps it, and its saved data, as `SavedDataStorage` keeps it: operations on `world`, in a new folder of its own, which is the server's folder, the universe. Results go into one blob, each after what its operation logged, as `region` writes them. In what was logged and in names, the folder's path is taken out, `/` goes between names, the time in a `level.dat_corrupted_` file's name becomes `<time>`, and the random number in a new `level<n>.dat` becomes `<n>`, since each is the run's own.
+A world's folder, as vanilla's `LevelStorageSource` and its `LevelStorageAccess` keep it, its players' data, as `PlayerDataStorage` keeps it, its saved data, as `SavedDataStorage` keeps it, and its players' advancements and statistics, as `PlayerAdvancements` and `ServerStatsCounter` keep them: operations on `world`, in a new folder of its own, which is the server's folder, the universe. Results go into one blob, each after what its operation logged, as `region` writes them. In what was logged and in names, the folder's path is taken out, `/` goes between names, the time in a `level.dat_corrupted_` file's name becomes `<time>`, and the random number in a new `level<n>.dat` becomes `<n>`, since each is the run's own.
 
 Input `{"ops": [...]}`, with blobs. A name is a path in `world` with `/` between names, which mustn't leave it, and a blob is its index in the case's list.
 
@@ -423,9 +423,12 @@ Input `{"ops": [...]}`, with blobs. A name is a path in `world` with `/` between
 | `["player_load", uuid, name]` | a byte: 0 if `load(new NameAndId(uuid, name))` gives nothing; or 1, then an `int` length and the compound, as `load` writes it. The first makes the `PlayerDataStorage`, as a server makes it as it starts, which makes `players/data` |
 | `["saved_load", folder, id]` | a byte: 0 if a new `SavedDataStorage` for the folder gives nothing for the type `id`, with no file or one it can't read; 2 if the file has no `data`; or 1, then an `int` length and its `data`, as `NbtIo.writeAnyTag` writes it. The folder is `""` for the world's `data`, or a dimension's ID for `data` in its folder. The type's codec keeps `data` as it is |
 | `["saved_save", folder, id, blob]` | a byte: 0 once a new `SavedDataStorage` for the folder has saved the blob, read as `NbtIo.readAnyTag` reads it, as the type `id`'s `data`, with `saveAndJoin`; or 1, then what the save threw, as `open` writes it |
+| `["progress_load", kind, uuid]` | what was logged, then a byte: 0 if `players/advancements/<uuid>.json`, for `kind` `advancements`, or `players/stats/<uuid>.json`, for `stats`, isn't a regular file or can't be read, as `PlayerAdvancements.load` and `ServerStatsCounter`'s constructor read it before their codecs, through a buffered UTF-8 reader with `StrictJsonParser`; or 1, then the JSON as `JsonElement.toString` writes it, as a message, then a byte: 1, then the `int` data version the kind's codec would read it as, `DataFixTypes.wrapCodec`'s for advancements and `NbtUtils.getDataVersion` for statistics, or 0 if that throws. The UUID is any name in the folder |
+| `["progress_save", kind, uuid, blob]` | what was logged: the blob, a JSON object, saved to that file as the kind's `save` saves what its codec gives, with the data version put in and its own `GSON` |
+| `["stats_locate", uuid, name]` | what was logged, then the file `PlayerList.locateStatsFile` gives for the player, as a message, moving one under their name to their UUID's |
 | `["close"]` | `close`, then every file and folder in `world`, sorted by name: an `int` count, then for each its name as a message and a byte, 0 for a file, 1 for a folder and 2 for a file that's gzip and inflates whole, then for a file an `int` length and its bytes, or for a gzipped one what it inflates to. No two deflaters write the same bytes, so a gzipped file is compared by what it holds |
 
-Opening a folder that's open, an operation on one that isn't, `check` and `save` with nothing loaded, a name outside `world`, a UUID, ID or dimension that isn't one, a blob that isn't there or isn't a tag, and an operation it doesn't have are an `error` status. Version 2 added `player_load`, and version 3 `saved_load` and `saved_save`.
+Opening a folder that's open, an operation on one that isn't, `check` and `save` with nothing loaded, a name outside `world`, a UUID, ID or dimension that isn't one, a blob that isn't there or isn't a tag or a JSON object, a kind that isn't `advancements` or `stats`, and an operation it doesn't have are an `error` status. Version 2 added `player_load`, version 3 `saved_load` and `saved_save`, and version 4 `progress_load`, `progress_save` and `stats_locate`.
 
 ## Adding a probe
 
