@@ -177,12 +177,12 @@ Calcite's adapter reports the new probe as unimplemented until Calcite can run i
 The probes check Calcite's parts. The protocol suites check the server as a client sees it (`P4.8`): the [protocol bot](../src/rig/session.calx), one player made from Calcite's protocol code, runs the same scenarios against vanilla 26.3 and against Calcite, writes down every packet each sends, and the two sessions are compared packet by packet.
 
 ```sh
-py -I rig/runner/sessions.py                       # both configurations, every scenario
+py -I rig/runner/sessions.py                       # every configuration and scenario
 py -I rig/runner/sessions.py --config compressed --scenario join
 py -I rig/runner/sessions.py --compare-only --show 0
 ```
 
-[`sessions.py`](runner/sessions.py) builds Calcite and the bot with `calx build --release`, then, for each configuration, starts vanilla in a fresh folder under `build/rig/sessions/CONFIG/vanilla/`, runs the bot once for each scenario, and stops it; then the same for Calcite. Both servers get the same `server.properties`: offline, a flat world named by its seed with no structures, peaceful, a view of 4 chunks, and the default `white-list=true`, with a `whitelist.json` that lists the bot. The configurations are `compressed`, at the default threshold, and `uncompressed`, at `-1`. Vanilla runs from the jar's own classes, which [`build.py`](../oracle/vanilla-adapter/build.py) unpacks, with Mojang's EULA accepted in its scratch folder only; it needs the vanilla adapter built, and never runs in CI. What vanilla draws at random that Calcite doesn't yet, the spawn's spread, is set from its console as it starts. `--compare-only` compares what the last run recorded.
+[`sessions.py`](runner/sessions.py) builds Calcite and the bot with `calx build --release`, then, for each configuration, starts vanilla in a fresh folder under `build/rig/sessions/CONFIG/vanilla/`, runs the bot once for each scenario, and stops it; then the same for Calcite. Both servers get the same `server.properties`: offline, a flat world named by its seed with no structures, peaceful, a view of 4 chunks, and the default `white-list=true`, with a `whitelist.json` that lists the bot. The configurations are `compressed`, at the default threshold; `uncompressed`, at `-1`; and `saved`, the `join` scenario alone, on a copy of the world [the round trip](#the-round-trip) has vanilla make, so `roundtrip.py` runs first and `sessions.py` skips `saved` with a note until it has. It's at a view of 3, which sends the chunks from -4 to 4, saved full with every chunk around them, and vanilla's spawn is moved to the origin from its console, where Calcite's player joins. Vanilla runs from the jar's own classes, which [`build.py`](../oracle/vanilla-adapter/build.py) unpacks, with Mojang's EULA accepted in its scratch folder only; it needs the vanilla adapter built, and never runs in CI. What vanilla draws at random that Calcite doesn't yet, the spawn's spread, is set from its console as it starts. `--compare-only` compares what the last run recorded.
 
 The scenarios:
 
@@ -203,11 +203,13 @@ The bot cuts its session into steps, `login`, `configuration`, `join`, `walk`, `
 
 Each packet that differs is keyed `session:SCENARIO/STEP/KIND`, such as `session:join/configuration/custom_payload`, which a file in [`differences/`](differences/) can cover, with `*` for any scenario. The status scenario and the login and configuration steps are the suites the Phase 4 gate needs (`G4.2`): `sessions.py` exits with 1 if one of them has a difference no file covers. Play is reported, not gated, until Calcite sends what vanilla sends there. A run of every scenario also notes a difference file whose session cases covered nothing, as `score` does.
 
-Status, login and configuration pass in both configurations, with the server's [brand](differences/brand.md) the one deliberate difference. Play matches in its positions, its chat, the unknown command's answer and nearly every chunk, and differs where Calcite has yet to do what vanilla does, each with the phase that brings it:
+Status, login and configuration pass in every configuration, with the server's [brand](differences/brand.md) the one deliberate difference. Play matches in its positions, its chat, the unknown command's answer and nearly every chunk, and differs where Calcite has yet to do what vanilla does, each with the phase that brings it:
 
 - vanilla's three dimensions, where Calcite has one (Phase 5)
 - the 25 chunks within 2 of the spawn, which vanilla loads as it starts, saves and drops. Their blocks are the same, but vanilla's sections list their blocks in the order they first come, bedrock first, as a section read back from a region file does, where a new section, Calcite's or vanilla's, lists air first. Every other chunk matches byte for byte. Matching these needs the world on disk (Phase 5, P5.2)
 - recipes, the command tree, the player's entity data, advancements, health, experience and attributes (Phase 6)
+
+On the saved world, the two servers read the same chunks and light them the same: 73 of the 81 match byte for byte, light included. A step's chunks that differ are reported as the first, then the rest grouped by the fields they differ in. Six differ only by their block entities (Phase 6). Two hold the round trip's sand and water, whose ticks wait in the save: vanilla runs them as the player joins, so its sand falls and its water spreads, with the light and heightmaps that change with them, where Calcite ticks no blocks yet (Phase 6). Vanilla also sends light updates for the chunks at the edge of what it's lit, which carry the light their chunk packets did, and others with the block changes of water flowing in caves ([D184](../docs/decisions.md)). Its mobs and the round trip's entities keep moving, so its join step never goes quiet and ends at the bot's timeout.
 
 ## The round trip
 

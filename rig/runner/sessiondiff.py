@@ -23,6 +23,7 @@ the suites G4.2 and P4.2 need, and fail on any difference no file covers.
 
 import difflib
 import json
+import re
 from dataclasses import dataclass, field
 
 import differences as registry
@@ -220,17 +221,33 @@ def compare_chunks(va, ca, found, tally):
     only_c = sorted(set(ca.chunks) - set(va.chunks))
     if only_v or only_c:
         found("play/level_chunk_with_light", "other chunks", [f"only vanilla's: {only_v[:12]}", f"only Calcite's: {only_c[:12]}"])
-    bad = 0
+    bad = {}
     for pos in sorted(set(va.chunks) & set(ca.chunks)):
         problem = compare_entries(va.chunks[pos], ca.chunks[pos])
         if problem:
-            bad += 1
-            if bad == 1:
-                found("play/level_chunk_with_light", f"chunk {pos} differs", problem)
-    if bad > 1:
-        found("play/level_chunk_with_light", f"{bad - 1} more chunks differ")
-    if not bad and not only_v and not only_c:
-        tally["match"] += len(va.chunks)
+            bad[pos] = problem
+    if bad:
+        first = next(iter(bad))
+        found("play/level_chunk_with_light", f"chunk {first} differs", bad[first])
+    if len(bad) > 1:
+        # The others, by what differs in them, so a few kinds of difference over many chunks
+        # read as a few lines.
+        kinds = {}
+        for pos in list(bad)[1:]:
+            kinds.setdefault(fields(bad[pos]), []).append(pos)
+        found("play/level_chunk_with_light", f"{len(bad) - 1} more chunks differ",
+              [f"{', '.join(k)}: {' '.join(f'({x},{z})' for x, z in ps)}" for k, ps in sorted(kinds.items(), key=lambda kv: -len(kv[1]))])
+    tally["match"] += len(set(va.chunks) & set(ca.chunks)) - len(bad)
+
+
+def fields(problem):
+    """The fields a chunk's differences are in, two deep and without indices, as
+    `.lightData.skyUpdates`."""
+    out = set()
+    for line in problem:
+        at = line.split(": ", 1)[0] if line.startswith(".") else line
+        out.add(".".join(re.sub(r"\[\d+\]", "", at).split(".")[:3]))
+    return tuple(sorted(out))
 
 
 @dataclass
@@ -257,13 +274,14 @@ def compare(vanilla_steps, calcite_steps, scenario, findings, counts):
 
 
 def run(sessions, configs, scenarios, differences_dir, show=3, out=print, complete=False):
-    """Compares the sessions of each configuration and scenario, and prints the suites. With
+    """Compares the sessions of each configuration and scenario, and prints the suites.
+    `scenarios` is a list for every configuration, or a dict of each one's. With
     `complete`, every scenario ran, so a difference with session cases that covered nothing is
     noted, as the scoreboard notes one whose cases pass."""
     known = registry.load(differences_dir)
     findings, counts = [], {}
     for config in configs:
-        for scenario in scenarios:
+        for scenario in (scenarios.get(config, ()) if isinstance(scenarios, dict) else scenarios):
             v = load(sessions / config / "vanilla" / f"{scenario}.jsonl")
             c = load(sessions / config / "calcite" / f"{scenario}.jsonl")
             before = len(findings)

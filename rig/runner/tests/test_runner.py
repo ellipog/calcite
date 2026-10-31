@@ -227,6 +227,33 @@ class Sessions(unittest.TestCase):
         self.assertTrue(report.passed)
         self.assertIn("note: x covers no session that differs, so it may be out of date", printed)
 
+    def test_chunks_that_differ_are_grouped(self):
+        def chunk(x, z, light, entities=()):
+            value = {"x": x, "z": z, "chunkData": {"buffer": "b", "blockEntitiesData": list(entities)},
+                     "lightData": {"skyUpdates": [light]}}
+            return self.packet("play", "level_chunk_with_light", value)
+        done = self.packet("play", "chunk_batch_finished", {"batchSize": 5})
+        vanilla = [{"mark": "step join"}, chunk(0, 0, "a"), chunk(1, 0, "a", ["chest"]), chunk(2, 0, "a"), chunk(3, 0, "b"), chunk(4, 0, "a"), done]
+        calcite = [{"mark": "step join"}, chunk(0, 0, "a"), chunk(1, 0, "a"), chunk(2, 0, "c"), chunk(3, 0, "c"), chunk(4, 0, "a"), done]
+        report, printed = self.compare(vanilla, calcite)
+        self.assertEqual([f.what for f in report.findings], ["chunk (1, 0) differs", "2 more chunks differ"])
+        self.assertEqual(report.findings[1].detail, [".lightData.skyUpdates: (2,0) (3,0)"])
+        # The two chunks that are the same still count.
+        self.assertEqual(report.counts["play"]["match"], 2)
+
+    def test_scenarios_by_configuration(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for config, scenario in (("a", "join"), ("b", "status")):
+                for side in ("vanilla", "calcite"):
+                    folder = root / config / side
+                    folder.mkdir(parents=True)
+                    (folder / f"{scenario}.jsonl").write_text(json.dumps(self.packet("status", "status_response", {"v": 1})) + "\n", encoding="utf-8")
+            (root / "differences").mkdir()
+            report = sessiondiff.run(root, ["a", "b"], {"a": ["join"], "b": ["status"]}, root / "differences", out=lambda _: None)
+            self.assertTrue(report.passed)
+            self.assertEqual(report.counts["status"]["match"], 1)
+
 
 class StoreFiles(unittest.TestCase):
     def test_configs_and_round_trip(self):

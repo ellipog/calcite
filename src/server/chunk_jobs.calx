@@ -3,9 +3,9 @@
 ///
 /// One IO thread owns the region files. It finds which chunks a region's file has, and reads
 /// what the file holds of a chunk, as it's asked. What it reads goes to the chunk workers, which
-/// check it, inflate it and read its NBT into a chunk ready to send, and back to the tick thread
-/// with what each logged, waking the poll. The workers start as chunks need them, up to one fewer
-/// than the processors.
+/// check it, inflate it and read its NBT into a chunk, with its sky sources and its light as it
+/// was saved, and back to the tick thread with what each logged, waking the poll. The workers
+/// start as chunks need them, up to one fewer than the processors.
 ///
 /// What the IO thread reads is the server's input, as the network's bytes are: the link records
 /// it, and a replay hands it over in the same order. What the workers make of it depends only on
@@ -22,6 +22,7 @@ import storage.chunk.{ChunkData, ChunkFormat}
 import storage.region.{ReadError, Stored, unpack}
 import storage.regions.{ChunkRead, RegionStorage, read_root}
 import world.chunk.{BlockStates, Chunk, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, OCEAN_FLOOR_WG, Section, WORLD_SURFACE, WORLD_SURFACE_WG}
+import world.light.{LightStates, SkySources}
 import world.pos.{ChunkPos}
 
 /// The thread vanilla's region files log on, `Util.ioPool`'s first.
@@ -51,8 +52,31 @@ pub struct ChunkContext {
 pub enum Loaded {
     /// Nothing that can be used was saved, or it couldn't be read: the chunk is to be generated.
     Generate
-    /// The chunk as it was saved, and its light as it's sent.
-    Saved(Chunk, LightData)
+    /// The chunk as it was saved.
+    Saved(SavedChunk)
+}
+
+/// A chunk as it was saved: its blocks, its sky's sources worked out from them, as
+/// `initializeLightSources` works them out, and its light, for the light engine to take.
+pub struct SavedChunk {
+    pub chunk: Chunk
+    pub sources: SkySources
+    /// The light saved for each section, from the one below the world to the one above, or
+    /// `none` where there's none: the sky's, and the blocks'.
+    pub sky: List<List<u8>?>
+    pub block: List<List<u8>?>
+    /// Whether it was saved lit, its status `minecraft:light` or later with its light on, as
+    /// vanilla's `isLighted` says, so its light isn't spread again.
+    pub lighted: bool
+}
+
+impl SavedChunk {
+    /// Its light as it was saved, as a packet sends it: each layer saved in the mask, with its
+    /// data, from the section below the world up. Without the light engine, the masks of empty
+    /// layers, which come from the sections next to blocks, aren't known, so none are sent.
+    pub fn saved_light(self) -> LightData {
+        return light_of(self.sky.copy(), self.block.copy())
+    }
 }
 
 /// What the tick thread gets back.
@@ -84,19 +108,20 @@ pub enum Done {
 /// The rest loads as `SerializableChunkData.read` reads it: each section saved in the world in
 /// its place, a later one over an earlier at the same height, and air with plains in each one
 /// not saved; the light saved, the same way; each heightmap saved, and those not, of the four a
-/// chunk keeps from its terrain on, worked out from the blocks.
-pub fn prepare(pos: ChunkPos, read: ChunkRead, context: ChunkContext, lines: mut List<Entry>) -> Loaded {
+/// chunk keeps from its terrain on, worked out from the blocks. Its sky's sources are worked out
+/// from its blocks with `light`, as the `initialize_light` status does first.
+pub fn prepare(pos: ChunkPos, read: ChunkRead, context: ChunkContext, light: LightStates, lines: mut List<Entry>) -> Loaded {
     match read {
         ChunkRead.Absent => return Loaded.Generate,
         ChunkRead.Failed(e) => {
             failed_read(pos, e, mut lines)
             return Loaded.Generate
         },
-        ChunkRead.Stored(stored) => return prepare_stored(pos, stored, context, mut lines),
+        ChunkRead.Stored(stored) => return prepare_stored(pos, stored, context, light, mut lines),
     }
 }
 
-fn prepare_stored(pos: ChunkPos, stored: Stored, context: ChunkContext, lines: mut List<Entry>) -> Loaded {
+fn prepare_stored(pos: ChunkPos, stored: Stored, context: ChunkContext, light: LightStates, lines: mut List<Entry>) -> Loaded {
     var io = List<Entry>()
     var failed: ReadError? = none
     let unpacked: List<u8>? = match unpack(pos, stored, mut io) {
@@ -205,12 +230,14 @@ fn prepare_stored(pos: ChunkPos, stored: Stored, context: ChunkContext, lines: m
         to_prime = left
     }
     chunk.prime_heightmaps(context.table, to_prime)
-    return Loaded.Saved(chunk, light_of(sky, block))
+    var sources = SkySources.new(context.min_section * 16)
+    sources.fill_from(chunk, light)
+    let lighted = context.format.has_light(data.status) and data.light_correct
+    return Loaded.Saved(SavedChunk { chunk: chunk, sources: sources, sky: sky, block: block, lighted: lighted })
 }
 
 // The light a chunk's saved layers send, as vanilla's light packet sends each layer its engine
-// has: in the mask, with its data, from the section below the world up. The masks of empty
-// layers, which come from the sections next to blocks, wait for the light engine (CAL-66).
+// has: in the mask, with its data, from the section below the world up.
 fn light_of(sky: own List<List<u8>?>, block: own List<List<u8>?>) -> LightData {
     var sky_layers = sky
     var block_layers = block
@@ -339,7 +366,8 @@ impl Task for IoThread {
     }
 }
 
-// A chunk worker: it makes each chunk the IO thread read, sends it back, and wakes the poll.
+// A chunk worker: it makes each chunk the IO thread read, sends it back, and wakes the poll. It
+// works out the block states' light properties with the first chunk it's handed.
 struct ChunkWorker {
     context: ChunkContext
     work: Receiver<Work>
@@ -351,9 +379,12 @@ impl Task for ChunkWorker {
     fn run(own self) {
         var work = self.work
         var done = self.done
+        var states: LightStates? = none
         while let w = work.wait() {
             var lines = List<Entry>()
-            let loaded = prepare(w.pos, w.read, self.context, mut lines)
+            let made = states.take() ?? LightStates.new()
+            let loaded = prepare(w.pos, w.read, self.context, made, mut lines)
+            states = some(made)
             done.send(Done.Chunk(w.pos, w.lines, w.read, lines, loaded))
             self.waker.wake()
         }

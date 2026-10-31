@@ -26,6 +26,7 @@ import sys
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -54,11 +55,34 @@ BASE = {
     "view-distance": str(VIEW),
     "simulation-distance": str(VIEW),
 }
-CONFIGS = {
-    "compressed": {},
-    "uncompressed": {"network-compression-threshold": "-1"},
-}
 SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
+# The world the round trip has vanilla make and save (rig/runner/roundtrip.py), from the seed
+# `calcite` with real terrain, its chunks full from -6 to 5 around the origin.
+SAVED_WORLD = CALCITE / "build" / "rig" / "roundtrip" / "vanilla" / "world"
+
+
+@dataclass
+class Config:
+    """A configuration: what it adds to the properties, the view, its scenarios, and the world
+    both servers are given a copy of, or none for the flat world each makes."""
+    props: dict
+    view: int = VIEW
+    scenarios: tuple = tuple(SCENARIOS)
+    world: Path | None = None
+    # Typed into vanilla's console after VANILLA_COMMANDS, with what it answers.
+    commands: tuple = ()
+
+
+CONFIGS = {
+    "compressed": Config({}),
+    "uncompressed": Config({"network-compression-threshold": "-1"}),
+    # A saved world, whose chunks both servers read and light (CAL-76). A view of 3 sends the
+    # chunks from -4 to 4, which vanilla lights with their neighbours, all of them full in the
+    # save. Calcite's player joins at (0.5, -60, 0.5), and vanilla's on the spawn when its radius
+    # is 0, so the spawn is moved to the origin and both are in chunk (0, 0).
+    "saved": Config({}, view=3, scenarios=("join",), world=SAVED_WORLD,
+                    commands=(("setworldspawn 0 100 0", "Set the world spawn point"),)),
+}
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
 BOT = "Bot"
@@ -107,8 +131,14 @@ def prepare(folder, config, port, vanilla):
     if folder.exists():
         shutil.rmtree(folder)
     folder.mkdir(parents=True)
-    props = dict(BASE, **CONFIGS[config])
+    c = CONFIGS[config]
+    props = dict(BASE, **c.props)
+    props["view-distance"] = props["simulation-distance"] = str(c.view)
     props["server-port"] = str(port)
+    if c.world is not None:
+        # Without the lock, which vanilla held, and the players' data, so neither server's
+        # player starts where the round trip's bot was.
+        shutil.copytree(c.world, folder / "world", ignore=lambda at, names: [n for n in names if n in ("session.lock", "players") and Path(at) == c.world])
     (folder / "server.properties").write_text("".join(f"{k}={v}\n" for k, v in props.items()), encoding="utf-8")
     listed = [{"uuid": offline_uuid(BOT), "name": BOT}]
     (folder / "whitelist.json").write_text(json.dumps(listed, indent=2) + "\n", encoding="utf-8")
@@ -176,14 +206,14 @@ def record(config, side, argv, bot, scenarios):
     server = Server(argv, folder, side)
     at = server.wait_for("Done (")
     if side == "vanilla":
-        for command, answer in VANILLA_COMMANDS:
+        for command, answer in VANILLA_COMMANDS + list(CONFIGS[config].commands):
             server.type(command)
             at = server.wait_for(answer, at)
     print(f"  {side}: up in {time.monotonic() - began:.1f}s on port {port}", flush=True)
     try:
         for scenario in scenarios:
             out = folder / f"{scenario}.bin"
-            got = subprocess.run([str(bot), str(port), str(VIEW), scenario, str(out)], cwd=CALCITE,
+            got = subprocess.run([str(bot), str(port), str(CONFIGS[config].view), scenario, str(out)], cwd=CALCITE,
                                  capture_output=True, text=True, encoding="utf-8", timeout=120)
             if got.returncode != 0:
                 sys.exit(f"sessions: the bot failed {scenario} against {side}:\n{got.stdout}{got.stderr}")
@@ -208,16 +238,27 @@ def main():
     ap.add_argument("--show", type=int, default=3, help="differences shown for each packet, 0 for all")
     args = ap.parse_args()
     configs = args.config or list(CONFIGS)
-    scenarios = args.scenario or SCENARIOS
+    complete = args.config is None and args.scenario is None
+    for c in list(configs):
+        world = CONFIGS[c].world
+        if world is not None and not (world / "level.dat").is_file():
+            print(f"{c}: skipped, since there's no {world.relative_to(CALCITE)}; run py -I rig/runner/roundtrip.py", flush=True)
+            configs.remove(c)
+            complete = False
+    scenarios = {c: [s for s in (args.scenario or SCENARIOS) if s in CONFIGS[c].scenarios] for c in configs}
     a = adapter()
     if not args.compare_only:
         server, bot = build_calcite(find_calx())
         for config in configs:
+            if not scenarios[config]:
+                continue
             print(f"{config}:", flush=True)
-            record(config, "vanilla", vanilla_argv(a), bot, scenarios)
-            record(config, "calcite", [str(server)], bot, scenarios)
-    dump(a, [SESSIONS / c / side / f"{s}.bin" for c in configs for side in ("vanilla", "calcite") for s in scenarios])
-    complete = args.config is None and args.scenario is None
+            record(config, "vanilla", vanilla_argv(a), bot, scenarios[config])
+            record(config, "calcite", [str(server)], bot, scenarios[config])
+    files = [SESSIONS / c / side / f"{s}.bin" for c in configs for side in ("vanilla", "calcite") for s in scenarios[c]]
+    if not files:
+        sys.exit("sessions: no configuration has those scenarios")
+    dump(a, files)
     report = sessiondiff.run(SESSIONS, configs, scenarios, CALCITE / "rig" / "differences", show=args.show, complete=complete)
     return 0 if report.passed else 1
 
