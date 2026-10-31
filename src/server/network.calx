@@ -19,7 +19,7 @@ import protocol.codec.{Decoder}
 import protocol.common.{ChatVisibility, ClientInformation, ClientboundDisconnect, ClientboundKeepAlive, ClientboundPostEffects, ClientboundResourcePackPush, ResourcePackAction, ServerboundKeepAlive}
 import protocol.configuration.{ClientboundCodeOfConduct, ClientboundFinishConfiguration, ConfigurationIn}
 import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
-import protocol.ids.{PROTOCOL_VERSION, game_version}
+import protocol.ids.{DATA_VERSION, PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
 import protocol.play.{Abilities, BookRecipes, BookTab, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundCommands, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundInitializeBorder, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, ClockUpdate, CommandNode, GlobalPos, INITIALIZE_CHAT, LEVEL_CHUNKS_LOAD_START, NodeKind, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes}
@@ -39,10 +39,11 @@ import server.log.{Entry, Look}
 import server.sending.{Outbox, Sending}
 import server.status.{ServerStatus}
 import server.play.{World, display_name}
+import server.saving.{Save, Saving}
 import std.crypto.{RsaKey, RsaPublicKey}
 import std.net.{Conn, Event, NetError, Address, Ip}
 import std.time.{Timestamp}
-import storage.level.{Spawn}
+import storage.level.{LevelData, Spawn}
 import storage.players.{PlayerFiles, SavedPosition, saved_position}
 import world.collision.{CollisionStates}
 import world.flat.{MIN_Y, SECTIONS, SURFACE_Y}
@@ -235,6 +236,8 @@ struct Prepare {
     // Whether the spawn ticket's been added, and whether the chunks around the place are full.
     ticketed: bool = false
     ready: bool = false
+    // The player's data as it was read, if they have any.
+    data: JavaHashMap<String, Tag>? = none
 }
 
 impl Prepare {
@@ -297,6 +300,9 @@ struct Player {
     session: ChatSession? = none
     chain: Chain = Chain()
     signatures: SignatureCache = SignatureCache()
+    // Their data as it was read as they joined, which their saves keep what Calcite doesn't know
+    // of in, or `none` for a player new to the world.
+    data: JavaHashMap<String, Tag>? = none
 }
 
 // A login's check with the session server. It goes on if the player leaves, as vanilla's
@@ -363,7 +369,19 @@ pub struct Network {
     respawn_radius: i32 = DEFAULT_RESPAWN_RADIUS
     players: PlayerFiles? = none
     collisions: CollisionStates? = none
+    // The world's `level.dat` as it was read, which is saved with what's changed, or `none` for
+    // a world that had none, whose `level.dat` Calcite doesn't write; the level's name, as the
+    // lines that save it name it; the saver, which a replay hasn't; and the ticks until the next
+    // autosave, as `ticksUntilAutosave`.
+    level_data: LevelData? = none
+    level_name: String = "world"
+    saving: Saving? = none
+    autosave_in: i32 = AUTOSAVE_TICKS
 }
+
+/// The ticks from one autosave to the next, as `computeNextAutosaveInterval` makes them at 20
+/// ticks a second: 300 seconds' worth, and at least 100.
+pub const AUTOSAVE_TICKS: i32 = 6000
 
 /// A queue that already holds `key`, for a network whose key pair is made before it starts.
 pub fn key_ready(key: own RsaKey) -> Receiver<RsaKey> {
@@ -403,6 +421,41 @@ impl Network {
     /// Sets who may join, which is everyone until it's set.
     pub fn set_access(mut self, access: own Access) {
         self.access = access
+    }
+
+    /// Sets the world's `level.dat` as it was read, or `none` for a world without one, and the
+    /// level's name, its `LevelName` or `level-name`. The game time goes on from the one it
+    /// saved, and `brand`, the server's, is added to its brands, and it's marked modded, as
+    /// `setModdedInfo` marks it for a server whose brand isn't vanilla's.
+    pub fn set_level(mut self, level: own LevelData?, name: own String, brand: own String) {
+        self.level_name = name
+        if let given = level {
+            var data = given
+            self.world.game_time = data.time
+            if not data.brands.contains(brand) {
+                data.brands.push(brand)
+            }
+            data.modded = true
+            self.level_data = some(data)
+        }
+    }
+
+    /// Saves players' data to `players`, and the world's `level.dat` to its folder at `world`,
+    /// from now on, on the saver's thread (D189). Until this, and replaying, nothing is saved.
+    pub fn open_saving(mut self, players: own PlayerFiles, world: own String) {
+        match self.link.waker() {
+            ok(waker) => self.saving = some(Saving.start(players, world, waker)),
+            err(_) => self.logs.push(Entry.error("Can't save the world: there's nothing to wake the server's poll with")),
+        }
+    }
+
+    /// How many saves are handed to the saver whose lines the server hasn't taken: the server
+    /// isn't to end until there are none.
+    pub fn saves_away(self) -> usize {
+        if let s = self.saving {
+            return s.away()
+        }
+        return 0
     }
 
     /// Reads the overworld's chunks from the region files in `regions` from now on, as the
@@ -506,6 +559,11 @@ impl Network {
                 }
                 self.level_lines()
                 self.level.dispatch()
+            },
+            Input.Saved(lines) => {
+                for e in lines {
+                    self.logs.push(e.copy())
+                }
             },
             Input.Chunk(pos, io, bytes) => {
                 // What the workers made of what the IO thread read is made again here, from it.
@@ -612,17 +670,20 @@ impl Network {
         return n
     }
 
-    // What vanilla's `MinecraftServer.stopServer` does that Calcite has: it says so, then tells
-    // each player the server closed, as `PlayerList.removeAll` does, and closes their
-    // connections. Calcite saves nothing yet, so vanilla's lines for saving players and worlds
-    // aren't logged. Connections still logging in or being configured are left, as vanilla
-    // leaves them, to end with the process.
+    // What vanilla's `MinecraftServer.stopServer` does that Calcite has: it says so, saves each
+    // player, as `PlayerList.saveAll` does, then tells them the server closed, as `removeAll`
+    // does, and closes their connections; then it saves the world, the overworld, the one level
+    // Calcite has, and `level.dat`, with vanilla's lines. Connections still logging in or being
+    // configured are left, as vanilla leaves them, to end with the process. The server ends once
+    // the saver has written it all.
     fn stop(mut self) {
         if self.halted {
             return
         }
         self.halted = true
         self.logs.push(Entry.info(String("Stopping server")).calcite(Look.Words(String("Stopping"))))
+        self.logs.push(Entry.info(String("Saving players")).calcite(Look.Quiet))
+        self.save_players()
         for i in 0..self.connections.len() {
             if not self.playing(i) {
                 continue
@@ -632,7 +693,72 @@ impl Network {
             self.close(mut con)
             self.connections[i] = some(con)
         }
+        self.logs.push(Entry.info(String("Saving worlds")).calcite(Look.Words(String("Saving the world"))))
+        self.logs.push(Entry.info("Saving chunks for level 'ServerLevel[{self.level_name}]'/minecraft:overworld").calcite(Look.Quiet))
+        self.save_level()
         self.flush()
+    }
+
+    // An autosave, as `autoSave` saves: each player, then the world, logging nothing.
+    fn autosave(mut self) {
+        self.autosave_in = AUTOSAVE_TICKS
+        self.save_players()
+        self.save_level()
+    }
+
+    // Saves each player in the world, as `PlayerList.saveAll` does.
+    fn save_players(mut self) {
+        for i in 0..self.connections.len() {
+            if not self.playing(i) {
+                continue
+            }
+            let con = self.connections[i].take() else continue
+            self.save_player(con)
+            self.connections[i] = some(con)
+        }
+    }
+
+    // Saves the player's data, as `PlayerList.save` does: as it was read as they joined, or a
+    // new player's, with where they are now (D189).
+    fn save_player(mut self, con: Connection) {
+        let p = con.profile else return
+        var saving = self.saving.take() else return
+        saving.save(Save.Player(p.id, p.name.copy(), Tag.Compound(player_tag(con.player, p.id, self.world.settings.game_type))))
+        self.saving = some(saving)
+    }
+
+    // Saves `level.dat`, as `saveDataTag` does, with the game time and the wall clock's time now,
+    // if the world had one.
+    fn save_level(mut self) {
+        var saving = self.saving.take() else return
+        if let kept = self.level_data.take() {
+            var data = kept
+            data.time = self.world.game_time
+            saving.save(Save.Level(data.write(self.clock.unix_ms)))
+            self.level_data = some(data)
+        }
+        self.saving = some(saving)
+    }
+
+    // Takes in what the saver's saves logged, recording it as the server's loop hands it over.
+    fn saves_done(mut self) {
+        var saving = self.saving.take() else return
+        var done = saving.take_done()
+        self.saving = some(saving)
+        while let lines = done.pop_first() {
+            self.link.saved(lines)
+            for e in lines {
+                self.logs.push(e.copy())
+            }
+        }
+    }
+
+    // Waits for the saver to write what it's been handed, so a player's data is read once their
+    // last save is on the disk. What the saves logged is taken in later, as ever.
+    fn wait_saves(mut self) {
+        var saving = self.saving.take() else return
+        saving.wait()
+        self.saving = some(saving)
     }
 
     /// Replays the rest of the log, taking the logs after each input, and says what it found.
@@ -700,6 +826,7 @@ impl Network {
             Event.Woken => {
                 self.sent()
                 self.chunks_read()
+                self.saves_done()
                 self.flush()
                 return false
             },
@@ -757,6 +884,12 @@ impl Network {
         self.level.dispatch()
         if self.open() == 0 {
             self.session = none
+        }
+        // The autosave, as `tickServer` counts down to it after the tick, which a server that's
+        // stopped and saved has no more of.
+        self.autosave_in -= 1
+        if self.autosave_in <= 0 and not self.halted {
+            self.autosave()
         }
         self.flush()
     }
@@ -1426,6 +1559,7 @@ impl Network {
         var saved = SavedPosition { dimension: none, pos: none, rotation: none }
         if let data = self.player_data(con) {
             saved = saved_position(data)
+            con.prepare.data = some(data)
         }
         var y_rot = self.respawn.yaw
         var x_rot = self.respawn.pitch
@@ -1511,6 +1645,9 @@ impl Network {
         let profile = con.profile else return none
         var lines = List<Entry>()
         var found = FileRead.Absent
+        if self.players != none {
+            self.wait_saves()
+        }
         if let files = self.players {
             let now = self.clock.date_time(unsafe { self.clock.local_offset() })
             if let data = files.load(profile.id, profile.name, now, mut lines) {
@@ -1701,7 +1838,8 @@ impl Network {
                 x_rot = 90.0f32
             }
         }
-        con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam }
+        let saved_data = con.prepare.data.take()
+        con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam, data: saved_data }
         self.logs.push(Entry.info("{profile.name}[{con.address}] logged in with entity id {id} at ({con.player.x}, {con.player.y}, {con.player.z})").calcite(Look.Join(joined_words(profile.name, con.address))))
         let mode = self.world.settings.game_type
         let spawn = SpawnInfo { dimension_type: self.world.settings.dimension_type, dimension: overworld(), seed: self.world.settings.hashed_seed, game_type: mode, previous_game_type: PreviousGameType { mode: none }, is_debug: false, is_flat: true, last_death_location: none, portal_cooldown: 0, sea_level: -63 }
@@ -2483,6 +2621,11 @@ impl Network {
         self.settle()
         let message = Component.translatable("multiplayer.player.left", [display_name(p)]).colored("yellow")
         self.broadcast_system(message, Look.Quiet)
+        // Then they're saved, as `PlayerList.remove` saves them, unless the server's stopping,
+        // which saved them as it told them.
+        if not self.halted {
+            self.save_player(con)
+        }
         self.broadcast(encode_play(ClientboundPlayerInfoRemove { profile_ids: [p.id] }))
     }
 
@@ -2556,6 +2699,25 @@ impl Network {
 // The overworld, Calcite's one dimension so far.
 fn overworld() -> Identifier {
     return Identifier { namespace: "minecraft", path: "overworld" }
+}
+
+// The player's data as Calcite saves it: as it was read as they joined, with where they are
+// now, their `Pos`, `Rotation` and `Dimension`, or for a player new to the world, those with
+// their `UUID`, the game mode they play in and 26.3's `DataVersion`. Data older than 26.3's keeps
+// its version, since the rest of it is as old (D189).
+fn player_tag(player: Player, id: Uuid, mode: GameType) -> JavaHashMap<String, Tag> {
+    var data = JavaHashMap<String, Tag>()
+    if let kept = player.data {
+        data = kept.copy()
+    } else {
+        data.insert(String("DataVersion"), Tag.Int(DATA_VERSION))
+        data.insert(String("UUID"), Tag.IntArray(id.ints()))
+        data.insert(String("playerGameType"), Tag.Int(mode.id()))
+    }
+    data.insert(String("Pos"), Tag.List([Tag.double(player.x), Tag.double(player.y), Tag.double(player.z)]))
+    data.insert(String("Rotation"), Tag.List([Tag.float(player.y_rot), Tag.float(player.x_rot)]))
+    data.insert(String("Dimension"), Tag.Str(String("minecraft:overworld")))
+    return data
 }
 
 fn closed_tab() -> BookTab {

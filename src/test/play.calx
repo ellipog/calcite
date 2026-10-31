@@ -2,8 +2,9 @@
 /// is sent as they join, their chunks a batch at a time, their view following them, the
 /// teleport they're to accept before they move, what other players see as they come and go, and
 /// chat: messages to everyone, what's refused, spam, commands, which are all unknown so far, and
-/// signed chat, with chat sessions whose keys a test key signs where Mojang's would, and the
-/// console's commands, with `stop` and the console's request to stop. Each server
+/// signed chat, with chat sessions whose keys a test key signs where Mojang's would, the
+/// console's commands, with `stop` and the console's request to stop, and saving, as a player
+/// leaves, every 6000 ticks and as the server stops. Each server
 /// records what it's handed, and a server made the same way replays it at the end, sending and
 /// logging the same (D21).
 ///
@@ -19,7 +20,7 @@ import auth.services.{KeySet, Services}
 import chat.component.{ClickEvent, Component}
 import chat.language.{Language}
 import java.uuid.{Uuid}
-import nbt.tag.{Tag}
+import nbt.tag.{Accounter, Tag}
 import pack.resources.{KnownPack}
 import protocol.chat.{ArgumentSignature, ChatSession, ChatTypeBound, ClientboundPlayerChat, FilterMask, LastSeenUpdate, MessageSignature, PackedSignature, ServerboundChat, ServerboundChatAck, ServerboundChatCommand, ServerboundChatCommandSigned, ServerboundChatSessionUpdate, SignedBody}
 import protocol.codec.{Codec}
@@ -42,12 +43,12 @@ import server.play.{World, display_name}
 import server.status.{ServerStatus}
 import std.crypto.{RsaKey}
 import std.hash.{Algorithm}
-import std.fs.{append, make_dir_all, write}
+import std.fs.{append, is_file, make_dir_all, remove_dir_all, write}
 import std.net.{Net, Conn, Event}
 import std.time.{Timestamp}
-import storage.level.{Spawn}
+import storage.level.{LevelData, Spawn}
 import storage.players.{PlayerFiles}
-import storage.world.{write_compressed}
+import storage.world.{read_compressed, write_compressed}
 import world.pos.{BlockPos, ChunkPos}
 
 fn check(got: String, want: String) {
@@ -288,6 +289,23 @@ impl Rig {
         var replay = new_server(Link.replay(self.server.take_log())!, services, self.rate_limit, self.login_throttle, self.force_view)
         let report = replay.replay_all()
         assert(report.same(), "the replay differs: {report.to_string()}")
+    }
+
+    // As `replays`, for a server whose world's `level.dat` held `level`, named `name`, which its
+    // replay reads from its log as Calcite's does.
+    fn replays_level(mut self, level: JavaHashMap<String, Tag>, name: String) {
+        _ = self.server.take_logs()
+        var replay = new_server(Link.replay(self.server.take_log())!, Services.offline(), self.rate_limit, self.login_throttle, self.force_view)
+        replay.set_level(some(LevelData.parse(level)), name.copy(), String("calcite"))
+        let report = replay.replay_all()
+        assert(report.same(), "the replay differs: {report.to_string()}")
+    }
+
+    // Settles until the saver's written all it was handed and the server's taken what it logged.
+    fn saved(mut self) {
+        while self.server.saves_away() > 0 {
+            self.settle()
+        }
     }
 
     // The server's log since the last call.
@@ -1161,7 +1179,7 @@ fn stopping() {
     }
     // Each player's lines come as their connection closes, in whichever order they close.
     let log = rig.logs()
-    let start = "commands.stop.stopping|Stopping server|"
+    let start = "commands.stop.stopping|Stopping server|Saving players|Saving worlds|Saving chunks for level 'ServerLevel[world]'/minecraft:overworld|"
     let gone = "Steve lost connection: multiplayer.disconnect.server_shutdown|System chat: Steve left the game|"
     let also_gone = "Alex lost connection: multiplayer.disconnect.server_shutdown|System chat: Alex left the game|"
     assert(log.starts_with(start), "the log as the server stopped: {log}")
@@ -1177,7 +1195,7 @@ fn stopping() {
     halted.server.halt()
     halted.settle()
     check(halted.next(player).name, "disconnect")
-    check(halted.logs(), "Stopping server|Steve lost connection: multiplayer.disconnect.server_shutdown|System chat: Steve left the game|")
+    check(halted.logs(), "Stopping server|Saving players|Saving worlds|Saving chunks for level 'ServerLevel[world]'/minecraft:overworld|Steve lost connection: multiplayer.disconnect.server_shutdown|System chat: Steve left the game|")
     halted.replays(Services.offline())
     println("ok stopping")
 }
@@ -1252,6 +1270,145 @@ fn spawning() {
     println("ok spawning")
 }
 
+// A gzipped NBT file's compound.
+fn read_nbt(path: String) -> JavaHashMap<String, Tag> {
+    var accounter = Accounter.unlimited()
+    return read_compressed(path, mut accounter)!
+}
+
+// The strings a list tag holds, each followed by a comma.
+fn strings_of(tag: Tag) -> String {
+    var out = String()
+    match tag {
+        Tag.List(items) => {
+            for item in items {
+                match item {
+                    Tag.Str(s) => out.push_str("{s},"),
+                    _ => out.push_str("?,"),
+                }
+            }
+        },
+        _ => out.push_str("not a list"),
+    }
+    return out
+}
+
+// What `level.dat` at `path` says of the level: its name, time, brands and whether it was
+// modded.
+fn level_said(path: String) -> String {
+    let root = read_nbt(path)
+    let data = match root["Data"] {
+        Tag.Compound(d) => d.copy(),
+        _ => panic("{path} has no Data"),
+    }
+    let name = match data["LevelName"] {
+        Tag.Str(s) => s.copy(),
+        _ => String("?"),
+    }
+    let time = data["Time"].long_value() ?? -1
+    let modded = data["WasModded"].byte_value() ?? -1
+    return "{name} {time} {strings_of(data["ServerBrands"])} {modded}"
+}
+
+// What's saved: a player's data as they leave, where they were, which they join again at, even
+// with the save still being written; then `level.dat` every 6000 ticks, and each player and
+// `level.dat` as the server stops, with vanilla's lines, the game time going on from the one the
+// world saved, and the server's brand added. A save that can't be written logs vanilla's line,
+// which comes back through the server's poll, and is replayed as it came.
+fn saving() {
+    let root = String("build/test/save")
+    match remove_dir_all(root) {
+        ok => {},
+        err(_) => {},
+    }
+    let world = "{root}/world"
+    let folder = "{world}/players/data"
+    make_dir_all(folder)!
+    var level = JavaHashMap<String, Tag>()
+    level.insert(String("LevelName"), Tag.Str(String("Saved")))
+    level.insert(String("Time"), Tag.Long(1000))
+    level.insert(String("ServerBrands"), Tag.List([Tag.Str(String("vanilla"))]))
+    var rig = new_rig()
+    rig.server.set_spawn(flat_spawn(), 0, some(PlayerFiles { folder: folder.copy() }))
+    rig.server.set_level(some(LevelData.parse(level)), String("Saved"), String("calcite"))
+    rig.server.open_saving(PlayerFiles { folder: folder.copy() }, world.copy())
+    let steve = rig.join("Steve")
+    rig.clients[steve].drain()
+    rig.send(steve, play(ServerboundAcceptTeleportation { teleport_id: 1, x: 0.5, y: -60.0, z: 0.5, y_rot: 0.0, x_rot: 0.0 }))
+    rig.send(steve, play(ServerboundMovePlayerPos { x: 3.5, y: -60.0, z: 0.5, flags: ON_GROUND }))
+    rig.tick(50)
+    _ = rig.logs()
+    let conn = rig.clients[steve].conn
+    rig.net.close(conn)
+    rig.settle()
+    check(rig.logs(), "Steve lost connection: disconnect.endOfStream|System chat: Steve left the game|")
+    let again = rig.join("Steve")
+    let place = logged_place(rig.logs())
+    check("{place[0]} {place[1]} {place[2]}", "3.5 -60.0 0.5")
+    rig.clients[again].drain()
+    let back = rig.clients[again].conn
+    rig.net.close(back)
+    rig.settle()
+    rig.saved()
+    _ = rig.logs()
+    let id = GameProfile.offline("Steve").id
+    let data = read_nbt("{folder}/{id.to_string()}.dat")
+    let pos = data["Pos"].doubles() ?? List<f64>()
+    check("{pos[0]} {pos[1]} {pos[2]}", "3.5 -60.0 0.5")
+    let uuid = data["UUID"].int_stream() ?? List<i32>()
+    check_int(i64.wrap(uuid.len()), 4)
+    check(Uuid.from_ints(uuid).to_string(), id.to_string())
+    check_int(i64(data["playerGameType"].int_value() ?? -1), 0)
+    check_int(i64(data["DataVersion"].int_value() ?? -1), i64(DATA_VERSION))
+    let rotation = data["Rotation"].floats() ?? List<f32>()
+    check_int(i64.wrap(rotation.len()), 2)
+    match data["Dimension"] {
+        Tag.Str(s) => check(s, "minecraft:overworld"),
+        _ => panic("no Dimension"),
+    }
+    assert(not is_file("{world}/level.dat"), "level.dat was saved before the server stopped or 6000 ticks went by")
+
+    // The 6000th tick saves the world, though no one's on, without a line. Five went by as Steve
+    // came and went.
+    for _ in 0..5995 {
+        rig.now += 50000000
+        rig.server.tick(rig.now)
+    }
+    rig.settle()
+    rig.saved()
+    check(rig.logs(), "")
+    check(level_said("{world}/level.dat"), "Saved 7000 vanilla,calcite, 1")
+    rig.tick(50)
+    rig.tick(50)
+    rig.server.command("stop")
+    rig.settle()
+    rig.saved()
+    check(rig.logs(), "commands.stop.stopping|Stopping server|Saving players|Saving worlds|Saving chunks for level 'ServerLevel[Saved]'/minecraft:overworld|")
+    check(level_said("{world}/level.dat"), "Saved 7002 vanilla,calcite, 1")
+    check(level_said("{world}/level.dat_old"), "Saved 7000 vanilla,calcite, 1")
+    rig.replays_level(level, String("Saved"))
+
+    // Where the files can't be written, each save logs vanilla's line.
+    let gone = "{root}/gone"
+    var broken = new_rig()
+    broken.server.set_level(some(LevelData.parse(level)), String("Saved"), String("calcite"))
+    broken.server.open_saving(PlayerFiles { folder: "{gone}/players/data" }, gone.copy())
+    let alex = broken.join("Alex")
+    broken.clients[alex].drain()
+    _ = broken.logs()
+    let alex_conn = broken.clients[alex].conn
+    broken.net.close(alex_conn)
+    broken.settle()
+    broken.saved()
+    check(broken.logs(), "Alex lost connection: disconnect.endOfStream|System chat: Alex left the game|Failed to save player data for Alex|")
+    broken.server.halt()
+    broken.settle()
+    broken.saved()
+    check(broken.logs(), "Stopping server|Saving players|Saving worlds|Saving chunks for level 'ServerLevel[Saved]'/minecraft:overworld|Failed to save level {gone}|")
+    broken.replays_level(level, String("Saved"))
+    println("ok saving")
+}
+
 fn main() {
     make_dir_all("build/packets")!
     write(capture_path(), [])!
@@ -1270,5 +1427,6 @@ fn main() {
     throttled_logins()
     stopping()
     spawning()
+    saving()
     println("ok")
 }
