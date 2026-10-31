@@ -14,6 +14,8 @@ IDs the protocol needs, which every compatible server encodes:
   block_flags.json, which oracle/datagen/block_flags.py writes beside the tables (D164).
 - `world.light_faces`: the faces light sees of each block state, and which two faces light
   can't pass between, from the same file (CAL-66).
+- `world.collision_shapes`: each block state's collision shape, as the spawn finder sees it, and
+  the boxes of each, from the same file (CAL-75).
 """
 
 import argparse
@@ -282,6 +284,9 @@ FLAGS = [
     ("CAN_OCCLUDE", 1 << 6, "`canOcclude`"),
     ("SOLID_RENDER", 1 << 7, "`isSolidRender`: a full, opaque cube"),
     ("BLOCK_ENTITY", 1 << 8, "`hasBlockEntity`"),
+    ("COLLISION_TOP_FULL", 1 << 9, "`Block.isFaceFull` of its collision shape on `UP`: something can stand on all of its top"),
+    ("LARGE_COLLISION", 1 << 10, "`hasLargeCollisionShape`: its collision shape reaches out of its block, or changes with where it is"),
+    ("OFFSET", 1 << 11, "`hasOffsetFunction`: its shapes are moved in its block by where it is, as bamboo's"),
 ]
 LOW_MASK = (1 << 12) - 1
 LIGHT_EMISSION_SHIFT = 12
@@ -303,7 +308,7 @@ def block_flags_module(index, flags):
         raise ValueError(f"block_flags.json has {len(values)} flags for {flags['states']} states")
     known = sum(bit for _, bit, _ in FLAGS)
     for state, v in enumerate(values):
-        if v & LOW_MASK & ~known or v >> 24:
+        if v & LOW_MASK & ~known or v >> 20:
             raise ValueError(f"state {state}'s flags {v:#x} have bits this script doesn't know")
     counts = {}
     for v in values:
@@ -461,6 +466,135 @@ def light_faces_module(index, flags):
     return "\n".join(lines)
 
 
+# How a collision shape's boxes are stored: each coordinate in 32nds of a block, which every one
+# of vanilla's is, from BOX_FLOOR up, so they fit a byte.
+BOX_UNIT = 32
+BOX_FLOOR = -16
+
+
+def collision_module(index, flags):
+    """The text of src/world/collision_shapes.calx."""
+    shapes = flags["collision"]
+    boxes = flags["collision_boxes"]
+    if len(shapes) != flags["states"]:
+        raise ValueError(f"block_flags.json has {len(shapes)} states' collision shapes for {flags['states']} states")
+    if not all(0 <= s < len(boxes) for s in shapes):
+        raise ValueError("a state's collision shape isn't one of the table's")
+    if boxes[0] != [] or boxes[1] != [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]:
+        raise ValueError("collision shape 0 isn't empty, or 1 isn't the whole block")
+    coords = []
+    starts = []
+    for shape in boxes:
+        starts.append(len(coords) // 6)
+        for box in shape:
+            if len(box) != 6:
+                raise ValueError(f"a box of {len(box)} numbers")
+            for c in box:
+                v = c * BOX_UNIT
+                if v != round(v) or not 0 <= round(v) - BOX_FLOOR < 256:
+                    raise ValueError(f"the coordinate {c} isn't a 32nd of a block from {BOX_FLOOR / BOX_UNIT} to {(255 + BOX_FLOOR) / BOX_UNIT}")
+                coords.append(round(v) - BOX_FLOOR)
+    starts.append(len(coords) // 6)
+    # Each state's shape as a character of `alphabet`, the commonest shapes first, or a pair for
+    # the rest, from the last `pairs` characters.
+    counts = {}
+    for s in shapes:
+        counts[s] = counts.get(s, 0) + 1
+    palette = sorted(counts, key=lambda s: (-counts[s], s))
+    pairs = 1
+    while len(ALPHABET) - pairs + pairs * len(ALPHABET) < len(palette):
+        pairs += 1
+    single = len(ALPHABET) - pairs
+    where = {s: i for i, s in enumerate(palette)}
+    text = []
+    for s in shapes:
+        i = where[s]
+        if i < single:
+            text.append(ALPHABET[i])
+        else:
+            i -= single
+            text.append(ALPHABET[single + i // len(ALPHABET)] + ALPHABET[i % len(ALPHABET)])
+    chunks = [""]
+    for c in text:
+        if len(chunks[-1]) + len(c) > LINE:
+            chunks.append("")
+        chunks[-1] += c
+
+    def numbers(values, per=24):
+        rows = [", ".join(str(v) for v in values[i:i + per]) for i in range(0, len(values), per)]
+        return ",\n".join(f"        {r}" for r in rows)
+
+    lines = [
+        f"/// Each of vanilla {index['game_version']}'s block states' collision shapes, as the spawn finder sees them:",
+        "/// `getCollisionShape` with an empty context that collides with fluids, so a liquid is a whole",
+        "/// block. A state vanilla offsets by its position, as bamboo, has the shape it has before it's",
+        "/// offset. Written by oracle/datagen/calx_tables.py from block_flags.json (CAL-75): don't edit it.",
+        "///",
+        "/// The shapes are numbered, 0 the empty one and 1 the whole block, and each is a list of boxes,",
+        "/// as `toAabbs` gives them.",
+        "module world.collision_shapes",
+        "",
+        "/// How many 32nds of a block a box's coordinate is from, and above, `BOX_FLOOR`.",
+        f"pub const BOX_UNIT: i32 = {BOX_UNIT}",
+        f"pub const BOX_FLOOR: i32 = {BOX_FLOOR}",
+        "/// How many different shapes there are.",
+        f"pub const SHAPES: u32 = {len(boxes)}",
+        "",
+        "/// Each state's shape, in state ID order.",
+        "pub fn state_shapes() -> List<u16> {",
+        f"    // The shapes, the commonest first, and an index into them for each state, a character",
+        f"    // each, from `alphabet`, or for the {len(palette) - single} rarest a pair, whose first is one of its last {pairs}.",
+        f"    let values: List<u16> = [{', '.join(str(v) for v in palette)}]",
+        "    let lines: List<String> = [",
+    ]
+    lines += [f'        "{c}",' for c in chunks]
+    lines += [
+        "    ]",
+        f'    let alphabet = "{ALPHABET}"',
+        "    var digit: List<u32> = []",
+        "    for _ in 0..128 {",
+        "        digit.push(0)",
+        "    }",
+        "    for i in 0..alphabet.len() {",
+        "        digit[usize(alphabet.byte_at(i))] = u32.wrap(i)",
+        "    }",
+        "    var shapes: List<u16> = []",
+        f"    shapes.reserve({len(shapes)})",
+        "    for line in lines {",
+        "        var i: usize = 0",
+        "        while i < line.len() {",
+        "            let d = digit[usize(line.byte_at(i))]",
+        f"            if d >= {single} {{",
+        f"                shapes.push(values[usize({single} + (d - {single}) * {len(ALPHABET)} + digit[usize(line.byte_at(i + 1))])])",
+        "                i += 2",
+        "            } else {",
+        "                shapes.push(values[usize(d)])",
+        "                i += 1",
+        "            }",
+        "        }",
+        "    }",
+        "    return shapes",
+        "}",
+        "",
+        "/// Where each shape's boxes start in `shape_boxes`, counted in boxes, and where the last ends.",
+        "pub fn shape_starts() -> List<u16> {",
+        "    return [",
+        numbers(starts),
+        "    ]",
+        "}",
+        "",
+        "/// Every shape's boxes, six coordinates each, min x, y, z then max x, y, z, in `BOX_UNIT`s",
+        "/// above `BOX_FLOOR`.",
+        "pub fn shape_boxes() -> List<u8> {",
+        "    return [",
+        numbers(coords),
+        "    ]",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def outputs(tables, version=VERSION):
     index = json.loads((tables / "index.json").read_text(encoding="utf-8"))
     packets = json.loads((tables / "packets.json").read_text(encoding="utf-8"))
@@ -475,6 +609,7 @@ def outputs(tables, version=VERSION):
         CALCITE / "src" / "world" / "blocks.calx": blocks_module(index, blocks),
         CALCITE / "src" / "world" / "block_flags.calx": block_flags_module(index, flags),
         CALCITE / "src" / "world" / "light_faces.calx": light_faces_module(index, flags),
+        CALCITE / "src" / "world" / "collision_shapes.calx": collision_module(index, flags),
     }
 
 

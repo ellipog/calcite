@@ -34,6 +34,7 @@ CALCITE = HERE.parents[1]
 sys.path.insert(0, str(CALCITE / "rig" / "calcite-adapter"))
 sys.path.insert(0, str(HERE))
 from launch import find_calx  # noqa: E402
+import nbt  # noqa: E402
 import sessiondiff  # noqa: E402
 
 PLATFORM = "windows" if os.name == "nt" else "linux"
@@ -71,6 +72,8 @@ class Config:
     world: Path | None = None
     # Typed into vanilla's console after VANILLA_COMMANDS, with what it answers.
     commands: tuple = ()
+    # Where the copy of `world` has its spawn, both servers' level.dat's, if it's moved.
+    spawn: tuple | None = None
 
 
 CONFIGS = {
@@ -78,18 +81,20 @@ CONFIGS = {
     "uncompressed": Config({"network-compression-threshold": "-1"}),
     # A saved world, whose chunks both servers read and light (CAL-76). A view of 3 sends the
     # chunks from -4 to 4, which vanilla lights with their neighbours, all of them full in the
-    # save. Calcite's player joins at (0.5, -60, 0.5), and vanilla's on the spawn when its radius
-    # is 0, so the spawn is moved to the origin and both are in chunk (0, 0).
-    "saved": Config({}, view=3, scenarios=("join",), world=SAVED_WORLD,
-                    commands=(("setworldspawn 0 100 0", "Set the world spawn point"),)),
+    # save. Its spawn is moved to the origin, so the player is in chunk (0, 0), on the ground
+    # there, as each server finds it (CAL-75).
+    "saved": Config({}, view=3, scenarios=("join",), world=SAVED_WORLD, spawn=(0, 100, 0)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
 BOT = "Bot"
 # Typed into vanilla's console once it's up, with what it answers. A player joins at a random
-# place within `respawn_radius` of the spawn, drawn from a thread-local random, which Calcite
-# doesn't do yet.
+# place within `respawn_radius` of the spawn, drawn from a thread-local random, which can't be
+# the same on both servers, so it's 0: on the spawn, or the ground there. Calcite reads it from
+# the world's game rules, which `prepare` writes (CAL-75).
 VANILLA_COMMANDS = [("gamerule respawn_radius 0", "respawn_radius")]
+# The data version both servers save, which a game rules file the rig writes is in.
+DATA_VERSION = 5023
 
 
 def offline_uuid(name):
@@ -139,6 +144,17 @@ def prepare(folder, config, port, vanilla):
         # Without the lock, which vanilla held, and the players' data, so neither server's
         # player starts where the round trip's bot was.
         shutil.copytree(c.world, folder / "world", ignore=lambda at, names: [n for n in names if n in ("session.lock", "players") and Path(at) == c.world])
+        if c.spawn is not None:
+            level = nbt.read(folder / "world" / "level.dat")
+            level["Data"]["spawn"]["pos"] = nbt.IntArray(c.spawn)
+            nbt.write(folder / "world" / "level.dat", level)
+    rules = folder / "world" / "data" / "minecraft" / "game_rules.dat"
+    if rules.is_file():
+        saved = nbt.read(rules)
+        saved["data"]["minecraft:respawn_radius"] = nbt.Int(0)
+        nbt.write(rules, saved)
+    elif not vanilla:
+        nbt.write(rules, {"data": {"minecraft:respawn_radius": nbt.Int(0)}, "DataVersion": nbt.Int(DATA_VERSION)})
     (folder / "server.properties").write_text("".join(f"{k}={v}\n" for k, v in props.items()), encoding="utf-8")
     listed = [{"uuid": offline_uuid(BOT), "name": BOT}]
     (folder / "whitelist.json").write_text(json.dumps(listed, indent=2) + "\n", encoding="utf-8")

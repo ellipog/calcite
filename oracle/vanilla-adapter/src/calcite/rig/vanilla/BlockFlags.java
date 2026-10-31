@@ -9,13 +9,17 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import net.minecraft.SharedConstants;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.Vec3;
+import net.minecraft.world.phys.shapes.CollisionContext;
 import net.minecraft.world.phys.shapes.Shapes;
 import net.minecraft.world.phys.shapes.VoxelShape;
 
@@ -28,6 +32,14 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  * LightEngine.getOcclusionShape} gives on each of its six sides, as a number for each different
  * shape, and for each two shapes whether {@code Shapes.faceShapeOccludes} says light can't pass
  * between them. Shape 0 is empty and shape 1 the full face.
+ *
+ * <p>And each state's collision shape, as {@code PlayerSpawnFinder} sees it: {@code
+ * getCollisionShape} with an empty context that collides with fluids, so a liquid is a whole
+ * block, numbered as the faces are, with the boxes of each shape. A state whose shape vanilla
+ * offsets by its position, as bamboo's, gets the shape it has before it's offset, and the flag
+ * {@code OFFSET}. {@code COLLISION_TOP_FULL} is whether the shape with an empty context covers
+ * its block's top, {@code Block.isFaceFull} on {@code UP}, and {@code LARGE_COLLISION} is {@code
+ * hasLargeCollisionShape}, whether it reaches out of its block or changes with where it is.
  *
  * <p>Every value is fixed when the states are made, before any data pack loads, so the table is
  * the same for every world.
@@ -42,6 +54,9 @@ final class BlockFlags {
     static final int CAN_OCCLUDE = 1 << 6;
     static final int SOLID_RENDER = 1 << 7;
     static final int BLOCK_ENTITY = 1 << 8;
+    static final int COLLISION_TOP_FULL = 1 << 9;
+    static final int LARGE_COLLISION = 1 << 10;
+    static final int OFFSET = 1 << 11;
     static final int LIGHT_EMISSION_SHIFT = 12;
     static final int LIGHT_DAMPENING_SHIFT = 16;
 
@@ -55,8 +70,10 @@ final class BlockFlags {
         Bootstrap.bootStrap();
         int count = Block.BLOCK_STATE_REGISTRY.size();
         Faces faces = new Faces();
+        Faces collisions = new Faces();
         StringBuilder json = new StringBuilder();
         StringBuilder light = new StringBuilder();
+        StringBuilder collision = new StringBuilder();
         json.append("{\n  \"game_version\": \"").append(SharedConstants.getCurrentVersion().name()).append("\",\n");
         json.append("  \"states\": ").append(count).append(",\n  \"flags\": [");
         for (int id = 0; id < count; id++) {
@@ -70,20 +87,15 @@ final class BlockFlags {
                 light.append(direction.ordinal() == 0 ? "" : ", ").append(faces.id(LightEngine.getOcclusionShape(state, direction)));
             }
             light.append("]");
+            collision.append(id == 0 ? "" : ", ").append(collisions.id(collisionShape(state)));
         }
         json.append("],\n  \"light_faces\": [").append(light).append("],\n");
-        json.append("  \"face_boxes\": [");
-        for (int i = 0; i < faces.shapes.size(); i++) {
-            json.append(i == 0 ? "[" : ", [");
-            List<AABB> boxes = faces.shapes.get(i).toAabbs();
-            for (int b = 0; b < boxes.size(); b++) {
-                AABB box = boxes.get(b);
-                json.append(b == 0 ? "[" : ", [").append(box.minX).append(", ").append(box.minY).append(", ").append(box.minZ)
-                        .append(", ").append(box.maxX).append(", ").append(box.maxY).append(", ").append(box.maxZ).append("]");
-            }
-            json.append("]");
-        }
-        json.append("],\n  \"face_occludes\": [");
+        json.append("  \"face_boxes\": ");
+        boxes(json, faces);
+        json.append(",\n  \"collision\": [").append(collision).append("],\n");
+        json.append("  \"collision_boxes\": ");
+        boxes(json, collisions);
+        json.append(",\n  \"face_occludes\": [");
         for (int i = 0; i < faces.shapes.size(); i++) {
             json.append(i == 0 ? "[" : ", [");
             for (int j = 0; j < faces.shapes.size(); j++) {
@@ -94,7 +106,34 @@ final class BlockFlags {
         }
         json.append("]\n}\n");
         Files.writeString(Path.of(args[0]), json, StandardCharsets.UTF_8);
-        System.err.println("BlockFlags: wrote " + count + " states and " + faces.shapes.size() + " face shapes to " + args[0]);
+        System.err.println("BlockFlags: wrote " + count + " states, " + faces.shapes.size() + " face shapes and "
+                + collisions.shapes.size() + " collision shapes to " + args[0]);
+    }
+
+    /** Each shape's boxes, as a list of lists of six numbers. */
+    private static void boxes(StringBuilder json, Faces shapes) {
+        json.append("[");
+        for (int i = 0; i < shapes.shapes.size(); i++) {
+            json.append(i == 0 ? "[" : ", [");
+            List<AABB> boxes = shapes.shapes.get(i).toAabbs();
+            for (int b = 0; b < boxes.size(); b++) {
+                AABB box = boxes.get(b);
+                json.append(b == 0 ? "[" : ", [").append(box.minX).append(", ").append(box.minY).append(", ").append(box.minZ)
+                        .append(", ").append(box.maxX).append(", ").append(box.maxY).append(", ").append(box.maxZ).append("]");
+            }
+            json.append("]");
+        }
+        json.append("]");
+    }
+
+    /** The state's collision shape with fluids, before vanilla offsets it by its position. */
+    private static VoxelShape collisionShape(BlockState state) {
+        VoxelShape shape = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, CollisionContext.emptyWithFluidCollisions());
+        if (!state.hasOffsetFunction()) {
+            return shape;
+        }
+        Vec3 offset = state.getOffset(BlockPos.ZERO);
+        return shape.move(-offset.x, -offset.y, -offset.z);
     }
 
     private static int flags(BlockState state) {
@@ -109,6 +148,9 @@ final class BlockFlags {
         f |= state.canOcclude() ? CAN_OCCLUDE : 0;
         f |= state.isSolidRender() ? SOLID_RENDER : 0;
         f |= state.hasBlockEntity() ? BLOCK_ENTITY : 0;
+        f |= Block.isFaceFull(state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO), Direction.UP) ? COLLISION_TOP_FULL : 0;
+        f |= state.hasLargeCollisionShape() ? LARGE_COLLISION : 0;
+        f |= state.hasOffsetFunction() ? OFFSET : 0;
         f |= state.getLightEmission() << LIGHT_EMISSION_SHIFT;
         f |= state.getLightDampening() << LIGHT_DAMPENING_SHIFT;
         return f;

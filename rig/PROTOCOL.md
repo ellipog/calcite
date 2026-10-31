@@ -562,6 +562,26 @@ The result is one blob, each operation's result after the last's.
 
 Blobs, a `min_y`, `sections` or `sky` it doesn't take, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, an argument that isn't an `int` where one is wanted or is out of its range, a seed that isn't a decimal `long`, a state that isn't one, an empty list of states, and a block in a chunk that isn't there are an `error` status.
 
+### `spawn` (v1)
+
+Where a player new to the world joins it, as vanilla's own `PlayerSpawnFinder` finds the place, over chunks the case makes, through a list of operations.
+
+Input `{"ops": [...]}`, with no blobs. The chunks are `LevelChunk`s of the overworld's height, from −64 to 319, in a stand-in for the overworld's `ServerLevel` made without its constructor: its chunk source has every chunk the case made full and notes each ticket a search adds, which must be a `spawn_search` ticket of radius 0 for a chunk the case made, and its server runs each task handed to it in turn, as its thread would once the ticket's chunk is full. No entity collides, and the world border is the default one. A block is set as `LevelChunk.setBlockState` sets it in its section and the chunk's heightmaps, with nothing else told: nothing for air in a section of only air or for the state it had. A state is a block state's ID. A seed is a `long` as a decimal string, for the probe's LCG: `x = x * 6364136223846793005 + 1442695040888963407`, each draw `(int) (x >>> 33)`. A chunk's `x` and `z` are from −1000 to 1000, and a block's from −16000 to 16015.
+
+The result is one blob, each operation's result after the last's. A place is `Vec3.atBottomCenterOf` a block, three `double`s, `x`, `y` and `z`.
+
+| Operation | Result |
+| --- | --- |
+| `["chunk", x, z]` | nothing: an empty chunk there, which mustn't be there already |
+| `["fill", x0, y0, z0, x1, y1, z1, state]` | nothing: every block from one corner to the other set, `y`, then `x`, then `z`, at most 256 blocks across, in chunks that are there |
+| `["random", seed, count, [state, ...], x0, y0, z0, x1, y1, z1]` | nothing: `count` blocks, each at `x0 + draw % (x1 − x0 + 1)` and the same for `y` and `z`, then a state from the list at `draw % length` |
+| `["respawn", x, z]` | `getLevelRespawnPos` of the column, in a chunk that's there: a byte 0 for `null`, or 1 and the block's `x`, `y` and `z` as `int`s |
+| `["fits", x, y, z]` | a byte for `noCollisionNoLiquid` at the block, `y` up to 64 past the world each way |
+| `["fixup", x, y, z]` | the place `fixupSpawnHeight` moves the block to, as an adventure world's spawn, `y` up to 64 past the world each way |
+| `["search", x, y, z, radius, offset]` | a whole search around the block, `PlayerSpawnFinder`'s private constructor with `radius`, from 0 to 64, its random `offset` replaced by the case's, from 0 to one less than its candidates, then `scheduleNext` and every task it hands the server: an `int` count of the tickets it added, each chunk's `x` and `z` as `int`s, then the place it found |
+
+Blobs, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, an argument that isn't an `int` where one is wanted or is out of its range, a seed that isn't a decimal `long`, a state that isn't one, an empty list of states, a block in a chunk that isn't there, and a search with a candidate in one are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

@@ -13,6 +13,7 @@ import auth.velocity.{channel, request, read}
 import chat.component.{ClickEvent, Component}
 import chat.language.{Language}
 import java.uuid.{Uuid}
+import nbt.tag.{Tag}
 import protocol.chat.{ChatSession, ChatTypeBound, ClientboundPlayerChat, FilterMask, MessageSignature, PackedSignature, ServerboundChat, ServerboundChatCommandSigned, SignedBody}
 import protocol.codec.{Decoder}
 import protocol.common.{ChatVisibility, ClientInformation, ClientboundDisconnect, ClientboundKeepAlive, ClientboundPostEffects, ClientboundResourcePackPush, ResourcePackAction, ServerboundKeepAlive}
@@ -25,6 +26,7 @@ import protocol.play.{Abilities, BookRecipes, BookTab, ClientboundChangeDifficul
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
+import random.legacy.{LegacyRandom}
 import resources.identifier.{Identifier}
 import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
@@ -32,7 +34,7 @@ import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
 import server.configuration.{Configuration}
 import server.level.{Level, SPAWN_RADIUS}
-import server.link.{Input, Link, Report}
+import server.link.{FileRead, Input, Link, Report}
 import server.log.{Entry, Look}
 import server.sending.{Outbox, Sending}
 import server.status.{ServerStatus}
@@ -40,10 +42,14 @@ import server.play.{World, display_name}
 import std.crypto.{RsaKey, RsaPublicKey}
 import std.net.{Conn, Event, NetError, Address, Ip}
 import std.time.{Timestamp}
-import world.flat.{SURFACE_Y}
+import storage.level.{Spawn}
+import storage.players.{PlayerFiles, SavedPosition, saved_position}
+import world.collision.{CollisionStates}
+import world.flat.{MIN_Y, SECTIONS, SURFACE_Y}
 import world.item.{ItemStack}
 import world.modes.{GameType, PreviousGameType}
 import world.pos.{BlockPos, ChunkPos}
+import world.spawn.{Candidate, DEFAULT_RESPAWN_RADIUS, SpawnSearch, border_distance, candidate_count, fits, fixup_height, search_radius}
 
 /// How long a connection may send nothing before it's closed, as vanilla's
 /// `ReadTimeoutHandler(30)`.
@@ -207,11 +213,45 @@ struct Connection {
     ticks: i32 = 0
     received: i32 = 0
     average_received: f32 = 0.0
-    // Whether the spawn task has added its ticket, and whether the chunks around the spawn are
-    // full, after which each configuration tick adds the ticket again, as vanilla's
-    // `PrepareSpawnTask` goes from `Preparing` to `Ready`.
-    spawning: bool = false
-    spawn_ready: bool = false
+    // Where the player joins, as the spawn task works it out.
+    prepare: Prepare = Prepare()
+}
+
+// Where a joining player goes, as vanilla's `PrepareSpawnTask` works it out: the search for the
+// place, until it's found, then the place, the spawn ticket added around it, and the chunks there
+// full, after which each configuration tick adds the ticket again, as the task goes from
+// `Preparing` to `Ready`.
+struct Prepare {
+    // The search, and the candidate whose chunk is loading to be checked.
+    search: SpawnSearch? = none
+    candidate: Candidate? = none
+    // Whether the place is found, and the place and the angle the player faces.
+    found: bool = false
+    x: f64 = 0.0
+    y: f64 = 0.0
+    z: f64 = 0.0
+    y_rot: f32 = 0.0
+    x_rot: f32 = 0.0
+    // Whether the spawn ticket's been added, and whether the chunks around the place are full.
+    ticketed: bool = false
+    ready: bool = false
+}
+
+impl Prepare {
+    // The place is `x`, `y`, `z`.
+    fn place(mut self, x: f64, y: f64, z: f64) {
+        self.found = true
+        self.x = x
+        self.y = y
+        self.z = z
+        self.search = none
+        self.candidate = none
+    }
+
+    // The chunk the place is in, `ChunkPos.containing(BlockPos.containing(pos))`.
+    fn chunk(self) -> ChunkPos {
+        return ChunkPos.containing(self.x, self.z)
+    }
 }
 
 // A player in the world, as their `ServerPlayer` and its listener hold them.
@@ -316,6 +356,13 @@ pub struct Network {
     access: Access
     // The server is stopping: its players have been told, and it ticks no more.
     halted: bool
+    // Where players new to the world spawn, the world's `level.dat`'s, and how far around it,
+    // `respawn_radius`; the world's player files, which a replay hasn't; and what collisions see
+    // of each block state, made for the first search.
+    respawn: Spawn
+    respawn_radius: i32 = DEFAULT_RESPAWN_RADIUS
+    players: PlayerFiles? = none
+    collisions: CollisionStates? = none
 }
 
 /// A queue that already holds `key`, for a network whose key pair is made before it starts.
@@ -334,10 +381,23 @@ impl Network {
     pub fn new(link: own Link, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, keys: own Receiver<RsaKey>, configuration: own Configuration, world: own World) -> Network {
         // The tickets reach the view distance, as `setServerViewDistance` has them. Vanilla
         // keeps it from 2 to 32, and Calcite doesn't yet (CAL-58); past 32 is the same as 32.
-        let level = Level.new(world.settings.chunk_radius(), world.settings.simulation_distance)
-        var network = Network { link: link, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, level: level, spiral: Spiral(), entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>(), sending: Sending.new(), to_flush: List<Conn>(), last_logins: Map<String, u64>(), access: Access.empty(false), halted: false }
+        var level = Level.new(world.settings.chunk_radius(), world.settings.simulation_distance)
+        if let flat = world.flat.take_chunk() {
+            level.ground(flat)
+        }
+        var network = Network { link: link, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, level: level, spiral: Spiral(), entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>(), sending: Sending.new(), to_flush: List<Conn>(), last_logins: Map<String, u64>(), access: Access.empty(false), halted: false, respawn: Spawn { dimension: overworld(), pos: BlockPos { x: 0, y: SURFACE_Y, z: 0 }, yaw: 0.0f32, pitch: 0.0f32 } }
         network.rebuild_status()
         return network
+    }
+
+    /// Sets where players new to the world spawn, `respawn`, as `level.dat` has it, and how far
+    /// around it, `respawn_radius`, as the world's game rules have it, and the player files their
+    /// saved places are read from, which a replay hasn't. Until it's set, players spawn at the
+    /// flat world's 0, 0, 10 around, as in a world that's new.
+    pub fn set_spawn(mut self, respawn: own Spawn, respawn_radius: i32, players: own PlayerFiles?) {
+        self.respawn = respawn
+        self.respawn_radius = respawn_radius
+        self.players = players
     }
 
     /// Sets who may join, which is everyone until it's set.
@@ -373,8 +433,7 @@ impl Network {
             return
         }
         let made = context else return
-        let flat = self.world.flat.take_chunk() else return
-        self.level.open(jobs, made, flat)
+        self.level.open(jobs, made)
     }
 
     /// Sets the wall clock's time, which the caller reads before it hands over what happened, as
@@ -1307,7 +1366,7 @@ impl Network {
                     self.send(mut con, p, State.Configuration)
                 }
             },
-            Task.PrepareSpawn => {},
+            Task.PrepareSpawn => self.start_spawn(mut con),
             Task.JoinWorld => self.send(mut con, ClientboundFinishConfiguration {}, State.Configuration),
         }
     }
@@ -1329,24 +1388,142 @@ impl Network {
         if not self.keep_alive(mut con, now) {
             return
         }
-        // The spawn ticket loads the chunks 3 around the spawn, and the player's place is ready
-        // once they're full, which in a flat world, or one whose chunks are read before the
-        // tick, is the first tick, as soon as vanilla's can be.
+        // Once the player's place is found, the spawn ticket loads the chunks 3 around it, and
+        // the place is ready once they're full, which in a flat world, or one whose chunks are
+        // read before the tick, is the first tick, as soon as vanilla's can be.
         if is(con.task, Task.PrepareSpawn) {
-            if not con.spawning {
-                con.spawning = true
-                self.level.load_spawn(spawn_chunk())
-                self.level_lines()
-                self.level.dispatch()
+            if not con.prepare.found {
+                self.search_spawn(mut con)
             }
-            if self.level.full_around(spawn_chunk(), SPAWN_RADIUS) {
-                con.spawn_ready = true
-                con.task = none
-                self.next_task(mut con)
+            if con.prepare.found {
+                let chunk = con.prepare.chunk()
+                if not con.prepare.ticketed {
+                    con.prepare.ticketed = true
+                    self.level.load_spawn(chunk)
+                    self.level_lines()
+                    self.level.dispatch()
+                }
+                if self.level.full_around(chunk, SPAWN_RADIUS) {
+                    con.prepare.ready = true
+                    con.task = none
+                    self.next_task(mut con)
+                }
             }
         }
-        if con.spawn_ready {
-            self.level.keep_spawn(spawn_chunk())
+        if con.prepare.ready {
+            self.level.keep_spawn(con.prepare.chunk())
+        }
+    }
+
+    // Starts the spawn task, as `PrepareSpawnTask.start`: the player's place and angle are where
+    // they were saved, or, for one new to the world, a place found around the world's spawn,
+    // facing as it does. In adventure mode that's the spawn, moved up or down to where they fit
+    // in what's loaded; otherwise a search starts, which the configuration ticks go on with as
+    // each candidate's chunk loads. Calcite has only the overworld, so a player saved in another
+    // dimension joins the overworld at the same place (CAL-69).
+    fn start_spawn(mut self, con: mut Connection) {
+        con.prepare = Prepare()
+        var saved = SavedPosition { dimension: none, pos: none, rotation: none }
+        if let data = self.player_data(con) {
+            saved = saved_position(data)
+        }
+        var y_rot = self.respawn.yaw
+        var x_rot = self.respawn.pitch
+        if let r = saved.rotation {
+            y_rot = r[0]
+            x_rot = r[1]
+        }
+        con.prepare.y_rot = y_rot
+        con.prepare.x_rot = x_rot
+        if let p = saved.pos {
+            con.prepare.place(p[0], p[1], p[2])
+            return
+        }
+        let origin = self.respawn.pos
+        if self.collisions == none {
+            self.collisions = some(CollisionStates.new())
+        }
+        if self.world.settings.game_type == GameType.Adventure {
+            var y = origin.y
+            if let states = self.collisions {
+                y = fixup_height(states, self.level, origin.x, origin.y, origin.z, MIN_Y, MIN_Y + SECTIONS * 16 - 1)
+            }
+            con.prepare.place(f64(origin.x) + 0.5, f64(y), f64(origin.z) + 0.5)
+            return
+        }
+        // The search starts from a random candidate, which vanilla draws with a new random source
+        // seeded from the thread's.
+        let radius = search_radius(self.respawn_radius, border_distance(origin.x, origin.z))
+        var seed: i64 = 0
+        for b in self.link.random(8) {
+            seed = (seed << 8) | i64(b)
+        }
+        var random = LegacyRandom.new(seed)
+        var search = SpawnSearch.new(origin, radius, random.next_int_below(candidate_count(radius)))
+        let first = search.next()
+        con.prepare.search = some(search)
+        self.next_candidate(mut con, first)
+    }
+
+    // Loads the chunk of the search's next candidate, `candidate`, to check it once it's full.
+    fn next_candidate(mut self, con: mut Connection, candidate: Candidate) {
+        self.level.search_spawn(ChunkPos { x: candidate.x >> 4, z: candidate.z >> 4 })
+        con.prepare.candidate = some(candidate)
+        self.level_lines()
+        self.level.dispatch()
+    }
+
+    // Goes on with the spawn search while its candidate's chunk is full, as vanilla checks each
+    // on the server's thread once its chunk is: the place is the candidate's column where a
+    // player can stand on its surface and fits, or the next candidate's chunk is loaded; and
+    // after them all, the world's spawn, moved up or down to where they fit.
+    fn search_spawn(mut self, con: mut Connection) {
+        loop {
+            let candidate = con.prepare.candidate else return
+            if not self.level.full(ChunkPos { x: candidate.x >> 4, z: candidate.z >> 4 }) {
+                return
+            }
+            var place: BlockPos? = none
+            if let states = self.collisions {
+                if candidate.last {
+                    let origin = self.respawn.pos
+                    place = some(BlockPos { x: origin.x, y: fixup_height(states, self.level, origin.x, origin.y, origin.z, MIN_Y, MIN_Y + SECTIONS * 16 - 1), z: origin.z })
+                } else if let pos = self.level.respawn_pos(states, candidate.x, candidate.z) {
+                    if fits(states, self.level, pos.x, pos.y, pos.z) {
+                        place = some(pos)
+                    }
+                }
+            }
+            if let p = place {
+                con.prepare.place(f64(p.x) + 0.5, f64(p.y), f64(p.z) + 0.5)
+                return
+            }
+            var search = con.prepare.search.take() else return
+            let next = search.next()
+            con.prepare.search = some(search)
+            self.next_candidate(mut con, next)
+        }
+    }
+
+    // The joining player's data, as `loadPlayerData` reads it, with what reading it logs, or
+    // `none` for a player new to the world. Replaying, it's what the recording read.
+    fn player_data(mut self, con: Connection) -> JavaHashMap<String, Tag>? {
+        let profile = con.profile else return none
+        var lines = List<Entry>()
+        var found = FileRead.Absent
+        if let files = self.players {
+            let now = self.clock.date_time(unsafe { self.clock.local_offset() })
+            if let data = files.load(profile.id, profile.name, now, mut lines) {
+                found = FileRead.Read(data)
+            }
+        }
+        let got = self.link.file(found, mut lines)
+        for e in lines {
+            self.logs.push(e.copy())
+        }
+        return match got {
+            FileRead.Read(data) => some(data),
+            _ => none,
         }
     }
 
@@ -1512,7 +1689,19 @@ impl Network {
         let id = self.entity_ids
         let chat_spam = Throttler.per_second(self.world.settings.chat_spam_threshold_seconds)
         let command_spam = Throttler.per_second(self.world.settings.command_spam_threshold_seconds)
-        con.player = Player { entity_id: id, x: 0.5, y: f64(SURFACE_Y), z: 0.5, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam }
+        // The player is put at the spawn task's place and angle, as `snapTo` puts them: a yaw
+        // or pitch that isn't finite is left at 0, and the pitch is kept from -90 to 90.
+        let y_rot = if finite(con.prepare.y_rot) { con.prepare.y_rot } else { 0.0f32 }
+        var x_rot = 0.0f32
+        if finite(con.prepare.x_rot) {
+            x_rot = con.prepare.x_rot % 360.0f32
+            if x_rot < -90.0f32 {
+                x_rot = -90.0f32
+            } else if x_rot > 90.0f32 {
+                x_rot = 90.0f32
+            }
+        }
+        con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam }
         self.logs.push(Entry.info("{profile.name}[{con.address}] logged in with entity id {id} at ({con.player.x}, {con.player.y}, {con.player.z})").calcite(Look.Join(joined_words(profile.name, con.address))))
         let mode = self.world.settings.game_type
         let spawn = SpawnInfo { dimension_type: self.world.settings.dimension_type, dimension: overworld(), seed: self.world.settings.hashed_seed, game_type: mode, previous_game_type: PreviousGameType { mode: none }, is_debug: false, is_flat: true, last_death_location: none, portal_cooldown: 0, sea_level: -63 }
@@ -1531,7 +1720,8 @@ impl Network {
         self.send(mut con, ClientboundRecipeBookSettings { crafting: closed_tab(), furnace: closed_tab(), blast_furnace: closed_tab(), smoker: closed_tab() }, State.Play)
         self.send(mut con, ClientboundRecipeBookAdd { recipes: BookRecipes {}, replace: true }, State.Play)
         self.broadcast_system(Component.translatable("multiplayer.player.joined", [display_name(profile)]).colored("yellow"), Look.Quiet)
-        self.teleport(mut con, 0.5, f64(SURFACE_Y), 0.5, 0.0, 0.0)
+        let (px, py, pz) = (con.player.x, con.player.y, con.player.z)
+        self.teleport(mut con, px, py, pz, y_rot, x_rot)
         if not con.transferred {
             let data = ClientboundServerData { motd: self.status.status.description.copy(), icon: self.status.status.favicon.copy() }
             self.send(mut con, data, State.Play)
@@ -1561,7 +1751,8 @@ impl Network {
         }
         let time = ClientboundSetTime { game_time: self.world.game_time, clocks: clocks }
         self.send(mut con, time, State.Play)
-        self.send(mut con, ClientboundSetDefaultSpawnPosition { pos: GlobalPos { dimension: overworld(), pos: BlockPos { x: 0, y: SURFACE_Y, z: 0 } }, yaw: 0.0, pitch: 0.0 }, State.Play)
+        let respawn = ClientboundSetDefaultSpawnPosition { pos: GlobalPos { dimension: self.respawn.dimension.copy(), pos: self.respawn.pos }, yaw: self.respawn.yaw, pitch: self.respawn.pitch }
+        self.send(mut con, respawn, State.Play)
         self.send(mut con, ClientboundGameEvent { event: LEVEL_CHUNKS_LOAD_START, param: 0.0 }, State.Play)
         self.send(mut con, ClientboundTickingState { tick_rate: 20.0, frozen: false }, State.Play)
         self.send(mut con, ClientboundTickingStep { steps: 0 }, State.Play)
@@ -2392,18 +2583,12 @@ fn live_session(con: Connection, now: i64) -> ChatSession? {
     return none
 }
 
-// A play packet's ID and fields.
-// The chunk a joining player's spawn ticket is at: the spawn's, at 0, 0, as Calcite has no spawn
-// finder yet.
-fn spawn_chunk() -> ChunkPos {
-    return ChunkPos { x: 0, z: 0 }
-}
-
 // The section a height is in, as `SectionPos.blockToSectionCoord` of its block.
 fn section(y: f64) -> i32 {
     return i32.saturate(y.floor()) >> 4
 }
 
+// A play packet's ID and fields.
 fn encode_play<T: Wire + Packet>(p: T) -> List<u8> {
     var w = Writer.new()
     write_packet(p, State.Play, mut w)
@@ -2415,6 +2600,7 @@ fn invalid(x: f64, y: f64, z: f64, y_rot: f32, x_rot: f32) -> bool {
     return x.is_nan() or y.is_nan() or z.is_nan() or not finite(x_rot) or not finite(y_rot)
 }
 
+// Whether `v` is a number and not infinite, Java's `Float.isFinite`.
 fn finite(v: f32) -> bool {
     return not v.is_nan() and v != f32.INFINITY and v != f32.NEG_INFINITY
 }

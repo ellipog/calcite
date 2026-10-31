@@ -56,6 +56,7 @@ public final class Main {
                 new LevelsProbe(),
                 new DistanceProbe(),
                 new LightProbe(),
+                new SpawnProbe(),
                 new RegistriesProbe())) {
             probes.put(probe.name(), probe);
         }

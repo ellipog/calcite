@@ -184,7 +184,7 @@ class BlockFlagsModule(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "1 flags for 2 states"):
             calx_tables.block_flags_module(INDEX, {"game_version": "1.0", "states": 2, "flags": [17]})
         with self.assertRaisesRegex(ValueError, "bits this script doesn't know"):
-            calx_tables.block_flags_module(INDEX, {"game_version": "1.0", "states": 1, "flags": [1 << 9]})
+            calx_tables.block_flags_module(INDEX, {"game_version": "1.0", "states": 1, "flags": [1 << 20]})
         with self.assertRaisesRegex(ValueError, "bits this script doesn't know"):
             calx_tables.block_flags_module(INDEX, {"game_version": "1.0", "states": 1, "flags": [1 << 24]})
         with self.assertRaisesRegex(ValueError, "more than the encoding holds"):
@@ -225,6 +225,71 @@ class LightFacesModule(unittest.TestCase):
             calx_tables.light_faces_module(INDEX, dict(self.FLAGS, light_faces=[[0] * 6, [0] * 6, [1] * 6, [3] * 6]))
         with self.assertRaisesRegex(ValueError, "all empty"):
             calx_tables.light_faces_module(INDEX, dict(self.FLAGS, light_faces=[[1] * 6, [1] * 6, [0] * 6, [2] * 6]))
+
+
+class CollisionModule(unittest.TestCase):
+    # Three states: the whole block, nothing, and a bottom slab.
+    FLAGS = {"states": 3, "collision": [1, 0, 2],
+             "collision_boxes": [[], [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]], [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]]]}
+
+    @staticmethod
+    def decode(text):
+        """Each state's shape, read back from the module as its `state_shapes` reads them."""
+        lines = text.splitlines()
+        values = [int(v) for v in next(l for l in lines if "let values" in l).split("[")[1].rstrip("]").split(", ")]
+        alphabet = next(l for l in lines if "let alphabet" in l).split('"')[1]
+        single = int(next(l for l in lines if "if d >= " in l).split(">= ")[1].rstrip(" {"))
+        start = lines.index("    let lines: List<String> = [") + 1
+        out = []
+        for line in lines[start:lines.index("    ]", start)]:
+            chunk = line.strip().removeprefix('"').removesuffix('",')
+            i = 0
+            while i < len(chunk):
+                d = alphabet.index(chunk[i])
+                if d >= single:
+                    out.append(values[single + (d - single) * len(alphabet) + alphabet.index(chunk[i + 1])])
+                    i += 2
+                else:
+                    out.append(values[d])
+                    i += 1
+        return out
+
+    @staticmethod
+    def numbers(text, function):
+        """The numbers the module's `function` returns."""
+        body = text.split(f"pub fn {function}()")[1].split("    ]")[0].split("return [")[1]
+        return [int(v) for v in body.replace(",", " ").split()]
+
+    def test_the_shapes_read_back(self):
+        text = calx_tables.collision_module(INDEX, self.FLAGS)
+        self.assertIn("pub const SHAPES: u32 = 3\n", text)
+        self.assertIn("pub const BOX_UNIT: i32 = 32\n", text)
+        self.assertEqual(self.decode(text), [1, 0, 2])
+        self.assertEqual(self.numbers(text, "shape_starts"), [0, 0, 1, 2])
+        self.assertEqual(self.numbers(text, "shape_boxes"), [16, 16, 16, 48, 48, 48, 16, 16, 16, 48, 32, 48])
+
+    def test_rejects_what_it_cant_represent(self):
+        with self.assertRaisesRegex(ValueError, "2 states' collision shapes for 3"):
+            calx_tables.collision_module(INDEX, dict(self.FLAGS, collision=[1, 0]))
+        with self.assertRaisesRegex(ValueError, "isn't one of the table's"):
+            calx_tables.collision_module(INDEX, dict(self.FLAGS, collision=[1, 0, 3]))
+        with self.assertRaisesRegex(ValueError, "0 isn't empty"):
+            calx_tables.collision_module(INDEX, dict(self.FLAGS, collision_boxes=[[[0, 0, 0, 1, 1, 1]]] * 3))
+        with self.assertRaisesRegex(ValueError, "isn't a 32nd"):
+            boxes = self.FLAGS["collision_boxes"][:2] + [[[0.0, 0.0, 0.0, 1.0, 0.3, 1.0]]]
+            calx_tables.collision_module(INDEX, dict(self.FLAGS, collision_boxes=boxes))
+        with self.assertRaisesRegex(ValueError, "isn't a 32nd"):
+            boxes = self.FLAGS["collision_boxes"][:2] + [[[0.0, -1.0, 0.0, 1.0, 1.0, 1.0]]]
+            calx_tables.collision_module(INDEX, dict(self.FLAGS, collision_boxes=boxes))
+
+    def test_the_committed_table_reads_back(self):
+        path = calx_tables.CALCITE / "generated" / calx_tables.VERSION / "block_flags.json"
+        if not path.exists():
+            self.skipTest("no block_flags.json")
+        import json
+        flags = json.loads(path.read_text(encoding="utf-8"))
+        text = (calx_tables.CALCITE / "src" / "world" / "collision_shapes.calx").read_text(encoding="utf-8")
+        self.assertEqual(self.decode(text), flags["collision"])
 
 
 if __name__ == "__main__":

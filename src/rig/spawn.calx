@@ -1,0 +1,272 @@
+/// The `spawn` probe (rig/PROTOCOL.md): where `world.spawn` puts a player new to the world, over
+/// chunks the case makes, run by a list of operations, each result written to one blob, which
+/// the rig compares with what vanilla's `PlayerSpawnFinder` gives for the same operations.
+///
+/// The chunks are the overworld's height, every one the case makes full, so a search takes a
+/// ticket for each candidate's chunk and checks it at once, as the server does once the chunk
+/// is loaded. No entity collides.
+module rig.spawn
+
+import json.tree.{Json, Member, as_i32, as_string, take}
+import protocol.wire.{Writer}
+import rig.frame.{Outcome}
+import world.chunk.{BlockStates, Chunk}
+import world.collision.{CollisionBlocks, CollisionStates}
+import world.pos.{BlockPos}
+import world.spawn.{SpawnSearch, candidate_count, fits, fixup_height, respawn_pos}
+
+// How far from 0 a chunk may be, each way.
+const CHUNKS: i32 = 1000
+// The overworld's height.
+const MIN_Y: i32 = -64
+const SECTIONS: i32 = 24
+
+pub fn run_spawn(input: own List<Member>, blobs: List<List<u8>>, table: BlockStates) -> Outcome {
+    if not blobs.is_empty() {
+        return Outcome.Failed("`spawn` takes no blobs")
+    }
+    var fields = input
+    let ops_value = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let ops = match ops_value {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    var out = Writer.new()
+    match run_ops(table, ops, mut out) {
+        ok => {},
+        err(message) => return Outcome.Failed(message),
+    }
+    return Outcome.Done { output: [], blobs: [out.into_bytes()] }
+}
+
+/// The probe's 64-bit LCG, as `palette`'s.
+struct Draws {
+    x: i64
+}
+
+impl Draws {
+    fn next(mut self) -> i32 {
+        self.x = self.x * 6364136223846793005 + 1442695040888963407
+        return i32.wrap(self.x >>> 33)
+    }
+}
+
+fn key(chunk_x: i32, chunk_z: i32) -> i64 {
+    return (i64(chunk_x) << 32) | (i64(chunk_z) & 0xFFFFFFFF)
+}
+
+/// The case's chunks, each full.
+struct World {
+    chunks: Map<i64, Chunk> = Map<i64, Chunk>()
+}
+
+impl CollisionBlocks for World {
+    fn collision_state(self, x: i32, y: i32, z: i32) -> u32? {
+        let k = key(x >> 4, z >> 4)
+        if not self.chunks.contains(k) {
+            return none
+        }
+        return some(self.chunks[k].block(x & 15, y, z & 15))
+    }
+}
+
+fn run_ops(table: BlockStates, ops: List<Json>, out: mut Writer) ! String {
+    var world = World {}
+    let states = CollisionStates.new()
+    let top = MIN_Y + SECTIONS * 16 - 1
+    let count = i32.wrap(table.len())
+    let low = -CHUNKS * 16
+    let high = CHUNKS * 16 + 15
+    for k in 0..ops.len() {
+        let items = try items_of(ops, k)
+        let name = as_string(items[0]) ?? String()
+        if name == "chunk" {
+            try expect(items, k, 2)
+            let cx = try within(items, k, 1, -CHUNKS, CHUNKS)
+            let cz = try within(items, k, 2, -CHUNKS, CHUNKS)
+            if world.chunks.contains(key(cx, cz)) {
+                fail "operation {k}: there's a chunk at {cx}, {cz} already"
+            }
+            world.chunks.insert(key(cx, cz), Chunk.new(table, MIN_Y, SECTIONS, 0))
+        } else if name == "fill" {
+            // Every block from one corner to the other, y, then x, then z.
+            try expect(items, k, 7)
+            let x0 = try within(items, k, 1, low, high)
+            let y0 = try within(items, k, 2, MIN_Y, top)
+            let z0 = try within(items, k, 3, low, high)
+            let x1 = try within(items, k, 4, x0, x0 + 255)
+            let y1 = try within(items, k, 5, y0, top)
+            let z1 = try within(items, k, 6, z0, z0 + 255)
+            let state = u32.wrap(try within(items, k, 7, 0, count - 1))
+            for y in y0..y1 + 1 {
+                for x in x0..x1 + 1 {
+                    for z in z0..z1 + 1 {
+                        try put(mut world, table, k, x, y, z, state)
+                    }
+                }
+            }
+        } else if name == "random" {
+            // `count` states from the list, each at a block in the box.
+            try expect(items, k, 9)
+            var draws = Draws { x: try seed(items, k, 1) }
+            let n = try within(items, k, 2, 0, 1 << 20)
+            var list: List<u32> = []
+            match items[3] {
+                Json.Array(values) => {
+                    for v in values {
+                        let id = as_i32(v) ?? -1
+                        if id < 0 or id >= count {
+                            fail "{what(k, 3)}'s entries must be block state IDs, from 0 to {count - 1}"
+                        }
+                        list.push(u32.wrap(id))
+                    }
+                },
+                _ => {},
+            }
+            if list.is_empty() {
+                fail "{what(k, 3)} must be a non-empty array of block state IDs"
+            }
+            let x0 = try within(items, k, 4, low, high)
+            let y0 = try within(items, k, 5, MIN_Y, top)
+            let z0 = try within(items, k, 6, low, high)
+            let x1 = try within(items, k, 7, x0, x0 + 255)
+            let y1 = try within(items, k, 8, y0, top)
+            let z1 = try within(items, k, 9, z0, z0 + 255)
+            let len = i32.wrap(list.len())
+            for _ in 0..n {
+                let x = x0 + draws.next() % (x1 - x0 + 1)
+                let y = y0 + draws.next() % (y1 - y0 + 1)
+                let z = z0 + draws.next() % (z1 - z0 + 1)
+                let state = list[usize.wrap(draws.next() % len)]
+                try put(mut world, table, k, x, y, z, state)
+            }
+        } else if name == "respawn" {
+            // `getLevelRespawnPos`: a byte 0 for none, or 1 and the block's x, y and z.
+            try expect(items, k, 2)
+            let x = try within(items, k, 1, low, high)
+            let z = try within(items, k, 2, low, high)
+            let c = try chunk_key(world, k, x, z)
+            match respawn_pos(states, world.chunks[c], x, z) {
+                some(pos) => {
+                    out.u8(1)
+                    out.i32(pos.x)
+                    out.i32(pos.y)
+                    out.i32(pos.z)
+                },
+                none => out.u8(0),
+            }
+        } else if name == "fits" {
+            // `noCollisionNoLiquid`: a byte.
+            try expect(items, k, 3)
+            let x = try within(items, k, 1, low, high)
+            let y = try within(items, k, 2, MIN_Y - 64, top + 64)
+            let z = try within(items, k, 3, low, high)
+            out.u8(if fits(states, world, x, y, z) { 1 } else { 0 })
+        } else if name == "fixup" {
+            // `fixupSpawnHeight`, as an adventure world's spawn: the place's x, y and z.
+            try expect(items, k, 3)
+            let x = try within(items, k, 1, low, high)
+            let y = try within(items, k, 2, MIN_Y - 64, top + 64)
+            let z = try within(items, k, 3, low, high)
+            place(mut out, x, fixup_height(states, world, x, y, z, MIN_Y, top), z)
+        } else if name == "search" {
+            // A whole search from `offset`: the tickets it added, an `int` count and each
+            // chunk's x and z, then the place's x, y and z.
+            try expect(items, k, 5)
+            let x = try within(items, k, 1, low, high)
+            let y = try within(items, k, 2, MIN_Y - 64, top + 64)
+            let z = try within(items, k, 3, low, high)
+            let radius = try within(items, k, 4, 0, 64)
+            let offset = try within(items, k, 5, 0, candidate_count(radius) - 1)
+            var search = SpawnSearch.new(BlockPos { x: x, y: y, z: z }, radius, offset)
+            var tickets: List<i32> = []
+            var found: BlockPos? = none
+            loop {
+                let next = search.next()
+                let c = key(next.x >> 4, next.z >> 4)
+                if not world.chunks.contains(c) {
+                    fail "operation {k}: the search's candidate in chunk {next.x >> 4}, {next.z >> 4} isn't in a chunk the case made"
+                }
+                tickets.push(next.x >> 4)
+                tickets.push(next.z >> 4)
+                if next.last {
+                    found = some(BlockPos { x: x, y: fixup_height(states, world, x, y, z, MIN_Y, top), z: z })
+                    break
+                }
+                if let pos = respawn_pos(states, world.chunks[c], next.x, next.z) {
+                    if fits(states, world, pos.x, pos.y, pos.z) {
+                        found = some(pos)
+                        break
+                    }
+                }
+            }
+            out.i32(i32.wrap(tickets.len() / 2))
+            for t in tickets {
+                out.i32(t)
+            }
+            if let pos = found {
+                place(mut out, pos.x, pos.y, pos.z)
+            }
+        } else {
+            fail "operation {k}: unknown `{name}`"
+        }
+    }
+}
+
+/// `Vec3.atBottomCenterOf` the block.
+fn place(out: mut Writer, x: i32, y: i32, z: i32) {
+    out.f64(f64(x) + 0.5)
+    out.f64(f64(y))
+    out.f64(f64(z) + 0.5)
+}
+
+fn chunk_key(world: World, k: usize, x: i32, z: i32) -> i64 ! String {
+    let c = key(x >> 4, z >> 4)
+    if not world.chunks.contains(c) {
+        fail "operation {k}: there's no chunk at {x >> 4}, {z >> 4}"
+    }
+    return c
+}
+
+// A block set as `LevelChunk.setBlockState` sets it in its section and heightmaps.
+fn put(world: mut World, table: BlockStates, k: usize, x: i32, y: i32, z: i32, state: u32) ! String {
+    let c = try chunk_key(world, k, x, z)
+    _ = world.chunks[c].set_block(table, x & 15, y, z & 15, state)
+}
+
+fn items_of(ops: List<Json>, k: usize) -> List<Json> ! String {
+    match ops[k] {
+        Json.Array(items) => {
+            if not items.is_empty() and as_string(items[0]) != none {
+                return items.copy()
+            }
+        },
+        _ => {},
+    }
+    fail "operation {k} must be a non-empty array named by a string"
+}
+
+fn what(k: usize, i: usize) -> String {
+    return "operation {k}'s argument {i}"
+}
+
+fn expect(items: List<Json>, k: usize, n: usize) ! String {
+    if items.len() != n + 1 {
+        fail "operation {k}: `{as_string(items[0]) ?? String()}` takes {n} arguments, got {items.len() - 1}"
+    }
+}
+
+/// Argument `i`, a number from `low` to `high`, both included.
+fn within(items: List<Json>, k: usize, i: usize, low: i32, high: i32) -> i32 ! String {
+    let n = as_i32(items[i]) else fail "{what(k, i)} must be a 32-bit integer"
+    if n < low or n > high {
+        fail "{what(k, i)} must be from {low} to {high}"
+    }
+    return n
+}
+
+/// Argument `i`, a long written as a string.
+fn seed(items: List<Json>, k: usize, i: usize) -> i64 ! String {
+    let s = i64.parse(as_string(items[i]) ?? String()) else fail "{what(k, i)} must be a long written as a string"
+    return s
+}
