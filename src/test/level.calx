@@ -1,0 +1,312 @@
+/// Checks `server.level` as a replay drives it, with no IO thread: which chunks a player's and a
+/// spawn's tickets load, the reads they ask for, handed back by hand, what's ready to send, a
+/// holder that unloads while its chunk is read, and the far chunks of a view past the tickets'
+/// reach; and what `prepare` makes of a chunk as its region file holds it.
+module test.level
+
+import nbt.snbt.{parse_compound}
+import registry.builtin.{builtin_entries, builtin_names}
+import registry.registries.{Registries}
+import registry.registry.{Registry}
+import resources.identifier.{Identifier}
+import server.chunk_jobs.{ChunkContext, Loaded}
+import server.chunks.{Next}
+import server.level.{Level, MOST_FAR_LOADS, SPAWN_RADIUS}
+import server.log.{Entry}
+import storage.chunk.{ChunkFormat}
+import storage.region.{Compression, External, Stored}
+import storage.regions.{ChunkRead, encode_tag, region_of}
+import world.chunk.{BlockStates}
+import world.pos.{ChunkPos}
+
+fn check_int(got: i64, want: i64, what: str) {
+    if got != want {
+        panic("{what}: got {got}, want {want}")
+    }
+}
+
+fn check(got: bool, what: str) {
+    if not got {
+        panic(what)
+    }
+}
+
+fn full(name: String) -> Identifier {
+    if let c = name.find(":") {
+        return Identifier { namespace: name[..c], path: name[c + 1..] }
+    }
+    return Identifier { namespace: "minecraft", path: name.copy() }
+}
+
+// The built-in registries, and plains as the one biome, in a world from y -64 to 320.
+fn context() -> ChunkContext {
+    var builtin = List<Registry>()
+    let names = builtin_names()
+    for i in 0..names.len() {
+        var r = Registry.new(Identifier { namespace: "minecraft", path: names[i].copy() }, false)
+        for e in builtin_entries(i) {
+            r.add(full(e), none)
+        }
+        builtin.push(r)
+    }
+    var biomes = Registry.new(Identifier { namespace: "minecraft", path: "worldgen/biome" }, true)
+    biomes.add(Identifier { namespace: "minecraft", path: "plains" }, some(0))
+    let made = ChunkFormat.new(Registries { synced: [biomes], builtin: builtin })!
+    return ChunkContext { format: made, table: BlockStates.new([1], [1], 1), min_section: -4, sections: 24, sky_light: true }
+}
+
+fn at(x: i32, z: i32) -> ChunkPos {
+    return ChunkPos { x: x, z: z }
+}
+
+// Hands back each read asked for within `radius` of `center`, generated, until none is asked
+// for, as the IO thread would, and how many it handed back.
+fn hand_back(level: mut Level, center: ChunkPos, radius: i32) -> i64 {
+    var n: i64 = 0
+    loop {
+        var any = false
+        for x in center.x - radius..center.x + radius + 1 {
+            for z in center.z - radius..center.z + radius + 1 {
+                if level.read_chunk(at(x, z), [], Loaded.Generate, []) {
+                    n += 1
+                    any = true
+                }
+            }
+        }
+        if not any {
+            return n
+        }
+    }
+}
+
+// Whether every chunk within `radius` of `center` can be sent.
+fn sendable_around(level: Level, center: ChunkPos, radius: i32) -> bool {
+    for x in center.x - radius..center.x + radius + 1 {
+        for z in center.z - radius..center.z + radius + 1 {
+            if not level.sendable(at(x, z)) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+fn holders(level: Level) -> i64 {
+    let (near, _) = level.chunk_count()
+    return i64.wrap(near)
+}
+
+fn far_count(level: Level) -> i64 {
+    let (_, n) = level.chunk_count()
+    return i64.wrap(n)
+}
+
+// A world that reads nothing: a player's tickets make the chunks 12 around them full, those 11
+// around them tick, so they can be sent, and nothing past that.
+fn flat() {
+    var level = Level.new(10, 10)
+    let player = at(3, -2)
+    level.add_player(player, 1)
+    level.pump()
+    check_int(holders(level), 25 * 25, "chunks loaded for a view of 10")
+    check(sendable_around(level, player, 11), "a chunk 11 out can't be sent")
+    check(not level.sendable(at(player.x + 12, player.z)), "a chunk 12 out can be sent")
+    // Going into the next chunk east loads a column. The column now 13 out keeps its chunk: its
+    // holder's level is 34, and a holder goes only once it's past 44.
+    let east = at(player.x + 1, player.z)
+    level.move_player(player, east, 1)
+    level.pump()
+    level.tick()
+    check_int(holders(level), 25 * 26, "chunks loaded after moving")
+    check(level.sendable(at(east.x + 11, east.z)), "the new column can't be sent")
+    // Walking on, the 11 columns behind those 12 out keep theirs, and the rest go.
+    var here = east
+    for _ in 0..30 {
+        let next = at(here.x + 1, here.z)
+        level.move_player(here, next, 1)
+        level.pump()
+        level.tick()
+        here = next
+    }
+    check_int(holders(level), 25 * (25 + 11), "chunks loaded after walking")
+    // Leaving lets them all go.
+    level.remove_player(here, 1)
+    level.pump()
+    level.tick()
+    check_int(holders(level), 0, "chunks loaded after leaving")
+    println("ok flat")
+}
+
+// A world that reads: each chunk the tickets make full is asked for once, and loads as it's
+// handed back; one not asked for, or handed back twice, is a replay gone another way.
+fn reads() {
+    var level = Level.new(10, 10)
+    level.open(none, context())
+    check(level.reads(), "it doesn't read")
+    let spawn = at(0, 0)
+    level.load_spawn(spawn)
+    check(not level.full_around(spawn, SPAWN_RADIUS), "the spawn is ready before it's read")
+    let side = SPAWN_RADIUS * 2 + 1
+    check_int(holders(level), i64(side * side), "chunks asked for by the spawn ticket")
+    for x in -SPAWN_RADIUS..SPAWN_RADIUS + 1 {
+        for z in -SPAWN_RADIUS..SPAWN_RADIUS + 1 {
+            if x == SPAWN_RADIUS and z == SPAWN_RADIUS {
+                continue
+            }
+            check(level.read_chunk(at(x, z), [], Loaded.Generate, []), "a spawn chunk wasn't asked for")
+        }
+    }
+    check(not level.full_around(spawn, SPAWN_RADIUS), "the spawn is ready with a chunk still read")
+    check(level.read_chunk(at(SPAWN_RADIUS, SPAWN_RADIUS), [], Loaded.Generate, []), "the last spawn chunk wasn't asked for")
+    check(level.full_around(spawn, SPAWN_RADIUS), "the spawn isn't ready once it's read")
+    check(not level.read_chunk(at(0, 0), [], Loaded.Generate, []), "a chunk was taken back twice")
+    check(not level.read_chunk(at(20, 20), [], Loaded.Generate, []), "a chunk no one asked for was taken")
+    // A player's tickets are handed over as the chunks before them load, so their reads come a
+    // few at a time, as they're handed back.
+    level.add_player(spawn, 1)
+    level.pump()
+    let first = holders(level)
+    check(first < 25 * 25, "every chunk was asked for before any was read")
+    check_int(hand_back(mut level, spawn, 14), 25 * 25 - i64(side * side), "chunks read for the player")
+    check_int(holders(level), 25 * 25, "chunks loaded for the player")
+    check(sendable_around(level, spawn, 11), "a chunk 11 out can't be sent")
+    // A holder that unloads while its chunk is read keeps its place until the read is back,
+    // then lets it go.
+    let east = at(1, 0)
+    level.move_player(spawn, east, 1)
+    level.pump()
+    level.remove_player(east, 1)
+    level.pump()
+    for _ in 0..400 {
+        level.tick()
+    }
+    let still = holders(level)
+    check(still > 0, "the chunks being read went before they were back")
+    check_int(hand_back(mut level, east, 14), still, "chunks back after their holders went")
+    check_int(holders(level), 0, "chunks kept after their holders went")
+    println("ok reads")
+}
+
+// A region's chunks as `Region.Known` holds them, a bit each by `x + z * 32` in 16 words: all
+// of them but `missing`.
+fn all_but(missing: ChunkPos) -> List<u64> {
+    var bits: List<u64> = []
+    for _ in 0..16 {
+        bits.push(0xFFFF_FFFF_FFFF_FFFFu64)
+    }
+    let i = (missing.x & 31) + (missing.z & 31) * 32
+    bits[usize.wrap(i >> 6)] &= ~(1u64 << u64.wrap(i & 63))
+    return bits
+}
+
+// Chunks past the tickets' reach are sent flat at once if nothing's read; otherwise their
+// region's file is asked which it has, those it hasn't are sent at once, and the rest are read
+// for the player, at most 64 at a time, and let go once they're sent or out of view.
+fn far() {
+    var unread = Level.new(40, 10)
+    check(unread.next(at(100, 0), false) == Next.Send, "a far chunk of a world that reads nothing waits")
+    var level = Level.new(40, 10)
+    level.open(none, context())
+    level.serve(7)
+    let saved = at(100, 0)
+    let region = region_of(saved)
+    check(level.next(saved, false) == Next.Stop, "a far chunk went before its region's file said")
+    check(level.next(saved, false) == Next.Stop, "a far chunk went while its region's file was asked")
+    let missing = at(100, 1)
+    check(level.read_region(region, [], all_but(missing)), "the region wasn't asked about")
+    check(not level.read_region(region, [], all_but(missing)), "the region was taken twice")
+    check(not level.read_region(at(9, 9), [], all_but(missing)), "a region no one asked about was taken")
+    check(level.next(missing, false) == Next.Send, "a far chunk its file hasn't waits")
+    check(level.next(saved, false) == Next.Skip, "a far chunk went before it was read")
+    check(level.next(saved, false) == Next.Skip, "a far chunk went while it was read")
+    check(level.read_chunk(saved, [], Loaded.Generate, []), "the far chunk wasn't asked for")
+    check(level.next(saved, false) == Next.Send, "a far chunk read waits")
+    check_int(far_count(level), 1, "far chunks held")
+    level.forget_far(saved, 7)
+    check_int(far_count(level), 0, "far chunks held once out of view")
+    // 64 at once: the first two rows of the region, but the one its file hasn't, then one more,
+    // and the sender stops at the next.
+    check_int(i64(MOST_FAR_LOADS), 64, "the most far chunks read at once")
+    var asked: i64 = 0
+    for z in 0..2 {
+        for x in 96..128 {
+            if level.next(at(x, z), false) == Next.Skip {
+                asked += 1
+            }
+        }
+    }
+    check_int(asked, 63, "far chunks being read")
+    check(level.next(at(96, 2), false) == Next.Skip, "the 64th far chunk wasn't read")
+    check(level.next(at(97, 2), false) == Next.Stop, "a 65th far chunk was read")
+    check_int(far_count(level), 64, "far chunks being read")
+    // Another player has 64 of their own.
+    level.serve(8)
+    check(level.next(at(97, 2), false) == Next.Skip, "another player's far chunk wasn't read")
+    level.serve(7)
+    check(level.read_chunk(at(96, 0), [], Loaded.Generate, []), "a far chunk wasn't asked for")
+    check(level.next(at(98, 2), false) == Next.Skip, "a far chunk wasn't read once another was")
+    // A player who leaves lets theirs go, and reads that come back after are let go too.
+    level.forget_player(7)
+    check_int(far_count(level), 1, "far chunks held once the player left")
+    check(level.read_chunk(at(97, 0), [], Loaded.Generate, []), "a far chunk wasn't asked for")
+    check_int(far_count(level), 1, "far chunks held once a read came back")
+    println("ok far")
+}
+
+// 2,048 bytes of light, the first 15.
+fn light() -> String {
+    var out = String("[B;15b")
+    for _ in 1..2048 {
+        out.push_str(",0b")
+    }
+    out.push_str("]")
+    return out
+}
+
+// What `snbt`'s chunk, as a region file holds it, comes to at `pos`, with what it logs.
+fn loaded_from(level: Level, pos: ChunkPos, snbt: String, lines: mut List<Entry>) -> Loaded {
+    let root = parse_compound(snbt)!
+    let stored = Stored { sectors: encode_tag(root, Compression.Deflate), length: 4096, external: External.None }
+    return level.make(pos, ChunkRead.Stored(stored), mut lines)
+}
+
+// A chunk saved full loads with its light; one saved before its terrain is generated; one saved
+// under another position loads, with vanilla's lines.
+fn prepared() {
+    var level = Level.new(10, 10)
+    level.open(none, context())
+    let pos = at(2, 1)
+    var lines = List<Entry>()
+    let full_chunk = "\{Status: \"minecraft:full\", xPos: 2, zPos: 1, sections: [\{Y: 0b, block_states: \{palette: [\"minecraft:stone\"]\}, biomes: \{palette: [\"minecraft:plains\"]\}, SkyLight: {light()}\}]\}"
+    match loaded_from(level, pos, full_chunk, mut lines) {
+        Loaded.Saved(_, l) => check_int(i64.wrap(l.sky.len()), 1, "sky light layers"),
+        Loaded.Generate => panic("a full chunk was generated"),
+    }
+    check_int(i64.wrap(lines.len()), 0, "lines for a full chunk")
+    let early = "\{Status: \"minecraft:empty\", xPos: 2, zPos: 1, sections: []\}"
+    match loaded_from(level, pos, String(early), mut lines) {
+        Loaded.Generate => {},
+        _ => panic("a chunk saved before its terrain loaded"),
+    }
+    let moved = "\{Status: \"minecraft:full\", xPos: 9, zPos: 1, sections: []\}"
+    match loaded_from(level, pos, String(moved), mut lines) {
+        Loaded.Saved(_, _) => {},
+        _ => panic("a chunk saved elsewhere was generated"),
+    }
+    check_int(i64.wrap(lines.len()), 2, "lines for a chunk saved elsewhere")
+    if lines[0].message != "Chunk file at [2, 1] is in the wrong location; relocating. (Expected [2, 1], got [9, 1])" {
+        panic("got {lines[0].message}")
+    }
+    if lines[1].message != "Failed to load chunk 2,1" {
+        panic("got {lines[1].message}")
+    }
+    println("ok prepared")
+}
+
+fn main() {
+    flat()
+    reads()
+    far()
+    prepared()
+    println("ok")
+}

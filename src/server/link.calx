@@ -2,10 +2,11 @@
 /// from (D21, D144).
 ///
 /// What the server does is decided by what comes in: what its connections send and when, its
-/// clocks, the random bytes it draws, its key pair, and what Mojang's services answer. The rest
-/// it works out. A `Link` is where the server gets each of those. Live, it asks the system.
-/// Recording, it asks the system and writes each answer in the log, in the order the server
-/// asked. Replaying, it takes each answer from the log instead, so the server runs again as it
+/// clocks, the random bytes it draws, its key pair, what Mojang's services answer, and what it
+/// reads of its world's region files, in the order its IO thread hands it over. The rest it
+/// works out, the chunks it makes of what it read among it (D178). A `Link` is where the server
+/// gets each of those. Live, it asks the system. Recording, it asks the system and writes each
+/// answer in the log, in the order the server asked. Replaying, it takes each answer from the log instead, so the server runs again as it
 /// ran, with no sockets, clocks or requests.
 ///
 /// What the server sends and logs goes in the log too, as a check. A replay compares each packet
@@ -21,6 +22,9 @@ import std.http.{Error, Header, Request, Response, get as http_get}
 import std.lz4.{xxh32}
 import std.net.{Address, Conn, Event, Ip, Net, NetError, Waker}
 import std.time.{Timestamp}
+import storage.region.{External, ReadError, Stored}
+import storage.regions.{ChunkRead}
+import world.pos.{ChunkPos}
 
 /// Whether a link asks the system, and whether it writes the answers in a log or takes them
 /// from one.
@@ -35,7 +39,8 @@ pub enum Mode {
 
 /// What a replay hands the server next, as the server's loop handed it over as it ran: an event
 /// of its `Net`, a tick or a sweep of stale connections, each at a time on the loop's clock, the
-/// wall clock's time, a line typed into the console, or the console's request to stop.
+/// wall clock's time, a line typed into the console, the console's request to stop, or what its
+/// IO thread read of a region or a chunk, with the lines it logged.
 pub enum Input {
     Event(Event, u64)
     Tick(u64)
@@ -43,6 +48,10 @@ pub enum Input {
     Clock(Timestamp)
     Command(String)
     Halt
+    /// The region, by region coordinates, and which of its chunks its file has, a bit each by
+    /// `x + z * 32` in 16 words.
+    Region(ChunkPos, List<Entry>, List<u64>)
+    Chunk(ChunkPos, List<Entry>, ChunkRead)
 }
 
 /// A request of a web service, which a replay answers from the log.
@@ -88,6 +97,8 @@ const SWEEP: u8 = 5
 const CLOCK: u8 = 6
 const COMMAND: u8 = 7
 const HALT: u8 = 8
+const REGION: u8 = 9
+const CHUNK: u8 = 10
 // What the server asks for as it handles those, which a replay answers with:
 const READ: u8 = 16
 const PEER: u8 = 17
@@ -95,6 +106,7 @@ const RANDOM: u8 = 18
 const KEY: u8 = 19
 const DONE: u8 = 20
 const RESPONSE: u8 = 21
+const WORLD: u8 = 22
 // What it sends and logs, which a replay compares with what it sends and logs:
 const SENT: u8 = 32
 const LOGGED: u8 = 33
@@ -109,6 +121,8 @@ fn kind_name(tag: u8) -> String {
         SWEEP => String("swept stale connections"),
         COMMAND => String("ran a console command"),
         HALT => String("was asked to stop"),
+        REGION => String("found which chunks a region has"),
+        CHUNK => String("read a chunk"),
         CLOCK => String("read the wall clock"),
         READ => String("read what a connection sent"),
         PEER => String("asked a connection's address"),
@@ -116,6 +130,7 @@ fn kind_name(tag: u8) -> String {
         KEY => String("took its key pair"),
         DONE => String("asked whether a request was done"),
         RESPONSE => String("took a request's response"),
+        WORLD => String("opened its world folder"),
         _ => "did something this build doesn't know ({tag})",
     }
 }
@@ -125,7 +140,7 @@ fn magic() -> String {
     return String("Calcite input log")
 }
 
-const VERSION: i32 = 1
+const VERSION: i32 = 2
 
 // One record of a log: its kind, and what it holds.
 struct Record {
@@ -326,6 +341,65 @@ impl Link {
         }
     }
 
+    /// Records which chunks of `region` its file has, as the IO thread found them, with the
+    /// lines it logged, as the server is handed them.
+    pub fn region_read(mut self, region: ChunkPos, lines: List<Entry>, presence: List<u64>) {
+        if not self.recording() {
+            return
+        }
+        var w = Writer.new()
+        w.varint(region.x)
+        w.varint(region.z)
+        write_entries(mut w, lines)
+        for word in presence {
+            w.varlong(i64.wrap(word))
+        }
+        self.put(REGION, w)
+    }
+
+    /// Records what the IO thread read of the chunk at `pos`, with the lines it logged, as the
+    /// server is handed it.
+    pub fn chunk_read(mut self, pos: ChunkPos, lines: List<Entry>, read: ChunkRead) {
+        if not self.recording() {
+            return
+        }
+        var w = Writer.new()
+        w.varint(pos.x)
+        w.varint(pos.z)
+        write_entries(mut w, lines)
+        match read {
+            ChunkRead.Absent => w.u8(0),
+            ChunkRead.Stored(stored) => {
+                w.u8(1)
+                w.byte_array(stored.sectors)
+                w.varlong(stored.length)
+                match stored.external {
+                    External.None => w.u8(0),
+                    External.Missing(path) => {
+                        w.u8(1)
+                        w.byte_array(path.to_bytes())
+                    },
+                    External.Bytes(bytes) => {
+                        w.u8(2)
+                        w.byte_array(bytes)
+                    },
+                }
+            },
+            ChunkRead.Failed(e) => {
+                w.u8(2)
+                w.byte_array(e.exception.to_bytes())
+                w.byte_array(e.message.to_bytes())
+            },
+        }
+        self.put(CHUNK, w)
+    }
+
+    /// Replaying, stops the replay where the server was handed something it didn't ask for, as
+    /// it can't have been as it was recorded: `why` says what.
+    pub fn diverged(mut self, why: own String) {
+        self.stop(why)
+    }
+
     /// Replaying, what the server's loop handed it next as it ran, or `none` at the end of the
     /// log, or once the server went another way than it did.
     pub fn next_input(mut self) -> Input? {
@@ -478,6 +552,28 @@ impl Link {
         return some(key)
     }
 
+    /// Whether the server reads its world's chunks: `opened`, whether it opened the world's
+    /// folder. Replaying, the folder isn't opened, and it's whether the recording's was, whose
+    /// chunks come from the log.
+    pub fn world(mut self, opened: bool) -> bool {
+        if self.replaying() {
+            var r = self.answer(WORLD) else return false
+            return match r.bool() {
+                ok(d) => d,
+                err(e) => {
+                    self.damaged(e)
+                    false
+                },
+            }
+        }
+        if self.recording() {
+            var w = Writer.new()
+            w.bool(opened)
+            self.put(WORLD, w)
+        }
+        return opened
+    }
+
     /// Starts a GET request, as `std.http.get`. Replaying, nothing is sent.
     pub fn get(self, url: String, headers: List<Header>, timeout_ms: u32, limit: usize) -> Call {
         if self.replaying() {
@@ -602,12 +698,7 @@ impl Link {
             return
         }
         var w = Writer.new()
-        w.u8(level_byte(e.level))
-        w.bool(e.thread != none)
-        if let t = e.thread {
-            w.byte_array(t.to_bytes())
-        }
-        w.byte_array(e.message.to_bytes())
+        write_entry(mut w, e)
         if self.recording() {
             self.put(LOGGED, w)
             return
@@ -672,8 +763,91 @@ fn read_input(tag: u8, r: mut Reader) -> Input? ! DecodeError {
             return some(Input.Command(line))
         },
         HALT => return some(Input.Halt),
+        REGION => {
+            let region = ChunkPos { x: try r.varint(), z: try r.varint() }
+            let lines = try read_entries(mut r)
+            var presence: List<u64> = []
+            for _ in 0..16 {
+                presence.push(u64.wrap(try r.varlong()))
+            }
+            return some(Input.Region(region, lines, presence))
+        },
+        CHUNK => {
+            let pos = ChunkPos { x: try r.varint(), z: try r.varint() }
+            let lines = try read_entries(mut r)
+            let kind = try r.u8()
+            if kind == 0 {
+                return some(Input.Chunk(pos, lines, ChunkRead.Absent))
+            }
+            if kind == 2 {
+                let exception = text(try r.byte_array_in_left())
+                let message = text(try r.byte_array_in_left())
+                return some(Input.Chunk(pos, lines, ChunkRead.Failed(ReadError { exception: exception, message: message })))
+            }
+            if kind != 1 {
+                fail DecodeError { message: "no such chunk read as {kind}" }
+            }
+            let sectors = try r.byte_array_in_left()
+            let length = try r.varlong()
+            let outside = try r.u8()
+            var external = External.None
+            if outside == 1 {
+                external = External.Missing(text(try r.byte_array_in_left()))
+            } else if outside == 2 {
+                external = External.Bytes(try r.byte_array_in_left())
+            } else if outside != 0 {
+                fail DecodeError { message: "no such external stream as {outside}" }
+            }
+            return some(Input.Chunk(pos, lines, ChunkRead.Stored(Stored { sectors: sectors, length: length, external: external })))
+        },
         _ => return none,
     }
+}
+
+fn text(bytes: own List<u8>) -> String {
+    return String.from_utf8(bytes) ?? String()
+}
+
+// Lines logged, as a count then each as `logged` records it.
+fn write_entries(w: mut Writer, lines: List<Entry>) {
+    w.count(lines.len())
+    for e in lines {
+        write_entry(mut w, e)
+    }
+}
+
+fn write_entry(w: mut Writer, e: Entry) {
+    w.u8(level_byte(e.level))
+    w.bool(e.thread != none)
+    if let t = e.thread {
+        w.byte_array(t.to_bytes())
+    }
+    w.byte_array(e.message.to_bytes())
+}
+
+fn read_entries(r: mut Reader) -> List<Entry> ! DecodeError {
+    let n = try r.count(1048576)
+    var out = List<Entry>()
+    for _ in 0..n {
+        let b = try r.u8()
+        if b > 2 {
+            fail DecodeError { message: "no such level as {b}" }
+        }
+        var thread: String? = none
+        if try r.bool() {
+            thread = some(text(try r.byte_array_in_left()))
+        }
+        let message = text(try r.byte_array_in_left())
+        var e = Entry.info(message)
+        if b == 1 {
+            e.level = Level.Warn
+        } else if b == 2 {
+            e.level = Level.Error
+        }
+        e.thread = thread
+        out.push(e)
+    }
+    return out
 }
 
 fn write_peer(w: mut Writer, peer: Address?) {

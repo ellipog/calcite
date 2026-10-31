@@ -1,0 +1,581 @@
+/// The overworld's chunks, as vanilla's `ServerChunkCache` and `ChunkMap` keep them: which load,
+/// which are ready to send, and when they go (CAL-65).
+///
+/// `world.distance` says which chunks load, from the players' tickets and a joining player's
+/// spawn ticket. Each chunk whose holder's level comes to 33, full, or below gets its chunk. A
+/// world whose folder is open reads it from its region file, on the IO thread and the chunk
+/// workers of `server.chunk_jobs`, and a chunk that wasn't saved is generated flat, as is every
+/// chunk of a world that reads nothing; a flat chunk is sent from the flat world's one body, so
+/// it holds no chunk of its own. A chunk is ready to send once it ticks, as `getChunkToSend` has
+/// it: its level is 32 or below and the 3×3 around it is loaded, as `prepareTickingChunk` waits
+/// for. Its entities tick, which lets the dispatcher hand the next player tickets over, once the
+/// 5×5 around it is loaded, as the entity ticking future waits for. A holder that unloads takes
+/// its chunk with it.
+///
+/// Vanilla loads, generates and promotes chunks on worker threads, and when each is done is up
+/// to them. Here what the IO thread reads comes back to the tick thread, which records it in the
+/// input log and makes the chunk loaded in the order it came, then runs the distance manager
+/// until it settles, so a replay has the same chunks at the same points (D178).
+///
+/// A view wider than vanilla's 32 has chunks the tickets don't reach: those more than 33 from
+/// the player on an axis. Each player's are loaded as their sender comes to them, at most 64 at
+/// once, and let go once they're sent. A region's file is asked which chunks it has first, so
+/// those it hasn't are sent flat at once. Two players who need the same far chunk each read it
+/// (D179).
+module server.level
+
+import protocol.play.{ClientboundLevelChunkWithLight, LightData}
+import protocol.state.{State}
+import protocol.wire.{Writer, write_packet}
+import server.chunk_jobs.{ChunkContext, ChunkJobs, Done, Loaded, prepare}
+import server.chunks.{Chunks, Next}
+import server.log.{Entry}
+import storage.regions.{ChunkRead, region_of}
+import world.chunk.{Chunk}
+import world.distance.{DistanceManager, Ticking}
+import world.flat.{FlatWorld}
+import world.pos.{ChunkPos}
+import world.tickets.{Holders, Ticket, TicketStorage, TicketType}
+
+/// How far around the spawn chunk a joining player's spawn ticket loads full chunks,
+/// `PrepareSpawnTask.PREPARE_CHUNK_RADIUS`.
+pub const SPAWN_RADIUS: i32 = 3
+/// The most far chunks being read for a player at once.
+pub const MOST_FAR_LOADS: i32 = 64
+// The level of a full chunk, at and below which a holder's chunk is loaded.
+const FULL: i32 = 33
+// The level at and below which a chunk ticks, so it can be sent.
+const TICKING: i32 = 32
+
+// A chunk the world has, or is reading.
+enum Body {
+    // Being read.
+    Loading
+    // Generated flat: every flat chunk is the same, and sent from the flat world's body.
+    Flat
+    // As it was saved, with its light as it's sent.
+    Saved(Chunk, LightData)
+}
+
+// A chunk read for a player whose view is wider than the tickets reach, `owner`.
+struct Far {
+    owner: i32
+    body: Body
+}
+
+// What's known of a region's file.
+enum Region {
+    // It's been asked which chunks it has.
+    Asked
+    // The chunks it has, a bit each by `x + z * 32` in 16 words.
+    Known(List<u64>)
+}
+
+// What's to be asked of the IO thread.
+enum Ask {
+    Region(ChunkPos)
+    Chunk(ChunkPos)
+}
+
+// The chunks being read for their holders, which aren't ready to save until they're read, as
+// `isReadyForSaving` says, so their tickets that don't run out unloaded don't run down.
+struct Reading {
+    chunks: OpenHashSet<i64> = OpenHashSet<i64>()
+}
+
+impl Holders for Reading {
+    fn ready_for_saving(self, chunk: i64) -> bool {
+        return not self.chunks.contains(chunk)
+    }
+}
+
+/// The overworld's chunks, and the distance manager that says which load.
+pub struct Level {
+    /// The tickets and players, and the chunks' holders.
+    pub dm: DistanceManager
+    // Each holder's chunk, by its packed position, and those of them still being read.
+    slots: OpenHashMap<i64, Body> = OpenHashMap<i64, Body>()
+    reading: Reading = Reading()
+    // The far chunks read for players, and how many each player has being read.
+    far: OpenHashMap<i64, Far> = OpenHashMap<i64, Far>()
+    far_loads: OpenHashMap<i32, i32> = OpenHashMap<i32, i32>()
+    regions: OpenHashMap<i64, Region> = OpenHashMap<i64, Region>()
+    // How many reads of each chunk are asked for and not back.
+    asked: OpenHashMap<i64, i32> = OpenHashMap<i64, i32>()
+    // What's to go to the IO thread at the next `dispatch`.
+    asks: List<Ask> = List<Ask>()
+    // Whether chunks are read, and the threads that read them, which a replay hasn't, and what
+    // chunks are made with.
+    opened: bool = false
+    jobs: ChunkJobs? = none
+    context: ChunkContext? = none
+    // The holders whose chunks are to tick their entities once the 5×5 around them is loaded.
+    waiting: LinkedSet<i64> = LinkedSet<i64>()
+    lines: List<Entry> = List<Entry>()
+    // The player whose sender asks next, for their far chunks.
+    serving: i32 = 0
+}
+
+impl Level {
+    /// A world whose player tickets reach `view` chunks and whose simulation distance is
+    /// `simulation`, as the chunk map sets them, which reads nothing until it's opened.
+    pub fn new(view: i32, simulation: i32) -> Level {
+        var dm = DistanceManager.new(TicketStorage.new())
+        dm.update_player_tickets(view)
+        dm.update_simulation_distance(simulation)
+        return Level { dm: dm }
+    }
+
+    /// Reads chunks from now on, made with `context`: through `jobs`, the IO thread and chunk
+    /// workers, or, replaying, from the log, which has what the recording read.
+    pub fn open(mut self, jobs: own ChunkJobs?, context: own ChunkContext) {
+        self.opened = true
+        self.jobs = jobs
+        self.context = some(context)
+    }
+
+    /// Whether chunks are read from the world's folder.
+    pub fn reads(self) -> bool {
+        return self.opened
+    }
+
+    /// What's been logged since this was last asked, oldest first.
+    pub fn take_lines(mut self) -> List<Entry> {
+        let out = self.lines.copy()
+        self.lines.clear()
+        return out
+    }
+
+    /// How many chunks are loaded or being read for holders, and how many far chunks for
+    /// players.
+    pub fn chunk_count(self) -> (usize, usize) {
+        return (self.slots.len(), self.far.len())
+    }
+
+    /// Adds `player` in `chunk`, as `ChunkMap.updatePlayerStatus` does. What their tickets
+    /// come to loads at the next `pump`.
+    pub fn add_player(mut self, chunk: ChunkPos, player: i32) {
+        self.dm.add_player(chunk.pack(), player)
+    }
+
+    /// Takes `player` out of `chunk`, as a player who leaves is, until the next `pump`.
+    pub fn remove_player(mut self, chunk: ChunkPos, player: i32) {
+        self.dm.remove_player(chunk.pack(), player)
+    }
+
+    /// Moves `player` from `from` to `to`, as `ChunkMap.move` does when they go into another
+    /// section, until the next `pump`.
+    pub fn move_player(mut self, from: ChunkPos, to: ChunkPos, player: i32) {
+        self.dm.remove_player(from.pack(), player)
+        self.dm.add_player(to.pack(), player)
+    }
+
+    /// Lets go of the far chunks read for `player`, who left.
+    pub fn forget_player(mut self, player: i32) {
+        var gone = List<i64>()
+        for (k, f) in self.far {
+            if f.owner == player {
+                gone.push(k)
+            }
+        }
+        for k in gone {
+            self.free_far(k)
+        }
+        _ = self.far_loads.remove(player)
+    }
+
+    /// The chunk at `pos` left `player`'s view: a far chunk read for them goes.
+    pub fn forget_far(mut self, pos: ChunkPos, player: i32) {
+        let k = pos.pack()
+        if self.far.contains(k) and self.far[k].owner == player {
+            self.free_far(k)
+        }
+    }
+
+    /// Adds a joining player's spawn ticket, `player_spawn` 3 around `chunk`, and settles what
+    /// it comes to, as `addTicketAndLoadWithRadius` does.
+    pub fn load_spawn(mut self, chunk: ChunkPos) {
+        _ = self.dm.add_ticket(chunk.pack(), Ticket.with_radius(TicketType.PlayerSpawn, SPAWN_RADIUS))
+        self.pump()
+    }
+
+    /// Adds the spawn ticket again, so it doesn't run out while the player is still to join, as
+    /// `PrepareSpawnTask.Ready.keepAlive` does each configuration tick.
+    pub fn keep_spawn(mut self, chunk: ChunkPos) {
+        _ = self.dm.add_ticket(chunk.pack(), Ticket.with_radius(TicketType.PlayerSpawn, SPAWN_RADIUS))
+    }
+
+    /// Whether every chunk within `radius` of `center` is full, as `getChunkRangeFuture` waits
+    /// for them to be.
+    pub fn full_around(self, center: ChunkPos, radius: i32) -> bool {
+        for x in center.x - radius..center.x + radius + 1 {
+            for z in center.z - radius..center.z + radius + 1 {
+                let k = ChunkPos { x: x, z: z }.pack()
+                if self.dm.chunk_level(k, false) > FULL or not self.loaded(k) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    /// Whether the chunk at `pos` is ready to send: it ticks, as `getChunkToSend` has it.
+    pub fn sendable(self, pos: ChunkPos) -> bool {
+        if self.dm.chunk_level(pos.pack(), false) > TICKING {
+            return false
+        }
+        return self.loaded_around(pos, 1)
+    }
+
+    /// The world's part of a tick, as `ServerChunkCache.tick` runs it: the tickets run down, the
+    /// distance manager settles, and the holders that dropped unload, with their chunks.
+    /// Vanilla unloads as many as it has time for, and Calcite all of them.
+    pub fn tick(mut self) {
+        self.dm.purge_stale(self.reading)
+        self.pump()
+        _ = self.dm.drop_unloaded()
+        while self.dm.unload_next() {
+        }
+        for k in self.dm.take_unloaded() {
+            self.unloaded(k)
+        }
+    }
+
+    /// Runs the distance manager until it settles: its updates, which load the chunks the
+    /// holders' levels call for; the dispatcher's jobs and the main thread's tasks, until
+    /// neither has any; then each holder waiting for its chunk to tick its entities, whose 5×5
+    /// is loaded, is let go; as long as any of those does something.
+    pub fn pump(mut self) {
+        loop {
+            var any = self.dm.run_all_updates()
+            for k in self.dm.take_changed() {
+                self.changed(k)
+            }
+            if self.drain() {
+                any = true
+            }
+            if self.ready_waiting() {
+                any = true
+            }
+            if not any {
+                return
+            }
+        }
+    }
+
+    /// Sets the player whose sender asks next, whose far chunks are read for them.
+    pub fn serve(mut self, player: i32) {
+        self.serving = player
+    }
+
+    /// The chunk at `pos` as it's sent, `ClientboundLevelChunkWithLightPacket`'s ID and fields:
+    /// as it was saved, or flat. A far chunk read for a player goes once it's sent. Block
+    /// entities aren't sent yet.
+    pub fn packet(mut self, pos: ChunkPos, flat: FlatWorld) -> List<u8> {
+        let k = pos.pack()
+        if self.slots.contains(k) {
+            match self.slots[k] {
+                Body.Saved(chunk, light) => return chunk_packet(pos, chunk, light),
+                _ => return flat.chunk_packet(pos.x, pos.z),
+            }
+        }
+        if self.far.contains(k) {
+            var packet: List<u8>? = none
+            match self.far[k].body {
+                Body.Saved(chunk, light) => packet = some(chunk_packet(pos, chunk, light)),
+                _ => {},
+            }
+            self.free_far(k)
+            if let p = packet {
+                return p
+            }
+        }
+        return flat.chunk_packet(pos.x, pos.z)
+    }
+
+    /// Hands what's to be read to the IO thread. Replaying, there's none: what the recording
+    /// read comes from the log.
+    pub fn dispatch(mut self) {
+        if self.asks.is_empty() {
+            return
+        }
+        let asks = self.asks.copy()
+        self.asks.clear()
+        var jobs = self.jobs.take() else return
+        for a in asks {
+            match a {
+                Ask.Region(r) => jobs.ask_region(r),
+                Ask.Chunk(p) => jobs.ask_chunk(p),
+            }
+        }
+        self.jobs = some(jobs)
+    }
+
+    /// What the IO thread and workers have done since this was last asked, in the order it came.
+    pub fn take_done(mut self) -> Deque<Done> {
+        var jobs = self.jobs.take() else return Deque<Done>()
+        let done = jobs.take_done()
+        self.jobs = some(jobs)
+        return done
+    }
+
+    /// What `read` comes to, made on this thread as a worker makes it, with what it logs added
+    /// to `lines`, for a replay, which has what was read and not what it came to.
+    pub fn make(self, pos: ChunkPos, read: ChunkRead, lines: mut List<Entry>) -> Loaded {
+        if let context = self.context {
+            return prepare(pos, read, context, mut lines)
+        }
+        return Loaded.Generate
+    }
+
+    /// Takes in which chunks `region`'s file has, as the IO thread found them, with what it
+    /// logged. `false` if it wasn't asked, which only a replay that's gone another way hands over.
+    pub fn read_region(mut self, region: ChunkPos, io: List<Entry>, presence: own List<u64>) -> bool {
+        let k = region.pack()
+        if not self.regions.contains(k) {
+            return false
+        }
+        match self.regions[k] {
+            Region.Known(_) => return false,
+            Region.Asked => {},
+        }
+        for e in io {
+            self.lines.push(e.copy())
+        }
+        self.regions.insert(k, Region.Known(presence))
+        return true
+    }
+
+    /// Takes in a read of the chunk at `pos`, with what the IO thread logged, which came to
+    /// `loaded` with what that logged: a holder's chunk loads if the holder's still there, and
+    /// goes if not, and a far chunk loads if it's still wanted. Then the distance manager
+    /// settles. `false` if no read of it was asked for, which only a replay that's gone another
+    /// way hands over.
+    pub fn read_chunk(mut self, pos: ChunkPos, io: List<Entry>, loaded: own Loaded, made: List<Entry>) -> bool {
+        let k = pos.pack()
+        let n = self.asked.get(k) ?? 0
+        if n == 0 {
+            return false
+        }
+        if n == 1 {
+            _ = self.asked.remove(k)
+        } else {
+            self.asked.insert(k, n - 1)
+        }
+        for e in io {
+            self.lines.push(e.copy())
+        }
+        for e in made {
+            self.lines.push(e.copy())
+        }
+        if self.reading.chunks.contains(k) {
+            self.reading.chunks.remove(k)
+            if self.held(k) {
+                self.slots.insert(k, body(loaded))
+                self.pump()
+            } else {
+                _ = self.slots.remove(k)
+            }
+            return true
+        }
+        if self.far.contains(k) {
+            let loading = match self.far[k].body {
+                Body.Loading => true,
+                _ => false,
+            }
+            if loading {
+                let owner = self.far[k].owner
+                self.far[k].body = body(loaded)
+                self.far_loads.insert(owner, (self.far_loads.get(owner) ?? 1) - 1)
+            }
+        }
+        return true
+    }
+
+    // The chunk at `k`'s holder's level changed: a full chunk with no chunk yet is loaded, and
+    // one whose entities are to tick waits for the chunks around it.
+    fn changed(mut self, k: i64) {
+        if self.dm.chunk_level(k, false) <= FULL and not self.slots.contains(k) {
+            if self.opened {
+                self.slots.insert(k, Body.Loading)
+                self.reading.chunks.insert(k)
+                self.ask(k)
+            } else {
+                self.slots.insert(k, Body.Flat)
+            }
+        }
+        if let h = self.dm.holder(k) {
+            if h.ticking == Ticking.Waiting {
+                self.waiting.insert(k)
+            }
+        }
+    }
+
+    // The holder at `k` unloaded: its chunk goes, unless it's still being read, when it goes as
+    // it comes back, with no holder to have it.
+    fn unloaded(mut self, k: i64) {
+        self.waiting.remove(k)
+        if not self.reading.chunks.contains(k) {
+            _ = self.slots.remove(k)
+        }
+    }
+
+    // Runs the dispatcher's jobs, then the main thread's tasks, until neither has any, and
+    // whether any ran.
+    fn drain(mut self) -> bool {
+        var ran = false
+        loop {
+            var any = false
+            while self.dm.run_dispatcher() {
+                any = true
+            }
+            while self.dm.run_main() {
+                any = true
+            }
+            if not any {
+                return ran
+            }
+            ran = true
+        }
+    }
+
+    // Lets each holder waiting whose 5×5 is loaded have its chunk tick its entities, in the
+    // order they came to wait, and whether that let any of what waited for it go.
+    fn ready_waiting(mut self) -> bool {
+        if self.waiting.is_empty() {
+            return false
+        }
+        var keys = List<i64>()
+        for k in self.waiting {
+            keys.push(k)
+        }
+        var any = false
+        for k in keys {
+            let still = match self.dm.holder(k) {
+                some(h) => h.ticking == Ticking.Waiting,
+                none => false,
+            }
+            if not still {
+                self.waiting.remove(k)
+            } else if self.loaded_around(unpacked(k), 2) {
+                self.waiting.remove(k)
+                if self.dm.entity_ticking_ready(k) {
+                    any = true
+                }
+            }
+        }
+        return any
+    }
+
+    // Whether the chunk at `k` is loaded.
+    fn loaded(self, k: i64) -> bool {
+        return self.slots.contains(k) and not self.reading.chunks.contains(k)
+    }
+
+    // Whether every chunk within `radius` of `pos` is loaded.
+    fn loaded_around(self, pos: ChunkPos, radius: i32) -> bool {
+        for x in pos.x - radius..pos.x + radius + 1 {
+            for z in pos.z - radius..pos.z + radius + 1 {
+                if not self.loaded(ChunkPos { x: x, z: z }.pack()) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    // Whether the chunk at `k` has a holder, in use or waiting to unload.
+    fn held(self, k: i64) -> bool {
+        if let _ = self.dm.holder(k) {
+            return true
+        }
+        if let _ = self.dm.unloading(k) {
+            return true
+        }
+        return false
+    }
+
+    // Asks for a read of the chunk at `k`.
+    fn ask(mut self, k: i64) {
+        self.asked.insert(k, (self.asked.get(k) ?? 0) + 1)
+        self.asks.push(Ask.Chunk(unpacked(k)))
+    }
+
+    // Lets the far chunk at `k` go, and its read if it's still being read.
+    fn free_far(mut self, k: i64) {
+        let f = self.far.remove(k) else return
+        match f.body {
+            Body.Loading => self.far_loads.insert(f.owner, (self.far_loads.get(f.owner) ?? 1) - 1),
+            _ => {},
+        }
+    }
+}
+
+impl Chunks for Level {
+    // A chunk the tickets reach goes once it ticks. One further goes at once if it's loaded,
+    // if nothing's read, or if its region's file hasn't it, so it's flat; otherwise it's read
+    // for the player, if they've fewer than 64 being read, and goes once it's read. The sender
+    // stops at one whose region's file is still to say, or past the most reads.
+    fn next(mut self, pos: ChunkPos, near: bool) -> Next {
+        if near {
+            return if self.sendable(pos) { Next.Send } else { Next.Skip }
+        }
+        let k = pos.pack()
+        if self.slots.contains(k) {
+            return if self.loaded(k) { Next.Send } else { Next.Skip }
+        }
+        if not self.opened {
+            return Next.Send
+        }
+        if self.far.contains(k) {
+            return match self.far[k].body {
+                Body.Loading => Next.Skip,
+                _ => Next.Send,
+            }
+        }
+        let region = region_of(pos)
+        let r = region.pack()
+        if not self.regions.contains(r) {
+            self.regions.insert(r, Region.Asked)
+            self.asks.push(Ask.Region(region))
+            return Next.Stop
+        }
+        match self.regions[r] {
+            Region.Asked => return Next.Stop,
+            Region.Known(bits) => {
+                let i = (pos.x & 31) + (pos.z & 31) * 32
+                if (bits[usize.wrap(i >> 6)] & (1u64 << u64.wrap(i & 63))) == 0 {
+                    return Next.Send
+                }
+            },
+        }
+        let loads = self.far_loads.get(self.serving) ?? 0
+        if loads >= MOST_FAR_LOADS {
+            return Next.Stop
+        }
+        self.far_loads.insert(self.serving, loads + 1)
+        self.far.insert(k, Far { owner: self.serving, body: Body.Loading })
+        self.ask(k)
+        return Next.Skip
+    }
+}
+
+// What a chunk read comes to, held: as it was saved, or flat.
+fn body(loaded: own Loaded) -> Body {
+    return match loaded {
+        Loaded.Generate => Body.Flat,
+        Loaded.Saved(chunk, light) => Body.Saved(chunk, light),
+    }
+}
+
+// A saved chunk's packet's ID and fields.
+fn chunk_packet(pos: ChunkPos, chunk: Chunk, light: LightData) -> List<u8> {
+    var w = Writer.new()
+    write_packet(ClientboundLevelChunkWithLight { x: pos.x, z: pos.z, chunk: chunk.chunk_data(), light: light.copy() }, State.Play, mut w)
+    return w.into_bytes()
+}
+
+// The chunk a packed position is.
+fn unpacked(k: i64) -> ChunkPos {
+    return ChunkPos { x: i32.wrap(k), z: i32.wrap(k >> 32) }
+}

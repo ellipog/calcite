@@ -1,0 +1,461 @@
+/// Reading chunks from a world's region files, off the tick thread, as vanilla's `IOWorker` and
+/// its background executor read them (CAL-65).
+///
+/// One IO thread owns the region files. It finds which chunks a region's file has, and reads
+/// what the file holds of a chunk, as it's asked. What it reads goes to the chunk workers, which
+/// check it, inflate it and read its NBT into a chunk ready to send, and back to the tick thread
+/// with what each logged, waking the poll. The workers start as chunks need them, up to one fewer
+/// than the processors.
+///
+/// What the IO thread reads is the server's input, as the network's bytes are: the link records
+/// it, and a replay hands it over in the same order. What the workers make of it depends only on
+/// that, so a replay makes it again with `prepare` on its own thread.
+module server.chunk_jobs
+
+import nbt.tag.{Tag}
+import protocol.play.{LightData, LightLayer}
+import server.log.{Entry}
+import std.net.{Waker}
+import std.pool.{workers}
+import std.thread.{Task}
+import storage.chunk.{ChunkData, ChunkFormat}
+import storage.region.{ReadError, Stored, unpack}
+import storage.regions.{ChunkRead, RegionStorage, read_root}
+import world.chunk.{BlockStates, Chunk, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, OCEAN_FLOOR_WG, Section, WORLD_SURFACE, WORLD_SURFACE_WG}
+import world.pos.{ChunkPos}
+
+/// The thread vanilla's region files log on, `Util.ioPool`'s first.
+pub fn io_thread() -> String {
+    return String("IO-Worker-1")
+}
+
+/// The thread vanilla reads a chunk's NBT on, the background executor's first.
+pub fn parse_thread() -> String {
+    return String("Worker-Main-1")
+}
+
+// The most chunk workers, whatever the processors.
+const MOST_WORKERS: usize = 8
+
+/// What a chunk is made from: the registries its NBT names things from, the block states'
+/// table, and the dimension's sections, from its lowest up, with whether it has sky light.
+pub struct ChunkContext {
+    pub format: ChunkFormat
+    pub table: BlockStates
+    pub min_section: i32
+    pub sections: i32
+    pub sky_light: bool
+}
+
+/// What a chunk read from its region file comes to.
+pub enum Loaded {
+    /// Nothing that can be used was saved, or it couldn't be read: the chunk is to be generated.
+    Generate
+    /// The chunk as it was saved, and its light as it's sent.
+    Saved(Chunk, LightData)
+}
+
+/// What the tick thread gets back.
+pub enum Done {
+    /// The region, by region coordinates, which of its chunks its file has, a bit each by
+    /// `x + z * 32` in 16 words, and what the IO thread logged finding them.
+    Region(ChunkPos, List<Entry>, List<u64>)
+    /// The chunk, what the IO thread logged reading it and what it read, then what the workers
+    /// logged making it, and what they made.
+    Chunk(ChunkPos, List<Entry>, ChunkRead, List<Entry>, Loaded)
+}
+
+/// What a chunk read from its region file comes to, as vanilla's `ChunkMap.scheduleChunkLoad`
+/// makes it, with what it logs added to `lines`, each on the thread vanilla logs it on:
+///
+/// - a file that can't be read, or a chunk whose bytes or NBT can't be, logs "Failed to read
+///   chunk [x, z]" on the IO thread and "Failed to load chunk x,z" on the server's, and is
+///   generated;
+/// - a chunk with no `Status` logs "Chunk file at [x, z] is missing level data, skipping" on the
+///   background executor, and is generated, as is one that isn't saved at all;
+/// - a chunk vanilla can't read logs "Failed to load chunk x,z", and is generated;
+/// - a chunk saved under another position logs that it's in the wrong location, and that it
+///   failed to load, and loads where it was asked for.
+///
+/// A chunk saved before its terrain, `minecraft:terrain`, is generated as one that isn't saved,
+/// and so is one saved later than that but before it's full, which vanilla would go on
+/// generating from where it was saved.
+///
+/// The rest loads as `SerializableChunkData.read` reads it: each section saved in the world in
+/// its place, a later one over an earlier at the same height, and air with plains in each one
+/// not saved; the light saved, the same way; each heightmap saved, and those not, of the four a
+/// chunk keeps from its terrain on, worked out from the blocks.
+pub fn prepare(pos: ChunkPos, read: ChunkRead, context: ChunkContext, lines: mut List<Entry>) -> Loaded {
+    match read {
+        ChunkRead.Absent => return Loaded.Generate,
+        ChunkRead.Failed(e) => {
+            failed_read(pos, e, mut lines)
+            return Loaded.Generate
+        },
+        ChunkRead.Stored(stored) => return prepare_stored(pos, stored, context, mut lines),
+    }
+}
+
+fn prepare_stored(pos: ChunkPos, stored: Stored, context: ChunkContext, lines: mut List<Entry>) -> Loaded {
+    var io = List<Entry>()
+    var failed: ReadError? = none
+    let unpacked: List<u8>? = match unpack(pos, stored, mut io) {
+        ok(b) => b,
+        err(e) => {
+            failed = some(e)
+            none
+        },
+    }
+    on(io, io_thread(), mut lines)
+    if let e = failed {
+        failed_read(pos, e, mut lines)
+        return Loaded.Generate
+    }
+    let bytes = unpacked else return Loaded.Generate
+    let fields = match read_root(bytes) {
+        ok(Tag.Compound(f)) => f,
+        ok(_) => return Loaded.Generate,
+        err(e) => {
+            failed_read(pos, e, mut lines)
+            return Loaded.Generate
+        },
+    }
+    var parsing = List<Entry>()
+    var broken = false
+    let parsed: ChunkData? = match ChunkData.parse(context.format, context.min_section, context.sections, fields, mut parsing) {
+        ok(d) => d,
+        err(_) => {
+            broken = true
+            none
+        },
+    }
+    on(parsing, parse_thread(), mut lines)
+    if broken {
+        lines.push(failed_load(pos))
+        return Loaded.Generate
+    }
+    var data = parsed else {
+        lines.push(Entry.error("Chunk file at {at(pos)} is missing level data, skipping").on(parse_thread()))
+        return Loaded.Generate
+    }
+    if data.pos.x != pos.x or data.pos.z != pos.z {
+        lines.push(Entry.error("Chunk file at {at(pos)} is in the wrong location; relocating. (Expected {at(pos)}, got {at(data.pos)})"))
+        lines.push(failed_load(pos))
+    }
+    if not context.format.has_terrain(data.status) {
+        return Loaded.Generate
+    }
+    let count = usize.wrap(context.sections)
+    let light_count = count + 2
+    var placed = List<Section?>()
+    for _ in 0..count {
+        placed.push(none)
+    }
+    var sky = List<List<u8>?>()
+    var block = List<List<u8>?>()
+    for _ in 0..light_count {
+        sky.push(none)
+        block.push(none)
+    }
+    // From the last saved back, so the first found at a height is the one that's kept.
+    while let popped = data.sections.pop() {
+        var section = popped
+        let i = section.y - context.min_section
+        if i >= 0 and usize.wrap(i) < count and placed[usize.wrap(i)] == none {
+            if let states = section.blocks.take() {
+                if let biomes = section.biomes.take() {
+                    placed[usize.wrap(i)] = some(Section.from(context.table, states, biomes))
+                }
+            }
+        }
+        let l = i + 1
+        if l >= 0 and usize.wrap(l) < light_count {
+            let at_l = usize.wrap(l)
+            if block[at_l] == none {
+                if let layer = section.block_light {
+                    block[at_l] = some(nibbles(layer))
+                }
+            }
+            if context.sky_light and sky[at_l] == none {
+                if let layer = section.sky_light {
+                    sky[at_l] = some(nibbles(layer))
+                }
+            }
+        }
+    }
+    var sections = List<Section>()
+    for i in 0..count {
+        sections.push(placed[i].take() ?? Section.new(context.table, context.format.plains))
+    }
+    var chunk = Chunk.of(context.min_section * 16, sections)
+    var to_prime: List<i32> = [WORLD_SURFACE, OCEAN_FLOOR, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES]
+    for kind in [WORLD_SURFACE_WG, WORLD_SURFACE, OCEAN_FLOOR_WG, OCEAN_FLOOR, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES] {
+        let saved = data.heightmaps[usize.wrap(kind)].take() else continue
+        let got = saved.len()
+        if let want = chunk.set_heightmap(kind, saved) {
+            lines.push(Entry.warn("Ignoring heightmap data for chunk {at(pos)}, size does not match; expected: {want}, got: {got}"))
+            chunk.prime_heightmaps(context.table, [kind])
+        }
+        var left = List<i32>()
+        for k in to_prime {
+            if k != kind {
+                left.push(k)
+            }
+        }
+        to_prime = left
+    }
+    chunk.prime_heightmaps(context.table, to_prime)
+    return Loaded.Saved(chunk, light_of(sky, block))
+}
+
+// The light a chunk's saved layers send, as vanilla's light packet sends each layer its engine
+// has: in the mask, with its data, from the section below the world up. The masks of empty
+// layers, which come from the sections next to blocks, wait for the light engine (CAL-66).
+fn light_of(sky: own List<List<u8>?>, block: own List<List<u8>?>) -> LightData {
+    var sky_layers = sky
+    var block_layers = block
+    var sky_bits = List<bool>()
+    var block_bits = List<bool>()
+    let sky_data = layers(mut sky_layers, mut sky_bits)
+    let block_data = layers(mut block_layers, mut block_bits)
+    return LightData { sky_mask: mask(sky_bits), block_mask: mask(block_bits), empty_sky_mask: [], empty_block_mask: [], sky: sky_data, block: block_data }
+}
+
+// The layers there are, from the lowest, with a bit in `bits` for each place, set where there's
+// one.
+fn layers(from: mut List<List<u8>?>, bits: mut List<bool>) -> List<LightLayer> {
+    var out = List<LightLayer>()
+    for i in 0..from.len() {
+        if let data = from[i].take() {
+            bits.push(true)
+            out.push(LightLayer { data: data })
+        } else {
+            bits.push(false)
+        }
+    }
+    return out
+}
+
+// The bits as `BitSet.toByteArray` gives them: 8 to a byte from the lowest, low bit first, with
+// no zero bytes at the end.
+fn mask(bits: List<bool>) -> List<u8> {
+    var out = List<u8>()
+    for i in 0..bits.len() {
+        if i % 8 == 0 {
+            out.push(0)
+        }
+        if bits[i] {
+            let last = out.len() - 1
+            out[last] = out[last] | u8.wrap(1 << i32.wrap(i % 8))
+        }
+    }
+    while not out.is_empty() and out[out.len() - 1] == 0 {
+        _ = out.pop()
+    }
+    return out
+}
+
+fn nibbles(layer: List<i8>) -> List<u8> {
+    var out = List<u8>()
+    for b in layer {
+        out.push(u8.wrap(b))
+    }
+    return out
+}
+
+// What a read that failed logs: the IO worker's warning, then the server's error.
+fn failed_read(pos: ChunkPos, e: ReadError, lines: mut List<Entry>) {
+    _ = e
+    lines.push(Entry.warn("Failed to read chunk {at(pos)}").on(io_thread()))
+    lines.push(failed_load(pos))
+}
+
+// `reportChunkLoadFailure`'s line.
+fn failed_load(pos: ChunkPos) -> Entry {
+    return Entry.error("Failed to load chunk {pos.x},{pos.z}")
+}
+
+// A chunk's position as `ChunkPos.toString` writes it.
+fn at(pos: ChunkPos) -> String {
+    return "[{pos.x}, {pos.z}]"
+}
+
+// Adds `from` to `to`, each on `thread`.
+fn on(from: List<Entry>, thread: String, to: mut List<Entry>) {
+    for e in from {
+        to.push(e.copy().on(thread.copy()))
+    }
+}
+
+// --- The threads ---
+
+// What the IO thread is asked.
+enum Ask {
+    Region(ChunkPos)
+    Chunk(ChunkPos)
+}
+
+// A chunk the IO thread read, on its way to a worker.
+struct Work {
+    pos: ChunkPos
+    lines: List<Entry>
+    read: ChunkRead
+}
+
+// The IO thread: it owns the region files, and reads what it's asked, in the order it's asked.
+struct IoThread {
+    storage: RegionStorage
+    asks: Receiver<Ask>
+    work: Sender<Work>
+    done: Sender<Done>
+    waker: Waker
+}
+
+impl Task for IoThread {
+    fn run(own self) {
+        var storage = self.storage
+        var asks = self.asks
+        var work = self.work
+        var done = self.done
+        while let ask = asks.wait() {
+            match ask {
+                Ask.Region(region) => {
+                    var logged = List<Entry>()
+                    let presence = storage.presence(region, mut logged)
+                    var lines = List<Entry>()
+                    on(logged, io_thread(), mut lines)
+                    done.send(Done.Region(region, lines, presence))
+                    self.waker.wake()
+                },
+                Ask.Chunk(pos) => {
+                    var logged = List<Entry>()
+                    let read = storage.read_chunk(pos, mut logged)
+                    var lines = List<Entry>()
+                    on(logged, io_thread(), mut lines)
+                    work.send(Work { pos: pos, lines: lines, read: read })
+                },
+            }
+        }
+    }
+}
+
+// A chunk worker: it makes each chunk the IO thread read, sends it back, and wakes the poll.
+struct ChunkWorker {
+    context: ChunkContext
+    work: Receiver<Work>
+    done: Sender<Done>
+    waker: Waker
+}
+
+impl Task for ChunkWorker {
+    fn run(own self) {
+        var work = self.work
+        var done = self.done
+        while let w = work.wait() {
+            var lines = List<Entry>()
+            let loaded = prepare(w.pos, w.read, self.context, mut lines)
+            done.send(Done.Chunk(w.pos, w.lines, w.read, lines, loaded))
+            self.waker.wake()
+        }
+    }
+}
+
+/// The IO thread and the chunk workers, and the queues to and from them, which start with the
+/// first thing asked.
+pub struct ChunkJobs {
+    context: ChunkContext
+    // The region files, until the IO thread takes them, and what wakes the poll.
+    storage: RegionStorage?
+    waker: Waker
+    asks: Receiver<Ask>
+    to_asks: Sender<Ask>
+    work: Receiver<Work>
+    to_work: Sender<Work>
+    done: Receiver<Done>
+    to_done: Sender<Done>
+    started: usize
+    most: usize
+    // How many chunks are asked for and not back, and how many regions.
+    chunks_away: usize
+    regions_away: usize
+}
+
+impl ChunkJobs {
+    /// The jobs for the region files in `folder`, which make chunks with `context` and wake the
+    /// server's poll with `waker` as each is done.
+    pub fn new(folder: String, context: own ChunkContext, waker: Waker) -> ChunkJobs {
+        let asks = Receiver<Ask>()
+        let to_asks = asks.sender()
+        let work = Receiver<Work>()
+        let to_work = work.sender()
+        let done = Receiver<Done>()
+        let to_done = done.sender()
+        let processors = unsafe { workers() }
+        var most = if processors > 2 { processors - 1 } else { 1 }
+        if most > MOST_WORKERS {
+            most = MOST_WORKERS
+        }
+        return ChunkJobs {
+            context: context,
+            storage: some(RegionStorage.new(folder, false)),
+            waker: waker,
+            asks: asks,
+            to_asks: to_asks,
+            work: work,
+            to_work: to_work,
+            done: done,
+            to_done: to_done,
+            started: 0,
+            most: most,
+            chunks_away: 0,
+            regions_away: 0,
+        }
+    }
+
+    /// Asks which chunks `region`'s file has.
+    pub fn ask_region(mut self, region: ChunkPos) {
+        self.start()
+        self.to_asks.send(Ask.Region(region))
+        self.regions_away += 1
+    }
+
+    /// Asks for the chunk at `pos`, starting another worker if each started has a chunk.
+    pub fn ask_chunk(mut self, pos: ChunkPos) {
+        self.start()
+        if self.chunks_away >= self.started and self.started < self.most {
+            _ = unsafe { Thread.spawn(ChunkWorker { context: self.context.copy(), work: self.work.share(), done: self.to_done.share(), waker: self.waker }) }
+            self.started += 1
+        }
+        self.to_asks.send(Ask.Chunk(pos))
+        self.chunks_away += 1
+    }
+
+    /// What's come back since this was last asked, in the order it came.
+    pub fn take_done(mut self) -> Deque<Done> {
+        var back = Deque<Done>()
+        while let d = self.done.next() {
+            match d {
+                Done.Region(_, _, _) => self.regions_away -= 1,
+                Done.Chunk(_, _, _, _, _) => self.chunks_away -= 1,
+            }
+            back.push_last(d)
+        }
+        return back
+    }
+
+    /// How many chunks and regions are asked for and not back.
+    pub fn away(self) -> usize {
+        return self.chunks_away + self.regions_away
+    }
+
+    /// How many chunk workers have started.
+    pub fn threads(self) -> usize {
+        return self.started
+    }
+
+    // Starts the IO thread, if it hasn't.
+    fn start(mut self) {
+        let storage = self.storage.take() else return
+        _ = unsafe { Thread.spawn(IoThread { storage: storage, asks: self.asks.share(), work: self.to_work.share(), done: self.to_done.share(), waker: self.waker }) }
+    }
+}

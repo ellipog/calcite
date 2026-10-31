@@ -1,6 +1,6 @@
 """A real client's join: Mojang's own 26.3 client joins Calcite, walks, jumps and chats.
 
-    py -I rig/runner/realclient.py [--online NAME] [--server PATH] [--message TEXT] [--keep-open SECONDS]
+    py -I rig/runner/realclient.py [--online NAME] [--server PATH] [--world PATH] [--message TEXT] [--keep-open SECONDS]
 
 The protocol suites and the tests play the client's side with Calcite's own code, so this is
 the one check where the other end is the game itself. Calcite runs from its release build,
@@ -10,6 +10,10 @@ App or Prism Launcher, each checked against the SHA-1 in 26.3's version file, wi
 game folder of its own beside the server's, with its sound off and the first-run screens
 skipped. It joins with --quickPlayMultiplayer. Nothing of Mojang's is copied: the client runs
 from the launcher's files.
+
+With --world PATH, the server's world is a copy of the world folder at PATH, such as one vanilla
+saved in the rig's scratch folders, so the client is sent the chunks it saved, read from its
+region files. Without it, the world is new, and every chunk flat.
 
 Without --online, the server is offline and the client is player RealClient, with no account.
 With --online NAME, the server is in online mode, and the client plays as the Modrinth App's
@@ -269,7 +273,7 @@ class Process:
         return None
 
 
-def prepare(server_dir, game, online):
+def prepare(server_dir, game, online, world):
     for folder in (server_dir, game / "screenshots"):
         if folder.exists():
             shutil.rmtree(folder)
@@ -278,6 +282,8 @@ def prepare(server_dir, game, online):
         f"online-mode={str(online).lower()}\nserver-ip=127.0.0.1\nserver-port={PORT}\ngamemode=creative\n"
         "white-list=false\nview-distance=8\nmotd=Calcite and a real client\n", encoding="utf-8")
     (server_dir / "calcite.properties").write_text("console-dashboard=off\n", encoding="utf-8")
+    if world:
+        shutil.copytree(world, server_dir / "world", ignore=shutil.ignore_patterns("session.lock"))
     game.mkdir(parents=True, exist_ok=True)
     (game / "options.txt").write_text(
         "onboardAccessibility:false\njoinedFirstServer:true\nskipMultiplayerWarning:true\n"
@@ -312,6 +318,7 @@ def main():
     parser = argparse.ArgumentParser(description="Mojang's 26.3 client joins Calcite, walks and chats.")
     parser.add_argument("--online", metavar="NAME", help="play as the Modrinth App's account NAME, in online mode")
     parser.add_argument("--server", default=str(CALCITE / "build" / "server" / f"calcite{EXE}"))
+    parser.add_argument("--world", help="a world folder to copy in as the server's world")
     parser.add_argument("--message", default="hello from a real client",
                         help="what the client says: small letters and spaces")
     parser.add_argument("--keep-open", type=float, default=0, help="seconds to leave the client in the game at the end")
@@ -328,7 +335,9 @@ def main():
     player = online_player(args.online) if args.online else offline_player()
     print(f"player: {player.name}, {'online, with a renewed session' if args.online else 'offline'}")
     command = client_command(spec, java_home, game, player)
-    prepare(server_dir, game, bool(args.online))
+    if args.world and not (Path(args.world) / "level.dat").is_file():
+        sys.exit(f"no level.dat in {args.world}")
+    prepare(server_dir, game, bool(args.online), args.world)
 
     server = Process([str(server_exe)], server_dir, OUT / "server.log")
     done = server.wait_for("Done (", 60)

@@ -28,8 +28,10 @@ import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import resources.identifier.{Identifier}
 import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
+import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
 import server.configuration.{Configuration}
+import server.level.{Level, SPAWN_RADIUS}
 import server.link.{Input, Link, Report}
 import server.log.{Entry, Look}
 import server.sending.{Outbox, Sending}
@@ -205,6 +207,11 @@ struct Connection {
     ticks: i32 = 0
     received: i32 = 0
     average_received: f32 = 0.0
+    // Whether the spawn task has added its ticket, and whether the chunks around the spawn are
+    // full, after which each configuration tick adds the ticket again, as vanilla's
+    // `PrepareSpawnTask` goes from `Preparing` to `Ready`.
+    spawning: bool = false
+    spawn_ready: bool = false
 }
 
 // A player in the world, as their `ServerPlayer` and its listener hold them.
@@ -229,6 +236,10 @@ struct Player {
     center_x: i32 = 0
     center_z: i32 = 0
     view: i32 = 0
+    // The section the player's tickets were last put in, `lastSectionPos`.
+    section_x: i32 = 0
+    section_y: i32 = 0
+    section_z: i32 = 0
     sender: ChunkSender = ChunkSender()
     // The view distance the client last asked for that was logged, for `force-view-distance`.
     asked: i32 = -1
@@ -285,8 +296,10 @@ pub struct Network {
     session: Uuid?
     // What configuration sends every player.
     configuration: Configuration
-    // The world players join, the last entity ID given out, and the server's ticks.
+    // The world players join and its chunks, the last entity ID given out, and the server's
+    // ticks.
     world: World
+    level: Level
     // Every player's chunks nearest first, for the widest view yet.
     spiral: Spiral
     entity_ids: i32
@@ -319,7 +332,10 @@ impl Network {
     /// and lets them into `world`. Only an online login needs the key pair, so the first waits
     /// for it, and the server can listen while another thread makes it.
     pub fn new(link: own Link, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, keys: own Receiver<RsaKey>, configuration: own Configuration, world: own World) -> Network {
-        var network = Network { link: link, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, spiral: Spiral(), entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>(), sending: Sending.new(), to_flush: List<Conn>(), last_logins: Map<String, u64>(), access: Access.empty(false), halted: false }
+        // The tickets reach the view distance, as `setServerViewDistance` has them. Vanilla
+        // keeps it from 2 to 32, and Calcite doesn't yet (CAL-58); past 32 is the same as 32.
+        let level = Level.new(world.settings.chunk_radius(), world.settings.simulation_distance)
+        var network = Network { link: link, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, level: level, spiral: Spiral(), entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>(), sending: Sending.new(), to_flush: List<Conn>(), last_logins: Map<String, u64>(), access: Access.empty(false), halted: false }
         network.rebuild_status()
         return network
     }
@@ -327,6 +343,37 @@ impl Network {
     /// Sets who may join, which is everyone until it's set.
     pub fn set_access(mut self, access: own Access) {
         self.access = access
+    }
+
+    /// Reads the overworld's chunks from the region files in `regions` from now on, as the
+    /// world's folder is open, on an IO thread and chunk workers that start with the first
+    /// chunk. Replaying, there's no folder, and `regions` is `none`: the chunks the recording
+    /// read come from its log, if it read any. Until this, every chunk is generated flat, and
+    /// they all are if the world was made without its registries, as a test's, or there's
+    /// nothing to wake the server's poll with as they're read.
+    pub fn open_world(mut self, regions: String?) {
+        var context: ChunkContext? = none
+        if let c = self.world.context {
+            context = some(c.copy())
+        }
+        var jobs: ChunkJobs? = none
+        var reads = false
+        if let folder = regions {
+            if let made = context {
+                match self.link.waker() {
+                    ok(waker) => {
+                        jobs = some(ChunkJobs.new(folder.copy(), made.copy(), waker))
+                        reads = true
+                    },
+                    err(_) => self.logs.push(Entry.error("Can't read the world's chunks, so they're generated: there's nothing to wake the server's poll with")),
+                }
+            }
+        }
+        if not self.link.world(reads) {
+            return
+        }
+        let made = context else return
+        self.level.open(jobs, made)
     }
 
     /// Sets the wall clock's time, which the caller reads before it hands over what happened, as
@@ -393,6 +440,23 @@ impl Network {
             Input.Clock(t) => self.set_clock(t),
             Input.Command(line) => self.command(line),
             Input.Halt => self.halt(),
+            Input.Region(region, lines, presence) => {
+                if not self.level.read_region(region, lines, presence) {
+                    self.link.diverged("the IO thread said which chunks region {region.x}, {region.z} has, which the server didn't ask")
+                }
+                self.level_lines()
+                self.level.dispatch()
+            },
+            Input.Chunk(pos, io, bytes) => {
+                // What the workers made of what the IO thread read is made again here, from it.
+                var made = List<Entry>()
+                let loaded = self.level.make(pos, bytes, mut made)
+                if not self.level.read_chunk(pos, io, loaded, made) {
+                    self.link.diverged("the IO thread read chunk {pos.x}, {pos.z}, which the server didn't ask for")
+                }
+                self.level_lines()
+                self.level.dispatch()
+            },
         }
         return true
     }
@@ -575,6 +639,7 @@ impl Network {
             Event.Connected(_) => return false,
             Event.Woken => {
                 self.sent()
+                self.chunks_read()
                 self.flush()
                 return false
             },
@@ -583,10 +648,11 @@ impl Network {
 
     /// One server tick, at `now` nanoseconds on the caller's clock, as vanilla's
     /// `MinecraftServer.tickChildren` runs the parts this has: every 20 ticks the players are
-    /// told the world's time, which then moves on a tick; each login, configuration and player
-    /// moves on, as its listener's `tick` moves it, once the checks with the session server that
-    /// are done have been acted on, and every connection ticks its second; then each player is
-    /// sent the chunks that are due. Mojang's services are fetched from as they're due.
+    /// told the world's time, which then moves on a tick, and the world's chunks tick; each
+    /// login, configuration and player moves on, as its listener's `tick` moves it, once the
+    /// checks with the session server that are done have been acted on, and every connection
+    /// ticks its second; then each player is sent the chunks that are due. Mojang's services are
+    /// fetched from as they're due.
     pub fn tick(mut self, now: u64) {
         self.link.tick(now)
         self.services.tick(now, mut self.logs, mut self.link)
@@ -603,6 +669,9 @@ impl Network {
             self.forget_logins(now)
         }
         self.world.game_time += 1
+        self.level.tick()
+        self.level_lines()
+        self.level.dispatch()
         for i in 0..self.connections.len() {
             var con = self.connections[i].take() else continue
             if not con.closing {
@@ -624,6 +693,8 @@ impl Network {
             self.send_chunks(mut con)
             self.connections[i] = some(con)
         }
+        // The far chunks the players' senders came to are read.
+        self.level.dispatch()
         if self.open() == 0 {
             self.session = none
         }
@@ -1257,11 +1328,24 @@ impl Network {
         if not self.keep_alive(mut con, now) {
             return
         }
+        // The spawn ticket loads the chunks 3 around the spawn, and the player's place is ready
+        // once they're full, which in a flat world, or one whose chunks are read before the
+        // tick, is the first tick, as soon as vanilla's can be.
         if is(con.task, Task.PrepareSpawn) {
-            // The flat world's chunks need no loading, so the player's place is ready on the
-            // first tick, which is as soon as vanilla's can be.
-            con.task = none
-            self.next_task(mut con)
+            if not con.spawning {
+                con.spawning = true
+                self.level.load_spawn(spawn_chunk())
+                self.level_lines()
+                self.level.dispatch()
+            }
+            if self.level.full_around(spawn_chunk(), SPAWN_RADIUS) {
+                con.spawn_ready = true
+                con.task = none
+                self.next_task(mut con)
+            }
+        }
+        if con.spawn_ready {
+            self.level.keep_spawn(spawn_chunk())
         }
     }
 
@@ -1480,7 +1564,15 @@ impl Network {
         self.send(mut con, ClientboundGameEvent { event: LEVEL_CHUNKS_LOAD_START, param: 0.0 }, State.Play)
         self.send(mut con, ClientboundTickingState { tick_rate: 20.0, frozen: false }, State.Play)
         self.send(mut con, ClientboundTickingStep { steps: 0 }, State.Play)
+        // The player's tickets go in their section, then their view, as `updatePlayerStatus`
+        // adds them, and the chunks they come to load.
+        let chunk = ChunkPos.containing(con.player.x, con.player.z)
+        con.player.section_x = chunk.x
+        con.player.section_y = section(con.player.y)
+        con.player.section_z = chunk.z
+        self.level.add_player(chunk, id)
         self.track(mut con, true)
+        self.settle()
         self.send(mut con, ClientboundPostEffects { effects: [] }, State.Play)
         // The inventory menu's 46 slots, all empty, with its first state.
         var slots = List<ItemStack>()
@@ -1582,9 +1674,16 @@ impl Network {
         }
     }
 
-    // A chunk left the player's view, as `PlayerChunkSender.dropChunk`.
+    // A chunk left the player's view, as `PlayerChunkSender.dropChunk`: the client is told to
+    // forget it unless it's waiting to be sent, which, near the player, is once it's ready. A far
+    // chunk read for the player goes, and is forgotten only if it was sent.
     fn forget(mut self, con: mut Connection, c: ChunkPos) {
-        if con.player.sender.drop_chunk(ChunkPos { x: c.x, z: c.z }) {
+        let near = con.player.sender.near(c)
+        let sent = con.player.sender.drop_chunk(c)
+        if not near {
+            self.level.forget_far(c, con.player.entity_id)
+        }
+        if sent or (near and not self.level.sendable(c)) {
             self.send(mut con, ClientboundForgetLevelChunk { pos: c }, State.Play)
         }
     }
@@ -1598,15 +1697,16 @@ impl Network {
         con.player.command_spam.tick()
     }
 
-    // Sends the player the chunks due this tick, as a batch, as `sendNextChunks`.
+    // Sends the player the chunks due this tick that are ready, as a batch, as `sendNextChunks`.
     fn send_chunks(mut self, con: mut Connection) {
-        let batch = con.player.sender.next_batch(mut self.spiral)
+        self.level.serve(con.player.entity_id)
+        let batch = con.player.sender.next_batch(mut self.spiral, mut self.level)
         if batch.is_empty() {
             return
         }
         self.send(mut con, ClientboundChunkBatchStart {}, State.Play)
         for c in batch {
-            let p = self.world.flat.chunk_packet(c.x, c.z)
+            let p = self.level.packet(c, self.world.flat)
             self.send_bytes(mut con, p)
         }
         self.send(mut con, ClientboundChunkBatchFinished { batch_size: i32.wrap(batch.len()) }, State.Play)
@@ -2019,7 +2119,58 @@ impl Network {
         con.player.z = clamp_f64(z, -30000000.0, 30000000.0)
         con.player.y_rot = wrap_degrees(y_rot)
         con.player.x_rot = wrap_degrees(x_rot)
+        // In another section, the player's tickets move with them, then their view, as
+        // `ChunkMap.move` moves them, and what that comes to loads.
+        let chunk = ChunkPos.containing(con.player.x, con.player.z)
+        let height = section(con.player.y)
+        if chunk.x != con.player.section_x or height != con.player.section_y or chunk.z != con.player.section_z {
+            self.level.move_player(ChunkPos { x: con.player.section_x, z: con.player.section_z }, chunk, con.player.entity_id)
+            con.player.section_x = chunk.x
+            con.player.section_y = height
+            con.player.section_z = chunk.z
+            self.track(mut con, false)
+            self.settle()
+            return
+        }
         self.track(mut con, false)
+    }
+
+    // Runs the world's distance manager until it settles, takes what it logged, and hands what
+    // it's to read to the IO thread.
+    fn settle(mut self) {
+        self.level.pump()
+        self.level_lines()
+        self.level.dispatch()
+    }
+
+    // Takes what the world logged.
+    fn level_lines(mut self) {
+        for e in self.level.take_lines() {
+            self.logs.push(e.copy())
+        }
+    }
+
+    // Takes in what the IO thread and chunk workers have done, recording what the IO thread
+    // read, as the server's loop hands it over, then what it comes to (D178).
+    fn chunks_read(mut self) {
+        var done = self.level.take_done()
+        if done.is_empty() {
+            return
+        }
+        while let d = done.pop_first() {
+            match d {
+                Done.Region(region, lines, presence) => {
+                    self.link.region_read(region, lines, presence)
+                    _ = self.level.read_region(region, lines, presence)
+                },
+                Done.Chunk(pos, io, bytes, made, loaded) => {
+                    self.link.chunk_read(pos, io, bytes)
+                    _ = self.level.read_chunk(pos, io, loaded, made)
+                },
+            }
+            self.level_lines()
+        }
+        self.level.dispatch()
     }
 
     // Sends a packet, its ID and fields, to every player in the world but the one being handled.
@@ -2133,6 +2284,11 @@ impl Network {
             profile = some(p.copy())
         }
         let p = profile else return
+        // Their tickets go, and the far chunks read for them, as `updatePlayerStatus` takes
+        // them out.
+        self.level.remove_player(ChunkPos { x: con.player.section_x, z: con.player.section_z }, con.player.entity_id)
+        self.level.forget_player(con.player.entity_id)
+        self.settle()
         let message = Component.translatable("multiplayer.player.left", [display_name(p)]).colored("yellow")
         self.broadcast_system(message, Look.Quiet)
         self.broadcast(encode_play(ClientboundPlayerInfoRemove { profile_ids: [p.id] }))
@@ -2236,6 +2392,17 @@ fn live_session(con: Connection, now: i64) -> ChatSession? {
 }
 
 // A play packet's ID and fields.
+// The chunk a joining player's spawn ticket is at: the spawn's, at 0, 0, as Calcite has no spawn
+// finder yet.
+fn spawn_chunk() -> ChunkPos {
+    return ChunkPos { x: 0, z: 0 }
+}
+
+// The section a height is in, as `SectionPos.blockToSectionCoord` of its block.
+fn section(y: f64) -> i32 {
+    return i32.saturate(y.floor()) >> 4
+}
+
 fn encode_play<T: Wire + Packet>(p: T) -> List<u8> {
     var w = Writer.new()
     write_packet(p, State.Play, mut w)
