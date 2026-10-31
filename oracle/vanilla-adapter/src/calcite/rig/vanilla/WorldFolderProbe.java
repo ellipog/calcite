@@ -89,7 +89,7 @@ final class WorldFolderProbe implements Probe {
 
     @Override
     public int version() {
-        return 4;
+        return 5;
     }
 
     // Logs as `PlayerAdvancements` and `ServerStatsCounter` log, for the parts of them run here.
@@ -133,6 +133,28 @@ final class WorldFolderProbe implements Probe {
                     case "dir" -> {
                         expect(op, k, 1);
                         Files.createDirectories(inside(world, op, k));
+                        lines.write(out);
+                    }
+                    case "link" -> {
+                        expect(op, k, 2);
+                        String at = Args.asString(op.get(1), "operation " + k + "'s name");
+                        Path link = at.isEmpty() ? world : inside(world, op, k);
+                        String target = Args.asString(op.get(2), "operation " + k + "'s target").replace("<folder>", lines.folder);
+                        Path to = Path.of(target);
+                        if (target.isEmpty() || !to.toString().equals(target)) {
+                            throw new CaseError("operation " + k + ": `" + target + "` isn't a path as Java writes one");
+                        }
+                        Files.createDirectories(link.getParent());
+                        Files.createSymbolicLink(link, to);
+                        lines.write(out);
+                    }
+                    case "allow" -> {
+                        expect(op, k, 1);
+                        int blob = Args.asInt(op.get(1), "operation " + k + "'s blob");
+                        if (blob < 0 || blob >= blobs.size()) {
+                            throw new CaseError("operation " + k + ": no blob " + blob);
+                        }
+                        Files.write(universe.resolve("allowed_symlinks.txt"), replaced(blobs.get(blob), lines.folder));
                         lines.write(out);
                     }
                     case "open" -> {
@@ -601,6 +623,28 @@ final class WorldFolderProbe implements Probe {
                 out.write(shown);
             }
         }
+    }
+
+    // The bytes with each `<folder>` in them replaced by the universe's path and a separator.
+    private static byte[] replaced(byte[] bytes, String folder) {
+        byte[] mark = "<folder>".getBytes(StandardCharsets.UTF_8);
+        byte[] with = folder.getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        int i = 0;
+        while (i < bytes.length) {
+            boolean here = i + mark.length <= bytes.length;
+            for (int j = 0; here && j < mark.length; j++) {
+                here = bytes[i + j] == mark[j];
+            }
+            if (here) {
+                out.writeBytes(with);
+                i += mark.length;
+            } else {
+                out.write(bytes[i]);
+                i++;
+            }
+        }
+        return out.toByteArray();
     }
 
     private static void text(DataOutputStream out, String text) throws IOException {

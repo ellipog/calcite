@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CASE_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+# The systems a case can be for, when vanilla gives each its own result, as PLATFORM names them.
+SYSTEMS = ("windows", "linux")
 MASK64 = (1 << 64) - 1
 
 
@@ -23,6 +25,8 @@ class Case:
     input: dict
     blobs: tuple
     source: Path
+    # The one system the case runs on, or None for every system.
+    system: str = None
 
     @property
     def key(self):
@@ -154,7 +158,10 @@ def load_file(path):
             blobs = tuple(expand_blob(b) for b in raw.get("blobs", []))
         except (CaseFileError, ValueError, KeyError, struct.error) as e:
             raise CaseFileError(f"{path}: case `{cid}`: {e}") from e
-        cases.append(Case(probe, version, cid, raw.get("input", {}), blobs, Path(path)))
+        system = raw.get("system")
+        if system is not None and system not in SYSTEMS:
+            raise CaseFileError(f"{path}: case `{cid}`: `system` is {system!r}, not one of {', '.join(SYSTEMS)}")
+        cases.append(Case(probe, version, cid, raw.get("input", {}), blobs, Path(path), system))
     return probe, cases
 
 

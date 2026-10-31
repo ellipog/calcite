@@ -106,6 +106,11 @@ class Session:
         self.adapter.close()
 
 
+def here(case):
+    """Whether the case runs on this system: it's for every system, or for this one."""
+    return case.system is None or case.system == PLATFORM
+
+
 def load_cases(probes):
     try:
         return cases_mod.load_all(ROOT / "cases", probes)
@@ -180,7 +185,10 @@ def _record(args, config):
         for probe, cases in by_probe.items():
             started = time.time()
             records, problems = [], []
+            elsewhere = {case.id for case in cases if not here(case)}
             for case in cases:
+                if case.id in elsewhere:
+                    continue
                 result = session.run(case)
                 if result.status != "ok":
                     lines = (result.message or "").strip().splitlines()
@@ -197,13 +205,18 @@ def _record(args, config):
             hashes = {cid: r.digest() for cid, r in records if f"{probe}:{cid}" not in quarantine}
             changed = [cid for cid, h in hashes.items() if cid in old and old[cid] != h]
             added = sum(1 for cid in hashes if cid not in old)
-            removed = sum(1 for cid in old if cid not in hashes)
+            removed = sum(1 for cid in old if cid not in hashes and cid not in elsewhere)
+            recorded = len(hashes)
+            # Another system's cases keep the hashes it recorded.
+            hashes.update({cid: h for cid, h in old.items() if cid in elsewhere})
             store.save_golden(probe, records)
-            store.save_expected(probe, cases[0].probe_version, session.about, hashes)
-            skipped = len(records) - len(hashes)
-            print(f"{probe}: recorded {len(hashes)} cases in {time.time() - started:.1f}s"
+            if records or hashes:
+                store.save_expected(probe, cases[0].probe_version, session.about, hashes)
+            skipped = len(records) - recorded
+            print(f"{probe}: recorded {recorded} cases in {time.time() - started:.1f}s"
                   f" ({added} new, {len(changed)} changed, {removed} removed"
-                  f"{f', {skipped} quarantined' if skipped else ''})")
+                  f"{f', {skipped} quarantined' if skipped else ''}"
+                  f"{f', {len(elsewhere)} for another system' if elsewhere else ''})")
             for cid in changed[:20]:
                 print(f"  changed: {probe}:{cid}")
     finally:
@@ -222,7 +235,7 @@ def _run_variant(name, config, by_probe, expected_by_probe, quarantine):
             random.Random(20261027).shuffle(work)
         for case in work:
             expected = expected_by_probe[case.probe].get(case.id)
-            if expected is None or case.key in quarantine:
+            if expected is None or case.key in quarantine or not here(case):
                 continue
             result = session.run(case)
             if variant.get("twice") and result.status == "ok":
@@ -253,7 +266,7 @@ def cmd_check(args):
         store = Store(ROOT, args.version, config)
         quarantine = store.quarantine()
         expected = {probe: store.expected(probe) for probe in by_probe}
-        unrecorded = [c.key for cases in by_probe.values() for c in cases if c.id not in expected[c.probe]]
+        unrecorded = [c.key for cases in by_probe.values() for c in cases if c.id not in expected[c.probe] and here(c)]
         print(f"== {config}")
         if unrecorded:
             print(f"check: {len(unrecorded)} cases have no expected hash yet; run `record` first. First: {unrecorded[0]}")
@@ -278,7 +291,9 @@ def cmd_check(args):
     sys.exit(1)
 
 
-OUTCOMES = ("pass", "fail", "difference", "unimplemented", "error", "quarantined", "unrecorded")
+OUTCOMES = ("pass", "fail", "difference", "unimplemented", "error", "quarantined", "unrecorded", "elsewhere")
+# Outcomes that don't count toward a score.
+UNSCORED = ("difference", "quarantined", "unrecorded", "elsewhere")
 RIG_PROBES = {"ping"}
 
 
@@ -298,6 +313,9 @@ def cmd_score(args):
             expected = store.expected(probe)
             theirs = {o.config: o.expected(probe) for o in others}
             for case in cases:
+                if not here(case):
+                    outcomes[case.key] = "elsewhere"
+                    continue
                 if case.key in quarantine:
                     outcomes[case.key] = "quarantined"
                     continue
@@ -345,7 +363,7 @@ def cmd_score(args):
     for probe, n, counts in rows + [("**All game probes**", sum(r[1] for r in game), total)]:
         if probe in RIG_PROBES:
             probe += " (rig)"
-        scored = n - counts["difference"] - counts["quarantined"] - counts["unrecorded"]
+        scored = n - sum(counts[o] for o in UNSCORED)
         score = f"{100 * counts['pass'] / scored:.1f}%" if scored else "-"
         print(f"| {probe} | {n} | {' | '.join(str(counts[o]) for o in OUTCOMES)} | {score} |")
 

@@ -114,6 +114,7 @@ Case inputs are committed in `cases/<probe>/<group>.json`:
 - `id` is unique within the probe, and uses only `a-z`, `0-9`, `.`, `_` and `-`.
 - A case with blobs lists them in `"blobs"`. Each is base64, or a readable form such as `{"f64": ["1.5", "nan"]}` or a seeded generator, which the runner expands to bytes before sending. Adapters only ever see bytes. The forms are listed in [`README.md`](README.md#blobs-in-case-files).
 - Generated case files say what generated them in a top-level `"generated_by"` field, and the generator is committed beside them with its seed.
+- A case that only one system can run, such as one that makes symbolic links, which Windows doesn't let most users make, or one whose paths only one system writes, says so with `"system": "windows"` or `"linux"`. On any other system it isn't recorded or run, and scores as elsewhere; its expected hash, recorded on its own system, is kept when the others are recorded again.
 
 ## Probes
 
@@ -405,7 +406,7 @@ The result is one blob: what was logged while it was read and written, as `chunk
 
 Blobs and SNBT that isn't a compound are an `error` status.
 
-### `world_folder` (v4)
+### `world_folder` (v5)
 
 A world's folder, as vanilla's `LevelStorageSource` and its `LevelStorageAccess` keep it, its players' data, as `PlayerDataStorage` keeps it, its saved data, as `SavedDataStorage` keeps it, and its players' advancements and statistics, as `PlayerAdvancements` and `ServerStatsCounter` keep them: operations on `world`, in a new folder of its own, which is the server's folder, the universe. Results go into one blob, each after what its operation logged, as `region` writes them. In what was logged and in names, the folder's path is taken out, `/` goes between names, the time in a `level.dat_corrupted_` file's name becomes `<time>`, and the random number in a new `level<n>.dat` becomes `<n>`, since each is the run's own.
 
@@ -415,7 +416,9 @@ Input `{"ops": [...]}`, with blobs. A name is a path in `world` with `/` between
 | --- | --- |
 | `["put", name, blob]` | nothing: makes the folders on the way, and the file holds the blob |
 | `["dir", name]` | nothing: makes the folder, and the folders on the way |
-| `["open"]` | a byte: 1 if `createDefault(universe).validateAndCreateAccess("world")` opened and locked it; or 0, then what it threw as its class's full name, `: ` and its message, as a message |
+| `["link", name, target]` | nothing: makes a symbolic link at the name, `""` for `world` itself, with the folders on the way, to the target as it's written, which is a path as this system's `Path` writes it, with `<folder>` for the universe's path and its separator |
+| `["allow", blob]` | nothing: the universe's `allowed_symlinks.txt` holds the blob, with `<folder>` in it for the universe's path and its separator |
+| `["open"]` | a byte: 1 if `createDefault(universe).validateAndCreateAccess("world")` read `allowed_symlinks.txt`, found no link in `world` it doesn't allow, and opened and locked it; or 0, then what it threw as its class's full name, `: ` and its message, as a message |
 | `["has"]` | a byte, 1 if `hasWorldData` |
 | `["load"]` | a byte: 0 if `getUnfixedDataTagWithFallback` threw, where `Main` stops; or 1, then an `int` length and the `Data` read, as `NbtIo.write` writes a file's root |
 | `["check"]` | a byte, from `fixAndGetSummaryFromTag` on what was loaded, as `Main` checks it: 0, then what it threw, as `open` writes it; 1 if it `requiresManualConversion`; 2 if it isn't `isCompatible`; or 3, then the `int` data version, `NbtUtils.getDataVersion` |
@@ -428,7 +431,17 @@ Input `{"ops": [...]}`, with blobs. A name is a path in `world` with `/` between
 | `["stats_locate", uuid, name]` | what was logged, then the file `PlayerList.locateStatsFile` gives for the player, as a message, moving one under their name to their UUID's |
 | `["close"]` | `close`, then every file and folder in `world`, sorted by name: an `int` count, then for each its name as a message and a byte, 0 for a file, 1 for a folder and 2 for a file that's gzip and inflates whole, then for a file an `int` length and its bytes, or for a gzipped one what it inflates to. No two deflaters write the same bytes, so a gzipped file is compared by what it holds |
 
-Opening a folder that's open, an operation on one that isn't, `check` and `save` with nothing loaded, a name outside `world`, a UUID, ID or dimension that isn't one, a blob that isn't there or isn't a tag or a JSON object, a kind that isn't `advancements` or `stats`, and an operation it doesn't have are an `error` status. Version 2 added `player_load`, version 3 `saved_load` and `saved_save`, and version 4 `progress_load`, `progress_save` and `stats_locate`.
+Opening a folder that's open, an operation on one that isn't, `check` and `save` with nothing loaded, a name outside `world`, a UUID, ID or dimension that isn't one, a blob that isn't there or isn't a tag or a JSON object, a kind that isn't `advancements` or `stats`, and an operation it doesn't have are an `error` status. Version 2 added `player_load`, version 3 `saved_load` and `saved_save`, version 4 `progress_load`, `progress_save` and `stats_locate`, and version 5 `link` and `allow`. A target that isn't a path as Java writes it is an `error` status too.
+
+### `allow_list` (v1)
+
+`allowed_symlinks.txt`, read as a server reads it as it starts, by `LevelStorageSource.parseValidator`, then asked about each of a list of link targets, as `DirectoryValidator` asks about each link it finds, with the `PathMatcher` it keeps.
+
+Input `{"paths": [...]}`, with the file as the one blob, or no blob for no file. Each path is a link's target as this system's `Path` writes it, so a case says which system it's for.
+
+The result is one blob: what was logged reading the file, as `world_folder` writes it, then for each path what was logged matching it, then a byte, 1 if it's allowed.
+
+More than one blob, and a path that's empty or isn't as Java writes it, are an `error` status.
 
 ### `entities_poi` (v1)
 

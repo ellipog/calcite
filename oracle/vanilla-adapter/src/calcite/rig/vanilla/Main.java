@@ -51,6 +51,7 @@ public final class Main {
                 new ChunkNbtProbe(),
                 new LevelDataProbe(),
                 new WorldFolderProbe(),
+                new AllowListProbe(),
                 new EntitiesPoiProbe(),
                 new TicketsProbe(),
                 new LevelsProbe(),

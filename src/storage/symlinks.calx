@@ -1,0 +1,355 @@
+/// Symbolic links in a world's folder, checked as vanilla checks them before it opens a world:
+/// `allowed_symlinks.txt` in the server's folder, read as `PathAllowList` reads it, says where
+/// a link may lead, and `DirectoryValidator.validateDirectory` walks the world's folder and
+/// lists each link that leads anywhere else, which `ContentValidationException` refuses the
+/// world with. Without the file, no link is allowed.
+///
+/// Each line of the file is one entry: `[prefix]` and a path a link's target must start with,
+/// `[glob]` and a glob (`java.glob`), or `[regex]` and a Java regular expression
+/// (`java.regex`), each matched against the whole target, case-insensitively on Windows. A line
+/// with no `[` first is a prefix, and blank lines and lines starting with `#` are skipped. A
+/// target is matched as `Files.readSymbolicLink` gives it, as it was made.
+module storage.symlinks
+
+import java.character.{is_whitespace}
+import java.glob.{glob_regex}
+import java.regex.{CASE_INSENSITIVE, Pattern, UNICODE_CASE}
+import server.log.{Entry}
+import std.fs.{FsError, Kind, is_dir, is_file, kind, list, read_link, read_text, separator}
+
+const PREFIX: u8 = 0
+const GLOB: u8 = 1
+const REGEX: u8 = 2
+
+struct Rule {
+    kind: u8
+    pattern: String
+}
+
+enum Matcher {
+    Prefix(String)
+    Regex(Pattern)
+}
+
+/// Where links may lead, as vanilla's `PathAllowList`: its entries, compiled the first time
+/// one is matched, as vanilla compiles them.
+pub struct AllowList {
+    rules: List<Rule>
+    compiled: bool
+    // Whether every match is false, since an entry didn't compile.
+    refused: bool
+    matchers: List<Matcher>
+}
+
+impl AllowList {
+    /// No link allowed, vanilla's `NO_SYMLINKS_ALLOWED`.
+    pub fn nothing() -> AllowList {
+        return AllowList { rules: List<Rule>(), compiled: true, refused: true, matchers: List<Matcher>() }
+    }
+
+    /// The entries of `text`, one per line, as `PathAllowList.readPlain` reads them, or the
+    /// message of the `IllegalArgumentException` a line that isn't one throws.
+    pub fn parse(text: String) -> AllowList ! String {
+        var rules = List<Rule>()
+        for line in lines_of(text) {
+            if is_blank(line) or line.starts_with("#") {
+                continue
+            }
+            if not line.starts_with("[") {
+                rules.push(Rule { kind: PREFIX, pattern: line.copy() })
+                continue
+            }
+            let split = line[1..].find("]") else {
+                fail "Unterminated type in line '{line}'"
+            }
+            let named = line[1..split + 1]
+            let contents = line[split + 2..]
+            if named == "glob" {
+                rules.push(Rule { kind: GLOB, pattern: contents })
+            } else if named == "regex" {
+                rules.push(Rule { kind: REGEX, pattern: contents })
+            } else if named == "prefix" {
+                rules.push(Rule { kind: PREFIX, pattern: contents })
+            } else {
+                fail "Unsupported definition type in line '{line}'"
+            }
+        }
+        return AllowList { rules: rules, compiled: false, refused: false, matchers: List<Matcher>() }
+    }
+
+    /// Whether a link may lead to `target`, as it's written. The first call compiles the
+    /// entries, as vanilla's first does, logging `Failed to compile file pattern list` if one
+    /// doesn't, after which nothing matches.
+    pub fn matches(mut self, target: String, lines: mut List<Entry>) -> bool {
+        if not self.compiled {
+            self.compile(mut lines)
+        }
+        if self.refused {
+            return false
+        }
+        for m in self.matchers {
+            let yes = match m {
+                Prefix(p) => target.starts_with(p),
+                Regex(p) => p.matches(target),
+            }
+            if yes {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn compile(mut self, lines: mut List<Entry>) {
+        self.compiled = true
+        let windows = separator() == "\\"
+        let flags: u32 = if windows { CASE_INSENSITIVE | UNICODE_CASE } else { 0 }
+        var matchers = List<Matcher>()
+        var failed = false
+        // A pattern Calcite can't match yet refuses every link too, once the rest compile.
+        var unsupported: String? = none
+        for r in self.rules {
+            if r.kind == PREFIX {
+                matchers.push(Matcher.Prefix(r.pattern.copy()))
+                continue
+            }
+            var regex = r.pattern.copy()
+            if r.kind == GLOB {
+                match glob_regex(r.pattern, windows) {
+                    ok(x) => regex = x,
+                    err(_) => {
+                        failed = true
+                        break
+                    },
+                }
+            }
+            match Pattern.compile(regex, flags) {
+                ok(p) => matchers.push(Matcher.Regex(p)),
+                err(e) => {
+                    if not e.unsupported {
+                        failed = true
+                        break
+                    }
+                    if unsupported == none {
+                        let what = e.description[13..]
+                        unsupported = some("Calcite can't match the pattern `{r.pattern}` in allowed_symlinks.txt yet, which uses {what}, so no symbolic link is allowed")
+                    }
+                },
+            }
+        }
+        if failed {
+            self.refused = true
+            lines.push(Entry.error("Failed to compile file pattern list"))
+        } else if let message = unsupported {
+            self.refused = true
+            lines.push(Entry.error(message))
+        } else {
+            self.matchers = matchers
+        }
+    }
+}
+
+/// The allow list in the file at `path`, as vanilla's `LevelStorageSource.parseValidator`
+/// reads it: none allowed if nothing's there, or if it can't be read, isn't UTF-8 or has a line
+/// that isn't an entry, which logs `Failed to parse allowed_symlinks.txt, disallowing all
+/// symbolic links`.
+pub fn read_allow_list(path: String, lines: mut List<Entry>) -> AllowList {
+    let there = is_file(path) or is_dir(path) or match kind(path) {
+        ok(some(Kind.Other)) => true,
+        _ => false,
+    }
+    if not there {
+        return AllowList.nothing()
+    }
+    match read_text(path) {
+        ok(some(text)) => {
+            match AllowList.parse(text) {
+                ok(a) => return a,
+                err(_) => {},
+            }
+        },
+        _ => {},
+    }
+    lines.push(Entry.error("Failed to parse allowed_symlinks.txt, disallowing all symbolic links"))
+    return AllowList.nothing()
+}
+
+/// A link that leads somewhere it may not: the link, as the walk came to it, and its target.
+pub struct Forbidden {
+    pub link: String
+    pub target: String
+}
+
+/// Why the walk stopped: what `directory` names is a file, or the system failed at `path`.
+pub enum WalkError {
+    NotDirectory
+    Files { error: FsError, path: String }
+}
+
+/// The links in `directory` that `allow` forbids, as vanilla's
+/// `validateDirectory(directory, true)` finds them: none if nothing's there; if it's a link
+/// itself, the links where it leads, as it's written, from the folder the server runs in; and
+/// otherwise each link in it and the folders in it, which aren't followed. A Windows junction
+/// is a folder, as Java takes it. Names are walked in the order Windows lists them, with ASCII
+/// letters uppercased, or elsewhere in the order of their bytes.
+pub fn forbidden_links(directory: String, allow: mut AllowList, lines: mut List<Entry>) -> List<Forbidden> ! WalkError {
+    var found = List<Forbidden>()
+    var start = directory.copy()
+    match kind(directory) {
+        ok(none) => return found,
+        ok(some(Kind.File)) => fail WalkError.NotDirectory,
+        ok(some(Kind.Link)) => {
+            let link = try target_of(directory)
+            if not link.1 {
+                start = link.0
+            }
+        },
+        ok(some(_)) => {},
+        err(e) => fail WalkError.Files { error: e, path: directory.copy() },
+    }
+    try visit(start, mut allow, mut found, mut lines)
+    return found
+}
+
+/// The message `ContentValidationException` gives for the links found in `directory`.
+pub fn refusal(directory: String, found: List<Forbidden>) -> String {
+    var out = "Failed to validate '{directory}'. Found forbidden symlinks: "
+    for k in 0..found.len() {
+        if k > 0 {
+            out.push_str(", ")
+        }
+        out.push_str("{found[k].link}->{found[k].target}")
+    }
+    return out
+}
+
+// What's at `path`, as the walk visits it: checked if it's a link, and looked through if it's a
+// folder.
+fn visit(path: String, allow: mut AllowList, found: mut List<Forbidden>, lines: mut List<Entry>) ! WalkError {
+    let k = match kind(path) {
+        ok(some(k)) => k,
+        ok(none) => fail WalkError.Files { error: FsError.NotFound, path: path.copy() },
+        err(e) => fail WalkError.Files { error: e, path: path.copy() },
+    }
+    match k {
+        Kind.Link => {
+            let link = try target_of(path)
+            if not link.1 {
+                if not allow.matches(link.0, mut lines) {
+                    found.push(Forbidden { link: path.copy(), target: link.0 })
+                }
+                return
+            }
+        },
+        Kind.Dir => {},
+        _ => return,
+    }
+    var names = match list(path) {
+        ok(n) => n,
+        err(e) => fail WalkError.Files { error: e, path: path.copy() },
+    }
+    if separator() == "\\" {
+        sort_as_windows(mut names)
+    }
+    for name in names {
+        try visit(resolve(path, name), mut allow, mut found, mut lines)
+    }
+}
+
+// Where the link at `path` leads, and whether it's a junction.
+fn target_of(path: String) -> (String, bool) ! WalkError {
+    return match read_link(path) {
+        ok(some(link)) => (link.target, link.junction),
+        ok(none) => fail WalkError.Files { error: FsError.NotFound, path: path.copy() },
+        err(e) => fail WalkError.Files { error: e, path: path.copy() },
+    }
+}
+
+// `name` in the folder `dir`, as Java's `Path.resolve` writes it: after a separator, unless
+// `dir` is only a root.
+fn resolve(dir: String, name: String) -> String {
+    let sep = separator()
+    if dir == "/" or (sep == "\\" and is_windows_root(dir)) {
+        return "{dir}{name}"
+    }
+    return "{dir}{sep}{name}"
+}
+
+fn is_windows_root(dir: String) -> bool {
+    let n = dir.len()
+    if n == 1 {
+        return dir == "\\" or dir == "/"
+    }
+    let drive = n >= 2 and dir.byte_at(1) == 58
+    return (n == 2 and drive) or (n == 3 and drive and (dir.byte_at(2) == 92 or dir.byte_at(2) == 47))
+}
+
+// NTFS lists a folder's names by their UTF-16 units, uppercased.
+fn sort_as_windows(names: mut List<String>) {
+    var i: usize = 1
+    while i < names.len() {
+        var j = i
+        while j > 0 and windows_less(names[j], names[j - 1]) {
+            names.swap(j, j - 1)
+            j -= 1
+        }
+        i += 1
+    }
+}
+
+fn windows_less(a: String, b: String) -> bool {
+    var x = List<u32>()
+    for c in a.chars() {
+        x.push(upper(u32(c)))
+    }
+    var y = List<u32>()
+    for c in b.chars() {
+        y.push(upper(u32(c)))
+    }
+    let n = if x.len() < y.len() { x.len() } else { y.len() }
+    for k in 0..n {
+        if x[k] != y[k] {
+            return x[k] < y[k]
+        }
+    }
+    return x.len() < y.len()
+}
+
+fn upper(c: u32) -> u32 {
+    return if c >= 0x61 and c <= 0x7A { c - 32 } else { c }
+}
+
+// The lines of `text`, as `BufferedReader.lines` reads them: ended by `\n`, `\r` or both, and
+// the last one even without an end, unless it's empty.
+fn lines_of(text: String) -> List<String> {
+    var out = List<String>()
+    var start: usize = 0
+    var i: usize = 0
+    let n = text.len()
+    while i < n {
+        let b = text.byte_at(i)
+        if b == 10 or b == 13 {
+            out.push(text[start..i])
+            i += 1
+            if b == 13 and i < n and text.byte_at(i) == 10 {
+                i += 1
+            }
+            start = i
+        } else {
+            i += 1
+        }
+    }
+    if start < n {
+        out.push(text[start..])
+    }
+    return out
+}
+
+// Whether every character is white space, as Java's `String.isBlank` asks.
+fn is_blank(s: String) -> bool {
+    for c in s.chars() {
+        if not is_whitespace(c) {
+            return false
+        }
+    }
+    return true
+}

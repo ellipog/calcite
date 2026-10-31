@@ -457,9 +457,69 @@ def progress():
     return cases
 
 
+def links():
+    """Symbolic links in the world's folder, checked against allowed_symlinks.txt in the server's
+    folder as `validateAndCreateAccess` checks them before it opens the world, and files of
+    entries that can't be read or compiled. `<folder>` in a target or the file is the server's
+    folder, with a separator after it. Making a link takes a privilege Windows doesn't give
+    everyone, so cases with links are Linux's, and each finds one forbidden link at most, since
+    the order a folder lists its names in is the file system's own."""
+    def linux(c):
+        c["system"] = "linux"
+        return c
+
+    def allow(text):
+        return text.encode() if isinstance(text, str) else text
+
+    open_ = [["open"]]
+    region = ["link", "region", "<folder>elsewhere"]
+    cases = []
+    # Read as the server starts, with no links to check: only a file that can't be read logs.
+    for name, text in [("allow-empty", ""), ("allow-comments", "# none\n\n"), ("allow-not-utf8", b"<folder>\n\xff\n"),
+                       ("allow-unterminated", "[glob"), ("allow-unknown-type", "[path]<folder>"),
+                       ("allow-bad-glob-unused", "[glob]{a{b}}"), ("allow-bad-regex-unused", "[regex](")]:
+        cases.append(case(name, [["allow", 0]] + open_ + [["has"]] + CLOSE, [allow(text)]))
+    # Links in the folder.
+    cases.append(linux(case("link-none-allowed", [region] + open_, [])))
+    cases.append(linux(case("link-empty-file", [region, ["allow", 0]] + open_, [b""])))
+    for name, text in [("prefix", "[prefix]<folder>"), ("plain-prefix", "# where links go\n<folder>else"), ("glob", "[glob]<folder>*"),
+                       ("glob-braces", "[glob]<folder>{other,elsewhere}"), ("regex", "[regex]<folder>.*where"),
+                       ("second-entry", "/nowhere\n[regex]x\n[glob]<folder>else*")]:
+        cases.append(linux(case("link-allowed-" + name, [region, ["allow", 0]] + open_ + [["has"]], [allow(text)])))
+    for name, text in [("prefix", "[prefix]<folder>other"), ("glob", "[glob]<folder>*/*"), ("regex", "[regex]<folder>else"),
+                       ("case", "[prefix]<folder>ELSEWHERE"), ("glob-case", "[glob]<folder>ELSE*"), ("regex-case", "[regex]<folder>ELSEWHERE")]:
+        cases.append(linux(case("link-forbidden-" + name, [region, ["allow", 0]] + open_, [allow(text)])))
+    for name, text in [("not-utf8", b"[prefix]<folder>\n\xc3("), ("unterminated", "[prefix]<folder>\n[regex"),
+                       ("unknown-type", "[prefix]<folder>\n[Prefix]<folder>"), ("bad-glob", "[prefix]<folder>\n[glob]{a{b}}"),
+                       ("bad-glob-range", "[glob]<folder>[z-a]\n[prefix]<folder>"), ("bad-regex", "[prefix]<folder>\n[regex](")]:
+        cases.append(linux(case("link-refused-" + name, [region, ["allow", 0]] + open_, [allow(text)])))
+    cases += [
+        linux(case("link-glob-in-name", [["link", "a/b", "<folder>x/y"], ["allow", 0]] + open_, [b"[glob]<folder>*"])),
+        linux(case("link-glob-across-names", [["link", "a/b", "<folder>x/y"], ["allow", 0]] + open_, [b"[glob]<folder>**"])),
+        linux(case("link-relative-forbidden", [["link", "region", "../elsewhere"], ["allow", 0]] + open_, [b"[prefix]<folder>"])),
+        linux(case("link-relative-allowed", [["link", "region", "../elsewhere"], ["allow", 0]] + open_, [b"[prefix].."])),
+        linux(case("link-unnormalized", [["link", "region", "<folder>./x/../elsewhere"], ["allow", 0]] + open_, [b"[glob]<folder>*/*"])),
+        linux(case("link-deep", [["link", "dimensions/minecraft/the_nether/region", "<folder>nether"]] + open_, [])),
+        linux(case("link-one-of-two", [["link", "a", "<folder>yes"], ["link", "b", "<folder>no"], ["allow", 0]] + open_, [b"[prefix]<folder>yes"])),
+        # A link's folder isn't walked into, even when it's allowed.
+        linux(case("link-not-followed", [["link", "a", "<folder>world/inner"], ["link", "inner/b", "<folder>no"], ["allow", 0]] + open_,
+                   [b"[prefix]<folder>world/inner"])),
+        linux(case("link-into-world-saved", [put("real/file", 0), put("real.txt", 0), ["link", "alias", "<folder>world/real"],
+                                             ["link", "alias.txt", "<folder>world/real.txt"], ["allow", 1]] + open_ + [["has"]] + CLOSE,
+                   [b"held", b"[prefix]<folder>world/real"])),
+        # The world's folder itself a link: allowed, and walked from its target as it's written.
+        linux(case("world-link-missing", [["link", "", "<folder>elsewhere"]] + open_, [])),
+        linux(case("world-link-relative-missing", [["link", "", "calcite-no-such-folder"]] + open_, [])),
+        linux(case("world-link-to-file", [["allow", 0], ["link", "", "<folder>allowed_symlinks.txt"]] + open_, [b"# a file"])),
+        linux(case("world-link-to-universe", [["link", "", "<folder>."]] + open_, [])),
+        linux(case("world-link-to-universe-allowed", [["link", "", "<folder>."], ["allow", 0]] + open_ + [["has"]] + CLOSE, [b"[prefix]<folder>"])),
+    ]
+    return cases
+
+
 def main():
-    cases = folders() + broken() + versions() + players() + saved() + progress()
-    write_file(HERE / "generated.json", "world_folder", "cases/world_folder/gen.py", cases, probe_version=4)
+    cases = folders() + broken() + versions() + players() + saved() + progress() + links()
+    write_file(HERE / "generated.json", "world_folder", "cases/world_folder/gen.py", cases, probe_version=5)
 
 
 if __name__ == "__main__":

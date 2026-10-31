@@ -1,0 +1,2569 @@
+/// Regular expressions as Java's `java.util.regex.Pattern` reads and matches them, for
+/// vanilla's `allowed_symlinks.txt`, whose `[regex]` lines are Java patterns matched against
+/// whole paths. A pattern compiles with Java's flags and fails with Java's messages and
+/// indexes, and `matches` gives what `Matcher.matches` gives, backtracking in the same order,
+/// so a pattern that leans on how Java backtracks still agrees.
+///
+/// Written from black-box tests of JDK 25: thousands of random patterns and inputs, each
+/// compiled and matched by Java and by this. What it doesn't do fails to compile with
+/// `unsupported` set, rather than matching differently: Unicode properties and scripts (`\p`
+/// and `\P`), grapheme clusters (`\X` and `\b{g}`), `CANON_EQ`, and the Unicode classes
+/// `UNICODE_CHARACTER_CLASS` gives `\d`, `\s`, `\w`, `\b` and `\B`.
+module java.regex
+
+import java.categories.{is_letter_or_digit, is_non_spacing_mark}
+import java.character.{code_point_of}
+
+/// `Pattern.UNIX_LINES`: only `\n` ends a line, for `.`, `^` and `$`.
+pub const UNIX_LINES: u32 = 1
+/// `Pattern.CASE_INSENSITIVE`: ASCII letters match either case, or every letter with
+/// `UNICODE_CASE`.
+pub const CASE_INSENSITIVE: u32 = 2
+/// `Pattern.COMMENTS`: whitespace and `#` comments in the pattern are skipped.
+pub const COMMENTS: u32 = 4
+/// `Pattern.MULTILINE`: `^` and `$` match at every line, not only the input's ends.
+pub const MULTILINE: u32 = 8
+/// `Pattern.LITERAL`: the pattern is the text to match, with nothing special in it.
+pub const LITERAL: u32 = 16
+/// `Pattern.DOTALL`: `.` matches line terminators too.
+pub const DOTALL: u32 = 32
+/// `Pattern.UNICODE_CASE`: case insensitivity covers every letter, not only ASCII.
+pub const UNICODE_CASE: u32 = 64
+/// `Pattern.CANON_EQ`, which isn't supported.
+pub const CANON_EQ: u32 = 128
+/// `Pattern.UNICODE_CHARACTER_CLASS`, which implies `UNICODE_CASE`. Its classes aren't
+/// supported, so a pattern with `\d`, `\s`, `\w`, `\b` or `\B` fails with it.
+pub const UNICODE_CHARACTER_CLASS: u32 = 256
+
+const NONE: u32 = 0xFFFFFFFF
+const MAX_REPS: i32 = 0x7FFFFFFF
+
+// The nodes every pattern has, at these indexes.
+const ACCEPT: u32 = 0
+const LAST: u32 = 1
+const BEHIND_END: u32 = 2
+
+// How a quantifier takes its repeats.
+const GREEDY: u8 = 0
+const LAZY: u8 = 1
+const POSSESSIVE: u8 = 2
+const INDEPENDENT: u8 = 3
+
+// Pattern characters.
+const BANG: u32 = 0x21
+const HASH: u32 = 0x23
+const DOLLAR: u32 = 0x24
+const AMP: u32 = 0x26
+const LPAREN: u32 = 0x28
+const RPAREN: u32 = 0x29
+const STAR: u32 = 0x2A
+const PLUS: u32 = 0x2B
+const COMMA: u32 = 0x2C
+const DASH: u32 = 0x2D
+const DOT: u32 = 0x2E
+const COLON: u32 = 0x3A
+const LT: u32 = 0x3C
+const EQ: u32 = 0x3D
+const GT: u32 = 0x3E
+const QUESTION: u32 = 0x3F
+const AT: u32 = 0x40
+const LBRACKET: u32 = 0x5B
+const BACKSLASH: u32 = 0x5C
+const RBRACKET: u32 = 0x5D
+const CARET: u32 = 0x5E
+const LBRACE: u32 = 0x7B
+const PIPE: u32 = 0x7C
+const RBRACE: u32 = 0x7D
+
+/// Why a pattern didn't compile: Java's `PatternSyntaxException`, or something this doesn't
+/// support.
+pub struct PatternError {
+    /// Java's description, such as `Unclosed group`.
+    pub description: String
+    /// Where Java says it went wrong, counting code points of the pattern with each `\Q...\E`
+    /// quote written out as escapes, or -1.
+    pub index: i32
+    /// The pattern as it was given.
+    pub pattern: String
+    /// Whether the pattern uses something this doesn't support, which Java might take. The
+    /// description then says what.
+    pub unsupported: bool
+}
+
+impl PatternError {
+    /// The message Java's `getMessage` gives, with `newline` between its lines: the
+    /// description and index, the pattern, and a `^` under the index when it's inside it.
+    pub fn message(self, newline: str) -> String {
+        var out = self.description.copy()
+        if self.index >= 0 {
+            out.push_str(" near index {self.index}")
+        }
+        out.push_str(newline)
+        out.push_str(self.pattern)
+        if self.index >= 0 and usize.wrap(self.index) < self.pattern.utf16_len() {
+            out.push_str(newline)
+            for _ in 0..self.index {
+                out.push(' ')
+            }
+            out.push('^')
+        }
+        return out
+    }
+}
+
+// A step of a compiled pattern. Each node but the branches and quantifiers goes on to the next
+// in `Pattern.nexts`, and the chains a quantifier or a lookaround runs on their own end at
+// `ACCEPT`, which notes where they stopped.
+enum Node {
+    // Success, noting the position in `State.last`.
+    Accept
+    // Success at the end of the input, which a whole pattern ends with.
+    Last
+    // Success where a lookbehind started, which its body ends with.
+    BehindEnd
+    // One code point that the predicate takes.
+    Char { pred: u32 }
+    // As many code points the predicate takes as there are, at least `cmin`, giving them back
+    // one at a time.
+    CharGreedy { pred: u32, cmin: i32 }
+    // The code points `items[start..start + len]`. `fold` is 0 for exact, 1 for ASCII case,
+    // 2 for Unicode case, the items folded already.
+    Slice { start: u32, len: u32, fold: u8 }
+    // The input's start, as `\A` and `^` without `MULTILINE`.
+    Begin
+    // The input's end, as `\z`.
+    End
+    // `^` with `MULTILINE`: the start of a line that isn't at the input's end.
+    Caret { unix: bool }
+    // `$`, or `\Z` without `multi`.
+    Dollar { unix: bool, multi: bool }
+    // `\b` with `word`, `\B` without.
+    Bound { word: bool }
+    // `\R`.
+    LineEnding
+    // The text the group last matched. `fold` as for `Slice`.
+    BackRef { group: i32, fold: u8 }
+    // A group's start, kept in a local.
+    GroupHead { local: i32 }
+    // A group's end. Group 0 is a group that doesn't capture.
+    GroupTail { local: i32, group: i32 }
+    // Alternatives `items[start..start + len]`, each going on to `conn` at its end. `NONE` is
+    // an empty one, which goes to `conn`'s next at once.
+    Branch { start: u32, len: u32, conn: u32 }
+    // Where a branch's alternatives join.
+    BranchConn
+    // `atom?`, or an atomic group as `INDEPENDENT`.
+    Ques { atom: u32, kind: u8 }
+    // `atom{cmin,cmax}`.
+    Curly { atom: u32, cmin: i32, cmax: i32, kind: u8 }
+    // A group repeated whose body always matches the same length, run without its head.
+    GroupCurly { atom: u32, cmin: i32, cmax: i32, kind: u8, local: i32, group: i32, capture: bool }
+    // The way into a `Loop`.
+    Prolog { lp: u32 }
+    // Any other group repeated: `body` runs to its tail, which comes back here. `count` and
+    // `begin` are locals, the repeats so far and where this one started. `memo`, unless
+    // `NONE`, marks positions where more repeats failed already.
+    Loop { body: u32, cmin: i32, cmax: i32, count: i32, begin: i32, lazy: bool, memo: u32 }
+    // `(?=cond)`.
+    Pos { cond: u32 }
+    // `(?!cond)`.
+    Neg { cond: u32 }
+    // `(?<=cond)`, or `(?<!cond)` if `negative`, trying starts from `rmin` to `rmax` before.
+    // Those count code points if `sup`, UTF-16 units if not.
+    Behind { cond: u32, rmin: i32, rmax: i32, sup: bool, negative: bool }
+}
+
+// What a `Char` takes.
+enum Pred {
+    Single(u32)
+    // Either of two code points, the lower and upper case of an ASCII letter.
+    SingleI(u32, u32)
+    // A code point whose lower case of its upper case is this.
+    SingleU(u32)
+    // The code points below 256 set in four words of `Pattern.bits`, from this one.
+    Bits(u32)
+    Range(u32, u32)
+    // A range, or an ASCII code point whose other case is in it.
+    RangeI(u32, u32)
+    // A range, or a code point whose upper case, or the lower case of that, is in it.
+    RangeU(u32, u32)
+    Dot
+    UnixDot
+    All
+    Digit
+    Space
+    Word
+    HSpace
+    VSpace
+    Not(u32)
+    Or(u32, u32)
+    And(u32, u32)
+}
+
+/// A compiled regular expression.
+pub struct Pattern {
+    nodes: List<Node>
+    nexts: List<u32>
+    preds: List<Pred>
+    bits: List<u64>
+    items: List<u32>
+    root: u32
+    // Capturing groups and group 0.
+    groups: i32
+    locals: i32
+    memos: u32
+}
+
+impl Pattern {
+    /// The pattern `text` compiled with `flags`, as Java's `Pattern.compile(text, flags)`, or
+    /// the error it throws.
+    pub fn compile(text: String, flags: u32) -> Pattern ! PatternError {
+        var f = flags
+        if (f & UNICODE_CHARACTER_CLASS) != 0 {
+            f = f | UNICODE_CASE
+        }
+        var cps = List<u32>()
+        for r in text.runes() {
+            cps.push(u32(r))
+        }
+        let temp = if (f & LITERAL) != 0 { cps } else { unquote(cps) }
+        let plen = i32.wrap(temp.len())
+        var p = Parser {
+            pat: Pattern {
+                nodes: [Node.Accept, Node.Last, Node.BehindEnd],
+                nexts: [ACCEPT, ACCEPT, ACCEPT],
+                preds: List<Pred>(),
+                bits: List<u64>(),
+                items: List<u32>(),
+                root: LAST,
+                groups: 1,
+                locals: 0,
+                memos: 0,
+            },
+            temp: temp,
+            plen: plen,
+            cursor: 0,
+            flags: f,
+            names: List<String>(),
+            name_groups: List<i32>(),
+            has_backref: false,
+            closures: List<u32>(),
+            root: NONE,
+            pred: NONE,
+            text: text.copy(),
+        }
+        try p.compile()
+        return p.pat
+    }
+
+    /// The number of capturing groups, as Java's `Matcher.groupCount`.
+    pub fn group_count(self) -> i32 {
+        return self.groups - 1
+    }
+
+    /// Whether the whole of `input` matches, as Java's `pattern.matcher(input).matches()`.
+    pub fn matches(self, input: String) -> bool {
+        var units = List<u16>()
+        for c in input.chars() {
+            units.push(u16(c))
+        }
+        return self.matches_units(units)
+    }
+
+    /// Whether the whole of the UTF-16 units `input` matches, for text a `String` can't hold,
+    /// such as a lone surrogate in a Windows file name.
+    pub fn matches_units(self, input: own List<u16>) -> bool {
+        let len = i32.wrap(input.len())
+        let g = if self.groups > 10 { self.groups } else { 10 }
+        var s = State {
+            text: input,
+            len: len,
+            groups: [-1; usize.wrap(g * 2)],
+            locals: [-1; usize.wrap(self.locals)],
+            failed: [false; usize(self.memos) * usize.wrap(len + 1)],
+            last: 0,
+            behind_to: 0,
+        }
+        return self.m(self.root, 0, mut s)
+    }
+
+    // Whether code point `c` is one the predicate takes.
+    fn is(self, p: u32, c: u32) -> bool {
+        return match self.preds[usize(p)] {
+            Single(x) => c == x,
+            SingleI(l, u) => c == l or c == u,
+            SingleU(l) => c == l or lower(upper(c)) == l,
+            Bits(at) => c < 256 and ((self.bits[usize(at + (c >> 6))] >> (c & 63)) & 1) != 0,
+            Range(a, b) => c >= a and c <= b,
+            RangeI(a, b) => (c >= a and c <= b) or (c < 128 and (in_range(a, ascii_upper(c), b) or in_range(a, ascii_lower(c), b))),
+            RangeU(a, b) => (c >= a and c <= b) or in_range(a, upper(c), b) or in_range(a, lower(upper(c)), b),
+            Dot => c != 0x0A and c != 0x0D and (c | 1) != 0x2029 and c != 0x85,
+            UnixDot => c != 0x0A,
+            All => true,
+            Digit => is_digit(c),
+            Space => is_space(c),
+            Word => is_word(c),
+            HSpace => c == 0x20 or c == 0x09 or c == 0xA0 or c == 0x1680 or c == 0x180E or (c >= 0x2000 and c <= 0x200A) or c == 0x202F or c == 0x205F or c == 0x3000,
+            VSpace => (c >= 0x0A and c <= 0x0D) or c == 0x85 or c == 0x2028 or c == 0x2029,
+            Not(a) => not self.is(a, c),
+            Or(a, b) => self.is(a, c) or self.is(b, c),
+            And(a, b) => self.is(a, c) and self.is(b, c),
+        }
+    }
+
+    // Whether the chain from `node` matches at `pos`. Nodes that only go on loop here; those
+    // that try more than one way call this for each.
+    fn m(self, node: u32, pos: i32, s: mut State) -> bool {
+        var n = node
+        var i = pos
+        loop {
+            let nx = self.nexts[usize(n)]
+            match self.nodes[usize(n)] {
+                Accept => {
+                    s.last = i
+                    return true
+                },
+                Last => {
+                    if i != s.len {
+                        return false
+                    }
+                    s.last = i
+                    return true
+                },
+                BehindEnd => {
+                    return i == s.behind_to
+                },
+                Char { pred } => {
+                    if i >= s.len {
+                        return false
+                    }
+                    let c = s.cp_at(i)
+                    if not self.is(pred, c) {
+                        return false
+                    }
+                    i += width(c)
+                },
+                CharGreedy { pred, cmin } => {
+                    var j = i
+                    var k: i32 = 0
+                    while j < s.len {
+                        let c = s.cp_at(j)
+                        if not self.is(pred, c) {
+                            break
+                        }
+                        j += width(c)
+                        k += 1
+                    }
+                    while k >= cmin {
+                        if self.m(nx, j, mut s) {
+                            return true
+                        }
+                        if k == cmin {
+                            return false
+                        }
+                        j -= width(s.cp_before(j))
+                        k -= 1
+                    }
+                    return false
+                },
+                Slice { start: first, len: count, fold } => {
+                    var x = i
+                    for k in 0..count {
+                        if x >= s.len {
+                            return false
+                        }
+                        let c = s.cp_at(x)
+                        let b = self.items[usize(first + k)]
+                        if b != c {
+                            if fold == 0 {
+                                return false
+                            }
+                            if fold == 1 and b != ascii_lower(c) {
+                                return false
+                            }
+                            if fold == 2 and b != lower(upper(c)) {
+                                return false
+                            }
+                        }
+                        x += width(c)
+                    }
+                    i = x
+                },
+                Begin => {
+                    if i != 0 {
+                        return false
+                    }
+                },
+                End => {
+                    if i != s.len {
+                        return false
+                    }
+                },
+                Caret { unix } => {
+                    if i >= s.len {
+                        return false
+                    }
+                    if i > 0 {
+                        let p = s.unit(i - 1)
+                        if unix {
+                            if p != 0x0A {
+                                return false
+                            }
+                        } else {
+                            if not is_terminator(p) {
+                                return false
+                            }
+                            if p == 0x0D and s.unit(i) == 0x0A {
+                                return false
+                            }
+                        }
+                    }
+                },
+                Dollar { unix, multi } => {
+                    if unix {
+                        if i < s.len {
+                            if s.unit(i) != 0x0A {
+                                return false
+                            }
+                            if not multi and i != s.len - 1 {
+                                return false
+                            }
+                        }
+                    } else {
+                        if not multi {
+                            if i < s.len - 2 {
+                                return false
+                            }
+                            if i == s.len - 2 and (s.unit(i) != 0x0D or s.unit(i + 1) != 0x0A) {
+                                return false
+                            }
+                        }
+                        if i < s.len {
+                            let c = s.unit(i)
+                            if c == 0x0A {
+                                if i > 0 and s.unit(i - 1) == 0x0D {
+                                    return false
+                                }
+                            } else if not is_terminator(c) {
+                                return false
+                            }
+                        }
+                    }
+                },
+                Bound { word } => {
+                    let left = i > 0 and i <= s.len and s.bound_word(s.cp_before(i), i - 2)
+                    let right = i < s.len and s.bound_word(s.cp_at(i), i - 1)
+                    if word != (left != right) {
+                        return false
+                    }
+                },
+                LineEnding => {
+                    if i >= s.len {
+                        return false
+                    }
+                    let c = s.unit(i)
+                    if c == 0x0D {
+                        if i + 1 < s.len and s.unit(i + 1) == 0x0A and self.m(nx, i + 2, mut s) {
+                            return true
+                        }
+                    } else if not ((c >= 0x0A and c <= 0x0C) or c == 0x85 or c == 0x2028 or c == 0x2029) {
+                        return false
+                    }
+                    i += 1
+                },
+                BackRef { group, fold } => {
+                    let j0 = s.groups[usize.wrap(group * 2)]
+                    let size = s.groups[usize.wrap(group * 2 + 1)] - j0
+                    if j0 < 0 or i + size > s.len {
+                        return false
+                    }
+                    if fold == 0 {
+                        for k in 0..size {
+                            if s.unit(i + k) != s.unit(j0 + k) {
+                                return false
+                            }
+                        }
+                    } else {
+                        var x = i
+                        var j = j0
+                        for _ in 0..size {
+                            if x >= s.len or j >= s.len {
+                                return false
+                            }
+                            let c1 = s.cp_at(x)
+                            let c2 = s.cp_at(j)
+                            if c1 != c2 {
+                                if fold == 2 {
+                                    let u1 = upper(c1)
+                                    let u2 = upper(c2)
+                                    if u1 != u2 and lower(u1) != lower(u2) {
+                                        return false
+                                    }
+                                } else if ascii_lower(c1) != ascii_lower(c2) {
+                                    return false
+                                }
+                            }
+                            x += width(c1)
+                            j += width(c2)
+                        }
+                    }
+                    i += size
+                },
+                GroupHead { local } => {
+                    let l = usize.wrap(local)
+                    let saved = s.locals[l]
+                    s.locals[l] = i
+                    let r = self.m(nx, i, mut s)
+                    s.locals[l] = saved
+                    return r
+                },
+                GroupTail { local, group } => {
+                    let t = s.locals[usize.wrap(local)]
+                    if t < 0 {
+                        s.last = i
+                        return true
+                    }
+                    let g = usize.wrap(group * 2)
+                    let g0 = s.groups[g]
+                    let g1 = s.groups[g + 1]
+                    s.groups[g] = t
+                    s.groups[g + 1] = i
+                    if self.m(nx, i, mut s) {
+                        return true
+                    }
+                    s.groups[g] = g0
+                    s.groups[g + 1] = g1
+                    return false
+                },
+                Branch { start: first, len: count, conn } => {
+                    for k in 0..count {
+                        let alt = self.items[usize(first + k)]
+                        let to = if alt == NONE { self.nexts[usize(conn)] } else { alt }
+                        if self.m(to, i, mut s) {
+                            return true
+                        }
+                    }
+                    return false
+                },
+                BranchConn => {},
+                Ques { atom, kind } => {
+                    if kind == GREEDY {
+                        if self.m(atom, i, mut s) {
+                            let l = s.last
+                            if self.m(nx, l, mut s) {
+                                return true
+                            }
+                        }
+                        return self.m(nx, i, mut s)
+                    }
+                    if kind == LAZY {
+                        if self.m(nx, i, mut s) {
+                            return true
+                        }
+                        if self.m(atom, i, mut s) {
+                            let l = s.last
+                            return self.m(nx, l, mut s)
+                        }
+                        return false
+                    }
+                    if self.m(atom, i, mut s) {
+                        i = s.last
+                    } else if kind == INDEPENDENT {
+                        return false
+                    }
+                },
+                Curly { atom, cmin, cmax, kind } => {
+                    var j: i32 = 0
+                    while j < cmin {
+                        if not self.m(atom, i, mut s) {
+                            return false
+                        }
+                        i = s.last
+                        j += 1
+                    }
+                    if kind == GREEDY {
+                        return self.curly(atom, nx, cmax, i, j, mut s)
+                    }
+                    if kind == LAZY {
+                        loop {
+                            if self.m(nx, i, mut s) {
+                                return true
+                            }
+                            if j >= cmax or not self.m(atom, i, mut s) or i == s.last {
+                                return false
+                            }
+                            i = s.last
+                            j += 1
+                        }
+                    }
+                    while j < cmax {
+                        if not self.m(atom, i, mut s) or i == s.last {
+                            break
+                        }
+                        i = s.last
+                        j += 1
+                    }
+                },
+                GroupCurly { atom, cmin, cmax, kind, local, group, capture } => {
+                    let l = usize.wrap(local)
+                    let g = usize.wrap(group * 2)
+                    let save0 = s.locals[l]
+                    let save1 = s.groups[g]
+                    let save2 = s.groups[g + 1]
+                    s.locals[l] = -1
+                    var fine = true
+                    var j: i32 = 0
+                    while j < cmin {
+                        if not self.m(atom, i, mut s) {
+                            fine = false
+                            break
+                        }
+                        if capture {
+                            s.groups[g] = i
+                            s.groups[g + 1] = s.last
+                        }
+                        i = s.last
+                        j += 1
+                    }
+                    if fine {
+                        let q = GroupLoop { atom: atom, next: nx, cmax: cmax, g: g, capture: capture }
+                        fine = if kind == GREEDY {
+                            self.group_greedy(q, i, cmin, mut s)
+                        } else if kind == LAZY {
+                            self.group_lazy(q, i, cmin, mut s)
+                        } else {
+                            self.group_possessive(q, i, cmin, mut s)
+                        }
+                    }
+                    if not fine {
+                        s.locals[l] = save0
+                        if capture {
+                            s.groups[g] = save1
+                            s.groups[g + 1] = save2
+                        }
+                    }
+                    return fine
+                },
+                Prolog { lp } => {
+                    return self.loop_init(lp, i, mut s)
+                },
+                Loop { body, cmin, cmax, count, begin, lazy, memo } => {
+                    if i > s.locals[usize.wrap(begin)] {
+                        let ci = usize.wrap(count)
+                        let c = s.locals[ci]
+                        if c < cmin {
+                            s.locals[ci] = c + 1
+                            let b = self.m(body, i, mut s)
+                            if not b {
+                                s.locals[ci] = c
+                            }
+                            return b
+                        }
+                        if lazy {
+                            if self.m(nx, i, mut s) {
+                                return true
+                            }
+                            if c < cmax {
+                                s.locals[ci] = c + 1
+                                let b = self.m(body, i, mut s)
+                                if not b {
+                                    s.locals[ci] = c
+                                }
+                                return b
+                            }
+                            return false
+                        }
+                        if c < cmax {
+                            let memoized = memo != NONE and i <= s.len
+                            let slot = if memoized { usize(memo) * usize.wrap(s.len + 1) + usize.wrap(i) } else { 0 }
+                            if not memoized or not s.failed[slot] {
+                                s.locals[ci] = c + 1
+                                if self.m(body, i, mut s) {
+                                    return true
+                                }
+                                s.locals[ci] = c
+                                if memoized {
+                                    s.failed[slot] = true
+                                }
+                            }
+                        }
+                    }
+                },
+                Pos { cond } => {
+                    if not self.m(cond, i, mut s) {
+                        return false
+                    }
+                },
+                Neg { cond } => {
+                    if self.m(cond, i, mut s) {
+                        return false
+                    }
+                },
+                Behind { cond, rmin, rmax, sup, negative } => {
+                    var from: i32 = 0
+                    var j: i32 = 0
+                    if sup {
+                        from = i - s.count_chars(i, 0 - rmax)
+                        j = i - s.count_chars(i, 0 - rmin)
+                    } else {
+                        from = i - rmax
+                        j = i - rmin
+                    }
+                    if from < 0 {
+                        from = 0
+                    }
+                    let saved = s.behind_to
+                    s.behind_to = i
+                    var matched = false
+                    while not matched and j >= from {
+                        matched = self.m(cond, j, mut s)
+                        if sup and j > from {
+                            j -= s.count_chars(j, -1)
+                        } else {
+                            j -= 1
+                        }
+                    }
+                    s.behind_to = saved
+                    if matched == negative {
+                        return false
+                    }
+                },
+            }
+            n = nx
+        }
+    }
+
+    // A greedy `Curly` once its minimum is met: `j` repeats of `atom` so far, ending at `pos`.
+    // Repeats of one length are counted off without trying the rest after each; one that comes
+    // out a different length tries the rest from there.
+    fn curly(self, atom: u32, next: u32, cmax: i32, pos: i32, done: i32, s: mut State) -> bool {
+        if done >= cmax {
+            return self.m(next, pos, mut s)
+        }
+        var i = pos
+        var j = done
+        if self.m(atom, i, mut s) {
+            let k = s.last - i
+            if k != 0 {
+                i = s.last
+                j += 1
+                while j < cmax {
+                    if not self.m(atom, i, mut s) {
+                        break
+                    }
+                    if i + k != s.last {
+                        let l = s.last
+                        if self.curly(atom, next, cmax, l, j + 1, mut s) {
+                            return true
+                        }
+                        break
+                    }
+                    i += k
+                    j += 1
+                }
+                while j >= done {
+                    if self.m(next, i, mut s) {
+                        return true
+                    }
+                    i -= k
+                    j -= 1
+                }
+                return false
+            }
+        }
+        return self.m(next, i, mut s)
+    }
+
+    // A greedy `GroupCurly` once its minimum is met, as `curly`, keeping the group's capture
+    // on the last repeat.
+    fn group_greedy(self, q: GroupLoop, pos: i32, done: i32, s: mut State) -> bool {
+        let g = q.g
+        let save0 = s.groups[g]
+        let save1 = s.groups[g + 1]
+        var i = pos
+        var j = done
+        loop {
+            if j >= q.cmax or not self.m(q.atom, i, mut s) {
+                break
+            }
+            let k = s.last - i
+            if k <= 0 {
+                if q.capture {
+                    s.groups[g] = i
+                    s.groups[g + 1] = i + k
+                }
+                i += k
+                break
+            }
+            loop {
+                if q.capture {
+                    s.groups[g] = i
+                    s.groups[g + 1] = i + k
+                }
+                i += k
+                j += 1
+                if j >= q.cmax or not self.m(q.atom, i, mut s) {
+                    break
+                }
+                if i + k != s.last {
+                    if self.group_greedy(q, i, j, mut s) {
+                        return true
+                    }
+                    break
+                }
+            }
+            while j > done {
+                if self.m(q.next, i, mut s) {
+                    if q.capture {
+                        s.groups[g + 1] = i
+                        s.groups[g] = i - k
+                    }
+                    return true
+                }
+                i -= k
+                if q.capture {
+                    s.groups[g + 1] = i
+                    s.groups[g] = i - k
+                }
+                j -= 1
+            }
+            break
+        }
+        if q.capture {
+            s.groups[g] = save0
+            s.groups[g + 1] = save1
+        }
+        return self.m(q.next, i, mut s)
+    }
+
+    // A lazy `GroupCurly` once its minimum is met: the rest first, then one more repeat.
+    fn group_lazy(self, q: GroupLoop, pos: i32, done: i32, s: mut State) -> bool {
+        var i = pos
+        var j = done
+        loop {
+            if self.m(q.next, i, mut s) {
+                return true
+            }
+            if j >= q.cmax or not self.m(q.atom, i, mut s) or i == s.last {
+                return false
+            }
+            if q.capture {
+                s.groups[q.g] = i
+                s.groups[q.g + 1] = s.last
+            }
+            i = s.last
+            j += 1
+        }
+    }
+
+    // A possessive `GroupCurly` once its minimum is met: every repeat there is, then the rest.
+    fn group_possessive(self, q: GroupLoop, pos: i32, done: i32, s: mut State) -> bool {
+        var i = pos
+        var j = done
+        while j < q.cmax {
+            if not self.m(q.atom, i, mut s) {
+                break
+            }
+            if q.capture {
+                s.groups[q.g] = i
+                s.groups[q.g + 1] = s.last
+            }
+            if i == s.last {
+                break
+            }
+            i = s.last
+            j += 1
+        }
+        return self.m(q.next, i, mut s)
+    }
+
+    // The way into a `Loop`: its first repeat, or the rest if it can have none.
+    fn loop_init(self, lp: u32, i: i32, s: mut State) -> bool {
+        let nx = self.nexts[usize(lp)]
+        return match self.nodes[usize(lp)] {
+            Loop { body, cmin, cmax, count, lazy, .. } => {
+                let ci = usize.wrap(count)
+                let save = s.locals[ci]
+                var r = false
+                if 0 < cmin {
+                    s.locals[ci] = 1
+                    r = self.m(body, i, mut s)
+                } else if lazy {
+                    if self.m(nx, i, mut s) {
+                        r = true
+                    } else if 0 < cmax {
+                        s.locals[ci] = 1
+                        r = self.m(body, i, mut s)
+                    }
+                } else if 0 < cmax {
+                    s.locals[ci] = 1
+                    r = self.m(body, i, mut s) or self.m(nx, i, mut s)
+                } else {
+                    r = self.m(nx, i, mut s)
+                }
+                s.locals[ci] = save
+                r
+            },
+            _ => false,
+        }
+    }
+
+    // The lengths the chain from `node` can match, in `t`, and whether it always matches one
+    // way: Java's study of a pattern, whose sums wrap as Java's `int` does.
+    fn study(self, node: u32, t: mut Info) -> bool {
+        var n = node
+        loop {
+            match self.nodes[usize(n)] {
+                Accept | Last | BehindEnd | BranchConn => {
+                    return t.det
+                },
+                Char { .. } => {
+                    t.min += 1
+                    t.max += 1
+                },
+                CharGreedy { cmin, .. } => {
+                    t.min += cmin
+                    if t.valid {
+                        t.max += MAX_REPS
+                    }
+                    t.det = false
+                },
+                Slice { len: count, .. } => {
+                    t.min += i32.wrap(count)
+                    t.max += i32.wrap(count)
+                },
+                LineEnding => {
+                    t.min += 1
+                    t.max += 2
+                },
+                BackRef { .. } => {
+                    t.valid = false
+                },
+                Branch { start: first, len: count, conn } => {
+                    let min0 = t.min
+                    let max0 = t.max
+                    var valid = t.valid
+                    var min2 = i32.MAX
+                    var max2: i32 = -1
+                    for k in 0..count {
+                        t.reset()
+                        let alt = self.items[usize(first + k)]
+                        if alt != NONE {
+                            _ = self.study(alt, mut t)
+                        }
+                        if t.min < min2 {
+                            min2 = t.min
+                        }
+                        if t.max > max2 {
+                            max2 = t.max
+                        }
+                        valid = valid and t.valid
+                    }
+                    t.reset()
+                    _ = self.study(self.nexts[usize(conn)], mut t)
+                    t.min += min0 + min2
+                    t.max += max0 + max2
+                    t.valid = t.valid and valid
+                    t.det = false
+                    return false
+                },
+                Ques { atom, kind } => {
+                    if kind == INDEPENDENT {
+                        _ = self.study(atom, mut t)
+                    } else {
+                        let min0 = t.min
+                        _ = self.study(atom, mut t)
+                        t.min = min0
+                        t.det = false
+                    }
+                },
+                Curly { atom, cmin, cmax, .. } => {
+                    self.study_repeat(atom, cmin, cmax, mut t)
+                },
+                GroupCurly { atom, cmin, cmax, .. } => {
+                    self.study_repeat(atom, cmin, cmax, mut t)
+                },
+                Prolog { .. } => {
+                    t.valid = false
+                    t.det = false
+                    return false
+                },
+                Loop { .. } => {
+                    t.valid = false
+                    t.det = false
+                    return false
+                },
+                _ => {},
+            }
+            n = self.nexts[usize(n)]
+        }
+    }
+
+    // The study of `atom{cmin,cmax}`, after what came before it.
+    fn study_repeat(self, atom: u32, cmin: i32, cmax: i32, t: mut Info) {
+        let min0 = t.min
+        let max0 = t.max
+        let valid0 = t.valid
+        let det0 = t.det
+        t.reset()
+        _ = self.study(atom, mut t)
+        var x = t.min * cmin + min0
+        if x < min0 {
+            x = 0xFFFFFFF
+        }
+        t.min = x
+        if valid0 and t.valid {
+            let y = t.max * cmax + max0
+            if y < max0 {
+                t.valid = false
+            } else {
+                t.max = y
+            }
+        } else {
+            t.valid = false
+        }
+        t.det = t.det and cmin == cmax and det0
+    }
+}
+
+// What a `GroupCurly` repeats, for its ways of repeating.
+struct GroupLoop {
+    atom: u32
+    next: u32
+    cmax: i32
+    g: usize
+    capture: bool
+}
+
+// A study's result: the least and most a chain matches, whether the most is known, and
+// whether the chain matches only one way.
+struct Info {
+    min: i32
+    max: i32
+    valid: bool
+    det: bool
+}
+
+impl Info {
+    fn new() -> Info {
+        return Info { min: 0, max: 0, valid: true, det: true }
+    }
+
+    fn reset(mut self) {
+        self.min = 0
+        self.max = 0
+        self.valid = true
+        self.det = true
+    }
+}
+
+// A match in progress: the input, the groups' bounds, the nodes' locals, the positions where a
+// memoized loop failed, where the last chain stopped, and where a lookbehind started.
+struct State {
+    text: List<u16>
+    len: i32
+    groups: List<i32>
+    locals: List<i32>
+    failed: List<bool>
+    last: i32
+    behind_to: i32
+}
+
+impl State {
+    // The unit at `i`, or 0 outside the input.
+    fn unit(self, i: i32) -> u32 {
+        if i < 0 or i >= self.len {
+            return 0
+        }
+        return u32(self.text[usize.wrap(i)])
+    }
+
+    // The code point at `i`, a surrogate pair's or a lone unit's.
+    fn cp_at(self, i: i32) -> u32 {
+        let c = self.unit(i)
+        if is_high(c) and i + 1 < self.len {
+            let d = self.unit(i + 1)
+            if is_low(d) {
+                return pair(c, d)
+            }
+        }
+        return c
+    }
+
+    // The code point that ends at `i`.
+    fn cp_before(self, i: i32) -> u32 {
+        let c = self.unit(i - 1)
+        if is_low(c) and i - 1 > 0 {
+            let h = self.unit(i - 2)
+            if is_high(h) {
+                return pair(h, c)
+            }
+        }
+        return c
+    }
+
+    // Whether `\b` and `\B` take `c` as a word character: an ASCII letter, digit or `_`, as `\w`
+    // takes, or a non-spacing mark with a base, a letter or digit of any script, before it. Java
+    // looks for the base one unit at a time from `base`, past other non-spacing marks, so a mark
+    // or base that's a surrogate pair stops it: for a mark that ends at the boundary, `base` is
+    // the unit before the mark's last, its own if it's a pair.
+    fn bound_word(self, c: u32, base: i32) -> bool {
+        if is_word(c) {
+            return true
+        }
+        if not is_non_spacing_mark(c) {
+            return false
+        }
+        var j = base
+        while j >= 0 {
+            let u = self.unit(j)
+            if is_letter_or_digit(u) {
+                return true
+            }
+            if not is_non_spacing_mark(u) {
+                return false
+            }
+            j -= 1
+        }
+        return false
+    }
+
+    // The units in `n` code points from `index`, forward if `n` isn't negative, back if it is.
+    fn count_chars(self, index: i32, n: i32) -> i32 {
+        var x = index
+        var k: i32 = 0
+        if n >= 0 {
+            while x < self.len and k < n {
+                let c = self.unit(x)
+                x += 1
+                if is_high(c) and x < self.len and is_low(self.unit(x)) {
+                    x += 1
+                }
+                k += 1
+            }
+            return x - index
+        }
+        let want = 0 - n
+        while x > 0 and k < want {
+            x -= 1
+            if is_low(self.unit(x)) and x > 0 and is_high(self.unit(x - 1)) {
+                x -= 1
+            }
+            k += 1
+        }
+        return index - x
+    }
+}
+
+// The pattern being read: its code points with each quote written out, and Java's cursor
+// into them.
+struct Parser {
+    pat: Pattern
+    temp: List<u32>
+    plen: i32
+    cursor: i32
+    flags: u32
+    names: List<String>
+    name_groups: List<i32>
+    has_backref: bool
+    // Greedy loops without a maximum, which can remember where they failed.
+    closures: List<u32>
+    // The tail of what a function just read, which Java's parser hands back beside the head.
+    root: u32
+    // The predicate a class escape just made.
+    pred: u32
+    text: String
+}
+
+impl Parser {
+    fn compile(mut self) ! PatternError {
+        if self.has(CANON_EQ) {
+            fail self.unsupported("CANON_EQ")
+        }
+        if self.has(LITERAL) {
+            let buf = self.temp.copy()
+            let s = self.slice(buf)
+            self.set_next(s, LAST)
+            self.pat.root = s
+            return
+        }
+        let r = try self.expr(LAST)
+        if self.cursor != self.plen {
+            if self.peek() == RPAREN {
+                fail self.error("Unmatched closing ')'")
+            }
+            // A backslash at the end escapes the zero after it, which reads one past the end.
+            if self.cursor == self.plen + 1 and self.at(self.plen - 1) == BACKSLASH {
+                fail self.error("Unescaped trailing backslash")
+            }
+            fail self.error("Unexpected internal error")
+        }
+        self.pat.root = r
+        if not self.has_backref {
+            for k in 0usize..self.closures.len() {
+                let lp = usize(self.closures[k])
+                let node = self.pat.nodes[lp]
+                match node {
+                    Loop { body, cmin, cmax, count, begin, lazy, .. } => {
+                        self.pat.nodes[lp] = Node.Loop { body: body, cmin: cmin, cmax: cmax, count: count, begin: begin, lazy: lazy, memo: self.pat.memos }
+                        self.pat.memos += 1
+                    },
+                    _ => {},
+                }
+            }
+        }
+    }
+
+    fn has(self, f: u32) -> bool {
+        return (self.flags & f) != 0
+    }
+
+    fn error(self, description: own String) -> PatternError {
+        return PatternError { description: description, index: self.cursor - 1, pattern: self.text.copy(), unsupported: false }
+    }
+
+    fn unsupported(self, what: String) -> PatternError {
+        return PatternError { description: "Unsupported: {what}", index: self.cursor - 1, pattern: self.text.copy(), unsupported: true }
+    }
+
+    fn add(mut self, node: Node) -> u32 {
+        let id = u32.wrap(self.pat.nodes.len())
+        self.pat.nodes.push(node)
+        self.pat.nexts.push(ACCEPT)
+        return id
+    }
+
+    fn add_pred(mut self, p: Pred) -> u32 {
+        let id = u32.wrap(self.pat.preds.len())
+        self.pat.preds.push(p)
+        return id
+    }
+
+    fn set_next(mut self, n: u32, to: u32) {
+        self.pat.nexts[usize(n)] = to
+    }
+
+    fn union(mut self, a: u32, b: u32) -> u32 {
+        if a == NONE {
+            return b
+        }
+        if b == NONE {
+            return a
+        }
+        return self.add_pred(Pred.Or(a, b))
+    }
+
+    // The code point at `i`, or 0 past the end, as Java's pattern ends in zeros.
+    fn at(self, i: i32) -> u32 {
+        if i < 0 or i >= self.plen {
+            return 0
+        }
+        return self.temp[usize.wrap(i)]
+    }
+
+    // The code point at the cursor, past whitespace and comments with `COMMENTS`.
+    fn peek(mut self) -> u32 {
+        let c = self.at(self.cursor)
+        if self.has(COMMENTS) {
+            return self.peek_past_space(c)
+        }
+        return c
+    }
+
+    // The code point at the cursor, moving past it.
+    fn read(mut self) -> u32 {
+        let c = self.at(self.cursor)
+        self.cursor += 1
+        if self.has(COMMENTS) {
+            return self.read_past_space(c)
+        }
+        return c
+    }
+
+    // The code point after the cursor, moving to it.
+    fn next(mut self) -> u32 {
+        self.cursor += 1
+        let c = self.at(self.cursor)
+        if self.has(COMMENTS) {
+            return self.peek_past_space(c)
+        }
+        return c
+    }
+
+    // The code point after the cursor, moving to it, whitespace or not.
+    fn next_raw(mut self) -> u32 {
+        self.cursor += 1
+        return self.at(self.cursor)
+    }
+
+    // The code point after the cursor, moving past it.
+    fn skip(mut self) -> u32 {
+        let c = self.at(self.cursor + 1)
+        self.cursor += 2
+        return c
+    }
+
+    fn unread(mut self) {
+        self.cursor -= 1
+    }
+
+    fn line_end(self, c: u32) -> bool {
+        if self.has(UNIX_LINES) {
+            return c == 0x0A
+        }
+        return is_terminator(c)
+    }
+
+    fn peek_past_space(mut self, first: u32) -> u32 {
+        var c = first
+        while is_space(c) or c == HASH {
+            while is_space(c) {
+                self.cursor += 1
+                c = self.at(self.cursor)
+            }
+            if c == HASH {
+                self.cursor += 1
+                c = self.at(self.cursor)
+                while c != 0 and not self.line_end(c) {
+                    self.cursor += 1
+                    c = self.at(self.cursor)
+                }
+                if c == 0 and self.cursor > self.plen {
+                    self.cursor = self.plen
+                    c = self.at(self.cursor)
+                }
+            }
+        }
+        return c
+    }
+
+    fn read_past_space(mut self, first: u32) -> u32 {
+        var c = first
+        while is_space(c) or c == HASH {
+            while is_space(c) {
+                c = self.at(self.cursor)
+                self.cursor += 1
+            }
+            if c == HASH {
+                c = self.at(self.cursor)
+                self.cursor += 1
+                while c != 0 and not self.line_end(c) {
+                    c = self.at(self.cursor)
+                    self.cursor += 1
+                }
+                if c == 0 and self.cursor > self.plen {
+                    self.cursor = self.plen
+                    c = self.at(self.cursor)
+                    self.cursor += 1
+                }
+            }
+        }
+        return c
+    }
+
+    fn accept(mut self, c: u32, description: own String) ! PatternError {
+        if self.read() != c {
+            fail self.error(description)
+        }
+    }
+
+    // Alternatives up to `)` or the end, each going on to `end`.
+    fn expr(mut self, end: u32) -> u32 ! PatternError {
+        var heads = List<u32>()
+        var tails = List<u32>()
+        loop {
+            let head = try self.sequence(end)
+            heads.push(head)
+            tails.push(self.root)
+            if self.peek() != PIPE {
+                break
+            }
+            _ = self.next()
+        }
+        if heads.len() == 1 {
+            return heads[0]
+        }
+        let conn = self.add(Node.BranchConn)
+        self.set_next(conn, end)
+        let first = u32.wrap(self.pat.items.len())
+        for k in 0usize..heads.len() {
+            if heads[k] == end {
+                self.pat.items.push(NONE)
+            } else {
+                self.pat.items.push(heads[k])
+                self.set_next(tails[k], conn)
+            }
+        }
+        return self.add(Node.Branch { start: first, len: u32.wrap(heads.len()), conn: conn })
+    }
+
+    // Atoms and their quantifiers up to `|`, `)` or the end, the last going on to `end`.
+    fn sequence(mut self, end: u32) -> u32 ! PatternError {
+        var head = NONE
+        var tail = NONE
+        loop {
+            let c = self.peek()
+            var node = NONE
+            if c == LPAREN {
+                let g = try self.group0()
+                if g == NONE {
+                    continue
+                }
+                if head == NONE {
+                    head = g
+                } else {
+                    self.set_next(tail, g)
+                }
+                tail = self.root
+                continue
+            } else if c == LBRACKET {
+                let p = try self.clazz(true)
+                node = self.add(Node.Char { pred: p })
+            } else if c == BACKSLASH {
+                let e = self.next_raw()
+                if e == 0x70 or e == 0x50 {
+                    fail self.unsupported("Unicode properties")
+                }
+                self.unread()
+                node = try self.atom()
+            } else if c == CARET {
+                _ = self.next()
+                if self.has(MULTILINE) {
+                    let unix = self.has(UNIX_LINES)
+                    node = self.add(Node.Caret { unix: unix })
+                } else {
+                    node = self.add(Node.Begin)
+                }
+            } else if c == DOLLAR {
+                _ = self.next()
+                let unix = self.has(UNIX_LINES)
+                let multi = self.has(MULTILINE)
+                node = self.add(Node.Dollar { unix: unix, multi: multi })
+            } else if c == DOT {
+                _ = self.next()
+                let p = if self.has(DOTALL) { Pred.All } else if self.has(UNIX_LINES) { Pred.UnixDot } else { Pred.Dot }
+                let id = self.add_pred(p)
+                node = self.add(Node.Char { pred: id })
+            } else if c == PIPE or c == RPAREN {
+                break
+            } else if c == QUESTION or c == STAR or c == PLUS {
+                _ = self.next()
+                let meta = if c == QUESTION { "?" } else if c == STAR { "*" } else { "+" }
+                fail self.error("Dangling meta character '{meta}'")
+            } else if c == 0 and self.cursor >= self.plen {
+                break
+            } else {
+                node = try self.atom()
+            }
+            node = try self.closure(node)
+            if head == NONE {
+                head = node
+            } else {
+                self.set_next(tail, node)
+            }
+            tail = node
+        }
+        if head == NONE {
+            return end
+        }
+        self.set_next(tail, end)
+        self.root = tail
+        return head
+    }
+
+    // A run of literal code points, as one `Char` or a `Slice`, or a node an escape made.
+    fn atom(mut self) -> u32 ! PatternError {
+        var buf = List<u32>()
+        var prev: i32 = -1
+        var c = self.peek()
+        loop {
+            if c == STAR or c == PLUS or c == QUESTION or c == LBRACE {
+                if buf.len() > 1 {
+                    self.cursor = prev
+                    _ = buf.pop()
+                }
+                break
+            }
+            if c == DOLLAR or c == DOT or c == CARET or c == LPAREN or c == LBRACKET or c == PIPE or c == RPAREN {
+                break
+            }
+            if c == BACKSLASH {
+                let e = self.next_raw()
+                if e == 0x70 or e == 0x50 {
+                    if buf.len() > 0 {
+                        self.unread()
+                        break
+                    }
+                    fail self.unsupported("Unicode properties")
+                }
+                self.unread()
+                prev = self.cursor
+                let x = try self.escape(false, buf.is_empty(), false)
+                if x >= 0 {
+                    buf.push(u32.wrap(x))
+                    c = self.peek()
+                    continue
+                }
+                if buf.is_empty() {
+                    return self.root
+                }
+                self.cursor = prev
+                break
+            }
+            if c == 0 and self.cursor >= self.plen {
+                break
+            }
+            prev = self.cursor
+            buf.push(c)
+            c = self.next()
+        }
+        if buf.len() == 1 {
+            let p = self.single(buf[0])
+            return self.add(Node.Char { pred: p })
+        }
+        return self.slice(buf)
+    }
+
+    fn slice(mut self, buf: own List<u32>) -> u32 {
+        var fold: u8 = 0
+        if self.has(CASE_INSENSITIVE) {
+            fold = if self.has(UNICODE_CASE) { 2 } else { 1 }
+        }
+        let first = u32.wrap(self.pat.items.len())
+        for x in buf {
+            let v = if fold == 2 { lower(upper(x)) } else if fold == 1 { ascii_lower(x) } else { x }
+            self.pat.items.push(v)
+        }
+        return self.add(Node.Slice { start: first, len: u32.wrap(buf.len()), fold: fold })
+    }
+
+    // The predicate for one literal code point, by the case flags.
+    fn single(mut self, c: u32) -> u32 {
+        if self.has(CASE_INSENSITIVE) {
+            if self.has(UNICODE_CASE) {
+                let u = upper(c)
+                let l = lower(u)
+                if u != l {
+                    return self.add_pred(Pred.SingleU(l))
+                }
+            } else if c < 128 and is_alpha(c) {
+                return self.add_pred(Pred.SingleI(ascii_lower(c), ascii_upper(c)))
+            }
+        }
+        return self.add_pred(Pred.Single(c))
+    }
+
+    // The quantifier after `prev`, if there is one.
+    fn closure(mut self, prev: u32) -> u32 ! PatternError {
+        let c = self.peek()
+        if c == QUESTION {
+            let k = self.next()
+            let kind = self.kind_after(k)
+            return self.add(Node.Ques { atom: prev, kind: kind })
+        }
+        if c == STAR or c == PLUS {
+            let k = self.next()
+            let kind = self.kind_after(k)
+            let cmin: i32 = if c == STAR { 0 } else { 1 }
+            return self.repeat(prev, cmin, MAX_REPS, kind, true)
+        }
+        if c != LBRACE {
+            return prev
+        }
+        var d = self.skip()
+        if not is_digit(d) {
+            fail self.error("Illegal repetition")
+        }
+        var cmin: i32 = 0
+        loop {
+            cmin = try self.digit_onto(cmin, d)
+            d = self.read()
+            if not is_digit(d) {
+                break
+            }
+        }
+        var cmax = cmin
+        var open = false
+        if d == COMMA {
+            d = self.read()
+            if d == RBRACE {
+                open = true
+                cmax = MAX_REPS
+            } else {
+                cmax = 0
+                while is_digit(d) {
+                    cmax = try self.digit_onto(cmax, d)
+                    d = self.read()
+                }
+            }
+        }
+        if d != RBRACE {
+            fail self.error("Unclosed counted closure")
+        }
+        if cmax < cmin {
+            fail self.error("Illegal repetition range")
+        }
+        let k = self.peek()
+        let kind = self.kind_after(k)
+        if cmin == 0 and cmax == 1 {
+            return self.add(Node.Ques { atom: prev, kind: kind })
+        }
+        return self.repeat(prev, cmin, cmax, kind, open)
+    }
+
+    fn digit_onto(self, n: i32, d: u32) -> i32 ! PatternError {
+        let ten = n.checked_mul(10) else {
+            fail self.error("Illegal repetition range")
+        }
+        let sum = ten.checked_add(i32.wrap(d - 0x30)) else {
+            fail self.error("Illegal repetition range")
+        }
+        return sum
+    }
+
+    // `?` or `+` after a quantifier, which it moves past: lazy, possessive, or greedy without.
+    fn kind_after(mut self, c: u32) -> u8 {
+        if c == QUESTION {
+            _ = self.next()
+            return LAZY
+        }
+        if c == PLUS {
+            _ = self.next()
+            return POSSESSIVE
+        }
+        return GREEDY
+    }
+
+    // `prev` repeated. A greedy repeat of one code point with no maximum backs off one code
+    // point at a time.
+    fn repeat(mut self, prev: u32, cmin: i32, cmax: i32, kind: u8, open: bool) -> u32 {
+        if open and kind == GREEDY {
+            let node = self.pat.nodes[usize(prev)]
+            match node {
+                Char { pred } => {
+                    return self.add(Node.CharGreedy { pred: pred, cmin: cmin })
+                },
+                _ => {},
+            }
+        }
+        return self.add(Node.Curly { atom: prev, cmin: cmin, cmax: cmax, kind: kind })
+    }
+
+    // A group, from its `(` to its `)` and its quantifier. `NONE` for a group of flags alone,
+    // such as `(?i)`.
+    fn group0(mut self) -> u32 ! PatternError {
+        let save = self.flags
+        let saved = self.closures.len()
+        var capturing = false
+        var head = NONE
+        var tail = NONE
+        self.root = NONE
+        var c = self.next()
+        if c == QUESTION {
+            c = self.skip()
+            if c == COLON {
+                head = self.create_group(true)
+                tail = self.root
+                let body = try self.expr(tail)
+                self.set_next(head, body)
+            } else if c == EQ or c == BANG {
+                let g = self.create_group(true)
+                let gt = self.root
+                let body = try self.expr(gt)
+                self.set_next(g, body)
+                head = if c == EQ { self.add(Node.Pos { cond: g }) } else { self.add(Node.Neg { cond: g }) }
+                tail = head
+            } else if c == GT {
+                let g = self.create_group(true)
+                let gt = self.root
+                let body = try self.expr(gt)
+                self.set_next(g, body)
+                head = self.add(Node.Ques { atom: g, kind: INDEPENDENT })
+                tail = head
+            } else if c == LT {
+                c = self.read()
+                if c != EQ and c != BANG {
+                    let name = try self.group_name(c)
+                    if self.named(name) != none {
+                        fail self.error("Named capturing group <{name}> is already defined")
+                    }
+                    capturing = true
+                    head = self.create_group(false)
+                    tail = self.root
+                    self.names.push(name)
+                    self.name_groups.push(self.pat.groups - 1)
+                    let body = try self.expr(tail)
+                    self.set_next(head, body)
+                } else {
+                    let start = self.cursor
+                    let g = self.create_group(true)
+                    let gt = self.root
+                    let body = try self.expr(gt)
+                    self.set_next(g, body)
+                    self.set_next(gt, BEHIND_END)
+                    var info = Info.new()
+                    _ = self.pat.study(g, mut info)
+                    if not info.valid {
+                        fail self.error("Look-behind group does not have an obvious maximum length")
+                    }
+                    let sup = self.has_supplementary(start)
+                    head = self.add(Node.Behind { cond: g, rmin: info.min, rmax: info.max, sup: sup, negative: c == BANG })
+                    tail = head
+                }
+            } else if c == DOLLAR or c == AT {
+                fail self.error("Unknown group type")
+            } else {
+                self.unread()
+                self.add_flags()
+                c = self.read()
+                if c == RPAREN {
+                    return NONE
+                }
+                if c != COLON {
+                    fail self.error("Unknown inline modifier")
+                }
+                head = self.create_group(true)
+                tail = self.root
+                let body = try self.expr(tail)
+                self.set_next(head, body)
+            }
+        } else {
+            capturing = true
+            head = self.create_group(false)
+            tail = self.root
+            let body = try self.expr(tail)
+            self.set_next(head, body)
+        }
+        try self.accept(RPAREN, "Unclosed group")
+        self.flags = save
+        let node = try self.closure(head)
+        if node == head {
+            self.root = tail
+            return node
+        }
+        if head == tail {
+            self.root = node
+            return node
+        }
+        self.closures.truncate(saved)
+        return self.repeat_group(node, head, tail, capturing)
+    }
+
+    // A quantified group, as the nodes that repeat it.
+    fn repeat_group(mut self, node: u32, head: u32, tail: u32, capturing: bool) -> u32 {
+        let q = self.pat.nodes[usize(node)]
+        match q {
+            Ques { kind, .. } => {
+                if kind == POSSESSIVE {
+                    self.root = node
+                    return node
+                }
+                let conn = self.add(Node.BranchConn)
+                self.set_next(tail, conn)
+                let first = u32.wrap(self.pat.items.len())
+                if kind == GREEDY {
+                    self.pat.items.push(head)
+                    self.pat.items.push(NONE)
+                } else {
+                    self.pat.items.push(NONE)
+                    self.pat.items.push(head)
+                }
+                self.root = conn
+                return self.add(Node.Branch { start: first, len: 2, conn: conn })
+            },
+            Curly { cmin, cmax, kind, .. } => {
+                if kind == POSSESSIVE {
+                    self.root = node
+                    return node
+                }
+                var info = Info.new()
+                if self.pat.study(head, mut info) {
+                    let t = self.pat.nodes[usize(tail)]
+                    var local: i32 = 0
+                    var group: i32 = 0
+                    match t {
+                        GroupTail { local: l, group: g } => {
+                            local = l
+                            group = g
+                        },
+                        _ => {},
+                    }
+                    let body = self.pat.nexts[usize(head)]
+                    let gc = self.add(Node.GroupCurly { atom: body, cmin: cmin, cmax: cmax, kind: kind, local: local, group: group, capture: capturing })
+                    self.root = gc
+                    return gc
+                }
+                let h = self.pat.nodes[usize(head)]
+                var begin: i32 = 0
+                match h {
+                    GroupHead { local: l } => {
+                        begin = l
+                    },
+                    _ => {},
+                }
+                let count = self.pat.locals
+                self.pat.locals += 1
+                let lp = self.add(Node.Loop { body: head, cmin: cmin, cmax: cmax, count: count, begin: begin, lazy: kind == LAZY, memo: NONE })
+                if kind == GREEDY and cmax == MAX_REPS {
+                    self.closures.push(lp)
+                }
+                self.set_next(tail, lp)
+                self.root = lp
+                return self.add(Node.Prolog { lp: lp })
+            },
+            _ => {
+                self.root = node
+                return node
+            },
+        }
+    }
+
+    // A group's head, its tail left in `root`. A group that doesn't capture is group 0.
+    fn create_group(mut self, anonymous: bool) -> u32 {
+        let local = self.pat.locals
+        self.pat.locals += 1
+        var group: i32 = 0
+        if not anonymous {
+            group = self.pat.groups
+            self.pat.groups += 1
+        }
+        let head = self.add(Node.GroupHead { local: local })
+        self.root = self.add(Node.GroupTail { local: local, group: group })
+        return head
+    }
+
+    fn group_name(mut self, first: u32) -> String ! PatternError {
+        if not is_alpha(first) {
+            fail self.error("capturing group name does not start with a Latin letter")
+        }
+        var name = String()
+        var c = first
+        loop {
+            name.push(rune.try_from(c) ?? ' ')
+            c = self.read()
+            if not (is_alpha(c) or is_digit(c)) {
+                break
+            }
+        }
+        if c != GT {
+            fail self.error("named capturing group is missing trailing '>'")
+        }
+        return name
+    }
+
+    fn named(self, name: String) -> i32? {
+        for k in 0usize..self.names.len() {
+            if self.names[k] == name {
+                return some(self.name_groups[k])
+            }
+        }
+        return none
+    }
+
+    // Whether a code point from `start` to the pattern's end is supplementary or a surrogate,
+    // which makes a lookbehind count code points.
+    fn has_supplementary(self, start: i32) -> bool {
+        var x = start
+        while x < self.plen {
+            if is_supplementary(self.at(x)) {
+                return true
+            }
+            x += 1
+        }
+        return false
+    }
+
+    // Inline flags such as `i` or `-s`, up to what isn't one.
+    fn add_flags(mut self) {
+        var c = self.peek()
+        var on = true
+        loop {
+            if c == DASH and on {
+                on = false
+            } else {
+                let f = flag_bits(c)
+                if f == 0 {
+                    return
+                }
+                if on {
+                    self.flags = self.flags | f
+                } else {
+                    self.flags = self.flags & (f ^ 0xFFFFFFFF)
+                }
+            }
+            c = self.next()
+        }
+    }
+
+    // A character class from its `[`, as a predicate. Without `consume` it's an operand of
+    // `&&`, which leaves its `]` to the class around it.
+    fn clazz(mut self, consume: bool) -> u32 ! PatternError {
+        var prev = NONE
+        var curr = NONE
+        let at = u32.wrap(self.pat.bits.len())
+        for _ in 0..4 {
+            self.pat.bits.push(0)
+        }
+        let bits = self.add_pred(Pred.Bits(at))
+        var negated = false
+        var has_bits = false
+        var c = self.next()
+        loop {
+            if c == LBRACKET {
+                let node = try self.clazz(true)
+                prev = self.union(prev, node)
+                curr = node
+                c = self.peek()
+                continue
+            }
+            if c == AMP {
+                c = self.next()
+                if c == AMP {
+                    c = self.next()
+                    var right = NONE
+                    while c != RBRACKET and c != AMP {
+                        if c == LBRACKET {
+                            let r = try self.clazz(true)
+                            right = self.union(right, r)
+                        } else {
+                            self.unread()
+                            let r = try self.clazz(false)
+                            right = self.union(right, r)
+                        }
+                        c = self.peek()
+                    }
+                    if has_bits {
+                        if prev == NONE {
+                            prev = bits
+                            curr = bits
+                        } else {
+                            prev = self.union(prev, bits)
+                        }
+                        has_bits = false
+                    }
+                    if right != NONE {
+                        curr = right
+                    }
+                    if prev == NONE {
+                        if right == NONE {
+                            fail self.error("Bad class syntax")
+                        }
+                        prev = right
+                    } else {
+                        if curr == NONE {
+                            fail self.error("Bad intersection syntax")
+                        }
+                        prev = self.add_pred(Pred.And(prev, curr))
+                    }
+                    continue
+                }
+                self.unread()
+            } else if c == 0 and self.cursor >= self.plen {
+                fail self.error("Unclosed character class")
+            } else if c == RBRACKET {
+                if prev != NONE or has_bits {
+                    if consume {
+                        _ = self.next()
+                    }
+                    if prev == NONE {
+                        prev = bits
+                    } else if has_bits {
+                        prev = self.union(prev, bits)
+                    }
+                    if negated {
+                        return self.add_pred(Pred.Not(prev))
+                    }
+                    return prev
+                }
+            } else if c == CARET and self.at(self.cursor - 1) == LBRACKET {
+                c = self.next()
+                negated = not negated
+                continue
+            }
+            let node = try self.range(at)
+            if node == NONE {
+                has_bits = true
+                curr = NONE
+            } else {
+                prev = self.union(prev, node)
+                curr = node
+            }
+            c = self.peek()
+        }
+    }
+
+    // One item of a class: a code point, a range or an escape's class. A code point below 256
+    // goes into the bits from `at`, giving `NONE`.
+    fn range(mut self, at: u32) -> u32 ! PatternError {
+        var c = self.peek()
+        if c == BACKSLASH {
+            let e = self.next_raw()
+            if e == 0x70 or e == 0x50 {
+                fail self.unsupported("Unicode properties")
+            }
+            let is_range = self.at(self.cursor + 1) == DASH
+            self.unread()
+            let x = try self.escape(true, true, is_range)
+            if x < 0 {
+                return self.pred
+            }
+            c = u32.wrap(x)
+        } else {
+            _ = self.next()
+        }
+        if self.peek() == DASH {
+            let end = self.at(self.cursor + 1)
+            if end != LBRACKET and end != RBRACKET {
+                _ = self.next()
+                var m: i32 = i32.wrap(self.peek())
+                if m == i32.wrap(BACKSLASH) {
+                    m = try self.escape(true, false, true)
+                } else {
+                    _ = self.next()
+                }
+                if m < i32.wrap(c) {
+                    fail self.error("Illegal character range")
+                }
+                let hi = u32.wrap(m)
+                if self.has(CASE_INSENSITIVE) {
+                    if self.has(UNICODE_CASE) {
+                        return self.add_pred(Pred.RangeU(c, hi))
+                    }
+                    return self.add_pred(Pred.RangeI(c, hi))
+                }
+                return self.add_pred(Pred.Range(c, hi))
+            }
+        }
+        return self.bits_or_single(at, c)
+    }
+
+    fn bits_or_single(mut self, at: u32, c: u32) -> u32 {
+        let ci = self.has(CASE_INSENSITIVE)
+        let uc = self.has(UNICODE_CASE)
+        if c < 256 and not (ci and uc and folds_past_latin1(c)) {
+            self.set_bit(at, c)
+            if ci {
+                if c < 128 {
+                    self.set_bit(at, ascii_upper(c))
+                    self.set_bit(at, ascii_lower(c))
+                } else if uc {
+                    self.set_bit(at, lower(c))
+                    self.set_bit(at, upper(c))
+                }
+            }
+            return NONE
+        }
+        return self.single(c)
+    }
+
+    fn set_bit(mut self, at: u32, c: u32) {
+        if c < 256 {
+            let w = usize(at + (c >> 6))
+            self.pat.bits[w] = self.pat.bits[w] | (1u64 << (c & 63))
+        }
+    }
+
+    // What follows a backslash: a code point, or -1 for a node in `root` or, in a class, a
+    // predicate in `pred`. Without `create` it only reads, for an atom to see where it ends.
+    fn escape(mut self, inclass: bool, create: bool, is_range: bool) -> i32 ! PatternError {
+        let ch = self.skip()
+        let c = if ch < 128 { char.try_from(ch) ?? ' ' } else { ' ' }
+        match c {
+            '0' => {
+                return try self.octal()
+            },
+            '1'..='9' => {
+                if not inclass {
+                    if create {
+                        self.root = self.back_ref(i32.wrap(ch - 0x30))
+                    }
+                    return -1
+                }
+            },
+            'A' | 'G' => {
+                if not inclass {
+                    if create {
+                        self.root = self.add(Node.Begin)
+                    }
+                    return -1
+                }
+            },
+            'z' => {
+                if not inclass {
+                    if create {
+                        self.root = self.add(Node.End)
+                    }
+                    return -1
+                }
+            },
+            'Z' => {
+                if not inclass {
+                    if create {
+                        let unix = self.has(UNIX_LINES)
+                        self.root = self.add(Node.Dollar { unix: unix, multi: false })
+                    }
+                    return -1
+                }
+            },
+            'B' => {
+                if not inclass {
+                    if create {
+                        if self.has(UNICODE_CHARACTER_CLASS) {
+                            fail self.unsupported("Unicode word boundaries")
+                        }
+                        self.root = self.add(Node.Bound { word: false })
+                    }
+                    return -1
+                }
+            },
+            'b' => {
+                if not inclass {
+                    if create {
+                        if self.peek() == LBRACE {
+                            if self.skip() == 0x67 {
+                                if self.read() == RBRACE {
+                                    fail self.unsupported("grapheme cluster boundaries")
+                                }
+                                fail self.error("Illegal/unsupported escape sequence")
+                            }
+                            self.unread()
+                            self.unread()
+                        }
+                        if self.has(UNICODE_CHARACTER_CLASS) {
+                            fail self.unsupported("Unicode word boundaries")
+                        }
+                        self.root = self.add(Node.Bound { word: true })
+                    }
+                    return -1
+                }
+            },
+            'R' => {
+                if not inclass {
+                    if create {
+                        self.root = self.add(Node.LineEnding)
+                    }
+                    return -1
+                }
+            },
+            'X' => {
+                if not inclass {
+                    if create {
+                        fail self.unsupported("grapheme clusters")
+                    }
+                    return -1
+                }
+            },
+            'k' => {
+                if not inclass {
+                    if self.read() != LT {
+                        fail self.error("\\k is not followed by '<' for named capturing group")
+                    }
+                    let first = self.read()
+                    let name = try self.group_name(first)
+                    let g = self.named(name) else {
+                        fail self.error("named capturing group <{name}> does not exist")
+                    }
+                    if create {
+                        self.has_backref = true
+                        let fold = self.ref_fold()
+                        self.root = self.add(Node.BackRef { group: g, fold: fold })
+                    }
+                    return -1
+                }
+            },
+            'd' | 'D' | 's' | 'S' | 'w' | 'W' => {
+                if create {
+                    if self.has(UNICODE_CHARACTER_CLASS) {
+                        fail self.unsupported("Unicode classes")
+                    }
+                    let p = if c == 'd' or c == 'D' { Pred.Digit } else if c == 's' or c == 'S' { Pred.Space } else { Pred.Word }
+                    self.class_escape(p, c == 'D' or c == 'S' or c == 'W', inclass)
+                }
+                return -1
+            },
+            'h' | 'H' => {
+                if create {
+                    self.class_escape(Pred.HSpace, c == 'H', inclass)
+                }
+                return -1
+            },
+            'v' | 'V' => {
+                if c == 'v' and is_range {
+                    return 0x0B
+                }
+                if create {
+                    self.class_escape(Pred.VSpace, c == 'V', inclass)
+                }
+                return -1
+            },
+            'a' => {
+                return 7
+            },
+            'e' => {
+                return 27
+            },
+            'f' => {
+                return 12
+            },
+            'n' => {
+                return 10
+            },
+            'r' => {
+                return 13
+            },
+            't' => {
+                return 9
+            },
+            'c' => {
+                if self.cursor < self.plen {
+                    return i32.wrap(self.read() ^ 64)
+                }
+                fail self.error("Illegal control escape sequence")
+            },
+            'u' => {
+                return try self.unicode_escape()
+            },
+            'x' => {
+                return try self.hex_escape()
+            },
+            'N' => {
+                return try self.name_escape()
+            },
+            'C' | 'E' | 'F' | 'I' | 'J' | 'K' | 'L' | 'M' | 'O' | 'P' | 'Q' | 'T' | 'U' | 'Y' => {},
+            'g' | 'i' | 'j' | 'l' | 'm' | 'o' | 'p' | 'q' | 'y' => {},
+            _ => {
+                return i32.wrap(ch)
+            },
+        }
+        fail self.error("Illegal/unsupported escape sequence")
+    }
+
+    fn class_escape(mut self, p: Pred, negated: bool, inclass: bool) {
+        var id = self.add_pred(p)
+        if negated {
+            id = self.add_pred(Pred.Not(id))
+        }
+        self.pred = id
+        if not inclass {
+            self.root = self.add(Node.Char { pred: id })
+        }
+    }
+
+    fn ref_fold(self) -> u8 {
+        if not self.has(CASE_INSENSITIVE) {
+            return 0
+        }
+        return if self.has(UNICODE_CASE) { 2 } else { 1 }
+    }
+
+    // `\N` for a group: more digits join while they still name a group that exists.
+    fn back_ref(mut self, first: i32) -> u32 {
+        var n = first
+        loop {
+            let d = self.peek()
+            if not is_digit(d) {
+                break
+            }
+            let more = n * 10 + i32.wrap(d - 0x30)
+            if self.pat.groups - 1 < more {
+                break
+            }
+            n = more
+            _ = self.read()
+        }
+        self.has_backref = true
+        let fold = self.ref_fold()
+        return self.add(Node.BackRef { group: n, fold: fold })
+    }
+
+    // `\0` and one to three octal digits, three only up to `\0377`.
+    fn octal(mut self) -> i32 ! PatternError {
+        let n = self.read()
+        if not is_octal(n) {
+            fail self.error("Illegal octal escape sequence")
+        }
+        let m = self.read()
+        if not is_octal(m) {
+            self.unread()
+            return i32.wrap(n - 0x30)
+        }
+        let o = self.read()
+        if is_octal(o) and n <= 0x33 {
+            return i32.wrap((n - 0x30) * 64 + (m - 0x30) * 8 + (o - 0x30))
+        }
+        self.unread()
+        return i32.wrap((n - 0x30) * 8 + (m - 0x30))
+    }
+
+    fn four_hex(mut self) -> i32 ! PatternError {
+        var n: i32 = 0
+        for _ in 0..4 {
+            let c = self.read()
+            if not is_hex(c) {
+                fail self.error("Illegal Unicode escape sequence")
+            }
+            n = n * 16 + i32.wrap(hex_value(c))
+        }
+        return n
+    }
+
+    // A four-digit escape, and the low half after it when it's a high surrogate.
+    fn unicode_escape(mut self) -> i32 ! PatternError {
+        let n = try self.four_hex()
+        if n >= 0xD800 and n <= 0xDBFF {
+            let back = self.cursor
+            if self.read() == BACKSLASH and self.read() == 0x75 {
+                let low = try self.four_hex()
+                if low >= 0xDC00 and low <= 0xDFFF {
+                    return i32.wrap(pair(u32.wrap(n), u32.wrap(low)))
+                }
+            }
+            self.cursor = back
+        }
+        return n
+    }
+
+    // `\xhh` or `\x{h...}`.
+    fn hex_escape(mut self) -> i32 ! PatternError {
+        let n = self.read()
+        if is_hex(n) {
+            let m = self.read()
+            if is_hex(m) {
+                return i32.wrap(hex_value(n) * 16 + hex_value(m))
+            }
+        } else if n == LBRACE and is_hex(self.peek()) {
+            var v: u32 = 0
+            var c = self.read()
+            while is_hex(c) {
+                v = (v << 4) + hex_value(c)
+                if v > 0x10FFFF {
+                    fail self.error("Hexadecimal codepoint is too big")
+                }
+                c = self.read()
+            }
+            if c != RBRACE {
+                fail self.error("Unclosed hexadecimal escape sequence")
+            }
+            return i32.wrap(v)
+        }
+        fail self.error("Illegal hexadecimal escape sequence")
+    }
+
+    // `\N{name}`, the code point a Unicode name names.
+    fn name_escape(mut self) -> i32 ! PatternError {
+        if self.read() != LBRACE {
+            fail self.error("Illegal character name escape sequence")
+        }
+        let start = self.cursor
+        while self.read() != RBRACE {
+            if self.cursor >= self.plen {
+                fail self.error("Unclosed character name escape sequence")
+            }
+        }
+        var name = String()
+        var x = start
+        while x < self.cursor - 1 {
+            name.push(rune.try_from(self.at(x)) ?? ' ')
+            x += 1
+        }
+        let cp = code_point_of(name.copy()) else {
+            fail self.error("Unknown character name [{name}]")
+        }
+        return i32.wrap(cp)
+    }
+}
+
+// The pattern with each `\Q...\E` quote written out as escapes, as Java rewrites it before
+// reading it: letters and code points past ASCII stay, a digit at a quote's start becomes a
+// hex escape so it can't extend an escape before it, and other ASCII is escaped.
+fn unquote(cps: own List<u32>) -> List<u32> {
+    let n = cps.len()
+    var i: usize = 0
+    while i + 1 < n {
+        if cps[i] != BACKSLASH {
+            i += 1
+        } else if cps[i + 1] != 0x51 {
+            i += 2
+        } else {
+            break
+        }
+    }
+    if i + 1 >= n {
+        return cps
+    }
+    var out = List<u32>()
+    for k in 0usize..i {
+        out.push(cps[k])
+    }
+    i += 2
+    var quoted = true
+    var begin = true
+    while i < n {
+        let c = cps[i]
+        i += 1
+        if quoted {
+            if c >= 128 or is_alpha(c) {
+                out.push(c)
+            } else if is_digit(c) {
+                if begin {
+                    out.push(BACKSLASH)
+                    out.push(0x78)
+                    out.push(0x33)
+                }
+                out.push(c)
+            } else if c != BACKSLASH {
+                out.push(BACKSLASH)
+                out.push(c)
+            } else if i < n and cps[i] == 0x45 {
+                i += 1
+                quoted = false
+            } else {
+                out.push(BACKSLASH)
+                out.push(BACKSLASH)
+            }
+        } else if c == BACKSLASH and i < n and cps[i] == 0x51 {
+            i += 1
+            quoted = true
+            begin = true
+            continue
+        } else {
+            out.push(c)
+            if c == BACKSLASH and i < n {
+                out.push(cps[i])
+                i += 1
+            }
+        }
+        begin = false
+    }
+    return out
+}
+
+// The flag an inline modifier letter sets, or 0.
+fn flag_bits(c: u32) -> u32 {
+    return match c {
+        0x69 => CASE_INSENSITIVE,
+        0x6D => MULTILINE,
+        0x73 => DOTALL,
+        0x64 => UNIX_LINES,
+        0x75 => UNICODE_CASE,
+        0x63 => CANON_EQ,
+        0x78 => COMMENTS,
+        0x55 => UNICODE_CHARACTER_CLASS | UNICODE_CASE,
+        _ => 0,
+    }
+}
+
+// The code points below 256 whose other case is above it, which a class can't keep in its
+// bits when it folds Unicode case.
+fn folds_past_latin1(c: u32) -> bool {
+    return c == 0xFF or c == 0xB5 or c == 0x49 or c == 0x69 or c == 0x53 or c == 0x73 or c == 0x4B or c == 0x6B or c == 0xC5 or c == 0xE5
+}
+
+fn in_range(a: u32, c: u32, b: u32) -> bool {
+    return c >= a and c <= b
+}
+
+fn width(c: u32) -> i32 {
+    return if c >= 0x10000 { 2 } else { 1 }
+}
+
+fn is_high(c: u32) -> bool {
+    return c >= 0xD800 and c <= 0xDBFF
+}
+
+fn is_low(c: u32) -> bool {
+    return c >= 0xDC00 and c <= 0xDFFF
+}
+
+fn pair(h: u32, l: u32) -> u32 {
+    return 0x10000 + ((h - 0xD800) << 10) + (l - 0xDC00)
+}
+
+fn is_supplementary(c: u32) -> bool {
+    return c >= 0x10000 or (c >= 0xD800 and c <= 0xDFFF)
+}
+
+// A line terminator outside `UNIX_LINES`: `\n`, `\r`, U+0085, U+2028 and U+2029.
+fn is_terminator(c: u32) -> bool {
+    return c == 0x0A or c == 0x0D or (c | 1) == 0x2029 or c == 0x85
+}
+
+fn ascii_lower(c: u32) -> u32 {
+    return if c >= 0x41 and c <= 0x5A { c + 32 } else { c }
+}
+
+fn ascii_upper(c: u32) -> u32 {
+    return if c >= 0x61 and c <= 0x7A { c - 32 } else { c }
+}
+
+fn is_digit(c: u32) -> bool {
+    return c >= 0x30 and c <= 0x39
+}
+
+fn is_octal(c: u32) -> bool {
+    return c >= 0x30 and c <= 0x37
+}
+
+fn is_alpha(c: u32) -> bool {
+    return (c >= 0x41 and c <= 0x5A) or (c >= 0x61 and c <= 0x7A)
+}
+
+fn is_word(c: u32) -> bool {
+    return is_alpha(c) or is_digit(c) or c == 0x5F
+}
+
+fn is_space(c: u32) -> bool {
+    return c == 0x20 or (c >= 0x09 and c <= 0x0D)
+}
+
+fn is_hex(c: u32) -> bool {
+    return is_digit(c) or (c >= 0x41 and c <= 0x46) or (c >= 0x61 and c <= 0x66)
+}
+
+fn hex_value(c: u32) -> u32 {
+    if is_digit(c) {
+        return c - 0x30
+    }
+    return (c | 0x20) - 0x61 + 10
+}
+
+// Java's `Character.toUpperCase` of a code point: its simple upper case.
+fn upper(c: u32) -> u32 {
+    if c < 128 {
+        return ascii_upper(c)
+    }
+    if (c >= 0x1F80 and c <= 0x1F87) or (c >= 0x1F90 and c <= 0x1F97) or (c >= 0x1FA0 and c <= 0x1FA7) {
+        return c + 8
+    }
+    if c == 0x1FB3 or c == 0x1FC3 or c == 0x1FF3 {
+        return c + 9
+    }
+    return one_case(c, true)
+}
+
+// Java's `Character.toLowerCase` of a code point: its simple lower case.
+fn lower(c: u32) -> u32 {
+    if c < 128 {
+        return ascii_lower(c)
+    }
+    if c == 0x130 {
+        return 0x69
+    }
+    return one_case(c, false)
+}
+
+// The code point's case as the root locale's string casing gives it, where that's one code
+// point, which outside the cases `upper` and `lower` handle is the simple mapping.
+fn one_case(c: u32, up: bool) -> u32 {
+    let r = rune.try_from(c) else return c
+    var s = String()
+    s.push(r)
+    let t = if up { s.to_upper_root() } else { s.to_lower_root() }
+    var out = c
+    var n = 0
+    for x in t.runes() {
+        out = u32(x)
+        n += 1
+    }
+    return if n == 1 { out } else { c }
+}
