@@ -1,0 +1,324 @@
+/// Points of interest as vanilla 26.3 saves them in a world's `poi` folder: the beds, job sites,
+/// bells, beehives, portals and lodestones villagers, bees and portals look for, a chunk's in
+/// one NBT compound, read as `SectionStorage` and `PoiSection` read it and written as they
+/// write it. This is the NBT alone; finding a chunk in its region file, and keeping which
+/// chunks changed, come with the server's world.
+///
+/// Reading is as lenient as vanilla's: a section that can't be read is left out and a record
+/// that can't be read is left out of its section, each with the line vanilla logs, and a
+/// record whose place is already a record's of another type takes its place, with vanilla's
+/// error.
+module storage.poi
+
+import nbt.tag.{Tag}
+import protocol.ids.{DATA_VERSION}
+import registry.names.{Names}
+import registry.registries.{Registries}
+import server.log.{Entry}
+import storage.chunk.{newest_first, no_key}
+import storage.level.{data_version_or, older_file}
+import world.pos.{BlockPos, ChunkPos}
+
+/// The registry a record's type is from, `minecraft:point_of_interest_type`.
+pub struct PoiFormat {
+    pub types: Names
+}
+
+impl PoiFormat {
+    /// The format of the built-in `point_of_interest_type` registry of `registries`, or what's
+    /// missing.
+    pub fn new(registries: Registries) -> PoiFormat ! String {
+        let i = registries.find_builtin(String("point_of_interest_type")) else fail "there's no point_of_interest_type registry"
+        return PoiFormat { types: Names.from(registries.builtin[i]) }
+    }
+}
+
+/// A point of interest, vanilla's `PoiRecord`: where it is, its type, and how many more
+/// villagers can claim it.
+pub struct PoiRecord {
+    pub pos: BlockPos
+    /// The type's ID in `point_of_interest_type`.
+    pub kind: u32
+    pub free_tickets: i32
+}
+
+/// A section's points of interest, vanilla's `PoiSection`, by their place in the section, as
+/// its `Short2ObjectOpenHashMap` keeps them, so they're saved in vanilla's order.
+pub struct PoiSection {
+    /// Whether the records were checked against the section's blocks, which a section that
+    /// isn't is when it's next ticked.
+    pub valid: bool
+    table: OpenHashMap<i16, PoiRecord>
+}
+
+impl PoiSection {
+    /// A section with no records.
+    pub fn new(valid: bool) -> PoiSection {
+        return PoiSection { valid: valid, table: OpenHashMap<i16, PoiRecord>() }
+    }
+
+    /// Adds `record` as vanilla's `add` does, by its place in the section, whichever section
+    /// it's in: not if a record of its type is there, and in place of one of another type,
+    /// with vanilla's error added to `lines`. Whether it's added.
+    pub fn add(mut self, record: PoiRecord, lines: mut List<Entry>) -> bool {
+        let key = relative(record.pos)
+        if self.table.contains(key) {
+            if self.table[key].kind == record.kind {
+                return false
+            }
+            lines.push(Entry.error("POI data mismatch: already registered at BlockPos\{x={record.pos.x}, y={record.pos.y}, z={record.pos.z}\}"))
+        }
+        self.table.insert(key, record)
+        return true
+    }
+
+    /// How many records there are.
+    pub fn len(self) -> usize {
+        return self.table.len()
+    }
+
+    /// The records in the order vanilla saves them, its table's `values().stream()`: the one
+    /// at the section's first block, which the table keeps apart, then the rest from its first
+    /// slot up, the other way to how a loop over the table goes.
+    pub fn records(self) -> List<PoiRecord> {
+        var out = List<PoiRecord>()
+        var rest = List<PoiRecord>()
+        for (k, v) in self.table {
+            if k == 0 {
+                out.push(v)
+            } else {
+                rest.push(v)
+            }
+        }
+        while let r = rest.pop() {
+            out.push(r)
+        }
+        return out
+    }
+}
+
+/// A chunk's points of interest, each of its sections' from the bottom.
+pub struct PoiChunk {
+    pub min_section: i32
+    /// Each section, or `none` for one with no data, which isn't saved.
+    pub sections: List<PoiSection?>
+}
+
+impl PoiChunk {
+    /// A chunk with no data in any of its `sections` sections from `min_section` up, as
+    /// vanilla has one with no file.
+    pub fn empty(min_section: i32, sections: i32) -> PoiChunk {
+        var list = List<PoiSection?>()
+        for _ in 0..sections {
+            list.push(none)
+        }
+        return PoiChunk { min_section: min_section, sections: list }
+    }
+
+    /// The chunk's NBT as `SectionStorage.writeChunk` writes it: each section with data,
+    /// named by its height, then the data version.
+    pub fn write(self, format: PoiFormat) -> Tag {
+        var sections = JavaHashMap<String, Tag>()
+        for i in 0..self.sections.len() {
+            if let section = self.sections[i] {
+                sections.insert("{self.min_section + i32.wrap(i)}", section_tag(format, section))
+            }
+        }
+        var root = JavaHashMap<String, Tag>()
+        root.insert("Sections", Tag.Compound(sections))
+        root.insert("DataVersion", Tag.Int(DATA_VERSION))
+        return Tag.Compound(root)
+    }
+}
+
+impl PoiChunk {
+/// The chunk at `pos` that `root` holds, in a world of `sections` sections from `min_section`
+/// up, read as `SectionStorage` reads it, with what it logs added to `lines`: the warning for
+/// a chunk older than 26.3's, which vanilla upgrades and Calcite reads as it is (D169), then
+/// each section's problems from the bottom, then the records that clash. Vanilla counts every
+/// section it reads as changed, so a chunk that's read is saved again.
+pub fn read(format: PoiFormat, pos: ChunkPos, min_section: i32, sections: i32, root: own JavaHashMap<String, Tag>, lines: mut List<Entry>) -> PoiChunk {
+    var tags = root
+    if let line = older_file("POI chunk [{pos.x}, {pos.z}]", data_version_or(tags, 1945)) {
+        lines.push(line)
+    }
+    var packed = List<Packed?>()
+    match tags.remove("Sections") {
+        some(Tag.Compound(fields)) => {
+            for i in 0..sections {
+                let name = "{min_section + i}"
+                if fields.contains(name) {
+                    packed.push(read_section(format, fields[name], mut lines))
+                } else {
+                    packed.push(none)
+                }
+            }
+        },
+        _ => {
+            for _ in 0..sections {
+                packed.push(none)
+            }
+        },
+    }
+    var list = List<PoiSection?>()
+    var rest = List<Packed?>()
+    while let p = packed.pop() {
+        rest.push(p)
+    }
+    while let p = rest.pop() {
+        match p {
+            some(section) => {
+                var unpacked = PoiSection.new(section.valid)
+                for r in section.records {
+                    _ = unpacked.add(r, mut lines)
+                }
+                list.push(some(unpacked))
+            },
+            none => list.push(none),
+        }
+    }
+    return PoiChunk { min_section: min_section, sections: list }
+}
+}
+
+// A section as `PoiSection.Packed.CODEC` reads it, before its records are added.
+struct Packed {
+    valid: bool
+    records: List<PoiRecord>
+}
+
+// The key a record's place has in its section's table, `SectionPos.sectionRelativePos`.
+fn relative(pos: BlockPos) -> i16 {
+    return i16.wrap(((pos.x & 15) << 8) | ((pos.z & 15) << 4) | (pos.y & 15))
+}
+
+// The section `tag` holds, as `PoiSection.Packed.CODEC` reads it, with `SectionStorage`'s
+// line if it can't be read, or can only in part.
+fn read_section(format: PoiFormat, tag: Tag, lines: mut List<Entry>) -> Packed? {
+    return match tag {
+        Tag.Compound(fields) => section_fields(format, tag, fields, mut lines),
+        _ => {
+            lines.push(Entry.error("Not a map: {tag.to_snbt()}"))
+            none
+        },
+    }
+}
+
+fn section_fields(format: PoiFormat, tag: Tag, fields: JavaHashMap<String, Tag>, lines: mut List<Entry>) -> Packed? {
+    // `Valid` is read leniently: what isn't a number is false.
+    var valid = false
+    if fields.contains("Valid") {
+        valid = fields["Valid"].number_bool() ?? false
+    }
+    if not fields.contains("Records") {
+        lines.push(Entry.error(no_key("Records", tag)))
+        return none
+    }
+    var records = List<PoiRecord>()
+    var errors = List<String>()
+    match fields["Records"] {
+        Tag.List(items) => {
+            for item in items {
+                add_record(format, item, mut records, mut errors)
+            }
+        },
+        Tag.ByteArray(values) => {
+            for v in values {
+                add_record(format, Tag.Byte(v), mut records, mut errors)
+            }
+        },
+        Tag.IntArray(values) => {
+            for v in values {
+                add_record(format, Tag.Int(v), mut records, mut errors)
+            }
+        },
+        Tag.LongArray(values) => {
+            for v in values {
+                add_record(format, Tag.Long(v), mut records, mut errors)
+            }
+        },
+        other => {
+            lines.push(Entry.error("Not a list: {other.to_snbt()}"))
+            return none
+        },
+    }
+    if not errors.is_empty() {
+        lines.push(Entry.error(newest_first(errors)))
+    }
+    return some(Packed { valid: valid, records: records })
+}
+
+// The record `tag` holds added to `records`, if it can be read, and what's wrong with it to
+// `errors`, as `listOf` reads each element.
+fn add_record(format: PoiFormat, tag: Tag, records: mut List<PoiRecord>, errors: mut List<String>) {
+    match tag {
+        Tag.Compound(fields) => {
+            var problems = List<String>()
+            if let r = record_fields(format, tag, fields, mut problems) {
+                records.push(r)
+            }
+            if not problems.is_empty() {
+                errors.push(newest_first(problems))
+            }
+        },
+        _ => errors.push("Not a map: {tag.to_snbt()}"),
+    }
+}
+
+// A record as `PoiRecord.Packed.CODEC` reads it, with what's wrong with each field in
+// `problems`: a place of more than 3 numbers is read from its first 3, and `free_tickets` that
+// aren't a number are 0, but a record without its place or its type isn't read.
+fn record_fields(format: PoiFormat, tag: Tag, fields: JavaHashMap<String, Tag>, problems: mut List<String>) -> PoiRecord? {
+    var pos: BlockPos? = none
+    if fields.contains("pos") {
+        var error: String? = none
+        if let xyz = fields["pos"].fixed_ints(3, mut error) {
+            pos = some(BlockPos { x: xyz[0], y: xyz[1], z: xyz[2] })
+        }
+        if let message = error {
+            problems.push(message)
+        }
+    } else {
+        problems.push(no_key("pos", tag))
+    }
+    var kind: u32? = none
+    if fields.contains("type") {
+        match format.types.decode_fixed(fields["type"]) {
+            ok(k) => kind = some(k),
+            err(message) => problems.push(message),
+        }
+    } else {
+        problems.push(no_key("type", tag))
+    }
+    var free_tickets: i32 = 0
+    if fields.contains("free_tickets") {
+        match fields["free_tickets"].number_int() {
+            some(n) => free_tickets = n,
+            none => problems.push(String("Not a number")),
+        }
+    }
+    let p = pos else return none
+    let k = kind else return none
+    return some(PoiRecord { pos: p, kind: k, free_tickets: free_tickets })
+}
+
+// A section as `PoiSection.Packed.CODEC` writes it: `Valid` only if it's true, and each record
+// with `free_tickets` only if they aren't 0.
+fn section_tag(format: PoiFormat, section: PoiSection) -> Tag {
+    var fields = JavaHashMap<String, Tag>()
+    if section.valid {
+        fields.insert("Valid", Tag.Byte(1))
+    }
+    var records = List<Tag>()
+    for r in section.records() {
+        var record = JavaHashMap<String, Tag>()
+        record.insert("pos", Tag.IntArray([r.pos.x, r.pos.y, r.pos.z]))
+        record.insert("type", format.types.encode(r.kind))
+        if r.free_tickets != 0 {
+            record.insert("free_tickets", Tag.Int(r.free_tickets))
+        }
+        records.push(Tag.Compound(record))
+    }
+    fields.insert("Records", Tag.List(records))
+    return Tag.Compound(fields)
+}

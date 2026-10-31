@@ -430,6 +430,22 @@ Input `{"ops": [...]}`, with blobs. A name is a path in `world` with `/` between
 
 Opening a folder that's open, an operation on one that isn't, `check` and `save` with nothing loaded, a name outside `world`, a UUID, ID or dimension that isn't one, a blob that isn't there or isn't a tag or a JSON object, a kind that isn't `advancements` or `stats`, and an operation it doesn't have are an `error` status. Version 2 added `player_load`, version 3 `saved_load` and `saved_save`, and version 4 `progress_load`, `progress_save` and `stats_locate`.
 
+### `entities_poi` (v1)
+
+A chunk of a world's `entities` or `poi` folder, its NBT as a region file holds it, read and written as vanilla reads and writes it, without the region file.
+
+Input `{"op": ..., "x": 0, "z": 0, "snbt": "{...}"}`, with no blobs: the operation, the chunk read from or saved to, and its NBT as SNBT, a compound, which `entities_load` and `poi` take as no file when it isn't there. `poi` also takes `min_y` and `sections`, as `chunk_nbt` does.
+
+The result is one blob: what was logged, as `chunk_nbt` writes it, then what the operation gives. A root is an `int` length and the compound as `NbtIo.write` writes a file's root.
+
+| Operation | Result |
+| --- | --- |
+| `entities_load` | `EntityStorage.loadEntities` up to making the entities, on its own logger: the `Position` checked with `ChunkPos.CODEC`, the tag upgraded, and `Entities` read with `TagValueInput.childrenListOrEmpty` in a `ScopedCollector` for the chunk, whose report is logged as it closes. A byte, 0 for no file; or 1, then a byte for what's reported to the server, 0 for nothing, 1 for a misplaced chunk, then where it says it is, `x` and `z` as `int`s, or 2 for a position that can't be read, then an `int` count and each entity's compound as a root, an empty one for an empty element |
+| `entities_save` | `storeEntities`, with the case's `Entities`, a list, as the tags the entities saved: a byte, 0 if there's no `Entities`, for a chunk with no entities, which stores nothing; or 1, then the chunk's tag as a root |
+| `poi` | `SectionStorage`'s `PackedChunk.parse` and `unpackChunk` with `PoiSection`'s codec, as `PoiManager` reads a chunk, then `writeChunk`: the chunk written, as a root |
+
+Blobs, an `x` or `z` that isn't an `int`, SNBT that isn't a compound, `entities_save` without it, a `min_y` or `sections` as `chunk_nbt` refuses them, and an operation it doesn't have are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

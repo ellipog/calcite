@@ -51,6 +51,7 @@ public final class Main {
                 new ChunkNbtProbe(),
                 new LevelDataProbe(),
                 new WorldFolderProbe(),
+                new EntitiesPoiProbe(),
                 new RegistriesProbe())) {
             probes.put(probe.name(), probe);
         }
