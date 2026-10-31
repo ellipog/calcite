@@ -1,7 +1,7 @@
 """Writes cases/world_folder/generated.json: a world's folder opened and locked, its level.dat read
 with the level.dat_old fallback, its version checked as a server checks it as it starts, saved,
-players' data read as they join, and the files left, as vanilla's LevelStorageSource and
-PlayerDataStorage do each.
+players' data read as they join, saved data read and written, and the files left, as vanilla's
+LevelStorageSource, PlayerDataStorage and SavedDataStorage do each.
 
     py -I cases/world_folder/gen.py
 
@@ -259,9 +259,76 @@ def players():
     ]
 
 
+WEATHER = "data/minecraft/weather.dat"
+
+
+def saved():
+    """Saved data read and written as SavedDataStorage does: gzipped or not, as its first two bytes
+    say, files that can't be read, a path whose `..` leaves the folder, a dimension's folder, and
+    saves over files, folders in the way and files where folders go."""
+    def file(data=None, version=5023, **more):
+        fields = {}
+        if data is not None:
+            fields["data"] = data
+        if version is not None:
+            fields["DataVersion"] = (INT, version)
+        fields.update(more)
+        return root(COMPOUND, fields)
+
+    weather = (COMPOUND, {"clear_weather_time": (INT, 0), "raining": (BYTE, 1), "rain_time": (INT, 1200)})
+    gz = gzip(file(weather))
+    plain = file(weather)
+    deep = gzip(bytes([COMPOUND]) + utf("") + (bytes([COMPOUND]) + utf("a")) * 600 + bytes([END]) * 601)
+
+    def load(folder="", id="minecraft:weather"):
+        return ["saved_load", folder, id]
+
+    def save(blob, folder="", id="minecraft:weather"):
+        return ["saved_save", folder, id, blob]
+
+    def any_tag(kind, v):
+        return bytes([kind]) + payload(kind, v)
+
+    open_ = [["open"]]
+    return [
+        case("saved-data-none", open_ + [load()] + CLOSE, []),
+        case("saved-data-gzipped", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [gz]),
+        case("saved-data-plain", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [plain]),
+        case("saved-data-no-data", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [gzip(file())]),
+        case("saved-data-int-data", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [gzip(file((INT, 7)))]),
+        case("saved-data-newer", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [gzip(file(weather, 6000))]),
+        case("saved-data-more-fields", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [gzip(file(weather, extra=(STRING, "kept")))]),
+        case("saved-data-trailing", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [plain + b"after"]),
+        case("saved-data-broken", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [b"not saved data"]),
+        case("saved-data-broken-gzip", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [bytes([0x1F, 0x8B, 8, 0]) + b"junk"]),
+        case("saved-data-cut-off", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [plain[:-3]]),
+        case("saved-data-empty", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [b""]),
+        case("saved-data-one-byte", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [bytes([COMPOUND])]),
+        case("saved-data-end", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [bytes([END])]),
+        case("saved-data-root-list", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [gzip(root(LIST, (INT, [1])))]),
+        case("saved-data-deep", [put(WEATHER, 0)] + open_ + [load()] + CLOSE, [deep]),
+        case("saved-data-folder", [["dir", WEATHER]] + open_ + [load()] + CLOSE, []),
+        case("saved-data-namespace", [put("data/calcite/thing.dat", 0)] + open_ + [load(id="calcite:thing")] + CLOSE, [gz]),
+        case("saved-data-nested", [put("data/minecraft/maps/last_id.dat", 0)] + open_ + [load(id="minecraft:maps/last_id")] + CLOSE, [gzip(file((COMPOUND, {"map": (INT, 3)})))]),
+        case("saved-data-out", [put("level.dat", 0)] + open_ + [load(id="minecraft:../../level")] + CLOSE, [gz]),
+        case("saved-data-dimension", [put("dimensions/minecraft/the_nether/data/minecraft/chunk_tickets.dat", 0)] + open_ + [load("minecraft:the_nether", "minecraft:chunk_tickets")] + CLOSE, [gz]),
+        case("saved-data-other-dimension", [put("dimensions/minecraft/the_nether/data/minecraft/chunk_tickets.dat", 0)] + open_ + [load("minecraft:overworld", "minecraft:chunk_tickets")] + CLOSE, [gz]),
+        case("saved-data-save", open_ + [save(0)] + CLOSE, [any_tag(*weather)]),
+        case("saved-data-save-int", open_ + [save(0)] + CLOSE, [any_tag(INT, 5)]),
+        case("saved-data-save-over", [put(WEATHER, 0)] + open_ + [save(1)] + CLOSE, [plain, any_tag(*weather)]),
+        case("saved-data-save-then-load", open_ + [save(0), load()] + CLOSE, [any_tag(*weather)]),
+        case("saved-data-save-nested", open_ + [save(0, id="minecraft:maps/last_id")] + CLOSE, [any_tag(COMPOUND, {"map": (INT, 3)})]),
+        case("saved-data-save-dimension", open_ + [save(0, "minecraft:the_end", "minecraft:raids")] + CLOSE, [any_tag(*weather)]),
+        case("saved-data-save-folder-in-way", [["dir", WEATHER]] + open_ + [save(0)] + CLOSE, [any_tag(*weather)]),
+        case("saved-data-save-file-in-way", [put("data/minecraft", 0)] + open_ + [save(1)] + CLOSE, [b"a file", any_tag(*weather)]),
+        case("saved-data-save-data-is-a-file", [put("data", 0)] + open_ + [save(1)] + CLOSE, [b"a file", any_tag(*weather)]),
+        case("saved-data-save-out", open_ + [save(0, id="minecraft:../../level")] + CLOSE, [any_tag(*weather)]),
+    ]
+
+
 def main():
-    cases = folders() + broken() + versions() + players()
-    write_file(HERE / "generated.json", "world_folder", "cases/world_folder/gen.py", cases, probe_version=2)
+    cases = folders() + broken() + versions() + players() + saved()
+    write_file(HERE / "generated.json", "world_folder", "cases/world_folder/gen.py", cases, probe_version=3)
 
 
 if __name__ == "__main__":

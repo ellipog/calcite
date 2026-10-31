@@ -2,7 +2,12 @@ package calcite.rig.vanilla;
 
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
+import com.mojang.datafixers.util.Pair;
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.DataResult;
 import com.mojang.serialization.Dynamic;
+import com.mojang.serialization.DynamicOps;
+import java.io.DataInputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
@@ -16,16 +21,29 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.CompletionException;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
+import net.minecraft.IdentifierException;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtUtils;
+import net.minecraft.nbt.Tag;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.players.NameAndId;
+import net.minecraft.util.datafix.DataFixTypes;
 import net.minecraft.util.datafix.DataFixers;
+import net.minecraft.world.level.saveddata.SavedData;
+import net.minecraft.world.level.saveddata.SavedDataType;
+import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.level.storage.LevelStorageSource;
 import net.minecraft.world.level.storage.LevelSummary;
 import net.minecraft.world.level.storage.PlayerDataStorage;
+import net.minecraft.world.level.storage.SavedDataStorage;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.LogEvent;
 import org.apache.logging.log4j.core.Logger;
@@ -36,8 +54,8 @@ import org.apache.logging.log4j.core.config.Property;
  * `world_folder`: operations on a world's folder, `world`, in a new folder of its own, with
  * vanilla's {@link LevelStorageSource} and its access: opening and locking it, reading
  * `level.dat` with its fallback, checking the version as `Main` does, saving it, reading a
- * player's data as they join, and the files left. Each result goes into one blob, after what was
- * logged.
+ * player's data as they join, reading and writing saved data with {@link SavedDataStorage}, and
+ * the files left. Each result goes into one blob, after what was logged.
  */
 final class WorldFolderProbe implements Probe {
     @Override
@@ -47,7 +65,7 @@ final class WorldFolderProbe implements Probe {
 
     @Override
     public int version() {
-        return 2;
+        return 3;
     }
 
     @Override
@@ -190,6 +208,53 @@ final class WorldFolderProbe implements Probe {
                             out.write(nbt.toByteArray());
                         }
                     }
+                    case "saved_load" -> {
+                        expect(op, k, 2);
+                        SavedDataStorage storage = saved(open(access, k), op, k);
+                        Raw raw = storage.get(type(op, k));
+                        lines.write(out);
+                        if (raw == null) {
+                            out.writeByte(0);
+                        } else if (raw.tag == null) {
+                            out.writeByte(2);
+                        } else {
+                            out.writeByte(1);
+                            ByteArrayOutputStream nbt = new ByteArrayOutputStream();
+                            NbtIo.writeAnyTag(raw.tag, new DataOutputStream(nbt));
+                            out.writeInt(nbt.size());
+                            out.write(nbt.toByteArray());
+                        }
+                    }
+                    case "saved_save" -> {
+                        expect(op, k, 3);
+                        SavedDataStorage storage = saved(open(access, k), op, k);
+                        SavedDataType<Raw> type = type(op, k);
+                        int blob = Args.asInt(op.get(3), "operation " + k + "'s blob");
+                        if (blob < 0 || blob >= blobs.size()) {
+                            throw new CaseError("operation " + k + ": no blob " + blob);
+                        }
+                        Tag tag;
+                        try {
+                            tag = NbtIo.readAnyTag(new DataInputStream(new ByteArrayInputStream(blobs.get(blob))), NbtAccounter.unlimitedHeap());
+                        } catch (IOException e) {
+                            throw new CaseError("operation " + k + ": blob " + blob + " isn't a tag");
+                        }
+                        storage.set(type, new Raw(tag));
+                        String thrown = null;
+                        try {
+                            storage.saveAndJoin();
+                        } catch (CompletionException e) {
+                            Throwable cause = e.getCause();
+                            thrown = cause.getClass().getName() + ": " + cause.getMessage();
+                        }
+                        lines.write(out);
+                        if (thrown == null) {
+                            out.writeByte(0);
+                        } else {
+                            out.writeByte(1);
+                            text(out, lines.normal(thrown));
+                        }
+                    }
                     case "close" -> {
                         expect(op, k, 0);
                         open(access, k).close();
@@ -231,6 +296,56 @@ final class WorldFolderProbe implements Probe {
         }
         return file;
     }
+
+    // A `SavedDataStorage` for the folder the operation names: the world's `data` for `""`, or
+    // that dimension's. A new one each time, so nothing read before is kept.
+    private static SavedDataStorage saved(LevelStorageSource.LevelStorageAccess access, JsonArray op, int k) {
+        String folder = Args.asString(op.get(1), "operation " + k + "'s folder");
+        Path path;
+        if (folder.isEmpty()) {
+            path = access.getLevelPath(LevelResource.DATA);
+        } else {
+            try {
+                path = access.getDimensionPath(ResourceKey.create(Registries.DIMENSION, Identifier.parse(folder))).resolve("data");
+            } catch (IdentifierException e) {
+                throw new CaseError("operation " + k + ": `" + folder + "` isn't a dimension");
+            }
+        }
+        return new SavedDataStorage(path, DataFixers.getDataFixer(), RegistryAccess.EMPTY);
+    }
+
+    // A saved data type named by the operation, whose codec keeps its `data` as it is.
+    private static SavedDataType<Raw> type(JsonArray op, int k) {
+        Identifier id;
+        try {
+            id = Identifier.parse(Args.asString(op.get(2), "operation " + k + "'s ID"));
+        } catch (IdentifierException e) {
+            throw new CaseError("operation " + k + ": the ID isn't one");
+        }
+        return new SavedDataType<>(id, () -> new Raw(null), RAW, DataFixTypes.SAVED_DATA_RANDOM_SEQUENCES);
+    }
+
+    // Saved data that's what was read, `null` for a file with no `data`.
+    private static final class Raw extends SavedData {
+        final Tag tag;
+
+        Raw(Tag tag) {
+            this.tag = tag;
+        }
+    }
+
+    private static final Codec<Raw> RAW = new Codec<>() {
+        @Override
+        public <T> DataResult<Pair<Raw, T>> decode(DynamicOps<T> ops, T input) {
+            return DataResult.success(Pair.of(new Raw((Tag) input), ops.empty()));
+        }
+
+        @Override
+        @SuppressWarnings("unchecked")
+        public <T> DataResult<T> encode(Raw input, DynamicOps<T> ops, T prefix) {
+            return DataResult.success((T) input.tag);
+        }
+    };
 
     private static LevelStorageSource.LevelStorageAccess open(LevelStorageSource.LevelStorageAccess access, int k) {
         if (access == null) {
