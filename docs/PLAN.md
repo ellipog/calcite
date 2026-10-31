@@ -255,7 +255,7 @@ Make the world real: storage that vanilla can read, Folia-style regions on a loc
 **Done when**
 
 - [ ] **G5.1** The worldgen suites pass on the seed grid in all three dimensions
-- [ ] **G5.2** Worlds round-trip between vanilla and Calcite
+- [x] **G5.2** Worlds round-trip between vanilla and Calcite
 - [ ] **G5.3** One-thread and many-thread runs of the same input log give identical results
 
 ## Phase 6: Simulation

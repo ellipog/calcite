@@ -73,6 +73,7 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `PacketCheck.java` | Vanilla reading Calcite's packets, run by `check_packets.py` |
 | `ChatCheck.java` | Vanilla's client checking the signed chat in `build/packets/chat/`, run by `check_packets.py` |
 | `SessionDump.java` | Vanilla reading the protocol bot's sessions, as trees, run by `rig/runner/sessions.py` |
+| `WorldCheck.java` | Vanilla reading a world it saved and the same world saved by Calcite, with `RegionFile`, `NbtIo` and Gson, and comparing them file by file and chunk by chunk, run by `rig/runner/roundtrip.py` (`G5.2`) |
 | `RegistriesProbe.java` | `registries`: the vanilla data pack's registries and tags, loaded once as `WorldLoader.load` loads them |
 
 ## Rules for probes

@@ -1,0 +1,406 @@
+/// The Calcite half of the round trip through vanilla (G5.2, `rig/runner/roundtrip.py`): a
+/// world's folder loaded and saved again, every file Calcite keeps, with Calcite's own readers
+/// and writers, as a server that loads all of it and saves all of it would.
+///
+///     calx run --release src/rig/resave.calx -- WORLD
+///
+/// It opens the folder and locks it (`storage.world`), then saves again:
+///
+/// - `level.dat`'s `Data`, read and written by `storage.level`, saved now;
+/// - in each of vanilla's dimensions under `dimensions/`, every chunk of `region/`, read and
+///   written by `storage.chunk`, every entity chunk of `entities/`, by `storage.entities`, and
+///   every POI chunk of `poi/`, by `storage.poi`, each region's chunks written together into its
+///   file as `storage.regions` writes them, deflated; and the dimension's saved data;
+/// - the world's saved data in `data/` (`storage.saved`);
+/// - each player's data in `players/data/` (`storage.players`), and their advancements and
+///   statistics in `players/advancements/` and `players/stats/` (`storage.progress`).
+///
+/// It runs from the repository's root, since it reads the vanilla data pack from the pinned
+/// jar in `oracle/jars/` for the registries chunks name things from. It prints each line
+/// logged, as `INFO`, `WARN` or `ERROR` then the message, then `saved` and how many of each
+/// kind were saved. It exits with 1 if the folder can't be opened or read.
+module rig.resave
+
+import java.uuid.{Uuid}
+import json.tree.{Json, Member}
+import nbt.tag.{Tag}
+import resources.identifier.{Identifier}
+import rig.registries.{load_registries}
+import server.log.{Entry, Level}
+import std.env.{args}
+import std.fs.{is_dir, is_file, list, separator}
+import std.process.{exit}
+import std.time.{Timestamp}
+import storage.chunk.{ChunkData, ChunkFormat}
+import storage.entities.{EntityChunk, logger, write_entities}
+import storage.level.{LevelData}
+import storage.players.{PlayerFiles}
+import storage.poi.{PoiChunk, PoiFormat}
+import storage.progress.{ProgressFiles}
+import storage.region.{Compression, configured}
+import storage.regions.{RegionStorage, encode_tag}
+import storage.saved.{SavedFiles}
+import storage.world.{WorldFolder, join}
+import world.pos.{ChunkPos}
+
+// What's in a region file: its chunks, its entity chunks or its POI chunks.
+enum Content {
+    Chunks
+    Entities
+    Poi
+}
+
+// How many of each kind were saved, and of each kind not saved.
+struct Counts {
+    chunks: usize
+    entity_chunks: usize
+    entity_chunks_cleared: usize
+    poi_chunks: usize
+    saved_data: usize
+    players: usize
+    advancements: usize
+    stats: usize
+    skipped: usize
+}
+
+// What every chunk is read and written with.
+struct Formats {
+    chunk: ChunkFormat
+    poi: PoiFormat
+    compression: Compression
+    now: i32
+}
+
+fn main() {
+    let given = args()
+    if given.len() != 1 {
+        println("usage: resave WORLD")
+        exit(1)
+    }
+    var lines = List<Entry>()
+    let code = resave(given[0], mut lines)
+    for line in lines {
+        let level = match line.level {
+            Level.Info => "INFO",
+            Level.Warn => "WARN",
+            Level.Error => "ERROR",
+        }
+        println("{level} {line.message}")
+    }
+    exit(code)
+}
+
+fn resave(path: String, lines: mut List<Entry>) -> u8 {
+    let (universe, name) = split(path)
+    let world = match WorldFolder.open(universe, name) {
+        ok(w) => w,
+        err(e) => {
+            lines.push(Entry.error("the folder wasn't opened: {e}"))
+            return 1
+        },
+    }
+    let loaded = match load_registries() {
+        ok(l) => l,
+        err(e) => {
+            lines.push(Entry.error("the registries didn't load: {e}"))
+            world.close(mut lines)
+            return 1
+        },
+    }
+    let chunk_format = match ChunkFormat.new(loaded.registries) {
+        ok(f) => f,
+        err(e) => {
+            lines.push(Entry.error("no chunk format: {e}"))
+            world.close(mut lines)
+            return 1
+        },
+    }
+    let poi_format = match PoiFormat.new(loaded.registries) {
+        ok(f) => f,
+        err(e) => {
+            lines.push(Entry.error("no POI format: {e}"))
+            world.close(mut lines)
+            return 1
+        },
+    }
+    let stamp = unsafe { Timestamp.now() }
+    let now = stamp.date_time(unsafe { stamp.local_offset() })
+    let formats = Formats { chunk: chunk_format, poi: poi_format, compression: configured(String("deflate"), mut lines), now: i32.wrap(stamp.unix_ms / 1000) }
+    var counts = Counts { chunks: 0, entity_chunks: 0, entity_chunks_cleared: 0, poi_chunks: 0, saved_data: 0, players: 0, advancements: 0, stats: 0, skipped: 0 }
+
+    match world.load_level(now, mut lines) {
+        some(data) => world.save_level(LevelData.parse(data).write(stamp.unix_ms), mut lines),
+        none => {
+            lines.push(Entry.error("level.dat wasn't read"))
+            world.close(mut lines)
+            return 1
+        },
+    }
+
+    let dimensions = world.resource("dimensions")
+    for namespace in names(dimensions) {
+        for dim in names(join(dimensions, namespace)) {
+            let id = Identifier { namespace: namespace.copy(), path: dim.copy() }
+            let (min_section, sections) = height(id) else {
+                lines.push(Entry.warn("dimensions/{namespace}/{dim}: its height isn't known, so it's left as it is"))
+                counts.skipped += 1
+                continue
+            }
+            let folder = world.dimension(id)
+            regions(join(folder, "region"), Content.Chunks, formats, min_section, sections, mut counts, mut lines)
+            regions(join(folder, "entities"), Content.Entities, formats, min_section, sections, mut counts, mut lines)
+            regions(join(folder, "poi"), Content.Poi, formats, min_section, sections, mut counts, mut lines)
+            let files = SavedFiles.dimension(world, id, mut lines)
+            saved(files, join(folder, "data"), mut counts, mut lines)
+        }
+    }
+    saved(SavedFiles.world(world), world.resource("data"), mut counts, mut lines)
+
+    let players = PlayerFiles.open(world)
+    for file in names(world.resource("players/data")) {
+        let uuid = stem(file, ".dat") else continue
+        let id = Uuid.parse(uuid) else {
+            counts.skipped += 1
+            continue
+        }
+        if let data = players.load(id, uuid, now, mut lines) {
+            players.save(id, uuid, Tag.Compound(data), mut lines)
+            counts.players += 1
+        }
+    }
+    let advancements = ProgressFiles.advancements(world)
+    for file in names(world.resource("players/advancements")) {
+        let uuid = stem(file, ".json") else continue
+        let at = advancements.file(uuid)
+        match advancements.load(at, mut lines) {
+            some(Json.Object(members)) => {
+                advancements.save(at, members, mut lines)
+                counts.advancements += 1
+            },
+            _ => counts.skipped += 1,
+        }
+    }
+    let stats = ProgressFiles.stats(world)
+    for file in names(world.resource("players/stats")) {
+        let uuid = stem(file, ".json") else continue
+        let at = stats.file(uuid)
+        match stats.load(at, mut lines) {
+            some(Json.Object(members)) => {
+                stats.save(at, stats_of(members), mut lines)
+                counts.stats += 1
+            },
+            _ => counts.skipped += 1,
+        }
+    }
+    world.close(mut lines)
+    lines.push(Entry.info("saved {counts.chunks} chunks, {counts.entity_chunks} entity chunks ({counts.entity_chunks_cleared} cleared), {counts.poi_chunks} POI chunks, {counts.saved_data} saved data, {counts.players} players, {counts.advancements} advancements, {counts.stats} statistics; {counts.skipped} skipped"))
+    return 0
+}
+
+// The world's folder as a universe and a name in it.
+fn split(path: String) -> (String, String) {
+    var end = path.len()
+    while end > 1 and (path.byte_at(end - 1) == 47 or path.byte_at(end - 1) == 92) {
+        end -= 1
+    }
+    var at = end
+    while at > 0 and path.byte_at(at - 1) != 47 and path.byte_at(at - 1) != 92 {
+        at -= 1
+    }
+    if at == 0 {
+        return (String("."), path[..end])
+    }
+    let universe = if at == 1 { path[..1] } else { path[..at - 1] }
+    return (universe, path[at..end])
+}
+
+// The names in a folder, none if it isn't one.
+fn names(folder: String) -> List<String> {
+    if not is_dir(folder) {
+        return []
+    }
+    return match list(folder) {
+        ok(n) => n,
+        err(_) => [],
+    }
+}
+
+// The name without `suffix`, if it ends in it.
+fn stem(name: String, suffix: String) -> String? {
+    if name.len() <= suffix.len() or not name.ends_with(suffix) {
+        return none
+    }
+    return some(name[..name.len() - suffix.len()])
+}
+
+// The lowest section and the number of sections of one of vanilla's dimensions.
+fn height(id: Identifier) -> (i32, i32)? {
+    if id.namespace != "minecraft" {
+        return none
+    }
+    if id.path == "overworld" {
+        return some((-4, 24))
+    }
+    if id.path == "the_nether" or id.path == "the_end" {
+        return some((0, 16))
+    }
+    return none
+}
+
+// Every region file in `folder`, each chunk read and written again, together.
+fn regions(folder: String, content: Content, formats: Formats, min_section: i32, sections: i32, counts: mut Counts, lines: mut List<Entry>) {
+    var storage = RegionStorage.new(folder, false)
+    for file in names(folder) {
+        let region = region_name(file) else continue
+        var chunks = List<(ChunkPos, List<u8>?)>()
+        for i in 0..1024 {
+            let pos = ChunkPos { x: region.x * 32 + (i & 31), z: region.z * 32 + (i >> 5) }
+            let root = match storage.read(pos, mut lines) {
+                ok(some(Tag.Compound(tags))) => tags,
+                ok(_) => continue,
+                err(e) => {
+                    lines.push(Entry.error("{file} [{pos.x}, {pos.z}]: {e.exception}: {e.message}"))
+                    counts.skipped += 1
+                    continue
+                },
+            }
+            match content {
+                Content.Chunks => match resaved_chunk(formats, pos, min_section, sections, root, mut lines) {
+                    some(bytes) => {
+                        chunks.push((pos, some(bytes)))
+                        counts.chunks += 1
+                    },
+                    none => counts.skipped += 1,
+                },
+                Content.Entities => {
+                    let read = EntityChunk.read(pos, root, mut lines)
+                    if let line = read.problems.close(logger()) {
+                        lines.push(line)
+                    }
+                    var tags = List<Tag>()
+                    for e in read.entities {
+                        tags.push(Tag.Compound(e.tag.copy()))
+                    }
+                    let entities: List<Tag>? = if tags.is_empty() { none } else { some(tags) }
+                    match write_entities(pos, entities) {
+                        some(tag) => {
+                            chunks.push((pos, some(encode_tag(tag, formats.compression))))
+                            counts.entity_chunks += 1
+                        },
+                        none => {
+                            chunks.push((pos, none))
+                            counts.entity_chunks_cleared += 1
+                        },
+                    }
+                },
+                Content.Poi => {
+                    let read = PoiChunk.read(formats.poi, pos, min_section, sections, root, mut lines)
+                    chunks.push((pos, some(encode_tag(read.write(formats.poi), formats.compression))))
+                    counts.poi_chunks += 1
+                },
+            }
+        }
+        match storage.write(chunks, formats.now, mut lines) {
+            ok => {},
+            err(_) => lines.push(Entry.error("{folder}{separator()}{file} wasn't written")),
+        }
+    }
+    match storage.close() {
+        ok => {},
+        err(_) => lines.push(Entry.error("{folder}: a region file wasn't closed")),
+    }
+}
+
+// A chunk read and written again, encoded for its region file, or none if it has no status or
+// can't be read or written, with why.
+fn resaved_chunk(formats: Formats, pos: ChunkPos, min_section: i32, sections: i32, root: own JavaHashMap<String, Tag>, lines: mut List<Entry>) -> List<u8>? {
+    let data = match ChunkData.parse(formats.chunk, min_section, sections, root, mut lines) {
+        ok(some(d)) => d,
+        ok(none) => {
+            lines.push(Entry.warn("chunk [{pos.x}, {pos.z}] has no status, so it's left as it is"))
+            return none
+        },
+        err(e) => {
+            lines.push(Entry.error("chunk [{pos.x}, {pos.z}] wasn't read: {e.exception}: {e.message}"))
+            return none
+        },
+    }
+    return match data.write(formats.chunk) {
+        ok(tag) => some(encode_tag(tag, formats.compression)),
+        err(e) => {
+            lines.push(Entry.error("chunk [{pos.x}, {pos.z}] wasn't written: {e.exception}: {e.message}"))
+            none
+        },
+    }
+}
+
+// The region `r.<x>.<z>.mca` names.
+fn region_name(file: String) -> ChunkPos? {
+    let inner = stem(file, ".mca") else return none
+    if not inner.starts_with("r.") {
+        return none
+    }
+    let rest = inner[2..]
+    let dot = rest.find(".") else return none
+    let x = i32.parse(rest[..dot]) else return none
+    let z = i32.parse(rest[dot + 1..]) else return none
+    return some(ChunkPos { x: x, z: z })
+}
+
+// Every saved data file under `folder`, `<namespace>/<path>.dat`, read and saved again.
+fn saved(files: SavedFiles, folder: String, counts: mut Counts, lines: mut List<Entry>) {
+    for namespace in names(folder) {
+        var found = List<String>()
+        paths(join(folder, namespace), String(), mut found)
+        for path in found {
+            let id = Identifier { namespace: namespace.copy(), path: path.copy() }
+            let root = files.load(id, mut lines) else {
+                counts.skipped += 1
+                continue
+            }
+            var tags = root
+            let data = tags.remove("data") ?? Tag.Compound(JavaHashMap<String, Tag>())
+            match files.save(id, data, mut lines) {
+                ok => counts.saved_data += 1,
+                err(e) => {
+                    lines.push(Entry.error("{namespace}:{path} wasn't saved: {e}"))
+                    counts.skipped += 1
+                },
+            }
+        }
+    }
+}
+
+// The path of each `.dat` file under `folder`, from `prefix`, `/` between folders.
+fn paths(folder: String, prefix: String, found: mut List<String>) {
+    for name in names(folder) {
+        let at = join(folder, name)
+        let path = if prefix.is_empty() { name.copy() } else { "{prefix}/{name}" }
+        if is_dir(at) {
+            paths(at, path, mut found)
+        } else if is_file(at) {
+            if let id = stem(path, ".dat") {
+                found.push(id)
+            }
+        }
+    }
+}
+
+// The members of a statistics file's `stats`, none if it has none.
+fn stats_of(members: own List<Member>) -> List<Member> {
+    var all = members
+    while let m = all.pop() {
+        if m.key == "stats" {
+            return object_members(m.value)
+        }
+    }
+    return []
+}
+
+// An object's members, none for anything else.
+fn object_members(value: own Json) -> List<Member> {
+    return match value {
+        Json.Object(members) => members,
+        _ => [],
+    }
+}

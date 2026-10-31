@@ -108,6 +108,7 @@ Calcite is written in [Calx](https://github.com/ellipog/calx). Module `a.b` is t
 | `rig.world_folder` | The `world_folder` probe: `storage.world`'s world folder, `storage.players`' player data, `storage.saved`'s saved data and `storage.progress`'s advancements and statistics against vanilla's `LevelStorageSource`, `PlayerDataStorage`, `SavedDataStorage`, `PlayerAdvancements`, `ServerStatsCounter` and `PlayerList` | |
 | `rig.registries` | The `registries` probe: the vanilla data pack's registries and tags against vanilla's | |
 | `rig.nbt` | The `nbt` probe: binary NBT read, printed and written back, and SNBT parsed, against vanilla's | |
+| `rig.resave` | The round trip's Calcite half (`G5.2`): a world's folder loaded and saved again, every file through `storage`'s readers and writers, for `rig/runner/roundtrip.py` to give back to vanilla | |
 | `rig.swarm` | The bot benchmark's players: bots that join a running server, walk and chat, and say how it went ([D154](../docs/decisions.md)). Its flags try wide views, as with `force-view-distance` | |
 
 ## Random sources
