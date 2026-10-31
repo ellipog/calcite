@@ -1,0 +1,859 @@
+/// Chunk tickets, as vanilla's `TicketStorage` keeps them: what keeps a chunk loaded or ticking,
+/// each with its type, its level and, for a type that runs out, the ticks it has left. Each
+/// chunk's are kept in a fastutil table, as vanilla keeps them, so they're gone over in vanilla's
+/// order, and they're saved as a dimension's `chunk_tickets`.
+///
+/// A ticket's level is how far from loaded the chunk it's at is: 33 is a full chunk's, 32 a
+/// ticking one's and 31 one whose entities tick, and a lower level reaches farther around it.
+/// Vanilla's storage tells its two chunk trackers of each chunk whose lowest ticket it changes,
+/// through listeners; Calcite's tells a `TicketListener`, in the same order (D175).
+module world.tickets
+
+import nbt.tag.{Tag}
+import registry.names.{Names}
+import registry.registry.{Registry}
+import resources.identifier.{Identifier}
+import server.log.{Entry}
+import storage.chunk.{newest_first, no_key}
+import storage.saved.{parse_failed}
+import world.pos.{ChunkPos}
+
+/// The highest level a chunk can have, where it isn't loaded at all: 33, a full chunk's, and the
+/// 11 chunks around one that generating it needs, `ChunkLevel.MAX_LEVEL`.
+pub const MAX_LEVEL: i32 = 44
+/// A full chunk's level, which a ticket of radius 0 has, `ChunkLevel.byStatus(FULL)`.
+pub const FULL_LEVEL: i32 = 33
+/// The level of a forced chunk's ticket, that of a chunk whose entities tick,
+/// `ChunkMap.FORCED_TICKET_LEVEL`.
+pub const FORCED_LEVEL: i32 = 31
+/// A chunk's level when it has no ticket, one past `MAX_LEVEL`, as `getTicketLevelAt` gives it.
+pub const NO_TICKET: i32 = 45
+
+/// A type that's saved with the dimension, `FLAG_PERSIST`.
+pub const PERSIST: i32 = 1
+/// A type that loads chunks, which the loading tracker counts, `FLAG_LOADING`.
+pub const LOADING: i32 = 2
+/// A type that ticks chunks, which the simulation tracker counts, `FLAG_SIMULATION`.
+pub const SIMULATION: i32 = 4
+/// A type that keeps its dimension ticking with no players in it, `FLAG_KEEP_DIMENSION_ACTIVE`.
+pub const KEEP_DIMENSION_ACTIVE: i32 = 8
+/// A type that runs out whether its chunk is loaded or not, `FLAG_CAN_EXPIRE_IF_UNLOADED`.
+pub const CAN_EXPIRE_IF_UNLOADED: i32 = 16
+
+/// The ticket types, in the order vanilla registers them in `minecraft:ticket_type`.
+pub enum TicketType: u8 {
+    PlayerSpawn
+    SpawnSearch
+    Dragon
+    PlayerLoading
+    PlayerSimulation
+    Forced
+    Portal
+    EnderPearl
+    Unknown
+}
+
+impl TicketType {
+    /// The type's name in its registry, as `player_spawn`.
+    pub fn name(self) -> str {
+        return match self {
+            PlayerSpawn => "player_spawn",
+            SpawnSearch => "spawn_search",
+            Dragon => "dragon",
+            PlayerLoading => "player_loading",
+            PlayerSimulation => "player_simulation",
+            Forced => "forced",
+            Portal => "portal",
+            EnderPearl => "ender_pearl",
+            Unknown => "unknown",
+        }
+    }
+
+    /// The ticks a ticket of the type lasts, or 0 for one that doesn't run out.
+    pub fn timeout(self) -> i64 {
+        return match self {
+            PlayerSpawn => 20,
+            SpawnSearch => 1,
+            Portal => 300,
+            EnderPearl => 40,
+            Unknown => 1,
+            _ => 0,
+        }
+    }
+
+    /// The type's flags, `PERSIST` and the rest, or'd together.
+    pub fn flags(self) -> i32 {
+        return match self {
+            PlayerSpawn => LOADING,
+            SpawnSearch => LOADING,
+            Dragon => LOADING | SIMULATION,
+            PlayerLoading => LOADING,
+            PlayerSimulation => SIMULATION | KEEP_DIMENSION_ACTIVE,
+            Forced => PERSIST | LOADING | SIMULATION | KEEP_DIMENSION_ACTIVE,
+            Portal => PERSIST | LOADING | SIMULATION | KEEP_DIMENSION_ACTIVE,
+            EnderPearl => LOADING | SIMULATION | KEEP_DIMENSION_ACTIVE,
+            Unknown => LOADING | CAN_EXPIRE_IF_UNLOADED,
+        }
+    }
+
+    /// Whether its tickets are saved with the dimension.
+    pub fn persists(self) -> bool {
+        return self.flags() & PERSIST != 0
+    }
+
+    /// Whether its tickets load chunks.
+    pub fn loads(self) -> bool {
+        return self.flags() & LOADING != 0
+    }
+
+    /// Whether its tickets tick chunks.
+    pub fn simulates(self) -> bool {
+        return self.flags() & SIMULATION != 0
+    }
+
+    /// Whether its tickets keep their dimension ticking with no players in it.
+    pub fn keeps_dimension_active(self) -> bool {
+        return self.flags() & KEEP_DIMENSION_ACTIVE != 0
+    }
+
+    /// Whether its tickets run out whether their chunk is loaded or not.
+    pub fn can_expire_if_unloaded(self) -> bool {
+        return self.flags() & CAN_EXPIRE_IF_UNLOADED != 0
+    }
+
+    /// Whether its tickets run out at all.
+    pub fn has_timeout(self) -> bool {
+        return self.timeout() != 0
+    }
+}
+
+/// A ticket: its type, its level, and the ticks it has left, vanilla's `Ticket`.
+pub struct Ticket {
+    pub kind: TicketType
+    pub level: i32
+    /// The ticks left until it runs out, for a type that runs out; it's out once it's below 0.
+    pub ticks_left: i64
+}
+
+impl Ticket {
+    /// A ticket of `kind` at `level`, with all its type's ticks left.
+    pub fn new(kind: TicketType, level: i32) -> Ticket {
+        return Ticket { kind: kind, level: level, ticks_left: kind.timeout() }
+    }
+
+    /// A ticket of `kind` that reaches `radius` chunks around its own as full chunks, at the
+    /// level `FULL_LEVEL - radius`, as `addTicketWithRadius` makes one.
+    pub fn with_radius(kind: TicketType, radius: i32) -> Ticket {
+        return Ticket.new(kind, FULL_LEVEL - radius)
+    }
+
+    /// Whether it's run out, `isTimedOut`.
+    pub fn timed_out(self) -> bool {
+        return self.kind.has_timeout() and self.ticks_left < 0
+    }
+
+    /// The ticket as vanilla's `toString` writes it, which the chunk debug shows:
+    /// `Ticket[minecraft:portal 30] with 299 ticks left ( out of300)`, its odd spaces kept, or
+    /// `Ticket[minecraft:forced 31] with no timeout`.
+    pub fn described(self) -> String {
+        if self.kind.has_timeout() {
+            return "Ticket[minecraft:{self.kind.name()} {self.level}] with {self.ticks_left} ticks left ( out of{self.kind.timeout()})"
+        }
+        return "Ticket[minecraft:{self.kind.name()} {self.level}] with no timeout"
+    }
+}
+
+/// What's told of a chunk whose lowest ticket changes: vanilla's two `ChunkUpdated` listeners,
+/// the loading tracker's and the simulation tracker's. Neither reads the tickets as it's told,
+/// only as it runs its updates after.
+pub interface TicketListener {
+    /// The chunk's lowest loading ticket is now at `level`, `NO_TICKET` if it has none.
+    /// `only_decreased` is set when a ticket was added, so the level can only have gone down.
+    fn loading(mut self, chunk: i64, level: i32, only_decreased: bool)
+    /// As `loading`, for the chunk's lowest simulation ticket.
+    fn simulation(mut self, chunk: i64, level: i32, only_decreased: bool)
+}
+
+/// A listener that hears nothing, as vanilla's storage is before a chunk map's trackers listen
+/// to it.
+pub struct NoListener {
+    _unused: bool = false
+}
+
+impl TicketListener for NoListener {
+    fn loading(mut self, chunk: i64, level: i32, only_decreased: bool) {}
+    fn simulation(mut self, chunk: i64, level: i32, only_decreased: bool) {}
+}
+
+/// What the storage asks of the chunks' holders as tickets run out: vanilla's `ChunkMap`.
+pub interface Holders {
+    /// Whether `chunk` has no holder, or one that's ready to save, as `canTicketExpire` asks. A
+    /// ticket that doesn't run out unloaded runs down only then.
+    fn ready_for_saving(self, chunk: i64) -> bool
+}
+
+// Holders that are all ready, for removal that doesn't ask them.
+struct AllReady {
+    _unused: bool = false
+}
+
+impl Holders for AllReady {
+    fn ready_for_saving(self, chunk: i64) -> bool {
+        return true
+    }
+}
+
+/// A dimension's chunk tickets, vanilla's `TicketStorage`: those in use, each chunk's in a list,
+/// and those deactivated, as they were saved or as the server closed, until they're activated
+/// again.
+pub struct TicketStorage {
+    tickets: OpenHashMap<i64, List<Ticket>>
+    deactivated: OpenHashMap<i64, List<Ticket>>
+    forced: OpenHashSet<i64>
+    /// Whether the tickets have changed since they were saved, vanilla's `isDirty`.
+    pub dirty: bool = false
+}
+
+impl TicketStorage {
+    /// No tickets, as a dimension with no `chunk_tickets` starts.
+    pub fn new() -> TicketStorage {
+        return TicketStorage { tickets: OpenHashMap<i64, List<Ticket>>(4), deactivated: OpenHashMap<i64, List<Ticket>>(), forced: OpenHashSet<i64>() }
+    }
+
+    /// Whether any chunk has a ticket in use.
+    pub fn has_tickets(self) -> bool {
+        return not self.tickets.is_empty()
+    }
+
+    /// Whether a ticket in use keeps the dimension ticking with no players in it.
+    pub fn keeps_dimension_active(self) -> bool {
+        for (_, list) in self.tickets {
+            for t in list {
+                if t.kind.keeps_dimension_active() {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// The chunks with tickets in use, packed as `ChunkPos.pack` packs them, in the table's
+    /// order.
+    pub fn chunks(self) -> List<i64> {
+        var out = List<i64>()
+        for (k, _) in self.tickets {
+            out.push(k)
+        }
+        return out
+    }
+
+    /// The tickets in use at `chunk`, in the order they were added.
+    pub fn tickets_at(self, chunk: i64) -> List<Ticket> {
+        if self.tickets.contains(chunk) {
+            return self.tickets[chunk].copy()
+        }
+        return List<Ticket>()
+    }
+
+    /// The chunks with tickets deactivated, in their table's order.
+    pub fn deactivated_chunks(self) -> List<i64> {
+        var out = List<i64>()
+        for (k, _) in self.deactivated {
+            out.push(k)
+        }
+        return out
+    }
+
+    /// The tickets deactivated at `chunk`, in the order they were.
+    pub fn deactivated_at(self, chunk: i64) -> List<Ticket> {
+        if self.deactivated.contains(chunk) {
+            return self.deactivated[chunk].copy()
+        }
+        return List<Ticket>()
+    }
+
+    /// The chunks with a forced ticket, in their set's order, `getForceLoadedChunks`.
+    pub fn forced_chunks(self) -> List<i64> {
+        var out = List<i64>()
+        for k in self.forced {
+            out.push(k)
+        }
+        return out
+    }
+
+    /// Whether `chunk` has a forced ticket.
+    pub fn is_forced(self, chunk: i64) -> bool {
+        return self.forced.contains(chunk)
+    }
+
+    /// The level of the lowest ticket at `chunk` that ticks it, if `simulation`, or that loads
+    /// it, or `NO_TICKET` if none does, `getTicketLevelAt`.
+    pub fn level_at(self, chunk: i64, simulation: bool) -> i32 {
+        if self.tickets.contains(chunk) {
+            return lowest(self.tickets[chunk], simulation)
+        }
+        return NO_TICKET
+    }
+
+    /// The lowest ticket at `chunk` that ticks it, if `simulation`, or that loads it, as the
+    /// chunk debug shows it, `getTicketDebugString`: `no_ticket` if there's none.
+    pub fn debug_string(self, chunk: i64, simulation: bool) -> String {
+        if self.tickets.contains(chunk) {
+            if let i = lowest_at(self.tickets[chunk], simulation) {
+                return self.tickets[chunk][i].described()
+            }
+        }
+        return String("no_ticket")
+    }
+
+    /// Adds `ticket` at `chunk`, as `addTicket` does: if the chunk has one of the same type and
+    /// level, that one gets all its ticks back and `false` is given. Otherwise the listener's
+    /// told if it lowers the chunk's lowest ticket, the simulation tracker first, and it's
+    /// `true`.
+    pub fn add<L: TicketListener>(mut self, chunk: i64, ticket: Ticket, listener: mut L) -> bool {
+        if not self.tickets.contains(chunk) {
+            self.tickets.insert(chunk, List<Ticket>())
+        }
+        let n = self.tickets[chunk].len()
+        for i in 0..n {
+            let t = self.tickets[chunk][i]
+            if t.kind == ticket.kind and t.level == ticket.level {
+                self.tickets[chunk][i].ticks_left = t.kind.timeout()
+                self.dirty = true
+                return false
+            }
+        }
+        let old_simulation = lowest(self.tickets[chunk], true)
+        let old_loading = lowest(self.tickets[chunk], false)
+        self.tickets[chunk].push(ticket)
+        if ticket.kind.simulates() and ticket.level < old_simulation {
+            listener.simulation(chunk, ticket.level, true)
+        }
+        if ticket.kind.loads() and ticket.level < old_loading {
+            listener.loading(chunk, ticket.level, true)
+        }
+        if ticket.kind == TicketType.Forced {
+            self.forced.insert(chunk)
+        }
+        self.dirty = true
+        return true
+    }
+
+    /// Adds a ticket of `kind` at `pos` that reaches `radius` chunks around it, as
+    /// `addTicketWithRadius` does.
+    pub fn add_with_radius<L: TicketListener>(mut self, kind: TicketType, pos: ChunkPos, radius: i32, listener: mut L) {
+        _ = self.add(pos.pack(), Ticket.with_radius(kind, radius), mut listener)
+    }
+
+    /// Takes the first ticket at `chunk` of `ticket`'s type and level out, as `removeTicket`
+    /// does, and tells the listener the chunk's lowest ticket now of each kind the type counts,
+    /// the simulation tracker first, whether it changed or not. `false` if there's no such
+    /// ticket.
+    pub fn remove<L: TicketListener>(mut self, chunk: i64, ticket: Ticket, listener: mut L) -> bool {
+        if not self.tickets.contains(chunk) {
+            return false
+        }
+        var at: usize? = none
+        let n = self.tickets[chunk].len()
+        for i in 0..n {
+            let t = self.tickets[chunk][i]
+            if t.kind == ticket.kind and t.level == ticket.level {
+                at = some(i)
+                break
+            }
+        }
+        let i = at else return false
+        _ = self.tickets[chunk].remove(i)
+        let simulation = lowest(self.tickets[chunk], true)
+        let loading = lowest(self.tickets[chunk], false)
+        if self.tickets[chunk].is_empty() {
+            _ = self.tickets.remove(chunk)
+        }
+        if ticket.kind.simulates() {
+            listener.simulation(chunk, simulation, false)
+        }
+        if ticket.kind.loads() {
+            listener.loading(chunk, loading, false)
+        }
+        if ticket.kind == TicketType.Forced {
+            self.update_forced_chunks()
+        }
+        self.dirty = true
+        return true
+    }
+
+    /// Takes out a ticket of `kind` at `pos` that reaches `radius` chunks around it, as
+    /// `removeTicketWithRadius` does.
+    pub fn remove_with_radius<L: TicketListener>(mut self, kind: TicketType, pos: ChunkPos, radius: i32, listener: mut L) {
+        _ = self.remove(pos.pack(), Ticket.with_radius(kind, radius), mut listener)
+    }
+
+    /// Forces `pos` or stops forcing it, with a forced ticket at `FORCED_LEVEL`, as
+    /// `updateChunkForced` does, and whether that added or took out a ticket.
+    pub fn update_forced<L: TicketListener>(mut self, pos: ChunkPos, forced: bool, listener: mut L) -> bool {
+        let ticket = Ticket.new(TicketType.Forced, FORCED_LEVEL)
+        if forced {
+            return self.add(pos.pack(), ticket, mut listener)
+        }
+        return self.remove(pos.pack(), ticket, mut listener)
+    }
+
+    /// Moves every ticket of `kind` to `level`, as `replaceTicketLevelOfType` does: each taken
+    /// out and a new one added, in the table's order.
+    pub fn replace_level_of_type<L: TicketListener>(mut self, level: i32, kind: TicketType, listener: mut L) {
+        var chunks = List<i64>()
+        var found = List<Ticket>()
+        for (k, list) in self.tickets {
+            for t in list {
+                if t.kind == kind {
+                    chunks.push(k)
+                    found.push(t)
+                }
+            }
+        }
+        for i in 0..chunks.len() {
+            _ = self.remove(chunks[i], found[i], mut listener)
+            _ = self.add(chunks[i], Ticket.new(found[i].kind, level), mut listener)
+        }
+    }
+
+    /// Runs each ticket down a tick, as `purgeStaleTickets` does each tick: one that runs out
+    /// unloaded, or one that runs out at a chunk `holders` say is ready to save, loses a tick,
+    /// and it's taken out once it's run out. Each chunk that lost a ticket is told of, in the
+    /// order vanilla's loop gets to it.
+    pub fn purge_stale<H: Holders, L: TicketListener>(mut self, holders: H, listener: mut L) {
+        self.remove_if(true, holders, mut listener)
+        self.dirty = true
+    }
+
+    /// Deactivates every ticket in use but those of `unknown` type, as the dimension closes, as
+    /// `deactivateTicketsOnClosing` does, so they're saved and come back as it opens again.
+    pub fn deactivate_on_closing<L: TicketListener>(mut self, listener: mut L) {
+        self.remove_if(false, AllReady {}, mut listener)
+    }
+
+    /// Adds each deactivated ticket back, in its table's order, as the server's ready to load
+    /// them, as `activateAllDeactivatedTickets` does.
+    pub fn activate_all_deactivated<L: TicketListener>(mut self, listener: mut L) {
+        var chunks = List<i64>()
+        var found = List<Ticket>()
+        for (k, list) in self.deactivated {
+            for t in list {
+                chunks.push(k)
+                found.push(t)
+            }
+        }
+        for i in 0..chunks.len() {
+            _ = self.add(chunks[i], found[i], mut listener)
+        }
+        self.deactivated.clear()
+    }
+
+    /// The tickets as a dimension's `chunk_tickets` saves them, its `data`, as
+    /// `TicketStorage.CODEC` writes them: each that persists, those in use first, then those
+    /// deactivated, each chunk's in the order they were added and the chunks in each table's
+    /// order. Each is `{chunk_pos: [I; x, z], type, level, ticks_left}`, with `ticks_left` left
+    /// out where it's 0, and `tickets` left out where there are none, as `optionalFieldOf` leaves
+    /// out a default.
+    pub fn pack(self) -> Tag {
+        var list = List<Tag>()
+        pack_table(self.tickets, mut list)
+        pack_table(self.deactivated, mut list)
+        var fields = JavaHashMap<String, Tag>()
+        if not list.is_empty() {
+            fields.insert("tickets", Tag.List(list))
+        }
+        return Tag.Compound(fields)
+    }
+
+    /// The tickets a dimension's `chunk_tickets` saved, from the file's root as
+    /// `SavedFiles.load` reads it, read from its `data` as `TicketStorage.CODEC` reads them, all
+    /// deactivated until the server's ready to load them, as `fromPacked` keeps them. Those that
+    /// can be read are kept, and if any can't, `parse_failed`'s line says why, the last first.
+    /// `none`, with the line, if `data` isn't a compound, and the dimension starts with no
+    /// tickets. A `tickets` that isn't a list reads as none, with its line, but is read.
+    pub fn parse(root: JavaHashMap<String, Tag>, lines: mut List<Entry>) -> TicketStorage? {
+        if not root.contains("data") {
+            lines.push(parse_failed(saved_id(), String("Not a map: null")))
+            return none
+        }
+        return match root["data"] {
+            Tag.Compound(fields) => read_data(fields, mut lines),
+            _ => {
+                lines.push(parse_failed(saved_id(), "Not a map: {root["data"].to_snbt()}"))
+                none
+            },
+        }
+    }
+
+    // Takes tickets out as `removeTicketIf` does: running them down a tick, if `purging`, as
+    // `purgeStaleTickets` does, or else deactivating them. Vanilla does it in one loop over the
+    // table, which takes a chunk with none left out with its iterator as it goes, so a chunk may
+    // be got to out of the table's order (D173). What happens to each ticket is the same
+    // whenever it's got to, so it's all worked out first, the chunks with none left taken out,
+    // then the rest of each chunk's tickets changed and its trackers told, in the order vanilla
+    // gets to them.
+    fn remove_if<H: Holders, L: TicketListener>(mut self, purging: bool, holders: H, listener: mut L) {
+        // The chunks that lose a tick or a ticket, by their places in the loop: the kinds of
+        // ticket each loses, and whether it has none left.
+        var touched = List<usize>()
+        var keys = List<i64>()
+        var lost = List<i32>()
+        var emptied = List<bool>()
+        var any_emptied = false
+        var at: usize = 0
+        for (k, list) in self.tickets {
+            var hit = false
+            var left = false
+            var kinds: i32 = 0
+            for t in list {
+                var out = false
+                if purging {
+                    if runs_down(t, k, holders) {
+                        hit = true
+                        out = t.ticks_left - 1 < 0
+                    }
+                } else if t.kind != TicketType.Unknown {
+                    hit = true
+                    out = true
+                }
+                if out {
+                    kinds = kinds | t.kind.flags()
+                    if t.kind == TicketType.Forced {
+                        kinds = kinds | LOST_FORCED
+                    }
+                } else {
+                    left = true
+                }
+            }
+            if hit {
+                touched.push(at)
+                keys.push(k)
+                lost.push(kinds)
+                let gone = kinds & (LOADING | SIMULATION) != 0 and not left
+                emptied.push(gone)
+                any_emptied = any_emptied or gone
+            }
+            at += 1
+        }
+        if touched.is_empty() {
+            return
+        }
+        // The tickets of the chunks with none left, which deactivating keeps, before they go.
+        var whole = List<List<Ticket>>()
+        if any_emptied and not purging {
+            for j in 0..touched.len() {
+                if emptied[j] {
+                    whole.push(self.tickets[keys[j]].copy())
+                } else {
+                    whole.push(List<Ticket>())
+                }
+            }
+        }
+        var order = List<usize>()
+        if any_emptied {
+            var marks = List<bool>()
+            var slot = List<u32>()
+            for _ in 0..self.tickets.len() {
+                marks.push(false)
+                slot.push(u32.MAX)
+            }
+            for j in 0..touched.len() {
+                marks[touched[j]] = emptied[j]
+                slot[touched[j]] = u32.wrap(j)
+            }
+            for i in self.tickets.remove_marked(marks) {
+                if slot[i] != u32.MAX {
+                    order.push(usize(slot[i]))
+                }
+            }
+        } else {
+            for j in 0..touched.len() {
+                order.push(j)
+            }
+        }
+        for j in order {
+            let k = keys[j]
+            var loading = NO_TICKET
+            var simulation = NO_TICKET
+            if emptied[j] {
+                if not purging {
+                    self.keep_deactivated(k, whole[j])
+                }
+            } else {
+                var kept = List<Ticket>()
+                var removed = List<Ticket>()
+                for t in self.tickets[k] {
+                    var u = t
+                    var out = false
+                    if purging {
+                        if runs_down(t, k, holders) {
+                            u.ticks_left -= 1
+                            out = u.timed_out()
+                        }
+                    } else {
+                        out = t.kind != TicketType.Unknown
+                    }
+                    if out {
+                        removed.push(u)
+                    } else {
+                        kept.push(u)
+                    }
+                }
+                if not purging {
+                    self.keep_deactivated(k, removed)
+                }
+                loading = lowest(kept, false)
+                simulation = lowest(kept, true)
+                self.tickets[k] = kept
+            }
+            if lost[j] & (LOADING | SIMULATION) != 0 {
+                if lost[j] & LOADING != 0 {
+                    listener.loading(k, loading, false)
+                }
+                if lost[j] & SIMULATION != 0 {
+                    listener.simulation(k, simulation, false)
+                }
+                self.dirty = true
+            }
+        }
+        var forced_gone = false
+        for j in 0..touched.len() {
+            forced_gone = forced_gone or lost[j] & LOST_FORCED != 0
+        }
+        if forced_gone {
+            self.update_forced_chunks()
+        }
+    }
+
+    // Adds the tickets deactivated at `chunk` to those deactivated, as `removeTicketIf` adds
+    // each to the table it's given.
+    fn keep_deactivated(mut self, chunk: i64, tickets: List<Ticket>) {
+        if tickets.is_empty() {
+            return
+        }
+        if not self.deactivated.contains(chunk) {
+            self.deactivated.insert(chunk, List<Ticket>())
+        }
+        for t in tickets {
+            self.deactivated[chunk].push(t)
+        }
+    }
+
+    // The chunks with a forced ticket, found afresh in the table's order, as
+    // `updateForcedChunks` finds them.
+    fn update_forced_chunks(mut self) {
+        var forced = OpenHashSet<i64>()
+        for (k, list) in self.tickets {
+            for t in list {
+                if t.kind == TicketType.Forced {
+                    forced.insert(k)
+                    break
+                }
+            }
+        }
+        self.forced = forced
+    }
+}
+
+/// The saved data type the tickets are saved as, in a dimension's `data`, `TicketStorage.TYPE`.
+pub fn saved_id() -> Identifier {
+    return Identifier { namespace: "minecraft", path: "chunk_tickets" }
+}
+
+// Adds the tickets of `table` that persist to `out`, as `forEachTicket` goes over them, each as
+// `TICKET_ENTRY` writes it. `mapPair` puts the ticket's fields in before `chunk_pos`, which
+// shows where `ticks_left` shares its bucket in the compound's table.
+fn pack_table(table: OpenHashMap<i64, List<Ticket>>, out: mut List<Tag>) {
+    for (k, list) in table {
+        for t in list {
+            if t.kind.persists() {
+                var pos = List<i32>()
+                pos.push(i32.wrap(k))
+                pos.push(i32.wrap(k >> 32))
+                var fields = JavaHashMap<String, Tag>()
+                fields.insert("type", Tag.Str("minecraft:{t.kind.name()}"))
+                fields.insert("level", Tag.Int(t.level))
+                if t.ticks_left != 0 {
+                    fields.insert("ticks_left", Tag.Long(t.ticks_left))
+                }
+                fields.insert("chunk_pos", Tag.IntArray(pos))
+                out.push(Tag.Compound(fields))
+            }
+        }
+    }
+}
+
+// The tickets of the compound `data`, as `fromPacked` keeps them. A `tickets` that isn't a list
+// is read as none, with its line, as `optionalFieldOf` keeps its default where the field can't be
+// read.
+fn read_data(fields: JavaHashMap<String, Tag>, lines: mut List<Entry>) -> TicketStorage? {
+    var storage = TicketStorage.new()
+    if not fields.contains("tickets") {
+        return some(storage)
+    }
+    let names = Names.from(ticket_types())
+    var chunks = List<i64>()
+    var found = List<Ticket>()
+    var errors = List<String>()
+    match fields["tickets"] {
+        Tag.List(items) => {
+            for item in items {
+                read_entry(item, names, mut chunks, mut found, mut errors)
+            }
+        },
+        Tag.ByteArray(values) => {
+            for v in values {
+                errors.push("Not a map: {Tag.Byte(v).to_snbt()}")
+            }
+        },
+        Tag.IntArray(values) => {
+            for v in values {
+                errors.push("Not a map: {Tag.Int(v).to_snbt()}")
+            }
+        },
+        Tag.LongArray(values) => {
+            for v in values {
+                errors.push("Not a map: {Tag.Long(v).to_snbt()}")
+            }
+        },
+        _ => {
+            lines.push(parse_failed(saved_id(), "Not a list: {fields["tickets"].to_snbt()}"))
+            return some(storage)
+        },
+    }
+    if not errors.is_empty() {
+        lines.push(parse_failed(saved_id(), newest_first(errors)))
+    }
+    for i in 0..chunks.len() {
+        if not storage.deactivated.contains(chunks[i]) {
+            storage.deactivated.insert(chunks[i], List<Ticket>())
+        }
+        storage.deactivated[chunks[i]].push(found[i])
+    }
+    return some(storage)
+}
+
+// Adds the ticket `tag` holds, and its chunk, as `TICKET_ENTRY` reads them, or why it can't be
+// read to `errors`.
+fn read_entry(tag: Tag, names: Names, chunks: mut List<i64>, out: mut List<Ticket>, errors: mut List<String>) {
+    match tag {
+        Tag.Compound(fields) => read_fields(tag, fields, names, mut chunks, mut out, mut errors),
+        _ => errors.push("Not a map: {tag.to_snbt()}"),
+    }
+}
+
+// The ticket of the compound `tag`, whose tags are `fields`: its `chunk_pos` first, then the
+// ticket's fields, whose errors come after its own, the last first. A `chunk_pos` of more than 2
+// numbers is read from its first 2, with its error, and a `ticks_left` that isn't a number is
+// read as 0, with its, as `optionalFieldOf` keeps its default.
+fn read_fields(tag: Tag, fields: JavaHashMap<String, Tag>, names: Names, chunks: mut List<i64>, out: mut List<Ticket>, errors: mut List<String>) {
+    if not fields.contains("chunk_pos") {
+        errors.push(no_key("chunk_pos", tag))
+        return
+    }
+    var pos_error: String? = none
+    var ints = List<i32>()
+    match fields["chunk_pos"].fixed_ints(2, mut pos_error) {
+        some(v) => ints = v,
+        none => {
+            if let e = pos_error {
+                errors.push(e)
+            }
+            return
+        },
+    }
+    var problems = List<String>()
+    var kind = TicketType.Unknown
+    if not fields.contains("type") {
+        problems.push(no_key("type", tag))
+    } else {
+        match names.decode(fields["type"]) {
+            ok(id) => kind = TicketType.try_from(u8.wrap(id)) ?? TicketType.Unknown,
+            err(message) => problems.push(message),
+        }
+    }
+    var level: i32 = 0
+    if not fields.contains("level") {
+        problems.push(no_key("level", tag))
+    } else {
+        match fields["level"].number_int() {
+            some(n) => {
+                if n < 0 {
+                    problems.push("Value must be non-negative: {n}")
+                } else {
+                    level = n
+                }
+            },
+            none => problems.push(String("Not a number")),
+        }
+    }
+    let read = problems.is_empty()
+    var ticks: i64 = 0
+    if fields.contains("ticks_left") {
+        match fields["ticks_left"].number_long() {
+            some(n) => ticks = n,
+            none => problems.push(String("Not a number")),
+        }
+    }
+    if read {
+        chunks.push(ChunkPos { x: ints[0], z: ints[1] }.pack())
+        out.push(Ticket { kind: kind, level: level, ticks_left: ticks })
+    }
+    if problems.is_empty() {
+        if let e = pos_error {
+            errors.push(e)
+        }
+        return
+    }
+    let message = newest_first(problems)
+    if let e = pos_error {
+        errors.push("{e}; {message}")
+    } else {
+        errors.push(message)
+    }
+}
+
+// The ticket types as their registry holds them, by which their names are read.
+fn ticket_types() -> Registry {
+    var registry = Registry.new(Identifier { namespace: "minecraft", path: "ticket_type" }, false)
+    for i in 0..9 {
+        let kind = TicketType.try_from(u8.wrap(i)) ?? TicketType.Unknown
+        registry.add(Identifier { namespace: "minecraft", path: String(kind.name()) }, none)
+    }
+    return registry
+}
+
+// A bit past the flags', for a chunk that lost a forced ticket.
+const LOST_FORCED: i32 = 32
+
+// Whether `t`, at `chunk`, runs down a tick as stale tickets are purged, as `canTicketExpire`
+// says: if its type runs out, unloaded or at a chunk whose holder is ready to save.
+fn runs_down<H: Holders>(t: Ticket, chunk: i64, holders: H) -> bool {
+    return t.kind.has_timeout() and (t.kind.can_expire_if_unloaded() or holders.ready_for_saving(chunk))
+}
+
+// The level of the lowest of `tickets` that ticks, if `simulation`, or loads, or `NO_TICKET` if
+// none does, as `getTicketLevelAt` finds it.
+fn lowest(tickets: List<Ticket>, simulation: bool) -> i32 {
+    if let i = lowest_at(tickets, simulation) {
+        return tickets[i].level
+    }
+    return NO_TICKET
+}
+
+// Where the first of the lowest of `tickets` that ticks, if `simulation`, or loads is, as
+// `getLowestTicket` finds it.
+fn lowest_at(tickets: List<Ticket>, simulation: bool) -> usize? {
+    var at: usize? = none
+    var level: i32 = 0
+    for i in 0..tickets.len() {
+        let t = tickets[i]
+        let counts = if simulation { t.kind.simulates() } else { t.kind.loads() }
+        if counts and (at == none or t.level < level) {
+            at = some(i)
+            level = t.level
+        }
+    }
+    return at
+}

@@ -52,6 +52,7 @@ public final class Main {
                 new LevelDataProbe(),
                 new WorldFolderProbe(),
                 new EntitiesPoiProbe(),
+                new TicketsProbe(),
                 new RegistriesProbe())) {
             probes.put(probe.name(), probe);
         }

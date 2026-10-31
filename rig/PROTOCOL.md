@@ -446,6 +446,33 @@ The result is one blob: what was logged, as `chunk_nbt` writes it, then what the
 
 Blobs, an `x` or `z` that isn't an `int`, SNBT that isn't a compound, `entities_save` without it, a `min_y` or `sections` as `chunk_nbt` refuses them, and an operation it doesn't have are an `error` status.
 
+### `tickets` (v1)
+
+A dimension's chunk tickets, in vanilla's own `TicketStorage`, through a list of operations, with what its two listeners, the loading and the simulation trackers, are told as they're told it.
+
+Input `{"ops": [...]}`, with no blobs. A chunk is `ChunkPos.pack`'s `long`, as a decimal string. A type is a ticket type's name in `minecraft`, without the namespace, such as `"portal"`.
+
+The result is one blob. As a listener is told of a chunk, the blob gets a byte 1, then a byte, 0 for the loading tracker or 1 for the simulation tracker, then the chunk as a `long`, the level as an `int`, and a byte, 1 if the change can only have lowered it. After each operation, the blob gets a byte 0, then its result. A ticket is its type's full name as a message (an `int` length and its UTF-8), its level as an `int` and the ticks it has left as a `long`, read from the ticket's field.
+
+| Operation | Result |
+| --- | --- |
+| `["add", chunk, type, level]` | a byte, 1 if `addTicket` added it, with a new `Ticket` of the type and level |
+| `["remove", chunk, type, level]` | a byte, 1 if `removeTicket` took one out |
+| `["add_radius", type, x, z, radius]` | nothing: `addTicketWithRadius` |
+| `["remove_radius", type, x, z, radius]` | nothing: `removeTicketWithRadius` |
+| `["forced", x, z, forced]` | a byte, 1 if `updateChunkForced` changed it |
+| `["replace_level", level, type]` | nothing: `replaceTicketLevelOfType` |
+| `["purge", [chunk, ...]]` | nothing: `purgeStaleTickets`, with a `ChunkMap` made without its constructor whose `updatingChunkMap` holds a holder, made the same way with a `saveSync` that hasn't finished, for each chunk given, the busy ones, and none for any other |
+| `["deactivate"]` | nothing: `deactivateTicketsOnClosing` |
+| `["activate"]` | nothing: `activateAllDeactivatedTickets` |
+| `["level", chunk, simulation]` | `getTicketLevelAt`, an `int` |
+| `["debug", chunk, simulation]` | `getTicketDebugString`, as a message |
+| `["dump"]` | 3 bytes, for `hasTickets`, `shouldKeepDimensionActive` and `isDirty`; then the tickets in use and those deactivated, each table in its order: an `int` count, then each chunk as a `long`, an `int` count and each ticket; then the forced chunks, `getForceLoadedChunks` in its order, an `int` count and each chunk as a `long` |
+| `["save"]` | a byte for `isDirty`, then an `int` length and what `TicketStorage.CODEC` encodes, as `NbtIo.write` writes a file's root; then `setDirty(false)` |
+| `["load", snbt]` | the root of a `chunk_tickets` file, a compound as SNBT, read as `SavedDataStorage.readSavedData` reads one: its `data` parsed with the type's codec, keeping what can be read. An `int` count and each line logged as a message, then a byte, 1 if it read the tickets. The storage is then what was read, or a new one if nothing was, with the same listeners |
+
+`ChunkLevel.MAX_LEVEL` must be 44, for which the cases are written; the vanilla adapter checks it. Blobs, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, a chunk that isn't a decimal `long`, a coordinate, level or radius that isn't an `int`, a type that isn't one, and SNBT that isn't a compound are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

@@ -1,0 +1,390 @@
+/// The `tickets` probe (rig/PROTOCOL.md): a dimension's chunk tickets in `world.tickets`, through
+/// the case's operations, with what the two trackers are told as they're told it, all to one
+/// blob, as the vanilla adapter writes vanilla's own `TicketStorage`.
+module rig.tickets
+
+import json.tree.{Json, Member, as_i32, as_string, take}
+import nbt.snbt.{parse_compound}
+import nbt.tag.{Tag}
+import rig.frame.{Outcome}
+import server.log.{Entry}
+import world.pos.{ChunkPos}
+import world.tickets.{Holders, Ticket, TicketListener, TicketStorage, TicketType}
+
+// The blob, with what the trackers are told written to it as they're told it: a 1, then 0 for
+// the loading tracker or 1 for the simulation tracker, the chunk, the level, and whether it can
+// only have gone down.
+struct Told {
+    out: List<u8> = List<u8>()
+}
+
+impl Told {
+    fn put(mut self, tracker: u8, chunk: i64, level: i32, only_decreased: bool) {
+        self.out.push(1)
+        self.out.push(tracker)
+        put_i64(mut self.out, chunk)
+        put_i32(mut self.out, level)
+        self.out.push(if only_decreased { 1 } else { 0 })
+    }
+}
+
+impl TicketListener for Told {
+    fn loading(mut self, chunk: i64, level: i32, only_decreased: bool) {
+        self.put(0, chunk, level, only_decreased)
+    }
+
+    fn simulation(mut self, chunk: i64, level: i32, only_decreased: bool) {
+        self.put(1, chunk, level, only_decreased)
+    }
+}
+
+// The holders of the chunks a `purge` says are busy, whose saves haven't finished. Every other
+// chunk has none, as vanilla's chunk map in the probe has none.
+struct Busy {
+    chunks: OpenHashSet<i64>
+}
+
+impl Holders for Busy {
+    fn ready_for_saving(self, chunk: i64) -> bool {
+        return not self.chunks.contains(chunk)
+    }
+}
+
+pub fn run_tickets(input: own List<Member>, blobs: List<List<u8>>) -> Outcome {
+    if not blobs.is_empty() {
+        return Outcome.Failed("`tickets` takes no blobs")
+    }
+    var fields = input
+    let value = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let ops = match value {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    var storage = TicketStorage.new()
+    var told = Told {}
+    var error = String()
+    for i in 0..ops.len() {
+        // Each operation's calls to the trackers come first, as they're made, then a 0 and its
+        // result.
+        var after = List<u8>()
+        if not run_op(mut storage, mut told, ops, i, mut after, mut error) {
+            return Outcome.Failed(error)
+        }
+        told.out.push(0)
+        for b in after {
+            told.out.push(b)
+        }
+    }
+    return Outcome.Done { output: [], blobs: [told.out] }
+}
+
+// Runs operation `i`, writing its result to `after`, or gives `false` with the error if the case
+// doesn't say it as the probe does.
+fn run_op(storage: mut TicketStorage, told: mut Told, ops: List<Json>, i: usize, after: mut List<u8>, error: mut String) -> bool {
+    let name = name_of(ops, i, mut error) else return false
+    if name == "add" or name == "remove" {
+        if not expect(ops, i, 3, mut error) {
+            return false
+        }
+        let chunk = chunk_of(ops, i, 1, mut error) else return false
+        let kind = type_of(ops, i, 2, mut error) else return false
+        let level = int_of(ops, i, 3, mut error) else return false
+        let done = if name == "add" {
+            storage.add(chunk, Ticket.new(kind, level), mut told)
+        } else {
+            storage.remove(chunk, Ticket.new(kind, level), mut told)
+        }
+        put_bool(mut after, done)
+    } else if name == "add_radius" or name == "remove_radius" {
+        if not expect(ops, i, 4, mut error) {
+            return false
+        }
+        let kind = type_of(ops, i, 1, mut error) else return false
+        let x = int_of(ops, i, 2, mut error) else return false
+        let z = int_of(ops, i, 3, mut error) else return false
+        let radius = int_of(ops, i, 4, mut error) else return false
+        if name == "add_radius" {
+            storage.add_with_radius(kind, ChunkPos { x: x, z: z }, radius, mut told)
+        } else {
+            storage.remove_with_radius(kind, ChunkPos { x: x, z: z }, radius, mut told)
+        }
+    } else if name == "forced" {
+        if not expect(ops, i, 3, mut error) {
+            return false
+        }
+        let x = int_of(ops, i, 1, mut error) else return false
+        let z = int_of(ops, i, 2, mut error) else return false
+        let forced = bool_of(ops, i, 3, mut error) else return false
+        put_bool(mut after, storage.update_forced(ChunkPos { x: x, z: z }, forced, mut told))
+    } else if name == "replace_level" {
+        if not expect(ops, i, 2, mut error) {
+            return false
+        }
+        let level = int_of(ops, i, 1, mut error) else return false
+        let kind = type_of(ops, i, 2, mut error) else return false
+        storage.replace_level_of_type(level, kind, mut told)
+    } else if name == "purge" {
+        if not expect(ops, i, 1, mut error) {
+            return false
+        }
+        let busy = busy_of(ops, i, mut error) else return false
+        storage.purge_stale(Busy { chunks: busy }, mut told)
+    } else if name == "deactivate" {
+        if not expect(ops, i, 0, mut error) {
+            return false
+        }
+        storage.deactivate_on_closing(mut told)
+    } else if name == "activate" {
+        if not expect(ops, i, 0, mut error) {
+            return false
+        }
+        storage.activate_all_deactivated(mut told)
+    } else if name == "level" or name == "debug" {
+        if not expect(ops, i, 2, mut error) {
+            return false
+        }
+        let chunk = chunk_of(ops, i, 1, mut error) else return false
+        let simulation = bool_of(ops, i, 2, mut error) else return false
+        if name == "level" {
+            put_i32(mut after, storage.level_at(chunk, simulation))
+        } else {
+            put_text(mut after, storage.debug_string(chunk, simulation))
+        }
+    } else if name == "dump" {
+        if not expect(ops, i, 0, mut error) {
+            return false
+        }
+        dump(storage, mut after)
+    } else if name == "save" {
+        if not expect(ops, i, 0, mut error) {
+            return false
+        }
+        put_bool(mut after, storage.dirty)
+        put_root(mut after, storage.pack())
+        storage.dirty = false
+    } else if name == "load" {
+        if not expect(ops, i, 1, mut error) {
+            return false
+        }
+        let snbt = text_of(ops, i, 1, mut error) else return false
+        let root = match parse_compound(snbt) {
+            ok(Tag.Compound(tags)) => tags,
+            ok(_) => {
+                error = "operation {i}'s SNBT isn't a compound"
+                return false
+            },
+            err(e) => {
+                error = "operation {i}'s SNBT isn't a compound: {e.context()}"
+                return false
+            },
+        }
+        var lines = List<Entry>()
+        let read = TicketStorage.parse(root, mut lines)
+        put_i32(mut after, i32.wrap(lines.len()))
+        for line in lines {
+            put_text(mut after, line.message)
+        }
+        put_bool(mut after, read != none)
+        storage = read ?? TicketStorage.new()
+    } else {
+        error = "operation {i}: no operation `{name}`"
+        return false
+    }
+    return true
+}
+
+// Whether it has tickets, keeps its dimension active and is dirty, then its tickets in use and
+// deactivated, each table in its order, each as a count, then each chunk, its count of tickets
+// and each ticket, then its forced chunks in their set's order.
+fn dump(storage: TicketStorage, out: mut List<u8>) {
+    put_bool(mut out, storage.has_tickets())
+    put_bool(mut out, storage.keeps_dimension_active())
+    put_bool(mut out, storage.dirty)
+    let chunks = storage.chunks()
+    put_i32(mut out, i32.wrap(chunks.len()))
+    for c in chunks {
+        put_tickets(mut out, c, storage.tickets_at(c))
+    }
+    let deactivated = storage.deactivated_chunks()
+    put_i32(mut out, i32.wrap(deactivated.len()))
+    for c in deactivated {
+        put_tickets(mut out, c, storage.deactivated_at(c))
+    }
+    let forced = storage.forced_chunks()
+    put_i32(mut out, i32.wrap(forced.len()))
+    for c in forced {
+        put_i64(mut out, c)
+    }
+}
+
+// A chunk, its count of tickets, then each ticket: its type's name, its level and the ticks it
+// has left.
+fn put_tickets(out: mut List<u8>, chunk: i64, tickets: List<Ticket>) {
+    put_i64(mut out, chunk)
+    put_i32(mut out, i32.wrap(tickets.len()))
+    for t in tickets {
+        put_text(mut out, "minecraft:{t.kind.name()}")
+        put_i32(mut out, t.level)
+        put_i64(mut out, t.ticks_left)
+    }
+}
+
+// --- reading operations -------------------------------------------------------------------------
+
+// Operation `i`'s name, or `none` with the error if it isn't a non-empty array named by a string.
+fn name_of(ops: List<Json>, i: usize, error: mut String) -> String? {
+    match ops[i] {
+        Json.Array(items) => {
+            if not items.is_empty() {
+                if let name = as_string(items[0]) {
+                    return some(name)
+                }
+            }
+        },
+        _ => {},
+    }
+    error = "operation {i} must be a non-empty array named by a string"
+    return none
+}
+
+fn expect(ops: List<Json>, i: usize, n: usize, error: mut String) -> bool {
+    let given = match ops[i] {
+        Json.Array(items) => items.len() - 1,
+        _ => 0,
+    }
+    if given == n {
+        return true
+    }
+    error = "operation {i} takes {n} arguments"
+    return false
+}
+
+// Argument `k` of operation `i`, a string.
+fn text_of(ops: List<Json>, i: usize, k: usize, error: mut String) -> String? {
+    match ops[i] {
+        Json.Array(items) => {
+            if let text = as_string(items[k]) {
+                return some(text)
+            }
+        },
+        _ => {},
+    }
+    error = "operation {i}'s argument {k} must be a string"
+    return none
+}
+
+// Argument `k` of operation `i`, a chunk packed into a `long`, given as its decimal string.
+fn chunk_of(ops: List<Json>, i: usize, k: usize, error: mut String) -> i64? {
+    if let text = text_of(ops, i, k, mut error) {
+        if let chunk = i64.parse(text) {
+            return some(chunk)
+        }
+    }
+    error = "operation {i}'s chunk must be a string holding a 64-bit integer"
+    return none
+}
+
+// Argument `k` of operation `i`, a 32-bit integer.
+fn int_of(ops: List<Json>, i: usize, k: usize, error: mut String) -> i32? {
+    match ops[i] {
+        Json.Array(items) => {
+            if let v = as_i32(items[k]) {
+                return some(v)
+            }
+        },
+        _ => {},
+    }
+    error = "operation {i}'s argument {k} must be a 32-bit integer"
+    return none
+}
+
+// Argument `k` of operation `i`, a boolean.
+fn bool_of(ops: List<Json>, i: usize, k: usize, error: mut String) -> bool? {
+    match ops[i] {
+        Json.Array(items) => match items[k] {
+            Json.Bool(b) => return some(b),
+            _ => {},
+        },
+        _ => {},
+    }
+    error = "operation {i}'s argument {k} must be a boolean"
+    return none
+}
+
+// Argument `k` of operation `i`, a ticket type, by its name without `minecraft:`.
+fn type_of(ops: List<Json>, i: usize, k: usize, error: mut String) -> TicketType? {
+    let name = text_of(ops, i, k, mut error) else return none
+    for n in 0..9 {
+        if let kind = TicketType.try_from(u8.wrap(n)) {
+            if name == String(kind.name()) {
+                return some(kind)
+            }
+        }
+    }
+    error = "operation {i}: no ticket type `{name}`"
+    return none
+}
+
+// The busy chunks of `purge` operation `i`, an array of chunks given as strings.
+fn busy_of(ops: List<Json>, i: usize, error: mut String) -> OpenHashSet<i64>? {
+    var busy = OpenHashSet<i64>()
+    match ops[i] {
+        Json.Array(items) => match items[1] {
+            Json.Array(chunks) => {
+                for c in chunks {
+                    let text = as_string(c) else {
+                        error = "operation {i}'s busy chunks must be strings"
+                        return none
+                    }
+                    let chunk = i64.parse(text) else {
+                        error = "operation {i}'s busy chunks must hold 64-bit integers"
+                        return none
+                    }
+                    busy.insert(chunk)
+                }
+                return some(busy)
+            },
+            _ => {},
+        },
+        _ => {},
+    }
+    error = "operation {i}'s busy chunks must be an array"
+    return none
+}
+
+// --- writing results ----------------------------------------------------------------------------
+
+fn put_bool(out: mut List<u8>, b: bool) {
+    out.push(if b { 1 } else { 0 })
+}
+
+fn put_i32(out: mut List<u8>, v: i32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}
+
+fn put_i64(out: mut List<u8>, v: i64) {
+    put_i32(mut out, i32.wrap(v >> 32))
+    put_i32(mut out, i32.wrap(v))
+}
+
+// An `int` length, then the text in UTF-8.
+fn put_text(out: mut List<u8>, text: String) {
+    let bytes = text.to_bytes()
+    put_i32(mut out, i32.wrap(bytes.len()))
+    for b in bytes {
+        out.push(b)
+    }
+}
+
+// An `int` length, then the tag as a file's root.
+fn put_root(out: mut List<u8>, tag: Tag) {
+    var bytes = List<u8>()
+    tag.write_unnamed(mut bytes)
+    put_i32(mut out, i32.wrap(bytes.len()))
+    for b in bytes {
+        out.push(b)
+    }
+}
