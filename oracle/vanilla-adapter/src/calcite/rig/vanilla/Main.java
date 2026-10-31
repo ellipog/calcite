@@ -55,6 +55,7 @@ public final class Main {
                 new TicketsProbe(),
                 new LevelsProbe(),
                 new DistanceProbe(),
+                new LightProbe(),
                 new RegistriesProbe())) {
             probes.put(probe.name(), probe);
         }

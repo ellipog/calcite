@@ -12,6 +12,8 @@ IDs the protocol needs, which every compatible server encodes:
 - `world.blocks`: each block's first state ID and default state, in block ID order.
 - `world.block_flags`: what each block state is, as vanilla's state cache holds it, from
   block_flags.json, which oracle/datagen/block_flags.py writes beside the tables (D164).
+- `world.light_faces`: the faces light sees of each block state, and which two faces light
+  can't pass between, from the same file (CAL-66).
 """
 
 import argparse
@@ -377,6 +379,88 @@ def block_flags_module(index, flags):
     return "\n".join(lines)
 
 
+# The directions, in vanilla's `Direction` order, which a state's faces are in.
+DIRECTIONS = ["down", "up", "north", "south", "west", "east"]
+FACE_BITS = 6
+
+
+def light_faces_module(index, flags):
+    """The text of src/world/light_faces.calx."""
+    faces = flags["light_faces"]
+    occludes = flags["face_occludes"]
+    shapes = len(flags["face_boxes"])
+    if len(faces) != flags["states"]:
+        raise ValueError(f"block_flags.json has {len(faces)} states' faces for {flags['states']} states")
+    if shapes > 1 << FACE_BITS or len(occludes) != shapes or any(len(row) != shapes for row in occludes):
+        raise ValueError(f"{shapes} face shapes don't fit {FACE_BITS} bits, or the table of which occlude isn't square")
+    if any(occludes[i][j] != occludes[j][i] for i in range(shapes) for j in range(shapes)):
+        raise ValueError("faceShapeOccludes isn't the same both ways round")
+    if any(len(f) != len(DIRECTIONS) or not all(0 <= s < shapes for s in f) for f in faces):
+        raise ValueError("a state's faces aren't six shapes of the table")
+    # Each state's six faces packed into one number, and the different ones, the commonest first.
+    packed = [sum(s << (FACE_BITS * d) for d, s in enumerate(f)) for f in faces]
+    counts = {}
+    for v in packed:
+        counts[v] = counts.get(v, 0) + 1
+    palette = sorted(counts, key=lambda v: (-counts[v], v))
+    if palette[0] != 0:
+        raise ValueError("most states' faces aren't all empty")
+    if len(palette) > SINGLE:
+        raise ValueError(f"{len(palette)} different sets of faces are more than a character each holds")
+    where = {v: i for i, v in enumerate(palette)}
+    text = "".join(ALPHABET[where[v]] for v in packed)
+    chunks = [text[i:i + LINE] for i in range(0, len(text), LINE)]
+    rows = [sum(1 << j for j in range(shapes) if occludes[i][j]) for i in range(shapes)]
+    lines = [
+        f"/// The faces light sees of each of vanilla {index['game_version']}'s block states, as `LightEngine.getOcclusionShape`",
+        "/// gives them, and which two faces light can't pass between, as `Shapes.faceShapeOccludes` says.",
+        "/// Written by oracle/datagen/calx_tables.py from block_flags.json (D164, CAL-66): don't edit it.",
+        "///",
+        "/// The faces are numbered shapes, 0 the empty one and 1 the whole face. A state that isn't",
+        "/// `canOcclude` or doesn't use its shape for light has every face empty.",
+        "module world.light_faces",
+        "",
+        "/// How many bits each face's shape takes in a state's faces, packed down, up, north, south,",
+        "/// west, east from the lowest.",
+        f"pub const FACE_BITS: u32 = {FACE_BITS}",
+        "/// How many different shapes the faces have.",
+        f"pub const FACE_SHAPES: u32 = {shapes}",
+        "",
+        "/// The different sets of faces, packed, and for each state, in state ID order, which it has.",
+        "pub fn state_faces() -> (List<u64>, List<u8>) {",
+        f"    let palette: List<u64> = [{', '.join(str(v) for v in palette)}]",
+        "    let lines: List<String> = [",
+    ]
+    lines += [f'        "{c}",' for c in chunks]
+    lines += [
+        "    ]",
+        f'    let alphabet = "{ALPHABET}"',
+        "    var digit: List<u8> = []",
+        "    for _ in 0..128 {",
+        "        digit.push(0)",
+        "    }",
+        "    for i in 0..alphabet.len() {",
+        "        digit[usize(alphabet.byte_at(i))] = u8.wrap(i)",
+        "    }",
+        "    var states: List<u8> = []",
+        f"    states.reserve({len(packed)})",
+        "    for line in lines {",
+        "        for i in 0..line.len() {",
+        "            states.push(digit[usize(line.byte_at(i))])",
+        "        }",
+        "    }",
+        "    return (palette, states)",
+        "}",
+        "",
+        "/// For each shape, the shapes it and light can't pass between, bit `j` for shape `j`.",
+        "pub fn face_occludes() -> List<u64> {",
+        f"    return [{', '.join(str(r) for r in rows)}]",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def outputs(tables, version=VERSION):
     index = json.loads((tables / "index.json").read_text(encoding="utf-8"))
     packets = json.loads((tables / "packets.json").read_text(encoding="utf-8"))
@@ -390,6 +474,7 @@ def outputs(tables, version=VERSION):
         CALCITE / "src" / "pack" / "pin.calx": pin_module(version, pins[version]),
         CALCITE / "src" / "world" / "blocks.calx": blocks_module(index, blocks),
         CALCITE / "src" / "world" / "block_flags.calx": block_flags_module(index, flags),
+        CALCITE / "src" / "world" / "light_faces.calx": light_faces_module(index, flags),
     }
 
 

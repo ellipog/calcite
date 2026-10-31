@@ -1,0 +1,1525 @@
+/// Light, as vanilla 26.3 works it out: block light from blocks that glow, sky light from the
+/// sky, a nibble a block, kept for each section with blocks and the sections around those.
+///
+/// It does what vanilla's `LevelLightEngine`, `BlockLightEngine`, `SkyLightEngine`, their section
+/// storages and `ChunkSkyLightSources` do, read for their behaviour and written again: the same
+/// queues, filled and emptied in the same order, so the light is vanilla's to the nibble, quirks
+/// included. The rig's `light` probe checks it against vanilla's own engines (rig/README.md).
+///
+/// Blocks are packed in a long as `BlockPos.asLong` packs them, and sections as
+/// `SectionPos.asLong` does. The chunks come from a `LightChunks`, vanilla's `LightChunkGetter`.
+module world.light
+
+import protocol.play.{LightData, LightLayer}
+import world.block_flags.{CAN_OCCLUDE, LIGHT_DAMPENING_SHIFT, LIGHT_EMISSION_SHIFT, SHAPE_FOR_LIGHT_OCCLUSION, state_flags}
+import world.chunk.{Chunk}
+import world.light_faces.{FACE_BITS, face_occludes, state_faces}
+
+/// The brightest light, vanilla's `MAX_LEVEL`.
+pub const MAX_LEVEL: i32 = 15
+/// The state light takes a block in a chunk that isn't there to be: `minecraft:bedrock`.
+pub const BEDROCK: u32 = 88
+// Air, which light takes a block that's an empty shape to be when it spreads from it.
+const AIR: u32 = 0
+
+// The directions light goes in, in vanilla's `Direction` order. The opposite of each is it
+// with its low bit flipped.
+const DOWN: i32 = 0
+const UP: i32 = 1
+const NORTH: i32 = 2
+const SOUTH: i32 = 3
+const WEST: i32 = 4
+const EAST: i32 = 5
+
+// A queue entry, vanilla's `LightEngine.QueueEntry`: the level in the low four bits, a bit for
+// each direction to go in from bit 4, then whether the block it's from is an empty shape, and
+// whether it's light a block gives.
+const LEVEL_MASK: i64 = 15
+const DIRECTIONS_MASK: i64 = 1008
+const FROM_EMPTY_SHAPE: i64 = 1024
+const FROM_EMISSION: i64 = 2048
+// Vanilla's `PULL_LIGHT_IN_ENTRY`, `decreaseAllDirections(1)`: a block takes light from around it.
+const PULL_LIGHT_IN: i64 = 1009
+// The sky's entries: `decreaseAllDirections(15)`, and `decreaseSkipOneDirection(15, UP)`, which
+// is `increaseSkipOneDirection(15, false, UP)` too.
+const REMOVE_TOP_SKY_SOURCE: i64 = 1023
+const SKY_SOURCE: i64 = 991
+
+// What a section's light is kept for, vanilla's `SectionState`: a bit for whether it has blocks,
+// and in the five below it how many of the 26 sections around it have.
+const HAS_DATA: i32 = 32
+const NEIGHBOURS: i32 = 31
+
+// The bits of a state's light properties in `LightStates`: its dampening, its light, whether
+// light sees it as an empty shape, and whether it uses its shape for light, then its faces.
+const EMISSION_SHIFT: u32 = 4
+const EMPTY_SHAPE: u32 = 256
+const USES_SHAPE: u32 = 512
+const FACES_SHIFT: u32 = 16
+
+/// A block packed in a long, as `BlockPos.asLong`: 26 bits of `x`, then 26 of `z`, then 12 of `y`.
+pub fn block_node(x: i32, y: i32, z: i32) -> i64 {
+    return ((i64(x) & 0x3FFFFFF) << 38) | ((i64(z) & 0x3FFFFFF) << 12) | (i64(y) & 0xFFF)
+}
+
+fn node_x(node: i64) -> i32 {
+    return i32.wrap(node >> 38)
+}
+
+fn node_y(node: i64) -> i32 {
+    return i32.wrap((node << 52) >> 52)
+}
+
+fn node_z(node: i64) -> i32 {
+    return i32.wrap((node << 26) >> 38)
+}
+
+/// A section packed in a long, as `SectionPos.asLong`: 22 bits of `x`, then 22 of `z`, then 20
+/// of `y`.
+pub fn section_node(x: i32, y: i32, z: i32) -> i64 {
+    return ((i64(x) & 0x3FFFFF) << 42) | ((i64(z) & 0x3FFFFF) << 20) | (i64(y) & 0xFFFFF)
+}
+
+fn x_of(section: i64) -> i32 {
+    return i32.wrap(section >> 42)
+}
+
+fn y_of(section: i64) -> i32 {
+    return i32.wrap((section << 44) >> 44)
+}
+
+fn z_of(section: i64) -> i32 {
+    return i32.wrap((section << 22) >> 42)
+}
+
+fn section_offset(section: i64, dx: i32, dy: i32, dz: i32) -> i64 {
+    return section_node(x_of(section) + dx, y_of(section) + dy, z_of(section) + dz)
+}
+
+// The section a block is in, `SectionPos.blockToSection`.
+fn section_of(node: i64) -> i64 {
+    return section_node(node_x(node) >> 4, node_y(node) >> 4, node_z(node) >> 4)
+}
+
+// The section at `y` 0 of a section's column, `SectionPos.getZeroNode`, which stands for the column.
+fn zero_node(section: i64) -> i64 {
+    return section & -1048576
+}
+
+fn column_node(chunk_x: i32, chunk_z: i32) -> i64 {
+    return section_node(chunk_x, 0, chunk_z)
+}
+
+// Where a block's nibble is in its section's layer, `DataLayer.getIndex`.
+fn index_in(x: i32, y: i32, z: i32) -> i32 {
+    return ((y & 15) << 8) | ((z & 15) << 4) | (x & 15)
+}
+
+fn node_index(node: i64) -> i32 {
+    return index_in(node_x(node), node_y(node), node_z(node))
+}
+
+// The block next to `node` in `direction`, `BlockPos.offset`.
+fn offset(node: i64, direction: i32) -> i64 {
+    var x = node_x(node)
+    var y = node_y(node)
+    var z = node_z(node)
+    match direction {
+        0 => y -= 1,
+        1 => y += 1,
+        2 => z -= 1,
+        3 => z += 1,
+        4 => x -= 1,
+        _ => x += 1,
+    }
+    return block_node(x, y, z)
+}
+
+fn direction_bit(direction: i32) -> i64 {
+    return i64(1) << (direction + 4)
+}
+
+fn goes(entry: i64, direction: i32) -> bool {
+    return (entry & direction_bit(direction)) != 0
+}
+
+fn entry_level(entry: i64) -> i32 {
+    return i32.wrap(entry & LEVEL_MASK)
+}
+
+fn with_level(entry: i64, level: i32) -> i64 {
+    return (entry & -16) | (i64(level) & LEVEL_MASK)
+}
+
+fn empty_flag(empty: bool) -> i64 {
+    return if empty { FROM_EMPTY_SHAPE } else { 0 }
+}
+
+fn decrease_all(level: i32) -> i64 {
+    return with_level(DIRECTIONS_MASK, level)
+}
+
+fn decrease_skip_one(level: i32, skip: i32) -> i64 {
+    return with_level(DIRECTIONS_MASK & ~direction_bit(skip), level)
+}
+
+fn increase_from_emission(level: i32, empty: bool) -> i64 {
+    return with_level(DIRECTIONS_MASK | FROM_EMISSION | empty_flag(empty), level)
+}
+
+fn increase_skip_one(level: i32, empty: bool, skip: i32) -> i64 {
+    return with_level((DIRECTIONS_MASK & ~direction_bit(skip)) | empty_flag(empty), level)
+}
+
+fn increase_only_one(level: i32, empty: bool, direction: i32) -> i64 {
+    return with_level(direction_bit(direction) | empty_flag(empty), level)
+}
+
+fn sky_source_in_directions(down: bool, north: bool, south: bool, west: bool, east: bool) -> i64 {
+    var entry: i64 = 15
+    if down {
+        entry |= direction_bit(DOWN)
+    }
+    if north {
+        entry |= direction_bit(NORTH)
+    }
+    if south {
+        entry |= direction_bit(SOUTH)
+    }
+    if west {
+        entry |= direction_bit(WEST)
+    }
+    if east {
+        entry |= direction_bit(EAST)
+    }
+    return entry
+}
+
+// Whether going in `direction` to a block at `x`, `z` in its section crossed into another
+// section's column, `SkyLightEngine.crossedSectionEdge`.
+fn crossed_section_edge(direction: i32, x: i32, z: i32) -> bool {
+    return match direction {
+        2 => z == 15,
+        3 => z == 0,
+        4 => x == 15,
+        5 => x == 0,
+        _ => false,
+    }
+}
+
+/// What light needs of each block state, by its ID: how much light it takes away and gives,
+/// and the faces light sees of it, from vanilla's state cache (`world.block_flags`,
+/// `world.light_faces`).
+pub struct LightStates {
+    // For each state: its dampening in the low four bits, its light from `EMISSION_SHIFT`, the
+    // `EMPTY_SHAPE` and `USES_SHAPE` bits, and its faces' index in `faces` from `FACES_SHIFT`.
+    props: List<u32>
+    faces: List<u64>
+    occludes: List<u64>
+}
+
+impl LightStates {
+    /// Every state's light properties.
+    pub fn new() -> LightStates {
+        let flags = state_flags()
+        let (palette, faces) = state_faces()
+        if faces.len() != flags.len() {
+            panic("{faces.len()} states' faces for {flags.len()} states")
+        }
+        var props = List<u32>()
+        props.reserve(flags.len())
+        for i in 0..flags.len() {
+            let f = flags[i]
+            var p = ((f >> LIGHT_DAMPENING_SHIFT) & 15) | (((f >> LIGHT_EMISSION_SHIFT) & 15) << EMISSION_SHIFT)
+            if f & CAN_OCCLUDE == 0 or f & SHAPE_FOR_LIGHT_OCCLUSION == 0 {
+                p |= EMPTY_SHAPE
+            }
+            if f & SHAPE_FOR_LIGHT_OCCLUSION != 0 {
+                p |= USES_SHAPE
+            }
+            props.push(p | (u32(faces[i]) << FACES_SHIFT))
+        }
+        return LightStates { props: props, faces: palette, occludes: face_occludes() }
+    }
+
+    /// How much light the state takes away, `getLightDampening`.
+    pub fn dampening(self, state: u32) -> i32 {
+        return i32.wrap(self.props[usize(state)] & 15)
+    }
+
+    // What light loses going into the state, vanilla's `getOpacity`: its dampening, or 1.
+    fn opacity(self, state: u32) -> i32 {
+        return self.dampening(state).max(1)
+    }
+
+    /// The light the state gives, `getLightEmission`.
+    pub fn emission(self, state: u32) -> i32 {
+        return i32.wrap((self.props[usize(state)] >> EMISSION_SHIFT) & 15)
+    }
+
+    /// Whether light sees no faces on the state, vanilla's `isEmptyShape`: it can't occlude, or
+    /// doesn't use its shape for light.
+    pub fn empty_shape(self, state: u32) -> bool {
+        return self.props[usize(state)] & EMPTY_SHAPE != 0
+    }
+
+    /// Whether changing a block from `old` to `new` changes its light, vanilla's
+    /// `LightEngine.hasDifferentLightProperties`.
+    pub fn differ(self, old: u32, new: u32) -> bool {
+        if old == new {
+            return false
+        }
+        let a = self.props[usize(old)]
+        let b = self.props[usize(new)]
+        return a & 255 != b & 255 or a & USES_SHAPE != 0 or b & USES_SHAPE != 0
+    }
+
+    // The shape of the state's face in `direction`, as `LightEngine.getOcclusionShape`.
+    fn face(self, state: u32, direction: i32) -> u32 {
+        let packed = self.faces[usize(self.props[usize(state)] >> FACES_SHIFT)]
+        return u32.wrap((packed >> u64(FACE_BITS * u32.wrap(direction))) & 63)
+    }
+
+    fn faces_occlude(self, a: u32, b: u32) -> bool {
+        return (self.occludes[usize(a)] >> u64(b)) & 1 != 0
+    }
+
+    // Whether light can't go from `from` to `to` in `direction` for their faces, vanilla's
+    // `shapeOccludes`.
+    fn shape_occludes(self, from: u32, to: u32, direction: i32) -> bool {
+        return self.faces_occlude(self.face(from, direction), self.face(to, direction ^ 1))
+    }
+
+    // Whether sky light can't go down from `top` into `bottom`, `ChunkSkyLightSources.isEdgeOccluded`.
+    fn edge_occluded(self, top: u32, bottom: u32) -> bool {
+        let below = self.props[usize(bottom)]
+        if below & 15 != 0 {
+            return true
+        }
+        // Two states light sees no faces on can't occlude, so their faces needn't be looked up.
+        if below & EMPTY_SHAPE != 0 and self.props[usize(top)] & EMPTY_SHAPE != 0 {
+            return false
+        }
+        return self.faces_occlude(self.face(top, DOWN), self.face(bottom, UP))
+    }
+}
+
+/// Where the sky's light comes down to in each column of a chunk, vanilla's
+/// `ChunkSkyLightSources`: the lowest block it reaches at 15, above the first block or face that
+/// stops it. A column it comes down through to the bottom has its sources go on below the world.
+pub struct SkySources {
+    // One below the dimension's lowest block, which stands for a column whose sources go on below.
+    min_y: i32
+    // For each column, `x` + 16 `z`, the lowest source's `y`.
+    lowest: List<i32>
+}
+
+impl SkySources {
+    /// The sources of a chunk in a dimension from `min_y`, as a new chunk has them: every
+    /// column's go on below the world.
+    pub fn new(min_y: i32) -> SkySources {
+        return SkySources { min_y: min_y - 1, lowest: [min_y - 1; 256] }
+    }
+
+    /// Works the sources out from the chunk's blocks, `fillFrom`: down each column from the top
+    /// of the highest section that isn't only air.
+    pub fn fill_from(mut self, chunk: Chunk, states: LightStates) {
+        let top = chunk.highest_filled_section()
+        for z in 0..16 {
+            for x in 0..16 {
+                let i = usize.wrap(x + z * 16)
+                self.lowest[i] = if top == -1 { self.min_y } else { self.find_lowest(chunk, states, top, x, z).max(self.min_y) }
+            }
+        }
+    }
+
+    fn find_lowest(self, chunk: Chunk, states: LightStates, top: i32, x: i32, z: i32) -> i32 {
+        let bottom = chunk.min_y()
+        var top_y = bottom + (top + 1) * 16
+        var top_state = AIR
+        var index = top
+        while index >= 0 {
+            let section_bottom = bottom + index * 16
+            if chunk.section_only_air(usize.wrap(index)) {
+                top_state = AIR
+                top_y = section_bottom
+            } else {
+                let section = usize.wrap(index)
+                var y = 15
+                while y >= 0 {
+                    let bottom_state = chunk.section_block(section, x, y, z)
+                    if states.edge_occluded(top_state, bottom_state) {
+                        return top_y
+                    }
+                    top_state = bottom_state
+                    top_y -= 1
+                    y -= 1
+                }
+            }
+            index -= 1
+        }
+        return self.min_y
+    }
+
+    /// Updates the column at `x`, `z` in the chunk for its block at `y` changing light, as
+    /// `update`, and gives whether its sources moved.
+    pub fn update(mut self, chunk: Chunk, states: LightStates, x: i32, y: i32, z: i32) -> bool {
+        let i = usize.wrap(x + z * 16)
+        let current = self.lowest[i]
+        if y + 1 < current {
+            return false
+        }
+        let top_state = chunk.block(x, y + 1, z)
+        let middle_state = chunk.block(x, y, z)
+        if self.update_edge(chunk, states, x, z, current, y + 1, top_state, middle_state) {
+            return true
+        }
+        let bottom_state = chunk.block(x, y - 1, z)
+        return self.update_edge(chunk, states, x, z, current, y, middle_state, bottom_state)
+    }
+
+    // The edge between the block at `top_y` and the one below it, `updateEdge`.
+    fn update_edge(mut self, chunk: Chunk, states: LightStates, x: i32, z: i32, old_top: i32, top_y: i32, top_state: u32, bottom_state: u32) -> bool {
+        let i = usize.wrap(x + z * 16)
+        if states.edge_occluded(top_state, bottom_state) {
+            if top_y > old_top {
+                self.lowest[i] = top_y
+                return true
+            }
+        } else if top_y == old_top {
+            self.lowest[i] = self.find_lowest_below(chunk, states, x, z, top_y - 1, bottom_state)
+            return true
+        }
+        return false
+    }
+
+    // Down from the block at `start_y` to the first edge the sky stops at, `findLowestSourceBelow`.
+    fn find_lowest_below(self, chunk: Chunk, states: LightStates, x: i32, z: i32, start_y: i32, start_state: u32) -> i32 {
+        var top_y = start_y
+        var top_state = start_state
+        var bottom_y = start_y - 1
+        while bottom_y >= self.min_y {
+            let bottom_state = chunk.block(x, bottom_y, z)
+            if states.edge_occluded(top_state, bottom_state) {
+                return top_y
+            }
+            top_state = bottom_state
+            top_y = bottom_y
+            bottom_y -= 1
+        }
+        return self.min_y
+    }
+
+    /// The `y` of the lowest source in the column at `x`, `z`, or `i32.MIN` when they go on
+    /// below the world: `getLowestSourceY`.
+    pub fn lowest_source_y(self, x: i32, z: i32) -> i32 {
+        return self.below_world(self.lowest[usize.wrap(x + z * 16)])
+    }
+
+    /// The highest of the columns' lowest sources, as `getHighestLowestSourceY`.
+    pub fn highest_lowest_source_y(self) -> i32 {
+        var highest = i32.MIN
+        for y in self.lowest {
+            highest = highest.max(y)
+        }
+        return self.below_world(highest)
+    }
+
+    fn below_world(self, y: i32) -> i32 {
+        return if y == self.min_y { i32.MIN } else { y }
+    }
+}
+
+/// The blocks that give light in a chunk at `chunk_x`, `chunk_z`, packed, in the order vanilla's
+/// `findBlockLightSources` finds them: up the sections, and in each by `y`, then `z`, then `x`.
+/// Vanilla skips a section whose palette has no state that gives light; this skips one with no
+/// block that does.
+pub fn light_sources(chunk: Chunk, states: LightStates, chunk_x: i32, chunk_z: i32) -> List<i64> {
+    var found = List<i64>()
+    for index in 0..chunk.section_count() {
+        if not chunk.section_gives_light(index) {
+            continue
+        }
+        let bottom = chunk.min_y() + i32.wrap(index) * 16
+        for y in 0..16 {
+            for z in 0..16 {
+                for x in 0..16 {
+                    if states.emission(chunk.block(x, bottom + y, z)) != 0 {
+                        found.push(block_node(chunk_x * 16 + x, bottom + y, chunk_z * 16 + z))
+                    }
+                }
+            }
+        }
+    }
+    return found
+}
+
+/// The chunks light is worked out in, vanilla's `LightChunkGetter`: a chunk is there when vanilla's
+/// `getChunkForLighting` would give it.
+pub interface LightChunks {
+    /// The state at the block `x`, `y`, `z`, or `none` when its chunk isn't there.
+    fn light_state(self, x: i32, y: i32, z: i32) -> u32?
+    /// The lowest sky source of the column at `x`, `z`, as its chunk's `SkySources` gives it, or
+    /// `none` when the chunk isn't there.
+    fn lowest_sky_source(self, x: i32, z: i32) -> i32?
+    /// The chunk's highest lowest sky source, `SkySources.highest_lowest_source_y`, or `none`
+    /// when it isn't there.
+    fn highest_sky_source(self, chunk_x: i32, chunk_z: i32) -> i32?
+    /// The blocks that give light in the chunk, as `light_sources` finds them, or none when it
+    /// isn't there.
+    fn light_sources_in(self, chunk_x: i32, chunk_z: i32) -> List<i64>
+}
+
+fn state_at<C: LightChunks>(chunks: C, node: i64) -> u32 {
+    return chunks.light_state(node_x(node), node_y(node), node_z(node)) ?? BEDROCK
+}
+
+/// A section's light, vanilla's `DataLayer`: a nibble a block, two to a byte, the low one first,
+/// at `y << 8 | z << 4 | x`. A layer whose blocks were never set keeps no bytes, and has `fill`
+/// at every block.
+pub struct Layer {
+    data: List<u8>
+    fill: i32
+}
+
+impl Layer {
+    /// A layer with `level` at every block, `new DataLayer(level)`.
+    pub fn filled(level: i32) -> Layer {
+        return Layer { data: [], fill: level }
+    }
+
+    /// A layer of the 2048 bytes a save or a packet holds. Panics unless there are 2048.
+    @track_caller
+    pub fn of(data: own List<u8>) -> Layer {
+        if data.len() != 2048 {
+            panic("a layer of light is 2048 bytes, not {data.len()}")
+        }
+        return Layer { data: data, fill: 0 }
+    }
+
+    /// The light of the block at `index`.
+    pub fn get(self, index: i32) -> i32 {
+        if self.data.is_empty() {
+            return self.fill
+        }
+        return (i32(self.data[usize.wrap(index >> 1)]) >> ((index & 1) * 4)) & 15
+    }
+
+    /// Sets the light of the block at `index`, keeping bytes from then on.
+    pub fn set(mut self, index: i32, level: i32) {
+        if self.data.is_empty() {
+            self.data = [u8.wrap(self.fill * 17); 2048]
+        }
+        let i = usize.wrap(index >> 1)
+        let shift = (index & 1) * 4
+        self.data[i] = u8.wrap((i32(self.data[i]) & ~(15 << shift)) | ((level & 15) << shift))
+    }
+
+    // Sets the light of the 256 blocks at `y`, as `set` on each of them would.
+    fn set_level_at(mut self, y: i32, level: i32) {
+        if self.data.is_empty() {
+            self.data = [u8.wrap(self.fill * 17); 2048]
+        }
+        let both = u8.wrap((level & 15) * 17)
+        let start = usize.wrap(y & 15) * 128
+        for i in start..start + 128 {
+            self.data[i] = both
+        }
+    }
+
+    /// Every block `level`, and no bytes kept, vanilla's `fill`.
+    pub fn fill_with(mut self, level: i32) {
+        self.fill = level
+        self.data = []
+    }
+
+    /// Whether the layer keeps no bytes and its blocks are 0, vanilla's `isEmpty`: a packet says
+    /// such a section has no light rather than sending it. A layer of bytes that are all 0
+    /// isn't empty.
+    pub fn is_empty(self) -> bool {
+        return self.data.is_empty() and self.fill == 0
+    }
+
+    fn copied(self) -> Layer {
+        return Layer { data: self.data.copy(), fill: self.fill }
+    }
+
+    /// Its 2048 bytes, as `copy().getData()` gives them for a packet.
+    pub fn bytes(self) -> List<u8> {
+        if self.data.is_empty() {
+            return [u8.wrap(self.fill * 17); 2048]
+        }
+        return self.data.copy()
+    }
+
+    // The layer a section below the top of the sky's data starts with, vanilla's
+    // `repeatFirstLayer`: the bottom layer of blocks of `self`, at every height.
+    fn repeat_first(self) -> Layer {
+        if self.data.is_empty() {
+            return Layer.filled(self.fill)
+        }
+        var out = List<u8>()
+        out.reserve(2048)
+        for _ in 0..16 {
+            for i in 0..128usize {
+                out.push(self.data[i])
+            }
+        }
+        return Layer { data: out, fill: 0 }
+    }
+}
+
+// The light kept for each section, vanilla's `LayerLightSectionStorage`, with
+// `SkyLightSectionStorage`'s top sections for the sky's.
+//
+// Vanilla lights one map of layers and, at the end of each run, copies it for what reads light:
+// packets and `getLightValue` see the light as the last run left it, whatever's changed since.
+// Here `stored` is the map being lit, and the other is kept as what changed: each section changed
+// since the last run, vanilla's `changedSections`, with its layer as the run left it in `before`,
+// and each column whose top changed, in `tops_before`.
+//
+// A section that starts from what was queued for it takes vanilla's queued `DataLayer` itself,
+// which the queue keeps until the end of the next run, so light set in it in the meantime is in
+// what's queued too. Such a section is in `shared`, and the queue holds nothing for it but a
+// placeholder: it's read from `stored`.
+struct Storage {
+    sky: bool
+    states: Map<i64, i32> = Map<i64, i32>()
+    stored: Map<i64, Layer> = Map<i64, Layer>()
+    queued: Map<i64, Layer> = Map<i64, Layer>()
+    shared: Set<i64> = Set<i64>()
+    changed: Set<i64> = Set<i64>()
+    before: Map<i64, Layer> = Map<i64, Layer>()
+    tops_before: Map<i64, i32> = Map<i64, i32>()
+    seen_lowest: i32 = i32.MAX
+    lit: Set<i64> = Set<i64>()
+    retained: Set<i64> = Set<i64>()
+    removing: Set<i64> = Set<i64>()
+    inconsistent: bool = false
+    // For each column, one above its highest stored section, and the lowest stored section
+    // there ever was; `lowest` stands for a column with none.
+    tops: Map<i64, i32> = Map<i64, i32>()
+    lowest: i32 = i32.MAX
+}
+
+impl Storage {
+    fn storing(self, section: i64) -> bool {
+        return self.stored.contains(section)
+    }
+
+    fn level(self, node: i64) -> i32 {
+        return self.stored[section_of(node)].get(node_index(node))
+    }
+
+    fn set_level(mut self, node: i64, level: i32) {
+        let section = section_of(node)
+        self.touch(section)
+        self.stored[section].set(node_index(node), level)
+    }
+
+    // Before a section's layer changes, keeps it as the last run left it, if it hasn't changed
+    // since. Vanilla copies the layer here, so a section that shared its layer with the queue
+    // doesn't any more; it can't happen, as a section shares only from when it starts until the
+    // end of the next run, but the queue gets its own copy if it does.
+    fn touch(mut self, section: i64) {
+        if self.changed.contains(section) {
+            return
+        }
+        self.changed.insert(section)
+        if self.stored.contains(section) {
+            self.before.insert(section, self.stored[section].copied())
+            if self.shared.contains(section) {
+                self.shared.remove(section)
+                self.queued.insert(section, self.stored[section].copied())
+            }
+        }
+    }
+
+    // Before a column's top changes, keeps it as the last run left it; `i32.MIN` for none.
+    fn touch_top(mut self, column: i64) {
+        if not self.tops_before.contains(column) {
+            self.tops_before.insert(column, self.tops.get(column) ?? i32.MIN)
+        }
+    }
+
+    // At the end of a run, `swapSectionMap`: the light as it is now is what's read.
+    fn swap(mut self) {
+        if self.changed.is_empty() {
+            return
+        }
+        self.changed.clear()
+        self.before.clear()
+        self.tops_before.clear()
+        self.seen_lowest = self.lowest
+    }
+
+    // Whether light was kept for the section as the last run left it.
+    fn seen(self, section: i64) -> bool {
+        return if self.changed.contains(section) { self.before.contains(section) } else { self.stored.contains(section) }
+    }
+
+    fn seen_level(self, section: i64, index: i32) -> i32 {
+        return if self.changed.contains(section) { self.before[section].get(index) } else { self.stored[section].get(index) }
+    }
+
+    fn seen_top(self, column: i64) -> i32 {
+        if self.tops_before.contains(column) {
+            let top = self.tops_before[column]
+            return if top == i32.MIN { self.seen_lowest } else { top }
+        }
+        return self.tops.get(column) ?? self.seen_lowest
+    }
+
+    fn light_on(self, section: i64) -> bool {
+        return self.lit.contains(zero_node(section))
+    }
+
+    fn set_lit(mut self, column: i64, on: bool) {
+        if on {
+            self.lit.insert(column)
+        } else {
+            self.lit.remove(column)
+        }
+    }
+
+    fn top(self, column: i64) -> i32 {
+        return self.tops.get(column) ?? self.lowest
+    }
+
+    fn has_data_at_or_below(self, section_y: i32) -> bool {
+        return section_y >= self.lowest
+    }
+
+    fn above_data(self, section: i64) -> bool {
+        let top = self.top(zero_node(section))
+        return top == self.lowest or y_of(section) >= top
+    }
+
+    fn queue(mut self, section: i64, data: own Layer?) {
+        self.shared.remove(section)
+        if let layer = data {
+            self.queued.insert(section, layer)
+            self.inconsistent = true
+        } else {
+            _ = self.queued.remove(section)
+        }
+    }
+
+    fn update_section_status(mut self, section: i64, empty: bool) {
+        let state = self.states.get(section) ?? 0
+        let next = if empty { state & ~HAS_DATA } else { state | HAS_DATA }
+        if state == next {
+            return
+        }
+        self.put_state(section, next)
+        let step = if empty { -1 } else { 1 }
+        for dx in -1..2 {
+            for dy in -1..2 {
+                for dz in -1..2 {
+                    if dx != 0 or dy != 0 or dz != 0 {
+                        let neighbour = section_offset(section, dx, dy, dz)
+                        let had = self.states.get(neighbour) ?? 0
+                        let count = (had & NEIGHBOURS) + step
+                        if count < 0 or count > 26 {
+                            panic("a section has {count} sections around it with blocks")
+                        }
+                        self.put_state(neighbour, (had & ~NEIGHBOURS) | count)
+                    }
+                }
+            }
+        }
+    }
+
+    fn put_state(mut self, section: i64, state: i32) {
+        if state != 0 {
+            let old = self.states.get(section) ?? 0
+            self.states.insert(section, state)
+            if old == 0 {
+                self.initialize(section)
+            }
+        } else if (self.states.remove(section) ?? 0) != 0 {
+            self.removing.insert(section)
+            self.inconsistent = true
+        }
+    }
+
+    fn initialize(mut self, section: i64) {
+        if self.removing.contains(section) {
+            self.removing.remove(section)
+            return
+        }
+        self.touch(section)
+        let layer = self.create_layer(section)
+        self.stored.insert(section, layer)
+        if self.sky {
+            self.node_added(section)
+        }
+        self.inconsistent = true
+    }
+
+    // A section's layer as it starts being lit, `createDataLayer`: what was queued for it, or for
+    // the sky, below the top of the column's data, the bottom of the next layer up repeated, and
+    // otherwise all 15 where the column's light is on, all 0 where it isn't. A queued layer moves
+    // in and is shared with the queue.
+    fn create_layer(mut self, section: i64) -> Layer {
+        if let queued = self.queued.remove(section) {
+            self.queued.insert(section, Layer.filled(0))
+            self.shared.insert(section)
+            return queued
+        }
+        if not self.sky {
+            return Layer.filled(0)
+        }
+        let top = self.top(zero_node(section))
+        if top != self.lowest and y_of(section) < top {
+            var above = section_offset(section, 0, 1, 0)
+            while not self.stored.contains(above) {
+                above = section_offset(above, 0, 1, 0)
+            }
+            return self.stored[above].repeat_first()
+        }
+        return Layer.filled(if self.light_on(section) { 15 } else { 0 })
+    }
+
+    // The sky's `onNodeAdded`.
+    fn node_added(mut self, section: i64) {
+        let y = y_of(section)
+        if self.lowest > y {
+            self.lowest = y
+        }
+        let column = zero_node(section)
+        if self.top(column) < y + 1 {
+            self.touch_top(column)
+            self.tops.insert(column, y + 1)
+        }
+    }
+
+    // The sky's `onNodeRemoved`.
+    fn node_removed(mut self, section: i64) {
+        let column = zero_node(section)
+        var y = y_of(section)
+        if self.top(column) != y + 1 {
+            return
+        }
+        var top = section
+        while not self.storing(top) and self.has_data_at_or_below(y) {
+            top = section_offset(top, 0, -1, 0)
+            y -= 1
+        }
+        self.touch_top(column)
+        if self.storing(top) {
+            self.tops.insert(column, y + 1)
+        } else {
+            _ = self.tops.remove(column)
+        }
+    }
+
+    // After a run, `markNewInconsistencies`: sections no longer kept are let go of, their light
+    // queued again where the column keeps its data, and queued layers move in to sections kept.
+    fn mark_new_inconsistencies(mut self) {
+        if not self.inconsistent {
+            return
+        }
+        self.inconsistent = false
+        var gone = List<i64>()
+        for section in self.removing {
+            gone.push(section)
+        }
+        for section in gone {
+            let shared = self.shared.contains(section)
+            self.shared.remove(section)
+            self.touch(section)
+            let queued = self.queued.remove(section)
+            let stored = self.stored.remove(section)
+            if self.retained.contains(zero_node(section)) {
+                if shared {
+                    if let layer = stored {
+                        self.queued.insert(section, layer)
+                    }
+                } else if let layer = queued {
+                    self.queued.insert(section, layer)
+                } else if let layer = stored {
+                    self.queued.insert(section, layer)
+                }
+            }
+        }
+        if self.sky {
+            for section in gone {
+                self.node_removed(section)
+            }
+        }
+        self.removing.clear()
+        var arrived = List<i64>()
+        for (section, _) in self.queued {
+            if self.stored.contains(section) {
+                arrived.push(section)
+            }
+        }
+        for section in arrived {
+            if let layer = self.queued.remove(section) {
+                if self.shared.contains(section) {
+                    self.shared.remove(section)
+                } else {
+                    self.touch(section)
+                    self.stored.insert(section, layer)
+                }
+            }
+        }
+    }
+
+    // The light a packet sends for a section, `getDataLayerData`: what's queued for it, or what
+    // the last run left it with, or `none`.
+    fn kind(self, section: i64) -> i32 {
+        if self.queued.contains(section) {
+            let empty = if self.shared.contains(section) { self.stored[section].is_empty() } else { self.queued[section].is_empty() }
+            return if empty { 1 } else { 2 }
+        }
+        if not self.seen(section) {
+            return 0
+        }
+        let empty = if self.changed.contains(section) { self.before[section].is_empty() } else { self.stored[section].is_empty() }
+        return if empty { 1 } else { 2 }
+    }
+
+    fn bytes(self, section: i64) -> List<u8> {
+        if self.queued.contains(section) {
+            return if self.shared.contains(section) { self.stored[section].bytes() } else { self.queued[section].bytes() }
+        }
+        return if self.changed.contains(section) { self.before[section].bytes() } else { self.stored[section].bytes() }
+    }
+
+    // The light at a block as the last run left it, as `getLightValue` reads it: 0 in a section
+    // block light isn't kept for, and for the sky, the bottom of the next section up kept, or 15
+    // above the column's data.
+    fn value(self, node: i64) -> i32 {
+        var section = section_of(node)
+        if not self.sky {
+            return if self.seen(section) { self.seen_level(section, node_index(node)) } else { 0 }
+        }
+        var y = y_of(section)
+        let top = self.seen_top(zero_node(section))
+        if top == self.seen_lowest or y >= top {
+            return 15
+        }
+        if self.seen(section) {
+            return self.seen_level(section, node_index(node))
+        }
+        loop {
+            y += 1
+            if y >= top {
+                return 15
+            }
+            section = section_offset(section, 0, 1, 0)
+            if self.seen(section) {
+                return self.seen_level(section, index_in(node_x(node), 0, node_z(node)))
+            }
+        }
+    }
+}
+
+// One kind of light's engine, vanilla's `BlockLightEngine` or `SkyLightEngine`.
+struct Engine {
+    sky: bool
+    storage: Storage
+    checks: OpenHashSet<i64> = OpenHashSet<i64>(512, 0.5)
+    decreases: Deque<i64> = Deque<i64>()
+    increases: Deque<i64> = Deque<i64>()
+}
+
+impl Engine {
+    fn new(sky: bool) -> Engine {
+        return Engine { sky: sky, storage: Storage { sky: sky } }
+    }
+
+    fn decrease(mut self, node: i64, entry: i64) {
+        self.decreases.push_last(node)
+        self.decreases.push_last(entry)
+    }
+
+    fn increase(mut self, node: i64, entry: i64) {
+        self.increases.push_last(node)
+        self.increases.push_last(entry)
+    }
+
+    fn has_work(self) -> bool {
+        return self.storage.inconsistent or not self.checks.is_empty() or not self.decreases.is_empty() or not self.increases.is_empty()
+    }
+
+    // The light a block gives where its column's light is on, `BlockLightEngine.getEmission`.
+    fn emission(self, states: LightStates, node: i64, state: u32) -> i32 {
+        let emission = states.emission(state)
+        return if emission > 0 and self.storage.light_on(section_of(node)) { emission } else { 0 }
+    }
+
+    // `setLightEnabled`, which for the sky fills the sections above the sources with 15.
+    fn set_light_enabled<C: LightChunks>(mut self, chunks: C, chunk_x: i32, chunk_z: i32, on: bool) {
+        let column = column_node(chunk_x, chunk_z)
+        self.storage.set_lit(column, on)
+        if not self.sky or not on {
+            return
+        }
+        // As vanilla, `i32.MIN - 1` wraps, so a chunk open to the void all over fills nothing.
+        let highest_non_source = (chunks.highest_sky_source(chunk_x, chunk_z) ?? i32.MIN) - 1
+        let lowest_fully_source = (highest_non_source >> 4) + 1
+        let bottom = self.storage.lowest.max(lowest_fully_source)
+        var y = self.storage.top(column) - 1
+        while y >= bottom {
+            let section = section_node(chunk_x, y, chunk_z)
+            if self.storage.stored.contains(section) {
+                self.storage.touch(section)
+                if self.storage.stored[section].is_empty() {
+                    self.storage.stored[section].fill_with(15)
+                }
+            }
+            y -= 1
+        }
+    }
+
+    // `propagateLightSources`: light starts from each block that gives it, or from the sky.
+    fn propagate_light_sources<C: LightChunks>(mut self, states: LightStates, chunks: C, chunk_x: i32, chunk_z: i32) {
+        let column = column_node(chunk_x, chunk_z)
+        self.storage.set_lit(column, true)
+        if not self.sky {
+            let sources = chunks.light_sources_in(chunk_x, chunk_z)
+            for node in sources {
+                let state = state_at(chunks, node)
+                self.increase(node, increase_from_emission(states.emission(state), states.empty_shape(state)))
+            }
+            return
+        }
+        let top = self.storage.top(column)
+        let bottom = self.storage.lowest
+        let min_x = chunk_x * 16
+        let min_z = chunk_z * 16
+        // The lowest source of each column of the chunk and the one around it, `x` + 1 + 18
+        // (`z` + 1), read once rather than for each section: they don't change while it lights.
+        var around = List<i32>()
+        // The highest of the chunk's own columns' lowest sources: every column is lit from there up.
+        var deepest = i32.MIN
+        var section_y = top - 1
+        while section_y >= bottom {
+            let section = section_node(chunk_x, section_y, chunk_z)
+            if self.storage.stored.contains(section) {
+                self.storage.touch(section)
+                if around.is_empty() {
+                    around = [0; 324]
+                    for z in -1..17 {
+                        for x in -1..17 {
+                            around[usize.wrap(x + 1 + 18 * (z + 1))] = sky_source(chunks, min_x + x, min_z + z)
+                        }
+                    }
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            deepest = deepest.max(around[usize.wrap(x + 1 + 18 * (z + 1))])
+                        }
+                    }
+                }
+                let min_y = section_y * 16
+                let max_y = min_y + 15
+                var sources_below = false
+                // Taken out while it's lit and put back, so it's looked up once, not for each block.
+                var layer = self.storage.stored.remove(section) ?? Layer.filled(0)
+                // 15 down to each column's lowest source: whole levels of the section while every
+                // column's is lower, then column by column. Vanilla sets each block as it queues
+                // them; the light set doesn't change what's queued.
+                var level_y = max_y
+                while level_y >= min_y and level_y >= deepest {
+                    layer.set_level_at(level_y, 15)
+                    level_y -= 1
+                }
+                if level_y >= min_y {
+                    for z in 0..16 {
+                        for x in 0..16 {
+                            var y = level_y
+                            while y >= min_y.max(around[usize.wrap(x + 1 + 18 * (z + 1))]) {
+                                layer.set(index_in(x, y, z), 15)
+                                y -= 1
+                            }
+                        }
+                    }
+                }
+                // Light spreads from the lowest source, and from each source above a neighbour's
+                // lowest, so down from where the neighbours' start, in vanilla's order.
+                for z in 0..16 {
+                    for x in 0..16 {
+                        let at = usize.wrap(x + 1 + 18 * (z + 1))
+                        let lowest = around[at]
+                        if lowest <= max_y {
+                            let north = around[at - 18]
+                            let south = around[at + 18]
+                            let west = around[at - 1]
+                            let east = around[at + 1]
+                            let neighbour = north.max(south).max(west.max(east))
+                            let low = min_y.max(lowest)
+                            if neighbour > low {
+                                var y = max_y.min(neighbour - 1)
+                                while y >= low {
+                                    self.increase(block_node(min_x + x, y, min_z + z), sky_source_in_directions(y == lowest, y < north, y < south, y < west, y < east))
+                                    y -= 1
+                                }
+                            } else if lowest >= min_y {
+                                self.increase(block_node(min_x + x, lowest, min_z + z), sky_source_in_directions(true, lowest < north, lowest < south, lowest < west, lowest < east))
+                            }
+                            if lowest < min_y {
+                                sources_below = true
+                            }
+                        }
+                    }
+                }
+                self.storage.stored.insert(section, layer)
+                if not sources_below {
+                    break
+                }
+            }
+            section_y -= 1
+        }
+    }
+
+    // `runLightUpdates`: the blocks to check, then light taken away, then light spread.
+    fn run<C: LightChunks>(mut self, states: LightStates, chunks: C) -> i32 {
+        if not self.checks.is_empty() {
+            var nodes = List<i64>()
+            for node in self.checks {
+                nodes.push(node)
+            }
+            // As vanilla's `clear()` then `trim(512)`, which leave the table it started with.
+            self.checks = OpenHashSet<i64>(512, 0.5)
+            for node in nodes {
+                self.check_node(states, chunks, node)
+            }
+        }
+        var count = 0
+        while let node = self.decreases.pop_first() {
+            let entry = self.decreases.pop_first() ?? 0
+            self.propagate_decrease(states, chunks, node, entry)
+            count += 1
+        }
+        while let node = self.increases.pop_first() {
+            let entry = self.increases.pop_first() ?? 0
+            var level = self.storage.level(node)
+            let target = entry_level(entry)
+            if entry & FROM_EMISSION != 0 and level < target {
+                self.storage.set_level(node, target)
+                level = target
+            }
+            if level == target {
+                self.propagate_increase(states, chunks, node, entry, level)
+            }
+            count += 1
+        }
+        self.storage.mark_new_inconsistencies()
+        self.storage.swap()
+        return count
+    }
+
+    fn check_node<C: LightChunks>(mut self, states: LightStates, chunks: C, node: i64) {
+        let section = section_of(node)
+        if not self.sky {
+            if not self.storage.storing(section) {
+                return
+            }
+            let state = state_at(chunks, node)
+            let emission = self.emission(states, node, state)
+            let old = self.storage.level(node)
+            if emission < old {
+                self.storage.set_level(node, 0)
+                self.decrease(node, decrease_all(old))
+            } else {
+                self.decrease(node, PULL_LIGHT_IN)
+            }
+            if emission > 0 {
+                self.increase(node, increase_from_emission(emission, states.empty_shape(state)))
+            }
+            return
+        }
+        let x = node_x(node)
+        let y = node_y(node)
+        let z = node_z(node)
+        let lowest = if self.storage.light_on(section) { chunks.lowest_sky_source(x, z) ?? i32.MAX } else { i32.MAX }
+        if lowest != i32.MAX {
+            let bottom = self.storage.lowest << 4
+            self.remove_sources_below(x, z, lowest, bottom)
+            self.add_sources_above(chunks, x, z, lowest, bottom)
+        }
+        if not self.storage.storing(section) {
+            return
+        }
+        if y >= lowest {
+            self.decrease(node, SKY_SOURCE)
+            self.increase(node, SKY_SOURCE)
+        } else {
+            let old = self.storage.level(node)
+            if old > 0 {
+                self.storage.set_level(node, 0)
+                self.decrease(node, decrease_all(old))
+            } else {
+                self.decrease(node, PULL_LIGHT_IN)
+            }
+        }
+    }
+
+    // The sky's `removeSourcesBelow`: the sources left below a column's new lowest go out.
+    fn remove_sources_below(mut self, x: i32, z: i32, lowest: i32, bottom: i32) {
+        if lowest <= bottom {
+            return
+        }
+        let start = lowest - 1
+        var section_y = start >> 4
+        while self.storage.has_data_at_or_below(section_y) {
+            if self.storage.storing(section_node(x >> 4, section_y, z >> 4)) {
+                let section_bottom = section_y * 16
+                var y = (section_bottom + 15).min(start)
+                while y >= section_bottom {
+                    let node = block_node(x, y, z)
+                    if self.storage.level(node) != MAX_LEVEL {
+                        return
+                    }
+                    self.storage.set_level(node, 0)
+                    self.decrease(node, if y == lowest - 1 { REMOVE_TOP_SKY_SOURCE } else { SKY_SOURCE })
+                    y -= 1
+                }
+            }
+            section_y -= 1
+        }
+    }
+
+    // The sky's `addSourcesAbove`: the blocks from a column's new lowest source up become sources.
+    fn add_sources_above<C: LightChunks>(mut self, chunks: C, x: i32, z: i32, lowest: i32, bottom: i32) {
+        let west = chunks.lowest_sky_source(x - 1, z) ?? i32.MIN
+        let east = chunks.lowest_sky_source(x + 1, z) ?? i32.MIN
+        let north = chunks.lowest_sky_source(x, z - 1) ?? i32.MIN
+        let south = chunks.lowest_sky_source(x, z + 1) ?? i32.MIN
+        let neighbour = west.max(east).max(north.max(south))
+        let start = lowest.max(bottom)
+        var section = section_node(x >> 4, start >> 4, z >> 4)
+        while not self.storage.above_data(section) {
+            if self.storage.storing(section) {
+                let section_bottom = y_of(section) * 16
+                var y = section_bottom.max(start)
+                while y <= section_bottom + 15 {
+                    let node = block_node(x, y, z)
+                    if self.storage.level(node) == MAX_LEVEL {
+                        return
+                    }
+                    self.storage.set_level(node, MAX_LEVEL)
+                    if y < neighbour or y == lowest {
+                        self.increase(node, SKY_SOURCE)
+                    }
+                    y += 1
+                }
+            }
+            section = section_offset(section, 0, 1, 0)
+        }
+    }
+
+    fn propagate_increase<C: LightChunks>(mut self, states: LightStates, chunks: C, from: i64, entry: i64, from_level: i32) {
+        var from_known = false
+        var from_state: u32 = AIR
+        let empty_below = if self.sky { self.count_empty_sections_below_if_at_border(from) } else { 0 }
+        for direction in 0..6 {
+            if not goes(entry, direction) {
+                continue
+            }
+            let to = offset(from, direction)
+            if not self.storage.storing(section_of(to)) {
+                continue
+            }
+            let to_level = self.storage.level(to)
+            if from_level - 1 <= to_level {
+                continue
+            }
+            let to_state = state_at(chunks, to)
+            let new_level = from_level - states.opacity(to_state)
+            if new_level <= to_level {
+                continue
+            }
+            if not from_known {
+                from_state = if entry & FROM_EMPTY_SHAPE != 0 { AIR } else { state_at(chunks, from) }
+                from_known = true
+            }
+            if states.shape_occludes(from_state, to_state, direction) {
+                continue
+            }
+            self.storage.set_level(to, new_level)
+            if new_level > 1 {
+                self.increase(to, increase_skip_one(new_level, states.empty_shape(to_state), direction ^ 1))
+            }
+            if self.sky {
+                self.propagate_from_empty_sections(to, direction, new_level, true, empty_below)
+            }
+        }
+    }
+
+    fn propagate_decrease<C: LightChunks>(mut self, states: LightStates, chunks: C, from: i64, entry: i64) {
+        let empty_below = if self.sky { self.count_empty_sections_below_if_at_border(from) } else { 0 }
+        let old_from = entry_level(entry)
+        for direction in 0..6 {
+            if not goes(entry, direction) {
+                continue
+            }
+            let to = offset(from, direction)
+            if not self.storage.storing(section_of(to)) {
+                continue
+            }
+            let to_level = self.storage.level(to)
+            if to_level == 0 {
+                continue
+            }
+            if to_level > old_from - 1 {
+                self.increase(to, increase_only_one(to_level, false, direction ^ 1))
+                continue
+            }
+            if self.sky {
+                self.storage.set_level(to, 0)
+                self.decrease(to, decrease_skip_one(to_level, direction ^ 1))
+                self.propagate_from_empty_sections(to, direction, to_level, false, empty_below)
+                continue
+            }
+            let to_state = state_at(chunks, to)
+            let to_emission = self.emission(states, to, to_state)
+            self.storage.set_level(to, 0)
+            if to_emission < to_level {
+                self.decrease(to, decrease_skip_one(to_level, direction ^ 1))
+            }
+            if to_emission > 0 {
+                self.increase(to, increase_from_emission(to_emission, states.empty_shape(to_state)))
+            }
+        }
+    }
+
+    // How many sections light isn't kept for are below a block at the bottom and on the edge of
+    // its section, down to the lowest data, `countEmptySectionsBelowIfAtBorder`.
+    fn count_empty_sections_below_if_at_border(self, node: i64) -> i32 {
+        let y = node_y(node)
+        if y & 15 != 0 {
+            return 0
+        }
+        let x = node_x(node)
+        let z = node_z(node)
+        let local_x = x & 15
+        let local_z = z & 15
+        if local_x != 0 and local_x != 15 and local_z != 0 and local_z != 15 {
+            return 0
+        }
+        var count = 0
+        while not self.storage.storing(section_node(x >> 4, (y >> 4) - count - 1, z >> 4)) and self.storage.has_data_at_or_below((y >> 4) - count - 1) {
+            count += 1
+        }
+        return count
+    }
+
+    // Sky light going sideways from above sections it isn't kept for reaches the column beside
+    // them all the way down, `propagateFromEmptySections`.
+    fn propagate_from_empty_sections(mut self, to: i64, direction: i32, level: i32, increase: bool, empty_below: i32) {
+        if empty_below == 0 {
+            return
+        }
+        let x = node_x(to)
+        let z = node_z(to)
+        if not crossed_section_edge(direction, x & 15, z & 15) {
+            return
+        }
+        var section_y = (node_y(to) >> 4) - 1
+        let bottom = section_y - empty_below + 1
+        while section_y >= bottom {
+            if self.storage.storing(section_node(x >> 4, section_y, z >> 4)) {
+                let min_y = section_y * 16
+                var local_y = 15
+                while local_y >= 0 {
+                    let node = block_node(x, min_y + local_y, z)
+                    if increase {
+                        self.storage.set_level(node, level)
+                        if level > 1 {
+                            self.increase(node, increase_skip_one(level, true, direction ^ 1))
+                        }
+                    } else {
+                        self.storage.set_level(node, 0)
+                        self.decrease(node, decrease_skip_one(level, direction ^ 1))
+                    }
+                    local_y -= 1
+                }
+            }
+            section_y -= 1
+        }
+    }
+}
+
+fn sky_source<C: LightChunks>(chunks: C, x: i32, z: i32) -> i32 {
+    return chunks.lowest_sky_source(x, z) ?? i32.MIN
+}
+
+/// A dimension's light, vanilla's `LevelLightEngine`: block light, and sky light where the
+/// dimension has a sky.
+pub struct Light {
+    block: Engine
+    sky: Engine
+    has_sky: bool
+    min_section: i32
+    sections: i32
+}
+
+impl Light {
+    /// The light of a dimension from `min_y`, `height` blocks up, both multiples of 16, with sky
+    /// light if `has_sky`.
+    pub fn new(min_y: i32, height: i32, has_sky: bool) -> Light {
+        return Light { block: Engine.new(false), sky: Engine.new(true), has_sky: has_sky, min_section: min_y >> 4, sections: height >> 4 }
+    }
+
+    /// The section at `x`, `y`, `z`, in sections, has blocks or has none, `updateSectionStatus`:
+    /// light is kept for a section with blocks and the 26 around it.
+    pub fn update_section_status(mut self, x: i32, y: i32, z: i32, empty: bool) {
+        let section = section_node(x, y, z)
+        self.block.storage.update_section_status(section, empty)
+        if self.has_sky {
+            self.sky.storage.update_section_status(section, empty)
+        }
+    }
+
+    /// Turns the chunk's light on or off, `setLightEnabled`: a block gives light only where it's
+    /// on, and turning the sky's on fills the sections above its sources with 15.
+    pub fn set_light_enabled<C: LightChunks>(mut self, chunks: C, chunk_x: i32, chunk_z: i32, on: bool) {
+        self.block.set_light_enabled(chunks, chunk_x, chunk_z, on)
+        if self.has_sky {
+            self.sky.set_light_enabled(chunks, chunk_x, chunk_z, on)
+        }
+    }
+
+    /// Whether the chunk keeps its queued light when its sections stop being lit, `retainData`.
+    pub fn retain_data(mut self, chunk_x: i32, chunk_z: i32, retain: bool) {
+        let column = column_node(chunk_x, chunk_z)
+        if retain {
+            self.block.storage.retained.insert(column)
+            self.sky.storage.retained.insert(column)
+        } else {
+            self.block.storage.retained.remove(column)
+            self.sky.storage.retained.remove(column)
+        }
+    }
+
+    /// Light starts from the chunk's blocks that give it, and from its sky, `propagateLightSources`.
+    pub fn propagate_light_sources<C: LightChunks>(mut self, states: LightStates, chunks: C, chunk_x: i32, chunk_z: i32) {
+        self.block.propagate_light_sources(states, chunks, chunk_x, chunk_z)
+        if self.has_sky {
+            self.sky.propagate_light_sources(states, chunks, chunk_x, chunk_z)
+        }
+    }
+
+    /// The block at `x`, `y`, `z` changed its light, `checkBlock`: the next run checks it.
+    pub fn check_block(mut self, x: i32, y: i32, z: i32) {
+        let node = block_node(x, y, z)
+        self.block.checks.insert(node)
+        if self.has_sky {
+            self.sky.checks.insert(node)
+        }
+    }
+
+    /// Tells light of a block in a chunk set from `old` to `new`, as `LevelChunk.setBlockState`
+    /// does once it's set it: the section's status if it stopped or started being only air,
+    /// which `was_empty` says it was before, and if the block's light changed, its column's sky
+    /// sources and a check of it at the next run. `x` and `z` are the block's in the chunk.
+    pub fn block_set(mut self, states: LightStates, chunk: Chunk, sources: mut SkySources, chunk_x: i32, chunk_z: i32, x: i32, y: i32, z: i32, old: u32, new: u32, was_empty: bool) {
+        let empty = chunk.section_only_air(usize.wrap((y - chunk.min_y()) >> 4))
+        if empty != was_empty {
+            self.update_section_status(chunk_x, y >> 4, chunk_z, empty)
+        }
+        if states.differ(old, new) {
+            _ = sources.update(chunk, states, x, y, z)
+            self.check_block(chunk_x * 16 + x, y, chunk_z * 16 + z)
+        }
+    }
+
+    /// Light for the section at `x`, `y`, `z`, as a save or a packet gives it, to use once light
+    /// is kept for the section, `queueSectionData`; `none` takes back what was queued.
+    pub fn queue_section_data(mut self, sky: bool, x: i32, y: i32, z: i32, data: own Layer?) {
+        let section = section_node(x, y, z)
+        if sky {
+            if self.has_sky {
+                self.sky.storage.queue(section, data)
+            }
+        } else {
+            self.block.storage.queue(section, data)
+        }
+    }
+
+    /// Works out the light that changed, `runLightUpdates`, and gives how many queue entries it
+    /// went through.
+    pub fn run<C: LightChunks>(mut self, states: LightStates, chunks: C) -> i32 {
+        var count = self.block.run(states, chunks)
+        if self.has_sky {
+            count += self.sky.run(states, chunks)
+        }
+        return count
+    }
+
+    /// Whether a run has anything to do, `hasLightWork`.
+    pub fn has_work(self) -> bool {
+        return self.block.has_work() or (self.has_sky and self.sky.has_work())
+    }
+
+    /// Whether the chunk's light is on, `lightOnInColumn`.
+    pub fn light_on(self, chunk_x: i32, chunk_z: i32) -> bool {
+        let column = column_node(chunk_x, chunk_z)
+        return self.block.storage.lit.contains(column) and (not self.has_sky or self.sky.storage.lit.contains(column))
+    }
+
+    /// The light at the block `x`, `y`, `z`, sky light if `sky`, as `getLightValue`.
+    pub fn value(self, sky: bool, x: i32, y: i32, z: i32) -> i32 {
+        if sky {
+            return if self.has_sky { self.sky.storage.value(block_node(x, y, z)) } else { 0 }
+        }
+        return self.block.storage.value(block_node(x, y, z))
+    }
+
+    /// What light the section at `x`, `y`, `z` has, as a packet sends it: 0 for none, 1 for
+    /// none but known to be dark, 2 for a layer of light.
+    pub fn layer_kind(self, sky: bool, x: i32, y: i32, z: i32) -> i32 {
+        if sky and not self.has_sky {
+            return 0
+        }
+        let section = section_node(x, y, z)
+        return if sky { self.sky.storage.kind(section) } else { self.block.storage.kind(section) }
+    }
+
+    /// The 2048 bytes of light of the section at `x`, `y`, `z`, which `layer_kind` gives 2 for.
+    pub fn layer_bytes(self, sky: bool, x: i32, y: i32, z: i32) -> List<u8> {
+        let section = section_node(x, y, z)
+        return if sky { self.sky.storage.bytes(section) } else { self.block.storage.bytes(section) }
+    }
+
+    /// The chunk's light as a packet sends it, vanilla's `ClientboundLightUpdatePacketData` for
+    /// every section: from the one below the world to the one above.
+    pub fn light_data(self, chunk_x: i32, chunk_z: i32) -> LightData {
+        var data = LightData { sky_mask: [], block_mask: [], empty_sky_mask: [], empty_block_mask: [], sky: [], block: [] }
+        for i in 0..self.sections + 2 {
+            let y = self.min_section - 1 + i
+            if self.has_sky {
+                match self.sky.storage.kind(section_node(chunk_x, y, chunk_z)) {
+                    1 => set_bit(mut data.empty_sky_mask, i),
+                    2 => {
+                        set_bit(mut data.sky_mask, i)
+                        data.sky.push(LightLayer { data: self.sky.storage.bytes(section_node(chunk_x, y, chunk_z)) })
+                    }
+                    _ => {}
+                }
+            }
+            match self.block.storage.kind(section_node(chunk_x, y, chunk_z)) {
+                1 => set_bit(mut data.empty_block_mask, i),
+                2 => {
+                    set_bit(mut data.block_mask, i)
+                    data.block.push(LightLayer { data: self.block.storage.bytes(section_node(chunk_x, y, chunk_z)) })
+                }
+                _ => {}
+            }
+        }
+        return data
+    }
+}
+
+// Sets bit `i` of a `BitSet`'s bytes, growing them only as far as the bit.
+fn set_bit(bits: mut List<u8>, i: i32) {
+    let byte = usize.wrap(i >> 3)
+    while bits.len() <= byte {
+        bits.push(0)
+    }
+    bits[byte] |= u8.wrap(1 << (i & 7))
+}

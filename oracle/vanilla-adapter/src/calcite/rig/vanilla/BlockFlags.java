@@ -4,16 +4,30 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import net.minecraft.SharedConstants;
+import net.minecraft.core.Direction;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.phys.AABB;
+import net.minecraft.world.phys.shapes.Shapes;
+import net.minecraft.world.phys.shapes.VoxelShape;
 
 /**
  * Writes what each block state is, as vanilla's state cache holds it, to the JSON file named by
  * its argument: one number a state, in state ID order, read by oracle/datagen/calx_tables.py
  * (oracle/datagen/README.md). Run by oracle/datagen/block_flags.py.
+ *
+ * <p>It also writes the faces light sees: for each state, the shape {@code
+ * LightEngine.getOcclusionShape} gives on each of its six sides, as a number for each different
+ * shape, and for each two shapes whether {@code Shapes.faceShapeOccludes} says light can't pass
+ * between them. Shape 0 is empty and shape 1 the full face.
  *
  * <p>Every value is fixed when the states are made, before any data pack loads, so the table is
  * the same for every world.
@@ -40,7 +54,9 @@ final class BlockFlags {
         SharedConstants.tryDetectVersion();
         Bootstrap.bootStrap();
         int count = Block.BLOCK_STATE_REGISTRY.size();
+        Faces faces = new Faces();
         StringBuilder json = new StringBuilder();
+        StringBuilder light = new StringBuilder();
         json.append("{\n  \"game_version\": \"").append(SharedConstants.getCurrentVersion().name()).append("\",\n");
         json.append("  \"states\": ").append(count).append(",\n  \"flags\": [");
         for (int id = 0; id < count; id++) {
@@ -49,10 +65,36 @@ final class BlockFlags {
                 throw new IllegalStateException("block state " + id + " is missing");
             }
             json.append(id == 0 ? "" : ", ").append(flags(state));
+            light.append(id == 0 ? "[" : ", [");
+            for (Direction direction : Direction.values()) {
+                light.append(direction.ordinal() == 0 ? "" : ", ").append(faces.id(LightEngine.getOcclusionShape(state, direction)));
+            }
+            light.append("]");
+        }
+        json.append("],\n  \"light_faces\": [").append(light).append("],\n");
+        json.append("  \"face_boxes\": [");
+        for (int i = 0; i < faces.shapes.size(); i++) {
+            json.append(i == 0 ? "[" : ", [");
+            List<AABB> boxes = faces.shapes.get(i).toAabbs();
+            for (int b = 0; b < boxes.size(); b++) {
+                AABB box = boxes.get(b);
+                json.append(b == 0 ? "[" : ", [").append(box.minX).append(", ").append(box.minY).append(", ").append(box.minZ)
+                        .append(", ").append(box.maxX).append(", ").append(box.maxY).append(", ").append(box.maxZ).append("]");
+            }
+            json.append("]");
+        }
+        json.append("],\n  \"face_occludes\": [");
+        for (int i = 0; i < faces.shapes.size(); i++) {
+            json.append(i == 0 ? "[" : ", [");
+            for (int j = 0; j < faces.shapes.size(); j++) {
+                boolean occludes = Shapes.faceShapeOccludes(faces.shapes.get(i), faces.shapes.get(j));
+                json.append(j == 0 ? "" : ", ").append(occludes ? 1 : 0);
+            }
+            json.append("]");
         }
         json.append("]\n}\n");
         Files.writeString(Path.of(args[0]), json, StandardCharsets.UTF_8);
-        System.err.println("BlockFlags: wrote " + count + " states to " + args[0]);
+        System.err.println("BlockFlags: wrote " + count + " states and " + faces.shapes.size() + " face shapes to " + args[0]);
     }
 
     private static int flags(BlockState state) {
@@ -70,5 +112,32 @@ final class BlockFlags {
         f |= state.getLightEmission() << LIGHT_EMISSION_SHIFT;
         f |= state.getLightDampening() << LIGHT_DAMPENING_SHIFT;
         return f;
+    }
+
+    /**
+     * The different face shapes, numbered as they're first met, each keyed by its boxes. Two
+     * shapes with the same boxes cover the same space, so {@code faceShapeOccludes} treats them
+     * the same; two with different boxes that happen to cover the same space just take two
+     * numbers.
+     */
+    private static final class Faces {
+        final List<VoxelShape> shapes = new ArrayList<>();
+        final Map<String, Integer> ids = new HashMap<>();
+
+        Faces() {
+            id(Shapes.empty());
+            id(Shapes.block());
+        }
+
+        int id(VoxelShape shape) {
+            String key = shape.isEmpty() ? "" : shape.toAabbs().toString();
+            Integer id = ids.get(key);
+            if (id == null) {
+                id = shapes.size();
+                ids.put(key, id);
+                shapes.add(shape);
+            }
+            return id;
+        }
     }
 }

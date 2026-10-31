@@ -15,7 +15,7 @@ sys.path.insert(0, str(DATAGEN))
 
 import calx_tables  # noqa: E402
 
-INDEX = {"game_version": "1.0", "protocol_version": 5}
+INDEX = {"game_version": "1.0", "protocol_version": 5, "world_version": 4600}
 
 
 def packets(**states):
@@ -32,6 +32,7 @@ class IdsModule(unittest.TestCase):
             "clientbound": ["minecraft:login_disconnect"],
         }))
         self.assertIn("pub const PROTOCOL_VERSION: i32 = 5\n", text)
+        self.assertIn("pub const DATA_VERSION: i32 = 4600\n", text)
         self.assertIn('    return "1.0"\n', text)
         self.assertIn(
             "        State.Login => {\n"
@@ -113,13 +114,14 @@ class PinModule(unittest.TestCase):
 
 class BlocksModule(unittest.TestCase):
     @staticmethod
-    def block(id, name, first, count, default):
-        return {"id": id, "name": name, "first_state": first, "state_count": count, "default_state": default}
+    def block(id, name, first, count, default, properties=()):
+        return {"id": id, "name": name, "first_state": first, "state_count": count, "default_state": default,
+                "properties": list(properties)}
 
     def test_writes_first_states_and_default_offsets(self):
-        text = calx_tables.blocks_module(INDEX, {"state_count": 4, "blocks": [
+        text = calx_tables.blocks_module(INDEX, {"state_count": 4, "properties": [{"name": "snowy", "values": ["true", "false"]}], "blocks": [
             self.block(0, "minecraft:air", 0, 1, 0),
-            self.block(1, "minecraft:grass_block", 1, 2, 2),
+            self.block(1, "minecraft:grass_block", 1, 2, 2, [0]),
             self.block(2, "minecraft:dirt", 3, 1, 3),
         ]})
         self.assertIn("pub const STATE_COUNT: u32 = 4\n", text)
@@ -197,6 +199,32 @@ class BlockFlagsModule(unittest.TestCase):
         flags = json.loads(path.read_text(encoding="utf-8"))
         text = (calx_tables.CALCITE / "src" / "world" / "block_flags.calx").read_text(encoding="utf-8")
         self.assertEqual(self.decode(text)[0], flags["flags"])
+
+
+class LightFacesModule(unittest.TestCase):
+    # Four states: two with no faces, one whole all round, and one half down and whole up.
+    FLAGS = {"states": 4, "light_faces": [[0] * 6, [0] * 6, [1] * 6, [2, 1, 0, 0, 0, 0]],
+             "face_boxes": [[], [[0, 0, 0, 1, 1, 1]], [[0, 0, 0, 1, 0.5, 1]]],
+             "face_occludes": [[0, 1, 0], [1, 1, 1], [0, 1, 0]]}
+
+    def test_packs_the_faces_commonest_first(self):
+        text = calx_tables.light_faces_module(INDEX, self.FLAGS)
+        self.assertIn("pub const FACE_SHAPES: u32 = 3\n", text)
+        whole = sum(1 << (6 * d) for d in range(6))
+        self.assertIn(f"    let palette: List<u64> = [0, 66, {whole}]\n", text)
+        a = calx_tables.ALPHABET
+        self.assertIn(f'        "{a[0]}{a[0]}{a[2]}{a[1]}",\n', text)
+        self.assertIn("    return [2, 7, 2]\n", text)
+
+    def test_rejects_what_it_cant_represent(self):
+        with self.assertRaisesRegex(ValueError, "3 states' faces for 4"):
+            calx_tables.light_faces_module(INDEX, dict(self.FLAGS, light_faces=self.FLAGS["light_faces"][:3]))
+        with self.assertRaisesRegex(ValueError, "both ways round"):
+            calx_tables.light_faces_module(INDEX, dict(self.FLAGS, face_occludes=[[0, 1, 0], [0, 1, 1], [0, 1, 0]]))
+        with self.assertRaisesRegex(ValueError, "six shapes"):
+            calx_tables.light_faces_module(INDEX, dict(self.FLAGS, light_faces=[[0] * 6, [0] * 6, [1] * 6, [3] * 6]))
+        with self.assertRaisesRegex(ValueError, "all empty"):
+            calx_tables.light_faces_module(INDEX, dict(self.FLAGS, light_faces=[[1] * 6, [1] * 6, [0] * 6, [2] * 6]))
 
 
 if __name__ == "__main__":

@@ -98,6 +98,8 @@ What each block state is that the reports don't say: whether it's air, takes ran
 py -I oracle/datagen/block_flags.py
 ```
 
+It also has the faces light sees, for `world.light` (CAL-66): `light_faces`, each state's shape on each of its six sides as `LightEngine.getOcclusionShape` gives it, a number for each different shape, 0 the empty one and 1 the whole face; `face_boxes`, each shape's boxes; and `face_occludes`, for each two shapes, whether `Shapes.faceShapeOccludes` says light can't pass between them.
+
 Which heightmaps count a state isn't here: in 26.3 that comes from the data pack's tags, which Calcite reads as it starts.
 
 ## What's compiled in and what's loaded (D61)
@@ -120,6 +122,7 @@ py -I oracle/datagen/calx_tables.py --check    # fail if a committed one is out 
 | `src/pack/pin.calx` | `../versions.json` | `jar_version()`, `jar_url()`, `jar_sha1()` and `JAR_SIZE`: the pinned server jar, which the rig checks; `client_url()`, `CLIENT_SIZE`, `DATA_OFFSET`, `DATA_LENGTH` and `data_sha256()`: the pinned client jar and the stretch of it holding the vanilla data, which the server reads or downloads and checks (D140) |
 | `src/world/blocks.calx` | `blocks.json` | `STATE_COUNT`, `first_states()`, each block's first state ID, and `default_offsets()`, where its default state is among its states, in block ID order; `property_names()` and `property_values()`, every property and its values in vanilla's order, and `property_starts()` and `block_properties()`, each block's properties by name, which `world.states` names states with |
 | `src/world/block_flags.calx` | `../block_flags.json` | The flags' constants, and `state_flags()`, each state's flags in ID order. The 35,723 states are a printable character each, an index into the 102 different values, commonest first, in lines of 96; the 13 rarest take two, after `~`. It's decoded once, as the server starts |
+| `src/world/light_faces.calx` | `../block_flags.json` | `state_faces()`, each state's six faces, packed in `FACE_BITS` each, as an index into the 53 different sets, a character a state; and `face_occludes()`, for each of the `FACE_SHAPES` shapes, a bit for each shape light can't pass between it and |
 
 They're committed, and hold only the names, IDs and facts about states the protocol and the world need, which every compatible server encodes. Don't edit one: change the script and run it again. A new game version that changes them changes Calcite's build, which is the point: `@packet` then fails to compile for a packet that was renamed or removed.
 

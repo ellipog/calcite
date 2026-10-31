@@ -529,6 +529,39 @@ The state, each table in its order: the holders in `updatingChunkMap`, then thos
 
 `ChunkLevel.MAX_LEVEL` must be 44, for which the cases are written; the vanilla adapter checks it. Blobs, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, a player, coordinate, level, distance or count that isn't an `int`, an `unplayer` of a player no earlier `player` named, and a type that isn't one are an `error` status.
 
+### `light` (v1)
+
+A dimension's light, vanilla's own `LevelLightEngine` with its block and sky engines, over chunks the case makes, through a list of operations.
+
+Input `{"min_y": y, "sections": n, "sky": s, "ops": [...]}`, with no blobs: the dimension from `min_y`, a multiple of 16, `n` sections up, all inside −2032 to 2032, with a sky if `s` is 1 and none if it's 0. The chunks are `ProtoChunk`s of that height, each with its own `ChunkSkyLightSources`, which the engine gets from a `LightChunkGetter` over a map, as a level's chunk source gives the chunks it has: a chunk the case hasn't made is missing, and the level reads air there. A state is a block state's ID. A seed is a `long` as a decimal string, for the probe's LCG: `x = x * 6364136223846793005 + 1442695040888963407`, each draw `(int) (x >>> 33)`. A chunk's `x` and `z` are from −1000 to 1000, and a block's from −16000 to 16015.
+
+A block is set *quietly* as generation sets one before light: straight into its section, except air in a section of only air, which `LevelChunk` doesn't set either, so the section's palette is what the world's would be. It's *told* as `LevelChunk.setBlockState` tells light once it's set one: nothing for air in a section of only air or for the state it had; otherwise, if the section stopped or started being only air, `updateSectionStatus`, and if `hasDifferentLightProperties` says the two states' light differs, the chunk's `getSkyLightSources().update` and then `checkBlock`.
+
+The result is one blob, each operation's result after the last's.
+
+| Operation | Result |
+| --- | --- |
+| `["chunk", x, z]` | nothing: an empty chunk there, which mustn't be there already |
+| `["fill", x0, y0, z0, x1, y1, z1, state]` | nothing: every block from one corner to the other set quietly, `y`, then `x`, then `z`, at most 256 blocks across, in chunks that are there |
+| `["random", tell, seed, count, [state, ...], x0, y0, z0, x1, y1, z1]` | nothing: `count` blocks, each at `x0 + draw % (x1 − x0 + 1)` and the same for `y` and `z`, then a state from the list at `draw % length`, set quietly or told by `tell`, 0 or 1 |
+| `["set", x, y, z, state]` | the block told, and the state it had as an `int`, or −1 for nothing changed |
+| `["sources", x, z]` | nothing: the chunk's `initializeLightSources`, as the `INITIALIZE_LIGHT` status starts |
+| `["sections", x, z]` | nothing: `updateSectionStatus(…, false)` for each of the chunk's sections that isn't only air, as `ThreadedLevelLightEngine.initializeLight` starts |
+| `["status", x, y, z, empty]` | nothing: `updateSectionStatus` of the section, `y` from one below the dimension's sections to one above |
+| `["enable", x, z, on]` | nothing: `setLightEnabled` |
+| `["retain", x, z, on]` | nothing: `retainData` |
+| `["propagate", x, z]` | nothing: `propagateLightSources`, as the `LIGHT` status does for a chunk not lit yet |
+| `["check", x, y, z]` | nothing: `checkBlock`, `y` up to 16 past the dimension each way |
+| `["queue", sky, x, y, z, kind, v]` | nothing: `queueSectionData` for the sky's layer if `sky` is 1 or the block's, `kind` 0 for `null`, 1 for `new DataLayer(v)`, `v` from 0 to 15, or 2 for 2048 bytes, each a draw from seed `v` as a byte |
+| `["run"]` | `runLightUpdates`, an `int` |
+| `["work"]` | a byte for `hasLightWork` |
+| `["on", x, z]` | a byte for `lightOnInColumn` |
+| `["value", sky, x, y, z]` | the layer listener's `getLightValue`, a byte, `y` up to 64 past the dimension each way |
+| `["layer", sky, x, y, z]` | the layer listener's `getDataLayerData`, as a packet reads it: a byte 0 for `null`, 1 for an empty layer, or 2 and its 2048 bytes |
+| `["light", x, z]` | the chunk's light as `level_chunk_with_light` sends it, `new ClientboundLightUpdatePacketData(pos, engine, null, null)` encoded with its `STREAM_CODEC`: an `int` length and the bytes |
+
+Blobs, a `min_y`, `sections` or `sky` it doesn't take, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, an argument that isn't an `int` where one is wanted or is out of its range, a seed that isn't a decimal `long`, a state that isn't one, an empty list of states, and a block in a chunk that isn't there are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.
