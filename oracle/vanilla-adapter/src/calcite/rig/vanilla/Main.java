@@ -54,6 +54,7 @@ public final class Main {
                 new EntitiesPoiProbe(),
                 new TicketsProbe(),
                 new LevelsProbe(),
+                new DistanceProbe(),
                 new RegistriesProbe())) {
             probes.put(probe.name(), probe);
         }

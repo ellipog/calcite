@@ -1,0 +1,1093 @@
+/// Which chunks load, which tick, and how near the players are to each, as vanilla's
+/// `DistanceManager` works it out from the tickets and the players, with the chunks' holders kept
+/// as `ChunkMap` keeps them.
+///
+/// Four of `world.levels`' graphs spread levels over the chunks. The loading tracker spreads each
+/// chunk's lowest loading ticket onto the holders, and the simulation tracker each chunk's lowest
+/// simulation ticket. The natural spawn counter spreads the players out 8 chunks, and the player
+/// ticket tracker out 32. A chunk the player ticket tracker brings into the view distance gets a
+/// player loading ticket. Those go through vanilla's throttling dispatcher: nearest first, at most
+/// four chunks at a time, each holding its place until its chunk ticks its entities.
+///
+/// Vanilla's dispatcher runs on a worker thread and hands its tasks to the main thread, so when
+/// each one runs is up to the threads. Calcite queues them instead: the dispatcher's jobs in
+/// vanilla's four priorities, and the main thread's tasks in a line. It runs them when it's told
+/// to, so the same calls give the same tickets every time. Vanilla updates the holders whose level
+/// changed in the order of a set of their identities, which is different every run, and Calcite
+/// updates them in the order their levels changed (D177).
+module world.distance
+
+import world.levels.{ChunkLevels, ChunkTracker, LevelSources}
+import world.pos.{ChunkPos}
+import world.tickets.{Holders, MAX_LEVEL, NO_TICKET, Ticket, TicketListener, TicketStorage, TicketType}
+
+/// The level of a player's loading ticket, that of a chunk whose entities tick,
+/// `PLAYER_TICKET_LEVEL`.
+pub const PLAYER_TICKET_LEVEL: i32 = 31
+/// The farthest a chunk's `x` or `z` can be from 0 for it to have a holder,
+/// `ChunkPyramid.MAX_CHUNK_COORDINATE_VALUE`.
+pub const MAX_CHUNK_COORDINATE: i32 = 2097061
+/// How far the natural spawn counter reaches from a player, in chunks.
+pub const SPAWN_DISTANCE: i32 = 8
+// How far the player ticket tracker reaches.
+const PLAYER_DISTANCE: i32 = 32
+// The chunks a square inside the natural spawn circle reaches,
+// `NaturalSpawner.INSCRIBED_SQUARE_SPAWN_DISTANCE_CHUNK`: 8 over the square root of 2, rounded
+// down.
+const SURE_SPAWN_DISTANCE: i32 = 5
+// The level from which the simulation tracker keeps no level, a full chunk's.
+const NOT_SIMULATED: i32 = 33
+// How many chunks' tasks the dispatcher lets the main thread have at once.
+const MAX_IN_EXECUTION: usize = 4
+// The levels of the dispatcher's task queue, `ChunkTaskPriorityQueue.PRIORITY_LEVEL_COUNT`.
+const QUEUE_LEVELS: i32 = 46
+
+/// Where a holder's chunk is in ticking its entities, as its `getEntityTickingChunkFuture` is.
+pub enum Ticking: u8 {
+    /// Not wanted: the chunk's level is too high for its entities to tick. Vanilla's future is
+    /// the one that's done with no chunk.
+    Unloaded
+    /// Wanted, and waited for: vanilla's future isn't done.
+    Waiting
+    /// Ticking its entities: the future's done with the chunk.
+    Ready
+}
+
+/// A chunk's holder, as far as its levels go. CAL-65 gives it its chunk.
+pub struct Holder {
+    /// A number no other holder has, so a holder that's come back can be told from one made
+    /// since, as vanilla tells them apart by identity.
+    pub serial: i64
+    /// The chunk's level from its tickets, `getTicketLevel`.
+    pub ticket_level: i32
+    /// The level the holder last updated what it loads for, `oldTicketLevel`.
+    pub old_ticket_level: i32 = NO_TICKET
+    /// Where its chunk is in ticking its entities.
+    pub ticking: Ticking = Ticking.Unloaded
+    /// How many of the dispatcher's releases wait for that, each a `thenAccept` on the future.
+    pub waiting: i32 = 0
+}
+
+// An unload queued for a holder dropped, as `scheduleUnload` queues one.
+struct Unload {
+    chunk: i64
+    serial: i64
+}
+
+/// The chunks' holders, as vanilla's `ChunkMap` keeps them: those in use, in the order they were
+/// made, those dropped and waiting to unload, and the chunks whose level has gone past loaded,
+/// which drop when the unloads are next processed. The loading tracker's levels are theirs.
+pub struct ChunkHolders {
+    updating: LinkedMap<i64, Holder> = LinkedMap<i64, Holder>()
+    pending_unloads: LinkedMap<i64, Holder> = LinkedMap<i64, Holder>()
+    to_drop: OpenHashSet<i64> = OpenHashSet<i64>()
+    unloads: Deque<Unload> = Deque<Unload>()
+    // The chunks whose holders' levels changed, to update after the loading tracker's run,
+    // `chunksToUpdateFutures`, in the order they changed (D177).
+    changed: LinkedSet<i64> = LinkedSet<i64>()
+    // Whether a holder's come or gone since the holders were last promoted, `modified`.
+    modified: bool = false
+    serials: i64 = 0
+}
+
+impl ChunkHolders {
+    /// The holder at `chunk`, if there's one in use, as `getUpdatingChunkIfPresent` finds it.
+    pub fn holder(self, chunk: i64) -> Holder? {
+        if self.updating.contains(chunk) {
+            return some(self.updating[chunk])
+        }
+        return none
+    }
+
+    /// The holder at `chunk` waiting to unload, if there's one.
+    pub fn unloading(self, chunk: i64) -> Holder? {
+        if self.pending_unloads.contains(chunk) {
+            return some(self.pending_unloads[chunk])
+        }
+        return none
+    }
+
+    /// The chunks with holders in use, in the order the holders were made or came back.
+    pub fn chunks(self) -> List<i64> {
+        var out = List<i64>()
+        for (k, _) in self.updating {
+            out.push(k)
+        }
+        return out
+    }
+
+    /// The chunks whose holders wait to unload, in the order they were dropped.
+    pub fn unloading_chunks(self) -> List<i64> {
+        var out = List<i64>()
+        for (k, _) in self.pending_unloads {
+            out.push(k)
+        }
+        return out
+    }
+
+    /// The chunks whose holders drop when the unloads are next processed, in their set's order.
+    pub fn dropping_chunks(self) -> List<i64> {
+        var out = List<i64>()
+        for k in self.to_drop {
+            out.push(k)
+        }
+        return out
+    }
+
+    /// How many unloads are queued.
+    pub fn unloads_queued(self) -> usize {
+        return self.unloads.len()
+    }
+
+    /// Whether a holder's come or gone since the last `promote`.
+    pub fn is_modified(self) -> bool {
+        return self.modified
+    }
+
+    /// Moves each holder whose chunk dropped to those waiting to unload, as `processUnloads`
+    /// starts, in the order vanilla's loop over `toDrop` gets to them, and queues its unload. The
+    /// chunks moved, in that order.
+    pub fn drop_unloaded(mut self) -> List<i64> {
+        var keys = List<i64>()
+        var marks = List<bool>()
+        for k in self.to_drop {
+            keys.push(k)
+            marks.push(true)
+        }
+        var moved = List<i64>()
+        for i in self.to_drop.remove_marked(marks) {
+            let chunk = keys[i]
+            if let holder = self.updating.remove(chunk) {
+                let serial = holder.serial
+                self.pending_unloads.insert(chunk, holder)
+                self.modified = true
+                self.unloads.push_last(Unload { chunk: chunk, serial: serial })
+                moved.push(chunk)
+            }
+        }
+        return moved
+    }
+
+    /// Runs the next unload queued, as the unload queue's task does: its holder goes if it's still
+    /// waiting, and stays if it's been taken back since. `false` if none is queued.
+    pub fn unload_next(mut self) -> bool {
+        let next = self.unloads.pop_first() else return false
+        if self.pending_unloads.contains(next.chunk) and self.pending_unloads[next.chunk].serial == next.serial {
+            _ = self.pending_unloads.remove(next.chunk)
+        }
+        return true
+    }
+
+    /// Clears `modified`, as `promoteChunkMap` does when it copies the holders in use to those
+    /// seen, and whether it was set.
+    pub fn promote(mut self) -> bool {
+        if not self.modified {
+            return false
+        }
+        self.modified = false
+        return true
+    }
+
+    // `updateChunkScheduling`: the holder at `chunk` gets `level`, from `old`. A holder's made, or
+    // taken back from those waiting to unload, for a chunk that comes to be loaded, and a chunk
+    // that's no longer loaded is to drop. Whether the chunk has a holder in use after.
+    fn schedule(mut self, chunk: i64, level: i32, old: i32) -> bool {
+        let had = self.updating.contains(chunk)
+        if not loaded(old) and not loaded(level) {
+            return had
+        }
+        if had {
+            self.updating[chunk].ticket_level = level
+            if loaded(level) {
+                self.to_drop.remove(chunk)
+            } else {
+                self.to_drop.insert(chunk)
+            }
+            return true
+        }
+        if not loaded(level) {
+            return false
+        }
+        if let back = self.pending_unloads.remove(chunk) {
+            var holder = back
+            holder.ticket_level = level
+            self.updating.insert(chunk, holder)
+        } else {
+            let x = i32.wrap(chunk)
+            let z = i32.wrap(chunk >> 32)
+            if java_abs(x) > MAX_CHUNK_COORDINATE or java_abs(z) > MAX_CHUNK_COORDINATE {
+                panic("Trying to create chunk out of reasonable bounds: [{x}, {z}]")
+            }
+            self.serials += 1
+            self.updating.insert(chunk, Holder { serial: self.serials, ticket_level: level })
+        }
+        self.modified = true
+        return true
+    }
+
+    // `updateFutures`, as far as the entity-ticking chunk goes: a holder that comes to tick its
+    // entities waits for its chunk, and one that stops lets go of what waited for it, each a
+    // release queued on the main thread. CAL-65 does the rest, and moves the holder in the
+    // worldgen and light queues.
+    fn update_futures(mut self, chunk: i64, main: mut Deque<MainTask>) {
+        let was = self.updating[chunk].old_ticket_level <= PLAYER_TICKET_LEVEL
+        let is = self.updating[chunk].ticket_level <= PLAYER_TICKET_LEVEL
+        if not was and is {
+            if self.updating[chunk].ticking != Ticking.Unloaded {
+                panic("IllegalStateException: a holder came to tick its entities while its chunk did")
+            }
+            self.updating[chunk].ticking = Ticking.Waiting
+        }
+        if was and not is {
+            for _ in 0..self.updating[chunk].waiting {
+                main.push_last(MainTask.Release(chunk))
+            }
+            self.updating[chunk].waiting = 0
+            self.updating[chunk].ticking = Ticking.Unloaded
+        }
+        self.updating[chunk].old_ticket_level = self.updating[chunk].ticket_level
+    }
+}
+
+impl ChunkLevels for ChunkHolders {
+    // `LoadingChunkTracker.getLevel`: a chunk that's to drop has none.
+    fn level(self, chunk: i64) -> i32 {
+        if not self.to_drop.contains(chunk) and self.updating.contains(chunk) {
+            return self.updating[chunk].ticket_level
+        }
+        return NO_TICKET
+    }
+
+    // `LoadingChunkTracker.setLevel`, which compares with the holder's level even if it's to drop.
+    fn set_level(mut self, chunk: i64, level: i32) {
+        let old = if self.updating.contains(chunk) { self.updating[chunk].ticket_level } else { NO_TICKET }
+        if old != level and self.schedule(chunk, level, old) {
+            self.changed.insert(chunk)
+        }
+    }
+}
+
+impl LevelSources<TicketStorage> for ChunkHolders {
+    fn source_level(self, sources: TicketStorage, chunk: i64) -> i32 {
+        return sources.level_at(chunk, false)
+    }
+}
+
+// The simulation tracker's levels: a fastutil table with no chunk at 33 or above.
+struct Simulated {
+    chunks: OpenHashMap<i64, i32> = OpenHashMap<i64, i32>()
+}
+
+impl ChunkLevels for Simulated {
+    fn level(self, chunk: i64) -> i32 {
+        return self.chunks.get(chunk) ?? NOT_SIMULATED
+    }
+
+    fn set_level(mut self, chunk: i64, level: i32) {
+        if level >= NOT_SIMULATED {
+            _ = self.chunks.remove(chunk)
+        } else {
+            self.chunks.insert(chunk, level)
+        }
+    }
+}
+
+impl LevelSources<TicketStorage> for Simulated {
+    fn source_level(self, sources: TicketStorage, chunk: i64) -> i32 {
+        return sources.level_at(chunk, true)
+    }
+}
+
+// What the tickets tell of: the loading tracker, over the holders, and the simulation tracker.
+struct Trackers {
+    loading_tracker: ChunkTracker
+    holders: ChunkHolders
+    simulation_tracker: ChunkTracker
+    simulated: Simulated
+}
+
+impl TicketListener for Trackers {
+    fn loading(mut self, chunk: i64, level: i32, only_decreased: bool) {
+        self.loading_tracker.update(chunk, level, only_decreased, self.holders)
+    }
+
+    fn simulation(mut self, chunk: i64, level: i32, only_decreased: bool) {
+        self.simulation_tracker.update(chunk, level, only_decreased, self.simulated)
+    }
+}
+
+// The players in each chunk, by their ids, `playersPerChunk`.
+struct Players {
+    at: Map<i64, Set<i32>> = Map<i64, Set<i32>>()
+}
+
+// A `FixedPlayerDistanceChunkTracker`'s levels: a fastutil table with no chunk past
+// `max_distance`, each a player's distance. The player ticket tracker's notes each chunk whose
+// level it sets, its `toUpdate`.
+struct PlayerLevels {
+    chunks: OpenHashMap<i64, i32> = OpenHashMap<i64, i32>()
+    max_distance: i32
+    notes: bool
+    changed: OpenHashSet<i64> = OpenHashSet<i64>()
+}
+
+impl ChunkLevels for PlayerLevels {
+    fn level(self, chunk: i64) -> i32 {
+        return self.chunks.get(chunk) ?? (self.max_distance + 2)
+    }
+
+    fn set_level(mut self, chunk: i64, level: i32) {
+        if level > self.max_distance {
+            _ = self.chunks.remove(chunk)
+        } else {
+            self.chunks.insert(chunk, level)
+        }
+        if self.notes {
+            self.changed.insert(chunk)
+        }
+    }
+}
+
+impl LevelSources<Players> for PlayerLevels {
+    fn source_level(self, sources: Players, chunk: i64) -> i32 {
+        if sources.at.contains(chunk) and not sources.at[chunk].is_empty() {
+            return 0
+        }
+        return i32.MAX
+    }
+}
+
+// A job for the dispatcher, which runs one at a time, lowest priority first and in the order
+// they came within one: `onLevelChange`'s at 0, `release`'s at 1, `submit`'s at 2 and
+// `pollTask`'s at 3.
+enum Job {
+    // The chunk's level changed: its tasks move to the new level's queue.
+    Resort { chunk: i64, level: i32 }
+    // The chunk's let go: its tasks are taken out if `clear`, and if `remove_ticket` its player
+    // ticket is taken out after, on the main thread.
+    Release { chunk: i64, clear: bool, remove_ticket: bool }
+    // A task for the chunk, at the level it was seen at: a check, on the main thread, for its
+    // player ticket.
+    Submit { chunk: i64, level: i32 }
+    // The next chunk's tasks go to the main thread, if fewer than four chunks have theirs there.
+    Poll
+}
+
+// A task for the main thread, which runs them in the order they came.
+enum MainTask {
+    // One of the chunk's tasks, handed over by the dispatcher: it queues the check, and the last
+    // of the chunk's has the dispatcher poll again.
+    Hand { chunk: i64, last: bool }
+    // Adds the chunk's player ticket if it's still in view, and lets the dispatcher go on if not.
+    Check(i64)
+    // Takes out the chunk's player ticket.
+    RemoveTicket(i64)
+    // Lets the dispatcher go on, once the chunk ticks its entities.
+    Release(i64)
+}
+
+// The dispatcher's tasks, as `ChunkTaskPriorityQueue` keeps them: each chunk's at one of 46
+// levels, each level's chunks in the order they came, and each chunk's tasks counted, since
+// they're all the same check.
+struct TaskQueue {
+    levels: List<LinkedMap<i64, i32>>
+    top: i32 = QUEUE_LEVELS
+}
+
+impl TaskQueue {
+    fn new() -> TaskQueue {
+        var levels = List<LinkedMap<i64, i32>>()
+        for _ in 0..QUEUE_LEVELS {
+            levels.push(LinkedMap<i64, i32>())
+        }
+        return TaskQueue { levels: levels }
+    }
+
+    fn has_work(self) -> bool {
+        return self.top < QUEUE_LEVELS
+    }
+
+    fn skip_empty(mut self) {
+        while self.top < QUEUE_LEVELS and self.levels[usize.wrap(self.top)].is_empty() {
+            self.top += 1
+        }
+    }
+
+    // `resortChunkTasks`: the chunk's tasks at `old` move to `new`, after any already there.
+    fn resort(mut self, old: i32, chunk: i64, new: i32) {
+        if old >= QUEUE_LEVELS {
+            return
+        }
+        let tasks = self.levels[usize.wrap(old)].remove(chunk) ?? 0
+        if old == self.top {
+            self.skip_empty()
+        }
+        if tasks > 0 {
+            self.add(chunk, new, tasks)
+        }
+    }
+
+    fn add(mut self, chunk: i64, level: i32, tasks: i32) {
+        let at = usize.wrap(level)
+        if self.levels[at].contains(chunk) {
+            self.levels[at][chunk] += tasks
+        } else {
+            self.levels[at].insert(chunk, tasks)
+        }
+        if level < self.top {
+            self.top = level
+        }
+    }
+
+    // `release`: the chunk's tasks are taken out at every level if `clear`.
+    fn release(mut self, chunk: i64, clear: bool) {
+        if clear {
+            for i in 0..self.levels.len() {
+                _ = self.levels[i].remove(chunk)
+            }
+        }
+        self.skip_empty()
+    }
+
+    // `pop`: the first chunk at the lowest level, with how many tasks it has.
+    fn pop(mut self) -> (i64, i32)? {
+        if not self.has_work() {
+            return none
+        }
+        let first = self.levels[usize.wrap(self.top)].pop_first() else panic("NoSuchElementException: the dispatcher's lowest level has no tasks")
+        self.skip_empty()
+        return some(first)
+    }
+}
+
+// Vanilla's `ThrottlingChunkTaskDispatcher` for player tickets, with its jobs queued in its
+// priorities rather than on a worker thread.
+struct Dispatcher {
+    jobs: List<Deque<Job>>
+    queue: TaskQueue
+    in_execution: OpenHashSet<i64> = OpenHashSet<i64>()
+    sleeping: bool = true
+}
+
+impl Dispatcher {
+    fn new() -> Dispatcher {
+        var jobs = List<Deque<Job>>()
+        for _ in 0..4 {
+            jobs.push(Deque<Job>())
+        }
+        return Dispatcher { jobs: jobs, queue: TaskQueue.new() }
+    }
+
+    fn schedule(mut self, job: Job) {
+        let priority: usize = match job {
+            Job.Resort { .. } => 0,
+            Job.Release { .. } => 1,
+            Job.Submit { .. } => 2,
+            Job.Poll => 3,
+        }
+        self.jobs[priority].push_last(job)
+    }
+
+    fn has_jobs(self) -> bool {
+        for q in self.jobs {
+            if not q.is_empty() {
+                return true
+            }
+        }
+        return false
+    }
+
+    fn next_job(mut self) -> Job? {
+        for i in 0..self.jobs.len() {
+            if let job = self.jobs[i].pop_first() {
+                return some(job)
+            }
+        }
+        return none
+    }
+
+    // Wakes the dispatcher to poll, if it's asleep.
+    fn wake(mut self) {
+        if self.sleeping {
+            self.sleeping = false
+            self.schedule(Job.Poll)
+        }
+    }
+}
+
+/// Whether there are players near a chunk for mobs to spawn, as `hasPlayersNearby` gives it.
+pub enum Nearby: u8 {
+    /// A player's within the square inside the spawn circle.
+    Yes
+    /// A player's near enough that their distance must be checked, vanilla's `DEFAULT`.
+    Check
+    /// No player's within 8 chunks.
+    No
+}
+
+/// A dimension's tickets and the chunk levels they and its players give, vanilla's
+/// `DistanceManager` with the chunk holders' part of its `ChunkMap`.
+pub struct DistanceManager {
+    /// The dimension's tickets. Change them through the manager, so the trackers are told.
+    pub tickets: TicketStorage
+    trackers: Trackers
+    players: Players
+    spawn: ChunkTracker
+    spawn_levels: PlayerLevels
+    player: ChunkTracker
+    player_levels: PlayerLevels
+    view_range: i32 = 0
+    // The level each chunk's player tickets are queued at, `queueLevels`, as the dispatcher's
+    // `Resort` jobs set them.
+    queue_levels: OpenHashMap<i64, i32> = OpenHashMap<i64, i32>()
+    dispatcher: Dispatcher
+    // The chunks given player tickets since the last update, `ticketsToRelease`.
+    to_release: OpenHashSet<i64> = OpenHashSet<i64>()
+    main: Deque<MainTask> = Deque<MainTask>()
+    simulation_range: i32 = 10
+}
+
+impl DistanceManager {
+    /// A manager for `tickets`, with no players, a view distance of 0 and a simulation distance
+    /// of 10, as vanilla's starts before the chunk map sets them.
+    pub fn new(tickets: own TicketStorage) -> DistanceManager {
+        let trackers = Trackers { loading_tracker: ChunkTracker.new(MAX_LEVEL + 2), holders: ChunkHolders {}, simulation_tracker: ChunkTracker.new(NOT_SIMULATED + 1), simulated: Simulated {} }
+        return DistanceManager {
+            tickets: tickets,
+            trackers: trackers,
+            players: Players {},
+            spawn: ChunkTracker.new(SPAWN_DISTANCE + 2),
+            spawn_levels: PlayerLevels { max_distance: SPAWN_DISTANCE, notes: false },
+            player: ChunkTracker.new(PLAYER_DISTANCE + 2),
+            player_levels: PlayerLevels { max_distance: PLAYER_DISTANCE, notes: true },
+            dispatcher: Dispatcher.new(),
+        }
+    }
+
+    /// The holder at `chunk`, if there's one in use, as `getUpdatingChunkIfPresent` finds it.
+    pub fn holder(self, chunk: i64) -> Holder? {
+        return self.trackers.holders.holder(chunk)
+    }
+
+    /// The holder at `chunk` waiting to unload, if there's one.
+    pub fn unloading(self, chunk: i64) -> Holder? {
+        return self.trackers.holders.unloading(chunk)
+    }
+
+    /// The chunks with holders in use, in the order the holders were made or came back.
+    pub fn holder_chunks(self) -> List<i64> {
+        return self.trackers.holders.chunks()
+    }
+
+    /// The chunks whose holders wait to unload, in the order they were dropped.
+    pub fn unloading_chunks(self) -> List<i64> {
+        return self.trackers.holders.unloading_chunks()
+    }
+
+    /// The chunks whose holders drop when the unloads are next processed, in their set's order.
+    pub fn dropping_chunks(self) -> List<i64> {
+        return self.trackers.holders.dropping_chunks()
+    }
+
+    /// How many unloads are queued.
+    pub fn unloads_queued(self) -> usize {
+        return self.trackers.holders.unloads_queued()
+    }
+
+    /// Whether a holder's come or gone since the last `promote`.
+    pub fn holders_modified(self) -> bool {
+        return self.trackers.holders.is_modified()
+    }
+
+    /// Moves each holder whose chunk dropped to those waiting to unload, and queues its unload,
+    /// as `processUnloads` starts. The chunks moved, in the order vanilla's loop gets to them.
+    pub fn drop_unloaded(mut self) -> List<i64> {
+        return self.trackers.holders.drop_unloaded()
+    }
+
+    /// Runs the next unload queued, and whether there was one. The server runs as many as it has
+    /// time for, and all but 2000 of them if there are more, as `processUnloads` does.
+    pub fn unload_next(mut self) -> bool {
+        return self.trackers.holders.unload_next()
+    }
+
+    /// Clears the holders' `modified`, as `promoteChunkMap` does, and whether it was set.
+    pub fn promote(mut self) -> bool {
+        return self.trackers.holders.promote()
+    }
+
+    /// Adds `ticket` at `chunk`, as `TicketStorage.addTicket` does, telling the trackers.
+    pub fn add_ticket(mut self, chunk: i64, ticket: Ticket) -> bool {
+        return self.tickets.add(chunk, ticket, mut self.trackers)
+    }
+
+    /// Takes a ticket like `ticket` out at `chunk`, as `TicketStorage.removeTicket` does,
+    /// telling the trackers.
+    pub fn remove_ticket(mut self, chunk: i64, ticket: Ticket) -> bool {
+        return self.tickets.remove(chunk, ticket, mut self.trackers)
+    }
+
+    /// Forces `pos` or stops forcing it, as `updateChunkForced` does.
+    pub fn update_forced(mut self, pos: ChunkPos, forced: bool) -> bool {
+        return self.tickets.update_forced(pos, forced, mut self.trackers)
+    }
+
+    /// Runs the tickets down a tick, as `purgeStaleTickets` does.
+    pub fn purge_stale<H: Holders>(mut self, holders: H) {
+        self.tickets.purge_stale(holders, mut self.trackers)
+    }
+
+    /// Runs every tracker's updates, as `runAllUpdates` does: the natural spawn counter's, the
+    /// simulation tracker's, the player ticket tracker's, which queues the dispatcher's jobs for
+    /// the chunks it moved, and the loading tracker's, which sets the holders' levels. If any
+    /// holder's level changed, each is updated and it's `true`. If not, each chunk given a player
+    /// ticket since has the dispatcher let it go once it ticks its entities, and it's whether the
+    /// loading tracker set any level.
+    pub fn run_all_updates(mut self) -> bool {
+        _ = self.spawn.run_updates(i32.MAX, mut self.spawn_levels, self.players)
+        _ = self.trackers.simulation_tracker.run_updates(i32.MAX, mut self.trackers.simulated, self.tickets)
+        self.run_player_updates()
+        let updated = self.trackers.loading_tracker.run_updates(i32.MAX, mut self.trackers.holders, self.tickets) != i32.MAX
+        if not self.trackers.holders.changed.is_empty() {
+            // CAL-65: `updateHighestAllowedStatus` for each first.
+            while let chunk = self.trackers.holders.changed.pop_first() {
+                self.trackers.holders.update_futures(chunk, mut self.main)
+            }
+            return true
+        }
+        if not self.to_release.is_empty() {
+            var chunks = List<i64>()
+            for k in self.to_release {
+                chunks.push(k)
+            }
+            for chunk in chunks {
+                if not self.has_player_ticket(chunk) {
+                    continue
+                }
+                if not self.trackers.holders.updating.contains(chunk) {
+                    panic("IllegalStateException: a chunk with a player ticket has no holder")
+                }
+                if self.trackers.holders.updating[chunk].ticking == Ticking.Waiting {
+                    self.trackers.holders.updating[chunk].waiting += 1
+                } else {
+                    self.main.push_last(MainTask.Release(chunk))
+                }
+            }
+            self.to_release.clear()
+        }
+        return updated
+    }
+
+    /// Adds `player` in `chunk`, as `addPlayer` does: the trackers are told, and the chunk gets a
+    /// player simulation ticket, at 31 less the simulation distance.
+    pub fn add_player(mut self, chunk: i64, player: i32) {
+        if not self.players.at.contains(chunk) {
+            self.players.at.insert(chunk, Set<i32>())
+        }
+        self.players.at[chunk].insert(player)
+        self.spawn.update(chunk, 0, true, self.spawn_levels)
+        self.player.update(chunk, 0, true, self.player_levels)
+        let level = self.player_ticket_level()
+        _ = self.add_ticket(chunk, Ticket.new(TicketType.PlayerSimulation, level))
+    }
+
+    /// Takes `player` out of `chunk`, as `removePlayer` does: if it was the chunk's last, the
+    /// trackers are told, and its player simulation ticket goes. Vanilla fails if the chunk never
+    /// had a player, and so does this.
+    pub fn remove_player(mut self, chunk: i64, player: i32) {
+        if not self.players.at.contains(chunk) {
+            panic("NullPointerException: no player was added in the chunk a player is taken out of")
+        }
+        self.players.at[chunk].remove(player)
+        if self.players.at[chunk].is_empty() {
+            _ = self.players.at.remove(chunk)
+            self.spawn.update(chunk, i32.MAX, false, self.spawn_levels)
+            self.player.update(chunk, i32.MAX, false, self.player_levels)
+            let level = self.player_ticket_level()
+            _ = self.remove_ticket(chunk, Ticket.new(TicketType.PlayerSimulation, level))
+        }
+    }
+
+    /// Sets the view distance the player tickets reach, as `updatePlayerTickets` does: each chunk
+    /// the player ticket tracker has comes into view or goes out of it, in its table's order.
+    /// The chunk map gives it the server's view distance, from 2 to 32, plus 1.
+    pub fn update_player_tickets(mut self, view_distance: i32) {
+        var chunks = List<i64>()
+        var levels = List<i32>()
+        for (k, level) in self.player_levels.chunks {
+            chunks.push(k)
+            levels.push(level)
+        }
+        let old = self.view_range
+        for i in 0..chunks.len() {
+            self.on_level_change(chunks[i], levels[i], levels[i] <= old, levels[i] <= view_distance)
+        }
+        self.view_range = view_distance
+    }
+
+    /// Sets the simulation distance, as `updateSimulationDistance` does: every player simulation
+    /// ticket moves to 31 less it.
+    pub fn update_simulation_distance(mut self, distance: i32) {
+        if distance != self.simulation_range {
+            self.simulation_range = distance
+            let level = self.player_ticket_level()
+            self.tickets.replace_level_of_type(level, TicketType.PlayerSimulation, mut self.trackers)
+        }
+    }
+
+    /// The view distance the player tickets reach.
+    pub fn view_distance(self) -> i32 {
+        return self.view_range
+    }
+
+    /// The simulation distance.
+    pub fn simulation_distance(self) -> i32 {
+        return self.simulation_range
+    }
+
+    /// Whether `chunk`'s entities are in range to tick, `inEntityTickingRange`.
+    pub fn in_entity_ticking_range(self, chunk: i64) -> bool {
+        return self.trackers.simulated.level(chunk) <= PLAYER_TICKET_LEVEL
+    }
+
+    /// Whether `chunk`'s blocks are in range to tick, `inBlockTickingRange`.
+    pub fn in_block_ticking_range(self, chunk: i64) -> bool {
+        return self.trackers.simulated.level(chunk) <= PLAYER_TICKET_LEVEL + 1
+    }
+
+    /// `chunk`'s level from the simulation tracker, if `simulation`, or from the loading tracker,
+    /// `getChunkLevel`.
+    pub fn chunk_level(self, chunk: i64, simulation: bool) -> i32 {
+        if simulation {
+            return self.trackers.simulated.level(chunk)
+        }
+        return self.trackers.holders.level(chunk)
+    }
+
+    /// How many chunks are within 8 of a player, after the natural spawn counter's updates,
+    /// `getNaturalSpawnChunkCount`.
+    pub fn natural_spawn_chunk_count(mut self) -> usize {
+        _ = self.spawn.run_updates(i32.MAX, mut self.spawn_levels, self.players)
+        return self.spawn_levels.chunks.len()
+    }
+
+    /// Whether players are near `chunk` for mobs to spawn, after the natural spawn counter's
+    /// updates, `hasPlayersNearby`.
+    pub fn players_nearby(mut self, chunk: i64) -> Nearby {
+        _ = self.spawn.run_updates(i32.MAX, mut self.spawn_levels, self.players)
+        let distance = self.spawn_levels.level(chunk)
+        if distance <= SURE_SPAWN_DISTANCE {
+            return Nearby.Yes
+        }
+        if distance > SPAWN_DISTANCE {
+            return Nearby.No
+        }
+        return Nearby.Check
+    }
+
+    /// The chunks whose entities tick, in the simulation tracker's table's order, as
+    /// `forEachEntityTickingChunk` goes over them.
+    pub fn entity_ticking_chunks(self) -> List<i64> {
+        var out = List<i64>()
+        for (k, level) in self.trackers.simulated.chunks {
+            if level <= PLAYER_TICKET_LEVEL {
+                out.push(k)
+            }
+        }
+        return out
+    }
+
+    /// The chunks within 8 of a player, after the natural spawn counter's updates, in its table's
+    /// order, `getSpawnCandidateChunks`.
+    pub fn spawn_candidate_chunks(mut self) -> List<i64> {
+        _ = self.spawn.run_updates(i32.MAX, mut self.spawn_levels, self.players)
+        var out = List<i64>()
+        for (k, _) in self.spawn_levels.chunks {
+            out.push(k)
+        }
+        return out
+    }
+
+    /// Whether any chunk has a ticket in use, `hasTickets`.
+    pub fn has_tickets(self) -> bool {
+        return self.tickets.has_tickets()
+    }
+
+    /// The dispatcher's state as `getDebugStatus` gives it: the chunks whose tasks the main
+    /// thread has, and whether it's asleep.
+    pub fn debug_status(self) -> String {
+        // Vanilla lists the chunks through a stream, whose spliterator goes over fastutil's table
+        // from the front, where its iterator goes from the back: chunk 0, 0, the table's null key,
+        // first either way, then the rest the other way round.
+        var rest = List<i64>()
+        var zero = false
+        for k in self.dispatcher.in_execution {
+            if k == 0 {
+                zero = true
+            } else {
+                rest.push(k)
+            }
+        }
+        var s = String("player ticket throttler=[")
+        if zero {
+            s.push_str("0:[0, 0]")
+        }
+        var i = rest.len()
+        while i > 0 {
+            i -= 1
+            let k = rest[i]
+            if zero or i + 1 < rest.len() {
+                s.push_str(",")
+            }
+            s.push_str("{k}:[{i32.wrap(k)}, {i32.wrap(k >> 32)}]")
+        }
+        s.push_str("], s={self.dispatcher.sleeping}")
+        return s
+    }
+
+    /// Whether the dispatcher has a job or a task queued, `hasWork`.
+    pub fn dispatcher_has_work(self) -> bool {
+        return self.dispatcher.has_jobs() or self.dispatcher.queue.has_work()
+    }
+
+    /// How many tasks wait for the main thread.
+    pub fn main_tasks(self) -> usize {
+        return self.main.len()
+    }
+
+    /// The chunks given player tickets since the last update, in their set's order,
+    /// `ticketsToRelease`.
+    pub fn releasing_chunks(self) -> List<i64> {
+        var out = List<i64>()
+        for k in self.to_release {
+            out.push(k)
+        }
+        return out
+    }
+
+    /// Whether the dispatcher's asleep, waiting for a task or a release to wake it.
+    pub fn dispatcher_sleeping(self) -> bool {
+        return self.dispatcher.sleeping
+    }
+
+    /// The chunks whose tasks the main thread has, in their set's order.
+    pub fn executing_chunks(self) -> List<i64> {
+        var out = List<i64>()
+        for k in self.dispatcher.in_execution {
+            out.push(k)
+        }
+        return out
+    }
+
+    /// The lowest level of the dispatcher's task queue with tasks, or 46 if none has.
+    pub fn task_queue_top(self) -> i32 {
+        return self.dispatcher.queue.top
+    }
+
+    /// The chunks with tasks at `level` of the dispatcher's task queue, in the order they came,
+    /// with how many each has.
+    pub fn queued_tasks(self, level: i32) -> List<(i64, i32)> {
+        var out = List<(i64, i32)>()
+        for (k, tasks) in self.dispatcher.queue.levels[usize.wrap(level)] {
+            out.push((k, tasks))
+        }
+        return out
+    }
+
+    /// How many of the dispatcher's jobs wait at each of its four priorities.
+    pub fn queued_jobs(self) -> List<usize> {
+        var out = List<usize>()
+        for q in self.dispatcher.jobs {
+            out.push(q.len())
+        }
+        return out
+    }
+
+    /// The simulation tracker's levels, in its table's order: none is 33 or above.
+    pub fn simulation_levels(self) -> List<(i64, i32)> {
+        return pairs(self.trackers.simulated.chunks)
+    }
+
+    /// The natural spawn counter's distances, in its table's order: none is past 8.
+    pub fn spawn_distances(self) -> List<(i64, i32)> {
+        return pairs(self.spawn_levels.chunks)
+    }
+
+    /// The player ticket tracker's distances, in its table's order: none is past 32.
+    pub fn player_distances(self) -> List<(i64, i32)> {
+        return pairs(self.player_levels.chunks)
+    }
+
+    /// The level each chunk's player tickets are queued at, in its table's order, `queueLevels`.
+    pub fn queued_levels(self) -> List<(i64, i32)> {
+        return pairs(self.queue_levels)
+    }
+
+    /// Runs the dispatcher's next job, as its worker does, and whether there was one.
+    pub fn run_dispatcher(mut self) -> bool {
+        let job = self.dispatcher.next_job() else return false
+        match job {
+            Job.Resort { chunk, level } => {
+                let old = self.queue_levels.get(chunk) ?? (PLAYER_DISTANCE + 2)
+                self.dispatcher.queue.resort(old, chunk, level)
+                if level >= PLAYER_DISTANCE + 2 {
+                    _ = self.queue_levels.remove(chunk)
+                } else {
+                    self.queue_levels.insert(chunk, level)
+                }
+            },
+            Job.Release { chunk, clear, remove_ticket } => {
+                self.dispatcher.queue.release(chunk, clear)
+                self.dispatcher.in_execution.remove(chunk)
+                self.dispatcher.wake()
+                if remove_ticket {
+                    self.main.push_last(MainTask.RemoveTicket(chunk))
+                }
+            },
+            Job.Submit { chunk, level } => {
+                self.dispatcher.queue.add(chunk, level, 1)
+                self.dispatcher.wake()
+            },
+            Job.Poll => {
+                if self.dispatcher.in_execution.len() >= MAX_IN_EXECUTION {
+                    self.dispatcher.sleeping = true
+                } else if let popped = self.dispatcher.queue.pop() {
+                    let (chunk, tasks) = popped
+                    self.dispatcher.in_execution.insert(chunk)
+                    for i in 0..tasks {
+                        self.main.push_last(MainTask.Hand { chunk: chunk, last: i == tasks - 1 })
+                    }
+                } else {
+                    self.dispatcher.sleeping = true
+                }
+            },
+        }
+        return true
+    }
+
+    /// Runs the main thread's next task, and whether there was one.
+    pub fn run_main(mut self) -> bool {
+        let task = self.main.pop_first() else return false
+        match task {
+            MainTask.Hand { chunk, last } => {
+                self.main.push_last(MainTask.Check(chunk))
+                if last {
+                    self.dispatcher.schedule(Job.Poll)
+                }
+            },
+            MainTask.Check(chunk) => {
+                if self.player_levels.level(chunk) <= self.view_range {
+                    _ = self.add_ticket(chunk, Ticket.new(TicketType.PlayerLoading, PLAYER_TICKET_LEVEL))
+                    self.to_release.insert(chunk)
+                } else {
+                    self.dispatcher.schedule(Job.Release { chunk: chunk, clear: false, remove_ticket: false })
+                }
+            },
+            MainTask.RemoveTicket(chunk) => {
+                _ = self.remove_ticket(chunk, Ticket.new(TicketType.PlayerLoading, PLAYER_TICKET_LEVEL))
+            },
+            MainTask.Release(chunk) => {
+                self.dispatcher.schedule(Job.Release { chunk: chunk, clear: false, remove_ticket: false })
+            },
+        }
+        return true
+    }
+
+    /// `chunk`'s holder's chunk now ticks its entities, which lets go of what waited for it.
+    /// Whether the holder, in use or waiting to unload, was waiting for that.
+    pub fn entity_ticking_ready(mut self, chunk: i64) -> bool {
+        if self.trackers.holders.updating.contains(chunk) {
+            return ready(mut self.trackers.holders.updating[chunk], chunk, mut self.main)
+        }
+        if self.trackers.holders.pending_unloads.contains(chunk) {
+            return ready(mut self.trackers.holders.pending_unloads[chunk], chunk, mut self.main)
+        }
+        return false
+    }
+
+    fn player_ticket_level(self) -> i32 {
+        let level = PLAYER_TICKET_LEVEL - self.simulation_range
+        return if level < 0 { 0 } else { level }
+    }
+
+    fn has_player_ticket(self, chunk: i64) -> bool {
+        for t in self.tickets.tickets_at(chunk) {
+            if t.kind == TicketType.PlayerLoading {
+                return true
+            }
+        }
+        return false
+    }
+
+    // `PlayerTicketTracker.runAllUpdates`: the graph's updates, then each chunk whose level
+    // changed has its tasks moved and comes into view or goes out of it, in its set's order.
+    fn run_player_updates(mut self) {
+        _ = self.player.run_updates(i32.MAX, mut self.player_levels, self.players)
+        if self.player_levels.changed.is_empty() {
+            return
+        }
+        var chunks = List<i64>()
+        for k in self.player_levels.changed {
+            chunks.push(k)
+        }
+        self.player_levels.changed.clear()
+        for chunk in chunks {
+            let old = self.queue_levels.get(chunk) ?? (PLAYER_DISTANCE + 2)
+            let level = self.player_levels.level(chunk)
+            if old != level {
+                self.dispatcher.schedule(Job.Resort { chunk: chunk, level: level })
+                let view = self.view_range
+                self.on_level_change(chunk, level, old <= view, level <= view)
+            }
+        }
+    }
+
+    // `PlayerTicketTracker.onLevelChange`: a chunk that comes into view has a task submitted, to
+    // add its ticket, and one that goes out of view is let go, its tasks taken out and its ticket
+    // after.
+    fn on_level_change(mut self, chunk: i64, level: i32, saw: bool, sees: bool) {
+        if saw == sees {
+            return
+        }
+        if sees {
+            self.dispatcher.schedule(Job.Submit { chunk: chunk, level: level })
+        } else {
+            self.dispatcher.schedule(Job.Release { chunk: chunk, clear: true, remove_ticket: true })
+        }
+    }
+}
+
+// The future completing: each release that waited on it is queued on the main thread.
+fn ready(holder: mut Holder, chunk: i64, main: mut Deque<MainTask>) -> bool {
+    if holder.ticking != Ticking.Waiting {
+        return false
+    }
+    for _ in 0..holder.waiting {
+        main.push_last(MainTask.Release(chunk))
+    }
+    holder.waiting = 0
+    holder.ticking = Ticking.Ready
+    return true
+}
+
+// A table's chunks and levels, in its order.
+fn pairs(table: OpenHashMap<i64, i32>) -> List<(i64, i32)> {
+    var out = List<(i64, i32)>()
+    for (k, v) in table {
+        out.push((k, v))
+    }
+    return out
+}
+
+// `ChunkLevel.isLoaded`.
+fn loaded(level: i32) -> bool {
+    return level <= MAX_LEVEL
+}
+
+// Java's `Math.abs`, which leaves the lowest `int` as it is.
+fn java_abs(v: i32) -> i32 {
+    if v < 0 {
+        return i32.wrap(0i64 - i64(v))
+    }
+    return v
+}

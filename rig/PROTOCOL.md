@@ -492,6 +492,43 @@ The result is one blob. As the tracker sets a level, the blob gets a byte 1, the
 
 Blobs, a `level_count` that isn't from 2 to 253, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, a coordinate, level or count that isn't an `int`, and an `only_decreased` that isn't a boolean are an `error` status.
 
+### `distance` (v1)
+
+A dimension's distance manager, vanilla's own `DistanceManager`, with its trackers, its player ticket dispatcher and its `TicketStorage`, and the chunk holders `ChunkMap` keeps for it, through a list of operations.
+
+Input `{"ops": [...]}`, with no blobs. A chunk is its `x` and `z`, each an `int`, packed with `ChunkPos.pack`. A type is a ticket type's name in `minecraft`, without the namespace, such as `"portal"`. A player is an `int` the case names it by; the vanilla adapter makes a `ServerPlayer` without its constructor the first time a case names it, with an entity ID, since a player's hash is its ID.
+
+The manager's two executors are queues the case runs: the dispatcher's worker and the main thread. The worker runs the dispatcher's jobs one at a time, lowest priority first, as its `PriorityConsecutiveExecutor` does, and the main thread runs its tasks in the order they came. The vanilla adapter replaces the manager's `chunksToUpdateFutures`, a set of identities whose order is different every run, with a `LinkedHashSet`, so the holders whose level changed are updated in the order it changed ([D177](../docs/decisions.md)).
+
+The holders are the vanilla adapter's subclass of the manager, with `ChunkMap`'s part: `updatingChunkMap` and `pendingUnloads`, two `Long2ObjectLinkedOpenHashMap`s, `toDrop`, a `LongOpenHashSet`, and `modified`. Its `updateChunkScheduling` is `ChunkMap`'s, and the holders are vanilla's `ChunkHolder` with their futures cut down to the one for the chunk ticking its entities, made when the holder's level reaches 31 and done with no chunk when it leaves, and with no worldgen or light. Each holder dropped has its unload queued at once, as a holder whose saves are done has, and an unload takes its holder out only if it's still the one waiting, as `pendingUnloads.remove(pos, holder)` does. `runAllUpdates` is given a `ChunkMap` made without its constructor whose `updatingChunkMap` is the manager's.
+
+The result is one blob, each operation's result after the last's.
+
+| Operation | Result |
+| --- | --- |
+| `["player", player, x, z]` | nothing: `addPlayer` |
+| `["unplayer", player, x, z]` | nothing: `removePlayer`. Vanilla throws if no player was added in the chunk |
+| `["view", d]` | nothing: `updatePlayerTickets(d)` |
+| `["simulation", d]` | nothing: `updateSimulationDistance(d)` |
+| `["ticket", type, level, x, z]` | a byte, 1 if the storage's `addTicket` added a new `Ticket` of the type and level |
+| `["unticket", type, level, x, z]` | a byte, 1 if `removeTicket` took one out |
+| `["update"]` | a byte for `runAllUpdates` |
+| `["promote"]` | a byte for `modified`, as `promoteChunkMap` reads it, which it then clears |
+| `["dispatch", n]` | an `int`, how many of the worker's next `n` jobs ran |
+| `["main", n]` | an `int`, how many of the main thread's next `n` tasks ran |
+| `["ready", x, z]` | a byte, 1 if the holder at the chunk, in `updatingChunkMap` or else `pendingUnloads`, had its chunk waited for, which then ticks its entities: its future is done |
+| `["ready_first", n]` | an `int`: the same for the holders in `updatingChunkMap`, in its order, until `n` were waited for |
+| `["drop"]` | the start of `processUnloads`: each chunk in `toDrop`, in fastutil's iterator's order, taken out, its holder moved from `updatingChunkMap` to `pendingUnloads` and its unload queued. An `int` count, then each chunk moved as a `long` |
+| `["unload", n]` | an `int`, how many of the next `n` unloads ran |
+| `["nearby", x, z]` | a byte for `hasPlayersNearby`: 0 for `TRUE`, 1 for `DEFAULT`, 2 for `FALSE` |
+| `["spawn_count"]` | `getNaturalSpawnChunkCount`, an `int` |
+| `["brief"]` | the state below, without the trackers' levels |
+| `["dump"]` | the state below |
+
+The state, each table in its order: the holders in `updatingChunkMap`, then those in `pendingUnloads`, each an `int` count, then each holder's chunk as a `long`, its ticket level as an `int`, a byte for its future, 0 if it's the one done with no chunk, 1 if it isn't done and 2 if it is, and its future's dependents as an `int`; `toDrop`, an `int` count and each chunk as a `long`; the unloads queued, an `int`; a byte for `modified`; `ticketsToRelease`, as `toDrop` is; a byte for the dispatcher's `sleeping`; its `chunkPositionsInExecution`, as `toDrop` is; its queue's `topPriorityQueueIndex`, an `int`; each of its queue's 46 levels with tasks, lowest first, as its level as an `int`, an `int` count, then each chunk as a `long` and its tasks as an `int`, and then an `int` -1; the worker's jobs waiting at each of its four priorities, four `int`s; the tickets in use, an `int` count, then each chunk as a `long`, an `int` count and each ticket, its type's ID in its registry as a byte, its level as an `int` and the ticks it has left as a `long`; and `getDebugStatus`, an `int` length and its UTF-8. Then, for `dump`, the levels of the simulation tracker, the natural spawn counter and the player ticket tracker, from their `Long2ByteOpenHashMap`s, and the player ticket tracker's `queueLevels`, each an `int` count, then each chunk as a `long` and its level as an `int`; then the player ticket tracker's view distance and the manager's simulation distance, each an `int`.
+
+`ChunkLevel.MAX_LEVEL` must be 44, for which the cases are written; the vanilla adapter checks it. Blobs, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, a player, coordinate, level, distance or count that isn't an `int`, an `unplayer` of a player no earlier `player` named, and a type that isn't one are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.
