@@ -14,14 +14,18 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtUtils;
+import net.minecraft.server.players.NameAndId;
 import net.minecraft.util.datafix.DataFixers;
 import net.minecraft.world.level.storage.LevelStorageSource;
 import net.minecraft.world.level.storage.LevelSummary;
+import net.minecraft.world.level.storage.PlayerDataStorage;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.LogEvent;
 import org.apache.logging.log4j.core.Logger;
@@ -31,8 +35,9 @@ import org.apache.logging.log4j.core.config.Property;
 /**
  * `world_folder`: operations on a world's folder, `world`, in a new folder of its own, with
  * vanilla's {@link LevelStorageSource} and its access: opening and locking it, reading
- * `level.dat` with its fallback, checking the version as `Main` does, saving it, and the files
- * left. Each result goes into one blob, after what was logged.
+ * `level.dat` with its fallback, checking the version as `Main` does, saving it, reading a
+ * player's data as they join, and the files left. Each result goes into one blob, after what was
+ * logged.
  */
 final class WorldFolderProbe implements Probe {
     @Override
@@ -42,7 +47,7 @@ final class WorldFolderProbe implements Probe {
 
     @Override
     public int version() {
-        return 1;
+        return 2;
     }
 
     @Override
@@ -57,6 +62,7 @@ final class WorldFolderProbe implements Probe {
         root.addAppender(lines);
         LevelStorageSource.LevelStorageAccess access = null;
         Dynamic<?> data = null;
+        PlayerDataStorage players = null;
         try {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
             DataOutputStream out = new DataOutputStream(bytes);
@@ -158,10 +164,37 @@ final class WorldFolderProbe implements Probe {
                         open(access, k).saveLevelData(loaded(data, k));
                         lines.write(out);
                     }
+                    case "player_load" -> {
+                        expect(op, k, 2);
+                        LevelStorageSource.LevelStorageAccess a = open(access, k);
+                        UUID id;
+                        try {
+                            id = UUID.fromString(Args.asString(op.get(1), "operation " + k + "'s UUID"));
+                        } catch (IllegalArgumentException e) {
+                            throw new CaseError("operation " + k + ": the UUID isn't one");
+                        }
+                        String player = Args.asString(op.get(2), "operation " + k + "'s name");
+                        if (players == null) {
+                            // As the server makes it as it starts, which makes `players/data`.
+                            players = new PlayerDataStorage(a, DataFixers.getDataFixer());
+                        }
+                        Optional<CompoundTag> tag = players.load(new NameAndId(id, player));
+                        lines.write(out);
+                        if (tag.isEmpty()) {
+                            out.writeByte(0);
+                        } else {
+                            out.writeByte(1);
+                            ByteArrayOutputStream nbt = new ByteArrayOutputStream();
+                            NbtIo.write(tag.get(), new DataOutputStream(nbt));
+                            out.writeInt(nbt.size());
+                            out.write(nbt.toByteArray());
+                        }
+                    }
                     case "close" -> {
                         expect(op, k, 0);
                         open(access, k).close();
                         access = null;
+                        players = null;
                         lines.write(out);
                         files(out, world, lines);
                     }

@@ -1,6 +1,7 @@
 """Writes cases/world_folder/generated.json: a world's folder opened and locked, its level.dat read
 with the level.dat_old fallback, its version checked as a server checks it as it starts, saved,
-and the files left, as vanilla's LevelStorageSource does each.
+players' data read as they join, and the files left, as vanilla's LevelStorageSource and
+PlayerDataStorage do each.
 
     py -I cases/world_folder/gen.py
 
@@ -216,9 +217,51 @@ def versions():
     ]
 
 
+UUID = "069a79f4-44e9-4726-a5be-fca90e38aaf5"
+PLAYER = f"players/data/{UUID}.dat"
+
+
+def players():
+    """A player's data read as they join: none yet, theirs, the old one when theirs can't be read,
+    with a copy of theirs kept, and neither."""
+    def player(**more):
+        fields = {
+            "DataVersion": (INT, 5023),
+            "Health": (FLOAT, 20.0),
+            "Pos": (LIST, (DOUBLE, [0.5, -60.0, 0.5])),
+            "playerGameType": (INT, 0),
+        }
+        fields.update(more)
+        return gzip(root(COMPOUND, fields))
+
+    load = [["open"], ["player_load", UUID, "Notch"]]
+    good = player()
+    old = player(Health=(FLOAT, 7.5))
+    broken = b"not a player"
+    data = root(COMPOUND, {"DataVersion": (INT, 5023), "Health": (FLOAT, 1.0)})
+    wrong_crc = gzip(data)[:-8] + struct.pack("<II", zlib.crc32(data) ^ 1, len(data))
+    deep = gzip(bytes([COMPOUND]) + utf("") + (bytes([COMPOUND]) + utf("a")) * 600 + bytes([END]) * 601)
+    return [
+        case("player-new", load + CLOSE, []),
+        case("player-saved", [put(PLAYER, 0)] + load + CLOSE, [good]),
+        case("player-old-only", [put(PLAYER + "_old", 0)] + load + CLOSE, [old]),
+        case("player-broken", [put(PLAYER, 0), put(PLAYER + "_old", 1)] + load + CLOSE, [broken, old]),
+        case("player-both-broken", [put(PLAYER, 0), put(PLAYER + "_old", 0)] + load + CLOSE, [broken]),
+        case("player-broken-no-old", [put(PLAYER, 0)] + load + CLOSE, [broken]),
+        case("player-folder", [["dir", PLAYER], put(PLAYER + "_old", 0)] + load + CLOSE, [old]),
+        case("player-root-list", [put(PLAYER, 0), put(PLAYER + "_old", 1)] + load + CLOSE, [gzip(root(LIST, (INT, [1]))), old]),
+        case("player-deep", [put(PLAYER, 0), put(PLAYER + "_old", 1)] + load + CLOSE, [deep, old]),
+        case("player-wrong-crc", [put(PLAYER, 0)] + load + CLOSE, [wrong_crc]),
+        case("player-newer", [put(PLAYER, 0)] + load + CLOSE, [player(DataVersion=(INT, 6000))]),
+        case("player-someone-else", [put("players/data/853c80ef-3c37-49fd-aa49-938b674adae6.dat", 0)] + load + CLOSE, [good]),
+        case("player-data-is-a-file", [put("players/data", 0)] + load + CLOSE, [good]),
+        case("player-twice", [put(PLAYER, 0)] + load + [["player_load", UUID, "Notch"]] + CLOSE, [good]),
+    ]
+
+
 def main():
-    cases = folders() + broken() + versions()
-    write_file(HERE / "generated.json", "world_folder", "cases/world_folder/gen.py", cases)
+    cases = folders() + broken() + versions() + players()
+    write_file(HERE / "generated.json", "world_folder", "cases/world_folder/gen.py", cases, probe_version=2)
 
 
 if __name__ == "__main__":

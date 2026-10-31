@@ -66,7 +66,7 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `ChunkProbe.java` | `chunk`: `LevelChunkSection` and `Heightmap` in a `ProtoChunk`, with blocks set as `LevelChunk.setBlockState` sets them |
 | `RegionProbe.java` | `region`: a `RegionFile` in a new folder, with chunks written as the case gives their bytes, and what it logs, caught by an appender on its logger |
 | `LevelDataProbe.java` | `level_data`: the `Data` of a `level.dat` read by `readDataConfig`, `LevelSettings.parse` and `PrimaryLevelData.parse` and written back by `createTag`, with `LastPlayed` as 0 |
-| `WorldFolderProbe.java` | `world_folder`: a world's folder in a new folder of its own, opened, locked, read with the `level.dat_old` fallback, checked as `Main` checks it, saved and closed by `LevelStorageSource`, with what it logs, caught by an appender on the root logger |
+| `WorldFolderProbe.java` | `world_folder`: a world's folder in a new folder of its own, opened, locked, read with the `level.dat_old` fallback, checked as `Main` checks it, saved and closed by `LevelStorageSource`, and players' data read by `PlayerDataStorage.load`, with what they log, caught by an appender on the root logger |
 | `ChunkNbtProbe.java` | `chunk_nbt`: a chunk's NBT read by `SerializableChunkData.parse` and written back by its `write`, with the data pack's biomes, and what it logs, caught by an appender on the root logger |
 | `BlockFlags.java` | Not a probe: writes each block state's flags from vanilla's state cache, run by `oracle/datagen/block_flags.py` |
 | `PacketCheck.java` | Vanilla reading Calcite's packets, run by `check_packets.py` |

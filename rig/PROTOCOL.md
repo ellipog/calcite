@@ -405,9 +405,9 @@ The result is one blob: what was logged while it was read and written, as `chunk
 
 Blobs and SNBT that isn't a compound are an `error` status.
 
-### `world_folder` (v1)
+### `world_folder` (v2)
 
-A world's folder, as vanilla's `LevelStorageSource` and its `LevelStorageAccess` keep it: operations on `world`, in a new folder of its own, which is the server's folder, the universe. Results go into one blob, each after what its operation logged, as `region` writes them. In what was logged and in names, the folder's path is taken out, `/` goes between names, the time in a `level.dat_corrupted_` file's name becomes `<time>`, and the random number in a new `level<n>.dat` becomes `<n>`, since each is the run's own.
+A world's folder, as vanilla's `LevelStorageSource` and its `LevelStorageAccess` keep it, and its players' data, as `PlayerDataStorage` keeps it: operations on `world`, in a new folder of its own, which is the server's folder, the universe. Results go into one blob, each after what its operation logged, as `region` writes them. In what was logged and in names, the folder's path is taken out, `/` goes between names, the time in a `level.dat_corrupted_` file's name becomes `<time>`, and the random number in a new `level<n>.dat` becomes `<n>`, since each is the run's own.
 
 Input `{"ops": [...]}`, with blobs. A name is a path in `world` with `/` between names, which mustn't leave it, and a blob is its index in the case's list.
 
@@ -420,9 +420,10 @@ Input `{"ops": [...]}`, with blobs. A name is a path in `world` with `/` between
 | `["load"]` | a byte: 0 if `getUnfixedDataTagWithFallback` threw, where `Main` stops; or 1, then an `int` length and the `Data` read, as `NbtIo.write` writes a file's root |
 | `["check"]` | a byte, from `fixAndGetSummaryFromTag` on what was loaded, as `Main` checks it: 0, then what it threw, as `open` writes it; 1 if it `requiresManualConversion`; 2 if it isn't `isCompatible`; or 3, then the `int` data version, `NbtUtils.getDataVersion` |
 | `["save"]` | nothing: `saveLevelData` with what was loaded |
+| `["player_load", uuid, name]` | a byte: 0 if `load(new NameAndId(uuid, name))` gives nothing; or 1, then an `int` length and the compound, as `load` writes it. The first makes the `PlayerDataStorage`, as a server makes it as it starts, which makes `players/data` |
 | `["close"]` | `close`, then every file and folder in `world`, sorted by name: an `int` count, then for each its name as a message and a byte, 0 for a file, 1 for a folder and 2 for a file that's gzip and inflates whole, then for a file an `int` length and its bytes, or for a gzipped one what it inflates to. No two deflaters write the same bytes, so a gzipped file is compared by what it holds |
 
-Opening a folder that's open, an operation on one that isn't, `check` and `save` with nothing loaded, a name outside `world`, a blob that isn't there and an operation it doesn't have are an `error` status.
+Opening a folder that's open, an operation on one that isn't, `check` and `save` with nothing loaded, a name outside `world`, a UUID that isn't one, a blob that isn't there and an operation it doesn't have are an `error` status. Version 2 added `player_load`.
 
 ## Adding a probe
 
