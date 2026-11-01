@@ -1,0 +1,511 @@
+/// Which of the generator's jobs can be done when (CAL-88): a chunk's terrain once the starts
+/// within 8 of it and the biomes around it are made, its decoration once the terrain of the nine
+/// around it is and each chunk 2 or less from it of a lower rank is decorated (D214), and the
+/// chunk finished once the nine around it are decorated. Starts and biomes are made a block of
+/// chunks a job.
+///
+/// Each job is a node, which counts the nodes it needs that aren't done, and each node keeps the
+/// nodes that wait for it, so a job is ready the moment the last it needs is done, with nothing
+/// looked at again. What's ready goes out most urgent first: finishing, then decorating, then
+/// terrain, biomes and starts, each in the order it came, so the chunks asked for first are
+/// finished first and few are kept part made.
+///
+/// The scheduler keeps what the jobs made until the jobs that need it are out: the starts, which
+/// it hands each decoration a copy of; each chunk's biomes and references; and the terrain of each
+/// chunk not yet finished, which goes out with each decoration of the nine around it and comes
+/// back. A decoration changes only pieces that reach its chunk, and a piece a decoration changes
+/// is never more than 33 blocks across, so two decorations that change one piece are 2 or less
+/// apart and go in rank order; the pieces a decoration hands back that reach its chunk replace
+/// the scheduler's.
+///
+/// `Generator` does the jobs one at a time on the thread it's on, as a check of the threads' and
+/// for what wants a chunk at once.
+module worldgen.scheduler
+
+import world.chunk.{BlockStates, Chunk}
+import worldgen.beardifier.{Beardifier}
+import worldgen.generator.{BLOCK_SHIFT, DecorateJob, FinishJob, GenSetup, HEIGHT, Job, MIN_Y, Made, TerrainJob, Worker, overworld_source, rank_of}
+import worldgen.interval.{Thrown}
+import worldgen.references.{Refs, StartMap, beardifier_for, chunk_key, create_references}
+import worldgen.region.{RegionChunk}
+import worldgen.structures.{RingSearch, Rings, StructureState, Structures}
+import std.zip.{Zip}
+
+// The kinds of node, most urgent first.
+const FINISH: i64 = 0
+const DECORATE: i64 = 1
+const TERRAIN: i64 = 2
+const BIOMES: i64 = 3
+const STARTS: i64 = 4
+const KINDS: usize = 5
+
+// What a node is doing.
+const WAITING: u8 = 0
+const READY: u8 = 1
+const RUNNING: u8 = 2
+const DONE: u8 = 3
+
+// Coordinates are kept in 28 bits each, from this.
+const OFFSET: i64 = 1 << 27
+const MASK: i64 = (1 << 28) - 1
+
+// A node's ID: its kind, and its chunk or block.
+fn node(kind: i64, x: i32, z: i32) -> i64 {
+    return (kind << 56) | (((i64(x) + OFFSET) & MASK) << 28) | ((i64(z) + OFFSET) & MASK)
+}
+
+fn kind_of(n: i64) -> i64 {
+    return n >> 56
+}
+
+fn x_of(n: i64) -> i32 {
+    return i32.wrap(((n >> 28) & MASK) - OFFSET)
+}
+
+fn z_of(n: i64) -> i32 {
+    return i32.wrap((n & MASK) - OFFSET)
+}
+
+// A job: how many of the nodes it needs aren't done, what it's doing, and the nodes that wait
+// for it.
+struct Node {
+    missing: u32
+    state: u8
+    dependents: List<i64>
+}
+
+/// What schedules the generator's jobs, with what they've made so far.
+pub struct Scheduler {
+    structures: Structures
+    nodes: Map<i64, Node>
+    // What's ready, by kind.
+    queues: List<Deque<i64>>
+    out: usize
+    starts: StartMap
+    biomes: Map<i64, List<i32>>
+    refs: Map<i64, List<Refs>>
+    protos: Map<i64, RegionChunk>
+    // The ring searches to go out, how many aren't back, the rings as they come back, and the
+    // starts' nodes that wait for them all.
+    searches: Deque<RingSearch>
+    searches_left: usize
+    rings: Rings
+    after_rings: List<i64>
+    // The chunks finished by `take`, to be taken.
+    finished: Deque<(i32, i32, Chunk)>
+    /// What went wrong making chunks, to be logged, oldest first.
+    pub problems: List<String>
+}
+
+impl Scheduler {
+    /// A scheduler for chunks of the structures, as `Worker.structures` gives them, whose
+    /// strongholds' rings the searches place, as `Worker.ring_searches` gives them.
+    pub fn new(structures: own Structures, searches: own List<RingSearch>) -> Scheduler {
+        var ready = List<Deque<i64>>()
+        for _ in 0..KINDS {
+            ready.push(Deque<i64>())
+        }
+        var rings = Rings { sets: List<usize>(), lists: List<List<(i32, i32)>>() }
+        var queue = Deque<RingSearch>()
+        let left = searches.len()
+        var rest = searches
+        while not rest.is_empty() {
+            let r = rest.remove(0)
+            if not rings.sets.contains(r.set) {
+                rings.sets.push(r.set)
+                rings.lists.push(List<(i32, i32)>())
+            }
+            for i in 0..rings.sets.len() {
+                if rings.sets[i] == r.set {
+                    rings.lists[i].push((0, 0))
+                }
+            }
+            queue.push_last(r)
+        }
+        return Scheduler {
+            structures: structures,
+            nodes: Map<i64, Node>(),
+            queues: ready,
+            out: 0,
+            starts: StartMap.new(),
+            biomes: Map<i64, List<i32>>(),
+            refs: Map<i64, List<Refs>>(),
+            protos: Map<i64, RegionChunk>(),
+            searches: queue,
+            searches_left: left,
+            rings: rings,
+            after_rings: List<i64>(),
+            finished: Deque<(i32, i32, Chunk)>(),
+            problems: List<String>(),
+        }
+    }
+
+    /// Asks for the chunk at `x`, `z` finished, with every job it needs.
+    pub fn want(mut self, x: i32, z: i32) {
+        _ = self.need(node(FINISH, x, z))
+    }
+
+    /// Whether the chunk at `x`, `z` is finished.
+    pub fn is_finished(self, x: i32, z: i32) -> bool {
+        let n = node(FINISH, x, z)
+        return self.nodes.contains(n) and self.nodes[n].state == DONE
+    }
+
+    /// How many jobs are out.
+    pub fn running(self) -> usize {
+        return self.out
+    }
+
+    /// How many jobs are ready to go out.
+    pub fn ready(self) -> usize {
+        var n: usize = 0
+        for q in self.queues {
+            n += q.len()
+        }
+        return n
+    }
+
+    /// How many chunks' terrain is kept, to be decorated around and finished.
+    pub fn kept(self) -> usize {
+        return self.protos.len()
+    }
+
+    /// The most urgent job that's ready, which is out until what it made is taken.
+    pub fn next(mut self) -> Job? {
+        if let r = self.searches.pop_first() {
+            self.out += 1
+            return some(Job.Ring(r))
+        }
+        for k in 0..KINDS {
+            if let n = self.queues[k].pop_first() {
+                self.nodes[n].state = RUNNING
+                self.out += 1
+                return some(self.job(n))
+            }
+        }
+        return none
+    }
+
+    /// Takes in what a job made. A finished chunk is kept to be taken with `take_finished`.
+    pub fn take(mut self, made: own Made) {
+        match made {
+            Made.Ring(set, index, cx, cz, problems) => {
+                for i in 0..self.rings.sets.len() {
+                    if self.rings.sets[i] == set {
+                        self.rings.lists[i][index] = (cx, cz)
+                    }
+                }
+                self.noted(problems)
+                self.out -= 1
+                self.searches_left -= 1
+                if self.searches_left == 0 {
+                    let waiting = self.after_rings.copy()
+                    self.after_rings.clear()
+                    for n in waiting {
+                        self.ready_one(n)
+                    }
+                }
+            },
+            Made.Starts(bx, bz, lists, problems) => {
+                var rest = lists
+                for z in bz << BLOCK_SHIFT..(bz + 1) << BLOCK_SHIFT {
+                    for x in bx << BLOCK_SHIFT..(bx + 1) << BLOCK_SHIFT {
+                        self.starts.chunks.insert(chunk_key(x, z), rest.remove(0))
+                    }
+                }
+                self.noted(problems)
+                self.done(node(STARTS, bx, bz))
+            },
+            Made.Biomes(bx, bz, lists, problems) => {
+                var rest = lists
+                for z in bz << BLOCK_SHIFT..(bz + 1) << BLOCK_SHIFT {
+                    for x in bx << BLOCK_SHIFT..(bx + 1) << BLOCK_SHIFT {
+                        self.biomes.insert(chunk_key(x, z), rest.remove(0))
+                    }
+                }
+                self.noted(problems)
+                self.done(node(BIOMES, bx, bz))
+            },
+            Made.Terrain(x, z, terrain, problems) => {
+                self.protos.insert(chunk_key(x, z), terrain)
+                self.noted(problems)
+                self.done(node(TERRAIN, x, z))
+            },
+            Made.Decorated(job, problems) => {
+                let DecorateJob { x: x, z: z, chunks: chunks, starts: starts, .. } = job
+                var rest = chunks
+                for dz in -1..2 {
+                    for dx in -1..2 {
+                        self.protos.insert(chunk_key(x + dx, z + dz), rest.remove(0))
+                    }
+                }
+                self.merge(x, z, starts)
+                self.noted(problems)
+                self.done(node(DECORATE, x, z))
+            },
+            Made.Finished(x, z, chunk) => {
+                self.finished.push_last((x, z, chunk))
+                self.done(node(FINISH, x, z))
+            },
+        }
+    }
+
+    /// Takes in that the chunk at `x`, `z` was finished, as a thread that made the server's chunk
+    /// of it and kept it says.
+    pub fn finished_at(mut self, x: i32, z: i32) {
+        self.done(node(FINISH, x, z))
+    }
+
+    /// The next chunk finished, by `take`, with where it is.
+    pub fn take_finished(mut self) -> (i32, i32, Chunk)? {
+        return self.finished.pop_first()
+    }
+
+    // Makes the node, unless it's made, waiting for the nodes it needs; whether it's done.
+    fn need(mut self, n: i64) -> bool {
+        if self.nodes.contains(n) {
+            return self.nodes[n].state == DONE
+        }
+        self.nodes.insert(n, Node { missing: 0, state: WAITING, dependents: List<i64>() })
+        var missing: u32 = 0
+        for d in needs(n) {
+            if not self.need(d) {
+                missing += 1
+                self.nodes[d].dependents.push(n)
+            }
+        }
+        if kind_of(n) == STARTS and self.searches_left > 0 {
+            missing += 1
+            self.after_rings.push(n)
+        }
+        self.nodes[n].missing = missing
+        if missing == 0 {
+            self.nodes[n].state = READY
+            self.queues[usize.wrap(kind_of(n))].push_last(n)
+        }
+        return false
+    }
+
+    // The node is done: each that waits for it needs one fewer, and is ready with none.
+    fn done(mut self, n: i64) {
+        self.out -= 1
+        self.nodes[n].state = DONE
+        let waiting = self.nodes[n].dependents.copy()
+        self.nodes[n].dependents = List<i64>()
+        for d in waiting {
+            self.ready_one(d)
+        }
+    }
+
+    // One fewer of what the node needs isn't done; it's ready if that was the last.
+    fn ready_one(mut self, n: i64) {
+        self.nodes[n].missing -= 1
+        if self.nodes[n].missing == 0 {
+            self.nodes[n].state = READY
+            self.queues[usize.wrap(kind_of(n))].push_last(n)
+        }
+    }
+
+    fn noted(mut self, problems: own List<String>) {
+        for p in problems {
+            self.problems.push(p.copy())
+        }
+    }
+
+    // The node's job, with what it's made from, moved out where nothing after it needs it.
+    fn job(mut self, n: i64) -> Job {
+        let kind = kind_of(n)
+        let x = x_of(n)
+        let z = z_of(n)
+        if kind == STARTS {
+            return Job.Starts(x, z, self.rings.copy())
+        }
+        if kind == BIOMES {
+            return Job.Biomes(x, z)
+        }
+        if kind == TERRAIN {
+            let refs = self.refs_of(x, z)
+            let beard: Beardifier? = beardifier_for(self.structures, self.starts, refs, x, z, List<f32>())
+            return Job.Terrain(TerrainJob { x: x, z: z, beard: beard, biomes: self.around(x, z) })
+        }
+        if kind == DECORATE {
+            var chunks = List<RegionChunk>()
+            for dz in -1..2 {
+                for dx in -1..2 {
+                    // Each is there: its terrain is done, and nothing else has it out, as every
+                    // decoration it's in is 2 or less from this one.
+                    let c = self.protos.remove(chunk_key(x + dx, z + dz)) else panic("chunk {x + dx}, {z + dz} has no terrain to decorate with")
+                    chunks.push(c)
+                }
+            }
+            // Its terrain is made, and only its decoration reads its references after.
+            let refs = self.refs.remove(chunk_key(x, z)) ?? self.refs_of(x, z)
+            var starts = StartMap.new()
+            for r in refs {
+                for key in r.chunks.values() {
+                    if not starts.chunks.contains(key) and self.starts.chunks.contains(key) {
+                        starts.chunks.insert(key, self.starts.chunks[key].copy())
+                    }
+                }
+            }
+            return Job.Decorate(DecorateJob { x: x, z: z, chunks: chunks, biomes: self.around(x, z), refs: refs, starts: starts })
+        }
+        // Finishing: everything 1 or less from it is decorated, so nothing reads its terrain or
+        // its biomes again.
+        let key = chunk_key(x, z)
+        let made = self.protos.remove(key) else panic("chunk {x}, {z} has no terrain to finish")
+        let biomes = self.biomes.remove(key) else panic("chunk {x}, {z} has no biomes to finish with")
+        return Job.Finish(FinishJob { x: x, z: z, made: made, biomes: biomes })
+    }
+
+    // The chunk's references to the structures started within 8 of it, whose starts are all made.
+    fn refs_of(mut self, x: i32, z: i32) -> List<Refs> {
+        let key = chunk_key(x, z)
+        if self.refs.contains(key) {
+            return self.refs[key].copy()
+        }
+        let made = create_references(self.structures, self.starts, x, z)
+        self.refs.insert(key, made.copy())
+        return made
+    }
+
+    // The biomes of the chunk and the eight around it, from the lower corner, `x` fastest.
+    fn around(self, x: i32, z: i32) -> List<List<i32>> {
+        var out = List<List<i32>>()
+        for dz in -1..2 {
+            for dx in -1..2 {
+                out.push(self.biomes[chunk_key(x + dx, z + dz)].copy())
+            }
+        }
+        return out
+    }
+
+    // Takes back the pieces a decoration of the chunk at `x`, `z` may have changed: those that
+    // reach its writable area, as `place_in_chunk` places them.
+    fn merge(mut self, x: i32, z: i32, back: own StartMap) {
+        let x0 = x << 4
+        let z0 = z << 4
+        let low = MIN_Y + 1
+        let high = MIN_Y + HEIGHT - 1
+        var given = back
+        var keys = List<i64>()
+        for (k, _) in given.chunks {
+            keys.push(k)
+        }
+        for k in keys {
+            let list = given.chunks.remove(k) else continue
+            if not self.starts.chunks.contains(k) {
+                continue
+            }
+            for s in 0..list.len() {
+                for i in 0..list[s].pieces.len() {
+                    let b = self.starts.chunks[k][s].pieces[i].bb
+                    if b.max_x >= x0 and b.min_x <= x0 + 15 and b.max_z >= z0 and b.min_z <= z0 + 15 and b.max_y >= low and b.min_y <= high {
+                        self.starts.chunks[k][s].pieces[i] = list[s].pieces[i].copy()
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The scheduler for a world as `setup` says, from vanilla's data in `zip`, made without a
+/// worker.
+pub fn scheduler_for(zip: Zip, setup: GenSetup) -> Scheduler ! String {
+    let structures = try Structures.read(zip, setup.biomes)
+    let source = try overworld_source(zip, setup.biomes)
+    let state = StructureState.new(structures, source.possible(), setup.seed)
+    let searches = state.ring_searches(structures)
+    return Scheduler.new(structures, searches)
+}
+
+// The nodes the node needs.
+fn needs(n: i64) -> List<i64> {
+    let kind = kind_of(n)
+    let x = x_of(n)
+    let z = z_of(n)
+    var out = List<i64>()
+    if kind == TERRAIN {
+        // The starts within 8, and the biomes 1 or less away, by block.
+        for bz in (z - 8) >> BLOCK_SHIFT..((z + 8) >> BLOCK_SHIFT) + 1 {
+            for bx in (x - 8) >> BLOCK_SHIFT..((x + 8) >> BLOCK_SHIFT) + 1 {
+                out.push(node(STARTS, bx, bz))
+            }
+        }
+        for bz in (z - 1) >> BLOCK_SHIFT..((z + 1) >> BLOCK_SHIFT) + 1 {
+            for bx in (x - 1) >> BLOCK_SHIFT..((x + 1) >> BLOCK_SHIFT) + 1 {
+                out.push(node(BIOMES, bx, bz))
+            }
+        }
+    } else if kind == DECORATE {
+        let rank = rank_of(x, z)
+        for dz in -2..3 {
+            for dx in -2..3 {
+                if rank_of(x + dx, z + dz) < rank {
+                    out.push(node(DECORATE, x + dx, z + dz))
+                }
+            }
+        }
+        for dz in -1..2 {
+            for dx in -1..2 {
+                out.push(node(TERRAIN, x + dx, z + dz))
+            }
+        }
+    } else if kind == FINISH {
+        for dz in -1..2 {
+            for dx in -1..2 {
+                out.push(node(DECORATE, x + dx, z + dz))
+            }
+        }
+    }
+    return out
+}
+
+/// The Overworld's generator, making chunks on the thread it's on, a job at a time, and keeping
+/// each it finishes.
+pub struct Generator {
+    worker: Worker
+    s: Scheduler
+    finished: Map<i64, Chunk>
+    /// What went wrong making chunks, to be logged, oldest first.
+    pub problems: List<String>
+}
+
+impl Generator {
+    /// The generator `setup` says, from vanilla's data in `zip`.
+    pub fn new(zip: own Zip, setup: GenSetup) -> Generator ! String {
+        let worker = try Worker.new(zip, setup)
+        let s = Scheduler.new(worker.structures(), worker.ring_searches())
+        return Generator { worker: worker, s: s, finished: Map<i64, Chunk>(), problems: List<String>() }
+    }
+
+    /// The block states' table the chunks are made with.
+    pub fn table(self) -> BlockStates {
+        return self.worker.table()
+    }
+
+    /// `NoiseBasedChunkGenerator.getOrigin`, as `Worker.origin`.
+    pub fn origin(self) -> (i32, i32) ! Thrown {
+        return try self.worker.origin()
+    }
+
+    /// The chunk at `x`, `z` finished, as the server's chunk.
+    pub fn full(mut self, x: i32, z: i32) -> Chunk ! Thrown {
+        let key = chunk_key(x, z)
+        if not self.finished.contains(key) {
+            self.s.want(x, z)
+            while not self.s.is_finished(x, z) {
+                let job = self.s.next() else fail Thrown { exception: "IllegalStateException", message: "chunk {x}, {z} can't be finished" }
+                self.s.take(self.worker.run(job))
+            }
+            while let (fx, fz, chunk) = self.s.take_finished() {
+                self.finished.insert(chunk_key(fx, fz), chunk)
+            }
+            for p in self.s.problems {
+                self.problems.push(p.copy())
+            }
+            self.s.problems.clear()
+        }
+        return self.finished[key].copy()
+    }
+}
