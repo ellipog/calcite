@@ -16,6 +16,8 @@ import net.minecraft.server.Bootstrap;
 import net.minecraft.world.entity.ai.village.poi.PoiTypes;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Mirror;
+import net.minecraft.world.level.block.Rotation;
 import net.minecraft.world.level.block.SupportType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.lighting.LightEngine;
@@ -121,12 +123,40 @@ final class BlockFlags {
                 poi.append(poi.isEmpty() ? "[" : ", [").append(id).append(", ").append(type).append("]");
             }
         }
+        // `BlockState.rotate` and `mirror`, as structure templates turn what they place: for each
+        // state any of them changes, the state, then what clockwise 90, 180 and counterclockwise 90
+        // make of it, then the mirrors left to right and front to back.
+        StringBuilder turns = new StringBuilder();
+        for (int id = 0; id < count; id++) {
+            BlockState state = Block.BLOCK_STATE_REGISTRY.byId(id);
+            BlockState[] made = {
+                state.rotate(Rotation.CLOCKWISE_90), state.rotate(Rotation.CLOCKWISE_180),
+                state.rotate(Rotation.COUNTERCLOCKWISE_90), state.mirror(Mirror.LEFT_RIGHT), state.mirror(Mirror.FRONT_BACK),
+            };
+            boolean changes = false;
+            for (BlockState m : made) {
+                changes |= m != state;
+            }
+            if (changes) {
+                turns.append(turns.isEmpty() ? "[" : ", [").append(id);
+                for (BlockState m : made) {
+                    turns.append(", ").append(Block.BLOCK_STATE_REGISTRY.getId(m));
+                }
+                turns.append("]");
+            }
+        }
         StringBuilder classes = new StringBuilder();
         StringBuilder survive = new StringBuilder();
         StringBuilder placeOn = new StringBuilder();
         StringBuilder shape = new StringBuilder();
         // `FireBlock.canBurn`: the blocks fire's ignite odds are above 0 for.
         StringBuilder flammable = new StringBuilder();
+        // The blocks that are `LiquidBlockContainer`s, as structure templates fill them: those that
+        // are `SimpleWaterloggedBlock`s, and the others.
+        StringBuilder waterloggable = new StringBuilder();
+        StringBuilder containers = new StringBuilder();
+        // `Block.hasDynamicShape`: blocks whose shape can change where they stand.
+        StringBuilder dynamic = new StringBuilder();
         java.lang.reflect.Field igniteField = net.minecraft.world.level.block.FireBlock.class.getDeclaredField("igniteOdds");
         igniteField.setAccessible(true);
         @SuppressWarnings("unchecked")
@@ -154,6 +184,15 @@ final class BlockFlags {
                 flammable.append(flammable.isEmpty() ? "" : ", ").append(id);
             }
             shape.append(id == 0 ? "\"" : ", \"").append(u).append("\"");
+            Block block = BuiltInRegistries.BLOCK.byId(id);
+            if (block.hasDynamicShape()) {
+                dynamic.append(dynamic.isEmpty() ? "" : ", ").append(id);
+            }
+            if (block instanceof net.minecraft.world.level.block.SimpleWaterloggedBlock) {
+                waterloggable.append(waterloggable.isEmpty() ? "" : ", ").append(id);
+            } else if (block instanceof net.minecraft.world.level.block.LiquidBlockContainer) {
+                containers.append(containers.isEmpty() ? "" : ", ").append(id);
+            }
         }
         StringBuilder parentJson = new StringBuilder();
         for (Map.Entry<String, String> e : parents.entrySet()) {
@@ -168,8 +207,12 @@ final class BlockFlags {
         json.append("  \"place_on_classes\": [").append(placeOn).append("],\n");
         json.append("  \"shape_classes\": [").append(shape).append("],\n");
         json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
+        json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");
+        json.append("  \"liquid_containers\": [").append(containers).append("],\n");
+        json.append("  \"dynamic_shape_blocks\": [").append(dynamic).append("],\n");
         json.append("  \"class_parents\": {").append(parentJson).append("},\n");
-        json.append("  \"poi\": [").append(poi).append("]");
+        json.append("  \"poi\": [").append(poi).append("],\n");
+        json.append("  \"turns\": [").append(turns).append("]");
         json.append(",\n  \"collision\": [").append(collision).append("],\n");
         json.append("  \"collision_boxes\": ");
         boxes(json, collisions);

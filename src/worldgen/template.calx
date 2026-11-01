@@ -1,0 +1,1130 @@
+/// Structure templates: the `.nbt` files of a data pack's `structure` folder, as vanilla's
+/// `StructureTemplateManager` loads them and `StructureTemplate.placeInWorld` places them,
+/// turned, mirrored and run through their processors, with the waterlogging, shape updates
+/// and block entities placing does. The `template` and `fossil` features place them, and later
+/// structures will.
+module worldgen.template
+
+import json.tree.{Json, Member, as_string}
+import nbt.tag.{Accounter, Tag}
+import pack.zip.{Zip}
+import protocol.ids.{DATA_VERSION}
+import random.legacy.{LegacyRandom}
+import random.source.{RandomSource, position_seed}
+import resources.identifier.{Identifier}
+import storage.world.{read_gzipped}
+import world.chunk.{OCEAN_FLOOR_WG}
+import worldgen.codec.{field, float_of, float_range_field, identifier_field, int_of, int_range_field, map_of}
+import worldgen.density.{data_json}
+import worldgen.facts.{BlockSet, Facts, NORTH, WATER_FLUID, WEST, clockwise, opposite, step_x, step_z}
+import worldgen.interval.{Thrown}
+import worldgen.predicates.{Readers, Rule, list_of, read_blocks, read_rule, read_state, test_rule}
+import worldgen.region.{Region}
+import worldgen.shapes.{Shape, update_edges, update_from_neighbours}
+import worldgen.survive.{Env}
+
+/// `Mirror`, in its order.
+pub const MIRROR_NONE: i32 = 0
+pub const LEFT_RIGHT: i32 = 1
+pub const FRONT_BACK: i32 = 2
+
+/// `Rotation`, in its order.
+pub const ROTATION_NONE: i32 = 0
+pub const CLOCKWISE_90: i32 = 1
+pub const CLOCKWISE_180: i32 = 2
+pub const COUNTERCLOCKWISE_90: i32 = 3
+
+/// A block of a template: where it is in the template, its state, and its block entity's data.
+pub struct BlockInfo {
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub state: u32
+    pub nbt: JavaHashMap<String, Tag>?
+}
+
+/// An entity of a template: where it is, its block, and its data.
+pub struct EntityInfo {
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    pub bx: i32
+    pub by: i32
+    pub bz: i32
+    pub nbt: JavaHashMap<String, Tag>
+}
+
+/// A structure template.
+pub struct Template {
+    pub size_x: i32
+    pub size_y: i32
+    pub size_z: i32
+    /// Each palette's blocks: the whole blocks, then the others, then those with block entities,
+    /// each by `y`, then `x`, then `z`.
+    pub palettes: List<List<BlockInfo>>
+    pub entities: List<EntityInfo>
+    /// The data version it was saved by, which vanilla would upgrade it from if it's older.
+    pub version: i32
+}
+
+/// The templates loaded, each once, by ID.
+pub struct Templates {
+    pub list: List<Template>
+    ids: Map<String, usize>
+}
+
+impl Templates {
+    pub fn new() -> Templates {
+        return Templates { list: List<Template>(), ids: Map<String, usize>() }
+    }
+
+    /// `StructureTemplateManager.getOrCreate`: the template `id`, loaded from
+    /// `data/<namespace>/structure/<path>.nbt`, or an empty one if there's none.
+    pub fn get_or_create(mut self, zip: Zip, facts: Facts, id: String) -> usize ! String {
+        if let i = self.ids.get(id) {
+            return i
+        }
+        let colon = id.find(":") else fail "`{id}` isn't an identifier"
+        let path = "data/{id[..colon]}/structure/{id[colon + 1..]}.nbt"
+        var template = Template { size_x: 0, size_y: 0, size_z: 0, palettes: List<List<BlockInfo>>(), entities: List<EntityInfo>(), version: DATA_VERSION }
+        if let at = zip.find(path) {
+            let bytes = try zip.read(at)
+            var accounter = Accounter.unlimited()
+            let root = try read_gzipped(bytes, mut accounter)
+            template = load(facts, root)
+        }
+        self.list.push(template)
+        let i = self.list.len() - 1
+        self.ids.insert(id.copy(), i)
+        return i
+    }
+}
+
+// `StructureTemplate.load`.
+fn load(facts: Facts, root: JavaHashMap<String, Tag>) -> Template {
+    // `NbtUtils.getDataVersion`, 500 if it isn't there.
+    var version = 500
+    if root.contains("DataVersion") {
+        version = root["DataVersion"].number_int() ?? 500
+    }
+    let size = list_or_empty(root, "size")
+    let blocks = list_or_empty(root, "blocks")
+    var palettes = List<List<BlockInfo>>()
+    var listed = false
+    if root.contains("palettes") {
+        match root["palettes"] {
+            Tag.List(each) => {
+                listed = true
+                for p in each {
+                    let entries = match p {
+                        Tag.List(items) => items.copy(),
+                        _ => List<Tag>(),
+                    }
+                    palettes.push(load_palette(facts, entries, blocks))
+                }
+            },
+            _ => {},
+        }
+    }
+    if not listed {
+        palettes.push(load_palette(facts, list_or_empty(root, "palette"), blocks))
+    }
+    var entities = List<EntityInfo>()
+    for e in list_or_empty(root, "entities") {
+        match e {
+            Tag.Compound(m) => {
+                let pos = list_or_empty(m, "pos")
+                let block = list_or_empty(m, "blockPos")
+                if m.contains("nbt") {
+                    match m["nbt"] {
+                        Tag.Compound(data) => entities.push(EntityInfo {
+                            x: double_at(pos, 0),
+                            y: double_at(pos, 1),
+                            z: double_at(pos, 2),
+                            bx: int_at(block, 0),
+                            by: int_at(block, 1),
+                            bz: int_at(block, 2),
+                            nbt: data.copy(),
+                        }),
+                        _ => {},
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    return Template {
+        size_x: int_at(size, 0),
+        size_y: int_at(size, 1),
+        size_z: int_at(size, 2),
+        palettes: palettes,
+        entities: entities,
+        version: version,
+    }
+}
+
+// `loadPalette`: each block's state from the palette, air where the palette has none, sorted
+// into whole blocks, other blocks and blocks with data, each by `y`, `x`, `z`.
+fn load_palette(facts: Facts, palette: List<Tag>, blocks: List<Tag>) -> List<BlockInfo> {
+    var states = List<u32>()
+    for p in palette {
+        states.push(read_block_state(facts, p))
+    }
+    var full = List<BlockInfo>()
+    var others = List<BlockInfo>()
+    var entities = List<BlockInfo>()
+    for b in blocks {
+        match b {
+            Tag.Compound(m) => {
+                let pos = list_or_empty(m, "pos")
+                var index = 0
+                if m.contains("state") {
+                    index = m["state"].number_int() ?? 0
+                }
+                let state = if index >= 0 and usize.wrap(index) < states.len() { states[usize.wrap(index)] } else { facts.ids.air_state }
+                var nbt: JavaHashMap<String, Tag>? = none
+                if m.contains("nbt") {
+                    match m["nbt"] {
+                        Tag.Compound(data) => nbt = some(data.copy()),
+                        _ => {},
+                    }
+                }
+                let info = BlockInfo { x: int_at(pos, 0), y: int_at(pos, 1), z: int_at(pos, 2), state: state, nbt: nbt }
+                // `addToLists`.
+                if info.nbt != none {
+                    entities.push(info)
+                } else if not facts.dynamic_shape(facts.block(state)) and facts.collision_full_block(state) {
+                    full.push(info)
+                } else {
+                    others.push(info)
+                }
+            },
+            _ => {},
+        }
+    }
+    var out = sorted(full)
+    for info in sorted(others) {
+        out.push(info.copy())
+    }
+    for info in sorted(entities) {
+        out.push(info.copy())
+    }
+    return out
+}
+
+// The blocks by `y`, then `x`, then `z`, the same in the order they came: a stable sort.
+fn sorted(infos: List<BlockInfo>) -> List<BlockInfo> {
+    var out = infos.copy()
+    // Insertion sort, stable; templates are small.
+    for i in 1..out.len() {
+        var j = i
+        while j > 0 and before(out[j], out[j - 1]) {
+            let a = out[j - 1].copy()
+            out[j - 1] = out[j].copy()
+            out[j] = a
+            j -= 1
+        }
+    }
+    return out
+}
+
+fn before(a: BlockInfo, b: BlockInfo) -> bool {
+    if a.y != b.y {
+        return a.y < b.y
+    }
+    if a.x != b.x {
+        return a.x < b.x
+    }
+    return a.z < b.z
+}
+
+// `NbtUtils.readBlockState`: air for a block that isn't there, and the default state's value
+// for a property that isn't one of the block's or isn't one of its values.
+fn read_block_state(facts: Facts, tag: Tag) -> u32 {
+    match tag {
+        Tag.Compound(m) => {
+            if not m.contains("id") {
+                return facts.ids.air_state
+            }
+            match m["id"] {
+                Tag.Str(_) => {},
+                _ => return facts.ids.air_state,
+            }
+            return match facts.codec.decode(tag) {
+                ok(s) => s,
+                err(_) => facts.ids.air_state,
+            }
+        },
+        _ => return facts.ids.air_state,
+    }
+}
+
+// `getListOrEmpty`.
+fn list_or_empty(m: JavaHashMap<String, Tag>, key: str) -> List<Tag> {
+    if not m.contains(key) {
+        return List<Tag>()
+    }
+    return match m[key] {
+        Tag.List(items) => items.copy(),
+        _ => List<Tag>(),
+    }
+}
+
+// `ListTag.getIntOr(i, 0)`.
+fn int_at(items: List<Tag>, i: usize) -> i32 {
+    if i >= items.len() {
+        return 0
+    }
+    return items[i].number_int() ?? 0
+}
+
+// `ListTag.getDoubleOr(i, 0.0)`.
+fn double_at(items: List<Tag>, i: usize) -> f64 {
+    if i >= items.len() {
+        return 0.0
+    }
+    return items[i].number_double() ?? 0.0
+}
+
+// Processors.
+
+/// A `StructureProcessor`.
+pub enum Processor {
+    /// `block_rot`: each block, of the blocks if given, kept with the chance `integrity`.
+    Rot { blocks: BlockSet?, integrity: f32 }
+    /// `protected_blocks`: nothing placed where these are.
+    Protected(BlockSet)
+    /// `rule`: the first rule that holds gives the block.
+    Rules(List<ProcessorRule>)
+    /// `block_ignore`: these blocks aren't placed.
+    Ignore(BlockSet)
+    Nop
+    /// A processor type Calcite doesn't place yet.
+    Unsupported(String)
+}
+
+/// A `ProcessorRule`.
+pub struct ProcessorRule {
+    pub input: Rule
+    pub location: Rule
+    pub position: PosRule
+    pub output: u32
+    pub modifier: Modifier
+}
+
+/// A `PosRuleTest`.
+pub enum PosRule {
+    AlwaysTrue
+    /// `linear_pos`, and `axis_aligned_linear_pos` along `axis` (0 `x`, 1 `y`, 2 `z`), or
+    /// along all three for -1.
+    Linear { min_chance: f32, max_chance: f32, min_dist: i32, max_dist: i32, axis: i32 }
+}
+
+/// A `RuleBlockEntityModifier`.
+pub enum Modifier {
+    Passthrough
+    Clear
+    AppendLoot(String)
+    AppendStatic(JavaHashMap<String, Tag>)
+}
+
+/// `StructureProcessorType.LIST_CODEC`: a processor list by its ID, `{processors: [...]}`, or
+/// the list itself.
+pub fn read_processor_list(zip: Zip, facts: Facts, rd: Readers, value: Json) -> List<Processor> ! String {
+    if let text = as_string(value) {
+        let id = (try Identifier.parse(text)).to_string()
+        let json = try data_json(zip, id, String("processor_list"))
+        return try read_direct_list(facts, rd, json)
+    }
+    return try read_direct_list(facts, rd, value)
+}
+
+// `DIRECT_CODEC`: `{processors: [...]}`, else the list.
+fn read_direct_list(facts: Facts, rd: Readers, value: Json) -> List<Processor> ! String {
+    match value {
+        Json.Object(_) => {
+            let m = try map_of(value)
+            let v = field(m, "processors") else fail "No key processors in MapLike"
+            return try read_processors(facts, rd, v)
+        },
+        _ => return try read_processors(facts, rd, value),
+    }
+}
+
+fn read_processors(facts: Facts, rd: Readers, value: Json) -> List<Processor> ! String {
+    var out = List<Processor>()
+    for item in try list_of(value) {
+        out.push(try read_processor(facts, rd, item))
+    }
+    return out
+}
+
+// `SINGLE_CODEC`: by `processor_type`.
+fn read_processor(facts: Facts, rd: Readers, value: Json) -> Processor ! String {
+    let m = try map_of(value)
+    let t = field(m, "processor_type") else fail "No key processor_type in MapLike"
+    let text = as_string(t) else fail "Not a string: {t}"
+    let kind = (try Identifier.parse(text)).to_string()
+    if kind == "minecraft:block_rot" {
+        var blocks: BlockSet? = none
+        if let v = field(m, "rottable_blocks") {
+            blocks = some(try read_blocks(facts, rd.blocks, v))
+        }
+        return Processor.Rot { blocks: blocks, integrity: try float_range_field(m, "integrity", 0.0f32, 1.0f32) }
+    }
+    if kind == "minecraft:protected_blocks" {
+        let v = field(m, "value") else fail "No key value in MapLike"
+        return Processor.Protected(try read_blocks(facts, rd.blocks, v))
+    }
+    if kind == "minecraft:rule" {
+        let v = field(m, "rules") else fail "No key rules in MapLike"
+        var rules = List<ProcessorRule>()
+        for item in try list_of(v) {
+            rules.push(try read_processor_rule(facts, item))
+        }
+        return Processor.Rules(rules)
+    }
+    if kind == "minecraft:block_ignore" {
+        let v = field(m, "blocks") else fail "No key blocks in MapLike"
+        var set = BlockSet.empty(facts.block_count)
+        for item in try list_of(v) {
+            set.add(facts.block(try read_state(facts, item)))
+        }
+        return Processor.Ignore(set)
+    }
+    if kind == "minecraft:nop" {
+        return Processor.Nop
+    }
+    let known: List<String> = ["blackstone_replace", "block_age", "capped", "gravity", "jigsaw_replacement", "lava_submerged_block"]
+    for k in known {
+        if kind == "minecraft:{k}" {
+            return Processor.Unsupported(kind.copy())
+        }
+    }
+    fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:worldgen/structure_processor]: {kind}"
+}
+
+// `ProcessorRule.CODEC`.
+fn read_processor_rule(facts: Facts, value: Json) -> ProcessorRule ! String {
+    let m = try map_of(value)
+    let i = field(m, "input_predicate") else fail "No key input_predicate in MapLike"
+    let l = field(m, "location_predicate") else fail "No key location_predicate in MapLike"
+    let input = try read_rule(facts, i)
+    let location = try read_rule(facts, l)
+    // Lenient: one that can't be read is the default.
+    var position = PosRule.AlwaysTrue
+    if let p = field(m, "position_predicate") {
+        match read_pos_rule(p) {
+            ok(read) => position = read,
+            err(_) => {},
+        }
+    }
+    let o = field(m, "output_state") else fail "No key output_state in MapLike"
+    let output = try read_state(facts, o)
+    var modifier = Modifier.Passthrough
+    if let b = field(m, "block_entity_modifier") {
+        match read_modifier(b) {
+            ok(read) => modifier = read,
+            err(_) => {},
+        }
+    }
+    return ProcessorRule { input: input, location: location, position: position, output: output, modifier: modifier }
+}
+
+// `PosRuleTest.CODEC`.
+fn read_pos_rule(value: Json) -> PosRule ! String {
+    let m = try map_of(value)
+    let t = field(m, "predicate_type") else fail "No key predicate_type in MapLike"
+    let text = as_string(t) else fail "Not a string: {t}"
+    let kind = (try Identifier.parse(text)).to_string()
+    if kind == "minecraft:always_true" {
+        return PosRule.AlwaysTrue
+    }
+    if kind != "minecraft:linear_pos" and kind != "minecraft:axis_aligned_linear_pos" {
+        fail "Unknown pos rule test type: {kind}"
+    }
+    let min_chance = try optional_float(m, "min_chance")
+    let max_chance = try optional_float(m, "max_chance")
+    let min_dist = try optional_int(m, "min_dist")
+    let max_dist = try optional_int(m, "max_dist")
+    // The constructor throws for an empty range; the lenient field reads that as the default.
+    if min_dist >= max_dist {
+        fail "Invalid range: [{min_dist},{max_dist}]"
+    }
+    var axis = -1
+    if kind == "minecraft:axis_aligned_linear_pos" {
+        axis = 1
+        if let a = field(m, "axis") {
+            let name = as_string(a) else fail "Not a string: {a}"
+            if name == "x" {
+                axis = 0
+            } else if name == "y" {
+                axis = 1
+            } else if name == "z" {
+                axis = 2
+            } else {
+                fail "Unknown element name:{name}"
+            }
+        }
+    }
+    return PosRule.Linear { min_chance: min_chance, max_chance: max_chance, min_dist: min_dist, max_dist: max_dist, axis: axis }
+}
+
+fn optional_float(m: List<Member>, key: str) -> f32 ! String {
+    let v = field(m, key) else return 0.0f32
+    return try float_of(v)
+}
+
+fn optional_int(m: List<Member>, key: str) -> i32 ! String {
+    let v = field(m, key) else return 0
+    return try int_of(v)
+}
+
+// `RuleBlockEntityModifier.CODEC`.
+fn read_modifier(value: Json) -> Modifier ! String {
+    let m = try map_of(value)
+    let t = field(m, "type") else fail "No key type in MapLike"
+    let text = as_string(t) else fail "Not a string: {t}"
+    let kind = (try Identifier.parse(text)).to_string()
+    if kind == "minecraft:passthrough" {
+        return Modifier.Passthrough
+    }
+    if kind == "minecraft:clear" {
+        return Modifier.Clear
+    }
+    if kind == "minecraft:append_loot" {
+        let v = field(m, "loot_table") else fail "No key loot_table in MapLike"
+        let name = as_string(v) else fail "Not a string: {v}"
+        return Modifier.AppendLoot((try Identifier.parse(name)).to_string())
+    }
+    if kind == "minecraft:append_static" {
+        let v = field(m, "data") else fail "No key data in MapLike"
+        match Tag.from_json(v) {
+            Tag.Compound(data) => return Modifier.AppendStatic(data.copy()),
+            _ => fail "Not a map: {v}",
+        }
+    }
+    fail "Unknown rule block entity modifier type: {kind}"
+}
+
+// Placing.
+
+/// A box of blocks, both corners in it: `BoundingBox`.
+pub struct Bounds {
+    pub min_x: i32
+    pub min_y: i32
+    pub min_z: i32
+    pub max_x: i32
+    pub max_y: i32
+    pub max_z: i32
+}
+
+impl Bounds {
+    /// `BoundingBox.fromCorners`.
+    pub fn of_corners(ax: i32, ay: i32, az: i32, bx: i32, by: i32, bz: i32) -> Bounds {
+        return Bounds { min_x: ax.min(bx), min_y: ay.min(by), min_z: az.min(bz), max_x: ax.max(bx), max_y: ay.max(by), max_z: az.max(bz) }
+    }
+
+    /// `isInside`.
+    pub fn inside(self, x: i32, y: i32, z: i32) -> bool {
+        return x >= self.min_x and x <= self.max_x and z >= self.min_z and z <= self.max_z and y >= self.min_y and y <= self.max_y
+    }
+}
+
+/// `StructurePlaceSettings`, with its random given apart from it.
+pub struct Settings {
+    pub mirror: i32 = MIRROR_NONE
+    pub rotation: i32 = ROTATION_NONE
+    pub pivot_x: i32 = 0
+    pub pivot_z: i32 = 0
+    pub ignore_entities: bool = false
+    pub bounds: Bounds? = none
+    /// `LiquidSettings.APPLY_WATERLOGGING`.
+    pub waterlogging: bool = true
+    /// Whether it has a random, which is the one placing is given; without one, each block's
+    /// is made from where it is.
+    pub has_random: bool = false
+    pub processors: List<Processor> = List<Processor>()
+    pub known_shape: bool = false
+}
+
+/// `StructureTemplate.transform` of a block: mirrored, then turned about the pivot.
+pub fn transform(x: i32, y: i32, z: i32, mirror: i32, rotation: i32, pivot_x: i32, pivot_z: i32) -> (i32, i32, i32) {
+    var mx = x
+    var mz = z
+    if mirror == LEFT_RIGHT {
+        mz = -z
+    } else if mirror == FRONT_BACK {
+        mx = -x
+    }
+    return match rotation {
+        3 => (pivot_x - pivot_z + mz, y, pivot_x + pivot_z - mx),
+        1 => (pivot_x + pivot_z - mz, y, pivot_z - pivot_x + mx),
+        2 => (pivot_x + pivot_x - mx, y, pivot_z + pivot_z - mz),
+        _ => (mx, y, mz),
+    }
+}
+
+impl Template {
+    /// `getSize(rotation)`: the size, `x` and `z` swapped by a quarter turn.
+    pub fn size(self, rotation: i32) -> (i32, i32, i32) {
+        if rotation == CLOCKWISE_90 or rotation == COUNTERCLOCKWISE_90 {
+            return (self.size_z, self.size_y, self.size_x)
+        }
+        return (self.size_x, self.size_y, self.size_z)
+    }
+
+    /// `getZeroPositionWithTransform`: where to place it from for its corner to be at the block.
+    pub fn zero_position(self, x: i32, y: i32, z: i32, mirror: i32, rotation: i32) -> (i32, i32, i32) {
+        let sx = self.size_x - 1
+        let sz = self.size_z - 1
+        let mdx = if mirror == FRONT_BACK { sx } else { 0 }
+        let mdz = if mirror == LEFT_RIGHT { sz } else { 0 }
+        return match rotation {
+            3 => (x + mdz, y, z + sx - mdx),
+            1 => (x + sz - mdz, y, z + mdx),
+            2 => (x + sx - mdx, y, z + sz - mdz),
+            _ => (x + mdx, y, z + mdz),
+        }
+    }
+
+    /// `getBoundingBox(settings, position)`.
+    pub fn bounding_box(self, s: Settings, x: i32, y: i32, z: i32) -> Bounds {
+        let (ax, ay, az) = transform(0, 0, 0, s.mirror, s.rotation, s.pivot_x, s.pivot_z)
+        let (bx, by, bz) = transform(self.size_x - 1, self.size_y - 1, self.size_z - 1, s.mirror, s.rotation, s.pivot_x, s.pivot_z)
+        let b = Bounds.of_corners(ax, ay, az, bx, by, bz)
+        return Bounds { min_x: b.min_x + x, min_y: b.min_y + y, min_z: b.min_z + z, max_x: b.max_x + x, max_y: b.max_y + y, max_z: b.max_z + z }
+    }
+}
+
+// A block to place, where it goes in the world.
+struct Placing {
+    x: i32
+    y: i32
+    z: i32
+    state: u32
+    nbt: JavaHashMap<String, Tag>?
+}
+
+/// `StructureTemplate.placeInWorld`: the template placed from the block `x, y, z` with the
+/// settings `s`, where `rx, ry, rz` is the reference processors measure from, and `flags` the
+/// update flags it sets blocks with. False if it has no palette, or nothing to place.
+pub fn place_in_world<T: RandomSource>(e: Env, r: mut Region, t: Template, x: i32, y: i32, z: i32, rx: i32, ry: i32, rz: i32, s: Settings, rand: mut T, flags: i32) -> bool ! Thrown {
+    let Env { facts: f, .. } = e
+    if t.palettes.is_empty() {
+        return false
+    }
+    if t.version < DATA_VERSION {
+        fail Thrown { exception: "Unimplemented", message: "a structure template from data version {t.version}, which vanilla upgrades" }
+    }
+    // `getRandomPalette`.
+    let count = i32.wrap(t.palettes.len())
+    var p = 0
+    if s.has_random {
+        p = rand.next_int_below(count)
+    } else {
+        var seeded = LegacyRandom.new(position_seed(x, y, z))
+        p = seeded.next_int_below(count)
+    }
+    let pi = usize.wrap(p)
+    if (t.palettes[pi].is_empty() and (s.ignore_entities or t.entities.is_empty())) or t.size_x < 1 or t.size_y < 1 or t.size_z < 1 {
+        return false
+    }
+    let processed = try process_infos(e, r, x, y, z, rx, ry, rz, s, t.palettes[pi], mut rand)
+    var to_fill = List<(i32, i32, i32)>()
+    var locked = List<(i32, i32, i32)>()
+    var placed = List<(i32, i32, i32)>()
+    var min_x = 2147483647
+    var min_y = 2147483647
+    var min_z = 2147483647
+    var max_x = -2147483648
+    var max_y = -2147483648
+    var max_z = -2147483648
+    let barrier = f.default_state(try f.named_block("barrier"))
+    for info in processed {
+        if let b = s.bounds {
+            if not b.inside(info.x, info.y, info.z) {
+                continue
+            }
+        }
+        var previous: u32? = none
+        if s.waterlogging {
+            previous = some(try r.state(f, info.x, info.y, info.z))
+        }
+        let state = f.rotate(f.mirror(info.state, s.mirror), s.rotation)
+        if info.nbt != none {
+            _ = r.set_block(f, info.x, info.y, info.z, barrier, 820)
+        }
+        if not r.set_block(f, info.x, info.y, info.z, state, flags) {
+            continue
+        }
+        min_x = min_x.min(info.x)
+        min_y = min_y.min(info.y)
+        min_z = min_z.min(info.z)
+        max_x = max_x.max(info.x)
+        max_y = max_y.max(info.y)
+        max_z = max_z.max(info.z)
+        placed.push((info.x, info.y, info.z))
+        if let data = info.nbt {
+            if let kind = try r.block_entity(f, info.x, info.y, info.z) {
+                var loaded = data.copy()
+                if randomizable(kind) {
+                    loaded.insert("LootTableSeed", Tag.Long(rand.next_long()))
+                }
+                try r.load_block_entity(info.x, info.y, info.z, loaded)
+            }
+        }
+        if let old_state = previous {
+            if f.is_source(state) {
+                locked.push((info.x, info.y, info.z))
+            } else if f.liquid_container(f.block(state)) {
+                _ = try place_liquid(f, mut r, info.x, info.y, info.z, state, old_state)
+                if not f.is_source(old_state) {
+                    to_fill.push((info.x, info.y, info.z))
+                }
+            }
+        }
+    }
+    // Liquid that flows into what's placed from sources beside it, until none does.
+    var filled = true
+    while filled and not to_fill.is_empty() {
+        filled = false
+        var left = List<(i32, i32, i32)>()
+        for (px, py, pz) in to_fill {
+            var source = try r.state(f, px, py, pz)
+            // Up, north, east, south, west.
+            let dx: List<i32> = [0, 0, 1, 0, -1]
+            let dy: List<i32> = [1, 0, 0, 0, 0]
+            let dz: List<i32> = [0, -1, 0, 1, 0]
+            var i: usize = 0
+            while i < 5 and not f.is_source(source) {
+                let nx = px + dx[i]
+                let ny = py + dy[i]
+                let nz = pz + dz[i]
+                let neighbour = try r.state(f, nx, ny, nz)
+                if f.is_source(neighbour) and not locked.contains((nx, ny, nz)) {
+                    source = neighbour
+                }
+                i += 1
+            }
+            if f.is_source(source) {
+                let here = try r.state(f, px, py, pz)
+                if f.liquid_container(f.block(here)) {
+                    _ = try place_liquid(f, mut r, px, py, pz, here, source)
+                    filled = true
+                    continue
+                }
+            }
+            left.push((px, py, pz))
+        }
+        to_fill = left
+    }
+    if min_x <= max_x {
+        if not s.known_shape {
+            var shape = Shape.new(min_x, min_y, min_z, max_x - min_x + 1, max_y - min_y + 1, max_z - min_z + 1)
+            for (px, py, pz) in placed {
+                shape.fill(px, py, pz)
+            }
+            try update_edges(e, mut r, shape, flags)
+            for (px, py, pz) in placed {
+                let state = try r.state(f, px, py, pz)
+                let updated = try update_from_neighbours(e, mut r, state, px, py, pz)
+                if updated != state {
+                    _ = r.set_block(f, px, py, pz, updated, (flags & -2) | 16)
+                }
+            }
+        }
+    }
+    if not s.ignore_entities {
+        for entity in t.entities {
+            let (bx, by, bz) = transform(entity.bx, entity.by, entity.bz, s.mirror, s.rotation, s.pivot_x, s.pivot_z)
+            var inside = true
+            if let b = s.bounds {
+                inside = b.inside(bx + x, by + y, bz + z)
+            }
+            if inside {
+                fail Thrown { exception: "Unimplemented", message: "an entity of a structure template" }
+            }
+        }
+    }
+    return true
+}
+
+// Whether a block entity of this type is a `RandomizableContainer`, which a template gives a
+// new loot table seed.
+fn randomizable(kind: String) -> bool {
+    let kinds: List<String> = ["barrel", "chest", "trapped_chest", "crafter", "dispenser", "dropper", "hopper", "shulker_box", "decorated_pot"]
+    for k in kinds {
+        if kind == "minecraft:{k}" {
+            return true
+        }
+    }
+    return false
+}
+
+// `LiquidBlockContainer.placeLiquid` of the block, with the fluid of the state `fluid`: a
+// waterloggable block not yet waterlogged takes water and a tick of it; kelp and seagrass take
+// nothing.
+fn place_liquid(f: Facts, r: mut Region, x: i32, y: i32, z: i32, state: u32, fluid: u32) -> bool ! Thrown {
+    let block = f.block(state)
+    if not f.waterloggable(block) {
+        return false
+    }
+    if f.is_a(block, "SlabBlock") and (f.get_name(state, "type") ?? String()) == "double" {
+        return false
+    }
+    if f.get_bool(state, "waterlogged") or f.fluid(fluid) != WATER_FLUID {
+        return false
+    }
+    if (f.is_a(block, "CampfireBlock") or f.is_a(block, "CandleBlock")) and f.get_bool(state, "lit") {
+        fail Thrown { exception: "Unimplemented", message: "a lit campfire or candle put out by a template's water" }
+    }
+    _ = r.set_block(f, x, y, z, try f.with_bool(state, "waterlogged", true), 3)
+    r.schedule_fluid(WATER_FLUID, x, y, z)
+    return true
+}
+
+// `processBlockInfos`: where each block goes, run through the processors, without those they
+// drop.
+fn process_infos<T: RandomSource>(e: Env, r: Region, x: i32, y: i32, z: i32, rx: i32, ry: i32, rz: i32, s: Settings, infos: List<BlockInfo>, rand: mut T) -> List<Placing> ! Thrown {
+    var whole = false
+    for p in s.processors {
+        match p {
+            Processor.Unsupported(kind) => if kind == "minecraft:capped" {
+                whole = true
+            },
+            _ => {},
+        }
+    }
+    var out = List<Placing>()
+    for info in infos {
+        let (tx, ty, tz) = transform(info.x, info.y, info.z, s.mirror, s.rotation, s.pivot_x, s.pivot_z)
+        let wx = tx + x
+        let wy = ty + y
+        let wz = tz + z
+        if not whole {
+            if let b = s.bounds {
+                if not b.inside(wx, wy, wz) {
+                    continue
+                }
+            }
+        }
+        var current = Placing { x: wx, y: wy, z: wz, state: info.state, nbt: info.nbt.copy() }
+        var kept = true
+        for p in s.processors {
+            match try process(e, r, p, current, rx, ry, rz, s, mut rand) {
+                some(next) => current = next,
+                none => {
+                    kept = false
+                    break
+                },
+            }
+        }
+        if kept {
+            out.push(current)
+        }
+    }
+    return out
+}
+
+// `processBlock` of one processor.
+fn process<T: RandomSource>(e: Env, r: Region, p: Processor, info: Placing, rx: i32, ry: i32, rz: i32, s: Settings, rand: mut T) -> Placing? ! Thrown {
+    let Env { facts: f, .. } = e
+    match p {
+        Processor.Rot { blocks, integrity } => {
+            if let set = blocks {
+                if not f.in_set(info.state, set) {
+                    return some(info.copy())
+                }
+            }
+            var chance = 0.0f32
+            if s.has_random {
+                chance = rand.next_float()
+            } else {
+                var seeded = LegacyRandom.new(position_seed(info.x, info.y, info.z))
+                chance = seeded.next_float()
+            }
+            if not (chance <= integrity) {
+                return none
+            }
+            return some(info.copy())
+        },
+        Processor.Protected(set) => {
+            if f.in_set(try r.state(f, info.x, info.y, info.z), set) {
+                return none
+            }
+            return some(info.copy())
+        },
+        Processor.Rules(rules) => {
+            var random = LegacyRandom.new(position_seed(info.x, info.y, info.z))
+            for rule in rules {
+                if not test_rule(f, rule.input, info.state, info.y, mut random) {
+                    continue
+                }
+                let here = try r.state(f, info.x, info.y, info.z)
+                if not test_rule(f, rule.location, here, info.y, mut random) {
+                    continue
+                }
+                if not test_pos(rule.position, info, rx, ry, rz, mut random) {
+                    continue
+                }
+                let nbt = try modified(rule.modifier, info.nbt.copy(), mut random)
+                return some(Placing { x: info.x, y: info.y, z: info.z, state: rule.output, nbt: nbt })
+            }
+            return some(info.copy())
+        },
+        Processor.Ignore(set) => {
+            if f.in_set(info.state, set) {
+                return none
+            }
+            return some(info.copy())
+        },
+        Processor.Nop => return some(info.copy()),
+        Processor.Unsupported(kind) => fail Thrown { exception: "Unimplemented", message: "the {kind} structure processor" },
+    }
+}
+
+// `PosRuleTest.test`.
+fn test_pos(rule: PosRule, info: Placing, rx: i32, ry: i32, rz: i32, random: mut LegacyRandom) -> bool {
+    match rule {
+        PosRule.AlwaysTrue => return true,
+        PosRule.Linear { min_chance, max_chance, min_dist, max_dist, axis } => {
+            // `distManhattan`, or the distance along the axis, which vanilla takes through a float.
+            let dist = if axis < 0 {
+                (info.x - rx).abs() + (info.y - ry).abs() + (info.z - rz).abs()
+            } else if axis == 0 {
+                i32.saturate(f64(to_f32((info.x - rx).abs())))
+            } else if axis == 1 {
+                i32.saturate(f64(to_f32((info.y - ry).abs())))
+            } else {
+                i32.saturate(f64(to_f32((info.z - rz).abs())))
+            }
+            let roll = random.next_float()
+            // `Mth.clampedLerp(Mth.inverseLerp(dist, min, max), min_chance, max_chance)`, in floats.
+            let factor = (to_f32(dist) - to_f32(min_dist)) / (to_f32(max_dist) - to_f32(min_dist))
+            let chance = if factor < 0.0f32 { min_chance } else if factor > 1.0f32 { max_chance } else { min_chance + factor * (max_chance - min_chance) }
+            return roll <= chance
+        },
+    }
+}
+
+// `RuleBlockEntityModifier.apply`.
+fn modified(m: Modifier, nbt: own JavaHashMap<String, Tag>?, random: mut LegacyRandom) -> JavaHashMap<String, Tag>? ! Thrown {
+    match m {
+        Modifier.Passthrough => return nbt,
+        Modifier.Clear => return some(JavaHashMap<String, Tag>()),
+        Modifier.AppendLoot(table) => {
+            var out = nbt ?? JavaHashMap<String, Tag>()
+            out.insert("LootTable", Tag.Str(table.copy()))
+            out.insert("LootTableSeed", Tag.Long(random.next_long()))
+            return some(out)
+        },
+        Modifier.AppendStatic(_) => fail Thrown { exception: "Unimplemented", message: "the append_static block entity modifier" },
+    }
+}
+
+// An int as Java makes it a float: the nearest.
+fn to_f32(v: i32) -> f32 {
+    return f32.nearest(f64(v))
+}
+
+/// `Rotation.rotate` of a horizontal direction.
+pub fn rotate_direction(rotation: i32, d: i32) -> i32 {
+    return match rotation {
+        1 => clockwise(d),
+        2 => opposite(d),
+        3 => clockwise(clockwise(clockwise(d))),
+        _ => d,
+    }
+}
+
+// The `template` and `fossil` features.
+
+/// A template a `template` feature can place, and the turns it can place it with.
+pub struct TemplateEntry {
+    pub template: usize
+    pub rotations: List<i32>
+}
+
+/// A `template` feature: its templates, weighted, and the processors it places them with.
+pub struct TemplateFeature {
+    pub entries: List<TemplateEntry>
+    pub weights: List<i32>
+    pub total: i32
+    pub processors: List<Processor>
+}
+
+/// A `fossil` feature: the fossils, each with its overlay, the processors of each, and how many
+/// of its corners may be open.
+pub struct Fossil {
+    pub fossils: List<usize>
+    pub overlays: List<usize>
+    pub fossil_processors: List<Processor>
+    pub overlay_processors: List<Processor>
+    pub max_empty_corners: i32
+}
+
+/// `TemplateFeature.CODEC`.
+pub fn read_template_feature(ts: mut Templates, zip: Zip, facts: Facts, rd: Readers, m: List<Member>) -> TemplateFeature ! String {
+    let v = field(m, "templates") else fail "No key templates in MapLike"
+    var entries = List<TemplateEntry>()
+    var weights = List<i32>()
+    var total: i64 = 0
+    for item in try list_of(v) {
+        let wm = try map_of(item)
+        let d = field(wm, "data") else fail "No key data in MapLike"
+        let w = field(wm, "weight") else fail "No key weight in MapLike"
+        let em = try map_of(d)
+        let id = try identifier_field(em, "id")
+        var rotations: List<i32> = [ROTATION_NONE, CLOCKWISE_90, CLOCKWISE_180, COUNTERCLOCKWISE_90]
+        if let rv = field(em, "rotations") {
+            rotations = List<i32>()
+            for name in try list_of(rv) {
+                rotations.push(try read_rotation(name))
+            }
+        }
+        let weight = try int_of(w)
+        if weight < 0 {
+            fail "Value must be non-negative: {weight}"
+        }
+        entries.push(TemplateEntry { template: try ts.get_or_create(zip, facts, id), rotations: rotations })
+        weights.push(weight)
+        total += i64(weight)
+    }
+    if total > 2147483647 {
+        fail "Sum of weights must be <= 2147483647"
+    }
+    var processors = List<Processor>()
+    if let p = field(m, "processors") {
+        processors = try read_processor_list(zip, facts, rd, p)
+    }
+    return TemplateFeature { entries: entries, weights: weights, total: i32.wrap(total), processors: processors }
+}
+
+// `Rotation.CODEC`: by name.
+fn read_rotation(value: Json) -> i32 ! String {
+    let name = as_string(value) else fail "Not a string: {value}"
+    if name == "none" {
+        return ROTATION_NONE
+    }
+    if name == "clockwise_90" {
+        return CLOCKWISE_90
+    }
+    if name == "180" {
+        return CLOCKWISE_180
+    }
+    if name == "counterclockwise_90" {
+        return COUNTERCLOCKWISE_90
+    }
+    fail "Unknown element name:{name}"
+}
+
+/// `FossilFeature.CODEC`.
+pub fn read_fossil(ts: mut Templates, zip: Zip, facts: Facts, rd: Readers, m: List<Member>) -> Fossil ! String {
+    let fossils = try template_list(mut ts, zip, facts, m, "fossil_structures")
+    let overlays = try template_list(mut ts, zip, facts, m, "overlay_structures")
+    let fp = field(m, "fossil_processors") else fail "No key fossil_processors in MapLike"
+    let fossil_processors = try read_processor_list(zip, facts, rd, fp)
+    let op = field(m, "overlay_processors") else fail "No key overlay_processors in MapLike"
+    let overlay_processors = try read_processor_list(zip, facts, rd, op)
+    let corners = try int_range_field(m, "max_empty_corners_allowed", 0, 7)
+    if fossils.len() != overlays.len() {
+        fail "Fossil structure lists must be equal lengths"
+    }
+    return Fossil { fossils: fossils, overlays: overlays, fossil_processors: fossil_processors, overlay_processors: overlay_processors, max_empty_corners: corners }
+}
+
+// A non-empty list of template IDs, each loaded.
+fn template_list(ts: mut Templates, zip: Zip, facts: Facts, m: List<Member>, key: str) -> List<usize> ! String {
+    let v = field(m, key) else fail "No key {key} in MapLike"
+    var out = List<usize>()
+    for item in try list_of(v) {
+        let text = as_string(item) else fail "Not a string: {item}"
+        let id = (try Identifier.parse(text)).to_string()
+        out.push(try ts.get_or_create(zip, facts, id))
+    }
+    if out.is_empty() {
+        fail "List must have contents"
+    }
+    return out
+}
+
+/// `TemplateFeature.place`: a template picked by weight, turned one of its ways, placed with
+/// its middle at the block.
+pub fn place_template_feature<T: RandomSource>(e: Env, r: mut Region, ts: Templates, rand: mut T, f: TemplateFeature, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if f.total == 0 {
+        fail Thrown { exception: "IllegalStateException", message: "No value present" }
+    }
+    let ei = pick_weighted(mut rand, f.weights, f.total)
+    let count = f.entries[ei].rotations.len()
+    if count == 0 {
+        fail Thrown { exception: "IllegalArgumentException", message: "Bound must be positive" }
+    }
+    let rotation = f.entries[ei].rotations[usize.wrap(rand.next_int_below(i32.wrap(count)))]
+    let ti = f.entries[ei].template
+    let half_x = ts.list[ti].size_x / 2
+    let half_z = ts.list[ti].size_z / 2
+    // `getRotatedOffset` along `x`, then `z`.
+    let dx = rotate_direction(rotation, WEST)
+    let dz = rotate_direction(rotation, NORTH)
+    let px = x + step_x(dx) * half_x + step_x(dz) * half_z
+    let pz = z + step_z(dx) * half_x + step_z(dz) * half_z
+    let s = Settings { rotation: rotation, has_random: true, processors: f.processors.copy() }
+    return try place_in_world(e, mut r, ts.list[ti], px, y, pz, px, y, pz, s, mut rand, 3)
+}
+
+// The pick of `WeightedList.getRandom`.
+fn pick_weighted<T: RandomSource>(rand: mut T, weights: List<i32>, total: i32) -> usize {
+    var selection = rand.next_int_below(total)
+    for i in 0..weights.len() {
+        selection -= weights[i]
+        if selection < 0 {
+            return i
+        }
+    }
+    return weights.len() - 1
+}
+
+/// `FossilFeature.place`: a fossil turned at random, sunk 15 to 24 below the lowest ocean floor
+/// under it, if no more of its corners than allowed are open, then its overlay.
+pub fn place_fossil<T: RandomSource>(e: Env, r: mut Region, ts: Templates, rand: mut T, fossil: Fossil, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let Env { facts: f, .. } = e
+    let rotation = rand.next_int_below(4)
+    let index = usize.wrap(rand.next_int_below(i32.wrap(fossil.fossils.len())))
+    let base = fossil.fossils[index]
+    let overlay = fossil.overlays[index]
+    let cx = (x >> 4) * 16
+    let cz = (z >> 4) * 16
+    let bounds = Bounds { min_x: cx - 16, min_y: r.min_y, min_z: cz - 16, max_x: cx + 15 + 16, max_y: r.min_y + r.height - 1, max_z: cz + 15 + 16 }
+    var s = Settings { rotation: rotation, bounds: some(bounds), has_random: true }
+    let (sx, _, sz) = ts.list[base].size(rotation)
+    let lx = x - sx / 2
+    let lz = z - sz / 2
+    var lowest = y
+    for xs in 0..sx {
+        for zs in 0..sz {
+            lowest = lowest.min(try r.get_height(f, OCEAN_FLOOR_WG, lx + xs, lz + zs))
+        }
+    }
+    let target_y = (lowest - 15 - rand.next_int_below(10)).max(r.min_y + 10)
+    let (tx, ty, tz) = ts.list[base].zero_position(lx, target_y, lz, MIRROR_NONE, rotation)
+    // `countEmptyCorners`.
+    let b = ts.list[base].bounding_box(s, tx, ty, tz)
+    var empty = 0
+    for cy in [b.max_y, b.min_y] {
+        for (kx, kz) in [(b.max_x, b.max_z), (b.min_x, b.max_z), (b.max_x, b.min_z), (b.min_x, b.min_z)] {
+            let st = try r.state(f, kx, cy, kz)
+            if f.is_air(st) or f.is(st, f.ids.lava) or f.is(st, f.ids.water) {
+                empty += 1
+            }
+        }
+    }
+    if empty > fossil.max_empty_corners {
+        return false
+    }
+    s.processors = fossil.fossil_processors.copy()
+    _ = try place_in_world(e, mut r, ts.list[base], tx, ty, tz, tx, ty, tz, s, mut rand, 260)
+    s.processors = fossil.overlay_processors.copy()
+    _ = try place_in_world(e, mut r, ts.list[overlay], tx, ty, tz, tx, ty, tz, s, mut rand, 260)
+    return true
+}

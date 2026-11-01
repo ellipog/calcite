@@ -407,6 +407,26 @@ def block_facts_module(index, flags):
         "/// `Block.isShapeFullBlock` of `getFaceOcclusionShape`, a bit for each face in `Direction` order.",
     ]
     lines += encoded_table("state_occlusion", "occlusion", [(v >> OCCLUSION_FACE_SHIFT) & 63 for v in values])
+    # `BlockState.rotate` and `mirror`, each as how far the state it makes is from the state, so
+    # that most are 0 and the rest few. Turning 180 and counterclockwise is turning clockwise twice
+    # and three times, for every state, so only the clockwise turn is written.
+    turned = {t[0]: t for t in flags["turns"]}
+    cw = [turned[s][1] if s in turned else s for s in range(len(values))]
+    for s, t in turned.items():
+        if cw[cw[s]] != t[2] or cw[cw[cw[s]]] != t[3]:
+            raise ValueError(f"state {s}'s turns aren't one clockwise turn made two and three times")
+    for i, (fn, what, doc) in enumerate([
+        ("state_turns", "turns", "turned clockwise a quarter: `rotate(Rotation.CLOCKWISE_90)`"),
+        ("state_mirrors_left_right", "mirrors", "mirrored left to right: `mirror(Mirror.LEFT_RIGHT)`"),
+        ("state_mirrors_front_back", "mirrors", "mirrored front to back: `mirror(Mirror.FRONT_BACK)`"),
+    ]):
+        column = 1 if i == 0 else i + 3
+        made = [turned[s][column] if s in turned else s for s in range(len(values))]
+        # src/worldgen/facts.calx keeps them as i16s.
+        if any(abs(m - s) > 32767 for s, m in enumerate(made)):
+            raise ValueError(f"a state is further than an i16 from what it is {doc}")
+        lines += [f"/// How far each state is from what it is {doc}, in state ID order, as a u32 that wraps."]
+        lines += encoded_table(fn, what, [(m - s) & 0xFFFFFFFF for s, m in enumerate(made)])
     lines += [
         "/// The names of the classes vanilla's blocks are and the classes they extend, sorted: an",
         "/// anonymous class by the class it extends.",
@@ -444,6 +464,15 @@ def block_facts_module(index, flags):
     lines += number_list(
         "flammable_blocks", "blocks", flags["flammable_blocks"],
         ["/// The blocks fire can burn, by ID: those `FireBlock`'s ignite odds are above 0 for."])
+    lines += number_list(
+        "waterloggable_blocks", "blocks", flags["waterloggable_blocks"],
+        ["/// The blocks that are `SimpleWaterloggedBlock`s, by ID."])
+    lines += number_list(
+        "liquid_containers", "blocks", flags["liquid_containers"],
+        ["/// The other blocks that are `LiquidBlockContainer`s, by ID."])
+    lines += number_list(
+        "dynamic_shape_blocks", "blocks", flags["dynamic_shape_blocks"],
+        ["/// The blocks whose shape can change where they stand, by ID: `Block.hasDynamicShape`."])
     pairs = [str(v) for pair in flags["poi"] for v in pair]
     lines += [
         "/// The states that are points of interest, each followed by its type's ID in the",
