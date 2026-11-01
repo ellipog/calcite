@@ -103,6 +103,14 @@ final class BlockFlags {
         // way round: what `Block.isShapeFullBlock(getShape)` says, as an exception to
         // `isCollisionShapeFullBlock`.
         StringBuilder outline = new StringBuilder();
+        // The states whose collision shape's bottom covers `WallBlock`'s test shapes otherwise
+        // than its face being full says, all of them or none: each state and its mask, a bit for
+        // the post's test and then one for the north, east, south and west wall's.
+        StringBuilder wallCover = new StringBuilder();
+        VoxelShape postTest = Block.column(2.0, 0.0, 16.0);
+        Map<Direction, VoxelShape> wallTests = Shapes.rotateHorizontal(Block.boxZ(2.0, 16.0, 0.0, 9.0));
+        VoxelShape[] coverTests = {postTest, wallTests.get(Direction.NORTH), wallTests.get(Direction.EAST),
+                wallTests.get(Direction.SOUTH), wallTests.get(Direction.WEST)};
         json.append("{\n  \"game_version\": \"").append(SharedConstants.getCurrentVersion().name()).append("\",\n");
         json.append("  \"states\": ").append(count).append(",\n  \"flags\": [");
         for (int id = 0; id < count; id++) {
@@ -121,6 +129,17 @@ final class BlockFlags {
             boolean shapeFull = Block.isShapeFullBlock(state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO));
             if (shapeFull != state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)) {
                 outline.append(outline.isEmpty() ? "" : ", ").append(id);
+            }
+            VoxelShape below = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+            VoxelShape bottom = below.getFaceShape(Direction.DOWN);
+            int cover = 0;
+            for (int i = 0; i < coverTests.length; i++) {
+                if (!Shapes.joinIsNotEmpty(coverTests[i], bottom, net.minecraft.world.phys.shapes.BooleanOp.ONLY_FIRST)) {
+                    cover |= 1 << i;
+                }
+            }
+            if (cover != (Block.isFaceFull(below, Direction.DOWN) ? 31 : 0)) {
+                wallCover.append(wallCover.isEmpty() ? "[" : ", [").append(id).append(", ").append(cover).append("]");
             }
         }
         StringBuilder poi = new StringBuilder();
@@ -231,6 +250,7 @@ final class BlockFlags {
         json.append("  \"liquid_containers\": [").append(containers).append("],\n");
         json.append("  \"dynamic_shape_blocks\": [").append(dynamic).append("],\n");
         json.append("  \"outline_differs\": [").append(outline).append("],\n");
+        json.append("  \"wall_cover\": [").append(wallCover).append("],\n");
         json.append("  \"class_parents\": {").append(parentJson).append("},\n");
         json.append("  \"poi\": [").append(poi).append("],\n");
         json.append("  \"block_entities\": [").append(blockEntities).append("],\n");

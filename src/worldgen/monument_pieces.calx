@@ -1,0 +1,1286 @@
+/// The ocean monument placed as `OceanMonumentPieces` places it. A start keeps only the
+/// building, as vanilla's does once saved, so each chunk rebuilds the rooms inside it from the
+/// world's seed and the start's chunk, as `OceanMonumentStructure.regeneratePiecesAfterLoad`
+/// does: the room graph with its openings closed at random, the rooms fitted into it, the wings
+/// and the penthouse. Then the building's walls, roof, pillars and water, and every room in the
+/// chunk with the same random.
+module worldgen.monument_pieces
+
+import random.legacy.{LegacyRandom}
+import random.source.{RandomSource}
+import random.worldgen.{WorldgenRandom}
+import worldgen.drawing.{Frame, block_state, boxes, blocks, fill_down, get, place, spawn_mob}
+import worldgen.facts.{DOWN, EAST, Facts, NORTH, SOUTH, UP, WEST}
+import worldgen.interval.{Thrown}
+import worldgen.multiface.{shuffle}
+import worldgen.pieces.{Piece, make_box, random_horizontal}
+import worldgen.region.{Region}
+import worldgen.template.{Bounds}
+
+// The rooms a monument is built from, in the order `MonumentBuilding` makes them.
+const ENTRY: i32 = 0
+const CORE: i32 = 1
+const DOUBLE_XY: i32 = 2
+const DOUBLE_YZ: i32 = 3
+const DOUBLE_Z: i32 = 4
+const DOUBLE_X: i32 = 5
+const DOUBLE_Y: i32 = 6
+const SIMPLE_TOP: i32 = 7
+const SIMPLE: i32 = 8
+const WING: i32 = 9
+const PENTHOUSE: i32 = 10
+
+/// `RoomDefinition`s side by side: each room's grid index, its six neighbours by direction
+/// (-1 for none), which of them it opens to, and whether it's claimed, the source, and the last
+/// search that reached it.
+struct Graph {
+    index: List<i32>
+    links: List<i32>
+    open: List<bool>
+    claimed: List<bool>
+    source: List<bool>
+    scan: List<i32>
+}
+
+impl Graph {
+    fn add(mut self, index: i32) -> i32 {
+        let id = i32.wrap(self.index.len())
+        self.index.push(index)
+        for _ in 0..6 {
+            self.links.push(-1)
+            self.open.push(false)
+        }
+        self.claimed.push(false)
+        self.source.push(false)
+        self.scan.push(0)
+        return id
+    }
+
+    fn link(self, room: i32, d: i32) -> i32 {
+        return self.links[usize.wrap(room * 6 + d)]
+    }
+
+    fn is_open(self, room: i32, d: i32) -> bool {
+        return self.open[usize.wrap(room * 6 + d)]
+    }
+
+    fn set_open(mut self, room: i32, d: i32, value: bool) {
+        self.open[usize.wrap(room * 6 + d)] = value
+    }
+
+    fn claim(mut self, room: i32) {
+        self.claimed[usize.wrap(room)] = true
+    }
+
+    fn claim_link(mut self, home: i32, d: i32) {
+        let other = self.links[usize.wrap(home * 6 + d)]
+        self.claimed[usize.wrap(other)] = true
+    }
+
+    fn is_claimed(self, room: i32) -> bool {
+        return self.claimed[usize.wrap(room)]
+    }
+
+    // `setConnection`.
+    fn connect(mut self, room: i32, d: i32, other: i32) {
+        self.links[usize.wrap(room * 6 + d)] = other
+        self.links[usize.wrap(other * 6 + back(d))] = room
+    }
+
+    // `updateOpenings`.
+    fn update_openings(mut self, room: i32) {
+        for d in 0..6 {
+            self.open[usize.wrap(room * 6 + d)] = self.links[usize.wrap(room * 6 + d)] >= 0
+        }
+    }
+
+    // `countOpenings`.
+    fn openings(self, room: i32) -> i32 {
+        var n = 0
+        for d in 0..6 {
+            if self.open[usize.wrap(room * 6 + d)] {
+                n += 1
+            }
+        }
+        return n
+    }
+
+    fn grid_index(self, room: i32) -> i32 {
+        return self.index[usize.wrap(room)]
+    }
+}
+
+// `Direction.getOpposite` on the 3D values: down and up, north and south, west and east.
+fn back(d: i32) -> i32 {
+    return if d % 2 == 0 { d + 1 } else { d - 1 }
+}
+
+// `RoomDefinition.findSource`: whether an open way leads from the room to the source.
+fn find_source(g: mut Graph, room: i32, scan: i32) -> bool {
+    if g.source[usize.wrap(room)] {
+        return true
+    }
+    g.scan[usize.wrap(room)] = scan
+    for d in 0..6 {
+        let other = g.link(room, d)
+        if other >= 0 and g.is_open(room, d) and g.scan[usize.wrap(other)] != scan and find_source(mut g, other, scan) {
+            return true
+        }
+    }
+    return false
+}
+
+// `getRoomIndex`.
+fn room_index(x: i32, y: i32, z: i32) -> i32 {
+    return y * 25 + z * 5 + x
+}
+
+/// One of the building's rooms: what it is, its room in the graph, its box, and its design.
+struct Room {
+    kind: i32
+    home: i32
+    bb: Bounds
+    design: i32
+}
+
+/// The building and its rooms, as `MonumentBuilding`'s constructor leaves them.
+struct Monument {
+    g: Graph
+    rooms: List<Room>
+}
+
+// `OceanMonumentPiece.makeBoundingBox`: the room's box from its place in the grid.
+fn room_box(index: i32, d: i32, width: i32, height: i32, depth: i32) -> Bounds {
+    let rx = index % 5
+    let rz = index / 5 % 5
+    let ry = index / 25
+    let b = make_box(0, 0, 0, d, width * 8, height * 4, depth * 8)
+    if d == NORTH {
+        return moved(b, rx * 8, ry * 4, -(rz + depth) * 8 + 1)
+    }
+    if d == SOUTH {
+        return moved(b, rx * 8, ry * 4, rz * 8)
+    }
+    if d == WEST {
+        return moved(b, -(rz + depth) * 8 + 1, ry * 4, rx * 8)
+    }
+    return moved(b, rz * 8, ry * 4, rx * 8)
+}
+
+fn moved(b: Bounds, x: i32, y: i32, z: i32) -> Bounds {
+    return Bounds { min_x: b.min_x + x, min_y: b.min_y + y, min_z: b.min_z + z, max_x: b.max_x + x, max_y: b.max_y + y, max_z: b.max_z + z }
+}
+
+fn fitted(g: Graph, kind: i32, home: i32, d: i32, width: i32, height: i32, depth: i32, design: i32) -> Room {
+    return Room { kind: kind, home: home, bb: room_box(g.grid_index(home), d, width, height, depth), design: design }
+}
+
+// `MonumentBuilding`'s constructor, from the random `regeneratePiecesAfterLoad` gives it.
+fn build(seed: i64, bb: Bounds, d: i32) -> Monument {
+    var random = WorldgenRandom.new(LegacyRandom.new(0))
+    random.set_large_feature_seed(seed, (bb.min_x + 29) >> 4, (bb.min_z + 29) >> 4)
+    _ = random_horizontal(mut random)
+    var g = Graph { index: List<i32>(), links: List<i32>(), open: List<bool>(), claimed: List<bool>(), source: List<bool>(), scan: List<i32>() }
+    // `generateRoomGraph`.
+    var grid = List<i32>()
+    for _ in 0..75 {
+        grid.push(-1)
+    }
+    for y in 0..2 {
+        for x in 0..5 {
+            for z in 0..4 {
+                let pos = room_index(x, y, z)
+                grid[usize.wrap(pos)] = g.add(pos)
+            }
+        }
+    }
+    for x in 1..4 {
+        for z in 0..2 {
+            let pos = room_index(x, 2, z)
+            grid[usize.wrap(pos)] = g.add(pos)
+        }
+    }
+    let source = grid[usize.wrap(room_index(2, 0, 0))]
+    let sx: List<i32> = [0, 0, 0, 0, -1, 1]
+    let sy: List<i32> = [-1, 1, 0, 0, 0, 0]
+    let sz: List<i32> = [0, 0, -1, 1, 0, 0]
+    for x in 0..5 {
+        for z in 0..5 {
+            for y in 0..3 {
+                let here = grid[usize.wrap(room_index(x, y, z))]
+                if here < 0 {
+                    continue
+                }
+                for dir in 0..6 {
+                    let nx = x + sx[usize.wrap(dir)]
+                    let ny = y + sy[usize.wrap(dir)]
+                    let nz = z + sz[usize.wrap(dir)]
+                    if nx < 0 or nx >= 5 or nz < 0 or nz >= 5 or ny < 0 or ny >= 3 {
+                        continue
+                    }
+                    let there = grid[usize.wrap(room_index(nx, ny, nz))]
+                    if there < 0 {
+                        continue
+                    }
+                    if nz == z {
+                        g.connect(here, dir, there)
+                    } else {
+                        g.connect(here, back(dir), there)
+                    }
+                }
+            }
+        }
+    }
+    let roof = g.add(1003)
+    let left = g.add(1001)
+    let right = g.add(1002)
+    g.connect(grid[usize.wrap(room_index(2, 2, 0))], UP, roof)
+    g.connect(grid[usize.wrap(room_index(0, 1, 0))], SOUTH, left)
+    g.connect(grid[usize.wrap(room_index(4, 1, 0))], SOUTH, right)
+    g.claim(roof)
+    g.claim(left)
+    g.claim(right)
+    g.source[usize.wrap(source)] = true
+    let core = grid[usize.wrap(room_index(random.next_int_below(4), 0, 2))]
+    let ce = g.link(core, EAST)
+    let cn = g.link(core, NORTH)
+    let cen = g.link(ce, NORTH)
+    let cu = g.link(core, UP)
+    g.claim(core)
+    g.claim(ce)
+    g.claim(cn)
+    g.claim(cen)
+    g.claim(cu)
+    g.claim_link(ce, UP)
+    g.claim_link(cn, UP)
+    g.claim_link(cen, UP)
+    var defs = List<i32>()
+    for pos in grid {
+        if pos >= 0 {
+            g.update_openings(pos)
+            defs.push(pos)
+        }
+    }
+    g.update_openings(roof)
+    shuffle(mut defs, mut random)
+    var scan = 1
+    for home in defs {
+        var closed = 0
+        var attempts = 0
+        while closed < 2 and attempts < 5 {
+            attempts += 1
+            let face = random.next_int_below(6)
+            if not g.is_open(home, face) {
+                continue
+            }
+            let other = g.link(home, face)
+            g.set_open(home, face, false)
+            g.set_open(other, back(face), false)
+            var found = find_source(mut g, home, scan)
+            scan += 1
+            if found {
+                found = find_source(mut g, other, scan)
+                scan += 1
+            }
+            if found {
+                closed += 1
+            } else {
+                g.set_open(home, face, true)
+                g.set_open(other, back(face), true)
+            }
+        }
+    }
+    defs.push(roof)
+    defs.push(left)
+    defs.push(right)
+    // The rooms fitted into the graph.
+    g.claim(source)
+    var rooms = List<Room>()
+    rooms.push(fitted(g, ENTRY, source, d, 1, 1, 1, 0))
+    rooms.push(fitted(g, CORE, core, d, 2, 2, 2, 0))
+    for home in defs {
+        if g.is_claimed(home) or g.grid_index(home) >= 75 {
+            continue
+        }
+        let e = g.link(home, EAST)
+        let n = g.link(home, NORTH)
+        let u = g.link(home, UP)
+        let open_e = g.is_open(home, EAST) and not g.is_claimed(e)
+        let open_n = g.is_open(home, NORTH) and not g.is_claimed(n)
+        let open_u = g.is_open(home, UP) and not g.is_claimed(u)
+        if open_e and open_u and g.is_open(e, UP) and not g.is_claimed(g.link(e, UP)) {
+            g.claim(home)
+            g.claim(e)
+            g.claim(u)
+            g.claim_link(e, UP)
+            rooms.push(fitted(g, DOUBLE_XY, home, d, 2, 2, 1, 0))
+        } else if open_n and open_u and g.is_open(n, UP) and not g.is_claimed(g.link(n, UP)) {
+            g.claim(home)
+            g.claim(n)
+            g.claim(u)
+            g.claim_link(n, UP)
+            rooms.push(fitted(g, DOUBLE_YZ, home, d, 1, 2, 2, 0))
+        } else if open_n {
+            g.claim(home)
+            g.claim(n)
+            rooms.push(fitted(g, DOUBLE_Z, home, d, 1, 1, 2, 0))
+        } else if open_e {
+            g.claim(home)
+            g.claim(e)
+            rooms.push(fitted(g, DOUBLE_X, home, d, 2, 1, 1, 0))
+        } else if open_u {
+            g.claim(home)
+            g.claim(u)
+            rooms.push(fitted(g, DOUBLE_Y, home, d, 1, 2, 1, 0))
+        } else if not g.is_open(home, WEST) and not g.is_open(home, EAST) and not g.is_open(home, NORTH) and not g.is_open(home, SOUTH) and not g.is_open(home, UP) {
+            g.claim(home)
+            rooms.push(fitted(g, SIMPLE_TOP, home, d, 1, 1, 1, 0))
+        } else {
+            g.claim(home)
+            let design = random.next_int_below(3)
+            rooms.push(fitted(g, SIMPLE, home, d, 1, 1, 1, design))
+        }
+    }
+    let fr = Frame.facing(bb, d)
+    let ox = fr.x(9, 22)
+    let oy = fr.y(0)
+    let oz = fr.z(9, 22)
+    for i in 0..rooms.len() {
+        rooms[i].bb = moved(rooms[i].bb, ox, oy, oz)
+    }
+    let wings = random.next_int()
+    rooms.push(Room { kind: WING, home: -1, bb: corners(fr, 1, 1, 1, 23, 8, 21), design: wings & 1 })
+    rooms.push(Room { kind: WING, home: -1, bb: corners(fr, 34, 1, 1, 56, 8, 21), design: 1 - (wings & 1) })
+    rooms.push(Room { kind: PENTHOUSE, home: -1, bb: corners(fr, 22, 13, 22, 35, 17, 35), design: 0 })
+    return Monument { g: g, rooms: rooms }
+}
+
+// `BoundingBox.fromCorners` of two of the building's positions.
+fn corners(fr: Frame, x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32) -> Bounds {
+    return Bounds.of_corners(fr.x(x0, z0), fr.y(y0), fr.z(x0, z0), fr.x(x1, z1), fr.y(y1), fr.z(x1, z1))
+}
+
+/// The blocks a monument's built from.
+struct Kit {
+    sea: i32
+    gray: u32
+    light: u32
+    black: u32
+    lamp: u32
+    water: u32
+    air: u32
+    gold: u32
+    sponge: u32
+    // The blocks a water box leaves: ice, packed ice, blue ice and water.
+    ice: u32
+    packed_ice: u32
+    blue_ice: u32
+    water_block: u32
+}
+
+/// A piece's frame, the chunk, and the blocks.
+struct Pen {
+    fr: Frame
+    area: Bounds
+    k: Kit
+}
+
+/// `MonumentBuilding.postProcess`, its rooms' with it.
+pub fn monument_piece<T: RandomSource>(f: Facts, r: mut Region, random: mut T, piece: Piece, area: Bounds) ! Thrown {
+    let m = build(r.seed, piece.bb, piece.orientation)
+    let water = try block_state(f, "water")
+    let k = Kit {
+        sea: r.sea_level,
+        gray: try block_state(f, "prismarine"),
+        light: try block_state(f, "prismarine_bricks"),
+        black: try block_state(f, "dark_prismarine"),
+        lamp: try block_state(f, "sea_lantern"),
+        water: water,
+        air: f.ids.air_state,
+        gold: try block_state(f, "gold_block"),
+        sponge: try block_state(f, "wet_sponge"),
+        ice: f.block(try block_state(f, "ice")),
+        packed_ice: f.block(try block_state(f, "packed_ice")),
+        blue_ice: f.block(try block_state(f, "blue_ice")),
+        water_block: f.block(water),
+    }
+    let p = Pen { fr: Frame.facing(piece.bb, piece.orientation), area: area, k: k }
+    let height = r.sea_level.max(64) - piece.bb.min_y
+    try waters(f, mut r, p, [0, 0, 0, 58, height, 58])
+    try wing(f, mut r, p, false, 0)
+    try wing(f, mut r, p, true, 33)
+    try entrance_archs(f, mut r, p)
+    try entrance_wall(f, mut r, p)
+    try roof_piece(f, mut r, p)
+    try lower_wall(f, mut r, p)
+    try middle_wall(f, mut r, p)
+    try upper_wall(f, mut r, p)
+    for px in 0..7 {
+        var pz = 0
+        while pz < 7 {
+            if pz == 0 and px == 3 {
+                pz = 6
+            }
+            let x0 = px * 9
+            let z0 = pz * 9
+            for w in 0..4 {
+                for dz in 0..4 {
+                    place(f, mut r, p.fr, k.light, x0 + w, 0, z0 + dz, area)
+                    try fill_down(f, mut r, p.fr, area, k.light, x0 + w, -1, z0 + dz)
+                }
+            }
+            if px != 0 and px != 6 {
+                pz += 6
+            } else {
+                pz += 1
+            }
+        }
+    }
+    for i in 0..5 {
+        try waters(f, mut r, p, [-1 - i, i * 2, -1 - i, -1 - i, 23, 58 + i, 58 + i, i * 2, -1 - i, 58 + i, 23, 58 + i, -i, i * 2, -1 - i, 57 + i, 23, -1 - i, -i, i * 2, 58 + i, 57 + i, 23, 58 + i])
+    }
+    for one in m.rooms {
+        if not overlaps(one.bb, area) {
+            continue
+        }
+        let q = Pen { fr: Frame.facing(one.bb, piece.orientation), area: area, k: k }
+        try draw_room(f, mut r, mut random, m.g, one, q)
+    }
+}
+
+fn overlaps(a: Bounds, b: Bounds) -> bool {
+    return a.max_x >= b.min_x and a.min_x <= b.max_x and a.max_z >= b.min_z and a.min_z <= b.max_z and a.max_y >= b.min_y and a.min_y <= b.max_y
+}
+
+// `chunkIntersects`: whether the chunk meets the piece's columns between the corners.
+fn crosses(p: Pen, x0: i32, z0: i32, x1: i32, z1: i32) -> bool {
+    let wx0 = p.fr.x(x0, z0)
+    let wz0 = p.fr.z(x0, z0)
+    let wx1 = p.fr.x(x1, z1)
+    let wz1 = p.fr.z(x1, z1)
+    let a = p.area
+    return a.max_x >= wx0.min(wx1) and a.min_x <= wx0.max(wx1) and a.max_z >= wz0.min(wz1) and a.min_z <= wz0.max(wz1)
+}
+
+fn bx(f: Facts, r: mut Region, p: Pen, at: List<i32>, state: u32) ! Thrown {
+    try boxes(f, mut r, p.fr, p.area, at, state)
+}
+
+fn put(f: Facts, r: mut Region, p: Pen, at: List<i32>, state: u32) {
+    blocks(f, mut r, p.fr, p.area, at, state)
+}
+
+// `generateWaterBox`, boxes of six numbers each: water, or air at or above the sea where there
+// isn't water already, past ice and water.
+fn waters(f: Facts, r: mut Region, p: Pen, at: List<i32>) ! Thrown {
+    var i: usize = 0
+    while i + 5 < at.len() {
+        for y in at[i + 1]..at[i + 4] + 1 {
+            for x in at[i]..at[i + 3] + 1 {
+                for z in at[i + 2]..at[i + 5] + 1 {
+                    let here = try get(f, r, p.fr, x, y, z, p.area)
+                    let b = f.block(here)
+                    if b == p.k.ice or b == p.k.packed_ice or b == p.k.blue_ice or b == p.k.water_block {
+                        continue
+                    }
+                    if p.fr.y(y) >= p.k.sea and here != p.k.water {
+                        place(f, mut r, p.fr, p.k.air, x, y, z, p.area)
+                    } else {
+                        place(f, mut r, p.fr, p.k.water, x, y, z, p.area)
+                    }
+                }
+            }
+        }
+        i += 6
+    }
+}
+
+// `generateBoxOnFillOnly`: the block only where there's water.
+fn fill_only(f: Facts, r: mut Region, p: Pen, x0: i32, y0: i32, z0: i32, x1: i32, y1: i32, z1: i32, state: u32) ! Thrown {
+    for y in y0..y1 + 1 {
+        for x in x0..x1 + 1 {
+            for z in z0..z1 + 1 {
+                if try get(f, r, p.fr, x, y, z, p.area) == p.k.water {
+                    place(f, mut r, p.fr, state, x, y, z, p.area)
+                }
+            }
+        }
+    }
+}
+
+// `generateDefaultFloor`.
+fn default_floor(f: Facts, r: mut Region, p: Pen, xo: i32, zo: i32, down: bool) ! Thrown {
+    if down {
+        try bx(f, mut r, p, [xo, 0, zo, xo + 2, 0, zo + 7, xo + 5, 0, zo, xo + 7, 0, zo + 7, xo + 3, 0, zo, xo + 4, 0, zo + 2, xo + 3, 0, zo + 5, xo + 4, 0, zo + 7], p.k.gray)
+        try bx(f, mut r, p, [xo + 3, 0, zo + 2, xo + 4, 0, zo + 2, xo + 3, 0, zo + 5, xo + 4, 0, zo + 5, xo + 2, 0, zo + 3, xo + 2, 0, zo + 4, xo + 5, 0, zo + 3, xo + 5, 0, zo + 4], p.k.light)
+    } else {
+        try bx(f, mut r, p, [xo, 0, zo, xo + 7, 0, zo + 7], p.k.gray)
+    }
+}
+
+// `spawnElder`.
+fn elder(r: mut Region, p: Pen, x: i32, y: i32, z: i32) ! Thrown {
+    let wx = p.fr.x(x, z)
+    let wy = p.fr.y(y)
+    let wz = p.fr.z(x, z)
+    if p.area.inside(wx, wy, wz) {
+        try spawn_mob(mut r, "minecraft:elder_guardian", wx, wy, wz)
+    }
+}
+
+// `generateWing`.
+fn wing(f: Facts, r: mut Region, p: Pen, flipped: bool, xo: i32) ! Thrown {
+    if not crosses(p, xo, 0, xo + 23, 20) {
+        return
+    }
+    let k = p.k
+    try bx(f, mut r, p, [xo, 0, 0, xo + 24, 0, 20], k.gray)
+    try waters(f, mut r, p, [xo, 1, 0, xo + 24, 10, 20])
+    for i in 0..4 {
+        try bx(f, mut r, p, [xo + i, i + 1, i, xo + i, i + 1, 20, xo + i + 7, i + 5, i + 7, xo + i + 7, i + 5, 20, xo + 17 - i, i + 5, i + 7, xo + 17 - i, i + 5, 20, xo + 24 - i, i + 1, i, xo + 24 - i, i + 1, 20, xo + i + 1, i + 1, i, xo + 23 - i, i + 1, i, xo + i + 8, i + 5, i + 7, xo + 16 - i, i + 5, i + 7], k.light)
+    }
+    try bx(f, mut r, p, [xo + 4, 4, 4, xo + 6, 4, 20, xo + 7, 4, 4, xo + 17, 4, 6, xo + 18, 4, 4, xo + 20, 4, 20, xo + 11, 8, 11, xo + 13, 8, 20], k.gray)
+    put(f, mut r, p, [xo + 12, 9, 12, xo + 12, 9, 15, xo + 12, 9, 18], k.light)
+    let left = xo + if flipped { 19 } else { 5 }
+    let right = xo + if flipped { 5 } else { 19 }
+    var z = 20
+    while z >= 5 {
+        put(f, mut r, p, [left, 5, z], k.light)
+        z -= 3
+    }
+    z = 19
+    while z >= 7 {
+        put(f, mut r, p, [right, 5, z], k.light)
+        z -= 3
+    }
+    for i in 0..4 {
+        let x = if flipped { xo + 24 - (17 - i * 3) } else { xo + 17 - i * 3 }
+        put(f, mut r, p, [x, 5, 5], k.light)
+    }
+    put(f, mut r, p, [right, 5, 5], k.light)
+    try bx(f, mut r, p, [xo + 11, 1, 12, xo + 13, 7, 12, xo + 12, 1, 11, xo + 12, 7, 13], k.gray)
+}
+
+// `generateEntranceArchs`.
+fn entrance_archs(f: Facts, r: mut Region, p: Pen) ! Thrown {
+    if not crosses(p, 22, 5, 35, 17) {
+        return
+    }
+    let k = p.k
+    try waters(f, mut r, p, [25, 0, 0, 32, 8, 20])
+    for i in 0..4 {
+        let z = 5 + i * 4
+        try bx(f, mut r, p, [24, 2, z, 24, 4, z, 22, 4, z, 23, 4, z], k.light)
+        put(f, mut r, p, [25, 5, z, 26, 6, z], k.light)
+        put(f, mut r, p, [26, 5, z], k.lamp)
+        try bx(f, mut r, p, [33, 2, z, 33, 4, z, 34, 4, z, 35, 4, z], k.light)
+        put(f, mut r, p, [32, 5, z, 31, 6, z], k.light)
+        put(f, mut r, p, [31, 5, z], k.lamp)
+        try bx(f, mut r, p, [27, 6, z, 30, 6, z], k.gray)
+    }
+}
+
+// `generateEntranceWall`.
+fn entrance_wall(f: Facts, r: mut Region, p: Pen) ! Thrown {
+    if not crosses(p, 15, 20, 42, 21) {
+        return
+    }
+    let k = p.k
+    try bx(f, mut r, p, [15, 0, 21, 42, 0, 21], k.gray)
+    try waters(f, mut r, p, [26, 1, 21, 31, 3, 21])
+    try bx(f, mut r, p, [21, 12, 21, 36, 12, 21, 17, 11, 21, 40, 11, 21, 16, 10, 21, 41, 10, 21, 15, 7, 21, 42, 9, 21, 16, 6, 21, 41, 6, 21, 17, 5, 21, 40, 5, 21, 21, 4, 21, 36, 4, 21, 22, 3, 21, 26, 3, 21, 31, 3, 21, 35, 3, 21, 23, 2, 21, 25, 2, 21, 32, 2, 21, 34, 2, 21], k.gray)
+    try bx(f, mut r, p, [28, 4, 20, 29, 4, 21], k.light)
+    put(f, mut r, p, [27, 3, 21, 30, 3, 21, 26, 2, 21, 31, 2, 21, 25, 1, 21, 32, 1, 21], k.light)
+    for i in 0..7 {
+        put(f, mut r, p, [28 - i, 6 + i, 21, 29 + i, 6 + i, 21], k.black)
+    }
+    for i in 0..4 {
+        put(f, mut r, p, [28 - i, 9 + i, 21, 29 + i, 9 + i, 21], k.black)
+    }
+    put(f, mut r, p, [28, 12, 21, 29, 12, 21], k.black)
+    for i in 0..3 {
+        put(f, mut r, p, [22 - i * 2, 8, 21, 22 - i * 2, 9, 21, 35 + i * 2, 8, 21, 35 + i * 2, 9, 21], k.black)
+    }
+    try waters(f, mut r, p, [15, 13, 21, 42, 15, 21, 15, 1, 21, 15, 6, 21, 16, 1, 21, 16, 5, 21, 17, 1, 21, 20, 4, 21, 21, 1, 21, 21, 3, 21, 22, 1, 21, 22, 2, 21, 23, 1, 21, 24, 1, 21, 42, 1, 21, 42, 6, 21, 41, 1, 21, 41, 5, 21, 37, 1, 21, 40, 4, 21, 36, 1, 21, 36, 3, 21, 33, 1, 21, 34, 1, 21, 35, 1, 21, 35, 2, 21])
+}
+
+// `generateRoofPiece`.
+fn roof_piece(f: Facts, r: mut Region, p: Pen) ! Thrown {
+    if not crosses(p, 21, 21, 36, 36) {
+        return
+    }
+    let k = p.k
+    try bx(f, mut r, p, [21, 0, 22, 36, 0, 36], k.gray)
+    try waters(f, mut r, p, [21, 1, 22, 36, 23, 36])
+    for i in 0..4 {
+        try bx(f, mut r, p, [21 + i, 13 + i, 21 + i, 36 - i, 13 + i, 21 + i, 21 + i, 13 + i, 36 - i, 36 - i, 13 + i, 36 - i, 21 + i, 13 + i, 22 + i, 21 + i, 13 + i, 35 - i, 36 - i, 13 + i, 22 + i, 36 - i, 13 + i, 35 - i], k.light)
+    }
+    try bx(f, mut r, p, [25, 16, 25, 32, 16, 32], k.gray)
+    try bx(f, mut r, p, [25, 17, 25, 25, 19, 25, 32, 17, 25, 32, 19, 25, 25, 17, 32, 25, 19, 32, 32, 17, 32, 32, 19, 32], k.light)
+    put(f, mut r, p, [26, 20, 26, 27, 21, 27], k.light)
+    put(f, mut r, p, [27, 20, 27], k.lamp)
+    put(f, mut r, p, [26, 20, 31, 27, 21, 30], k.light)
+    put(f, mut r, p, [27, 20, 30], k.lamp)
+    put(f, mut r, p, [31, 20, 31, 30, 21, 30], k.light)
+    put(f, mut r, p, [30, 20, 30], k.lamp)
+    put(f, mut r, p, [31, 20, 26, 30, 21, 27], k.light)
+    put(f, mut r, p, [30, 20, 27], k.lamp)
+    try bx(f, mut r, p, [28, 21, 27, 29, 21, 27, 27, 21, 28, 27, 21, 29, 28, 21, 30, 29, 21, 30, 30, 21, 28, 30, 21, 29], k.gray)
+}
+
+// `generateLowerWall`.
+fn lower_wall(f: Facts, r: mut Region, p: Pen) ! Thrown {
+    let k = p.k
+    if crosses(p, 0, 21, 6, 58) {
+        try bx(f, mut r, p, [0, 0, 21, 6, 0, 57], k.gray)
+        try waters(f, mut r, p, [0, 1, 21, 6, 7, 57])
+        try bx(f, mut r, p, [4, 4, 21, 6, 4, 53], k.gray)
+        for i in 0..4 {
+            try bx(f, mut r, p, [i, i + 1, 21, i, i + 1, 57 - i], k.light)
+        }
+        var z = 23
+        while z < 53 {
+            put(f, mut r, p, [5, 5, z], k.light)
+            z += 3
+        }
+        put(f, mut r, p, [5, 5, 52], k.light)
+        for i in 0..4 {
+            try bx(f, mut r, p, [i, i + 1, 21, i, i + 1, 57 - i], k.light)
+        }
+        try bx(f, mut r, p, [4, 1, 52, 6, 3, 52, 5, 1, 51, 5, 3, 53], k.gray)
+    }
+    if crosses(p, 51, 21, 58, 58) {
+        try bx(f, mut r, p, [51, 0, 21, 57, 0, 57], k.gray)
+        try waters(f, mut r, p, [51, 1, 21, 57, 7, 57])
+        try bx(f, mut r, p, [51, 4, 21, 53, 4, 53], k.gray)
+        for i in 0..4 {
+            try bx(f, mut r, p, [57 - i, i + 1, 21, 57 - i, i + 1, 57 - i], k.light)
+        }
+        var z = 23
+        while z < 53 {
+            put(f, mut r, p, [52, 5, z], k.light)
+            z += 3
+        }
+        put(f, mut r, p, [52, 5, 52], k.light)
+        try bx(f, mut r, p, [51, 1, 52, 53, 3, 52, 52, 1, 51, 52, 3, 53], k.gray)
+    }
+    if crosses(p, 0, 51, 57, 57) {
+        try bx(f, mut r, p, [7, 0, 51, 50, 0, 57], k.gray)
+        try waters(f, mut r, p, [7, 1, 51, 50, 10, 57])
+        for i in 0..4 {
+            try bx(f, mut r, p, [i + 1, i + 1, 57 - i, 56 - i, i + 1, 57 - i], k.light)
+        }
+    }
+}
+
+// `generateMiddleWall`.
+fn middle_wall(f: Facts, r: mut Region, p: Pen) ! Thrown {
+    let k = p.k
+    if crosses(p, 7, 21, 13, 50) {
+        try bx(f, mut r, p, [7, 0, 21, 13, 0, 50], k.gray)
+        try waters(f, mut r, p, [7, 1, 21, 13, 10, 50])
+        try bx(f, mut r, p, [11, 8, 21, 13, 8, 53], k.gray)
+        for i in 0..4 {
+            try bx(f, mut r, p, [i + 7, i + 5, 21, i + 7, i + 5, 54], k.light)
+        }
+        var z = 21
+        while z <= 45 {
+            put(f, mut r, p, [12, 9, z], k.light)
+            z += 3
+        }
+    }
+    if crosses(p, 44, 21, 50, 54) {
+        try bx(f, mut r, p, [44, 0, 21, 50, 0, 50], k.gray)
+        try waters(f, mut r, p, [44, 1, 21, 50, 10, 50])
+        try bx(f, mut r, p, [44, 8, 21, 46, 8, 53], k.gray)
+        for i in 0..4 {
+            try bx(f, mut r, p, [50 - i, i + 5, 21, 50 - i, i + 5, 54], k.light)
+        }
+        var z = 21
+        while z <= 45 {
+            put(f, mut r, p, [45, 9, z], k.light)
+            z += 3
+        }
+    }
+    if crosses(p, 8, 44, 49, 54) {
+        try bx(f, mut r, p, [14, 0, 44, 43, 0, 50], k.gray)
+        try waters(f, mut r, p, [14, 1, 44, 43, 10, 50])
+        var x = 12
+        while x <= 45 {
+            put(f, mut r, p, [x, 9, 45, x, 9, 52], k.light)
+            if x == 12 or x == 18 or x == 24 or x == 33 or x == 39 or x == 45 {
+                put(f, mut r, p, [x, 9, 47, x, 9, 50, x, 10, 45, x, 10, 46, x, 10, 51, x, 10, 52, x, 11, 47, x, 11, 50, x, 12, 48, x, 12, 49], k.light)
+            }
+            x += 3
+        }
+        for i in 0..3 {
+            try bx(f, mut r, p, [8 + i, 5 + i, 54, 49 - i, 5 + i, 54], k.gray)
+        }
+        try bx(f, mut r, p, [11, 8, 54, 46, 8, 54], k.light)
+        try bx(f, mut r, p, [14, 8, 44, 43, 8, 53], k.gray)
+    }
+}
+
+// `generateUpperWall`.
+fn upper_wall(f: Facts, r: mut Region, p: Pen) ! Thrown {
+    let k = p.k
+    if crosses(p, 14, 21, 20, 43) {
+        try bx(f, mut r, p, [14, 0, 21, 20, 0, 43], k.gray)
+        try waters(f, mut r, p, [14, 1, 22, 20, 14, 43])
+        try bx(f, mut r, p, [18, 12, 22, 20, 12, 39], k.gray)
+        try bx(f, mut r, p, [18, 12, 21, 20, 12, 21], k.light)
+        for i in 0..4 {
+            try bx(f, mut r, p, [i + 14, i + 9, 21, i + 14, i + 9, 43 - i], k.light)
+        }
+        var z = 23
+        while z <= 39 {
+            put(f, mut r, p, [19, 13, z], k.light)
+            z += 3
+        }
+    }
+    if crosses(p, 37, 21, 43, 43) {
+        try bx(f, mut r, p, [37, 0, 21, 43, 0, 43], k.gray)
+        try waters(f, mut r, p, [37, 1, 22, 43, 14, 43])
+        try bx(f, mut r, p, [37, 12, 22, 39, 12, 39], k.gray)
+        try bx(f, mut r, p, [37, 12, 21, 39, 12, 21], k.light)
+        for i in 0..4 {
+            try bx(f, mut r, p, [43 - i, i + 9, 21, 43 - i, i + 9, 43 - i], k.light)
+        }
+        var z = 23
+        while z <= 39 {
+            put(f, mut r, p, [38, 13, z], k.light)
+            z += 3
+        }
+    }
+    if crosses(p, 15, 37, 42, 43) {
+        try bx(f, mut r, p, [21, 0, 37, 36, 0, 43], k.gray)
+        try waters(f, mut r, p, [21, 1, 37, 36, 14, 43])
+        try bx(f, mut r, p, [21, 12, 37, 36, 12, 39], k.gray)
+        for i in 0..4 {
+            try bx(f, mut r, p, [15 + i, i + 9, 43 - i, 42 - i, i + 9, 43 - i], k.light)
+        }
+        var x = 21
+        while x <= 36 {
+            put(f, mut r, p, [x, 13, 38], k.light)
+            x += 3
+        }
+    }
+}
+
+// A room's `postProcess`.
+fn draw_room<T: RandomSource>(f: Facts, r: mut Region, random: mut T, g: Graph, one: Room, p: Pen) ! Thrown {
+    if one.kind == ENTRY {
+        try entry_room(f, mut r, g, one.home, p)
+    } else if one.kind == CORE {
+        try core_room(f, mut r, p)
+    } else if one.kind == DOUBLE_XY {
+        try double_xy_room(f, mut r, g, one.home, p)
+    } else if one.kind == DOUBLE_YZ {
+        try double_yz_room(f, mut r, g, one.home, p)
+    } else if one.kind == DOUBLE_Z {
+        try double_z_room(f, mut r, g, one.home, p)
+    } else if one.kind == DOUBLE_X {
+        try double_x_room(f, mut r, g, one.home, p)
+    } else if one.kind == DOUBLE_Y {
+        try double_y_room(f, mut r, g, one.home, p)
+    } else if one.kind == SIMPLE_TOP {
+        try simple_top_room(f, mut r, mut random, g, one.home, p)
+    } else if one.kind == SIMPLE {
+        try simple_room(f, mut r, mut random, g, one.home, one.design, p)
+    } else if one.kind == WING {
+        try wing_room(f, mut r, one.design, p)
+    } else {
+        try penthouse(f, mut r, p)
+    }
+}
+
+// `OceanMonumentCoreRoom`.
+fn core_room(f: Facts, r: mut Region, p: Pen) ! Thrown {
+    let k = p.k
+    try fill_only(f, mut r, p, 1, 8, 0, 14, 8, 14, k.gray)
+    try bx(f, mut r, p, [0, 7, 0, 0, 7, 15, 15, 7, 0, 15, 7, 15, 1, 7, 0, 15, 7, 0, 1, 7, 15, 14, 7, 15], k.light)
+    for y in 1..7 {
+        let s = if y == 2 or y == 6 { k.gray } else { k.light }
+        let xs: List<i32> = [0, 15]
+        for x in xs {
+            try bx(f, mut r, p, [x, y, 0, x, y, 1, x, y, 6, x, y, 9, x, y, 14, x, y, 15], s)
+        }
+        try bx(f, mut r, p, [1, y, 0, 1, y, 0, 6, y, 0, 9, y, 0, 14, y, 0, 14, y, 0, 1, y, 15, 14, y, 15], s)
+    }
+    try bx(f, mut r, p, [6, 3, 6, 9, 6, 9], k.black)
+    try bx(f, mut r, p, [7, 4, 7, 8, 5, 8], k.gold)
+    let ys: List<i32> = [3, 6]
+    for y in ys {
+        put(f, mut r, p, [6, y, 6, 6, y, 9, 9, y, 6, 9, y, 9], k.lamp)
+    }
+    try bx(f, mut r, p, [5, 1, 6, 5, 2, 6, 5, 1, 9, 5, 2, 9, 10, 1, 6, 10, 2, 6, 10, 1, 9, 10, 2, 9, 6, 1, 5, 6, 2, 5, 9, 1, 5, 9, 2, 5, 6, 1, 10, 6, 2, 10, 9, 1, 10, 9, 2, 10, 5, 2, 5, 5, 6, 5, 5, 2, 10, 5, 6, 10, 10, 2, 5, 10, 6, 5, 10, 2, 10, 10, 6, 10, 5, 7, 1, 5, 7, 6, 10, 7, 1, 10, 7, 6, 5, 7, 9, 5, 7, 14, 10, 7, 9, 10, 7, 14, 1, 7, 5, 6, 7, 5, 1, 7, 10, 6, 7, 10, 9, 7, 5, 14, 7, 5, 9, 7, 10, 14, 7, 10, 2, 1, 2, 2, 1, 3, 3, 1, 2, 3, 1, 2, 13, 1, 2, 13, 1, 3, 12, 1, 2, 12, 1, 2, 2, 1, 12, 2, 1, 13, 3, 1, 13, 3, 1, 13, 13, 1, 12, 13, 1, 13, 12, 1, 13, 12, 1, 13], k.light)
+}
+
+// The floor of a room above the first, if it's one.
+fn floor_of(f: Facts, r: mut Region, g: Graph, home: i32, p: Pen, xo: i32, zo: i32, of: i32) ! Thrown {
+    if g.grid_index(home) / 25 > 0 {
+        try default_floor(f, mut r, p, xo, zo, g.is_open(of, DOWN))
+    }
+}
+
+// `OceanMonumentDoubleXRoom`.
+fn double_x_room(f: Facts, r: mut Region, g: Graph, home: i32, p: Pen) ! Thrown {
+    let k = p.k
+    let east = g.link(home, EAST)
+    let west = home
+    try floor_of(f, mut r, g, home, p, 8, 0, east)
+    try floor_of(f, mut r, g, home, p, 0, 0, west)
+    if g.link(west, UP) < 0 {
+        try fill_only(f, mut r, p, 1, 4, 1, 7, 4, 6, k.gray)
+    }
+    if g.link(east, UP) < 0 {
+        try fill_only(f, mut r, p, 8, 4, 1, 14, 4, 6, k.gray)
+    }
+    try bx(f, mut r, p, [0, 3, 0, 0, 3, 7, 15, 3, 0, 15, 3, 7, 1, 3, 0, 15, 3, 0, 1, 3, 7, 14, 3, 7], k.light)
+    try bx(f, mut r, p, [0, 2, 0, 0, 2, 7, 15, 2, 0, 15, 2, 7, 1, 2, 0, 15, 2, 0, 1, 2, 7, 14, 2, 7], k.gray)
+    try bx(f, mut r, p, [0, 1, 0, 0, 1, 7, 15, 1, 0, 15, 1, 7, 1, 1, 0, 15, 1, 0, 1, 1, 7, 14, 1, 7, 5, 1, 0, 10, 1, 4], k.light)
+    try bx(f, mut r, p, [6, 2, 0, 9, 2, 3], k.gray)
+    try bx(f, mut r, p, [5, 3, 0, 10, 3, 4], k.light)
+    put(f, mut r, p, [6, 2, 3, 9, 2, 3], k.lamp)
+    if g.is_open(west, SOUTH) {
+        try waters(f, mut r, p, [3, 1, 0, 4, 2, 0])
+    }
+    if g.is_open(west, NORTH) {
+        try waters(f, mut r, p, [3, 1, 7, 4, 2, 7])
+    }
+    if g.is_open(west, WEST) {
+        try waters(f, mut r, p, [0, 1, 3, 0, 2, 4])
+    }
+    if g.is_open(east, SOUTH) {
+        try waters(f, mut r, p, [11, 1, 0, 12, 2, 0])
+    }
+    if g.is_open(east, NORTH) {
+        try waters(f, mut r, p, [11, 1, 7, 12, 2, 7])
+    }
+    if g.is_open(east, EAST) {
+        try waters(f, mut r, p, [15, 1, 3, 15, 2, 4])
+    }
+}
+
+// `OceanMonumentDoubleXYRoom`.
+fn double_xy_room(f: Facts, r: mut Region, g: Graph, home: i32, p: Pen) ! Thrown {
+    let k = p.k
+    let east = g.link(home, EAST)
+    let west = home
+    let west_up = g.link(west, UP)
+    let east_up = g.link(east, UP)
+    try floor_of(f, mut r, g, home, p, 8, 0, east)
+    try floor_of(f, mut r, g, home, p, 0, 0, west)
+    if g.link(west_up, UP) < 0 {
+        try fill_only(f, mut r, p, 1, 8, 1, 7, 8, 6, k.gray)
+    }
+    if g.link(east_up, UP) < 0 {
+        try fill_only(f, mut r, p, 8, 8, 1, 14, 8, 6, k.gray)
+    }
+    for y in 1..8 {
+        let s = if y == 2 or y == 6 { k.gray } else { k.light }
+        try bx(f, mut r, p, [0, y, 0, 0, y, 7, 15, y, 0, 15, y, 7, 1, y, 0, 15, y, 0, 1, y, 7, 14, y, 7], s)
+    }
+    try bx(f, mut r, p, [2, 1, 3, 2, 7, 4, 3, 1, 2, 4, 7, 2, 3, 1, 5, 4, 7, 5, 13, 1, 3, 13, 7, 4, 11, 1, 2, 12, 7, 2, 11, 1, 5, 12, 7, 5, 5, 1, 3, 5, 3, 4, 10, 1, 3, 10, 3, 4, 5, 7, 2, 10, 7, 5, 5, 5, 2, 5, 7, 2, 10, 5, 2, 10, 7, 2, 5, 5, 5, 5, 7, 5, 10, 5, 5, 10, 7, 5], k.light)
+    put(f, mut r, p, [6, 6, 2, 9, 6, 2, 6, 6, 5, 9, 6, 5], k.light)
+    try bx(f, mut r, p, [5, 4, 3, 6, 4, 4, 9, 4, 3, 10, 4, 4], k.light)
+    put(f, mut r, p, [5, 4, 2, 5, 4, 5, 10, 4, 2, 10, 4, 5], k.lamp)
+    if g.is_open(west, SOUTH) {
+        try waters(f, mut r, p, [3, 1, 0, 4, 2, 0])
+    }
+    if g.is_open(west, NORTH) {
+        try waters(f, mut r, p, [3, 1, 7, 4, 2, 7])
+    }
+    if g.is_open(west, WEST) {
+        try waters(f, mut r, p, [0, 1, 3, 0, 2, 4])
+    }
+    if g.is_open(east, SOUTH) {
+        try waters(f, mut r, p, [11, 1, 0, 12, 2, 0])
+    }
+    if g.is_open(east, NORTH) {
+        try waters(f, mut r, p, [11, 1, 7, 12, 2, 7])
+    }
+    if g.is_open(east, EAST) {
+        try waters(f, mut r, p, [15, 1, 3, 15, 2, 4])
+    }
+    if g.is_open(west_up, SOUTH) {
+        try waters(f, mut r, p, [3, 5, 0, 4, 6, 0])
+    }
+    if g.is_open(west_up, NORTH) {
+        try waters(f, mut r, p, [3, 5, 7, 4, 6, 7])
+    }
+    if g.is_open(west_up, WEST) {
+        try waters(f, mut r, p, [0, 5, 3, 0, 6, 4])
+    }
+    if g.is_open(east_up, SOUTH) {
+        try waters(f, mut r, p, [11, 5, 0, 12, 6, 0])
+    }
+    if g.is_open(east_up, NORTH) {
+        try waters(f, mut r, p, [11, 5, 7, 12, 6, 7])
+    }
+    if g.is_open(east_up, EAST) {
+        try waters(f, mut r, p, [15, 5, 3, 15, 6, 4])
+    }
+}
+
+// `OceanMonumentDoubleYRoom`.
+fn double_y_room(f: Facts, r: mut Region, g: Graph, home: i32, p: Pen) ! Thrown {
+    let k = p.k
+    try floor_of(f, mut r, g, home, p, 0, 0, home)
+    let above = g.link(home, UP)
+    if g.link(above, UP) < 0 {
+        try fill_only(f, mut r, p, 1, 8, 1, 6, 8, 6, k.gray)
+    }
+    try bx(f, mut r, p, [0, 4, 0, 0, 4, 7, 7, 4, 0, 7, 4, 7, 1, 4, 0, 6, 4, 0, 1, 4, 7, 6, 4, 7, 2, 4, 1, 2, 4, 2, 1, 4, 2, 1, 4, 2, 5, 4, 1, 5, 4, 2, 6, 4, 2, 6, 4, 2, 2, 4, 5, 2, 4, 6, 1, 4, 5, 1, 4, 5, 5, 4, 5, 5, 4, 6, 6, 4, 5, 6, 4, 5], k.light)
+    var level = home
+    var y = 1
+    while y <= 5 {
+        if g.is_open(level, SOUTH) {
+            try bx(f, mut r, p, [2, y, 0, 2, y + 2, 0, 5, y, 0, 5, y + 2, 0, 3, y + 2, 0, 4, y + 2, 0], k.light)
+        } else {
+            try bx(f, mut r, p, [0, y, 0, 7, y + 2, 0], k.light)
+            try bx(f, mut r, p, [0, y + 1, 0, 7, y + 1, 0], k.gray)
+        }
+        if g.is_open(level, NORTH) {
+            try bx(f, mut r, p, [2, y, 7, 2, y + 2, 7, 5, y, 7, 5, y + 2, 7, 3, y + 2, 7, 4, y + 2, 7], k.light)
+        } else {
+            try bx(f, mut r, p, [0, y, 7, 7, y + 2, 7], k.light)
+            try bx(f, mut r, p, [0, y + 1, 7, 7, y + 1, 7], k.gray)
+        }
+        if g.is_open(level, WEST) {
+            try bx(f, mut r, p, [0, y, 2, 0, y + 2, 2, 0, y, 5, 0, y + 2, 5, 0, y + 2, 3, 0, y + 2, 4], k.light)
+        } else {
+            try bx(f, mut r, p, [0, y, 0, 0, y + 2, 7], k.light)
+            try bx(f, mut r, p, [0, y + 1, 0, 0, y + 1, 7], k.gray)
+        }
+        if g.is_open(level, EAST) {
+            try bx(f, mut r, p, [7, y, 2, 7, y + 2, 2, 7, y, 5, 7, y + 2, 5, 7, y + 2, 3, 7, y + 2, 4], k.light)
+        } else {
+            try bx(f, mut r, p, [7, y, 0, 7, y + 2, 7], k.light)
+            try bx(f, mut r, p, [7, y + 1, 0, 7, y + 1, 7], k.gray)
+        }
+        level = above
+        y += 4
+    }
+}
+
+// `OceanMonumentDoubleYZRoom`.
+fn double_yz_room(f: Facts, r: mut Region, g: Graph, home: i32, p: Pen) ! Thrown {
+    let k = p.k
+    let north = g.link(home, NORTH)
+    let south = home
+    let north_up = g.link(north, UP)
+    let south_up = g.link(south, UP)
+    try floor_of(f, mut r, g, home, p, 0, 8, north)
+    try floor_of(f, mut r, g, home, p, 0, 0, south)
+    if g.link(south_up, UP) < 0 {
+        try fill_only(f, mut r, p, 1, 8, 1, 6, 8, 7, k.gray)
+    }
+    if g.link(north_up, UP) < 0 {
+        try fill_only(f, mut r, p, 1, 8, 8, 6, 8, 14, k.gray)
+    }
+    for y in 1..8 {
+        let s = if y == 2 or y == 6 { k.gray } else { k.light }
+        try bx(f, mut r, p, [0, y, 0, 0, y, 15, 7, y, 0, 7, y, 15, 1, y, 0, 6, y, 0, 1, y, 15, 6, y, 15], s)
+    }
+    for y in 1..8 {
+        let s = if y == 2 or y == 6 { k.lamp } else { k.black }
+        try bx(f, mut r, p, [3, y, 7, 4, y, 8], s)
+    }
+    if g.is_open(south, SOUTH) {
+        try waters(f, mut r, p, [3, 1, 0, 4, 2, 0])
+    }
+    if g.is_open(south, EAST) {
+        try waters(f, mut r, p, [7, 1, 3, 7, 2, 4])
+    }
+    if g.is_open(south, WEST) {
+        try waters(f, mut r, p, [0, 1, 3, 0, 2, 4])
+    }
+    if g.is_open(north, NORTH) {
+        try waters(f, mut r, p, [3, 1, 15, 4, 2, 15])
+    }
+    if g.is_open(north, WEST) {
+        try waters(f, mut r, p, [0, 1, 11, 0, 2, 12])
+    }
+    if g.is_open(north, EAST) {
+        try waters(f, mut r, p, [7, 1, 11, 7, 2, 12])
+    }
+    if g.is_open(south_up, SOUTH) {
+        try waters(f, mut r, p, [3, 5, 0, 4, 6, 0])
+    }
+    if g.is_open(south_up, EAST) {
+        try waters(f, mut r, p, [7, 5, 3, 7, 6, 4])
+        try bx(f, mut r, p, [5, 4, 2, 6, 4, 5, 6, 1, 2, 6, 3, 2, 6, 1, 5, 6, 3, 5], k.light)
+    }
+    if g.is_open(south_up, WEST) {
+        try waters(f, mut r, p, [0, 5, 3, 0, 6, 4])
+        try bx(f, mut r, p, [1, 4, 2, 2, 4, 5, 1, 1, 2, 1, 3, 2, 1, 1, 5, 1, 3, 5], k.light)
+    }
+    if g.is_open(north_up, NORTH) {
+        try waters(f, mut r, p, [3, 5, 15, 4, 6, 15])
+    }
+    if g.is_open(north_up, WEST) {
+        try waters(f, mut r, p, [0, 5, 11, 0, 6, 12])
+        try bx(f, mut r, p, [1, 4, 10, 2, 4, 13, 1, 1, 10, 1, 3, 10, 1, 1, 13, 1, 3, 13], k.light)
+    }
+    if g.is_open(north_up, EAST) {
+        try waters(f, mut r, p, [7, 5, 11, 7, 6, 12])
+        try bx(f, mut r, p, [5, 4, 10, 6, 4, 13, 6, 1, 10, 6, 3, 10, 6, 1, 13, 6, 3, 13], k.light)
+    }
+}
+
+// `OceanMonumentDoubleZRoom`.
+fn double_z_room(f: Facts, r: mut Region, g: Graph, home: i32, p: Pen) ! Thrown {
+    let k = p.k
+    let north = g.link(home, NORTH)
+    let south = home
+    try floor_of(f, mut r, g, home, p, 0, 8, north)
+    try floor_of(f, mut r, g, home, p, 0, 0, south)
+    if g.link(south, UP) < 0 {
+        try fill_only(f, mut r, p, 1, 4, 1, 6, 4, 7, k.gray)
+    }
+    if g.link(north, UP) < 0 {
+        try fill_only(f, mut r, p, 1, 4, 8, 6, 4, 14, k.gray)
+    }
+    try bx(f, mut r, p, [0, 3, 0, 0, 3, 15, 7, 3, 0, 7, 3, 15, 1, 3, 0, 7, 3, 0, 1, 3, 15, 6, 3, 15], k.light)
+    try bx(f, mut r, p, [0, 2, 0, 0, 2, 15, 7, 2, 0, 7, 2, 15, 1, 2, 0, 7, 2, 0, 1, 2, 15, 6, 2, 15], k.gray)
+    try bx(f, mut r, p, [0, 1, 0, 0, 1, 15, 7, 1, 0, 7, 1, 15, 1, 1, 0, 7, 1, 0, 1, 1, 15, 6, 1, 15, 1, 1, 1, 1, 1, 2, 6, 1, 1, 6, 1, 2, 1, 3, 1, 1, 3, 2, 6, 3, 1, 6, 3, 2, 1, 1, 13, 1, 1, 14, 6, 1, 13, 6, 1, 14, 1, 3, 13, 1, 3, 14, 6, 3, 13, 6, 3, 14, 2, 1, 6, 2, 3, 6, 5, 1, 6, 5, 3, 6, 2, 1, 9, 2, 3, 9, 5, 1, 9, 5, 3, 9, 3, 2, 6, 4, 2, 6, 3, 2, 9, 4, 2, 9, 2, 2, 7, 2, 2, 8, 5, 2, 7, 5, 2, 8], k.light)
+    put(f, mut r, p, [2, 2, 5, 5, 2, 5, 2, 2, 10, 5, 2, 10], k.lamp)
+    put(f, mut r, p, [2, 3, 5, 5, 3, 5, 2, 3, 10, 5, 3, 10], k.light)
+    if g.is_open(south, SOUTH) {
+        try waters(f, mut r, p, [3, 1, 0, 4, 2, 0])
+    }
+    if g.is_open(south, EAST) {
+        try waters(f, mut r, p, [7, 1, 3, 7, 2, 4])
+    }
+    if g.is_open(south, WEST) {
+        try waters(f, mut r, p, [0, 1, 3, 0, 2, 4])
+    }
+    if g.is_open(north, NORTH) {
+        try waters(f, mut r, p, [3, 1, 15, 4, 2, 15])
+    }
+    if g.is_open(north, WEST) {
+        try waters(f, mut r, p, [0, 1, 11, 0, 2, 12])
+    }
+    if g.is_open(north, EAST) {
+        try waters(f, mut r, p, [7, 1, 11, 7, 2, 12])
+    }
+}
+
+// `OceanMonumentEntryRoom`.
+fn entry_room(f: Facts, r: mut Region, g: Graph, home: i32, p: Pen) ! Thrown {
+    try bx(f, mut r, p, [0, 3, 0, 2, 3, 7, 5, 3, 0, 7, 3, 7, 0, 2, 0, 1, 2, 7, 6, 2, 0, 7, 2, 7, 0, 1, 0, 0, 1, 7, 7, 1, 0, 7, 1, 7, 0, 1, 7, 7, 3, 7, 1, 1, 0, 2, 3, 0, 5, 1, 0, 6, 3, 0], p.k.light)
+    if g.is_open(home, NORTH) {
+        try waters(f, mut r, p, [3, 1, 7, 4, 2, 7])
+    }
+    if g.is_open(home, WEST) {
+        try waters(f, mut r, p, [0, 1, 3, 1, 2, 4])
+    }
+    if g.is_open(home, EAST) {
+        try waters(f, mut r, p, [6, 1, 3, 7, 2, 4])
+    }
+}
+
+// `OceanMonumentPenthouse`.
+fn penthouse(f: Facts, r: mut Region, p: Pen) ! Thrown {
+    let k = p.k
+    try bx(f, mut r, p, [2, -1, 2, 11, -1, 11], k.light)
+    try bx(f, mut r, p, [0, -1, 0, 1, -1, 11, 12, -1, 0, 13, -1, 11, 2, -1, 0, 11, -1, 1, 2, -1, 12, 11, -1, 13], k.gray)
+    try bx(f, mut r, p, [0, 0, 0, 0, 0, 13, 13, 0, 0, 13, 0, 13, 1, 0, 0, 12, 0, 0, 1, 0, 13, 12, 0, 13], k.light)
+    var i = 2
+    while i <= 11 {
+        put(f, mut r, p, [0, 0, i, 13, 0, i, i, 0, 0], k.lamp)
+        i += 3
+    }
+    try bx(f, mut r, p, [2, 0, 3, 4, 0, 9, 9, 0, 3, 11, 0, 9, 4, 0, 9, 9, 0, 11], k.light)
+    put(f, mut r, p, [5, 0, 8, 8, 0, 8, 10, 0, 10, 3, 0, 10], k.light)
+    try bx(f, mut r, p, [3, 0, 3, 3, 0, 7, 10, 0, 3, 10, 0, 7, 6, 0, 10, 7, 0, 10], k.black)
+    let xs: List<i32> = [3, 10]
+    for x in xs {
+        var z = 2
+        while z <= 8 {
+            try bx(f, mut r, p, [x, 0, z, x, 2, z], k.light)
+            z += 3
+        }
+    }
+    try bx(f, mut r, p, [5, 0, 10, 5, 2, 10, 8, 0, 10, 8, 2, 10], k.light)
+    try bx(f, mut r, p, [6, -1, 7, 7, -1, 8], k.black)
+    try waters(f, mut r, p, [6, -1, 3, 7, -1, 4])
+    try elder(mut r, p, 6, 1, 6)
+}
+
+// `OceanMonumentSimpleRoom`, in its design.
+fn simple_room<T: RandomSource>(f: Facts, r: mut Region, random: mut T, g: Graph, home: i32, design: i32, p: Pen) ! Thrown {
+    let k = p.k
+    try floor_of(f, mut r, g, home, p, 0, 0, home)
+    if g.link(home, UP) < 0 {
+        try fill_only(f, mut r, p, 1, 4, 1, 6, 4, 6, k.gray)
+    }
+    let pillar = design != 0 and random.next_boolean() and not g.is_open(home, DOWN) and not g.is_open(home, UP) and g.openings(home) > 1
+    if design == 0 {
+        try bx(f, mut r, p, [0, 1, 0, 2, 1, 2, 0, 3, 0, 2, 3, 2], k.light)
+        try bx(f, mut r, p, [0, 2, 0, 0, 2, 2, 1, 2, 0, 2, 2, 0], k.gray)
+        put(f, mut r, p, [1, 2, 1], k.lamp)
+        try bx(f, mut r, p, [5, 1, 0, 7, 1, 2, 5, 3, 0, 7, 3, 2], k.light)
+        try bx(f, mut r, p, [7, 2, 0, 7, 2, 2, 5, 2, 0, 6, 2, 0], k.gray)
+        put(f, mut r, p, [6, 2, 1], k.lamp)
+        try bx(f, mut r, p, [0, 1, 5, 2, 1, 7, 0, 3, 5, 2, 3, 7], k.light)
+        try bx(f, mut r, p, [0, 2, 5, 0, 2, 7, 1, 2, 7, 2, 2, 7], k.gray)
+        put(f, mut r, p, [1, 2, 6], k.lamp)
+        try bx(f, mut r, p, [5, 1, 5, 7, 1, 7, 5, 3, 5, 7, 3, 7], k.light)
+        try bx(f, mut r, p, [7, 2, 5, 7, 2, 7, 5, 2, 7, 6, 2, 7], k.gray)
+        put(f, mut r, p, [6, 2, 6], k.lamp)
+        if g.is_open(home, SOUTH) {
+            try bx(f, mut r, p, [3, 3, 0, 4, 3, 0], k.light)
+        } else {
+            try bx(f, mut r, p, [3, 3, 0, 4, 3, 1], k.light)
+            try bx(f, mut r, p, [3, 2, 0, 4, 2, 0], k.gray)
+            try bx(f, mut r, p, [3, 1, 0, 4, 1, 1], k.light)
+        }
+        if g.is_open(home, NORTH) {
+            try bx(f, mut r, p, [3, 3, 7, 4, 3, 7], k.light)
+        } else {
+            try bx(f, mut r, p, [3, 3, 6, 4, 3, 7], k.light)
+            try bx(f, mut r, p, [3, 2, 7, 4, 2, 7], k.gray)
+            try bx(f, mut r, p, [3, 1, 6, 4, 1, 7], k.light)
+        }
+        if g.is_open(home, WEST) {
+            try bx(f, mut r, p, [0, 3, 3, 0, 3, 4], k.light)
+        } else {
+            try bx(f, mut r, p, [0, 3, 3, 1, 3, 4], k.light)
+            try bx(f, mut r, p, [0, 2, 3, 0, 2, 4], k.gray)
+            try bx(f, mut r, p, [0, 1, 3, 1, 1, 4], k.light)
+        }
+        if g.is_open(home, EAST) {
+            try bx(f, mut r, p, [7, 3, 3, 7, 3, 4], k.light)
+        } else {
+            try bx(f, mut r, p, [6, 3, 3, 7, 3, 4], k.light)
+            try bx(f, mut r, p, [7, 2, 3, 7, 2, 4], k.gray)
+            try bx(f, mut r, p, [6, 1, 3, 7, 1, 4], k.light)
+        }
+    } else if design == 1 {
+        try bx(f, mut r, p, [2, 1, 2, 2, 3, 2, 2, 1, 5, 2, 3, 5, 5, 1, 5, 5, 3, 5, 5, 1, 2, 5, 3, 2], k.light)
+        put(f, mut r, p, [2, 2, 2, 2, 2, 5, 5, 2, 5, 5, 2, 2], k.lamp)
+        try bx(f, mut r, p, [0, 1, 0, 1, 3, 0, 0, 1, 1, 0, 3, 1, 0, 1, 7, 1, 3, 7, 0, 1, 6, 0, 3, 6, 6, 1, 7, 7, 3, 7, 7, 1, 6, 7, 3, 6, 6, 1, 0, 7, 3, 0, 7, 1, 1, 7, 3, 1], k.light)
+        put(f, mut r, p, [1, 2, 0, 0, 2, 1, 1, 2, 7, 0, 2, 6, 6, 2, 7, 7, 2, 6, 6, 2, 0, 7, 2, 1], k.gray)
+        if not g.is_open(home, SOUTH) {
+            try bx(f, mut r, p, [1, 3, 0, 6, 3, 0], k.light)
+            try bx(f, mut r, p, [1, 2, 0, 6, 2, 0], k.gray)
+            try bx(f, mut r, p, [1, 1, 0, 6, 1, 0], k.light)
+        }
+        if not g.is_open(home, NORTH) {
+            try bx(f, mut r, p, [1, 3, 7, 6, 3, 7], k.light)
+            try bx(f, mut r, p, [1, 2, 7, 6, 2, 7], k.gray)
+            try bx(f, mut r, p, [1, 1, 7, 6, 1, 7], k.light)
+        }
+        if not g.is_open(home, WEST) {
+            try bx(f, mut r, p, [0, 3, 1, 0, 3, 6], k.light)
+            try bx(f, mut r, p, [0, 2, 1, 0, 2, 6], k.gray)
+            try bx(f, mut r, p, [0, 1, 1, 0, 1, 6], k.light)
+        }
+        if not g.is_open(home, EAST) {
+            try bx(f, mut r, p, [7, 3, 1, 7, 3, 6], k.light)
+            try bx(f, mut r, p, [7, 2, 1, 7, 2, 6], k.gray)
+            try bx(f, mut r, p, [7, 1, 1, 7, 1, 6], k.light)
+        }
+    } else if design == 2 {
+        try plain_walls(f, mut r, p)
+        if g.is_open(home, SOUTH) {
+            try waters(f, mut r, p, [3, 1, 0, 4, 2, 0])
+        }
+        if g.is_open(home, NORTH) {
+            try waters(f, mut r, p, [3, 1, 7, 4, 2, 7])
+        }
+        if g.is_open(home, WEST) {
+            try waters(f, mut r, p, [0, 1, 3, 0, 2, 4])
+        }
+        if g.is_open(home, EAST) {
+            try waters(f, mut r, p, [7, 1, 3, 7, 2, 4])
+        }
+    }
+    if pillar {
+        try bx(f, mut r, p, [3, 1, 3, 4, 1, 4], k.light)
+        try bx(f, mut r, p, [3, 2, 3, 4, 2, 4], k.gray)
+        try bx(f, mut r, p, [3, 3, 3, 4, 3, 4], k.light)
+    }
+}
+
+// The walls of a simple room's third design and of the top room: bricks with a band of dark
+// prismarine, and a dark doorway in each.
+fn plain_walls(f: Facts, r: mut Region, p: Pen) ! Thrown {
+    let k = p.k
+    try bx(f, mut r, p, [0, 1, 0, 0, 1, 7, 7, 1, 0, 7, 1, 7, 1, 1, 0, 6, 1, 0, 1, 1, 7, 6, 1, 7], k.light)
+    try bx(f, mut r, p, [0, 2, 0, 0, 2, 7, 7, 2, 0, 7, 2, 7, 1, 2, 0, 6, 2, 0, 1, 2, 7, 6, 2, 7], k.black)
+    try bx(f, mut r, p, [0, 3, 0, 0, 3, 7, 7, 3, 0, 7, 3, 7, 1, 3, 0, 6, 3, 0, 1, 3, 7, 6, 3, 7], k.light)
+    try bx(f, mut r, p, [0, 1, 3, 0, 2, 4, 7, 1, 3, 7, 2, 4, 3, 1, 0, 4, 2, 0, 3, 1, 7, 4, 2, 7], k.black)
+}
+
+// `OceanMonumentSimpleTopRoom`: wet sponge hanging from the ceiling.
+fn simple_top_room<T: RandomSource>(f: Facts, r: mut Region, random: mut T, g: Graph, home: i32, p: Pen) ! Thrown {
+    let k = p.k
+    try floor_of(f, mut r, g, home, p, 0, 0, home)
+    if g.link(home, UP) < 0 {
+        try fill_only(f, mut r, p, 1, 4, 1, 6, 4, 6, k.gray)
+    }
+    for x in 1..7 {
+        for z in 1..7 {
+            if random.next_int_below(3) != 0 {
+                let y0 = 2 + if random.next_int_below(4) == 0 { 0 } else { 1 }
+                try bx(f, mut r, p, [x, y0, z, x, 3, z], k.sponge)
+            }
+        }
+    }
+    try plain_walls(f, mut r, p)
+    if g.is_open(home, SOUTH) {
+        try waters(f, mut r, p, [3, 1, 0, 4, 2, 0])
+    }
+}
+
+// `OceanMonumentWingRoom`, in its design.
+fn wing_room(f: Facts, r: mut Region, design: i32, p: Pen) ! Thrown {
+    let k = p.k
+    if design == 0 {
+        for i in 0..4 {
+            try bx(f, mut r, p, [10 - i, 3 - i, 20 - i, 12 + i, 3 - i, 20], k.light)
+        }
+        try bx(f, mut r, p, [7, 0, 6, 15, 0, 16, 6, 0, 6, 6, 3, 20, 16, 0, 6, 16, 3, 20, 7, 1, 7, 7, 1, 20, 15, 1, 7, 15, 1, 20, 7, 1, 6, 9, 3, 6, 13, 1, 6, 15, 3, 6, 8, 1, 7, 9, 1, 7, 13, 1, 7, 14, 1, 7, 9, 0, 5, 13, 0, 5], k.light)
+        try bx(f, mut r, p, [10, 0, 7, 12, 0, 7, 8, 0, 10, 8, 0, 12, 14, 0, 10, 14, 0, 12], k.black)
+        var z = 18
+        while z >= 7 {
+            put(f, mut r, p, [6, 3, z, 16, 3, z], k.lamp)
+            z -= 3
+        }
+        put(f, mut r, p, [10, 0, 10, 12, 0, 10, 10, 0, 12, 12, 0, 12, 8, 3, 6, 14, 3, 6], k.lamp)
+        let xs: List<i32> = [4, 18]
+        for zc in xs {
+            for xc in xs {
+                put(f, mut r, p, [xc, 2, zc], k.light)
+                put(f, mut r, p, [xc, 1, zc], k.lamp)
+                put(f, mut r, p, [xc, 0, zc], k.light)
+            }
+        }
+        put(f, mut r, p, [9, 7, 20, 13, 7, 20], k.light)
+        try bx(f, mut r, p, [6, 0, 21, 7, 4, 21, 15, 0, 21, 16, 4, 21], k.light)
+        try elder(mut r, p, 11, 2, 16)
+    } else if design == 1 {
+        try bx(f, mut r, p, [9, 3, 18, 13, 3, 20, 9, 0, 18, 9, 2, 18, 13, 0, 18, 13, 2, 18], k.light)
+        let ends: List<i32> = [9, 13]
+        for x in ends {
+            put(f, mut r, p, [x, 6, 20], k.light)
+            put(f, mut r, p, [x, 5, 20], k.lamp)
+            put(f, mut r, p, [x, 4, 20], k.light)
+        }
+        try bx(f, mut r, p, [7, 3, 7, 15, 3, 14], k.light)
+        let posts: List<i32> = [10, 12]
+        for x in posts {
+            try bx(f, mut r, p, [x, 0, 10, x, 6, 10, x, 0, 12, x, 6, 12], k.light)
+            put(f, mut r, p, [x, 0, 10, x, 0, 12, x, 4, 10, x, 4, 12], k.lamp)
+        }
+        let sides: List<i32> = [8, 14]
+        for x in sides {
+            try bx(f, mut r, p, [x, 0, 7, x, 2, 7, x, 0, 14, x, 2, 14], k.light)
+        }
+        try bx(f, mut r, p, [8, 3, 8, 8, 3, 13, 14, 3, 8, 14, 3, 13], k.black)
+        try elder(mut r, p, 11, 5, 13)
+    }
+}

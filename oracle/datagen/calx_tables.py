@@ -478,6 +478,16 @@ def block_facts_module(index, flags):
         ["/// The states whose shape is a full block when their collision shape isn't, or the",
          "/// other way round, by ID: `Block.isShapeFullBlock(getShape)` against",
          "/// `isCollisionShapeFullBlock`."])
+    pairs = [str(v) for pair in flags["wall_cover"] for v in pair]
+    lines += [
+        "/// The states whose collision shape's bottom covers `WallBlock`'s test shapes otherwise than",
+        "/// its face being full says, all or none, each followed by which it covers: a bit for the",
+        "/// post's, then the north, east, south and west wall's. `WallBlock.isCovered`.",
+        "pub fn wall_cover() -> List<u32> {",
+        "    let pairs: List<u32> = [",
+    ]
+    lines += ["        " + ", ".join(pairs[i:i + 24]) + "," for i in range(0, len(pairs), 24)]
+    lines += ["    ]", "    return pairs", "}", ""]
     pairs = [str(v) for pair in flags["poi"] for v in pair]
     lines += [
         "/// The states that are points of interest, each followed by its type's ID in the",
