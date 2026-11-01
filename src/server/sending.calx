@@ -12,6 +12,10 @@
 /// the encoder come back on a queue, waking the poll. Only one batch of a connection is away at a
 /// time, so its bytes keep their order, and what it queues meanwhile goes once the encoder is
 /// back. The codec threads start as batches need them, up to one fewer than the processors.
+///
+/// A chunk's packet that's kept for several players is compressed once, by whichever player's
+/// encoder gets it first: the body comes back for the level to keep, and the others are sent it
+/// framed and encrypted as theirs (D196). Compressing is most of what a chunk costs to send.
 module server.sending
 
 import protocol.codec.{Encoder}
@@ -35,6 +39,19 @@ enum Step {
     Compress(i32)
     /// Encryption from here on, with this secret.
     Encrypt(List<u8>)
+    /// A packet kept for other players, whose compressed body comes back with its key and version.
+    Shared { packet: List<u8>, key: i64, version: u64 }
+    /// A frame's body, compressed already with this threshold.
+    Body(List<u8>, i32)
+}
+
+/// A packet kept for other players, as a connection's encoder compressed it on the way: the key
+/// and version it was queued with, and its frame's body, compressed with `threshold`.
+pub struct Compressed {
+    pub key: i64
+    pub version: u64
+    pub body: List<u8>
+    pub threshold: i32
 }
 
 /// What a connection has queued to send.
@@ -59,6 +76,20 @@ impl Outbox {
     pub fn packet(mut self, body: own List<u8>) {
         self.bytes += body.len()
         self.steps.push_last(Step.Packet(body))
+    }
+
+    /// Queues a packet that's kept for other players. If the connection compresses, the body
+    /// it's compressed to comes back from `Sending.take_compressed`, with `key` and `version`.
+    pub fn shared(mut self, packet: own List<u8>, key: i64, version: u64) {
+        self.bytes += packet.len()
+        self.steps.push_last(Step.Shared { packet: packet, key: key, version: version })
+    }
+
+    /// Queues a packet's frame body, compressed already with `threshold`, as another
+    /// connection's encoder compressed it.
+    pub fn compressed(mut self, body: own List<u8>, threshold: i32) {
+        self.bytes += body.len()
+        self.steps.push_last(Step.Body(body, threshold))
     }
 
     /// Queues bytes that go as they are.
@@ -90,13 +121,14 @@ struct Batch {
     steps: Deque<Step>
 }
 
-/// A batch a codec thread encoded: its connection's encoder, the bytes to send, and why any
-/// packet couldn't be.
+/// A batch a codec thread encoded: its connection's encoder, the bytes to send, why any packet
+/// couldn't be, and the shared packets it compressed.
 pub struct Encoded {
     pub conn: Conn
     encoder: Encoder
     bytes: List<u8>
     problems: List<String>
+    compressed: List<Compressed>
 }
 
 // A codec thread: it encodes each batch that comes, sends it back, and wakes the poll.
@@ -114,16 +146,18 @@ impl Task for CodecThread {
             var encoder = b.encoder
             var steps = b.steps
             var problems = List<String>()
-            let bytes = encode(mut encoder, mut steps, mut problems)
-            done.send(Encoded { conn: b.conn, encoder: encoder, bytes: bytes, problems: problems })
+            var compressed = List<Compressed>()
+            let bytes = encode(mut encoder, mut steps, mut problems, mut compressed)
+            done.send(Encoded { conn: b.conn, encoder: encoder, bytes: bytes, problems: problems, compressed: compressed })
             self.waker.wake()
         }
     }
 }
 
 // The steps, taken in order, as the bytes to send through `encoder`. A packet that can't be
-// sent, such as one too big, is left out, with why in `problems`.
-fn encode(encoder: mut Encoder, steps: mut Deque<Step>, problems: mut List<String>) -> List<u8> {
+// sent, such as one too big, is left out, with why in `problems`. The shared packets compressed
+// on the way go in `compressed`.
+fn encode(encoder: mut Encoder, steps: mut Deque<Step>, problems: mut List<String>, compressed: mut List<Compressed>) -> List<u8> {
     var w = Writer.new()
     while let s = steps.pop_first() {
         match s {
@@ -136,6 +170,32 @@ fn encode(encoder: mut Encoder, steps: mut Deque<Step>, problems: mut List<Strin
             Step.Raw(bytes) => w.raw(bytes),
             Step.Compress(threshold) => encoder.start_compression(threshold),
             Step.Encrypt(secret) => encoder.start_encryption(secret),
+            Step.Shared { packet, key, version } => {
+                match encoder.body(packet) {
+                    ok(body) => {
+                        let threshold = encoder.compression()
+                        if threshold >= 0 {
+                            compressed.push(Compressed { key: key, version: version, body: body.copy(), threshold: threshold })
+                        }
+                        match encoder.encode_body(body) {
+                            ok(bytes) => w.raw(bytes),
+                            err(message) => problems.push(message),
+                        }
+                    },
+                    err(message) => problems.push(message),
+                }
+            },
+            Step.Body(body, threshold) => {
+                // Every connection compresses from the server's threshold, so this is a mistake.
+                if threshold != encoder.compression() {
+                    problems.push("A packet compressed from {threshold} bytes can't go where they're compressed from {encoder.compression()}")
+                } else {
+                    match encoder.encode_body(body) {
+                        ok(bytes) => w.raw(bytes),
+                        err(message) => problems.push(message),
+                    }
+                }
+            },
         }
     }
     return w.into_bytes()
@@ -156,6 +216,8 @@ pub struct Sending {
     started: usize
     most: usize
     batches_away: usize
+    // The shared packets compressed since they were last taken.
+    compressed: List<Compressed>
 }
 
 impl Sending {
@@ -168,7 +230,7 @@ impl Sending {
         // The tick thread is busy itself, so the codec threads leave it a processor.
         let processors = unsafe { workers() }
         let most = if processors > 2 { processors - 1 } else { 1 }
-        return Sending { waker: none, no_waker: false, jobs: jobs, to_jobs: to_jobs, done: done, to_done: to_done, started: 0, most: most, batches_away: 0 }
+        return Sending { waker: none, no_waker: false, jobs: jobs, to_jobs: to_jobs, done: done, to_done: to_done, started: 0, most: most, batches_away: 0, compressed: List<Compressed>() }
     }
 
     /// Encodes what `out` queued for `conn`, and sends it through `link`: here if it's at most
@@ -192,7 +254,7 @@ impl Sending {
                 return
             }
             var encoder = out.encoder.take()!
-            let bytes = encode(mut encoder, mut out.steps, mut problems)
+            let bytes = encode(mut encoder, mut out.steps, mut problems, mut self.compressed)
             out.encoder = some(encoder)
             out.bytes = 0
             link.write(conn, bytes)
@@ -218,9 +280,23 @@ impl Sending {
         var back = List<Encoded>()
         while let e = self.done.next() {
             self.batches_away -= 1
-            back.push(e)
+            var got = e
+            while let c = got.compressed.pop() {
+                self.compressed.push(c)
+            }
+            back.push(got)
         }
         return back
+    }
+
+    /// The shared packets compressed since this was last asked, here or on the codec threads,
+    /// whether or not their connections are still open.
+    pub fn take_compressed(mut self) -> List<Compressed> {
+        var out = List<Compressed>()
+        while let c = self.compressed.pop() {
+            out.push(c)
+        }
+        return out
     }
 
     /// Sends what a batch came back with, gives its connection's encoder back to `out`, and then
