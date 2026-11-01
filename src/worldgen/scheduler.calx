@@ -2,7 +2,10 @@
 /// within 8 of it and the biomes around it are made, its decoration once the terrain of the nine
 /// around it is and each chunk 2 or less from it of a lower rank is decorated (D214), and the
 /// chunk finished once the nine around it are decorated. Starts and biomes are made a block of
-/// chunks a job.
+/// chunks a job. A block's starts wait only for the strongholds' ring searches whose positions
+/// its chunks, or the exclusion zones about them, can meet: a search moves its position at most
+/// `RING_REACH` chunks, so the chunks near the origin never wait for one (D219). A search some
+/// starts wait for goes out first, and the rest once nothing else is ready.
 ///
 /// Each job is a node, which counts the nodes it needs that aren't done, and each node keeps the
 /// nodes that wait for it, so a job is ready the moment the last it needs is done, with nothing
@@ -28,7 +31,7 @@ import worldgen.generator.{BLOCK_SHIFT, DecorateJob, FinishJob, GenSetup, HEIGHT
 import worldgen.interval.{Thrown}
 import worldgen.references.{Refs, StartMap, beardifier_for, chunk_key, create_references}
 import worldgen.region.{RegionChunk}
-import worldgen.structures.{RingSearch, Rings, StructureState, Structures}
+import worldgen.structures.{RING_REACH, RingSearch, Rings, StructureState, Structures, UNKNOWN_RING}
 import std.zip.{Zip}
 
 // The kinds of node, most urgent first.
@@ -85,12 +88,21 @@ pub struct Scheduler {
     biomes: Map<i64, List<i32>>
     refs: Map<i64, List<Refs>>
     protos: Map<i64, RegionChunk>
-    // The ring searches to go out, how many aren't back, the rings as they come back, and the
-    // starts' nodes that wait for them all.
-    searches: Deque<RingSearch>
-    searches_left: usize
+    // The ring searches, each until it goes out; where each starts and its set and place; whether
+    // it's back; the starts' nodes that wait for it; those some node waits for, to go out first;
+    // and the next to go out when nothing else is ready. The rings fill in as they come back.
+    searches: List<RingSearch?>
+    search_origins: List<(i32, i32)>
+    search_keys: List<(usize, usize)>
+    search_done: List<bool>
+    search_waiting: List<List<i64>>
+    search_urgent: List<bool>
+    urgent: Deque<usize>
+    idle_search: usize
+    // How far from a block's chunks a ring position matters to its starts: as far as a search
+    // moves its position, and as far as a set's exclusion zone looks.
+    ring_margin: i32
     rings: Rings
-    after_rings: List<i64>
     // The chunks finished by `take`, to be taken.
     finished: Deque<(i32, i32, Chunk)>
     /// What went wrong making chunks, to be logged, oldest first.
@@ -106,8 +118,10 @@ impl Scheduler {
             ready.push(Deque<i64>())
         }
         var rings = Rings { sets: List<usize>(), lists: List<List<(i32, i32)>>() }
-        var queue = Deque<RingSearch>()
-        let left = searches.len()
+        var queue = List<RingSearch?>()
+        var origins = List<(i32, i32)>()
+        var keys = List<(usize, usize)>()
+        var waiting = List<List<i64>>()
         var rest = searches
         while not rest.is_empty() {
             let r = rest.remove(0)
@@ -117,11 +131,16 @@ impl Scheduler {
             }
             for i in 0..rings.sets.len() {
                 if rings.sets[i] == r.set {
-                    rings.lists[i].push((0, 0))
+                    rings.lists[i].push(UNKNOWN_RING)
                 }
             }
-            queue.push_last(r)
+            origins.push(r.origin())
+            keys.push((r.set, r.index))
+            waiting.push(List<i64>())
+            queue.push(some(r))
         }
+        let count = queue.len()
+        let margin = RING_REACH + StructureState.most_exclusion(structures)
         return Scheduler {
             structures: structures,
             nodes: Map<i64, Node>(),
@@ -132,9 +151,15 @@ impl Scheduler {
             refs: Map<i64, List<Refs>>(),
             protos: Map<i64, RegionChunk>(),
             searches: queue,
-            searches_left: left,
+            search_origins: origins,
+            search_keys: keys,
+            search_done: [false; count],
+            search_waiting: waiting,
+            search_urgent: [false; count],
+            urgent: Deque<usize>(),
+            idle_search: 0,
+            ring_margin: margin,
             rings: rings,
-            after_rings: List<i64>(),
             finished: Deque<(i32, i32, Chunk)>(),
             problems: List<String>(),
         }
@@ -171,16 +196,28 @@ impl Scheduler {
     }
 
     /// The most urgent job that's ready, which is out until what it made is taken.
+    /// A ring search some starts wait for goes out first; the others only once nothing else is
+    /// ready, as the chunks near the origin never meet a ring.
     pub fn next(mut self) -> Job? {
-        if let r = self.searches.pop_first() {
-            self.out += 1
-            return some(Job.Ring(r))
+        while let k = self.urgent.pop_first() {
+            if let r = self.searches[k].take() {
+                self.out += 1
+                return some(Job.Ring(r))
+            }
         }
         for k in 0..KINDS {
             if let n = self.queues[k].pop_first() {
                 self.nodes[n].state = RUNNING
                 self.out += 1
                 return some(self.job(n))
+            }
+        }
+        while self.idle_search < self.searches.len() {
+            let k = self.idle_search
+            self.idle_search += 1
+            if let r = self.searches[k].take() {
+                self.out += 1
+                return some(Job.Ring(r))
             }
         }
         return none
@@ -197,12 +234,14 @@ impl Scheduler {
                 }
                 self.noted(problems)
                 self.out -= 1
-                self.searches_left -= 1
-                if self.searches_left == 0 {
-                    let waiting = self.after_rings.copy()
-                    self.after_rings.clear()
-                    for n in waiting {
-                        self.ready_one(n)
+                for k in 0..self.search_keys.len() {
+                    if self.search_keys[k] == (set, index) {
+                        self.search_done[k] = true
+                        let waiting = self.search_waiting[k].copy()
+                        self.search_waiting[k].clear()
+                        for n in waiting {
+                            self.ready_one(n)
+                        }
                     }
                 }
             },
@@ -274,9 +313,25 @@ impl Scheduler {
                 self.nodes[d].dependents.push(n)
             }
         }
-        if kind_of(n) == STARTS and self.searches_left > 0 {
-            missing += 1
-            self.after_rings.push(n)
+        if kind_of(n) == STARTS {
+            // The ring searches whose position its chunks, or the exclusion zones about them, can
+            // meet; a position found elsewhere doesn't change them.
+            let reach = self.ring_margin
+            let x0 = (x_of(n) << BLOCK_SHIFT) - reach
+            let x1 = ((x_of(n) + 1) << BLOCK_SHIFT) - 1 + reach
+            let z0 = (z_of(n) << BLOCK_SHIFT) - reach
+            let z1 = ((z_of(n) + 1) << BLOCK_SHIFT) - 1 + reach
+            for k in 0..self.search_origins.len() {
+                let (ox, oz) = self.search_origins[k]
+                if not self.search_done[k] and ox + RING_REACH >= x0 and ox - RING_REACH <= x1 and oz + RING_REACH >= z0 and oz - RING_REACH <= z1 {
+                    missing += 1
+                    self.search_waiting[k].push(n)
+                    if not self.search_urgent[k] {
+                        self.search_urgent[k] = true
+                        self.urgent.push_last(k)
+                    }
+                }
+            }
         }
         self.nodes[n].missing = missing
         if missing == 0 {
