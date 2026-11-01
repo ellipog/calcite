@@ -1,0 +1,195 @@
+/// The `terrain` probe (rig/PROTOCOL.md): chunks filled with a noise settings' terrain shape,
+/// before their surface and carvers, and base columns and heights, in a world of the given bottom
+/// and height.
+module rig.terrain
+
+import json.tree.{Json, Member, as_i32, as_string, take}
+import pack.zip.{Zip}
+import rig.frame.{Outcome}
+import world.chunk.{BlockStates, HEIGHTMAP_KINDS}
+import world.states.{StateCodec}
+import worldgen.density.{Functions, data_json, qualified}
+import worldgen.interval.{Thrown}
+import worldgen.terrain.{Shape, base_column, base_height, fill_chunk, read_shape}
+
+/// The most blocks a case's ops may ask for.
+const MAX_VALUES: i64 = 4194304
+
+/// A `fill` of the chunk at `a`, `b`, or a `column` at the block `a`, `b`.
+struct Op {
+    fill: bool
+    a: i32
+    b: i32
+}
+
+pub fn run_terrain(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, codec: StateCodec, states: BlockStates) -> Outcome {
+    if blobs.len() != 0 {
+        return Outcome.Failed("`terrain` takes no blobs")
+    }
+    var fields = input
+    let seed_value = take(mut fields, "seed") else return Outcome.Failed("missing field `seed`")
+    let seed_text = as_string(seed_value) else return Outcome.Failed("`seed` must be a string")
+    let seed = i64.parse(seed_text) else return Outcome.Failed("`seed` must be a decimal 64-bit integer")
+    let settings_value = take(mut fields, "settings") else return Outcome.Failed("missing field `settings`")
+    let name = as_string(settings_value) else return Outcome.Failed("`settings` must be an identifier")
+    let json = match data_json(zip, qualified(name), "noise_settings") {
+        ok(j) => j,
+        err(e) => return Outcome.Failed(e),
+    }
+    let members = match json {
+        Json.Object(m) => m,
+        _ => return Outcome.Failed("noise settings `{name}` isn't an object"),
+    }
+    let legacy = match get_bool(members, "legacy_random_source") {
+        some(b) => b,
+        none => return Outcome.Failed("noise settings `{name}` have no `legacy_random_source`"),
+    }
+    let level = match take(mut fields, "level") {
+        some(Json.Array(items)) => items,
+        _ => return Outcome.Failed("`level` must be [min_y, height]"),
+    }
+    if level.len() != 2 {
+        return Outcome.Failed("`level` must be [min_y, height]")
+    }
+    let min_y = as_i32(level[0]) else return Outcome.Failed("`level`[0] must be an int")
+    let height = as_i32(level[1]) else return Outcome.Failed("`level`[1] must be an int")
+    if min_y % 16 != 0 or height % 16 != 0 or height <= 0 or min_y < -2032 or min_y + height > 2032 {
+        return Outcome.Failed("`level` must be whole sections within the world")
+    }
+    let op_list = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let ops = match op_list {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    var steps = List<Op>()
+    var values: i64 = 0
+    for i in 0..ops.len() {
+        match read_op(ops[i], i) {
+            ok(op) => {
+                values += if op.fill { 256 * i64(height) } else { i64(height) }
+                steps.push(op)
+            },
+            err(e) => return Outcome.Failed(e),
+        }
+    }
+    if values > MAX_VALUES {
+        return Outcome.Failed("the ops give more than {MAX_VALUES} values")
+    }
+    var functions = Functions.new(legacy, seed)
+    let shape = match read_shape(mut functions, zip, members, codec, states) {
+        ok(s) => s,
+        err(e) => return Outcome.Failed(e),
+    }
+    var out = List<u8>()
+    match evaluate(mut functions, shape, states, steps, min_y, height, mut out) {
+        ok => {},
+        err(thrown) => return rejected(thrown),
+    }
+    let output: List<Member> = []
+    return Outcome.Done { output: output, blobs: [out] }
+}
+
+/// The ops, as the vanilla adapter does them: the first exception thrown is the case's.
+fn evaluate(functions: mut Functions, s: Shape, states: BlockStates, steps: List<Op>, min_y: i32, height: i32, out: mut List<u8>) ! Thrown {
+    for op in steps {
+        if op.fill {
+            let f = try fill_chunk(mut functions, s, states, op.a, op.b, min_y, height)
+            // The blocks as runs of one state.
+            var runs = List<u32>()
+            var i: usize = 0
+            while i < f.states.len() {
+                let state = f.states[i]
+                var end = i + 1
+                while end < f.states.len() and f.states[end] == state {
+                    end += 1
+                }
+                runs.push(state)
+                runs.push(u32.wrap(end - i))
+                i = end
+            }
+            put_u32(mut out, u32.wrap(runs.len() / 2))
+            for v in runs {
+                put_u32(mut out, v)
+            }
+            for h in f.ocean_floor {
+                put_u32(mut out, u32.wrap(h))
+            }
+            for h in f.world_surface {
+                put_u32(mut out, u32.wrap(h))
+            }
+            for list in f.marked {
+                put_u32(mut out, u32.wrap(list.len()))
+                for packed in list {
+                    put_u32(mut out, u32(packed))
+                }
+            }
+        } else {
+            let column = try base_column(mut functions, s, op.a, op.b, min_y, height)
+            if let c = column {
+                put_u32(mut out, u32.wrap(c.states.len()))
+                put_u32(mut out, u32.wrap(c.min_y))
+                for state in c.states {
+                    put_u32(mut out, state)
+                }
+            } else {
+                put_u32(mut out, 0xFFFFFFFF)
+            }
+            for kind in 0..HEIGHTMAP_KINDS {
+                put_u32(mut out, u32.wrap(base_height(column, states, kind, min_y)))
+            }
+        }
+    }
+}
+
+fn read_op(value: Json, i: usize) -> Op ! String {
+    let what = "`ops`[{i}]"
+    match value {
+        Json.Array(items) => return try op_of(items, what),
+        _ => {},
+    }
+    fail "{what} must be a non-empty array"
+}
+
+fn op_of(op: List<Json>, what: String) -> Op ! String {
+    if op.len() == 0 {
+        fail "{what} must be a non-empty array"
+    }
+    let kind = as_string(op[0]) else fail "{what}[0] must be a string"
+    if kind != "fill" and kind != "column" {
+        fail "{what}: unknown op `{kind}`"
+    }
+    if op.len() != 3 {
+        fail "{what} must have 3 elements"
+    }
+    let a = as_i32(op[1]) else fail "{what}[1] must be an int"
+    let b = as_i32(op[2]) else fail "{what}[2] must be an int"
+    return Op { fill: kind == "fill", a: a, b: b }
+}
+
+fn get_bool(members: List<Member>, key: String) -> bool? {
+    for m in members {
+        if m.key == key {
+            return match m.value {
+                Json.Bool(b) => some(b),
+                _ => none,
+            }
+        }
+    }
+    return none
+}
+
+/// A rejection, as the vanilla adapter reports an exception the game throws.
+fn rejected(thrown: Thrown) -> Outcome {
+    let output: List<Member> = [
+        Member { key: "exception", value: Json.Str(thrown.exception.copy()) },
+        Member { key: "error", value: Json.Str(thrown.message.copy()) },
+    ]
+    return Outcome.Done { output: output, blobs: [] }
+}
+
+fn put_u32(out: mut List<u8>, v: u32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}

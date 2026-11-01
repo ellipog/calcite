@@ -62,7 +62,8 @@ public final class Main {
                 new PacksProbe(),
                 new NoiseProbe(),
                 new DensityProbe(),
-                new BiomesProbe())) {
+                new BiomesProbe(),
+                new TerrainProbe())) {
             probes.put(probe.name(), probe);
         }
 

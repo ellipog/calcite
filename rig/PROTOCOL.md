@@ -674,6 +674,21 @@ Each case runs on a thread of its own, so the parameter list's search starts fro
 
 A source the codec doesn't read is `{"invalid": true}` and no blob: the codec's messages are its own, so only that it doesn't read is compared. If anything else throws, the result is the rejection, as `rng`'s is, and no blob. Settings that don't exist, an op that isn't one of those or isn't whole sections, `list` or `search` with another kind of source, too many values and a blob of the wrong length are an `error` status.
 
+### `terrain` (v1)
+
+A noise settings' terrain shape: chunks filled as `NoiseBasedChunkGenerator.buildTerrain` fills them before their surface and carvers, and base columns and heights. The registries are vanilla's own, as `density`'s are.
+
+Input `{"seed": s, "settings": id, "level": [min_y, height], "ops": [...]}` and no blobs. `s` is a `long` as a decimal string, and the `RandomState` is `RandomState.create(noises, seed, settings)` of the noise settings `id`. The generator is a `NoiseBasedChunkGenerator` of those settings, with a fixed biome source, which the terrain doesn't use. The world is `LevelHeightAccessor.create(min_y, height)`, whole sections, `height` positive, within -2032 and 2032. The ops, in order:
+
+| Op | Writes to the blob |
+| --- | --- |
+| `["fill", x, z]` | A new `ProtoChunk` at chunk `x`, `z` of the world, filled as `buildTerrain` does with no structures to beardify and nothing to blend: the settings' noise clamped to the world (`clampToHeightAccessor`), and if any is left, `doFill` with a new `NoiseChunk` over the chunk's volume. Then the chunk's blocks from the bottom up, each section in `y`, `z`, `x` order, as runs: their count, then each run's state ID and length, as `int`s; the `OCEAN_FLOOR_WG` and `WORLD_SURFACE_WG` heightmaps, each column's `getFirstAvailable` by `x` + 16`z`; and each section's blocks marked for post-processing, their count and then each one packed as `ProtoChunk.packOffsetCoordinates` packs it |
+| `["column", x, z]` | `getBaseColumn(x, z, world, random_state)`: its length, or -1 if there's no column, then its bottom and each block's state ID from the bottom up; then `getBaseHeight` of each of the six heightmaps, in `Heightmap.Types` order |
+
+The ops give at most 2^22 blocks in all, 256 times the world's height for each `fill` and the height for each `column`. The output is `{}`.
+
+If anything throws, the result is the rejection, as `rng`'s is, and no blob. Settings that don't exist, a world that isn't whole sections within the limits, an op that isn't one of those, too many blocks and any blob are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.
