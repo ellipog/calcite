@@ -1,0 +1,420 @@
+/// What features test blocks with: vanilla's worldgen `BlockPredicate`s, which look at a block of
+/// the region near a position, and the `RuleTest`s ores and processors test a state with, read as
+/// their codecs read them. Sets of blocks, fluids and biomes are read here too, as
+/// `RegistryCodecs.holderSet` reads them.
+module worldgen.predicates
+
+import json.tree.{Json, Member, as_string}
+import nbt.tag.{Tag}
+import random.source.{RandomSource}
+import registry.registry.{Registry}
+import resources.identifier.{Identifier}
+import worldgen.codec.{field, float_field, int_field, int_of, map_of, type_of}
+import worldgen.facts.{BlockSet, Facts, direction_named}
+import worldgen.interval.{Thrown}
+import worldgen.providers.{Anchor, anchor_field}
+import worldgen.region.{Region}
+import worldgen.survive.{Env, can_survive, sturdy_at}
+
+/// A worldgen `BlockPredicate`.
+pub enum Pred {
+    /// `matching_blocks`, `matching_block_tag`, `matching_fluids`, `replaceable` and `solid`:
+    /// the block at the offset.
+    Blocks { dx: i32, dy: i32, dz: i32, set: BlockSet }
+    Fluids { dx: i32, dy: i32, dz: i32, mask: u32 }
+    Replaceable { dx: i32, dy: i32, dz: i32 }
+    Solid { dx: i32, dy: i32, dz: i32 }
+    Biomes(List<i32>)
+    Sturdy { dx: i32, dy: i32, dz: i32, direction: i32 }
+    Survives { dx: i32, dy: i32, dz: i32, state: u32 }
+    InsideWorld { dx: i32, dy: i32, dz: i32 }
+    AnyOf(List<Pred>)
+    AllOf(List<Pred>)
+    Not(Box<Pred>)
+    True
+    Unobstructed
+    HeightRange { min: Anchor, max: Anchor }
+    Volume { min_x: i32, min_y: i32, min_z: i32, max_x: i32, max_y: i32, max_z: i32, of: Box<Pred> }
+}
+
+/// What reading a predicate needs: the block, fluid and biome registries by name.
+pub struct Readers {
+    pub blocks: Registry
+    pub fluids: Registry
+    pub biomes: Registry
+}
+
+/// `BlockPredicate.CODEC`.
+pub fn read_pred(facts: Facts, rd: Readers, value: Json) -> Pred ! String {
+    let m = try map_of(value)
+    let kind = try type_of(m)
+    if kind == "minecraft:matching_blocks" {
+        let (dx, dy, dz) = try offset(m, "offset")
+        let v = field(m, "blocks") else fail "No key blocks in MapLike"
+        return Pred.Blocks { dx: dx, dy: dy, dz: dz, set: try read_blocks(facts, rd.blocks, v) }
+    }
+    if kind == "minecraft:matching_block_tag" {
+        let (dx, dy, dz) = try offset(m, "offset")
+        let name = try tag_key(m, "tag")
+        return Pred.Blocks { dx: dx, dy: dy, dz: dz, set: facts.tag_or_empty(name) }
+    }
+    if kind == "minecraft:matching_fluids" {
+        let (dx, dy, dz) = try offset(m, "offset")
+        let v = field(m, "fluids") else fail "No key fluids in MapLike"
+        return Pred.Fluids { dx: dx, dy: dy, dz: dz, mask: try read_fluids(rd.fluids, v) }
+    }
+    if kind == "minecraft:matching_biomes" {
+        let v = field(m, "biomes") else fail "No key biomes in MapLike"
+        return Pred.Biomes(try read_ids(rd.biomes, v, "worldgen/biome"))
+    }
+    if kind == "minecraft:has_sturdy_face" {
+        let (dx, dy, dz) = try offset(m, "offset")
+        let v = field(m, "direction") else fail "No key direction in MapLike"
+        return Pred.Sturdy { dx: dx, dy: dy, dz: dz, direction: try read_direction(v) }
+    }
+    if kind == "minecraft:solid" {
+        let (dx, dy, dz) = try offset(m, "offset")
+        return Pred.Solid { dx: dx, dy: dy, dz: dz }
+    }
+    if kind == "minecraft:replaceable" {
+        let (dx, dy, dz) = try offset(m, "offset")
+        return Pred.Replaceable { dx: dx, dy: dy, dz: dz }
+    }
+    if kind == "minecraft:would_survive" {
+        let (dx, dy, dz) = try offset(m, "offset")
+        let v = field(m, "state") else fail "No key state in MapLike"
+        return Pred.Survives { dx: dx, dy: dy, dz: dz, state: try read_state(facts, v) }
+    }
+    if kind == "minecraft:inside_world_bounds" {
+        let (dx, dy, dz) = try offset(m, "offset")
+        return Pred.InsideWorld { dx: dx, dy: dy, dz: dz }
+    }
+    if kind == "minecraft:any_of" or kind == "minecraft:all_of" {
+        let v = field(m, "predicates") else fail "No key predicates in MapLike"
+        let items = try list_of(v)
+        var preds = List<Pred>()
+        for item in items {
+            preds.push(try read_pred(facts, rd, item))
+        }
+        return if kind == "minecraft:any_of" { Pred.AnyOf(preds) } else { Pred.AllOf(preds) }
+    }
+    if kind == "minecraft:not" {
+        let v = field(m, "predicate") else fail "No key predicate in MapLike"
+        return Pred.Not(Box(try read_pred(facts, rd, v)))
+    }
+    if kind == "minecraft:true" {
+        return Pred.True
+    }
+    if kind == "minecraft:unobstructed" {
+        // `Vec3i.CODEC`, not limited, and unused: nothing in a region obstructs.
+        if let v = field(m, "offset") {
+            _ = try vec3(v)
+        }
+        return Pred.Unobstructed
+    }
+    if kind == "minecraft:height_range" {
+        return Pred.HeightRange { min: try anchor_field(m, "min_inclusive"), max: try anchor_field(m, "max_inclusive") }
+    }
+    if kind == "minecraft:volume_match" {
+        let lo_value = field(m, "min") else fail "No key min in MapLike"
+        let hi_value = field(m, "max") else fail "No key max in MapLike"
+        let (ax, ay, az) = try limited(try vec3(lo_value), 16)
+        let (bx, by, bz) = try limited(try vec3(hi_value), 16)
+        let v = field(m, "match") else fail "No key match in MapLike"
+        let of = try read_pred(facts, rd, v)
+        if ax > bx or ay > by or az > bz {
+            fail "min bound cannot be larger than max bound"
+        }
+        return Pred.Volume { min_x: ax, min_y: ay, min_z: az, max_x: bx, max_y: by, max_z: bz, of: Box(of) }
+    }
+    fail "Unknown block predicate type: {kind}"
+}
+
+/// `test`: whether the predicate holds at the position.
+pub fn test(e: Env, r: Region, p: Pred, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let Env { facts: facts, .. } = e
+    match p {
+        Pred.Blocks { dx, dy, dz, set } => return facts.in_set(try r.state(facts, x + dx, y + dy, z + dz), set),
+        Pred.Fluids { dx, dy, dz, mask } => {
+            let s = try r.state(facts, x + dx, y + dy, z + dz)
+            return mask & (1u32 << facts.fluid(s)) != 0
+        },
+        Pred.Replaceable { dx, dy, dz } => return facts.replaceable(try r.state(facts, x + dx, y + dy, z + dz)),
+        Pred.Solid { dx, dy, dz } => return facts.is_solid(try r.state(facts, x + dx, y + dy, z + dz)),
+        Pred.Biomes(ids) => {
+            let b = try r.biome(x, y, z)
+            for id in ids {
+                if id == b {
+                    return true
+                }
+            }
+            return false
+        },
+        Pred.Sturdy { dx, dy, dz, direction } => {
+            return try sturdy_at(e, r, x + dx, y + dy, z + dz, direction)
+        },
+        Pred.Survives { dx, dy, dz, state } => return try can_survive(e, r, state, x + dx, y + dy, z + dz),
+        Pred.InsideWorld { dy, .. } => return not r.outside(y + dy),
+        Pred.AnyOf(preds) => {
+            for q in preds {
+                if try test(e, r, q, x, y, z) {
+                    return true
+                }
+            }
+            return false
+        },
+        Pred.AllOf(preds) => {
+            for q in preds {
+                if not try test(e, r, q, x, y, z) {
+                    return false
+                }
+            }
+            return true
+        },
+        Pred.Not(q) => return not try test(e, r, q.value, x, y, z),
+        Pred.True => return true,
+        Pred.Unobstructed => return true,
+        Pred.HeightRange { min, max } => {
+            let lo = e.ctx.resolve(min)
+            let hi = e.ctx.resolve(max)
+            return y >= lo and y <= hi
+        },
+        Pred.Volume { min_x, min_y, min_z, max_x, max_y, max_z, of } => {
+            var ox = min_x
+            while ox <= max_x {
+                var oz = min_z
+                while oz <= max_z {
+                    var oy = min_y
+                    while oy <= max_y {
+                        if not try test(e, r, of.value, x + ox, y + oy, z + oz) {
+                            return false
+                        }
+                        oy += 1
+                    }
+                    oz += 1
+                }
+                ox += 1
+            }
+            return true
+        },
+    }
+}
+
+// Rule tests.
+
+/// A `RuleTest`.
+pub enum Rule {
+    AlwaysTrue
+    Block(u32)
+    State(u32)
+    Tag(BlockSet)
+    RandomBlock { block: u32, probability: f32 }
+    RandomState { state: u32, probability: f32 }
+    Height { min: i32, max: i32 }
+    AllOf(List<Rule>)
+    AnyOf(List<Rule>)
+    Not(Box<Rule>)
+}
+
+/// `RuleTest.CODEC`: a rule by its `predicate_type`.
+pub fn read_rule(facts: Facts, value: Json) -> Rule ! String {
+    let m = try map_of(value)
+    let t = field(m, "predicate_type") else fail "No key predicate_type in MapLike"
+    let text = as_string(t) else fail "Not a string: {t}"
+    let kind = (try Identifier.parse(text)).to_string()
+    if kind == "minecraft:always_true" {
+        return Rule.AlwaysTrue
+    }
+    if kind == "minecraft:block_match" {
+        let v = field(m, "block") else fail "No key block in MapLike"
+        return Rule.Block(try read_block(facts, v))
+    }
+    if kind == "minecraft:blockstate_match" {
+        let v = field(m, "block_state") else fail "No key block_state in MapLike"
+        return Rule.State(try read_state(facts, v))
+    }
+    if kind == "minecraft:tag_match" {
+        return Rule.Tag(facts.tag_or_empty(try tag_key(m, "tag")))
+    }
+    if kind == "minecraft:random_block_match" {
+        let v = field(m, "block") else fail "No key block in MapLike"
+        let block = try read_block(facts, v)
+        return Rule.RandomBlock { block: block, probability: try float_field(m, "probability") }
+    }
+    if kind == "minecraft:random_blockstate_match" {
+        let v = field(m, "block_state") else fail "No key block_state in MapLike"
+        let state = try read_state(facts, v)
+        return Rule.RandomState { state: state, probability: try float_field(m, "probability") }
+    }
+    if kind == "minecraft:height_match" {
+        return Rule.Height { min: try int_field(m, "min_inclusive"), max: try int_field(m, "max_inclusive") }
+    }
+    if kind == "minecraft:all_of" or kind == "minecraft:any_of" {
+        let v = field(m, "rules") else fail "No key rules in MapLike"
+        let items = try list_of(v)
+        var rules = List<Rule>()
+        for item in items {
+            rules.push(try read_rule(facts, item))
+        }
+        return if kind == "minecraft:all_of" { Rule.AllOf(rules) } else { Rule.AnyOf(rules) }
+    }
+    if kind == "minecraft:not" {
+        let v = field(m, "rule") else fail "No key rule in MapLike"
+        return Rule.Not(Box(try read_rule(facts, v)))
+    }
+    fail "Unknown rule test type: {kind}"
+}
+
+/// `RuleTest.test`.
+pub fn test_rule<T: RandomSource>(facts: Facts, rule: Rule, state: u32, y: i32, rand: mut T) -> bool {
+    match rule {
+        Rule.AlwaysTrue => return true,
+        Rule.Block(b) => return facts.is(state, b),
+        Rule.State(s) => return state == s,
+        Rule.Tag(set) => return facts.in_set(state, set),
+        Rule.RandomBlock { block, probability } => return facts.is(state, block) and rand.next_float() < probability,
+        Rule.RandomState { state: s, probability } => return state == s and rand.next_float() < probability,
+        Rule.Height { min, max } => return min <= y and y <= max,
+        Rule.AllOf(rules) => {
+            for q in rules {
+                if not test_rule(facts, q, state, y, mut rand) {
+                    return false
+                }
+            }
+            return true
+        },
+        Rule.AnyOf(rules) => {
+            for q in rules {
+                if test_rule(facts, q, state, y, mut rand) {
+                    return true
+                }
+            }
+            return false
+        },
+        Rule.Not(q) => return not test_rule(facts, q.value, state, y, mut rand),
+    }
+}
+
+// Values.
+
+/// `BlockState.CODEC`: a block's name for its default state, or `{id, properties}`.
+pub fn read_state(facts: Facts, value: Json) -> u32 ! String {
+    return try facts.codec.decode(Tag.from_json(value))
+}
+
+/// `BlockState.FULL_CODEC`: only `{id, properties}`.
+pub fn read_full_state(facts: Facts, value: Json) -> u32 ! String {
+    match value {
+        Json.Object(_) => return try read_state(facts, value),
+        _ => fail "Not a map: {value}",
+    }
+}
+
+/// `BuiltInRegistries.BLOCK.byNameCodec()`: a block by its name.
+pub fn read_block(facts: Facts, value: Json) -> u32 ! String {
+    let text = as_string(value) else fail "Not a string: {value}"
+    return try facts.codec.blocks.parse(text)
+}
+
+/// A `TagKey`'s identifier, written without `#`: the tag needn't be there.
+pub fn tag_key(m: List<Member>, key: str) -> String ! String {
+    let v = field(m, key) else fail "No key {key} in MapLike"
+    let text = as_string(v) else fail "Not a string: {v}"
+    return (try Identifier.parse(text)).to_string()
+}
+
+/// `RegistryCodecs.holderSet(BLOCK)`: `#tag`, which must be there, or a block's name, or a list
+/// of names.
+pub fn read_blocks(facts: Facts, blocks: Registry, value: Json) -> BlockSet ! String {
+    let ids = try read_ids(blocks, value, "block")
+    var out = BlockSet.empty(facts.block_count)
+    for id in ids {
+        out.add(u32.wrap(id))
+    }
+    return out
+}
+
+/// The fluids of a holder set of the fluid registry, as a mask of their IDs.
+pub fn read_fluids(fluids: Registry, value: Json) -> u32 ! String {
+    var mask: u32 = 0
+    for id in try read_ids(fluids, value, "fluid") {
+        mask |= 1u32 << u32.wrap(id)
+    }
+    return mask
+}
+
+/// A holder set of a registry whose entries are referred to by name: `#tag`, one name, or a
+/// list of names, as IDs, in order.
+pub fn read_ids(registry: Registry, value: Json, what: str) -> List<i32> ! String {
+    if let text = as_string(value) {
+        if text.starts_with("#") {
+            let id = try Identifier.parse(text[1..].copy())
+            for t in registry.tags {
+                if t.name.namespace == id.namespace and t.name.path == id.path {
+                    return t.values.copy()
+                }
+            }
+            fail "Missing tag: '{id}' in 'minecraft:{what}'"
+        }
+        return [try entry(registry, text, what)]
+    }
+    let items = try list_of(value)
+    var out = List<i32>()
+    for item in items {
+        let text = as_string(item) else fail "Not a string: {item}"
+        out.push(try entry(registry, text, what))
+    }
+    return out
+}
+
+fn entry(registry: Registry, text: String, what: str) -> i32 ! String {
+    let id = try Identifier.parse(text)
+    let i = registry.id(id) else fail "Failed to get element {id} from registry minecraft:{what}"
+    return i
+}
+
+/// The JSON list `value`'s elements.
+pub fn list_of(value: Json) -> List<Json> ! String {
+    return match value {
+        Json.Array(a) => a.copy(),
+        _ => fail "Not a list: {value}",
+    }
+}
+
+/// `Direction.CODEC`.
+pub fn read_direction(value: Json) -> i32 ! String {
+    let text = as_string(value) else fail "Not a string: {value}"
+    let d = direction_named(text) else fail "Unknown element name:{text}"
+    return d
+}
+
+/// `Vec3i.CODEC`: a list of three ints.
+pub fn vec3(value: Json) -> (i32, i32, i32) ! String {
+    let items = try list_of(value)
+    var v = List<i32>()
+    for item in items {
+        match item {
+            Json.Number(_) => v.push(try int_of(item)),
+            _ => fail "Some elements are not ints",
+        }
+    }
+    if v.len() != 3 {
+        fail "Input is not a list of 3 ints"
+    }
+    return (v[0], v[1], v[2])
+}
+
+/// `Vec3i.offsetCodec(max)`: each part at most `max` from 0.
+pub fn limited(v: (i32, i32, i32), max: i32) -> (i32, i32, i32) ! String {
+    let (x, y, z) = v
+    if x.abs() > max or y.abs() > max or z.abs() > max {
+        fail "Position out of range, expected at most {max}"
+    }
+    return v
+}
+
+/// An optional `offset`, `Vec3i.offsetCodec(16)`, zero if missing.
+fn offset(m: List<Member>, key: str) -> (i32, i32, i32) ! String {
+    let v = field(m, key) else return (0, 0, 0)
+    return try limited(try vec3(v), 16)
+}

@@ -1,0 +1,338 @@
+/// The `features` probe (rig/PROTOCOL.md): chunks decorated as `applyBiomeDecoration` decorates
+/// them, or one placed feature placed, in a region of chunks made as the vanilla adapter makes
+/// them: the 5×5 around the op's chunk with their biomes, and the 3×3 with their terrain,
+/// surface and carvers. Each op's nine chunks are written after it, with what features left in
+/// them, and the points of interest the region reported.
+module rig.features
+
+import json.tree.{Json, Member, as_i32, as_string, get, take}
+import pack.zip.{Zip}
+import random.worldgen.{WorldgenRandom}
+import random.xoroshiro.{XoroshiroRandom}
+import registry.registry.{Registry}
+import rig.frame.{Outcome}
+import rig.surface.{invalid, put_u32, rejected, write}
+import world.chunk.{BlockStates, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, WORLD_SURFACE}
+import worldgen.biome_manager.{SourceBiomes, Zoom}
+import worldgen.biome_source.{climate_of, read_source}
+import worldgen.carver.{Carvers, carve_chunk}
+import worldgen.density.{Functions, data_json, qualified}
+import worldgen.facts.{Facts}
+import worldgen.features.{Catalog, Decoration, Gen, decorate, place_placed}
+import worldgen.interval.{Thrown}
+import worldgen.material.{Materials, Rules, build_surface, materials, read_rules}
+import worldgen.predicates.{Readers}
+import worldgen.region.{Region}
+import worldgen.sampler.{Context}
+import worldgen.survive.{Env}
+import worldgen.terrain.{Filled, Shape, clamped, fill_noise, read_shape}
+
+/// The most ops a case may have, as the vanilla adapter allows.
+const MAX_OPS: usize = 64
+
+/// An op: decorate the chunk, or place the case's feature from a position with a seed.
+struct Op {
+    place: bool
+    cx: i32
+    cz: i32
+    x: i32
+    y: i32
+    z: i32
+    seed: i64
+}
+
+/// The registries the probe reads: blocks, fluids and biomes.
+pub fn run_features(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, blocks: Registry, fluids: Registry, biomes: Registry, table: own BlockStates, uncarvable: List<i32>) -> Outcome {
+    if blobs.len() != 0 {
+        return Outcome.Failed("`features` takes no blobs")
+    }
+    var fields = input
+    let seed_value = take(mut fields, "seed") else return Outcome.Failed("missing field `seed`")
+    let seed_text = as_string(seed_value) else return Outcome.Failed("`seed` must be a string")
+    let seed = i64.parse(seed_text) else return Outcome.Failed("`seed` must be a decimal 64-bit integer")
+    let settings_value = take(mut fields, "settings") else return Outcome.Failed("missing field `settings`")
+    let name = as_string(settings_value) else return Outcome.Failed("`settings` must be an identifier")
+    let settings_id = qualified(name)
+    let json = match data_json(zip, settings_id.copy(), "noise_settings") {
+        ok(j) => j,
+        err(e) => return Outcome.Failed(e),
+    }
+    let members = match json {
+        Json.Object(m) => m,
+        _ => return Outcome.Failed("noise settings `{name}` isn't an object"),
+    }
+    let legacy = match get(members, "legacy_random_source") {
+        some(Json.Bool(b)) => b,
+        _ => return Outcome.Failed("noise settings `{name}` have no `legacy_random_source`"),
+    }
+    let level = match take(mut fields, "level") {
+        some(Json.Array(items)) => items,
+        _ => return Outcome.Failed("`level` must be [min_y, height]"),
+    }
+    if level.len() != 2 {
+        return Outcome.Failed("`level` must be [min_y, height]")
+    }
+    let min_y = as_i32(level[0]) else return Outcome.Failed("`level`[0] must be an int")
+    let height = as_i32(level[1]) else return Outcome.Failed("`level`[1] must be an int")
+    if min_y % 16 != 0 or height % 16 != 0 or height <= 0 or min_y < -2032 or min_y + height > 2032 {
+        return Outcome.Failed("`level` must be whole sections within the world")
+    }
+    let op_list = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let items = match op_list {
+        Json.Array(a) => a,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    if items.len() > MAX_OPS {
+        return Outcome.Failed("at most {MAX_OPS} ops")
+    }
+    var ops = List<Op>()
+    var places = false
+    var decorates = false
+    for i in 0..items.len() {
+        match read_op(items[i], i) {
+            ok(op) => {
+                if op.place {
+                    places = true
+                } else {
+                    decorates = true
+                }
+                ops.push(op)
+            },
+            err(e) => return Outcome.Failed(e),
+        }
+    }
+    // A source or feature that doesn't read is compared only as that.
+    let source_value = take(mut fields, "source") else return Outcome.Failed("missing field `source`")
+    let source = match read_source(zip, biomes, source_value) {
+        ok(s) => s,
+        err(_) => return invalid("source"),
+    }
+    let facts = match Facts.new(blocks, fluids, table) {
+        ok(f) => f,
+        err(e) => return Outcome.Failed(e),
+    }
+    let rd = Readers { blocks: blocks.copy(), fluids: fluids.copy(), biomes: biomes.copy() }
+    var catalog = Catalog.new()
+    var feature: usize? = none
+    if let value = take(mut fields, "feature") {
+        match catalog.read_placed(zip, facts, rd, value) {
+            ok(p) => feature = some(p),
+            err(_) => return invalid("feature"),
+        }
+    } else if places {
+        return Outcome.Failed("a `place` op needs `feature`")
+    }
+    var decoration = Decoration.empty()
+    if decorates {
+        match Decoration.of_biomes(mut catalog, zip, facts, rd, source.possible()) {
+            ok(d) => decoration = d,
+            err(e) => return Outcome.Failed(e),
+        }
+    }
+    var functions = Functions.new(legacy, seed)
+    let rule_value = get(members, "material_rule") else return Outcome.Failed("noise settings `{name}` have no `material_rule`")
+    let rules = match read_rules(mut functions, zip, biomes, facts.codec, rule_value) {
+        ok(r) => r,
+        err(e) => return Outcome.Failed(e),
+    }
+    let carvers = match Carvers.of_biomes(zip, biomes, source.possible(), facts.codec, uncarvable) {
+        ok(c) => c,
+        err(e) => return Outcome.Failed(e),
+    }
+    let router = match get(members, "noise_router") {
+        some(Json.Object(m)) => m,
+        _ => return Outcome.Failed("noise settings `{name}` have no router"),
+    }
+    let climate = match climate_of(mut functions, zip, router) {
+        ok(c) => c,
+        err(e) => return Outcome.Failed(e),
+    }
+    let shape = match read_shape(mut functions, zip, members, facts.codec, facts.table) {
+        ok(s) => s,
+        err(e) => return Outcome.Failed(e),
+    }
+    let mat = match materials(mut functions, zip, members, shape, facts.codec, biomes, source.possible(), min_y, height) {
+        ok(m) => m,
+        err(e) => return Outcome.Failed(e),
+    }
+    // The dimension's sky light, as the settings' world has it: the Nether and the End have none.
+    let sky_light = settings_id != "minecraft:nether" and settings_id != "minecraft:end"
+    let env = Env { facts: facts, ctx: mat.gen, sky_light: sky_light }
+    let g = Gen.new(env, catalog, decoration)
+    var source_biomes = SourceBiomes.new(source, climate, seed)
+    var out = List<u8>()
+    for op in ops {
+        match run_op(g, mut functions, shape, mat, rules, carvers, mut source_biomes, seed, min_y, height, op, feature, mut out) {
+            ok => {},
+            err(thrown) => {
+                if thrown.exception == "Unimplemented" {
+                    return Outcome.Unimplemented(thrown.message.copy())
+                }
+                return rejected(thrown)
+            },
+        }
+    }
+    let output: List<Member> = []
+    return Outcome.Done { output: output, blobs: [out] }
+}
+
+// One op: the region's chunks made, the op run in it, and the nine chunks written.
+fn run_op(g: Gen, functions: mut Functions, shape: Shape, mat: Materials, rules: Rules, carvers: Carvers, biomes: mut SourceBiomes, seed: i64, min_y: i32, height: i32, op: Op, feature: usize?, out: mut List<u8>) ! Thrown {
+    let Gen { env: Env { facts: Facts { table: states, .. }, .. }, .. } = g
+    // The 5×5 chunks' biomes, from the lower corner, `x` fastest.
+    var around = List<List<i32>>()
+    for dz in -2..3 {
+        for dx in -2..3 {
+            var b = List<i32>()
+            try biomes.chunk(functions.program, op.cx + dx, op.cz + dz, min_y, height, mut b)
+            around.push(b)
+        }
+    }
+    var filled = List<Filled>()
+    for dz in -1..2 {
+        for dx in -1..2 {
+            let x = op.cx + dx
+            let z = op.cz + dz
+            var zoom = zoom_of(around, op.cx, op.cz, x, z, min_y, height, biomes.seed)
+            var ctx = Context.new(true)
+            let (made, noise_aquifer) = try fill_noise(mut functions, shape, states, mut ctx, x, z, min_y, height)
+            var f = made
+            var aquifer = noise_aquifer
+            let (_, noise_height) = clamped(shape, min_y, height)
+            if noise_height > 0 {
+                try build_surface(mut f, mut functions, mat, rules, states, mut ctx, mut zoom, x, z)
+                try carve_chunk(mut f, mut functions, shape, mat, rules, states, mut ctx, mut aquifer, mut biomes, carvers, seed, x, z)
+            }
+            filled.push(f)
+        }
+    }
+    let center = zoom_of(around, op.cx, op.cz, op.cx, op.cz, min_y, height, biomes.seed)
+    var r = Region.new(g.env.facts, op.cx, op.cz, filled, center, seed, shape.sea_level)
+    if op.place {
+        let p = feature else fail Thrown { exception: "IllegalStateException", message: "no feature" }
+        var random = WorldgenRandom.new(XoroshiroRandom.new(0))
+        random.set_seed(op.seed)
+        _ = try place_placed(g, mut r, mut random, p, op.x, op.y, op.z, false)
+    } else {
+        match decorate(g, mut r, seed) {
+            ok => {},
+            err(thrown) => {
+                if thrown.exception == "Unimplemented" {
+                    fail thrown
+                }
+                // `applyBiomeDecoration` reports what any feature throws as its own crash.
+                fail Thrown { exception: "ReportedException", message: "Biome decoration" }
+            },
+        }
+    }
+    try write_region(g.env.facts, mut r, mut out)
+}
+
+// The biomes of the chunk at `x`, `z` and its eight neighbours, from the 5×5 around `cx`, `cz`.
+fn zoom_of(around: List<List<i32>>, cx: i32, cz: i32, x: i32, z: i32, min_y: i32, height: i32, seed: i64) -> Zoom {
+    var chunks = List<List<i32>>()
+    for nz in -1..2 {
+        for nx in -1..2 {
+            let i = usize.wrap((z + nz - cz + 2) * 5 + (x + nx - cx + 2))
+            chunks.push(around[i].copy())
+        }
+    }
+    return Zoom { chunk_x: x, chunk_z: z, min_y: min_y, height: height, seed: seed, chunks: chunks }
+}
+
+// The nine chunks as the vanilla adapter writes them, and then the points of interest.
+fn write_region(f: Facts, r: mut Region, out: mut List<u8>) ! Thrown {
+    for c in 0..9usize {
+        write(r.chunks[c].filled, f.table, mut out)
+        for kind in [WORLD_SURFACE, OCEAN_FLOOR, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES] {
+            for h in r.final_heights(f, c, kind) {
+                put_u32(mut out, u32.wrap(h))
+            }
+        }
+        // Block entities by position: `y`, then `z`, then `x`.
+        var order = List<(i32, i32, i32, usize)>()
+        for i in 0..r.chunks[c].block_entities.len() {
+            let x = r.chunks[c].block_entities[i].x
+            let y = r.chunks[c].block_entities[i].y
+            let z = r.chunks[c].block_entities[i].z
+            order.push((y, z, x, i))
+        }
+        order.sort()
+        put_u32(mut out, u32.wrap(order.len()))
+        for (_, _, _, i) in order {
+            let be = r.chunks[c].block_entities[i].copy()
+            put_u32(mut out, u32.wrap(be.x))
+            put_u32(mut out, u32.wrap(be.y))
+            put_u32(mut out, u32.wrap(be.z))
+            match be.tag.write_any(mut out) {
+                ok => {},
+                err(e) => fail Thrown { exception: "UTFDataFormatException", message: e },
+            }
+        }
+        put_u32(mut out, u32.wrap(r.chunks[c].block_ticks.len()))
+        for t in r.chunks[c].block_ticks {
+            put_u32(mut out, t.kind)
+            put_u32(mut out, u32.wrap(t.x))
+            put_u32(mut out, u32.wrap(t.y))
+            put_u32(mut out, u32.wrap(t.z))
+            put_u32(mut out, u32.wrap(t.priority))
+        }
+        put_u32(mut out, u32.wrap(r.chunks[c].fluid_ticks.len()))
+        for t in r.chunks[c].fluid_ticks {
+            put_u32(mut out, t.kind)
+            put_u32(mut out, u32.wrap(t.x))
+            put_u32(mut out, u32.wrap(t.y))
+            put_u32(mut out, u32.wrap(t.z))
+            put_u32(mut out, u32.wrap(t.priority))
+        }
+        put_u32(mut out, u32.wrap(r.chunks[c].entities.len()))
+        for e in r.chunks[c].entities {
+            match e.write_any(mut out) {
+                ok => {},
+                err(message) => fail Thrown { exception: "UTFDataFormatException", message: message },
+            }
+        }
+    }
+    put_u32(mut out, u32.wrap(r.poi.len()))
+    for p in r.poi {
+        put_u32(mut out, u32.wrap(p.x))
+        put_u32(mut out, u32.wrap(p.y))
+        put_u32(mut out, u32.wrap(p.z))
+        put_u32(mut out, u32.wrap(p.old))
+        put_u32(mut out, u32.wrap(p.new))
+    }
+}
+
+fn read_op(value: Json, i: usize) -> Op ! String {
+    let what = "`ops`[{i}]"
+    let op = match value {
+        Json.Array(items) => items.copy(),
+        _ => fail "{what} must be a non-empty array",
+    }
+    if op.len() == 0 {
+        fail "{what} must be a non-empty array"
+    }
+    let kind = as_string(op[0]) else fail "{what}[0] must be a string"
+    if kind == "decorate" {
+        if op.len() != 3 {
+            fail "{what} must have 3 elements"
+        }
+        let cx = as_i32(op[1]) else fail "{what}[1] must be an int"
+        let cz = as_i32(op[2]) else fail "{what}[2] must be an int"
+        return Op { place: false, cx: cx, cz: cz, x: 0, y: 0, z: 0, seed: 0 }
+    }
+    if kind == "place" {
+        if op.len() != 7 {
+            fail "{what} must have 7 elements"
+        }
+        let cx = as_i32(op[1]) else fail "{what}[1] must be an int"
+        let cz = as_i32(op[2]) else fail "{what}[2] must be an int"
+        let x = as_i32(op[3]) else fail "{what}[3] must be an int"
+        let y = as_i32(op[4]) else fail "{what}[4] must be an int"
+        let z = as_i32(op[5]) else fail "{what}[5] must be an int"
+        let text = as_string(op[6]) else fail "{what}[6] must be a string"
+        let seed = i64.parse(text) else fail "{what}[6] must be a decimal 64-bit integer"
+        return Op { place: true, cx: cx, cz: cz, x: x, y: y, z: z, seed: seed }
+    }
+    fail "{what}: unknown op `{kind}`"
+}

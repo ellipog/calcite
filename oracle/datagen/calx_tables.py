@@ -315,6 +315,137 @@ def block_flags_module(index, flags):
     for state, v in enumerate(values):
         if v & LOW_MASK & ~known or v >> 20:
             raise ValueError(f"state {state}'s flags {v:#x} have bits this script doesn't know")
+    lines = [
+        f"/// What each of vanilla {index['game_version']}'s block states is, as the game's state cache holds it, in state ID",
+        "/// order. Written by oracle/datagen/calx_tables.py from block_flags.json (D164): don't edit it.",
+        "module world.block_flags",
+        "",
+    ]
+    for name, bit, what in FLAGS:
+        lines += [f"/// {what}.", f"pub const {name}: u32 = {bit}"]
+    lines += [
+        "",
+        "/// Where a state's light emission, 0 to 15, is in its flags.",
+        f"pub const LIGHT_EMISSION_SHIFT: u32 = {LIGHT_EMISSION_SHIFT}",
+        "/// Where a state's light dampening, 0 to 15, is in its flags: how much light it takes away.",
+        f"pub const LIGHT_DAMPENING_SHIFT: u32 = {LIGHT_DAMPENING_SHIFT}",
+        "",
+        "/// Each state's flags, in state ID order.",
+    ]
+    lines += encoded_table("state_flags", "flags", values)
+    return "\n".join(lines)
+
+
+# The facts block_flags.json gives each state for features, as calcite.rig.vanilla.BlockFlags sets
+# them.
+FACTS = [
+    ("SOLID", 1, "`isSolid`: the legacy solidity, from its collision shape's size"),
+    ("REPLACEABLE", 1 << 1, "`canBeReplaced()`: a block placed on it replaces it"),
+    ("COLLISION_FULL_BLOCK", 1 << 3, "`isCollisionShapeFullBlock` at the origin of an empty world"),
+    ("LIQUID", 1 << 4, "`liquid`: the block is water or lava itself"),
+    ("IGNITED_BY_LAVA", 1 << 5, "`ignitedByLava`"),
+    ("REDSTONE_CONDUCTOR", 1 << 6, "`isRedstoneConductor` at the origin of an empty world"),
+]
+STURDY_FULL_SHIFT = 7
+STURDY_CENTER_SHIFT = 13
+STURDY_RIGID_SHIFT = 19
+COLLISION_FACE_SHIFT = 25
+COLLISION_TOP_ANY = 1 << 31
+FLUID_TYPE_SHIFT = 32
+FLUID_AMOUNT_SHIFT = 36
+
+
+def block_facts_module(index, flags):
+    """The text of src/world/block_facts.calx."""
+    values = flags["facts"]
+    classes = flags["classes"]
+    if len(values) != flags["states"]:
+        raise ValueError(f"block_flags.json has {len(values)} facts for {flags['states']} states")
+    known = sum(bit for _, bit, _ in FACTS)
+    for state, v in enumerate(values):
+        if v & ((1 << STURDY_FULL_SHIFT) - 1) & ~known:
+            raise ValueError(f"state {state}'s facts {v:#x} have bits this script doesn't know")
+    parents = flags["class_parents"]
+    names = sorted(set(classes) | set(parents) | {p for p in parents.values() if p})
+    where = {c: i for i, c in enumerate(names)}
+    none = len(names)
+    lines = [
+        f"/// What vanilla {index['game_version']}'s features ask of each block state and block, in state and block ID order.",
+        "/// Written by oracle/datagen/calx_tables.py from block_flags.json (CAL-84): don't edit it.",
+        "module world.block_facts",
+        "",
+    ]
+    for name, bit, what in FACTS:
+        lines += [f"/// {what}.", f"pub const {name}: u32 = {bit}"]
+    lines += [
+        "",
+        "/// Where the faces that are sturdy for `SupportType.FULL` are in a state's facts, a bit each, in",
+        "/// `Direction` order: down, up, north, south, west, east.",
+        f"pub const STURDY_FULL_SHIFT: u32 = {STURDY_FULL_SHIFT}",
+        "/// Where the faces sturdy for `SupportType.CENTER` are.",
+        f"pub const STURDY_CENTER_SHIFT: u32 = {STURDY_CENTER_SHIFT}",
+        "/// Where the faces sturdy for `SupportType.RIGID` are.",
+        f"pub const STURDY_RIGID_SHIFT: u32 = {STURDY_RIGID_SHIFT}",
+        "/// Where the faces its collision shape covers whole are: `Block.isFaceFull` of it.",
+        f"pub const COLLISION_FACE_SHIFT: u32 = {COLLISION_FACE_SHIFT}",
+        "/// Its collision shape touches the top of its block anywhere.",
+        f"pub const COLLISION_TOP_ANY: u32 = {COLLISION_TOP_ANY}",
+        "",
+        "/// Each state's facts, in state ID order.",
+    ]
+    lines += encoded_table("state_facts", "facts", [v & 0xFFFFFFFF for v in values])
+    lines += [
+        "/// Each state's fluid, in state ID order: its amount, 0 to 8, in the low 4 bits, and above them",
+        "/// its fluid's ID in the fluid registry.",
+    ]
+    fluids = [((v >> FLUID_TYPE_SHIFT) & 7) << 4 | (v >> FLUID_AMOUNT_SHIFT) & 15 for v in values]
+    lines += encoded_table("state_fluids", "fluids", fluids)
+    lines += [
+        "/// The names of the classes vanilla's blocks are and the classes they extend, sorted: an",
+        "/// anonymous class by the class it extends.",
+        "pub fn class_names() -> List<String> {",
+        "    let names: List<String> = [",
+    ]
+    lines += [f'        "{n}",' for n in names]
+    lines += [
+        "    ]",
+        "    return names",
+        "}",
+        "",
+        "/// Each block's class, as an index into `class_names`, in block ID order.",
+    ]
+    def number_list(fn, var, values, doc):
+        text = [str(v) for v in values]
+        out = doc + [f"pub fn {fn}() -> List<u32> {{", f"    let {var}: List<u32> = ["]
+        out += ["        " + ", ".join(text[i:i + 24]) + "," for i in range(0, len(text), 24)]
+        out += ["    ]", f"    return {var}", "}", ""]
+        return out
+
+    lines += number_list("block_classes", "classes", [where[c] for c in classes], [])
+    lines += number_list(
+        "class_parents", "parents", [where[parents[n]] if parents.get(n) else none for n in names],
+        [f"/// Each class's superclass, by its index in `class_names`, in their order: {none} for none."])
+    lines += number_list(
+        "survive_classes", "classes", [where[c] if c else none for c in flags["survive_classes"]],
+        [f"/// The class whose `canSurvive` each block runs, by its index in `class_names`, in block ID order."])
+    lines += number_list(
+        "place_on_classes", "classes", [where[c] if c else none for c in flags["place_on_classes"]],
+        [f"/// The class whose `mayPlaceOn` each block runs, {none} for none, in block ID order."])
+    pairs = [str(v) for pair in flags["poi"] for v in pair]
+    lines += [
+        "/// The states that are points of interest, each followed by its type's ID in the",
+        "/// `point_of_interest_type` registry: `PoiTypes.forState`.",
+        "pub fn poi_states() -> List<u32> {",
+        "    let pairs: List<u32> = [",
+    ]
+    lines += ["        " + ", ".join(pairs[i:i + 24]) + "," for i in range(0, len(pairs), 24)]
+    lines += ["    ]", "    return pairs", "}", ""]
+    return "\n".join(lines)
+
+
+def encoded_table(fn, what, values):
+    """A Calx function `fn` giving `values`, u32s, compactly: each an index into the different
+    values, the commonest first, as a character or two."""
     counts = {}
     for v in values:
         counts[v] = counts.get(v, 0) + 1
@@ -334,24 +465,9 @@ def block_flags_module(index, flags):
             chunks.append("")
         chunks[-1] += t
     lines = [
-        f"/// What each of vanilla {index['game_version']}'s block states is, as the game's state cache holds it, in state ID",
-        "/// order. Written by oracle/datagen/calx_tables.py from block_flags.json (D164): don't edit it.",
-        "module world.block_flags",
-        "",
-    ]
-    for name, bit, what in FLAGS:
-        lines += [f"/// {what}.", f"pub const {name}: u32 = {bit}"]
-    lines += [
-        "",
-        "/// Where a state's light emission, 0 to 15, is in its flags.",
-        f"pub const LIGHT_EMISSION_SHIFT: u32 = {LIGHT_EMISSION_SHIFT}",
-        "/// Where a state's light dampening, 0 to 15, is in its flags: how much light it takes away.",
-        f"pub const LIGHT_DAMPENING_SHIFT: u32 = {LIGHT_DAMPENING_SHIFT}",
-        "",
-        "/// Each state's flags, in state ID order.",
-        "pub fn state_flags() -> List<u32> {",
-        "    // The different flags, the commonest first, and an index into them for each state, a",
-        f"    // character each, from `alphabet`. Its last character starts a pair, for the {len(palette) - SINGLE} rarest.",
+        f"pub fn {fn}() -> List<u32> {{",
+        f"    // The different {what}, the commonest first, and an index into them for each, a",
+        f"    // character each, from `alphabet`. Its last character starts a pair, for the {max(0, len(palette) - SINGLE)} rarest.",
         f"    let values: List<u32> = [{', '.join(str(v) for v in palette)}]",
         "    let lines: List<String> = [",
     ]
@@ -367,26 +483,26 @@ def block_flags_module(index, flags):
         "        digit[usize(alphabet.byte_at(i))] = u32.wrap(i)",
         "    }",
         f"    let pair = alphabet.byte_at({SINGLE})",
-        "    var flags: List<u32> = []",
-        f"    flags.reserve({len(values)})",
+        f"    var {what}: List<u32> = []",
+        f"    {what}.reserve({len(values)})",
         "    for line in lines {",
         "        var i: usize = 0",
         "        while i < line.len() {",
         "            let b = line.byte_at(i)",
         "            if b == pair {",
-        f"                flags.push(values[usize({SINGLE} + digit[usize(line.byte_at(i + 1))])])",
+        f"                {what}.push(values[usize({SINGLE} + digit[usize(line.byte_at(i + 1))])])",
         "                i += 2",
         "            } else {",
-        "                flags.push(values[usize(digit[usize(b)])])",
+        f"                {what}.push(values[usize(digit[usize(b)])])",
         "                i += 1",
         "            }",
         "        }",
         "    }",
-        "    return flags",
+        f"    return {what}",
         "}",
         "",
     ]
-    return "\n".join(lines)
+    return lines
 
 
 # The directions, in vanilla's `Direction` order, which a state's faces are in.
@@ -613,6 +729,7 @@ def outputs(tables, version=VERSION):
         CALCITE / "src" / "pack" / "pin.calx": pin_module(version, pins[version]),
         CALCITE / "src" / "world" / "blocks.calx": blocks_module(index, blocks),
         CALCITE / "src" / "world" / "block_flags.calx": block_flags_module(index, flags),
+        CALCITE / "src" / "world" / "block_facts.calx": block_facts_module(index, flags),
         CALCITE / "src" / "world" / "light_faces.calx": light_faces_module(index, flags),
         CALCITE / "src" / "world" / "collision_shapes.calx": collision_module(index, flags),
     }

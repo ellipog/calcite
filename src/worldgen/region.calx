@@ -1,0 +1,430 @@
+/// The chunks a chunk's features are placed in, as vanilla's `WorldGenRegion` holds them for the
+/// `features` step: the chunk and the eight around it, done with `terrain`, which features read
+/// and write, and empty chunks out to 8 away, which read as air. A block set outside the nine is
+/// dropped, as `ensureCanWrite` drops it.
+///
+/// Each of the nine keeps what vanilla's `ProtoChunk` keeps as features change it: its blocks,
+/// with how many in each section aren't air, since a section of only air reads as air; its two
+/// `_WG` heightmaps as terrain left them, and the four final ones, each made from the blocks the
+/// first time anything asks for it and kept after; the block entities features placed, a marker
+/// until something asks for the block entity itself; the ticks features scheduled, once each for
+/// a block or fluid at a position; the entities they added; and the blocks marked for
+/// post-processing.
+module worldgen.region
+
+import nbt.tag.{Tag}
+import world.chunk.{HEIGHTMAP_KINDS, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, OCEAN_FLOOR_WG, WORLD_SURFACE, WORLD_SURFACE_WG}
+import worldgen.biome_manager.{Zoom}
+import worldgen.facts.{Facts}
+import worldgen.interval.{Thrown}
+import worldgen.terrain.{Filled}
+
+/// `Block.UPDATE_KNOWN_SHAPE`: a set with this flag doesn't mark its block for post-processing.
+pub const UPDATE_KNOWN_SHAPE: i32 = 16
+
+/// A scheduled tick, as `SavedTick` keeps it in a chunk being generated: the block or fluid by
+/// its registry ID, where, and its priority.
+pub struct Tick {
+    pub kind: u32
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub priority: i32
+}
+
+/// A block entity in a chunk: a `DUMMY` marker as `WorldGenRegion.setBlock` leaves it, or the
+/// block entity's own data once something asked for it.
+pub struct BlockEntity {
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub tag: Tag
+    pub real: bool
+}
+
+/// A block whose point of interest changed: its old and new types by ID, -1 for none.
+pub struct PoiChange {
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub old: i32
+    pub new: i32
+}
+
+/// One of the region's nine chunks.
+pub struct RegionChunk {
+    pub filled: Filled
+    non_air: List<i32>
+    // The final heightmaps, by kind, each made when it's first asked for.
+    finals: List<List<i32>>
+    primed: List<bool>
+    pub block_entities: List<BlockEntity>
+    pub block_ticks: List<Tick>
+    pub fluid_ticks: List<Tick>
+    pub entities: List<Tag>
+}
+
+/// The region.
+pub struct Region {
+    pub cx: i32
+    pub cz: i32
+    pub min_y: i32
+    pub height: i32
+    pub chunks: List<RegionChunk>
+    /// The biomes of the nine chunks, which features read through the biome manager.
+    pub zoom: Zoom
+    pub seed: i64
+    pub sea_level: i32
+    pub poi: List<PoiChange>
+    sub_ticks: i64
+}
+
+impl Region {
+    /// The region around the chunk at `cx`, `cz`, from the nine chunks' terrain, with the chunks
+    /// from the lower corner, `x` fastest, and their biomes in `zoom`.
+    pub fn new(facts: Facts, cx: i32, cz: i32, filled: own List<Filled>, zoom: own Zoom, seed: i64, sea_level: i32) -> Region {
+        var rest = filled
+        var chunks = List<RegionChunk>()
+        while not rest.is_empty() {
+            let f = rest.remove(0)
+            var non_air = List<i32>()
+            let sections = f.states.len() / 4096
+            for s in 0..sections {
+                var n = 0
+                for i in s * 4096..(s + 1) * 4096 {
+                    if not facts.is_air(f.states[i]) {
+                        n += 1
+                    }
+                }
+                non_air.push(n)
+            }
+            var finals = List<List<i32>>()
+            var primed = List<bool>()
+            for _ in 0..HEIGHTMAP_KINDS {
+                finals.push(List<i32>())
+                primed.push(false)
+            }
+            chunks.push(RegionChunk {
+                filled: f,
+                non_air: non_air,
+                finals: finals,
+                primed: primed,
+                block_entities: List<BlockEntity>(),
+                block_ticks: List<Tick>(),
+                fluid_ticks: List<Tick>(),
+                entities: List<Tag>(),
+            })
+        }
+        let min_y = chunks[0].filled.min_y
+        let height = chunks[0].filled.height
+        return Region { cx: cx, cz: cz, min_y: min_y, height: height, chunks: chunks, zoom: zoom, seed: seed, sea_level: sea_level, poi: List<PoiChange>(), sub_ticks: 0 }
+    }
+
+    /// `isOutsideBuildHeight`.
+    pub fn outside(self, y: i32) -> bool {
+        return y < self.min_y or y >= self.min_y + self.height
+    }
+
+    /// The index of the chunk holding `x`, `z` among the nine, or `none` past them.
+    fn chunk_at(self, x: i32, z: i32) -> usize? {
+        let dx = (x >> 4) - self.cx
+        let dz = (z >> 4) - self.cz
+        if dx < -1 or dx > 1 or dz < -1 or dz > 1 {
+            return none
+        }
+        return some(usize.wrap((dz + 1) * 3 + dx + 1))
+    }
+
+    // What `getChunk` throws for a chunk past what the step may read.
+    fn check_far(self, x: i32, z: i32) ! Thrown {
+        let dx = (x >> 4) - self.cx
+        let dz = (z >> 4) - self.cz
+        if dx < -8 or dx > 8 or dz < -8 or dz > 8 {
+            fail Thrown { exception: "ReportedException", message: "Exception generating new chunk" }
+        }
+    }
+
+    /// `getBlockState`: void air outside the world, air in a section of only air and in the
+    /// empty chunks past the nine.
+    pub fn state(self, facts: Facts, x: i32, y: i32, z: i32) -> u32 ! Thrown {
+        let c = self.chunk_at(x, z) else {
+            try self.check_far(x, z)
+            return if self.outside(y) { facts.ids.void_air_state } else { facts.ids.air_state }
+        }
+        if self.outside(y) {
+            return facts.ids.void_air_state
+        }
+        let section = usize.wrap((y - self.min_y) >> 4)
+        if self.chunks[c].non_air[section] == 0 {
+            return facts.ids.air_state
+        }
+        return self.chunks[c].filled.states[index(self.min_y, x, y, z)]
+    }
+
+    /// A block as a `BulkSectionAccess` reads it, from its section as it is: air past the world
+    /// and in the empty chunks.
+    pub fn section_state(self, facts: Facts, x: i32, y: i32, z: i32) -> u32 ! Thrown {
+        if self.outside(y) {
+            return facts.ids.air_state
+        }
+        let c = self.chunk_at(x, z) else {
+            try self.check_far(x, z)
+            return facts.ids.air_state
+        }
+        return self.chunks[c].filled.states[index(self.min_y, x, y, z)]
+    }
+
+    /// `ensureCanWrite`: whether a block there may be set.
+    pub fn can_write(self, x: i32, z: i32) -> bool {
+        return self.chunk_at(x, z) != none
+    }
+
+    /// `LevelChunkSection.setBlockState` through a `BulkSectionAccess`, as ores set their
+    /// blocks: the block only, its section's counts with it, and nothing else. The caller has
+    /// checked `can_write` and the world's height.
+    pub fn set_section(mut self, facts: Facts, x: i32, y: i32, z: i32, state: u32) {
+        let c = self.chunk_at(x, z) else return
+        let i = index(self.min_y, x, y, z)
+        let old = self.chunks[c].filled.states[i]
+        self.chunks[c].filled.states[i] = state
+        let section = usize.wrap((y - self.min_y) >> 4)
+        if facts.is_air(old) and not facts.is_air(state) {
+            self.chunks[c].non_air[section] += 1
+        } else if not facts.is_air(old) and facts.is_air(state) {
+            self.chunks[c].non_air[section] -= 1
+        }
+    }
+
+    /// `WorldGenRegion.setBlock`: false if the block can't be written there. Sets the block
+    /// as `ProtoChunk.setBlockState` does, keeping the final heightmaps, tells the level of the
+    /// point of interest it changed, leaves a block entity marker or takes the old block
+    /// entity away, and marks the block for post-processing if its block asks and `flags`
+    /// don't say otherwise.
+    pub fn set_block(mut self, facts: Facts, x: i32, y: i32, z: i32, state: u32, flags: i32) -> bool {
+        let c = self.chunk_at(x, z) else return false
+        let old = self.set_in_chunk(facts, c, x, y, z, state)
+        if let o = old {
+            let before = facts.poi(o)
+            let after = facts.poi(state)
+            if before != after {
+                self.poi.push(PoiChange { x: x, y: y, z: z, old: before, new: after })
+            }
+        }
+        if facts.has_block_entity(state) {
+            // `setBlockEntityNbt`: a marker, unless the block entity itself is there.
+            var found = false
+            for be in self.chunks[c].block_entities {
+                if be.x == x and be.y == y and be.z == z and be.real {
+                    found = true
+                }
+            }
+            if not found {
+                self.remove_block_entity(c, x, y, z)
+                var tag = JavaHashMap<String, Tag>()
+                tag.insert("x", Tag.Int(x))
+                tag.insert("y", Tag.Int(y))
+                tag.insert("z", Tag.Int(z))
+                tag.insert("id", Tag.Str("DUMMY"))
+                self.chunks[c].block_entities.push(BlockEntity { x: x, y: y, z: z, tag: Tag.Compound(tag), real: false })
+            }
+        } else if let o = old {
+            if facts.has_block_entity(o) {
+                self.remove_block_entity(c, x, y, z)
+            }
+        }
+        if flags & UPDATE_KNOWN_SHAPE == 0 {
+            let b = facts.block(state)
+            if b == facts.ids.brown_mushroom or b == facts.ids.red_mushroom {
+                self.mark(x, y, z)
+            } else if b == facts.ids.soul_sand or b == facts.ids.magma_block {
+                self.mark(x, y + 1, z)
+            }
+        }
+        return true
+    }
+
+    // `ProtoChunk.setBlockState`: the old state, none outside the world, where vanilla gives
+    // void air, which the caller doesn't treat as a change. Setting air in a section of only
+    // air changes nothing and gives the new state as the old.
+    fn set_in_chunk(mut self, facts: Facts, c: usize, x: i32, y: i32, z: i32, state: u32) -> u32? {
+        if self.outside(y) {
+            return some(facts.ids.void_air_state)
+        }
+        let section = usize.wrap((y - self.min_y) >> 4)
+        let was_empty = self.chunks[c].non_air[section] == 0
+        if was_empty and state == facts.ids.air_state {
+            return some(state)
+        }
+        let i = index(self.min_y, x, y, z)
+        let old = self.chunks[c].filled.states[i]
+        self.chunks[c].filled.states[i] = state
+        if facts.is_air(old) and not facts.is_air(state) {
+            self.chunks[c].non_air[section] += 1
+        } else if not facts.is_air(old) and facts.is_air(state) {
+            self.chunks[c].non_air[section] -= 1
+        }
+        // The final heightmaps: each kept one updated, the others made now, after the block.
+        var unprimed = false
+        for kind in [WORLD_SURFACE, OCEAN_FLOOR, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES] {
+            if self.chunks[c].primed[usize.wrap(kind)] {
+                self.update_height(facts, c, kind, x, y, z, state)
+            } else {
+                unprimed = true
+            }
+        }
+        if unprimed {
+            for kind in [WORLD_SURFACE, OCEAN_FLOOR, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES] {
+                if not self.chunks[c].primed[usize.wrap(kind)] {
+                    self.prime(facts, c, kind)
+                }
+            }
+        }
+        return some(old)
+    }
+
+    // `Heightmap.update` of a kept heightmap.
+    fn update_height(mut self, facts: Facts, c: usize, kind: i32, x: i32, y: i32, z: i32, state: u32) {
+        let column = usize.wrap((x & 15) + (z & 15) * 16)
+        let first = self.chunks[c].finals[usize.wrap(kind)][column]
+        if y <= first - 2 {
+            return
+        }
+        if facts.table.counts_in(kind, state) {
+            if y >= first {
+                self.chunks[c].finals[usize.wrap(kind)][column] = y + 1
+            }
+            return
+        }
+        if first - 1 != y {
+            return
+        }
+        var below = y - 1
+        while below >= self.min_y {
+            if facts.table.counts_in(kind, self.read_for_height(facts, c, x, below, z)) {
+                self.chunks[c].finals[usize.wrap(kind)][column] = below + 1
+                return
+            }
+            below -= 1
+        }
+        self.chunks[c].finals[usize.wrap(kind)][column] = self.min_y
+    }
+
+    // A block as the chunk's `getBlockState` reads it.
+    fn read_for_height(self, facts: Facts, c: usize, x: i32, y: i32, z: i32) -> u32 {
+        let section = usize.wrap((y - self.min_y) >> 4)
+        if self.chunks[c].non_air[section] == 0 {
+            return facts.ids.air_state
+        }
+        return self.chunks[c].filled.states[index(self.min_y, x, y, z)]
+    }
+
+    // `Heightmap.primeHeightmaps` for one kind: each column's highest block it counts.
+    fn prime(mut self, facts: Facts, c: usize, kind: i32) {
+        var heights: List<i32> = [self.min_y; 256]
+        for column in 0..256 {
+            let x = column & 15
+            let z = column >> 4
+            var y = self.min_y + self.height - 1
+            while y >= self.min_y {
+                if facts.table.counts_in(kind, self.read_for_height(facts, c, x, y, z)) {
+                    heights[usize.wrap(column)] = y + 1
+                    break
+                }
+                y -= 1
+            }
+        }
+        self.chunks[c].finals[usize.wrap(kind)] = heights
+        self.chunks[c].primed[usize.wrap(kind)] = true
+    }
+
+    /// `WorldGenRegion.getHeight`: one above the highest block the heightmap counts in the
+    /// column, the bottom of the world if none. The `_WG` ones are as terrain left them; a
+    /// final one is made the first time it's asked for. The empty chunks have no blocks.
+    pub fn get_height(mut self, facts: Facts, kind: i32, x: i32, z: i32) -> i32 ! Thrown {
+        let c = self.chunk_at(x, z) else {
+            try self.check_far(x, z)
+            return self.min_y
+        }
+        let column = usize.wrap((x & 15) + (z & 15) * 16)
+        if kind == OCEAN_FLOOR_WG {
+            return self.chunks[c].filled.ocean_floor[column]
+        }
+        if kind == WORLD_SURFACE_WG {
+            return self.chunks[c].filled.world_surface[column]
+        }
+        if not self.chunks[c].primed[usize.wrap(kind)] {
+            self.prime(facts, c, kind)
+        }
+        return self.chunks[c].finals[usize.wrap(kind)][column]
+    }
+
+    /// The final heightmap `kind` of the chunk `c` of the nine, made if it wasn't.
+    pub fn final_heights(mut self, facts: Facts, c: usize, kind: i32) -> List<i32> {
+        if not self.chunks[c].primed[usize.wrap(kind)] {
+            self.prime(facts, c, kind)
+        }
+        return self.chunks[c].finals[usize.wrap(kind)].copy()
+    }
+
+    /// `markPosForPostprocessing` of the block's chunk, if the block is in the world and the
+    /// nine.
+    pub fn mark(mut self, x: i32, y: i32, z: i32) {
+        let c = self.chunk_at(x, z) else return
+        if self.outside(y) {
+            return
+        }
+        let packed = (x & 15) | ((y & 15) << 4) | ((z & 15) << 8)
+        self.chunks[c].filled.marked[usize.wrap((y - self.min_y) >> 4)].push(u16.wrap(packed))
+    }
+
+    /// `scheduleTick` of a block: once for each block at each position.
+    pub fn schedule_block(mut self, block: u32, x: i32, y: i32, z: i32, priority: i32) {
+        self.sub_ticks += 1
+        let c = self.chunk_at(x, z) else return
+        for t in self.chunks[c].block_ticks {
+            if t.kind == block and t.x == x and t.y == y and t.z == z {
+                return
+            }
+        }
+        self.chunks[c].block_ticks.push(Tick { kind: block, x: x, y: y, z: z, priority: priority })
+    }
+
+    /// `scheduleTick` of a fluid.
+    pub fn schedule_fluid(mut self, fluid: u32, x: i32, y: i32, z: i32) {
+        self.sub_ticks += 1
+        let c = self.chunk_at(x, z) else return
+        for t in self.chunks[c].fluid_ticks {
+            if t.kind == fluid and t.x == x and t.y == y and t.z == z {
+                return
+            }
+        }
+        self.chunks[c].fluid_ticks.push(Tick { kind: fluid, x: x, y: y, z: z, priority: 0 })
+    }
+
+    /// `getBiome`: the biome the biome manager zooms to at the block, from the nine chunks.
+    /// Past the nine, the region throws as `getChunk` does: their biomes may not be read.
+    pub fn biome(self, x: i32, y: i32, z: i32) -> i32 ! Thrown {
+        return match self.zoom.at(x, y, z) {
+            ok(b) => b,
+            err(_) => fail Thrown { exception: "ReportedException", message: "Exception generating new chunk" },
+        }
+    }
+
+    // Takes away the block entity or marker at the block, as `removeBlockEntity`.
+    fn remove_block_entity(mut self, c: usize, x: i32, y: i32, z: i32) {
+        var i: usize = 0
+        while i < self.chunks[c].block_entities.len() {
+            let at = self.chunks[c].block_entities[i].x == x and self.chunks[c].block_entities[i].y == y
+            if at and self.chunks[c].block_entities[i].z == z {
+                _ = self.chunks[c].block_entities.remove(i)
+            } else {
+                i += 1
+            }
+        }
+    }
+}
+
+/// Where a block is in a chunk's `Filled` states.
+fn index(min_y: i32, x: i32, y: i32, z: i32) -> usize {
+    return usize.wrap(((y - min_y) << 8) | ((z & 15) << 4) | (x & 15))
+}

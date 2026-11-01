@@ -1,0 +1,467 @@
+/// The block states features place: vanilla's `BlockStateProvider`s, read as their codecs read
+/// them, each by reference to `worldgen/block_state_provider` or written out, and asked for a
+/// state at a position as features ask them.
+module worldgen.state_providers
+
+import json.tree.{Json, Member, as_string}
+import pack.zip.{Zip}
+import random.any.{AnyRandom}
+import random.legacy.{LegacyRandom}
+import random.source.{RandomSource}
+import resources.identifier.{Identifier}
+import worldgen.codec.{field, float_of, int_of, map_of, type_of}
+import worldgen.density.{data_json}
+import worldgen.facts.{Facts, direction_name}
+import worldgen.interval.{Thrown}
+import worldgen.noise.{Stack}
+import worldgen.normal.{NormalNoise, read_parameters}
+import worldgen.predicates.{Pred, Readers, list_of, read_full_state, read_ids, read_pred, read_state, test}
+import worldgen.providers.{IntProvider, read_int}
+import worldgen.region.{Region}
+import worldgen.survive.{Env}
+
+/// A `BlockStateProvider`. Others it holds are indexes into the table they're read into.
+pub enum Provider {
+    Simple(u32)
+    Weighted { states: List<u32>, weights: List<i32>, total: i32 }
+    RandomizedInt { source: usize, property: String, values: IntProvider }
+    Rotated { source: usize, direction: i32 }
+    RuleBased { fallback: usize?, rules: List<Pred>, thens: List<usize> }
+    RandomBlock(List<i32>)
+    CopyProperties(usize)
+    Noise { noise: Stack, scale: f32, states: List<u32> }
+    NoiseThreshold { noise: Stack, scale: f32, threshold: f32, high_chance: f32, default_state: u32, low: List<u32>, high: List<u32> }
+    DualNoise { noise: Stack, scale: f32, states: List<u32>, slow: Stack, slow_scale: f32, min: i32, max: i32 }
+}
+
+/// The providers read: those by reference once each, by ID.
+pub struct Providers {
+    pub table: List<Provider>
+    ids: Map<String, usize>
+}
+
+impl Providers {
+    pub fn new() -> Providers {
+        return Providers { table: List<Provider>(), ids: Map<String, usize>() }
+    }
+
+    /// `BlockStateProvider.CODEC`: a provider's ID, or one written out, as a state's
+    /// `{id, properties}` or by its `type`, but not both.
+    pub fn read(mut self, zip: Zip, facts: Facts, rd: Readers, value: Json) -> usize ! String {
+        if let text = as_string(value) {
+            let id = (try Identifier.parse(text)).to_string()
+            if let i = self.ids.get(id) {
+                return i
+            }
+            let json = try data_json(zip, id.copy(), "block_state_provider")
+            let i = try self.read_direct(zip, facts, rd, json)
+            self.ids.insert(id, i)
+            return i
+        }
+        return try self.read_direct(zip, facts, rd, value)
+    }
+
+    // `DIRECT_CODEC`: `xor(BlockState.FULL_CODEC, TYPED_CODEC)`.
+    fn read_direct(mut self, zip: Zip, facts: Facts, rd: Readers, value: Json) -> usize ! String {
+        var state: u32? = none
+        var first = String()
+        match read_full_state(facts, value) {
+            ok(s) => state = some(s),
+            err(e) => first = e,
+        }
+        var typed: Provider? = none
+        var second = String()
+        match self.read_typed(zip, facts, rd, value) {
+            ok(p) => typed = some(p),
+            err(e) => second = e,
+        }
+        if let s = state {
+            if typed != none {
+                fail "Both alternatives read successfully, can not pick the correct one"
+            }
+            self.table.push(Provider.Simple(s))
+            return self.table.len() - 1
+        }
+        let p = typed.take() else fail "{first}; {second}"
+        self.table.push(p)
+        return self.table.len() - 1
+    }
+
+    fn read_typed(mut self, zip: Zip, facts: Facts, rd: Readers, value: Json) -> Provider ! String {
+        let m = try map_of(value)
+        let kind = try type_of(m)
+        if kind == "minecraft:simple" {
+            let v = field(m, "state") else fail "No key state in MapLike"
+            return Provider.Simple(try read_state(facts, v))
+        }
+        if kind == "minecraft:weighted" {
+            let v = field(m, "entries") else fail "No key entries in MapLike"
+            let (states, weights, total) = try weighted_states(facts, v)
+            if total == 0 {
+                fail "Weighted list must contain at least one entry with non-zero weight"
+            }
+            return Provider.Weighted { states: states, weights: weights, total: total }
+        }
+        if kind == "minecraft:randomized_int" {
+            let v = field(m, "source") else fail "No key source in MapLike"
+            let source = try self.read(zip, facts, rd, v)
+            let p = field(m, "property") else fail "No key property in MapLike"
+            let property = as_string(p) else fail "Not a string: {p}"
+            let values_json = field(m, "values") else fail "No key values in MapLike"
+            return Provider.RandomizedInt { source: source, property: property, values: try read_int(values_json) }
+        }
+        if kind == "minecraft:rotated" {
+            let v = field(m, "state") else fail "No key state in MapLike"
+            let source = try self.read(zip, facts, rd, v)
+            var direction = -1
+            if let d = field(m, "direction") {
+                let text = as_string(d) else fail "Not a string: {d}"
+                var found = false
+                for i in 0..6 {
+                    if text == direction_name(i) {
+                        direction = i
+                        found = true
+                    }
+                }
+                if not found {
+                    fail "Unknown element name:{text}"
+                }
+            }
+            return Provider.Rotated { source: source, direction: direction }
+        }
+        if kind == "minecraft:rule_based" {
+            var fallback: usize? = none
+            if let v = field(m, "fallback") {
+                fallback = some(try self.read(zip, facts, rd, v))
+            }
+            let v = field(m, "rules") else fail "No key rules in MapLike"
+            let items = try list_of(v)
+            var rules = List<Pred>()
+            var thens = List<usize>()
+            for item in items {
+                let rm = try map_of(item)
+                let if_true = field(rm, "if_true") else fail "No key if_true in MapLike"
+                let then = field(rm, "then") else fail "No key then in MapLike"
+                rules.push(try read_pred(facts, rd, if_true))
+                thens.push(try self.read(zip, facts, rd, then))
+            }
+            return Provider.RuleBased { fallback: fallback, rules: rules, thens: thens }
+        }
+        if kind == "minecraft:random_block" {
+            let v = field(m, "blocks") else fail "No key blocks in MapLike"
+            return Provider.RandomBlock(try read_ids(rd.blocks, v, "block"))
+        }
+        if kind == "minecraft:copy_properties" {
+            let v = field(m, "source") else fail "No key source in MapLike"
+            return Provider.CopyProperties(try self.read(zip, facts, rd, v))
+        }
+        if kind == "minecraft:noise" or kind == "minecraft:noise_threshold" or kind == "minecraft:dual_noise" {
+            return try read_noise(facts, m, kind)
+        }
+        fail "Unknown block state provider type: {kind}"
+    }
+}
+
+// The noise providers: `noiseCodec`'s seed, noise and scale, then each one's own.
+fn read_noise(facts: Facts, m: List<Member>, kind: String) -> Provider ! String {
+    let seed_value = field(m, "seed") else fail "No key seed in MapLike"
+    let seed = try long_of(seed_value)
+    let noise_value = field(m, "noise") else fail "No key noise in MapLike"
+    let noise = try normal_noise(noise_value, seed)
+    let scale = try positive_float(m, "scale")
+    if kind == "minecraft:noise_threshold" {
+        let threshold = try float_in(m, "threshold", -1.0f32, 1.0f32)
+        let high_chance = try float_in(m, "high_chance", 0.0f32, 1.0f32)
+        let d = field(m, "default_state") else fail "No key default_state in MapLike"
+        let default_state = try read_state(facts, d)
+        let low = try state_list(facts, m, "low_states")
+        let high = try state_list(facts, m, "high_states")
+        return Provider.NoiseThreshold { noise: noise, scale: scale, threshold: threshold, high_chance: high_chance, default_state: default_state, low: low, high: high }
+    }
+    let states = try state_list(facts, m, "states")
+    if kind == "minecraft:noise" {
+        return Provider.Noise { noise: noise, scale: scale, states: states }
+    }
+    let variety = field(m, "variety") else fail "No key variety in MapLike"
+    let (min, max) = try int_range(variety, 1, 64)
+    let slow_value = field(m, "slow_noise") else fail "No key slow_noise in MapLike"
+    let slow = try normal_noise(slow_value, seed)
+    let slow_scale = try positive_float(m, "slow_scale")
+    return Provider.DualNoise { noise: noise, scale: scale, states: states, slow: slow, slow_scale: slow_scale, min: min, max: max }
+}
+
+// A `NormalNoise` made as the providers make theirs: from a legacy random of the seed.
+fn normal_noise(value: Json, seed: i64) -> Stack ! String {
+    var error = String()
+    let parameters = read_parameters(value, mut error) else fail error
+    var random = AnyRandom.Legacy(LegacyRandom.new(seed))
+    return NormalNoise.new(parameters).create(mut random)
+}
+
+// `InclusiveRange.codec(Codec.INT, low, high)`: `[min, max]` or one int for both.
+fn int_range(value: Json, low: i32, high: i32) -> (i32, i32) ! String {
+    let (a, b) = match value {
+        Json.Array(items) => {
+            if items.len() != 2 {
+                fail "Input is not a list of 2 elements"
+            }
+            (try int_of(items[0]), try int_of(items[1]))
+        },
+        _ => {
+            let v = try int_of(value)
+            (v, v)
+        },
+    }
+    if b < a {
+        fail "Range: min_inclusive > max_inclusive"
+    }
+    if a < low or b > high {
+        fail "Range limit out of bounds"
+    }
+    return (a, b)
+}
+
+fn long_of(value: Json) -> i64 ! String {
+    match value {
+        Json.Number(text) => {
+            let d = f64.parse(text) else fail "Not a number: {text}"
+            if let v = i64.parse(text) {
+                return v
+            }
+            return i64.saturate(d)
+        },
+        Json.Bool(b) => return if b { 1 } else { 0 },
+        _ => {},
+    }
+    fail "Not a number: {value}"
+}
+
+fn positive_float(m: List<Member>, key: str) -> f32 ! String {
+    let v = field(m, key) else fail "No key {key} in MapLike"
+    let f = try float_of(v)
+    if not (f > 0.0f32) {
+        fail "Value must be positive: {f}"
+    }
+    return f
+}
+
+fn float_in(m: List<Member>, key: str, low: f32, high: f32) -> f32 ! String {
+    let v = field(m, key) else fail "No key {key} in MapLike"
+    let f = try float_of(v)
+    if not (f >= low and f <= high) {
+        fail "Value {f} outside of range [{low}:{high}]"
+    }
+    return f
+}
+
+// A non-empty list of states.
+fn state_list(facts: Facts, m: List<Member>, key: str) -> List<u32> ! String {
+    let v = field(m, key) else fail "No key {key} in MapLike"
+    let items = try list_of(v)
+    if items.is_empty() {
+        fail "List must have contents"
+    }
+    var out = List<u32>()
+    for item in items {
+        out.push(try read_state(facts, item))
+    }
+    return out
+}
+
+/// `WeightedList.codec(BlockState.CODEC)`: `{data, weight}` entries, weights not negative and
+/// adding up to an int.
+pub fn weighted_states(facts: Facts, value: Json) -> (List<u32>, List<i32>, i32) ! String {
+    let items = try list_of(value)
+    var states = List<u32>()
+    var weights = List<i32>()
+    var total: i64 = 0
+    for item in items {
+        let m = try map_of(item)
+        let d = field(m, "data") else fail "No key data in MapLike"
+        let w = field(m, "weight") else fail "No key weight in MapLike"
+        let weight = try int_of(w)
+        if weight < 0 {
+            fail "Value must be non-negative: {weight}"
+        }
+        states.push(try read_state(facts, d))
+        weights.push(weight)
+        total += i64(weight)
+    }
+    if total > 2147483647 {
+        fail "Sum of weights must be <= 2147483647"
+    }
+    return (states, weights, i32.wrap(total))
+}
+
+/// `WeightedList.getRandom`'s pick: `nextInt(total)`, then the entry it falls in.
+pub fn pick<T: RandomSource>(rand: mut T, weights: List<i32>, total: i32) -> usize {
+    var selection = rand.next_int_below(total)
+    for i in 0..weights.len() {
+        selection -= weights[i]
+        if selection < 0 {
+            return i
+        }
+    }
+    return weights.len() - 1
+}
+
+/// `getState`: the state the provider gives at the position.
+pub fn get_state<T: RandomSource>(e: Env, ps: Providers, r: Region, rand: mut T, p: usize, x: i32, y: i32, z: i32) -> u32 ! Thrown {
+    match ps.table[p] {
+        Provider.RandomBlock(blocks) => {
+            if blocks.is_empty() {
+                return try r.state(e.facts, x, y, z)
+            }
+            let b = blocks[usize.wrap(rand.next_int_below(i32.wrap(blocks.len())))]
+            return e.facts.default_state(u32.wrap(b))
+        },
+        Provider.RuleBased { .. } => {
+            if let s = try optional_state(e, ps, r, mut rand, p, x, y, z) {
+                return s
+            }
+            return try r.state(e.facts, x, y, z)
+        },
+        _ => {},
+    }
+    let s = try optional_state(e, ps, r, mut rand, p, x, y, z) else fail Thrown { exception: "IllegalStateException", message: "no state" }
+    return s
+}
+
+/// `getOptionalState`: none where a random block provider picks from nothing or no rule of a
+/// rule-based one gives a state.
+pub fn optional_state<T: RandomSource>(e: Env, ps: Providers, r: Region, rand: mut T, p: usize, x: i32, y: i32, z: i32) -> u32? ! Thrown {
+    let Env { facts: f, .. } = e
+    match ps.table[p] {
+        Provider.Simple(s) => return some(s),
+        Provider.Weighted { states, weights, total } => {
+            if total == 0 {
+                fail Thrown { exception: "IllegalStateException", message: "Weighted list has no elements" }
+            }
+            return some(states[pick(mut rand, weights, total)])
+        },
+        Provider.RandomizedInt { source, property, values } => {
+            let s = try get_state(e, ps, r, mut rand, source, x, y, z)
+            let prop = f.codec.prop(f.block(s), property) else return some(s)
+            let low = f.codec.int_start(prop) else return some(s)
+            let v = try values.sample(mut rand)
+            let i = v - low
+            if i < 0 or u32.wrap(i) >= prop.count {
+                fail Thrown { exception: "IllegalArgumentException", message: "Cannot set property {property} to {v} on {f.codec.blocks.name(f.block(s))}, it is not an allowed value" }
+            }
+            return some(prop.set(s, u32.wrap(i)))
+        },
+        Provider.Rotated { source, direction } => {
+            let d = if direction >= 0 { direction } else { rand.next_int_below(6) }
+            var s = try get_state(e, ps, r, mut rand, source, x, y, z)
+            let axis: String = if d == 0 or d == 1 { "y" } else if d == 2 or d == 3 { "z" } else { "x" }
+            // `AXIS`, `FACING` and `HORIZONTAL_FACING`, told from other properties of their
+            // names by how many values they have.
+            s = try_exact(f, s, "axis", 3, axis)
+            s = try_exact(f, s, "facing", 6, direction_name(d))
+            if d >= 2 {
+                s = try_exact(f, s, "facing", 4, direction_name(d))
+            }
+            return some(s)
+        },
+        Provider.RuleBased { fallback, rules, thens } => {
+            for i in 0..rules.len() {
+                if try test(e, r, rules[i], x, y, z) {
+                    if let s = try optional_state(e, ps, r, mut rand, thens[i], x, y, z) {
+                        return some(s)
+                    }
+                }
+            }
+            let fb = fallback else return none
+            return try optional_state(e, ps, r, mut rand, fb, x, y, z)
+        },
+        Provider.RandomBlock(blocks) => {
+            if blocks.is_empty() {
+                return none
+            }
+            let b = blocks[usize.wrap(rand.next_int_below(i32.wrap(blocks.len())))]
+            return some(f.default_state(u32.wrap(b)))
+        },
+        Provider.CopyProperties(source) => {
+            let s = try get_state(e, ps, r, mut rand, source, x, y, z)
+            let here = try r.state(f, x, y, z)
+            return some(with_properties_of(f, s, here))
+        },
+        Provider.Noise { noise, scale, states } => {
+            let v = noise.get(f64(x) * f64(scale), f64(y) * f64(scale), f64(z) * f64(scale))
+            return some(noise_state(states, v))
+        },
+        Provider.NoiseThreshold { noise, scale, threshold, high_chance, default_state, low, high } => {
+            let v = f64(noise.get(f64(x) * f64(scale), f64(y) * f64(scale), f64(z) * f64(scale)))
+            if v < f64(threshold) {
+                return some(low[usize.wrap(rand.next_int_below(i32.wrap(low.len())))])
+            }
+            if rand.next_float() < high_chance {
+                return some(high[usize.wrap(rand.next_int_below(i32.wrap(high.len())))])
+            }
+            return some(default_state)
+        },
+        Provider.DualNoise { noise, scale, states, slow, slow_scale, min, max } => {
+            // `pos.getX() * slowScale` is an int times a float: in `float`.
+            let variety = f64(slow_at(slow, slow_scale, x, y, z))
+            let local = i32.saturate(clamped_map(variety, -1.0, 1.0, f64(min), f64(max + 1)))
+            var possible = List<u32>()
+            for i in 0..local {
+                let v = slow_at(slow, slow_scale, x + i * 54545, y, z + i * 34234)
+                possible.push(noise_state(states, v))
+            }
+            let v = noise.get(f64(x) * f64(scale), f64(y) * f64(scale), f64(z) * f64(scale))
+            return some(noise_state(possible, v))
+        },
+    }
+}
+
+fn slow_at(slow: Stack, scale: f32, x: i32, y: i32, z: i32) -> f32 {
+    return slow.get(f64(f32.nearest(x) * scale), f64(f32.nearest(y) * scale), f64(f32.nearest(z) * scale))
+}
+
+// `trySetValue` of the property `name` that has `count` values.
+fn try_exact(f: Facts, state: u32, name: String, count: u32, value: String) -> u32 {
+    let p = f.prop(state, name) else return state
+    if p.count != count {
+        return state
+    }
+    let i = f.codec.index_of(p, value) else return state
+    return p.set(state, i)
+}
+
+// `NoiseProvider.getRandomState`: the state the noise's value falls on.
+fn noise_state(states: List<u32>, v: f32) -> u32 {
+    var placement = (1.0f32 + v) / 2.0f32
+    if placement < 0.0f32 {
+        placement = 0.0f32
+    } else if placement > 0.9999f32 {
+        placement = 0.9999f32
+    }
+    return states[usize.wrap(i32.saturate(f64(placement * f32.nearest(i32.wrap(states.len())))))]
+}
+
+// `Mth.clampedMap`.
+fn clamped_map(v: f64, from_min: f64, from_max: f64, to_min: f64, to_max: f64) -> f64 {
+    let t = (v - from_min) / (from_max - from_min)
+    if t < 0.0 {
+        return to_min
+    }
+    if t > 1.0 {
+        return to_max
+    }
+    return to_min + t * (to_max - to_min)
+}
+
+/// `withPropertiesOf`: `state` with each property it shares with `source` set to `source`'s
+/// value.
+pub fn with_properties_of(f: Facts, state: u32, source: u32) -> u32 {
+    var out = state
+    for p in f.codec.props(f.block(source)) {
+        if let mine = f.codec.prop(f.block(state), f.codec.prop_name(p)) {
+            if mine.id == p.id {
+                out = mine.set(out, p.get(source))
+            }
+        }
+    }
+    return out
+}

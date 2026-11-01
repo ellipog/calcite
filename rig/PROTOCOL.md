@@ -717,6 +717,29 @@ The input may also have `"carvers": c`, read by `WorldCarver.LIST_CODEC` with th
 
 The chunk is written as in `surface`. After a source and a rule, carvers that don't read are `{"invalid": "carvers"}`, with no blob; a weighted list whose weights add up past an `int` throws as it's read, and counts as not reading. An op that isn't `carve` is an `error` status.
 
+### `features` (v1)
+
+Chunks decorated as 26.3's `ChunkGenerator.applyBiomeDecoration` decorates them, or one placed feature placed, in a `WorldGenRegion` for the `features` step. The registries are vanilla's own, as `density`'s are, so a feature, placed feature, block state provider, biome or tag named by ID is vanilla's.
+
+Input `{"seed": s, "settings": id, "level": [min_y, height], "source": v, "ops": [...]}`, with `"feature": f` or without, and no blobs. `s`, `id`, `level` and `v` are as in `surface`. `f` is read by `PlacedFeature.CODEC` with the registries' ops: a placed feature by ID or written out. The generator is a `NoiseBasedChunkGenerator` of `v` and the settings. Each case runs on a thread of its own, as `surface`'s do. The ops, in order, at most 64:
+
+| Op | Does |
+| --- | --- |
+| `["decorate", cx, cz]` | `applyBiomeDecoration` of the chunk at `cx`, `cz`, with a structure manager whose world options don't generate structures |
+| `["place", cx, cz, x, y, z, seed]` | `f.place` in the region around chunk `cx`, `cz`, at block `x`, `y`, `z`, with a `WorldgenRandom` over a `XoroshiroRandomSource` given `setSeed(seed)`, `seed` a `long` as a decimal string. It has no top feature, so a biome filter in it throws, as one in a feature placed by another does |
+
+For each op, the region is made as the server makes it for the `features` step, without running its constructor, which wants the server's chunk holders:
+
+1. The 5×5 chunks around `cx`, `cz` are new `ProtoChunk`s given their biomes as `createBiomes` gives them. The 3×3 are each filled, given their materials and carved as `carvers` does with no carvers written out, each with a biome manager over its own eight neighbours, and marked done with `terrain`.
+2. The region's cache holds those 3×3 chunks and, out to 8 away, new empty chunks marked done with `structure_starts`. Its other fields are what the constructor would set: the level, a seed, level data whose game time is 0, the `worldgen_region_random` factory's random at the center, the dimension type, tick access through the chunks, the `features` step of the generation pyramid with its write radius of 1, the uncached biome resolver and a biome manager over the region.
+3. The level is a stand-in for a `ServerLevel`, also made without its constructor. It gives the dimension type the settings' world has (the Nether's for `nether`, the End's for `end` and the Overworld's for any other), the generator's random state and sea level, the world's height, and a light engine with no sections, as the server's is for chunks not yet lit: sky light 15 where the dimension has sky light, block light 0. It notes each point-of-interest change the region reports.
+
+After each op, the blob gets each of the 3×3 chunks, `z` outer and `x` inner from the lower corner: written as `terrain`'s `fill` writes it; then its four final heightmaps, `WORLD_SURFACE`, `OCEAN_FLOOR`, `MOTION_BLOCKING` and `MOTION_BLOCKING_NO_LEAVES`, each column's `getHeight + 1` by `x` + 16`z`, primed if no feature primed them; its block entities by position, `y` then `z` then `x`, as a count and then each one's `x`, `y` and `z` and its NBT as `NbtIo.writeAnyTag` writes it (the `DUMMY` marker the region leaves, or the block entity's own data with full metadata once something asked for it); its block ticks and fluid ticks in the order they were scheduled, each a count and then each tick's registry ID, `x`, `y`, `z` and priority; and its entities, a count and each one's NBT. Then the point-of-interest changes: a count, then each one's `x`, `y` and `z` and its old and new type's registry ID, -1 for none. The output is `{}`.
+
+A source that doesn't read is `{"invalid": "source"}`, and then a feature that doesn't read `{"invalid": "feature"}`, each with no blob. If anything else throws, the result is the rejection, as `rng`'s is, and no blob. `applyBiomeDecoration` reports anything a feature throws as a `ReportedException` titled `Biome decoration`. Settings that don't exist, a world that isn't whole sections within the limits, more than 64 ops, an op that isn't one of those, a `place` op without `f` and any blob are an `error` status.
+
+Calcite answers `unimplemented` for a case that reaches a feature type, a block's `canSurvive` or a placement it doesn't run yet.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

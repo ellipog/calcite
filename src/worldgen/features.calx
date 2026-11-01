@@ -1,0 +1,1171 @@
+/// Vanilla's features, as 26.3 places them in a chunk's `features` step: the placed features of
+/// `worldgen/placed_feature` and the features of `worldgen/feature`, read as their codecs read
+/// them; the placement modifiers that turn a placed feature's origin into the positions it's
+/// placed at, run as `FeaturePlacer` runs them; the features themselves; and the order
+/// `FeatureSorter` puts each step's features in, which `applyBiomeDecoration` places them in.
+///
+/// A feature of a type Calcite doesn't place yet reads, and fails as it's placed with the
+/// exception `Unimplemented`, which the rig reports as such.
+module worldgen.features
+
+import json.tree.{Json, Member, as_string}
+import math.mth.{SinTable, floor}
+import pack.zip.{Zip}
+import random.legacy.{LegacyRandom}
+import random.source.{RandomSource}
+import random.worldgen.{WorldgenRandom}
+import random.xoroshiro.{XoroshiroRandom}
+import resources.identifier.{Identifier}
+import std.java.math.{cos, sin}
+import world.chunk.{MOTION_BLOCKING, OCEAN_FLOOR, OCEAN_FLOOR_WG, WORLD_SURFACE}
+import worldgen.codec.{bool_of, double_of, field, float_range_field, int_field, int_of, int_range_field, map_of, type_of}
+import worldgen.density.{data_json}
+import worldgen.facts.{Facts}
+import worldgen.interval.{Thrown}
+import worldgen.noise.{Noise}
+import worldgen.predicates.{Pred, Readers, Rule, list_of, read_pred, read_rule, read_state, test, test_rule}
+import worldgen.providers.{HeightProvider, IntProvider, int_provider_field, read_height}
+import worldgen.region.{Region}
+import worldgen.state_providers.{Providers, optional_state, pick}
+import worldgen.survive.{Env, can_survive}
+
+/// `GenerationStep.Decoration.values().length`: the steps a chunk is decorated in at least.
+const DECORATION_STEPS: i32 = 11
+/// `(float) Math.PI`.
+const PI_F32: f32 = 3.1415927f32
+
+/// A placement modifier.
+pub enum Modifier {
+    Biome
+    Filter(Pred)
+    CountOnEveryLayer(IntProvider)
+    Count(IntProvider)
+    EnvironmentScan { direction: i32, target: Pred, allowed: Pred, max_steps: i32 }
+    /// The positions, as `x, y, z` in a row each.
+    Fixed(List<i32>)
+    HeightRange(HeightProvider)
+    Heightmap(i32)
+    InSquare
+    NoiseBasedCount { ratio: i32, factor: f64, offset: f64 }
+    NoiseThresholdCount { level: f64, below: i32, above: i32 }
+    Offset { x: IntProvider, y: IntProvider, z: IntProvider }
+    RandomChance(f32)
+    RandomlySelected(List<Modifier>)
+    Rarity(i32)
+    SurfaceRelativeThreshold { heightmap: i32, min: i32, max: i32 }
+    SurfaceWaterDepth(i32)
+    Cuboid { xz: IntProvider, y: IntProvider, edges: bool, interior: bool }
+}
+
+/// An ore's `BlockReplacement`: the state put where the rule passes.
+pub struct Replacement {
+    pub rule: Rule
+    pub state: u32
+}
+
+/// A feature. Others it places are indexes into the catalog's placed features.
+pub enum Feature {
+    NoOp
+    Ore { targets: List<Replacement>, size: i32, discard: f32 }
+    ScatteredOre { targets: List<Replacement>, size: i32, discard: f32 }
+    SimpleBlock { provider: usize, schedule_tick: bool }
+    RandomSelector { features: List<usize>, chances: List<f32>, fallback: usize }
+    SimpleRandomSelector(List<usize>)
+    RandomBooleanSelector { yes: usize, no: usize }
+    WeightedRandomSelector { features: List<usize>, weights: List<i32>, total: i32 }
+    Sequence(List<usize>)
+    /// A feature of a type that isn't placed yet, by the type's ID.
+    Unsupported(String)
+}
+
+/// A placed feature: its feature, by index, and its placement.
+pub struct Placed {
+    pub feature: usize
+    pub placement: List<Modifier>
+}
+
+/// The features read, each read by reference once.
+pub struct Catalog {
+    pub placed: List<Placed>
+    pub features: List<Feature>
+    pub providers: Providers
+    placed_ids: Map<String, usize>
+    feature_ids: Map<String, usize>
+}
+
+impl Catalog {
+    pub fn new() -> Catalog {
+        return Catalog {
+            placed: List<Placed>(),
+            features: List<Feature>(),
+            providers: Providers.new(),
+            placed_ids: Map<String, usize>(),
+            feature_ids: Map<String, usize>(),
+        }
+    }
+
+    /// `PlacedFeature.CODEC`: a placed feature by its ID, or written out.
+    pub fn read_placed(mut self, zip: Zip, facts: Facts, rd: Readers, value: Json) -> usize ! String {
+        if let text = as_string(value) {
+            let id = (try Identifier.parse(text)).to_string()
+            if let i = self.placed_ids.get(id) {
+                return i
+            }
+            let json = try data_json(zip, id.copy(), "placed_feature")
+            let i = try self.read_placed_direct(zip, facts, rd, json)
+            self.placed_ids.insert(id, i)
+            return i
+        }
+        return try self.read_placed_direct(zip, facts, rd, value)
+    }
+
+    // `PlacedFeature.DIRECT_CODEC`.
+    fn read_placed_direct(mut self, zip: Zip, facts: Facts, rd: Readers, value: Json) -> usize ! String {
+        let m = try map_of(value)
+        let f = field(m, "feature") else fail "No key feature in MapLike"
+        let feature = try self.read_feature(zip, facts, rd, f)
+        let p = field(m, "placement") else fail "No key placement in MapLike"
+        var placement = List<Modifier>()
+        for item in try list_of(p) {
+            placement.push(try read_modifier(facts, rd, item))
+        }
+        self.placed.push(Placed { feature: feature, placement: placement })
+        return self.placed.len() - 1
+    }
+
+    /// `PlacedFeature.LIST_CODEC`, or with `force_list` the lists of `LIST_OF_LISTS_CODEC`: a tag,
+    /// a list of placed features, or without `force_list` one alone. Vanilla's pack has no
+    /// placed feature tags, so every tag is missing.
+    pub fn read_placed_set(mut self, zip: Zip, facts: Facts, rd: Readers, value: Json, force_list: bool) -> List<usize> ! String {
+        if let text = as_string(value) {
+            if text.starts_with("#") {
+                fail "Missing tag: '{text[1..]}' in 'minecraft:worldgen/placed_feature'"
+            }
+        }
+        let items = match value {
+            Json.Array(a) => a.copy(),
+            _ => {
+                if force_list {
+                    fail "Not a list: {value}"
+                }
+                return [try self.read_placed(zip, facts, rd, value)]
+            },
+        }
+        var out = List<usize>()
+        for item in items {
+            out.push(try self.read_placed(zip, facts, rd, item))
+        }
+        return out
+    }
+
+    /// `Feature.CODEC`: a feature by its ID, or written out.
+    fn read_feature(mut self, zip: Zip, facts: Facts, rd: Readers, value: Json) -> usize ! String {
+        if let text = as_string(value) {
+            let id = (try Identifier.parse(text)).to_string()
+            if let i = self.feature_ids.get(id) {
+                return i
+            }
+            let json = try data_json(zip, id.copy(), "feature")
+            let i = try self.read_feature_direct(zip, facts, rd, json)
+            self.feature_ids.insert(id, i)
+            return i
+        }
+        return try self.read_feature_direct(zip, facts, rd, value)
+    }
+
+    // `Feature.DIRECT_CODEC`: by the feature type's codec.
+    fn read_feature_direct(mut self, zip: Zip, facts: Facts, rd: Readers, value: Json) -> usize ! String {
+        let m = try map_of(value)
+        let kind = try type_of(m)
+        let feature = try self.read_typed(zip, facts, rd, m, kind)
+        self.features.push(feature)
+        return self.features.len() - 1
+    }
+
+    fn read_typed(mut self, zip: Zip, facts: Facts, rd: Readers, m: List<Member>, kind: String) -> Feature ! String {
+        if kind == "minecraft:no_op" {
+            return Feature.NoOp
+        }
+        if kind == "minecraft:ore" or kind == "minecraft:scattered_ore" {
+            let t = field(m, "targets") else fail "No key targets in MapLike"
+            var targets = List<Replacement>()
+            for item in try list_of(t) {
+                let tm = try map_of(item)
+                let rule_value = field(tm, "target") else fail "No key target in MapLike"
+                let state_value = field(tm, "state") else fail "No key state in MapLike"
+                targets.push(Replacement { rule: try read_rule(facts, rule_value), state: try read_state(facts, state_value) })
+            }
+            let size = try int_range_field(m, "size", 0, 64)
+            let discard = try float_range_field(m, "discard_chance_on_air_exposure", 0.0f32, 1.0f32)
+            if kind == "minecraft:ore" {
+                return Feature.Ore { targets: targets, size: size, discard: discard }
+            }
+            return Feature.ScatteredOre { targets: targets, size: size, discard: discard }
+        }
+        if kind == "minecraft:simple_block" {
+            let v = field(m, "to_place") else fail "No key to_place in MapLike"
+            let provider = try self.providers.read(zip, facts, rd, v)
+            var schedule_tick = false
+            if let s = field(m, "schedule_tick") {
+                schedule_tick = try bool_of(s)
+            }
+            return Feature.SimpleBlock { provider: provider, schedule_tick: schedule_tick }
+        }
+        if kind == "minecraft:random_selector" {
+            let v = field(m, "features") else fail "No key features in MapLike"
+            var features = List<usize>()
+            var chances = List<f32>()
+            for item in try list_of(v) {
+                let wm = try map_of(item)
+                let fv = field(wm, "feature") else fail "No key feature in MapLike"
+                features.push(try self.read_placed(zip, facts, rd, fv))
+                chances.push(try float_range_field(wm, "chance", 0.0f32, 1.0f32))
+            }
+            let d = field(m, "default") else fail "No key default in MapLike"
+            let fallback = try self.read_placed(zip, facts, rd, d)
+            return Feature.RandomSelector { features: features, chances: chances, fallback: fallback }
+        }
+        if kind == "minecraft:simple_random_selector" or kind == "minecraft:sequence" {
+            let v = field(m, "features") else fail "No key features in MapLike"
+            let features = try self.read_placed_set(zip, facts, rd, v, false)
+            if features.is_empty() {
+                fail "Holder set must not be empty"
+            }
+            if kind == "minecraft:sequence" {
+                return Feature.Sequence(features)
+            }
+            return Feature.SimpleRandomSelector(features)
+        }
+        if kind == "minecraft:random_boolean_selector" {
+            let a = field(m, "feature_true") else fail "No key feature_true in MapLike"
+            let b = field(m, "feature_false") else fail "No key feature_false in MapLike"
+            let yes = try self.read_placed(zip, facts, rd, a)
+            let no = try self.read_placed(zip, facts, rd, b)
+            return Feature.RandomBooleanSelector { yes: yes, no: no }
+        }
+        if kind == "minecraft:weighted_random_selector" {
+            let v = field(m, "features") else fail "No key features in MapLike"
+            var features = List<usize>()
+            var weights = List<i32>()
+            var total: i64 = 0
+            for item in try list_of(v) {
+                let wm = try map_of(item)
+                let d = field(wm, "data") else fail "No key data in MapLike"
+                let w = field(wm, "weight") else fail "No key weight in MapLike"
+                let weight = try int_of(w)
+                if weight < 0 {
+                    fail "Value must be non-negative: {weight}"
+                }
+                features.push(try self.read_placed(zip, facts, rd, d))
+                weights.push(weight)
+                total += i64(weight)
+            }
+            if total > 2147483647 {
+                fail "Sum of weights must be <= 2147483647"
+            }
+            return Feature.WeightedRandomSelector { features: features, weights: weights, total: i32.wrap(total) }
+        }
+        if is_feature_type(kind) {
+            return Feature.Unsupported(kind.copy())
+        }
+        fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:worldgen/feature_type]: {kind}"
+    }
+}
+
+// Whether `kind` is one of 26.3's feature types.
+fn is_feature_type(kind: String) -> bool {
+    let names: List<String> = [
+        "bamboo", "block_blob", "block_column", "block_pile", "blue_ice", "bonus_chest", "chorus_plant", "coral_claw",
+        "coral_tree", "delta_feature", "disk", "end_gateway", "end_island", "end_platform", "end_podium", "end_spike",
+        "fallen_tree", "fill_layer", "fossil", "freeze_top_layer", "geode", "huge_brown_mushroom", "huge_fungus",
+        "huge_red_mushroom", "iceberg", "lake", "large_dripstone", "monster_room", "multiface_growth",
+        "netherrack_replace_blobs", "no_op", "ore", "overlay", "projected_random_patchy_square",
+        "random_boolean_selector", "random_neighbor_spread", "random_selector", "replace_single_block", "root_system",
+        "scattered_ore", "sculk_patch", "sequence", "simple_block", "simple_random_selector", "single_block_pillar",
+        "speleothem", "speleothem_cluster", "spike", "spring_feature", "stepped_column_cluster", "template", "tree",
+        "underwater_magma", "vegetation_patch", "vines", "void_start_platform", "waterlogged_vegetation_patch",
+        "weighted_random_selector",
+    ]
+    for n in names {
+        if kind == "minecraft:{n}" {
+            return true
+        }
+    }
+    return false
+}
+
+/// `Heightmap.Types.CODEC`: a heightmap by its name.
+pub fn read_heightmap(value: Json) -> i32 ! String {
+    let text = as_string(value) else fail "Not a string: {value}"
+    let names: List<String> = ["WORLD_SURFACE_WG", "WORLD_SURFACE", "OCEAN_FLOOR_WG", "OCEAN_FLOOR", "MOTION_BLOCKING", "MOTION_BLOCKING_NO_LEAVES"]
+    for i in 0..names.len() {
+        if names[i] == text {
+            return i32.wrap(i)
+        }
+    }
+    fail "Unknown element name:{text}"
+}
+
+// `PlacementModifier.CODEC`: by the modifier type's codec.
+fn read_modifier(facts: Facts, rd: Readers, value: Json) -> Modifier ! String {
+    let m = try map_of(value)
+    let kind = try type_of(m)
+    if kind == "minecraft:biome" {
+        return Modifier.Biome
+    }
+    if kind == "minecraft:in_square" {
+        return Modifier.InSquare
+    }
+    if kind == "minecraft:block_predicate_filter" {
+        let v = field(m, "predicate") else fail "No key predicate in MapLike"
+        return Modifier.Filter(try read_pred(facts, rd, v))
+    }
+    if kind == "minecraft:count" {
+        return Modifier.Count(try int_provider_field(m, "count", 0, 4096))
+    }
+    if kind == "minecraft:count_on_every_layer" {
+        return Modifier.CountOnEveryLayer(try int_provider_field(m, "count", 0, 256))
+    }
+    if kind == "minecraft:environment_scan" {
+        let d = field(m, "direction_of_search") else fail "No key direction_of_search in MapLike"
+        let text = as_string(d) else fail "Not a string: {d}"
+        let direction = if text == "up" { 1 } else if text == "down" { -1 } else { fail "Expected a vertical direction" }
+        let t = field(m, "target_condition") else fail "No key target_condition in MapLike"
+        let target = try read_pred(facts, rd, t)
+        var allowed = Pred.True
+        if let a = field(m, "allowed_search_condition") {
+            allowed = try read_pred(facts, rd, a)
+        }
+        let max_steps = try int_range_field(m, "max_steps", 1, 32)
+        return Modifier.EnvironmentScan { direction: direction, target: target, allowed: allowed, max_steps: max_steps }
+    }
+    if kind == "minecraft:fixed_placement" {
+        let v = field(m, "positions") else fail "No key positions in MapLike"
+        var positions = List<i32>()
+        for item in try list_of(v) {
+            let coords = try list_of(item)
+            if coords.len() != 3 {
+                fail "Input is not a list of 3 ints"
+            }
+            for c in coords {
+                positions.push(try int_of(c))
+            }
+        }
+        return Modifier.Fixed(positions)
+    }
+    if kind == "minecraft:height_range" {
+        let v = field(m, "height") else fail "No key height in MapLike"
+        return Modifier.HeightRange(try read_height(v))
+    }
+    if kind == "minecraft:heightmap" {
+        let v = field(m, "heightmap") else fail "No key heightmap in MapLike"
+        return Modifier.Heightmap(try read_heightmap(v))
+    }
+    if kind == "minecraft:noise_based_count" {
+        let ratio = try int_field(m, "noise_to_count_ratio")
+        let f = field(m, "noise_factor") else fail "No key noise_factor in MapLike"
+        let factor = try double_of(f)
+        var offset = 0.0
+        if let o = field(m, "noise_offset") {
+            offset = try double_of(o)
+        }
+        return Modifier.NoiseBasedCount { ratio: ratio, factor: factor, offset: offset }
+    }
+    if kind == "minecraft:noise_threshold_count" {
+        let l = field(m, "noise_level") else fail "No key noise_level in MapLike"
+        let level = try double_of(l)
+        let below = try int_field(m, "below_noise")
+        let above = try int_field(m, "above_noise")
+        return Modifier.NoiseThresholdCount { level: level, below: below, above: above }
+    }
+    if kind == "minecraft:offset" {
+        let x = try int_provider_field(m, "x", -16, 16)
+        let y = try int_provider_field(m, "y", -16, 16)
+        let z = try int_provider_field(m, "z", -16, 16)
+        return Modifier.Offset { x: x, y: y, z: z }
+    }
+    if kind == "minecraft:random_chance" {
+        return Modifier.RandomChance(try float_range_field(m, "chance", 0.0f32, 1.0f32))
+    }
+    if kind == "minecraft:randomly_selected" {
+        let v = field(m, "placements") else fail "No key placements in MapLike"
+        var placements = List<Modifier>()
+        for item in try list_of(v) {
+            placements.push(try read_modifier(facts, rd, item))
+        }
+        if placements.is_empty() {
+            fail "List must have contents"
+        }
+        return Modifier.RandomlySelected(placements)
+    }
+    if kind == "minecraft:rarity_filter" {
+        let chance = try int_field(m, "chance")
+        if chance <= 0 {
+            fail "Value must be positive: {chance}"
+        }
+        return Modifier.Rarity(chance)
+    }
+    if kind == "minecraft:surface_relative_threshold_filter" {
+        let h = field(m, "heightmap") else fail "No key heightmap in MapLike"
+        let heightmap = try read_heightmap(h)
+        var min = i32.MIN
+        if let v = field(m, "min_inclusive") {
+            min = try int_of(v)
+        }
+        var max = i32.MAX
+        if let v = field(m, "max_inclusive") {
+            max = try int_of(v)
+        }
+        return Modifier.SurfaceRelativeThreshold { heightmap: heightmap, min: min, max: max }
+    }
+    if kind == "minecraft:surface_water_depth_filter" {
+        return Modifier.SurfaceWaterDepth(try int_field(m, "max_water_depth"))
+    }
+    if kind == "minecraft:cuboid" {
+        let xz = try int_provider_field(m, "xz_size", 1, 16)
+        let y = try int_provider_field(m, "y_size", 1, 16)
+        var edges = true
+        if let v = field(m, "include_edges") {
+            edges = try bool_of(v)
+        }
+        var interior = true
+        if let v = field(m, "include_interior") {
+            interior = try bool_of(v)
+        }
+        return Modifier.Cuboid { xz: xz, y: y, edges: edges, interior: interior }
+    }
+    fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:worldgen/placement_modifier_type]: {kind}"
+}
+
+/// The order `FeatureSorter` gives each step's features, and the features each biome lists.
+pub struct Decoration {
+    /// Each step's features, by index into the catalog's placed features, in the order of their
+    /// global indexes.
+    pub steps: List<List<usize>>
+    /// Each step's global index of each feature in it.
+    index: List<Map<usize, i32>>
+    /// The biomes the source can give, in its order.
+    possible: List<i32>
+    /// Each biome's features of each step, by the biome's ID.
+    by_biome: List<List<List<usize>>>
+    /// Each biome's features of every step: what `BiomeFilter` asks.
+    in_biome: List<Set<usize>>
+    /// Why the features couldn't be sorted, if they couldn't.
+    cycle: bool
+}
+
+impl Decoration {
+    /// No biomes' features, for placing features alone.
+    pub fn empty() -> Decoration {
+        return Decoration { steps: [], index: [], possible: [], by_biome: [], in_biome: [], cycle: false }
+    }
+
+    /// The features of the biomes in `possible`, the biome source's, from their JSON in the
+    /// pack, read into `catalog` and sorted as `FeatureSorter.buildFeaturesPerStep` sorts them.
+    pub fn of_biomes(catalog: mut Catalog, zip: Zip, facts: Facts, rd: Readers, possible: List<i32>) -> Decoration ! String {
+        let count = rd.biomes.entries.len()
+        var by_biome = List<List<List<usize>>>()
+        var in_biome = List<Set<usize>>()
+        for _ in 0..count {
+            by_biome.push(List<List<usize>>())
+            in_biome.push(Set<usize>())
+        }
+        for b in possible {
+            let id = rd.biomes.entries[usize.wrap(b)].to_string()
+            let json = try data_json(zip, id.copy(), "biome")
+            let m = try map_of(json)
+            let value = field(m, "features") else fail "biome `{id}` has no `features`"
+            var steps = List<List<usize>>()
+            for step in try list_of(value) {
+                let set = try catalog.read_placed_set(zip, facts, rd, step, true)
+                for p in set {
+                    in_biome[usize.wrap(b)].insert(p)
+                }
+                steps.push(set)
+            }
+            by_biome[usize.wrap(b)] = steps
+        }
+        var d = Decoration { steps: [], index: [], possible: possible.copy(), by_biome: by_biome, in_biome: in_biome, cycle: false }
+        d.sort()
+        return d
+    }
+
+    // `FeatureSorter.buildFeaturesPerStep`: each feature of each step a node, keyed by its step
+    // and the order it was first seen in, with an edge to the feature after it in each biome's
+    // list of all its steps' features; the nodes in reverse of the order a depth-first search
+    // from each in key order finishes them, split by step.
+    fn sort(mut self) {
+        var first_seen = Map<usize, i64>()
+        var next: i64 = 0
+        var node_feature = Map<i64, usize>()
+        var edges = Map<i64, List<i64>>()
+        var max_step: usize = 0
+        for b in self.possible {
+            let steps = self.by_biome[usize.wrap(b)].len()
+            if steps > max_step {
+                max_step = steps
+            }
+            var list = List<i64>()
+            for i in 0..steps {
+                for p in self.by_biome[usize.wrap(b)][i] {
+                    let fi = match first_seen.get(p) {
+                        some(v) => v,
+                        none => {
+                            first_seen.insert(p, next)
+                            next += 1
+                            next - 1
+                        },
+                    }
+                    let key = (i64.wrap(i) << 32) | fi
+                    node_feature.insert(key, p)
+                    list.push(key)
+                }
+            }
+            for i in 0..list.len() {
+                if not edges.contains(list[i]) {
+                    edges.insert(list[i], List<i64>())
+                }
+                if i + 1 < list.len() {
+                    let after = list[i + 1]
+                    if not edges[list[i]].contains(after) {
+                        edges[list[i]].push(after)
+                    }
+                }
+            }
+        }
+        var keys = List<i64>()
+        for (k, _) in node_feature {
+            keys.push(k)
+        }
+        keys.sort()
+        for k in keys {
+            edges[k].sort()
+        }
+        var discovered = Set<i64>()
+        var visiting = Set<i64>()
+        var sorted = List<i64>()
+        for k in keys {
+            if not discovered.contains(k) and depth_first(edges, mut discovered, mut visiting, mut sorted, k) {
+                self.cycle = true
+                return
+            }
+        }
+        let last = sorted.len()
+        for i in 0..last / 2 {
+            sorted.swap(i, last - 1 - i)
+        }
+        for step in 0..max_step {
+            var features = List<usize>()
+            var index = Map<usize, i32>()
+            for key in sorted {
+                if (key >> 32) == i64.wrap(step) {
+                    let p = node_feature.get(key) ?? 0
+                    index.insert(p, i32.wrap(features.len()))
+                    features.push(p)
+                }
+            }
+            self.steps.push(features)
+            self.index.push(index)
+        }
+    }
+}
+
+// `Graph.depthFirstSearch`: true if it found a cycle.
+fn depth_first(edges: Map<i64, List<i64>>, discovered: mut Set<i64>, visiting: mut Set<i64>, sorted: mut List<i64>, current: i64) -> bool {
+    if discovered.contains(current) {
+        return false
+    }
+    if visiting.contains(current) {
+        return true
+    }
+    visiting.insert(current)
+    let n = edges[current].len()
+    for i in 0..n {
+        if depth_first(edges, mut discovered, mut visiting, mut sorted, edges[current][i]) {
+            return true
+        }
+    }
+    visiting.remove(current)
+    discovered.insert(current)
+    sorted.push(current)
+    return false
+}
+
+/// What placing features reads: the facts of the blocks, the generation context, the features,
+/// the biomes' features, and the noise and table vanilla keeps in statics.
+pub struct Gen {
+    pub env: Env
+    pub catalog: Catalog
+    pub decoration: Decoration
+    /// `Biome.BIOME_INFO_NOISE`.
+    pub info_noise: Noise
+    pub sin: SinTable
+}
+
+impl Gen {
+    pub fn new(env: own Env, catalog: own Catalog, decoration: own Decoration) -> Gen {
+        var info = LegacyRandom.new(2345)
+        return Gen { env: env, catalog: catalog, decoration: decoration, info_noise: Noise.simplex(mut info, true), sin: SinTable.new() }
+    }
+}
+
+fn unimplemented(what: own String) -> Thrown {
+    return Thrown { exception: "Unimplemented", message: what }
+}
+
+/// `ChunkGenerator.applyBiomeDecoration` of the region's center chunk, with no structures: each
+/// step's features of the biomes in the nine chunks, the source can give, in the order of their
+/// global indexes, each from its own seed.
+pub fn decorate(g: Gen, r: mut Region, seed: i64) ! Thrown {
+    let Gen { decoration: d, .. } = g
+    if d.cycle {
+        fail Thrown { exception: "IllegalStateException", message: "Feature order cycle found" }
+    }
+    let ox = r.cx << 4
+    let oz = r.cz << 4
+    var random = WorldgenRandom.new(XoroshiroRandom.new(0))
+    let decoration_seed = random.set_decoration_seed(seed, ox, oz)
+    var present = Set<i32>()
+    for c in 0..r.zoom.chunks.len() {
+        for b in r.zoom.chunks[c] {
+            present.insert(b)
+        }
+    }
+    let feature_steps = d.steps.len()
+    let steps = if i32.wrap(feature_steps) > DECORATION_STEPS { i32.wrap(feature_steps) } else { DECORATION_STEPS }
+    for step in 0..steps {
+        let s = usize.wrap(step)
+        if s >= feature_steps {
+            continue
+        }
+        var chosen = Set<i32>()
+        for b in d.possible {
+            if not present.contains(b) {
+                continue
+            }
+            if s < d.by_biome[usize.wrap(b)].len() {
+                for p in d.by_biome[usize.wrap(b)][s] {
+                    chosen.insert(d.index[s].get(p) ?? 0)
+                }
+            }
+        }
+        var order = List<i32>()
+        for i in chosen {
+            order.push(i)
+        }
+        order.sort()
+        for gi in order {
+            random.set_feature_seed(decoration_seed, gi, step)
+            let oy = r.min_y
+            _ = try place_placed(g, mut r, mut random, d.steps[s][usize.wrap(gi)], ox, oy, oz, true)
+        }
+    }
+}
+
+/// `FeaturePlacer.place`: the placed feature `p` from `x`, `y`, `z`, its modifiers run on a
+/// stack, each position a modifier gives handed to the next one in order, and the feature placed
+/// at each the last one gives. `top` is whether it's the step's own feature, which a biome filter
+/// may check.
+pub fn place_placed<T: RandomSource>(g: Gen, r: mut Region, rand: mut T, p: usize, x: i32, y: i32, z: i32, top: bool) -> bool ! Thrown {
+    let feature = g.catalog.placed[p].feature
+    let n = g.catalog.placed[p].placement.len()
+    if n == 0 {
+        return try place_feature(g, mut r, mut rand, feature, x, y, z)
+    }
+    var placed_any = false
+    var positions: List<(i32, i32, i32)> = [(x, y, z)]
+    var indices: List<usize> = [0]
+    var modified = List<(i32, i32, i32)>()
+    while let at = positions.pop() {
+        let mi = indices.pop() ?? 0
+        let (px, py, pz) = at
+        try modify(g, mut r, mut rand, g.catalog.placed[p].placement[mi], p, top, px, py, pz, mut modified)
+        if mi + 1 < n {
+            var i = modified.len()
+            while i > 0 {
+                i -= 1
+                positions.push(modified[i])
+                indices.push(mi + 1)
+            }
+        } else {
+            for (mx, my, mz) in modified {
+                if try place_feature(g, mut r, mut rand, feature, mx, my, mz) {
+                    placed_any = true
+                }
+            }
+        }
+        modified.clear()
+    }
+    return placed_any
+}
+
+// `PlacementModifier.modify`: the positions the modifier gives from one, onto `out`.
+fn modify<T: RandomSource>(g: Gen, r: mut Region, rand: mut T, m: Modifier, p: usize, top: bool, x: i32, y: i32, z: i32, out: mut List<(i32, i32, i32)>) ! Thrown {
+    let Env { facts: f, .. } = g.env
+    match m {
+        Modifier.Biome => {
+            if not top {
+                fail Thrown { exception: "IllegalStateException", message: "Tried to biome check an unregistered feature, or a feature that should not restrict the biome" }
+            }
+            let b = try r.biome(x, y, z)
+            if g.decoration.in_biome[usize.wrap(b)].contains(p) {
+                out.push((x, y, z))
+            }
+        },
+        Modifier.Filter(pred) => {
+            if try test(g.env, r, pred, x, y, z) {
+                out.push((x, y, z))
+            }
+        },
+        Modifier.CountOnEveryLayer(count) => {
+            var layer = 0
+            loop {
+                var found = false
+                var i = 0
+                loop {
+                    let n = try count.sample(mut rand)
+                    if i >= n {
+                        break
+                    }
+                    let ax = rand.next_int_below(16) + x
+                    let az = rand.next_int_below(16) + z
+                    let start = try r.get_height(f, MOTION_BLOCKING, ax, az)
+                    let gy = try on_ground(f, r, ax, start, az, layer)
+                    if gy != i32.MAX {
+                        out.push((ax, gy, az))
+                        found = true
+                    }
+                    i += 1
+                }
+                layer += 1
+                if not found {
+                    break
+                }
+            }
+        },
+        Modifier.Count(count) => {
+            let n = try count.sample(mut rand)
+            for _ in 0..n {
+                out.push((x, y, z))
+            }
+        },
+        Modifier.EnvironmentScan { direction, target, allowed, max_steps } => {
+            var py = y
+            if not try test(g.env, r, allowed, x, py, z) {
+                return
+            }
+            for _ in 0..max_steps {
+                if try test(g.env, r, target, x, py, z) {
+                    out.push((x, py, z))
+                    return
+                }
+                py += direction
+                if r.outside(py) {
+                    return
+                }
+                if not try test(g.env, r, allowed, x, py, z) {
+                    break
+                }
+            }
+            if try test(g.env, r, target, x, py, z) {
+                out.push((x, py, z))
+            }
+        },
+        Modifier.Fixed(positions) => {
+            var i: usize = 0
+            while i + 2 < positions.len() {
+                let px = positions[i]
+                let pz = positions[i + 2]
+                if (px >> 4) == (x >> 4) and (pz >> 4) == (z >> 4) {
+                    out.push((px, positions[i + 1], pz))
+                }
+                i += 3
+            }
+        },
+        Modifier.HeightRange(h) => {
+            let hy = try h.sample(mut rand, g.env.ctx)
+            out.push((x, hy, z))
+        },
+        Modifier.Heightmap(kind) => {
+            let h = try r.get_height(f, kind, x, z)
+            if h > r.min_y {
+                out.push((x, h, z))
+            }
+        },
+        Modifier.InSquare => {
+            let ax = rand.next_int_below(16) + x
+            let az = rand.next_int_below(16) + z
+            out.push((ax, y, az))
+        },
+        Modifier.NoiseBasedCount { ratio, factor, offset } => {
+            let noise = f64(g.info_noise.get2(f64(x) / factor, f64(z) / factor))
+            let n = i32.saturate(((noise + offset) * f64(ratio)).ceil())
+            for _ in 0..n {
+                out.push((x, y, z))
+            }
+        },
+        Modifier.NoiseThresholdCount { level, below, above } => {
+            let noise = f64(g.info_noise.get2(f64(x) / 200.0, f64(z) / 200.0))
+            let n = if noise < level { below } else { above }
+            for _ in 0..n {
+                out.push((x, y, z))
+            }
+        },
+        Modifier.Offset { x: ox, y: oy, z: oz } => {
+            let dx = try ox.sample(mut rand)
+            let dy = try oy.sample(mut rand)
+            let dz = try oz.sample(mut rand)
+            out.push((x + dx, y + dy, z + dz))
+        },
+        Modifier.RandomChance(chance) => {
+            if rand.next_float() < chance {
+                out.push((x, y, z))
+            }
+        },
+        Modifier.RandomlySelected(list) => {
+            let i = rand.next_int_below(i32.wrap(list.len()))
+            try modify(g, mut r, mut rand, list[usize.wrap(i)], p, top, x, y, z, mut out)
+        },
+        Modifier.Rarity(chance) => {
+            if rand.next_float() < 1.0f32 / f32.nearest(chance) {
+                out.push((x, y, z))
+            }
+        },
+        Modifier.SurfaceRelativeThreshold { heightmap, min, max } => {
+            let surface = i64(try r.get_height(f, heightmap, x, z))
+            if surface + i64(min) <= i64(y) and i64(y) <= surface + i64(max) {
+                out.push((x, y, z))
+            }
+        },
+        Modifier.SurfaceWaterDepth(max) => {
+            let ocean = try r.get_height(f, OCEAN_FLOOR, x, z)
+            let surface = try r.get_height(f, WORLD_SURFACE, x, z)
+            if surface - ocean <= max {
+                out.push((x, y, z))
+            }
+        },
+        Modifier.Cuboid { xz, y: ys, edges, interior } => {
+            let height = try ys.sample(mut rand)
+            let width = try xz.sample(mut rand)
+            let length = try xz.sample(mut rand)
+            var a = 0
+            while a <= width {
+                var b = 0
+                while b <= height {
+                    var c = 0
+                    while c <= length {
+                        let ea = a != 0 and a != width
+                        let eb = b != 0 and b != height
+                        let ec = c != 0 and c != length
+                        let shell = a == 0 or a == width or b == 0 or b == height or c == 0 or c == length
+                        if (edges or ea or eb) and (edges or ec or eb) and (edges or ea or ec) and (interior or shell) {
+                            out.push((x + a, y + b, z + c))
+                        }
+                        c += 1
+                    }
+                    b += 1
+                }
+                a += 1
+            }
+        },
+    }
+}
+
+// `CountOnEveryLayerPlacement.findOnGroundYPosition`: the height above the `layer`th floor from
+// `start` down, a floor being a block not air, water or lava, but not bedrock, under one that
+// is; `i32.MAX` if there's none.
+fn on_ground(f: Facts, r: Region, x: i32, start: i32, z: i32, layer: i32) -> i32 ! Thrown {
+    var current_layer = 0
+    var current = try r.state(f, x, start, z)
+    var y = start
+    while y >= r.min_y + 1 {
+        let below = try r.state(f, x, y - 1, z)
+        if not layer_empty(f, below) and layer_empty(f, current) and not f.is(below, f.ids.bedrock) {
+            if current_layer == layer {
+                return y
+            }
+            current_layer += 1
+        }
+        current = below
+        y -= 1
+    }
+    return i32.MAX
+}
+
+fn layer_empty(f: Facts, state: u32) -> bool {
+    return f.is_air(state) or f.is(state, f.ids.water) or f.is(state, f.ids.lava)
+}
+
+/// `Feature.place` of the feature `fi` at `x`, `y`, `z`.
+pub fn place_feature<T: RandomSource>(g: Gen, r: mut Region, rand: mut T, fi: usize, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    match g.catalog.features[fi] {
+        Feature.NoOp => return true,
+        Feature.Ore { targets, size, discard } => return try place_ore(g, mut r, mut rand, targets, size, discard, x, y, z),
+        Feature.ScatteredOre { targets, size, discard } => return try place_scattered_ore(g, mut r, mut rand, targets, size, discard, x, y, z),
+        Feature.SimpleBlock { provider, schedule_tick } => return try place_simple_block(g, mut r, mut rand, provider, schedule_tick, x, y, z),
+        Feature.RandomSelector { features, chances, fallback } => {
+            for i in 0..features.len() {
+                if rand.next_float() < chances[i] {
+                    return try place_placed(g, mut r, mut rand, features[i], x, y, z, false)
+                }
+            }
+            return try place_placed(g, mut r, mut rand, fallback, x, y, z, false)
+        },
+        Feature.SimpleRandomSelector(features) => {
+            let i = rand.next_int_below(i32.wrap(features.len()))
+            return try place_placed(g, mut r, mut rand, features[usize.wrap(i)], x, y, z, false)
+        },
+        Feature.RandomBooleanSelector { yes, no } => {
+            let which = if rand.next_boolean() { yes } else { no }
+            return try place_placed(g, mut r, mut rand, which, x, y, z, false)
+        },
+        Feature.WeightedRandomSelector { features, weights, total } => {
+            if total == 0 {
+                return false
+            }
+            let i = pick(mut rand, weights, total)
+            return try place_placed(g, mut r, mut rand, features[i], x, y, z, false)
+        },
+        Feature.Sequence(features) => {
+            for p in features {
+                if not try place_placed(g, mut r, mut rand, p, x, y, z, false) {
+                    return false
+                }
+            }
+            return true
+        },
+        Feature.Unsupported(kind) => fail unimplemented("the feature type `{kind}`"),
+    }
+}
+
+// `AbstractOreFeature.canPlaceOre`: the rule first, then, unless the chance skips it, that no
+// neighbour is air, as `read` reads them.
+fn can_place_ore<T: RandomSource>(f: Facts, r: Region, rand: mut T, rule: Rule, state: u32, discard: f32, x: i32, y: i32, z: i32, bulk: bool) -> bool ! Thrown {
+    if not test_rule(f, rule, state, y, mut rand) {
+        return false
+    }
+    // `shouldSkipAirCheck`.
+    if discard <= 0.0f32 {
+        return true
+    }
+    if discard < 1.0f32 and rand.next_float() >= discard {
+        return true
+    }
+    // `isAdjacentToAir`, in `Direction.values()` order.
+    let dxs: List<i32> = [0, 0, 0, 0, -1, 1]
+    let dys: List<i32> = [-1, 1, 0, 0, 0, 0]
+    let dzs: List<i32> = [0, 0, -1, 1, 0, 0]
+    for d in 0..6usize {
+        let nx = x + dxs[d]
+        let ny = y + dys[d]
+        let nz = z + dzs[d]
+        let n = if bulk { try r.section_state(f, nx, ny, nz) } else { try r.state(f, nx, ny, nz) }
+        if f.is_air(n) {
+            return false
+        }
+    }
+    return true
+}
+
+// `OreFeature.place`: a vein along a line through the origin at a random angle, of spheres that
+// shrink toward its ends, set straight into the sections.
+fn place_ore<T: RandomSource>(g: Gen, r: mut Region, rand: mut T, targets: List<Replacement>, size: i32, discard: f32, ox: i32, oy: i32, oz: i32) -> bool ! Thrown {
+    let Env { facts: f, .. } = g.env
+    let dir = rand.next_float() * PI_F32
+    let spread = f32.nearest(size) / 8.0f32
+    let max_radius = ceil_f32((f32.nearest(size) / 16.0f32 * 2.0f32 + 1.0f32) / 2.0f32)
+    let sd = sin(f64(dir))
+    let cd = cos(f64(dir))
+    let x0 = f64(ox) + sd * f64(spread)
+    let x1 = f64(ox) - sd * f64(spread)
+    let z0 = f64(oz) + cd * f64(spread)
+    let z1 = f64(oz) - cd * f64(spread)
+    let y0 = f64(oy + rand.next_int_below(3) - 2)
+    let y1 = f64(oy + rand.next_int_below(3) - 2)
+    let x_start = ox - ceil_f32(spread) - max_radius
+    let y_start = oy - 2 - max_radius
+    let z_start = oz - ceil_f32(spread) - max_radius
+    let size_xz = 2 * (ceil_f32(spread) + max_radius)
+    let size_y = 2 * (2 + max_radius)
+    for xp in x_start..x_start + size_xz + 1 {
+        for zp in z_start..z_start + size_xz + 1 {
+            if y_start <= try r.get_height(f, OCEAN_FLOOR_WG, xp, zp) {
+                return try ore_vein(g, mut r, mut rand, targets, size, discard, x0, x1, z0, z1, y0, y1, x_start, y_start, z_start, size_xz, size_y)
+            }
+        }
+    }
+    return false
+}
+
+// `OreFeature.doPlace`.
+fn ore_vein<T: RandomSource>(g: Gen, r: mut Region, rand: mut T, targets: List<Replacement>, size: i32, discard: f32, x0: f64, x1: f64, z0: f64, z1: f64, y0: f64, y1: f64, x_start: i32, y_start: i32, z_start: i32, size_xz: i32, size_y: i32) -> bool ! Thrown {
+    let Env { facts: f, .. } = g.env
+    var placed = 0
+    // A `BitSet`, which grows: an index past the box wraps into the next row, as vanilla's does.
+    var tested: List<bool> = [false; usize.wrap(size_xz * size_y * size_xz + size_xz * size_y + size_xz + 1)]
+    var data: List<f64> = [0.0; usize.wrap(size * 4)]
+    for i in 0..size {
+        let step = f32.nearest(i) / f32.nearest(size)
+        let xx = x0 + f64(step) * (x1 - x0)
+        let yy = y0 + f64(step) * (y1 - y0)
+        let zz = z0 + f64(step) * (z1 - z0)
+        let ss = rand.next_double() * f64(size) / 16.0
+        let radius = (f64(g.sin.sin(f64(PI_F32 * step)) + 1.0f32) * ss + 1.0) / 2.0
+        let at = usize.wrap(i * 4)
+        data[at] = xx
+        data[at + 1] = yy
+        data[at + 2] = zz
+        data[at + 3] = radius
+    }
+    for i1 in 0..size - 1 {
+        let a = usize.wrap(i1 * 4)
+        if not (data[a + 3] <= 0.0) {
+            for i2 in i1 + 1..size {
+                let b = usize.wrap(i2 * 4)
+                if not (data[b + 3] <= 0.0) {
+                    let dx = data[a] - data[b]
+                    let dy = data[a + 1] - data[b + 1]
+                    let dz = data[a + 2] - data[b + 2]
+                    let dr = data[a + 3] - data[b + 3]
+                    if dr * dr > dx * dx + dy * dy + dz * dz {
+                        if dr > 0.0 {
+                            data[b + 3] = -1.0
+                        } else {
+                            data[a + 3] = -1.0
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for i in 0..size {
+        let at = usize.wrap(i * 4)
+        let radius = data[at + 3]
+        if radius < 0.0 {
+            continue
+        }
+        let xx = data[at]
+        let yy = data[at + 1]
+        let zz = data[at + 2]
+        let x_min = floor(xx - radius).max(x_start)
+        let y_min = floor(yy - radius).max(y_start)
+        let z_min = floor(zz - radius).max(z_start)
+        let x_max = floor(xx + radius).max(x_min)
+        let y_max = floor(yy + radius).max(y_min)
+        let z_max = floor(zz + radius).max(z_min)
+        for x in x_min..x_max + 1 {
+            let xd = (f64(x) + 0.5 - xx) / radius
+            if not (xd * xd < 1.0) {
+                continue
+            }
+            for y in y_min..y_max + 1 {
+                let yd = (f64(y) + 0.5 - yy) / radius
+                if not (xd * xd + yd * yd < 1.0) {
+                    continue
+                }
+                for z in z_min..z_max + 1 {
+                    let zd = (f64(z) + 0.5 - zz) / radius
+                    if not (xd * xd + yd * yd + zd * zd < 1.0) or r.outside(y) {
+                        continue
+                    }
+                    let bit = usize.wrap(x - x_start + (y - y_start) * size_xz + (z - z_start) * size_xz * size_y)
+                    while bit >= tested.len() {
+                        tested.push(false)
+                    }
+                    if tested[bit] {
+                        continue
+                    }
+                    tested[bit] = true
+                    if not r.can_write(x, z) {
+                        continue
+                    }
+                    let state = try r.section_state(f, x, y, z)
+                    for t in targets {
+                        if try can_place_ore(f, r, mut rand, t.rule, state, discard, x, y, z, true) {
+                            r.set_section(f, x, y, z, t.state)
+                            placed += 1
+                            break
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return placed > 0
+}
+
+// `Mth.ceil(float)`.
+fn ceil_f32(v: f32) -> i32 {
+    return i32.saturate(f64(v).ceil())
+}
+
+// `ScatteredOreFeature.place`: tries scattered ever further from the origin, up to 7 away.
+fn place_scattered_ore<T: RandomSource>(g: Gen, r: mut Region, rand: mut T, targets: List<Replacement>, size: i32, discard: f32, ox: i32, oy: i32, oz: i32) -> bool ! Thrown {
+    let Env { facts: f, .. } = g.env
+    let tries = rand.next_int_below(size + 1)
+    for i in 0..tries {
+        let reach = f32.nearest(i.min(7))
+        let dx = i32.round((rand.next_float() - rand.next_float()) * reach)
+        let dy = i32.round((rand.next_float() - rand.next_float()) * reach)
+        let dz = i32.round((rand.next_float() - rand.next_float()) * reach)
+        let x = ox + dx
+        let y = oy + dy
+        let z = oz + dz
+        let state = try r.state(f, x, y, z)
+        for t in targets {
+            if try can_place_ore(f, r, mut rand, t.rule, state, discard, x, y, z, false) {
+                _ = r.set_block(f, x, y, z, t.state, 2)
+                break
+            }
+        }
+    }
+    return true
+}
+
+// `SimpleBlockFeature.place`.
+fn place_simple_block<T: RandomSource>(g: Gen, r: mut Region, rand: mut T, provider: usize, schedule_tick: bool, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let Env { facts: f, .. } = g.env
+    let s = try optional_state(g.env, g.catalog.providers, r, mut rand, provider, x, y, z) else return false
+    if not try can_survive(g.env, r, s, x, y, z) {
+        return false
+    }
+    let block = f.block(s)
+    if f.is_a(block, "DoublePlantBlock") {
+        let above = try r.state(f, x, y + 1, z)
+        if not f.is_air(above) {
+            let same_fluid = f.fluid(s) == f.fluid(above) and f.fluid_amount(s) == f.fluid_amount(above)
+            if not same_fluid or not f.replaceable(above) {
+                return false
+            }
+        }
+        try place_double_plant(f, mut r, s, x, y, z, 2)
+    } else if f.is_a(block, "MossyCarpetBlock") {
+        fail unimplemented("placing `MossyCarpetBlock`")
+    } else {
+        _ = r.set_block(f, x, y, z, s, 2)
+    }
+    if schedule_tick {
+        let now = try r.state(f, x, y, z)
+        r.schedule_block(f.block(now), x, y, z, 0)
+    }
+    return true
+}
+
+/// `DoublePlantBlock.placeAt`: the lower half, then the upper, each waterlogged if it can be and
+/// water is there.
+pub fn place_double_plant(f: Facts, r: mut Region, state: u32, x: i32, y: i32, z: i32, flags: i32) ! Thrown {
+    let lower = try f.with_name(state, "half", "lower")
+    let lower_here = try r.state(f, x, y, z)
+    _ = r.set_block(f, x, y, z, copy_waterlogged(f, lower, lower_here), flags)
+    let upper = try f.with_name(state, "half", "upper")
+    let upper_here = try r.state(f, x, y + 1, z)
+    _ = r.set_block(f, x, y + 1, z, copy_waterlogged(f, upper, upper_here), flags)
+}
+
+// `DoublePlantBlock.copyWaterloggedFrom`.
+fn copy_waterlogged(f: Facts, state: u32, here: u32) -> u32 {
+    if not f.has(state, "waterlogged") {
+        return state
+    }
+    return f.try_bool(state, "waterlogged", f.is_water(here))
+}

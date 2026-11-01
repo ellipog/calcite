@@ -11,9 +11,12 @@ import java.util.Map;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.world.entity.ai.village.poi.PoiTypes;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.SupportType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.lighting.LightEngine;
 import net.minecraft.world.level.material.FluidState;
@@ -60,6 +63,22 @@ final class BlockFlags {
     static final int LIGHT_EMISSION_SHIFT = 12;
     static final int LIGHT_DAMPENING_SHIFT = 16;
 
+    // What features ask of a state: its `facts`.
+    static final int SOLID = 1;
+    static final int REPLACEABLE = 1 << 1;
+    static final int COLLISION_FULL_BLOCK = 1 << 3;
+    static final int LIQUID = 1 << 4;
+    static final int IGNITED_BY_LAVA = 1 << 5;
+    static final int REDSTONE_CONDUCTOR = 1 << 6;
+    static final int STURDY_FULL_SHIFT = 7;
+    static final int STURDY_CENTER_SHIFT = 13;
+    static final int STURDY_RIGID_SHIFT = 19;
+    static final int COLLISION_FACE_SHIFT = 25;
+    static final int COLLISION_TOP_ANY = 1 << 31;
+    // The fluid, in a long's high half.
+    static final int FLUID_TYPE_SHIFT = 32;
+    static final int FLUID_AMOUNT_SHIFT = 36;
+
     private BlockFlags() {}
 
     public static void main(String[] args) throws IOException {
@@ -74,6 +93,7 @@ final class BlockFlags {
         StringBuilder json = new StringBuilder();
         StringBuilder light = new StringBuilder();
         StringBuilder collision = new StringBuilder();
+        StringBuilder facts = new StringBuilder();
         json.append("{\n  \"game_version\": \"").append(SharedConstants.getCurrentVersion().name()).append("\",\n");
         json.append("  \"states\": ").append(count).append(",\n  \"flags\": [");
         for (int id = 0; id < count; id++) {
@@ -88,10 +108,48 @@ final class BlockFlags {
             }
             light.append("]");
             collision.append(id == 0 ? "" : ", ").append(collisions.id(collisionShape(state)));
+            facts.append(id == 0 ? "" : ", ").append(facts(state));
+        }
+        StringBuilder poi = new StringBuilder();
+        for (int id = 0; id < count; id++) {
+            BlockState state = Block.BLOCK_STATE_REGISTRY.byId(id);
+            int type = PoiTypes.forState(state).map(h -> BuiltInRegistries.POINT_OF_INTEREST_TYPE.getId(h.value())).orElse(-1);
+            if (type >= 0) {
+                poi.append(poi.isEmpty() ? "[" : ", [").append(id).append(", ").append(type).append("]");
+            }
+        }
+        StringBuilder classes = new StringBuilder();
+        StringBuilder survive = new StringBuilder();
+        StringBuilder placeOn = new StringBuilder();
+        Map<String, String> parents = new java.util.TreeMap<>();
+        for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
+            Class<?> type = BuiltInRegistries.BLOCK.byId(id).getClass();
+            while (type.isAnonymousClass()) {
+                type = type.getSuperclass();
+            }
+            classes.append(id == 0 ? "\"" : ", \"").append(type.getSimpleName()).append("\"");
+            for (Class<?> c = type; c != null && c != Object.class; c = c.getSuperclass()) {
+                Class<?> parent = c.getSuperclass();
+                parents.put(c.getSimpleName(), parent == null || parent == Object.class ? "" : parent.getSimpleName());
+            }
+            String s = declaring(type, "canSurvive", BlockState.class, net.minecraft.world.level.LevelReader.class, BlockPos.class);
+            String p = declaring(type, "mayPlaceOn", BlockState.class, net.minecraft.world.level.BlockGetter.class, BlockPos.class);
+            survive.append(id == 0 ? "\"" : ", \"").append(s).append("\"");
+            placeOn.append(id == 0 ? "\"" : ", \"").append(p).append("\"");
+        }
+        StringBuilder parentJson = new StringBuilder();
+        for (Map.Entry<String, String> e : parents.entrySet()) {
+            parentJson.append(parentJson.isEmpty() ? "\"" : ", \"").append(e.getKey()).append("\": \"").append(e.getValue()).append("\"");
         }
         json.append("],\n  \"light_faces\": [").append(light).append("],\n");
         json.append("  \"face_boxes\": ");
         boxes(json, faces);
+        json.append(",\n  \"facts\": [").append(facts).append("],\n");
+        json.append("  \"classes\": [").append(classes).append("],\n");
+        json.append("  \"survive_classes\": [").append(survive).append("],\n");
+        json.append("  \"place_on_classes\": [").append(placeOn).append("],\n");
+        json.append("  \"class_parents\": {").append(parentJson).append("},\n");
+        json.append("  \"poi\": [").append(poi).append("]");
         json.append(",\n  \"collision\": [").append(collision).append("],\n");
         json.append("  \"collision_boxes\": ");
         boxes(json, collisions);
@@ -153,6 +211,55 @@ final class BlockFlags {
         f |= state.hasOffsetFunction() ? OFFSET : 0;
         f |= state.getLightEmission() << LIGHT_EMISSION_SHIFT;
         f |= state.getLightDampening() << LIGHT_DAMPENING_SHIFT;
+        return f;
+    }
+
+    /** The simple name of the class that declares the method the class runs, "" if none does. */
+    private static String declaring(Class<?> type, String name, Class<?>... parameters) {
+        for (Class<?> c = type; c != null && c != Object.class; c = c.getSuperclass()) {
+            try {
+                c.getDeclaredMethod(name, parameters);
+                return c.getSimpleName();
+            } catch (NoSuchMethodException e) {
+                // Look further up.
+            }
+        }
+        return "";
+    }
+
+    /**
+     * What features ask of a state: whether it's solid as {@code isSolid} says, replaceable as
+     * {@code canBeReplaced()} says, and so on; which of its faces are sturdy for each {@code
+     * SupportType}, in {@code Direction} order; and its fluid, by its ID in the fluid registry,
+     * and amount. The faces are asked at the origin of an empty world, which is where every
+     * state's cache asks them; a state with no cache, whose shape changes with where it is,
+     * may answer otherwise in a world.
+     */
+    private static long facts(BlockState state) {
+        FluidState fluid = state.getFluidState();
+        long f = 0;
+        f |= state.isSolid() ? SOLID : 0;
+        f |= state.canBeReplaced() ? REPLACEABLE : 0;
+        f |= state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO) ? COLLISION_FULL_BLOCK : 0;
+        f |= state.liquid() ? LIQUID : 0;
+        f |= state.ignitedByLava() ? IGNITED_BY_LAVA : 0;
+        f |= state.isRedstoneConductor(EmptyBlockGetter.INSTANCE, BlockPos.ZERO) ? REDSTONE_CONDUCTOR : 0;
+        for (Direction d : Direction.values()) {
+            f |= state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, d, SupportType.FULL) ? 1 << (STURDY_FULL_SHIFT + d.ordinal()) : 0;
+            f |= state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, d, SupportType.CENTER) ? 1 << (STURDY_CENTER_SHIFT + d.ordinal()) : 0;
+            f |= state.isFaceSturdy(EmptyBlockGetter.INSTANCE, BlockPos.ZERO, d, SupportType.RIGID) ? 1 << (STURDY_RIGID_SHIFT + d.ordinal()) : 0;
+        }
+        VoxelShape collision = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+        for (Direction d : Direction.values()) {
+            f |= Block.isFaceFull(collision, d) ? 1L << (COLLISION_FACE_SHIFT + d.ordinal()) : 0;
+        }
+        f |= collision.getFaceShape(Direction.UP).isEmpty() ? 0 : COLLISION_TOP_ANY & 0xFFFFFFFFL;
+        int type = BuiltInRegistries.FLUID.getId(fluid.getType());
+        if (type < 0 || type > 7 || fluid.getAmount() > 15) {
+            throw new IllegalStateException("a fluid that doesn't fit: " + fluid);
+        }
+        f |= (long) type << FLUID_TYPE_SHIFT;
+        f |= (long) fluid.getAmount() << FLUID_AMOUNT_SHIFT;
         return f;
     }
 
