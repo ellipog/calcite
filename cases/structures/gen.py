@@ -12,6 +12,10 @@ structure in `worldgen/structure` is started in a world of one biome it may star
 chunks its set's random spread picks near the origin and far out, which the cases work out with
 Java's `Random` as `RandomSpreadStructurePlacement` does; whether the start is made there is
 vanilla's to say. The strongholds start at their rings' first positions.
+
+Last, each kind of structure that adapts the terrain about it gets a world where its terrain is
+filled, with its structures' beardifier, at a chunk its set may place it in and one beside
+another; the strongholds' at their rings' first position.
 """
 
 import io
@@ -44,6 +48,11 @@ END = {"the_end", "end_highlands", "end_midlands", "small_end_islands", "end_bar
 MASK = (1 << 48) - 1
 # Structures whose starts the chunks a case tries seldom make.
 RARE = {"end_city", "pillager_outpost"}
+# Structures that adapt the terrain, one of each kind of adaptation and each village.
+BEARDED = [
+    "abandoned_camp_forest", "ancient_city", "nether_fossil", "pillager_outpost", "trail_ruins", "trial_chambers",
+    "village_desert", "village_plains", "village_savanna", "village_snowy", "village_taiga",
+]
 
 
 class Gen:
@@ -293,6 +302,22 @@ def starts(g, cases, sets, structures, tags):
         cases.append(Case(f"starts-strongholds-{i}", g.seed(), "overworld", preset("overworld")).op("ring_starts", 4).build())
 
 
+def bearded(g, cases, sets, structures, tags):
+    set_of = {}
+    for sid, s in sets.items():
+        for entry in s["structures"]:
+            set_of.setdefault(bare(entry["structure"]), sid)
+    for sid in BEARDED:
+        biome = g.pick(biomes_of(structures[sid]["biomes"], tags))
+        seed = g.seed()
+        c = Case(f"bearded-{sid}", seed, world_of(biome), fixed(biome))
+        found = candidates(g, seed, sets[set_of[sid]]["placement"], 2, False)
+        c.op("bearded", found[0][0], found[0][1])
+        c.op("bearded", found[1][0] + 1, found[1][1] - 1)
+        cases.append(c.build())
+    cases.append(Case("bearded-strongholds", g.seed(), "overworld", preset("overworld")).op("ring_bearded", 0).build())
+
+
 def main():
     g = Gen(SEED)
     sets, structures, tags = vanilla()
@@ -300,7 +325,8 @@ def main():
     placements(g, cases)
     rings(g, cases)
     starts(g, cases, sets, structures, tags)
-    write_file(HERE / "generated.json", "structures", f"cases/structures/gen.py, seed {SEED}", cases, probe_version=1)
+    bearded(g, cases, sets, structures, tags)
+    write_file(HERE / "generated.json", "structures", f"cases/structures/gen.py, seed {SEED}", cases, probe_version=2)
 
 
 if __name__ == "__main__":

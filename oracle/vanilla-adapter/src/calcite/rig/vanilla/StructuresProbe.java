@@ -7,9 +7,15 @@ import com.mojang.serialization.JsonOps;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Proxy;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import it.unimi.dsi.fastutil.longs.LongIterator;
+import it.unimi.dsi.fastutil.longs.LongSet;
 import net.minecraft.IdentifierException;
 import net.minecraft.core.Holder;
 import net.minecraft.core.RegistryAccess;
@@ -23,13 +29,18 @@ import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.LevelHeightAccessor;
 import net.minecraft.world.level.StructureManager;
+import net.minecraft.world.level.WorldGenLevel;
 import net.minecraft.world.level.biome.BiomeSource;
+import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.ChunkGeneratorStructureState;
 import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.level.chunk.ProtoChunk;
 import net.minecraft.world.level.chunk.UpgradeData;
+import net.minecraft.world.level.levelgen.Beardifier;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
+import net.minecraft.world.level.levelgen.NoiseChunk;
 import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
+import net.minecraft.world.level.levelgen.NoiseSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 import net.minecraft.world.level.levelgen.structure.Structure;
 import net.minecraft.world.level.levelgen.structure.StructureSet;
@@ -48,6 +59,12 @@ import net.minecraft.world.level.levelgen.structure.placement.StructurePlacement
  * {@code ProtoChunk} with a structure manager that only reads and writes that chunk's starts, as
  * the server's does for a chunk with none yet, and a template manager that loads vanilla's
  * templates, as the `features` probe's does.
+ *
+ * <p>A `bearded` op makes the starts of every chunk within 8 of its chunk, then runs
+ * {@code createReferences} for the chunk over them, and fills its terrain as {@code buildTerrain}
+ * does, with the {@code Beardifier} {@code forStructuresInChunk} makes from those references. The
+ * chunk's references are put in the structure registry's order first: vanilla keeps them in a map
+ * by the structures' identity hashes, whose order no two runs need share.
  */
 final class StructuresProbe implements Probe {
     private static final int MAX_OPS = 64;
@@ -60,7 +77,7 @@ final class StructuresProbe implements Probe {
 
     @Override
     public int version() {
-        return 1;
+        return 2;
     }
 
     @Override
@@ -166,6 +183,28 @@ final class StructuresProbe implements Probe {
                         }
                     }
                 }
+            } else if (kind.equals("bearded")) {
+                if (op.size() != 3) {
+                    throw new CaseError(what + " must have 3 elements");
+                }
+                ChunkPos pos = new ChunkPos(Args.asInt(op.get(1), what + "[1]"), Args.asInt(op.get(2), what + "[2]"));
+                bearded(access, generator, structures, state, settings.value(), templates, dimension, heights, containers, pos, out);
+            } else if (kind.equals("ring_bearded")) {
+                if (op.size() != 2) {
+                    throw new CaseError(what + " must have 2 elements");
+                }
+                int k = Args.asInt(op.get(1), what + "[1]");
+                // At each concentric rings placement's `k`th position, if it has one.
+                for (Holder<StructureSet> set : structures.possibleStructureSets()) {
+                    if (set.value().placement() instanceof ConcentricRingsStructurePlacement rings) {
+                        List<ChunkPos> positions = structures.getRingPositionsFor(rings);
+                        boolean has = positions != null && k >= 0 && k < positions.size();
+                        out.writeBoolean(has);
+                        if (has) {
+                            bearded(access, generator, structures, state, settings.value(), templates, dimension, heights, containers, positions.get(k), out);
+                        }
+                    }
+                }
             } else {
                 throw new CaseError(what + ": unknown op `" + kind + "`");
             }
@@ -228,6 +267,75 @@ final class StructuresProbe implements Probe {
                 }
             }
         }
+    }
+
+    /**
+     * The chunk's references, in the structure registry's order: how many structures, then each
+     * one's ID, how many start chunks and each one's packed position in the set's order; then its
+     * terrain, as the `terrain` probe's `fill` writes it, filled with its structures' beardifier.
+     */
+    private static void bearded(
+            RegistryAccess.Frozen access,
+            NoiseBasedChunkGenerator generator,
+            ChunkGeneratorStructureState structures,
+            RandomState state,
+            NoiseGeneratorSettings settings,
+            FeaturesProbe.Templates templates,
+            ResourceKey<Level> dimension,
+            LevelHeightAccessor heights,
+            PalettedContainerFactory containers,
+            ChunkPos target,
+            DataOutputStream out) throws Exception {
+        Map<Long, ProtoChunk> chunks = new HashMap<>();
+        for (int x = target.x() - 8; x <= target.x() + 8; x++) {
+            for (int z = target.z() - 8; z <= target.z() + 8; z++) {
+                ProtoChunk chunk = new ProtoChunk(new ChunkPos(x, z), UpgradeData.EMPTY, heights, containers, null);
+                StructureManager manager = (StructureManager) FeaturesProbe.allocate(StructureManager.class);
+                generator.createStructures(access, structures, manager, chunk, templates, dimension);
+                chunks.put(ChunkPos.pack(x, z), chunk);
+            }
+        }
+        ProtoChunk chunk = chunks.get(ChunkPos.pack(target.x(), target.z()));
+        // A level of those chunks alone, which is all `createReferences` and the structure manager read.
+        WorldGenLevel level = (WorldGenLevel) Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(), new Class<?>[] {WorldGenLevel.class}, (proxy, method, arguments) -> {
+            if (method.getName().equals("getChunk") && arguments != null && arguments.length >= 2 && arguments[0] instanceof Integer x && arguments[1] instanceof Integer z) {
+                ChunkAccess found = chunks.get(ChunkPos.pack(x, z));
+                if (found == null) {
+                    throw new IllegalStateException("no chunk " + x + ", " + z);
+                }
+                return found;
+            }
+            throw new UnsupportedOperationException(method.getName());
+        });
+        StructureManager manager = (StructureManager) FeaturesProbe.allocate(StructureManager.class);
+        Field managerLevel = StructureManager.class.getDeclaredField("level");
+        managerLevel.setAccessible(true);
+        managerLevel.set(manager, level);
+        generator.createReferences(level, manager, chunk);
+        var registry = access.lookupOrThrow(Registries.STRUCTURE);
+        Map<Structure, LongSet> ordered = new LinkedHashMap<>();
+        chunk.getAllReferences().entrySet().stream()
+                .sorted(Comparator.comparingInt(e -> registry.getId(e.getKey())))
+                .forEach(e -> ordered.put(e.getKey(), e.getValue()));
+        Field references = ChunkAccess.class.getDeclaredField("structureReferences");
+        references.setAccessible(true);
+        references.set(chunk, ordered);
+        out.writeInt(ordered.size());
+        for (Map.Entry<Structure, LongSet> e : ordered.entrySet()) {
+            out.writeUTF(registry.getKey(e.getKey()).toString());
+            out.writeInt(e.getValue().size());
+            for (LongIterator it = e.getValue().iterator(); it.hasNext(); ) {
+                out.writeLong(it.nextLong());
+            }
+        }
+        Beardifier beardifier = Beardifier.forStructuresInChunk(manager, chunk.getPos());
+        NoiseSettings noise = settings.noiseSettings().clampToHeightAccessor(chunk.getHeightAccessorForGeneration());
+        if (noise.height() > 0) {
+            try (NoiseChunk noiseChunk = TerrainProbe.noiseChunk(generator, settings, state, chunk, noise, beardifier)) {
+                TerrainProbe.doFill(generator, noiseChunk, chunk);
+            }
+        }
+        TerrainProbe.write(chunk, out);
     }
 
     /** The chunk's starts as a chunk's {@code structures.starts} compound saves them. */

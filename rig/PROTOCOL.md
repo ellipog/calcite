@@ -740,7 +740,7 @@ A source that doesn't read is `{"invalid": "source"}`, and then a feature that d
 
 Calcite answers `unimplemented` for a case that reaches a feature type, a block's `canSurvive` or a placement it doesn't run yet.
 
-### `structures` (v1)
+### `structures` (v2)
 
 Where 26.3's structure sets place structures, and the starts `ChunkGenerator.createStructures` makes. The registries are vanilla's own, as `features`' are, so the structure sets are every one in vanilla's data, in their registry's order.
 
@@ -752,10 +752,14 @@ Input `{"seed": s, "settings": id, "level": [min_y, height], "source": v, "ops":
 | `["rings"]` | For each set placed in concentric rings: its ID, then how many positions `getRingPositionsFor` gives, -1 for none, and each one's `x` and `z` |
 | `["starts", cx, cz]` | `createStructures` on a new `ProtoChunk` at chunk `cx`, `cz`, with a structure manager made without its constructor, which reads and writes only that chunk's starts, and a template manager that loads vanilla's templates as `features`' does; then the chunk's starts as a saved chunk's `structures.starts` compound has them, with `NbtIo.writeAnyTag` |
 | `["ring_starts", n]` | For each set placed in concentric rings, how many of its first `n` positions, 0 to 16, there are, then the starts made at each as `starts` makes them |
+| `["bearded", cx, cz]` | `createStructures`, as `starts` runs it, on a new `ProtoChunk` for every chunk within 8 of chunk `cx`, `cz`; then `createReferences` for the chunk at `cx`, `cz` over a level of those chunks alone, with a structure manager that reads them. Its references are put in the structure registry's order, since vanilla keeps them in a map by the structures' identity hashes, which no two runs need iterate alike. Then how many structures it references, and each one's ID with `writeUTF`, how many start chunks and each one's `ChunkPos.pack`ed position as a `long`, in its `LongOpenHashSet`'s order; then the chunk filled as `terrain`'s `fill` fills it, but with the `Beardifier` `forStructuresInChunk` makes from those references, and written as `fill` writes it |
+| `["ring_bearded", k]` | For each set placed in concentric rings, whether it has a `k`th position, as a byte 1 or 0, then `bearded` at that position if it does |
 
 The output is `{}`, with one blob of each op's bytes in order. A source that doesn't read is `{"invalid": "source"}` with no blob. If anything else throws, the result is the rejection, as `rng`'s.
 
 Calcite answers `unimplemented` for a case that reaches a structure type, a placement or a piece it doesn't make yet.
+
+Version 2 added `bearded` and `ring_bearded`.
 
 ## Adding a probe
 

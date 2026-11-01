@@ -32,6 +32,7 @@ import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.level.chunk.ProtoChunk;
 import net.minecraft.world.level.chunk.UpgradeData;
 import net.minecraft.world.level.levelgen.Aquifer;
+import net.minecraft.world.level.levelgen.Beardifier;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseChunk;
@@ -180,7 +181,13 @@ final class TerrainProbe implements Probe {
 
     /** The {@code NoiseChunk} {@code buildTerrain} makes, with no structures and nothing to blend. */
     static NoiseChunk noiseChunk(NoiseBasedChunkGenerator generator, NoiseGeneratorSettings settings, RandomState state, ChunkAccess chunk, NoiseSettings noise) {
-        return new NoiseChunk(state, null, settings, fluidPicker(generator), Blender.empty(), (DensityVolume) invoke(CHUNK_VOLUME, null, chunk, noise));
+        return noiseChunk(generator, settings, state, chunk, noise, null);
+    }
+
+    /** The {@code NoiseChunk} {@code buildTerrain} makes with the beardifier, nothing to blend. */
+    static NoiseChunk noiseChunk(
+            NoiseBasedChunkGenerator generator, NoiseGeneratorSettings settings, RandomState state, ChunkAccess chunk, NoiseSettings noise, Beardifier beardifier) {
+        return new NoiseChunk(state, beardifier, settings, fluidPicker(generator), Blender.empty(), (DensityVolume) invoke(CHUNK_VOLUME, null, chunk, noise));
     }
 
     static void doFill(NoiseBasedChunkGenerator generator, NoiseChunk noiseChunk, ChunkAccess chunk) {
