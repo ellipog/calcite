@@ -614,6 +614,34 @@ A second `pick`, a `list` or `load` before one, a second `load`, a setup that is
 
 Vanilla finds a folder's entries in the order the file system lists them. NTFS lists a folder in the same order on every machine, by name; a Linux file system needn't, since ext4 lists by a hash of each name with a seed of each file system's own. So a case where more than one entry in a folder logs something is Windows'.
 
+### `noise` (v1)
+
+Vanilla's noises, made from a random source and sampled at points the case gives, or over a volume as a density function samples them.
+
+Input `{"random": r, "seed": s, "noise": n, "fn": f, ...}`. The source is `new LegacyRandomSource(seed)` if `r` is `"legacy"` or `new XoroshiroRandomSource(seed)` if it's `"xoroshiro"`, `s` a `long` as a decimal string, and the noise is made from it by `n`:
+
+| `noise` | Made by |
+| --- | --- |
+| `{"type": "perlin"}` | `new PerlinNoise(random)` |
+| `{"type": "smeared", "fudge_y_scale": d}` | `new SmearedPerlinNoise(random, d)` |
+| `{"type": "simplex", "discard_offset": b}` | `new SimplexNoise(random, b)` |
+| `{"type": "normal", "parameters": p}` | `create(random)` of the `NormalNoise` that `NormalNoise.DIRECT_CODEC` reads from `p`, a noise as a data pack writes it |
+| `{"type": "legacy_nether", "parameters": p}` | `createForLegacyNetherBiome(random)` of the same |
+| `{"type": "fbm", "first_octave": n, "smear_scale_y": d, "value_factor": v}` | `BlendedNoise.createFbm(random, n, d, v)` |
+
+A `double` in the input, `d` and `v` here, is a decimal string, read as `Double.parseDouble` reads it; so are the `float`s below, read as `Float.parseFloat` reads them. The result is one blob:
+
+| `fn` | Blob |
+| --- | --- |
+| `"get3"`, with a blob of `(x, y, z)` `f64` triples | `get(x, y, z)` of each, as `f32` bits |
+| `"get2"`, with a blob of `(x, y)` `f64` pairs | `get(x, y)` of each, as `f32` bits |
+| `"volume"`, with `"volume": [sx, sy, sz, x, y, z, stepx, stepy, stepz]`, `"xz_scale"`, `"y_scale"` and `"amplitude"` | `addToVolume` of a `DensityBuffer` of zeros over `new DensityVolume(...)` of those `int`s, with the two `double` scales and the `float` amplitude, then each of its values in order, `y` fastest, then `x`, then `z`, as `f32` bits. The volume is at most 65,536 values |
+| `"range"` | the noise's `range()`, its `min` and `max` as `f32` bits, then for `normal` and `legacy_nether` the `NormalNoise`'s own `range()` the same way |
+
+Every NaN is written as `0x7fc00000`, `Float.floatToIntBits`'s NaN, whatever its sign and payload (D198): which NaN Java gives when two meet isn't defined, and differs with the order the JIT puts them in, so only where a NaN comes out is compared.
+
+If making the noise throws, the result is the rejection, as `rng`'s is, and no blob. Parameters the codec doesn't read, a noise or `fn` it doesn't have, a field missing or of the wrong type, a blob it doesn't take or of the wrong length, and a volume too big or not positive are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

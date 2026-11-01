@@ -76,6 +76,7 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `SessionDump.java` | Vanilla reading the protocol bot's sessions, as trees, run by `rig/runner/sessions.py` |
 | `WorldCheck.java` | Vanilla reading a world it saved and the same world saved by Calcite, with `RegionFile`, `NbtIo` and Gson, and comparing them file by file and chunk by chunk, run by `rig/runner/roundtrip.py` (`G5.2`) |
 | `RegistriesProbe.java` | `registries`: the vanilla data pack's registries and tags, loaded once as `WorldLoader.load` loads them |
+| `NoiseProbe.java` | `noise`: `PerlinNoise`, `SmearedPerlinNoise`, `SimplexNoise`, the stacks `NormalNoise` and `BlendedNoise.createFbm` make, sampled with `get` and `addToVolume` |
 
 ## Rules for probes
 

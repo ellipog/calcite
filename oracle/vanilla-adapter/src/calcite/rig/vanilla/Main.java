@@ -59,7 +59,8 @@ public final class Main {
                 new LightProbe(),
                 new SpawnProbe(),
                 new RegistriesProbe(),
-                new PacksProbe())) {
+                new PacksProbe(),
+                new NoiseProbe())) {
             probes.put(probe.name(), probe);
         }
 

@@ -1,0 +1,363 @@
+/// The `noise` probe (rig/PROTOCOL.md): one of vanilla's noises, made from a seeded source and
+/// sampled at points or over a volume, or its range.
+module rig.noise
+
+import random.any.{AnyRandom}
+import rig.frame.{Outcome}
+import json.tree.{Json, Member, as_i32, as_string, get, take}
+import worldgen.interval.{Interval}
+import worldgen.noise.{Noise, Thrown, Volume, fbm}
+import worldgen.normal.{NormalNoise, Normalization, Parameters}
+
+/// The most values a `volume` case may ask for.
+const MAX_VOLUME: i64 = 65536
+
+/// A `volume` case's box and scales.
+struct Sampled {
+    volume: Volume
+    xz_scale: f64
+    y_scale: f64
+    amplitude: f32
+}
+
+pub fn run_noise(input: own List<Member>, blobs: List<List<u8>>) -> Outcome {
+    var fields = input
+    var error = String()
+    let kind = string_field(mut fields, "random", mut error) else return Outcome.Failed(error)
+    let seed_text = string_field(mut fields, "seed", mut error) else return Outcome.Failed(error)
+    let seed = i64.parse(seed_text) else return Outcome.Failed("`seed` must be a decimal 64-bit integer")
+    let legacy = match kind {
+        "legacy" => true,
+        "xoroshiro" => false,
+        _ => return Outcome.Failed("unknown random `{kind}`"),
+    }
+    let spec_value = take(mut fields, "noise") else return Outcome.Failed("missing field `noise`")
+    var spec = match spec_value {
+        Json.Object(members) => members,
+        _ => return Outcome.Failed("`noise` must be an object"),
+    }
+    let kind_of = string_field(mut spec, "type", mut error) else return Outcome.Failed(error)
+    var normal: NormalNoise? = none
+    if kind_of == "normal" or kind_of == "legacy_nether" {
+        let value = take(mut spec, "parameters") else return Outcome.Failed("missing field `parameters`")
+        let parameters = read_parameters(value, mut error) else return Outcome.Failed("`parameters`: {error}")
+        normal = some(NormalNoise.new(parameters))
+    }
+    let fn_name = string_field(mut fields, "fn", mut error) else return Outcome.Failed(error)
+    var box: Sampled? = none
+    if fn_name == "volume" {
+        let b = read_box(mut fields, blobs, mut error) else return Outcome.Failed(error)
+        box = some(b)
+    }
+    var random = AnyRandom.of(legacy, seed)
+    var made: Noise? = none
+    if kind_of == "perlin" {
+        made = some(Noise.perlin(mut random))
+    } else if kind_of == "smeared" {
+        let fudge = decimal_field(mut spec, "fudge_y_scale", mut error) else return Outcome.Failed(error)
+        made = some(Noise.smeared(mut random, fudge))
+    } else if kind_of == "simplex" {
+        let discard = match take(mut spec, "discard_offset") {
+            some(Json.Bool(b)) => b,
+            _ => return Outcome.Failed("`discard_offset` must be true or false"),
+        }
+        made = some(Noise.simplex(mut random, discard))
+    } else if kind_of == "normal" {
+        if let n = normal {
+            made = some(Noise.Stack(n.create(mut random)))
+        }
+    } else if kind_of == "legacy_nether" {
+        if let n = normal {
+            match n.legacy_nether(mut random) {
+                ok(stack) => made = some(Noise.Stack(stack)),
+                err(thrown) => return rejected(thrown),
+            }
+        }
+    } else if kind_of == "fbm" {
+        let first_value = take(mut spec, "first_octave") else return Outcome.Failed("missing field `first_octave`")
+        let first = as_i32(first_value) else return Outcome.Failed("`first_octave` must be a 32-bit integer")
+        let smear = decimal_field(mut spec, "smear_scale_y", mut error) else return Outcome.Failed(error)
+        let factor = decimal_field(mut spec, "value_factor", mut error) else return Outcome.Failed(error)
+        match fbm(mut random, first, smear, factor) {
+            ok(stack) => made = some(Noise.Stack(stack)),
+            err(thrown) => return rejected(thrown),
+        }
+    } else {
+        return Outcome.Failed("unknown noise `{kind_of}`")
+    }
+    let noise = made else return Outcome.Failed("unknown noise `{kind_of}`")
+    var out: List<u8> = []
+    if fn_name == "get3" {
+        let blob = records(blobs, 24, mut error) else return Outcome.Failed(error)
+        let n = blob.len() / 24
+        out.reserve(n * 4)
+        for i in 0..n {
+            let at = i * 24
+            let v = noise.get(double_at(blob, at), double_at(blob, at + 8), double_at(blob, at + 16))
+            put_u32(mut out, float_bits(v))
+        }
+    } else if fn_name == "get2" {
+        let blob = records(blobs, 16, mut error) else return Outcome.Failed(error)
+        let n = blob.len() / 16
+        out.reserve(n * 4)
+        for i in 0..n {
+            let at = i * 16
+            put_u32(mut out, float_bits(noise.get2(double_at(blob, at), double_at(blob, at + 8))))
+        }
+    } else if fn_name == "volume" {
+        let b = box else return Outcome.Failed("`volume` is missing")
+        let size = usize.wrap(b.volume.size())
+        var buffer = List<f32>()
+        buffer.reserve(size)
+        for _ in 0..size {
+            buffer.push(0.0)
+        }
+        noise.add_to_volume(mut buffer, b.volume, b.xz_scale, b.y_scale, b.amplitude)
+        out.reserve(size * 4)
+        for v in buffer {
+            put_u32(mut out, float_bits(v))
+        }
+    } else if fn_name == "range" {
+        if not blobs.is_empty() {
+            return Outcome.Failed("`range` takes no blobs")
+        }
+        put_range(mut out, noise.range())
+        if let n = normal {
+            put_range(mut out, n.range)
+        }
+    } else {
+        return Outcome.Failed("unknown fn `{fn_name}`")
+    }
+    return Outcome.Done { output: [], blobs: [out] }
+}
+
+/// A rejection, as the vanilla adapter reports an exception thrown while making the noise.
+fn rejected(thrown: Thrown) -> Outcome {
+    let output: List<Member> = [
+        Member { key: "exception", value: Json.Str(thrown.exception.copy()) },
+        Member { key: "error", value: Json.Str(thrown.message.copy()) },
+    ]
+    return Outcome.Done { output: output, blobs: [] }
+}
+
+/// `NormalNoise.Parameters.CODEC`, reading JSON as `JsonOps` gives it, with the codec's checks.
+fn read_parameters(value: own Json, error: mut String) -> Parameters? {
+    let members = match value {
+        Json.Object(m) => m,
+        _ => {
+            error = "Not a JSON object: {value}"
+            return none
+        }
+    }
+    var base_amplitude = 1.0
+    if let v = get(members, "base_amplitude") {
+        let a = number(v, mut error) else return none
+        if not (a >= f64(0.00001f32) and a <= 1000000.0) {
+            error = "Value {a} outside of range [9.999999747378752E-6:1000000.0]"
+            return none
+        }
+        base_amplitude = a
+    }
+    let octave_value = get(members, "base_octave") else {
+        error = "No key base_octave in MapLike"
+        return none
+    }
+    let base_octave = int(octave_value, -32, 32, mut error) else return none
+    var octave_count: i32 = 1
+    if let v = get(members, "octave_count") {
+        let c = int(v, 1, 32, mut error) else return none
+        octave_count = c
+    }
+    var normalize = Normalization.Enabled
+    if let v = get(members, "normalize") {
+        normalize = match v {
+            Json.Bool(true) => Normalization.Enabled,
+            Json.Bool(false) => Normalization.Disabled,
+            Json.Str(s) => {
+                if s != "legacy" {
+                    error = "Invalid normalization type: {s}"
+                    return none
+                }
+                Normalization.Legacy
+            },
+            _ => {
+                error = "`normalize` must be a boolean or \"legacy\""
+                return none
+            },
+        }
+    }
+    var modifiers = List<f64>()
+    if let v = get(members, "amplitude_modifiers") {
+        let items = match v {
+            Json.Array(items) => items,
+            _ => {
+                error = "Not a list"
+                return none
+            },
+        }
+        if items.len() > 32 {
+            error = "List too long: {items.len()} > 32"
+            return none
+        }
+        for item in items {
+            let m = number(item, mut error) else return none
+            if not (m >= 0.0 and m <= 1000000.0) {
+                error = "Value {m} outside of range [0.0:1000000.0]"
+                return none
+            }
+            modifiers.push(m)
+        }
+    }
+    if not modifiers.is_empty() and i64.wrap(modifiers.len()) != i64(octave_count) {
+        error = "amplitude_modifiers had size {modifiers.len()}, but octave_count was {octave_count}"
+        return none
+    }
+    return some(Parameters {
+        base_amplitude: base_amplitude,
+        base_octave: base_octave,
+        octave_count: octave_count,
+        normalize: normalize,
+        modifiers: modifiers,
+    })
+}
+
+fn number(value: Json, error: mut String) -> f64? {
+    match value {
+        Json.Number(text) => {
+            if let v = f64.parse(text) {
+                return some(v)
+            }
+        },
+        _ => {},
+    }
+    error = "Not a number: {value}"
+    return none
+}
+
+fn int(value: Json, min: i32, max: i32, error: mut String) -> i32? {
+    let v = as_i32(value) else {
+        error = "Not a 32-bit integer: {value}"
+        return none
+    }
+    if v < min or v > max {
+        error = "Value {v} outside of range [{min}:{max}]"
+        return none
+    }
+    return some(v)
+}
+
+fn read_box(fields: mut List<Member>, blobs: List<List<u8>>, error: mut String) -> Sampled? {
+    if not blobs.is_empty() {
+        error = "`volume` takes no blobs"
+        return none
+    }
+    let value = take(mut fields, "volume") else {
+        error = "missing field `volume`"
+        return none
+    }
+    let items = match value {
+        Json.Array(items) => items,
+        _ => {
+            error = "`volume` must be an array"
+            return none
+        },
+    }
+    if items.len() != 9 {
+        error = "`volume` must have 9 numbers"
+        return none
+    }
+    var a: [i32; 9] = [0; 9]
+    let nine: usize = 9
+    for i in 0..nine {
+        let v = as_i32(items[i]) else {
+            error = "`volume` must be 32-bit integers"
+            return none
+        }
+        a[i] = v
+    }
+    if a[0] <= 0 or a[1] <= 0 or a[2] <= 0 or a[6] <= 0 or a[7] <= 0 or a[8] <= 0 {
+        error = "`volume`'s sizes and steps must be positive"
+        return none
+    }
+    if i64(a[0]) * i64(a[1]) * i64(a[2]) > MAX_VOLUME {
+        error = "`volume` is more than {MAX_VOLUME} values"
+        return none
+    }
+    let xz = decimal_field(mut fields, "xz_scale", mut error) else return none
+    let y = decimal_field(mut fields, "y_scale", mut error) else return none
+    let amplitude_text = string_field(mut fields, "amplitude", mut error) else return none
+    let amplitude = f32.parse(amplitude_text) else {
+        error = "`amplitude` must be a decimal number"
+        return none
+    }
+    let volume = Volume {
+        size_x: a[0], size_y: a[1], size_z: a[2],
+        min_x: a[3], min_y: a[4], min_z: a[5],
+        step_x: a[6], step_y: a[7], step_z: a[8],
+    }
+    return some(Sampled { volume: volume, xz_scale: xz, y_scale: y, amplitude: amplitude })
+}
+
+fn string_field(fields: mut List<Member>, name: String, error: mut String) -> String? {
+    if let value = take(mut fields, name) {
+        if let s = as_string(value) {
+            return some(s)
+        }
+        error = "`{name}` must be a string"
+        return none
+    }
+    error = "missing field `{name}`"
+    return none
+}
+
+/// A double, which the protocol writes as a decimal string.
+fn decimal_field(fields: mut List<Member>, name: String, error: mut String) -> f64? {
+    let text = string_field(mut fields, name, mut error) else return none
+    if let v = f64.parse(text) {
+        return some(v)
+    }
+    error = "`{name}` must be a decimal number"
+    return none
+}
+
+/// The one blob, if its length is a whole number of records.
+fn records(blobs: List<List<u8>>, size: usize, error: mut String) -> List<u8>? {
+    if blobs.len() != 1 {
+        error = "expected 1 blob, got {blobs.len()}"
+        return none
+    }
+    let blob = blobs[0].copy()
+    if blob.len() % size != 0 {
+        error = "blob length {blob.len()} isn't a multiple of {size}"
+        return none
+    }
+    return some(blob)
+}
+
+fn double_at(blob: List<u8>, at: usize) -> f64 {
+    var bits: u64 = 0
+    for k in 0..8 {
+        bits = (bits << 8) | u64(blob[at + usize.wrap(k)])
+    }
+    return f64.from_bits(bits)
+}
+
+fn put_range(out: mut List<u8>, range: Interval) {
+    put_u32(mut out, float_bits(range.min))
+    put_u32(mut out, float_bits(range.max))
+}
+
+/// A float's bits, every NaN written as `Float.floatToIntBits`'s one (D198).
+fn float_bits(v: f32) -> u32 {
+    if v.is_nan() {
+        return 0x7fc00000
+    }
+    return v.to_bits()
+}
+
+fn put_u32(out: mut List<u8>, v: u32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}

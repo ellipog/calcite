@@ -1,0 +1,605 @@
+/// Vanilla 26.3's noises: Perlin noise, its smeared form, simplex noise, and stacks of octaves
+/// of them, sampled at a point or over a volume as density functions sample them.
+///
+/// Since 26.1 vanilla samples noise in `float`, with the input in `double`: the lattice
+/// coordinates and the fractions are worked out in `double`, then the dot products, the smooth
+/// steps and the interpolation in `float`. Every operation here is vanilla's, in vanilla's order,
+/// so the results are the same bits; Calx rounds each operation as Java does and never fuses
+/// one into the next.
+module worldgen.noise
+
+import random.source.{RandomSource}
+import worldgen.interval.{Interval}
+
+/// `GradientNoise.GRADIENT`'s sixteen directions, by axis: the twelve edges of a cube, then four
+/// of them again.
+const GRAD_X: [f32; 16] = [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0]
+const GRAD_Y: [f32; 16] = [1.0, 1.0, -1.0, -1.0, 0.0, 0.0, 0.0, 0.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, -1.0]
+const GRAD_Z: [f32; 16] = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 1.0, 0.0, -1.0]
+
+/// `Math.nextDown(2^24)`: inputs from minus it up to it are sampled as they are, and others are
+/// first folded by multiples of 2^25.
+const HALF_ROUND_OFF: f64 = 16777215.999999998
+const ROUND_OFF: f64 = 33554432.0
+
+/// `SimplexNoise`'s skew factors, `0.5 * (sqrt(3) - 1)` and `(3 - sqrt(3)) / 6`.
+const F2: f64 = 0.3660254037844386
+const G2: f64 = 0.21132486540518713
+const F3: f64 = 0.3333333333333333
+const G3: f64 = 0.16666666666666666
+
+/// The ranges `PerlinNoise.RANGE` and `SimplexNoise.RANGE` are symmetric about, and
+/// `SmearedPerlinNoise.SHIFT_UP_EPSILON` widened to a `double`, as vanilla adds it.
+const SAMPLE_RANGE: f32 = 2.0
+const SHIFT_UP: f64 = f64(1.0e-7f32)
+
+/// What `GradientNoise` makes from a random source: a shuffle of 0 to 255, which picks each
+/// lattice point's gradient, and an offset for each axis.
+pub struct Lattice {
+    perms: [u8; 256]
+    x: f64
+    y: f64
+    z: f64
+}
+
+impl Lattice {
+    /// `GradientNoise(random, noiseOffsetScale)`: three offsets, each `nextDouble` times
+    /// `scale`, then the shuffle, swapping each place with one at random from it on.
+    pub fn new<T: RandomSource>(random: mut T, scale: f64) -> Lattice {
+        let x = random.next_double() * scale
+        let y = random.next_double() * scale
+        let z = random.next_double() * scale
+        var perms: [u8; 256] = [0; 256]
+        let n: usize = 256
+        for i in 0..n {
+            perms[i] = u8.wrap(i)
+        }
+        for i in 0..n {
+            let offset = usize.wrap(random.next_int_below(256 - i32.wrap(i)))
+            let tmp = perms[i]
+            perms[i] = perms[offset + i]
+            perms[offset + i] = tmp
+        }
+        return Lattice { perms: perms, x: x, y: y, z: z }
+    }
+
+    fn permute(self, x: i32) -> i32 {
+        return i32(self.perms[usize.wrap(x & 0xFF)])
+    }
+
+    /// `PerlinNoise.get`.
+    pub fn perlin(self, x: f64, y: f64, z: f64) -> f32 {
+        let px = wrap(x) + self.x
+        let py = wrap(y) + self.y
+        let pz = wrap(z) + self.z
+        let fx = floor(px)
+        let fy = floor(py)
+        let fz = floor(pz)
+        let rx = f32.nearest(px - f64(fx))
+        let ry = f32.nearest(py - f64(fy))
+        let rz = f32.nearest(pz - f64(fz))
+        return self.sample(fx, fy, fz, rx, ry, rz, ry)
+    }
+
+    /// `SmearedPerlinNoise.get`: Perlin noise whose fraction of `y` is pulled down by a multiple
+    /// of `fudge`, though its smooth step isn't.
+    pub fn smeared(self, fudge: f64, x: f64, y: f64, z: f64) -> f32 {
+        let px = wrap(x) + self.x
+        let py = wrap(y) + self.y
+        let pz = wrap(z) + self.z
+        let fx = floor(px)
+        let fy = floor(py)
+        let fz = floor(pz)
+        let rx = f32.nearest(px - f64(fx))
+        let ry = py - f64(fy)
+        let rz = f32.nearest(pz - f64(fz))
+        let fudged = f32.nearest(ry - fudge_y(fudge, y, ry))
+        return self.sample(fx, fy, fz, rx, fudged, rz, f32.nearest(ry))
+    }
+
+    /// `PerlinNoise.sampleAndLerp`: the dot products at the cell's eight corners, interpolated
+    /// by the smooth steps of the fractions. `smooth_y` is the fraction of `y` the step is of.
+    fn sample(self, x: i32, y: i32, z: i32, rx: f32, ry: f32, rz: f32, smooth_y: f32) -> f32 {
+        let x0 = self.permute(x)
+        let x1 = self.permute(x + 1)
+        let xy00 = self.permute(x0 + y)
+        let xy01 = self.permute(x0 + y + 1)
+        let xy10 = self.permute(x1 + y)
+        let xy11 = self.permute(x1 + y + 1)
+        let d000 = grad_dot(self.permute(xy00 + z), rx, ry, rz)
+        let d100 = grad_dot(self.permute(xy10 + z), rx - 1.0f32, ry, rz)
+        let d010 = grad_dot(self.permute(xy01 + z), rx, ry - 1.0f32, rz)
+        let d110 = grad_dot(self.permute(xy11 + z), rx - 1.0f32, ry - 1.0f32, rz)
+        let d001 = grad_dot(self.permute(xy00 + z + 1), rx, ry, rz - 1.0f32)
+        let d101 = grad_dot(self.permute(xy10 + z + 1), rx - 1.0f32, ry, rz - 1.0f32)
+        let d011 = grad_dot(self.permute(xy01 + z + 1), rx, ry - 1.0f32, rz - 1.0f32)
+        let d111 = grad_dot(self.permute(xy11 + z + 1), rx - 1.0f32, ry - 1.0f32, rz - 1.0f32)
+        let ax = smoothstep(rx)
+        let ay = smoothstep(smooth_y)
+        let az = smoothstep(rz)
+        return lerp3(ax, ay, az, d000, d100, d010, d110, d001, d101, d011, d111)
+    }
+
+    /// `PerlinNoise.addToVolume`, or `SmearedPerlinNoise.addToVolume` if `smeared`: the noise at
+    /// each point of the volume times `amplitude`, added to `buffer`. Along a column, the corners'
+    /// gradients are looked up again only when the cell changes.
+    pub fn perlin_volume(self, buffer: mut List<f32>, v: Volume, xz_scale: f64, y_scale: f64, amplitude: f32, smeared: bool, fudge: f64) {
+        var d000xz: f32 = 0.0
+        var d100xz: f32 = 0.0
+        var d010xz: f32 = 0.0
+        var d110xz: f32 = 0.0
+        var d001xz: f32 = 0.0
+        var d101xz: f32 = 0.0
+        var d011xz: f32 = 0.0
+        var d111xz: f32 = 0.0
+        var g000y: f32 = 0.0
+        var g100y: f32 = 0.0
+        var g010y: f32 = 0.0
+        var g110y: f32 = 0.0
+        var g001y: f32 = 0.0
+        var g101y: f32 = 0.0
+        var g011y: f32 = 0.0
+        var g111y: f32 = 0.0
+        var index: usize = 0
+        for iz in 0..v.size_z {
+            let z = wrap(f64(v.block_z(iz)) * xz_scale) + self.z
+            let fz = floor(z)
+            let rz = f32.nearest(z - f64(fz))
+            let az = smoothstep(rz)
+            for ix in 0..v.size_x {
+                let x = wrap(f64(v.block_x(ix)) * xz_scale) + self.x
+                let fx = floor(x)
+                let rx = f32.nearest(x - f64(fx))
+                let x0 = self.permute(fx)
+                let x1 = self.permute(fx + 1)
+                let ax = smoothstep(rx)
+                var last = i32.MIN
+                for iy in 0..v.size_y {
+                    let original = f64(v.block_y(iy)) * y_scale
+                    let y = wrap(original) + self.y
+                    let fy = floor(y)
+                    let exact = y - f64(fy)
+                    let ay = smoothstep(f32.nearest(exact))
+                    if last != fy {
+                        let xy00 = self.permute(x0 + fy)
+                        let xy01 = self.permute(x0 + fy + 1)
+                        let xy10 = self.permute(x1 + fy)
+                        let xy11 = self.permute(x1 + fy + 1)
+                        let g000 = self.grad(xy00 + fz)
+                        d000xz = dot_xz(g000, rx, rz)
+                        g000y = GRAD_Y[g000]
+                        let g100 = self.grad(xy10 + fz)
+                        d100xz = dot_xz(g100, rx - 1.0f32, rz)
+                        g100y = GRAD_Y[g100]
+                        let g010 = self.grad(xy01 + fz)
+                        d010xz = dot_xz(g010, rx, rz)
+                        g010y = GRAD_Y[g010]
+                        let g110 = self.grad(xy11 + fz)
+                        d110xz = dot_xz(g110, rx - 1.0f32, rz)
+                        g110y = GRAD_Y[g110]
+                        let g001 = self.grad(xy00 + fz + 1)
+                        d001xz = dot_xz(g001, rx, rz - 1.0f32)
+                        g001y = GRAD_Y[g001]
+                        let g101 = self.grad(xy10 + fz + 1)
+                        d101xz = dot_xz(g101, rx - 1.0f32, rz - 1.0f32)
+                        g101y = GRAD_Y[g101]
+                        let g011 = self.grad(xy01 + fz + 1)
+                        d011xz = dot_xz(g011, rx, rz - 1.0f32)
+                        g011y = GRAD_Y[g011]
+                        let g111 = self.grad(xy11 + fz + 1)
+                        d111xz = dot_xz(g111, rx - 1.0f32, rz - 1.0f32)
+                        g111y = GRAD_Y[g111]
+                        last = fy
+                    }
+                    let ry = if smeared { f32.nearest(exact - fudge_y(fudge, original, exact)) } else { f32.nearest(exact) }
+                    let value = lerp3(
+                        ax, ay, az,
+                        d000xz + g000y * ry,
+                        d100xz + g100y * ry,
+                        d010xz + g010y * (ry - 1.0f32),
+                        d110xz + g110y * (ry - 1.0f32),
+                        d001xz + g001y * ry,
+                        d101xz + g101y * ry,
+                        d011xz + g011y * (ry - 1.0f32),
+                        d111xz + g111y * (ry - 1.0f32),
+                    )
+                    buffer[index] = buffer[index] + amplitude * value
+                    index += 1
+                }
+            }
+        }
+    }
+
+    /// `permuteToGrad`: the gradient at a lattice point, as an index into the table.
+    fn grad(self, x: i32) -> usize {
+        return usize.wrap(self.permute(x) & 15)
+    }
+
+    /// `SimplexNoise.get(x, y)`: 2D simplex noise, in `double` until the end.
+    pub fn simplex2(self, x: f64, y: f64) -> f32 {
+        let xin = x + self.x
+        let yin = y + self.y
+        let s = (xin + yin) * F2
+        let i = floor(xin + s)
+        let j = floor(yin + s)
+        let t = f64(i + j) * G2
+        let x0 = xin - (f64(i) - t)
+        let y0 = yin - (f64(j) - t)
+        var i1 = 0
+        var j1 = 1
+        if x0 > y0 {
+            i1 = 1
+            j1 = 0
+        }
+        let x1 = x0 - f64(i1) + G2
+        let y1 = y0 - f64(j1) + G2
+        let x2 = x0 - 1.0 + 2.0 * G2
+        let y2 = y0 - 1.0 + 2.0 * G2
+        let ii = i & 0xFF
+        let jj = j & 0xFF
+        let gi0 = self.permute(ii + self.permute(jj)) % 12
+        let gi1 = self.permute(ii + i1 + self.permute(jj + j1)) % 12
+        let gi2 = self.permute(ii + 1 + self.permute(jj + 1)) % 12
+        let n0 = corner(gi0, x0, y0, 0.0, 0.5)
+        let n1 = corner(gi1, x1, y1, 0.0, 0.5)
+        let n2 = corner(gi2, x2, y2, 0.0, 0.5)
+        return f32.nearest(70.0 * (n0 + n1 + n2))
+    }
+
+    /// `SimplexNoise.get(x, y, z)`: 3D simplex noise.
+    pub fn simplex3(self, x: f64, y: f64, z: f64) -> f32 {
+        let xin = x + self.x
+        let yin = y + self.y
+        let zin = z + self.z
+        let s = (xin + yin + zin) * F3
+        let i = floor(xin + s)
+        let j = floor(yin + s)
+        let k = floor(zin + s)
+        let t = f64(i + j + k) * G3
+        let x0 = xin - (f64(i) - t)
+        let y0 = yin - (f64(j) - t)
+        let z0 = zin - (f64(k) - t)
+        // The second and third corners: the simplex the point is in, from which axis is largest.
+        var i1 = 0
+        var j1 = 0
+        var k1 = 0
+        var i2 = 0
+        var j2 = 0
+        var k2 = 0
+        if x0 >= y0 {
+            if y0 >= z0 {
+                i1 = 1
+                i2 = 1
+                j2 = 1
+            } else if x0 >= z0 {
+                i1 = 1
+                i2 = 1
+                k2 = 1
+            } else {
+                k1 = 1
+                i2 = 1
+                k2 = 1
+            }
+        } else if y0 < z0 {
+            k1 = 1
+            j2 = 1
+            k2 = 1
+        } else if x0 < z0 {
+            j1 = 1
+            j2 = 1
+            k2 = 1
+        } else {
+            j1 = 1
+            i2 = 1
+            j2 = 1
+        }
+        let x1 = x0 - f64(i1) + G3
+        let y1 = y0 - f64(j1) + G3
+        let z1 = z0 - f64(k1) + G3
+        let x2 = x0 - f64(i2) + F3
+        let y2 = y0 - f64(j2) + F3
+        let z2 = z0 - f64(k2) + F3
+        let x3 = x0 - 1.0 + 0.5
+        let y3 = y0 - 1.0 + 0.5
+        let z3 = z0 - 1.0 + 0.5
+        let ii = i & 0xFF
+        let jj = j & 0xFF
+        let kk = k & 0xFF
+        let gi0 = self.permute(ii + self.permute(jj + self.permute(kk))) % 12
+        let gi1 = self.permute(ii + i1 + self.permute(jj + j1 + self.permute(kk + k1))) % 12
+        let gi2 = self.permute(ii + i2 + self.permute(jj + j2 + self.permute(kk + k2))) % 12
+        let gi3 = self.permute(ii + 1 + self.permute(jj + 1 + self.permute(kk + 1))) % 12
+        let n0 = corner(gi0, x0, y0, z0, 0.6)
+        let n1 = corner(gi1, x1, y1, z1, 0.6)
+        let n2 = corner(gi2, x2, y2, z2, 0.6)
+        let n3 = corner(gi3, x3, y3, z3, 0.6)
+        return f32.nearest(32.0 * (n0 + n1 + n2 + n3))
+    }
+}
+
+/// `GradientNoise.wrap`.
+fn wrap(x: f64) -> f64 {
+    if x >= -HALF_ROUND_OFF and x < HALF_ROUND_OFF {
+        return x
+    }
+    return x - (x / ROUND_OFF + 0.5).floor() * ROUND_OFF
+}
+
+/// `Mth.floor(double)`, Java's `(int) Math.floor(v)`.
+fn floor(v: f64) -> i32 {
+    return i32.saturate(v.floor())
+}
+
+/// `SmearedPerlinNoise.computeFudgeY`.
+fn fudge_y(fudge: f64, original: f64, relative: f64) -> f64 {
+    let limit = if original >= 0.0 and original < relative { original } else { relative }
+    return f64(floor(limit / fudge + SHIFT_UP)) * fudge
+}
+
+/// `GradientNoise.gradDot`: `Gradient.dot` in `float`, every axis multiplied, even by zero.
+fn grad_dot(hash: i32, x: f32, y: f32, z: f32) -> f32 {
+    let g = usize.wrap(hash & 15)
+    return GRAD_X[g] * x + GRAD_Y[g] * y + GRAD_Z[g] * z
+}
+
+/// `Gradient.dotXz`.
+fn dot_xz(g: usize, x: f32, z: f32) -> f32 {
+    return GRAD_X[g] * x + GRAD_Z[g] * z
+}
+
+/// `SimplexNoise.getCornerNoise3D`: a corner's part, `(base - d²)⁴` times its gradient's dot
+/// product, or zero outside its reach.
+fn corner(index: i32, x: f64, y: f64, z: f64, base: f64) -> f64 {
+    var t = base - x * x - y * y - z * z
+    if t < 0.0 {
+        return 0.0
+    }
+    t *= t
+    let g = usize.wrap(index)
+    return t * t * (f64(GRAD_X[g]) * x + f64(GRAD_Y[g]) * y + f64(GRAD_Z[g]) * z)
+}
+
+/// `Mth.smoothstep(float)`.
+fn smoothstep(x: f32) -> f32 {
+    return x * x * x * (x * (x * 6.0f32 - 15.0f32) + 10.0f32)
+}
+
+/// `Mth.lerp(float, float, float)`.
+fn lerp(alpha: f32, p0: f32, p1: f32) -> f32 {
+    return p0 + alpha * (p1 - p0)
+}
+
+fn lerp2(a1: f32, a2: f32, x00: f32, x10: f32, x01: f32, x11: f32) -> f32 {
+    return lerp(a2, lerp(a1, x00, x10), lerp(a1, x01, x11))
+}
+
+fn lerp3(a1: f32, a2: f32, a3: f32, x000: f32, x100: f32, x010: f32, x110: f32, x001: f32, x101: f32, x011: f32, x111: f32) -> f32 {
+    return lerp(a3, lerp2(a1, a2, x000, x100, x010, x110), lerp2(a1, a2, x001, x101, x011, x111))
+}
+
+/// `DensityVolume`: a box of points, `size` along each axis, from `min`, `step` blocks apart.
+/// Its values are kept `y` fastest, then `x`, then `z`.
+pub struct Volume {
+    pub size_x: i32
+    pub size_y: i32
+    pub size_z: i32
+    pub min_x: i32
+    pub min_y: i32
+    pub min_z: i32
+    pub step_x: i32 = 1
+    pub step_y: i32 = 1
+    pub step_z: i32 = 1
+}
+
+impl Volume {
+    pub fn size(self) -> i32 {
+        return self.size_x * self.size_y * self.size_z
+    }
+
+    pub fn block_x(self, x: i32) -> i32 {
+        return self.min_x + x * self.step_x
+    }
+
+    pub fn block_y(self, y: i32) -> i32 {
+        return self.min_y + y * self.step_y
+    }
+
+    pub fn block_z(self, z: i32) -> i32 {
+        return self.min_z + z * self.step_z
+    }
+}
+
+/// One octave of a stack: a Perlin or smeared Perlin noise, sampled at the input times
+/// `frequency`, its value times `amplitude`.
+pub struct Layer {
+    pub lattice: Lattice
+    pub frequency: f64
+    pub amplitude: f32
+    /// The smeared noise's `fudgeYScale`, for a stack of smeared noises.
+    pub fudge: f64 = 0.0
+}
+
+/// `NoiseStack`: the sum of its layers, in order, in `float`. Vanilla's stacks are all of Perlin
+/// noises or all of smeared ones.
+pub struct Stack {
+    pub layers: List<Layer>
+    pub smeared: bool
+    pub range: Interval
+}
+
+impl Stack {
+    /// `NoiseStack.Builder.build`, working out the range from the layers'.
+    pub fn new(layers: own List<Layer>, smeared: bool) -> Stack {
+        var range = Interval.exact(0.0f32)
+        for layer in layers {
+            let one = if smeared { smeared_range(layer.fudge) } else { Interval.symmetric(SAMPLE_RANGE) }
+            range = range.add(one.mul(Interval.exact(layer.amplitude)))
+        }
+        return Stack { layers: layers, smeared: smeared, range: range }
+    }
+
+    pub fn get(self, x: f64, y: f64, z: f64) -> f32 {
+        var value: f32 = 0.0
+        if self.smeared {
+            for layer in self.layers {
+                let f = layer.frequency
+                value += layer.amplitude * layer.lattice.smeared(layer.fudge, x * f, y * f, z * f)
+            }
+        } else {
+            for layer in self.layers {
+                let f = layer.frequency
+                value += layer.amplitude * layer.lattice.perlin(x * f, y * f, z * f)
+            }
+        }
+        return value
+    }
+
+    /// `NoiseStack.get(x, y)`: each layer's `get(x, y)`, which is `get(wrap(x), 0, wrap(y))`.
+    pub fn get2(self, x: f64, y: f64) -> f32 {
+        var value: f32 = 0.0
+        for layer in self.layers {
+            let f = layer.frequency
+            let a = wrap(x * f)
+            let b = wrap(y * f)
+            let sample = if self.smeared { layer.lattice.smeared(layer.fudge, a, 0.0, b) } else { layer.lattice.perlin(a, 0.0, b) }
+            value += layer.amplitude * sample
+        }
+        return value
+    }
+
+    pub fn add_to_volume(self, buffer: mut List<f32>, v: Volume, xz_scale: f64, y_scale: f64, amplitude: f32) {
+        for layer in self.layers {
+            let f = layer.frequency
+            layer.lattice.perlin_volume(mut buffer, v, xz_scale * f, y_scale * f, amplitude * layer.amplitude, self.smeared, layer.fudge)
+        }
+    }
+}
+
+/// `SmearedPerlinNoise.range(fudgeYScale)`.
+fn smeared_range(fudge: f64) -> Interval {
+    return Interval.symmetric(f32.nearest(fudge.abs() + 2.0))
+}
+
+/// Any of vanilla's noises.
+pub enum Noise {
+    Perlin(Lattice)
+    /// A smeared Perlin noise and its `fudgeYScale`.
+    Smeared(Lattice, f64)
+    Simplex(Lattice)
+    Stack(Stack)
+}
+
+impl Noise {
+    /// `new PerlinNoise(random)`.
+    pub fn perlin<T: RandomSource>(random: mut T) -> Noise {
+        return Noise.Perlin(Lattice.new(mut random, 256.0))
+    }
+
+    /// `new SmearedPerlinNoise(random, fudgeYScale)`.
+    pub fn smeared<T: RandomSource>(random: mut T, fudge: f64) -> Noise {
+        return Noise.Smeared(Lattice.new(mut random, 256.0), fudge)
+    }
+
+    /// `new SimplexNoise(random, discardNoiseOffset)`: with the offsets drawn and then made zero
+    /// if `discard_offset`.
+    pub fn simplex<T: RandomSource>(random: mut T, discard_offset: bool) -> Noise {
+        return Noise.Simplex(Lattice.new(mut random, if discard_offset { 0.0 } else { 256.0 }))
+    }
+
+    pub fn get(self, x: f64, y: f64, z: f64) -> f32 {
+        return match self {
+            Noise.Perlin(l) => l.perlin(x, y, z),
+            Noise.Smeared(l, fudge) => l.smeared(fudge, x, y, z),
+            Noise.Simplex(l) => l.simplex3(x, y, z),
+            Noise.Stack(s) => s.get(x, y, z),
+        }
+    }
+
+    pub fn get2(self, x: f64, y: f64) -> f32 {
+        return match self {
+            Noise.Perlin(l) => l.perlin(wrap(x), 0.0, wrap(y)),
+            Noise.Smeared(l, fudge) => l.smeared(fudge, wrap(x), 0.0, wrap(y)),
+            Noise.Simplex(l) => l.simplex2(x, y),
+            Noise.Stack(s) => s.get2(x, y),
+        }
+    }
+
+    /// `addToVolume`: the noise over `v`, times `amplitude`, added to `buffer`, which holds a
+    /// value for each of its points.
+    pub fn add_to_volume(self, buffer: mut List<f32>, v: Volume, xz_scale: f64, y_scale: f64, amplitude: f32) {
+        match self {
+            Noise.Perlin(l) => l.perlin_volume(mut buffer, v, xz_scale, y_scale, amplitude, false, 0.0),
+            Noise.Smeared(l, fudge) => l.perlin_volume(mut buffer, v, xz_scale, y_scale, amplitude, true, fudge),
+            Noise.Simplex(l) => {
+                // `Noise.addToVolume`, which simplex noise doesn't override: a point at a time.
+                var index: usize = 0
+                for iz in 0..v.size_z {
+                    let z = f64(v.block_z(iz)) * xz_scale
+                    for ix in 0..v.size_x {
+                        let x = f64(v.block_x(ix)) * xz_scale
+                        for iy in 0..v.size_y {
+                            let y = f64(v.block_y(iy)) * y_scale
+                            buffer[index] = buffer[index] + amplitude * l.simplex3(x, y, z)
+                            index += 1
+                        }
+                    }
+                }
+            },
+            Noise.Stack(s) => s.add_to_volume(mut buffer, v, xz_scale, y_scale, amplitude),
+        }
+    }
+
+    pub fn range(self) -> Interval {
+        return match self {
+            Noise.Perlin(_) => Interval.symmetric(SAMPLE_RANGE),
+            Noise.Smeared(_, fudge) => smeared_range(fudge),
+            Noise.Simplex(_) => Interval.symmetric(SAMPLE_RANGE),
+            Noise.Stack(s) => s.range,
+        }
+    }
+}
+
+/// `BlendedNoise.createFbm`: `1 - first_octave` smeared octaves, the first at frequency 1, each
+/// next one at half the frequency and twice the amplitude, the amplitudes summing to
+/// `value_factor`. A first octave above 0 is refused, as vanilla throws
+/// `IllegalArgumentException`.
+pub fn fbm<T: RandomSource>(random: mut T, first_octave: i32, smear_scale_y: f64, value_factor: f64) -> Stack ! Thrown {
+    if first_octave > 0 {
+        fail Thrown { exception: "IllegalArgumentException", message: "firstOctave>0" }
+    }
+    let octaves = -first_octave + 1
+    var factor = 1.0
+    var amplitude = value_factor / (pow2(octaves) - 1.0)
+    var layers = List<Layer>()
+    var i = octaves - 1
+    while i >= 0 {
+        let fudge = smear_scale_y * factor
+        layers.push(Layer { lattice: Lattice.new(mut random, 256.0), frequency: factor, amplitude: f32.nearest(amplitude), fudge: fudge })
+        factor /= 2.0
+        amplitude *= 2.0
+        i -= 1
+    }
+    return Stack.new(layers, true)
+}
+
+/// An exception vanilla throws while making a noise from bad parameters: its class's simple name
+/// and its message.
+pub struct Thrown {
+    pub exception: String
+    pub message: String
+}
+
+/// 2^`n`, exactly, as `Math.pow(2.0, n)` gives it: infinite above 1023, subnormal below -1022,
+/// and zero below -1074.
+pub fn pow2(n: i32) -> f64 {
+    if n > 1023 {
+        return f64.INFINITY
+    }
+    if n < -1074 {
+        return 0.0
+    }
+    if n < -1022 {
+        return pow2(-1022) * pow2(n + 1022)
+    }
+    return f64.from_bits(u64.wrap(i64(n) + 1023) << 52)
+}
