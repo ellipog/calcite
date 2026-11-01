@@ -437,6 +437,9 @@ def block_facts_module(index, flags):
     lines += number_list(
         "place_on_classes", "classes", [where[c] if c else none for c in flags["place_on_classes"]],
         [f"/// The class whose `mayPlaceOn` each block runs, {none} for none, in block ID order."])
+    lines += number_list(
+        "shape_classes", "classes", [where[c] if c else none for c in flags["shape_classes"]],
+        [f"/// The class whose `updateShape` each block runs, by its index in `class_names`, in block ID order."])
     pairs = [str(v) for pair in flags["poi"] for v in pair]
     lines += [
         "/// The states that are points of interest, each followed by its type's ID in the",

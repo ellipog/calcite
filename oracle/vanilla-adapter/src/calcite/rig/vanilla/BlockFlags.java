@@ -123,6 +123,7 @@ final class BlockFlags {
         StringBuilder classes = new StringBuilder();
         StringBuilder survive = new StringBuilder();
         StringBuilder placeOn = new StringBuilder();
+        StringBuilder shape = new StringBuilder();
         Map<String, String> parents = new java.util.TreeMap<>();
         for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
             Class<?> type = BuiltInRegistries.BLOCK.byId(id).getClass();
@@ -138,6 +139,10 @@ final class BlockFlags {
             String p = declaring(type, "mayPlaceOn", BlockState.class, net.minecraft.world.level.BlockGetter.class, BlockPos.class);
             survive.append(id == 0 ? "\"" : ", \"").append(s).append("\"");
             placeOn.append(id == 0 ? "\"" : ", \"").append(p).append("\"");
+            String u = declaring(type, "updateShape", BlockState.class, net.minecraft.world.level.LevelReader.class,
+                    net.minecraft.world.level.ScheduledTickAccess.class, BlockPos.class, Direction.class, BlockPos.class,
+                    BlockState.class, net.minecraft.util.RandomSource.class);
+            shape.append(id == 0 ? "\"" : ", \"").append(u).append("\"");
         }
         StringBuilder parentJson = new StringBuilder();
         for (Map.Entry<String, String> e : parents.entrySet()) {
@@ -150,6 +155,7 @@ final class BlockFlags {
         json.append("  \"classes\": [").append(classes).append("],\n");
         json.append("  \"survive_classes\": [").append(survive).append("],\n");
         json.append("  \"place_on_classes\": [").append(placeOn).append("],\n");
+        json.append("  \"shape_classes\": [").append(shape).append("],\n");
         json.append("  \"class_parents\": {").append(parentJson).append("},\n");
         json.append("  \"poi\": [").append(poi).append("]");
         json.append(",\n  \"collision\": [").append(collision).append("],\n");

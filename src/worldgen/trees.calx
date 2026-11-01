@@ -1,0 +1,2213 @@
+/// Trees, as 26.3's `TreeFeature` grows them: read as the feature's codec reads one, then roots,
+/// a trunk and foliage placed by their placers within the size the tree may be clipped to, the
+/// decorators run over the logs, leaves and roots, and the leaves' distances and the shapes at the
+/// tree's edge updated. The positions a tree sets are kept in `JavaHashSet`s, since the order
+/// Java's `HashSet` goes over them in decides which leaf takes which distance.
+///
+/// `features` drives a tree through `grow`, `decorate` and `finish`, and runs the `pale_moss`
+/// decorator itself, since that places another feature.
+module worldgen.trees
+
+import json.tree.{Json, Member}
+import math.mth.{SinTable, floor}
+import pack.zip.{Zip}
+import random.source.{RandomSource}
+import std.java.math.{cos, sin}
+import world.chunk.{MOTION_BLOCKING_NO_LEAVES}
+import worldgen.codec.{bool_of, field, float_range_field, int_of, int_range_field, map_of, type_of}
+import worldgen.facts.{BlockSet, DOWN, EAST, Facts, NORTH, SOUTH, UP, WATER_FLUID, WEST, clockwise, direction_name, horizontal, opposite, step_x, step_y, step_z}
+import worldgen.interval.{Thrown}
+import worldgen.predicates.{Readers, list_of, read_blocks, read_direction}
+import worldgen.providers.{IntProvider, int_provider_field}
+import worldgen.region.{Region}
+import worldgen.shapes.{update_shape}
+import worldgen.state_providers.{Providers, get_state, optional_state}
+import worldgen.survive.{Env}
+
+/// `Block.UPDATE_ALL | UPDATE_KNOWN_SHAPE`: how a tree sets its blocks.
+const TREE_FLAGS: i32 = 19
+
+/// A block position, hashed as `Vec3i.hashCode`.
+pub struct Pos {
+    pub x: i32
+    pub y: i32
+    pub z: i32
+}
+
+impl JavaHash for Pos {
+    fn java_hash(self) -> i32 {
+        return (self.y + self.z * 31) * 31 + self.x
+    }
+}
+
+/// A trunk placer's kind and what it reads beyond the heights.
+pub enum TrunkKind {
+    Straight
+    Forking
+    Giant
+    MegaJungle
+    DarkOak
+    Fancy
+    Bending { min_leaves: i32, bend: IntProvider }
+    Upwards { steps: IntProvider, chance: f32, length: IntProvider, through: BlockSet }
+    Cherry { count: IntProvider, horizontal: IntProvider, start_min: i32, start_max: i32, end: IntProvider }
+    Poplar { above: IntProvider, branches: IntProvider }
+}
+
+pub struct TrunkPlacer {
+    base: i32
+    rand_a: i32
+    rand_b: i32
+    kind: TrunkKind
+}
+
+/// A foliage placer's kind and what it reads beyond the radius and offset.
+pub enum FoliageKind {
+    Blob(i32)
+    Bush(i32)
+    Fancy(i32)
+    Jungle(i32)
+    Acacia
+    DarkOak
+    Spruce(IntProvider)
+    Pine(IntProvider)
+    MegaPine(IntProvider)
+    RandomSpread { height: IntProvider, attempts: i32 }
+    Cherry { height: IntProvider, wide_hole: f32, corner_hole: f32, hanging: f32, extension: f32 }
+    Poplar { height: IntProvider, side_hole: f32 }
+}
+
+pub struct FoliagePlacer {
+    radius: IntProvider
+    offset: IntProvider
+    kind: FoliageKind
+}
+
+/// `MangroveRootPlacer`, the one root placer.
+pub struct RootPlacer {
+    offset_y: IntProvider
+    provider: usize
+    above: usize?
+    above_chance: f32
+    through: BlockSet
+    muddy_in: BlockSet
+    muddy: usize
+    width: i32
+    length: i32
+    skew: f32
+}
+
+/// `FeatureSize`: the radius that must be free at each height of the trunk.
+pub enum FeatureSize {
+    TwoLayers { limit: i32, lower: i32, upper: i32, clipped: i32? }
+    ThreeLayers { limit: i32, upper_limit: i32, lower: i32, middle: i32, upper: i32, clipped: i32? }
+}
+
+/// A tree decorator.
+pub enum Decorator {
+    PlaceOnGround { tries: i32, radius: i32, height: i32, provider: usize }
+    Beehive(f32)
+    LeaveVine(f32)
+    TrunkVine
+    Cocoa(f32)
+    AlterGround(usize)
+    AttachedToLeaves { chance: f32, xz: i32, y: i32, provider: usize, empty: i32, directions: List<i32> }
+    AttachedToLogs { chance: f32, provider: usize, directions: List<i32> }
+    CreakingHeart(f32)
+    /// `pale_moss`, which `features` runs, with the `pale_moss_patch` feature by index if the
+    /// registry has it.
+    PaleMoss { leaves: f32, trunk: f32, ground: f32, patch: usize? }
+    ShelfMushroom(f32)
+}
+
+/// The tags a tree asks about, found once when it's read.
+pub struct TreeTags {
+    replaceable: BlockSet
+    logs: BlockSet
+    prevents_decay: BlockSet
+    pub leaves: BlockSet
+}
+
+/// A `tree` feature, as read.
+pub struct Tree {
+    trunk_provider: usize
+    trunk: TrunkPlacer
+    foliage_provider: usize
+    foliage: FoliagePlacer
+    root: RootPlacer?
+    size: FeatureSize
+    pub decorators: List<Decorator>
+    ignore_vines: bool
+    below_trunk: usize
+    pub tags: TreeTags
+}
+
+/// What a tree has set: its roots, logs, leaves and decorations, in sets as vanilla keeps them.
+pub struct Grow {
+    pub roots: JavaHashSet<Pos>
+    pub trunks: JavaHashSet<Pos>
+    pub foliage: JavaHashSet<Pos>
+    pub decorations: JavaHashSet<Pos>
+}
+
+impl Grow {
+    pub fn new() -> Grow {
+        return Grow { roots: JavaHashSet<Pos>(), trunks: JavaHashSet<Pos>(), foliage: JavaHashSet<Pos>(), decorations: JavaHashSet<Pos>() }
+    }
+}
+
+/// `FoliagePlacer.FoliageAttachment`.
+struct Attachment {
+    x: i32
+    y: i32
+    z: i32
+    radius_offset: i32
+    height_offset: i32
+    double_trunk: bool
+}
+
+fn attach(x: i32, y: i32, z: i32, radius_offset: i32, double_trunk: bool) -> Attachment {
+    return Attachment { x: x, y: y, z: z, radius_offset: radius_offset, height_offset: 0, double_trunk: double_trunk }
+}
+
+// Reading.
+
+/// `TreeFeature.CODEC`: the fields of a `tree` feature.
+pub fn read_tree(ps: mut Providers, zip: Zip, facts: Facts, rd: Readers, m: List<Member>) -> Tree ! String {
+    let tv = field(m, "trunk_provider") else fail "No key trunk_provider in MapLike"
+    let trunk_provider = try ps.read(zip, facts, rd, tv)
+    let tpv = field(m, "trunk_placer") else fail "No key trunk_placer in MapLike"
+    let trunk = try read_trunk(facts, rd, tpv)
+    let fv = field(m, "foliage_provider") else fail "No key foliage_provider in MapLike"
+    let foliage_provider = try ps.read(zip, facts, rd, fv)
+    let fpv = field(m, "foliage_placer") else fail "No key foliage_placer in MapLike"
+    let foliage = try read_foliage(fpv)
+    var root: RootPlacer? = none
+    if let rv = field(m, "root_placer") {
+        root = some(try read_root(mut ps, zip, facts, rd, rv))
+    }
+    let sv = field(m, "minimum_size") else fail "No key minimum_size in MapLike"
+    let size = try read_size(sv)
+    let dv = field(m, "decorators") else fail "No key decorators in MapLike"
+    var decorators = List<Decorator>()
+    for item in try list_of(dv) {
+        decorators.push(try read_decorator(mut ps, zip, facts, rd, item))
+    }
+    // `fieldOf("ignore_vines").orElse(false)`: false for anything that doesn't read.
+    var ignore_vines = false
+    if let v = field(m, "ignore_vines") {
+        match bool_of(v) {
+            ok(b) => ignore_vines = b,
+            err(_) => {},
+        }
+    }
+    let bv = field(m, "below_trunk_provider") else fail "No key below_trunk_provider in MapLike"
+    let below = try ps.read(zip, facts, rd, bv)
+    let tags = TreeTags {
+        replaceable: facts.tag_or_empty("minecraft:replaceable_by_trees"),
+        logs: facts.tag_or_empty("minecraft:logs"),
+        prevents_decay: facts.tag_or_empty("minecraft:prevents_nearby_leaf_decay"),
+        leaves: facts.tag_or_empty("minecraft:leaves"),
+    }
+    return Tree {
+        trunk_provider: trunk_provider,
+        trunk: trunk,
+        foliage_provider: foliage_provider,
+        foliage: foliage,
+        root: root,
+        size: size,
+        decorators: decorators,
+        ignore_vines: ignore_vines,
+        below_trunk: below,
+        tags: tags,
+    }
+}
+
+// An optional int field in a range, with its default.
+fn optional_int(m: List<Member>, key: str, low: i32, high: i32, otherwise: i32) -> i32 ! String {
+    let v = field(m, key) else return otherwise
+    let n = try int_of(v)
+    if n < low or n > high {
+        fail "Value {n} outside of range [{low}:{high}]"
+    }
+    return n
+}
+
+// `TrunkPlacer.CODEC`.
+fn read_trunk(facts: Facts, rd: Readers, value: Json) -> TrunkPlacer ! String {
+    let m = try map_of(value)
+    let kind = try type_of(m)
+    let base = try int_range_field(m, "base_height", 0, 32)
+    let rand_a = try int_range_field(m, "height_rand_a", 0, 24)
+    let rand_b = try int_range_field(m, "height_rand_b", 0, 24)
+    var k = TrunkKind.Straight
+    if kind == "minecraft:straight_trunk_placer" {
+        k = TrunkKind.Straight
+    } else if kind == "minecraft:forking_trunk_placer" {
+        k = TrunkKind.Forking
+    } else if kind == "minecraft:giant_trunk_placer" {
+        k = TrunkKind.Giant
+    } else if kind == "minecraft:mega_jungle_trunk_placer" {
+        k = TrunkKind.MegaJungle
+    } else if kind == "minecraft:dark_oak_trunk_placer" {
+        k = TrunkKind.DarkOak
+    } else if kind == "minecraft:fancy_trunk_placer" {
+        k = TrunkKind.Fancy
+    } else if kind == "minecraft:bending_trunk_placer" {
+        let min_leaves = try optional_int(m, "min_height_for_leaves", 1, 2147483647, 1)
+        k = TrunkKind.Bending { min_leaves: min_leaves, bend: try int_provider_field(m, "bend_length", 1, 64) }
+    } else if kind == "minecraft:upwards_branching_trunk_placer" {
+        let steps = try int_provider_field(m, "extra_branch_steps", 1, 2147483647)
+        let chance = try float_range_field(m, "place_branch_per_log_probability", 0.0f32, 1.0f32)
+        let length = try int_provider_field(m, "extra_branch_length", 0, 2147483647)
+        let tv = field(m, "can_grow_through") else fail "No key can_grow_through in MapLike"
+        k = TrunkKind.Upwards { steps: steps, chance: chance, length: length, through: try read_blocks(facts, rd.blocks, tv) }
+    } else if kind == "minecraft:cherry_trunk_placer" {
+        let count = try int_provider_field(m, "branch_count", 1, 3)
+        let horizontal_length = try int_provider_field(m, "branch_horizontal_length", 2, 16)
+        let sv = field(m, "branch_start_offset_from_top") else fail "No key branch_start_offset_from_top in MapLike"
+        let sm = try map_of(sv)
+        let lo_v = field(sm, "min_inclusive") else fail "No key min_inclusive in MapLike"
+        let hi_v = field(sm, "max_inclusive") else fail "No key max_inclusive in MapLike"
+        let lo = try int_of(lo_v)
+        let hi = try int_of(hi_v)
+        if hi < lo {
+            fail "Max must be at least min, min_inclusive: {lo}, max_inclusive: {hi}"
+        }
+        if hi - lo < 1 {
+            fail "Need at least 2 blocks variation for the branch starts to fit both branches"
+        }
+        if lo < -16 or hi > 0 {
+            fail "Value provider out of range"
+        }
+        let end = try int_provider_field(m, "branch_end_offset_from_top", -16, 16)
+        k = TrunkKind.Cherry { count: count, horizontal: horizontal_length, start_min: lo, start_max: hi, end: end }
+    } else if kind == "minecraft:poplar_trunk_placer" {
+        let above = try int_provider_field(m, "trunk_height_above_branches", 0, 8)
+        k = TrunkKind.Poplar { above: above, branches: try int_provider_field(m, "branch_amount", 1, 4) }
+    } else {
+        fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:trunk_placer_type]: {kind}"
+    }
+    return TrunkPlacer { base: base, rand_a: rand_a, rand_b: rand_b, kind: k }
+}
+
+// `FoliagePlacer.CODEC`.
+fn read_foliage(value: Json) -> FoliagePlacer ! String {
+    let m = try map_of(value)
+    let kind = try type_of(m)
+    let radius = try int_provider_field(m, "radius", 0, 16)
+    let offset = try int_provider_field(m, "offset", 0, 16)
+    var k = FoliageKind.Acacia
+    if kind == "minecraft:blob_foliage_placer" {
+        k = FoliageKind.Blob(try int_range_field(m, "height", 0, 16))
+    } else if kind == "minecraft:bush_foliage_placer" {
+        k = FoliageKind.Bush(try int_range_field(m, "height", 0, 16))
+    } else if kind == "minecraft:fancy_foliage_placer" {
+        k = FoliageKind.Fancy(try int_range_field(m, "height", 0, 16))
+    } else if kind == "minecraft:jungle_foliage_placer" {
+        k = FoliageKind.Jungle(try int_range_field(m, "height", 0, 16))
+    } else if kind == "minecraft:acacia_foliage_placer" {
+        k = FoliageKind.Acacia
+    } else if kind == "minecraft:dark_oak_foliage_placer" {
+        k = FoliageKind.DarkOak
+    } else if kind == "minecraft:spruce_foliage_placer" {
+        k = FoliageKind.Spruce(try int_provider_field(m, "trunk_height", 0, 24))
+    } else if kind == "minecraft:pine_foliage_placer" {
+        k = FoliageKind.Pine(try int_provider_field(m, "height", 0, 24))
+    } else if kind == "minecraft:mega_pine_foliage_placer" {
+        k = FoliageKind.MegaPine(try int_provider_field(m, "crown_height", 0, 24))
+    } else if kind == "minecraft:random_spread_foliage_placer" {
+        let height = try int_provider_field(m, "foliage_height", 1, 512)
+        k = FoliageKind.RandomSpread { height: height, attempts: try int_range_field(m, "leaf_placement_attempts", 0, 256) }
+    } else if kind == "minecraft:cherry_foliage_placer" {
+        let height = try int_provider_field(m, "height", 4, 16)
+        let wide_hole = try float_range_field(m, "wide_bottom_layer_hole_chance", 0.0f32, 1.0f32)
+        let corner_hole = try float_range_field(m, "corner_hole_chance", 0.0f32, 1.0f32)
+        let hanging = try float_range_field(m, "hanging_leaves_chance", 0.0f32, 1.0f32)
+        let extension = try float_range_field(m, "hanging_leaves_extension_chance", 0.0f32, 1.0f32)
+        k = FoliageKind.Cherry { height: height, wide_hole: wide_hole, corner_hole: corner_hole, hanging: hanging, extension: extension }
+    } else if kind == "minecraft:poplar_foliage_placer" {
+        let height = try int_provider_field(m, "height", 5, 16)
+        k = FoliageKind.Poplar { height: height, side_hole: try float_range_field(m, "side_hole_chance", 0.0f32, 1.0f32) }
+    } else {
+        fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:foliage_placer_type]: {kind}"
+    }
+    return FoliagePlacer { radius: radius, offset: offset, kind: k }
+}
+
+// `RootPlacer.CODEC`: only `mangrove_root_placer`.
+fn read_root(ps: mut Providers, zip: Zip, facts: Facts, rd: Readers, value: Json) -> RootPlacer ! String {
+    let m = try map_of(value)
+    let kind = try type_of(m)
+    if kind != "minecraft:mangrove_root_placer" {
+        fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:root_placer_type]: {kind}"
+    }
+    let offset_y = try int_provider_field(m, "trunk_offset_y", -2147483648, 2147483647)
+    let pv = field(m, "root_provider") else fail "No key root_provider in MapLike"
+    let provider = try ps.read(zip, facts, rd, pv)
+    var above: usize? = none
+    var above_chance = 0.0f32
+    if let av = field(m, "above_root_placement") {
+        let am = try map_of(av)
+        let apv = field(am, "above_root_provider") else fail "No key above_root_provider in MapLike"
+        above = some(try ps.read(zip, facts, rd, apv))
+        above_chance = try float_range_field(am, "above_root_placement_chance", 0.0f32, 1.0f32)
+    }
+    let mv = field(m, "mangrove_root_placement") else fail "No key mangrove_root_placement in MapLike"
+    let mm = try map_of(mv)
+    let tv = field(mm, "can_grow_through") else fail "No key can_grow_through in MapLike"
+    let through = try read_blocks(facts, rd.blocks, tv)
+    let iv = field(mm, "muddy_roots_in") else fail "No key muddy_roots_in in MapLike"
+    let muddy_in = try read_blocks(facts, rd.blocks, iv)
+    let mpv = field(mm, "muddy_roots_provider") else fail "No key muddy_roots_provider in MapLike"
+    let muddy = try ps.read(zip, facts, rd, mpv)
+    let width = try int_range_field(mm, "max_root_width", 1, 12)
+    let length = try int_range_field(mm, "max_root_length", 1, 64)
+    let skew = try float_range_field(mm, "random_skew_chance", 0.0f32, 1.0f32)
+    return RootPlacer {
+        offset_y: offset_y,
+        provider: provider,
+        above: above,
+        above_chance: above_chance,
+        through: through,
+        muddy_in: muddy_in,
+        muddy: muddy,
+        width: width,
+        length: length,
+        skew: skew,
+    }
+}
+
+// `FeatureSize.CODEC`.
+fn read_size(value: Json) -> FeatureSize ! String {
+    let m = try map_of(value)
+    let kind = try type_of(m)
+    var clipped: i32? = none
+    if let v = field(m, "min_clipped_height") {
+        let n = try int_of(v)
+        if n < 0 or n > 80 {
+            fail "Value {n} outside of range [0:80]"
+        }
+        clipped = some(n)
+    }
+    if kind == "minecraft:two_layers_feature_size" {
+        let limit = try optional_int(m, "limit", 0, 81, 1)
+        let lower = try optional_int(m, "lower_size", 0, 16, 0)
+        let upper = try optional_int(m, "upper_size", 0, 16, 1)
+        return FeatureSize.TwoLayers { limit: limit, lower: lower, upper: upper, clipped: clipped }
+    }
+    if kind == "minecraft:three_layers_feature_size" {
+        let limit = try optional_int(m, "limit", 0, 80, 1)
+        let upper_limit = try optional_int(m, "upper_limit", 0, 80, 1)
+        let lower = try optional_int(m, "lower_size", 0, 16, 0)
+        let middle = try optional_int(m, "middle_size", 0, 16, 1)
+        let upper = try optional_int(m, "upper_size", 0, 16, 1)
+        return FeatureSize.ThreeLayers { limit: limit, upper_limit: upper_limit, lower: lower, middle: middle, upper: upper, clipped: clipped }
+    }
+    fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:feature_size_type]: {kind}"
+}
+
+// `ExtraCodecs.nonEmptyList(Direction.CODEC.listOf())`.
+fn read_directions(m: List<Member>) -> List<i32> ! String {
+    let v = field(m, "directions") else fail "No key directions in MapLike"
+    var out = List<i32>()
+    for item in try list_of(v) {
+        out.push(try read_direction(item))
+    }
+    if out.is_empty() {
+        fail "List must have contents"
+    }
+    return out
+}
+
+// `TreeDecorator.CODEC`.
+fn read_decorator(ps: mut Providers, zip: Zip, facts: Facts, rd: Readers, value: Json) -> Decorator ! String {
+    let m = try map_of(value)
+    let kind = try type_of(m)
+    if kind == "minecraft:place_on_ground" {
+        let tries = try optional_int(m, "tries", 1, 2147483647, 128)
+        let radius = try optional_int(m, "radius", 0, 2147483647, 2)
+        let height = try optional_int(m, "height", 0, 2147483647, 1)
+        let pv = field(m, "block_state_provider") else fail "No key block_state_provider in MapLike"
+        return Decorator.PlaceOnGround { tries: tries, radius: radius, height: height, provider: try ps.read(zip, facts, rd, pv) }
+    }
+    if kind == "minecraft:beehive" {
+        return Decorator.Beehive(try float_range_field(m, "probability", 0.0f32, 1.0f32))
+    }
+    if kind == "minecraft:leave_vine" {
+        return Decorator.LeaveVine(try float_range_field(m, "probability", 0.0f32, 1.0f32))
+    }
+    if kind == "minecraft:trunk_vine" {
+        return Decorator.TrunkVine
+    }
+    if kind == "minecraft:cocoa" {
+        return Decorator.Cocoa(try float_range_field(m, "probability", 0.0f32, 1.0f32))
+    }
+    if kind == "minecraft:alter_ground" {
+        let pv = field(m, "provider") else fail "No key provider in MapLike"
+        return Decorator.AlterGround(try ps.read(zip, facts, rd, pv))
+    }
+    if kind == "minecraft:attached_to_leaves" {
+        let chance = try float_range_field(m, "probability", 0.0f32, 1.0f32)
+        let xz = try int_range_field(m, "exclusion_radius_xz", 0, 16)
+        let y = try int_range_field(m, "exclusion_radius_y", 0, 16)
+        let pv = field(m, "block_provider") else fail "No key block_provider in MapLike"
+        let provider = try ps.read(zip, facts, rd, pv)
+        let empty = try int_range_field(m, "required_empty_blocks", 1, 16)
+        let directions = try read_directions(m)
+        return Decorator.AttachedToLeaves { chance: chance, xz: xz, y: y, provider: provider, empty: empty, directions: directions }
+    }
+    if kind == "minecraft:attached_to_logs" {
+        let chance = try float_range_field(m, "probability", 0.0f32, 1.0f32)
+        let pv = field(m, "block_provider") else fail "No key block_provider in MapLike"
+        let provider = try ps.read(zip, facts, rd, pv)
+        return Decorator.AttachedToLogs { chance: chance, provider: provider, directions: try read_directions(m) }
+    }
+    if kind == "minecraft:creaking_heart" {
+        return Decorator.CreakingHeart(try float_range_field(m, "probability", 0.0f32, 1.0f32))
+    }
+    if kind == "minecraft:pale_moss" {
+        let leaves = try float_range_field(m, "leaves_probability", 0.0f32, 1.0f32)
+        let trunk = try float_range_field(m, "trunk_probability", 0.0f32, 1.0f32)
+        let ground = try float_range_field(m, "ground_probability", 0.0f32, 1.0f32)
+        return Decorator.PaleMoss { leaves: leaves, trunk: trunk, ground: ground, patch: none }
+    }
+    if kind == "minecraft:shelf_mushroom" {
+        return Decorator.ShelfMushroom(try float_range_field(m, "probability", 0.0f32, 1.0f32))
+    }
+    fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:tree_decorator_type]: {kind}"
+}
+
+// Placing: what the setters and checks of `TreeFeature` and the placers do.
+
+// `TreeFeature.validTreePos`: air, or a block trees replace.
+fn valid_tree_pos(f: Facts, r: Region, t: Tree, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let s = try r.state(f, x, y, z)
+    return f.is_air(s) or f.in_set(s, t.tags.replaceable)
+}
+
+// The trunk placer's `validTreePos`: an upwards branching one also grows through its blocks.
+fn trunk_valid_pos(f: Facts, r: Region, t: Tree, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if try valid_tree_pos(f, r, t, x, y, z) {
+        return true
+    }
+    match t.trunk.kind {
+        TrunkKind.Upwards { through, .. } => return f.in_set(try r.state(f, x, y, z), through),
+        _ => return false,
+    }
+}
+
+// `TrunkPlacer.isFree`: valid for the trunk, or a log.
+fn is_free(f: Facts, r: Region, t: Tree, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if try trunk_valid_pos(f, r, t, x, y, z) {
+        return true
+    }
+    return f.in_set(try r.state(f, x, y, z), t.tags.logs)
+}
+
+fn set_tracked(f: Facts, r: mut Region, set: mut JavaHashSet<Pos>, x: i32, y: i32, z: i32, state: u32) {
+    set.insert(Pos { x: x, y: y, z: z })
+    _ = r.set_block(f, x, y, z, state, TREE_FLAGS)
+}
+
+/// A decorator's `setBlock`: the block set and kept among the decorations.
+pub fn set_decoration(f: Facts, r: mut Region, g: mut Grow, x: i32, y: i32, z: i32, state: u32) {
+    set_tracked(f, mut r, mut g.decorations, x, y, z, state)
+}
+
+// The axis a log is turned to, by name.
+fn axis_name(axis: i32) -> String {
+    return match axis {
+        0 => "x",
+        1 => "y",
+        _ => "z",
+    }
+}
+
+// The axis of a direction: 0 for `x`, 1 for `y`, 2 for `z`.
+fn axis_of(d: i32) -> i32 {
+    if d == WEST or d == EAST {
+        return 0
+    }
+    if d == DOWN or d == UP {
+        return 1
+    }
+    return 2
+}
+
+// `TrunkPlacer.placeLog`: the trunk provider's state, turned to `axis` if it's 0 or more and has
+// an axis, where the trunk may grow.
+fn place_log<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, x: i32, y: i32, z: i32, axis: i32) -> bool ! Thrown {
+    let Env { facts: f, .. } = e
+    if not try trunk_valid_pos(f, r, t, x, y, z) {
+        return false
+    }
+    var s = try get_state(e, ps, r, mut rand, t.trunk_provider, x, y, z)
+    if axis >= 0 {
+        s = f.try_name(s, "axis", axis_name(axis))
+    }
+    set_tracked(f, mut r, mut g.trunks, x, y, z, s)
+    return true
+}
+
+// `TrunkPlacer.placeBelowTrunkBlock`.
+fn place_below_trunk<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, x: i32, y: i32, z: i32) ! Thrown {
+    if let s = try optional_state(e, ps, r, mut rand, t.below_trunk, x, y, z) {
+        set_tracked(e.facts, mut r, mut g.trunks, x, y, z, s)
+    }
+}
+
+// `FoliagePlacer.tryPlaceLeaf`: the foliage provider's state, waterlogged in source water, where
+// no persistent leaves are and a tree may grow.
+fn try_place_leaf<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let Env { facts: f, .. } = e
+    let here = try r.state(f, x, y, z)
+    if f.get_bool(here, "persistent") {
+        return false
+    }
+    if not (f.is_air(here) or f.in_set(here, t.tags.replaceable)) {
+        return false
+    }
+    var s = try get_state(e, ps, r, mut rand, t.foliage_provider, x, y, z)
+    if f.has(s, "waterlogged") {
+        s = try f.with_bool(s, "waterlogged", f.fluid(here) == WATER_FLUID)
+    }
+    set_tracked(f, mut r, mut g.foliage, x, y, z, s)
+    return true
+}
+
+// `Direction.Plane.HORIZONTAL.getRandomDirection`.
+fn random_horizontal<T: RandomSource>(rand: mut T) -> i32 {
+    return horizontal(rand.next_int_below(4))
+}
+
+/// `Util.shuffle`: from the end, each element swapped with one at `nextInt` of its index and
+/// one.
+pub fn shuffle_positions<T: RandomSource>(xs: mut List<Pos>, rand: mut T) {
+    var i = xs.len()
+    while i > 1 {
+        let j = usize.wrap(rand.next_int_below(i32.wrap(i)))
+        xs.swap(i - 1, j)
+        i -= 1
+    }
+}
+
+// `Direction.allShuffled`.
+fn all_shuffled<T: RandomSource>(rand: mut T) -> List<i32> {
+    var ds: List<i32> = [0, 1, 2, 3, 4, 5]
+    var i: usize = 6
+    while i > 1 {
+        let j = usize.wrap(rand.next_int_below(i32.wrap(i)))
+        ds.swap(i - 1, j)
+        i -= 1
+    }
+    return ds
+}
+
+// Growing.
+
+/// `TreeFeature.doPlace`: the tree's height and foliage drawn, then, if the tree fits in the
+/// world and has room, its roots, trunk and foliage placed.
+pub fn grow<T: RandomSource>(e: Env, ps: Providers, sin_table: SinTable, r: mut Region, rand: mut T, t: Tree, g: mut Grow, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let tree_height = t.trunk.base + rand.next_int_below(t.trunk.rand_a + 1) + rand.next_int_below(t.trunk.rand_b + 1)
+    let foliage_height = try foliage_height_of(t.foliage, mut rand, tree_height)
+    let trunk_height = tree_height - foliage_height
+    let leaf_radius = try foliage_radius(t.foliage, mut rand, trunk_height)
+    var ty = y
+    if let root = t.root {
+        ty = y + try root.offset_y.sample(mut rand)
+    }
+    let min_y = y.min(ty)
+    let max_y = y.max(ty) + tree_height + 1
+    if min_y < r.min_y + 1 or max_y > r.min_y + r.height {
+        return false
+    }
+    let clipped = try max_free_height(e.facts, r, t, tree_height, x, ty, z)
+    let min_clipped = match t.size {
+        FeatureSize.TwoLayers { clipped: mc, .. } => mc,
+        FeatureSize.ThreeLayers { clipped: mc, .. } => mc,
+    }
+    var fits = clipped >= tree_height
+    if let mc = min_clipped {
+        if clipped >= mc {
+            fits = true
+        }
+    }
+    if not fits {
+        return false
+    }
+    if let root = t.root {
+        if not try place_roots(e, ps, mut r, mut rand, t, root, mut g, x, y, z, ty) {
+            return false
+        }
+    }
+    let attachments = try place_trunk(e, ps, sin_table, mut r, mut rand, t, mut g, clipped, x, ty, z)
+    for a in attachments {
+        try create_foliage(e, ps, mut r, mut rand, t, mut g, clipped, a, foliage_height, leaf_radius)
+    }
+    return true
+}
+
+// `TreeFeature.getMaxFreeTreeHeight`: two below the first height whose square isn't free.
+fn max_free_height(f: Facts, r: Region, t: Tree, tree_height: i32, x: i32, y: i32, z: i32) -> i32 ! Thrown {
+    for yy in 0..tree_height + 2 {
+        let rad = size_at(t.size, tree_height, yy)
+        for dx in -rad..rad + 1 {
+            for dz in -rad..rad + 1 {
+                let px = x + dx
+                let py = y + yy
+                let pz = z + dz
+                if not try is_free(f, r, t, px, py, pz) {
+                    return yy - 2
+                }
+                if not t.ignore_vines and f.is(try r.state(f, px, py, pz), f.ids.vine) {
+                    return yy - 2
+                }
+            }
+        }
+    }
+    return tree_height
+}
+
+// `FeatureSize.getSizeAtHeight`.
+fn size_at(s: FeatureSize, tree_height: i32, yo: i32) -> i32 {
+    match s {
+        FeatureSize.TwoLayers { limit, lower, upper, .. } => return if yo < limit { lower } else { upper },
+        FeatureSize.ThreeLayers { limit, upper_limit, lower, middle, upper, .. } => {
+            if yo < limit {
+                return lower
+            }
+            return if yo >= tree_height - upper_limit { upper } else { middle }
+        },
+    }
+}
+
+// Roots: `MangroveRootPlacer.placeRoots`.
+
+// `MangroveRootPlacer.canPlaceRoot`.
+fn can_place_root(f: Facts, r: Region, t: Tree, root: RootPlacer, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if try valid_tree_pos(f, r, t, x, y, z) {
+        return true
+    }
+    return f.in_set(try r.state(f, x, y, z), root.through)
+}
+
+// `RootPlacer.getPotentiallyWaterloggedState`: waterlogged where there's water.
+fn waterlogged_root(f: Facts, r: Region, x: i32, y: i32, z: i32, state: u32) -> u32 ! Thrown {
+    if not f.has(state, "waterlogged") {
+        return state
+    }
+    let here = try r.state(f, x, y, z)
+    return try f.with_bool(state, "waterlogged", f.fluid_in(here, "minecraft:water"))
+}
+
+fn place_roots<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, root: RootPlacer, g: mut Grow, x: i32, y: i32, z: i32, ty: i32) -> bool ! Thrown {
+    let Env { facts: f, .. } = e
+    var cy = y
+    while cy < ty {
+        if not try can_place_root(f, r, t, root, x, cy, z) {
+            return false
+        }
+        cy += 1
+    }
+    var positions: List<Pos> = [Pos { x: x, y: ty - 1, z: z }]
+    for i in 0..4 {
+        let d = horizontal(i)
+        let px = x + step_x(d)
+        let pz = z + step_z(d)
+        var found = List<Pos>()
+        if not try simulate_roots(f, r, mut rand, t, root, px, ty, pz, d, x, ty, z, mut found, 0) {
+            return false
+        }
+        for p in found {
+            positions.push(p)
+        }
+        positions.push(Pos { x: px, y: ty, z: pz })
+    }
+    for p in positions {
+        try place_root(e, ps, mut r, mut rand, t, root, mut g, p.x, p.y, p.z)
+    }
+    return true
+}
+
+// `MangroveRootPlacer.simulateRoots`.
+fn simulate_roots<T: RandomSource>(f: Facts, r: Region, rand: mut T, t: Tree, root: RootPlacer, x: i32, y: i32, z: i32, d: i32, ox: i32, oy: i32, oz: i32, found: mut List<Pos>, layer: i32) -> bool ! Thrown {
+    if layer == root.length or found.len() > usize.wrap(root.length) {
+        return false
+    }
+    for p in potential_roots(mut rand, root, x, y, z, d, ox, oy, oz) {
+        if try can_place_root(f, r, t, root, p.x, p.y, p.z) {
+            found.push(p)
+            if not try simulate_roots(f, r, mut rand, t, root, p.x, p.y, p.z, d, ox, oy, oz, mut found, layer + 1) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// `MangroveRootPlacer.potentialRootPositions`.
+fn potential_roots<T: RandomSource>(rand: mut T, root: RootPlacer, x: i32, y: i32, z: i32, d: i32, ox: i32, oy: i32, oz: i32) -> List<Pos> {
+    let below = Pos { x: x, y: y - 1, z: z }
+    let nx = x + step_x(d)
+    let nz = z + step_z(d)
+    let width = (x - ox).abs() + (y - oy).abs() + (z - oz).abs()
+    if width > root.width - 3 and width <= root.width {
+        if rand.next_float() < root.skew {
+            return [below, Pos { x: nx, y: y - 1, z: nz }]
+        }
+        return [below]
+    }
+    if width > root.width {
+        return [below]
+    }
+    if rand.next_float() < root.skew {
+        return [below]
+    }
+    if rand.next_boolean() {
+        return [Pos { x: nx, y: y, z: nz }]
+    }
+    return [below]
+}
+
+// `MangroveRootPlacer.placeRoot`: muddy roots in mud, else the root provider's state, and
+// perhaps the block above.
+fn place_root<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, root: RootPlacer, g: mut Grow, x: i32, y: i32, z: i32) ! Thrown {
+    let Env { facts: f, .. } = e
+    if f.in_set(try r.state(f, x, y, z), root.muddy_in) {
+        let s = try get_state(e, ps, r, mut rand, root.muddy, x, y, z)
+        let w = try waterlogged_root(f, r, x, y, z, s)
+        set_tracked(f, mut r, mut g.roots, x, y, z, w)
+        return
+    }
+    if not try can_place_root(f, r, t, root, x, y, z) {
+        return
+    }
+    let s = try get_state(e, ps, r, mut rand, root.provider, x, y, z)
+    let w = try waterlogged_root(f, r, x, y, z, s)
+    set_tracked(f, mut r, mut g.roots, x, y, z, w)
+    if let above = root.above {
+        if rand.next_float() < root.above_chance and f.is_air(try r.state(f, x, y + 1, z)) {
+            let a = try get_state(e, ps, r, mut rand, above, x, y + 1, z)
+            let wa = try waterlogged_root(f, r, x, y + 1, z, a)
+            set_tracked(f, mut r, mut g.roots, x, y + 1, z, wa)
+        }
+    }
+}
+
+// Trunks.
+
+fn place_trunk<T: RandomSource>(e: Env, ps: Providers, sin_table: SinTable, r: mut Region, rand: mut T, t: Tree, g: mut Grow, height: i32, x: i32, y: i32, z: i32) -> List<Attachment> ! Thrown {
+    match t.trunk.kind {
+        TrunkKind.Straight => {
+            try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x, y - 1, z)
+            for i in 0..height {
+                _ = try place_log(e, ps, mut r, mut rand, t, mut g, x, y + i, z, -1)
+            }
+            return [attach(x, y + height, z, 0, false)]
+        },
+        TrunkKind.Forking => return try forking_trunk(e, ps, mut r, mut rand, t, mut g, height, x, y, z),
+        TrunkKind.Giant => return try giant_trunk(e, ps, mut r, mut rand, t, mut g, height, x, y, z),
+        TrunkKind.MegaJungle => {
+            var out = try giant_trunk(e, ps, mut r, mut rand, t, mut g, height, x, y, z)
+            var branch = height - 2 - rand.next_int_below(4)
+            while branch > height / 2 {
+                let angle = rand.next_float() * 6.2831855f32
+                var bx = 0
+                var bz = 0
+                for b in 0..5 {
+                    bx = i32.saturate(1.5f32 + sin_table.cos(f64(angle)) * f32.nearest(b))
+                    bz = i32.saturate(1.5f32 + sin_table.sin(f64(angle)) * f32.nearest(b))
+                    _ = try place_log(e, ps, mut r, mut rand, t, mut g, x + bx, y + branch - 3 + b / 2, z + bz, -1)
+                }
+                out.push(attach(x + bx, y + branch, z + bz, -2, false))
+                branch -= 2 + rand.next_int_below(4)
+            }
+            return out
+        },
+        TrunkKind.DarkOak => return try dark_oak_trunk(e, ps, mut r, mut rand, t, mut g, height, x, y, z),
+        TrunkKind.Fancy => return try fancy_trunk(e, ps, mut r, mut rand, t, mut g, height, x, y, z),
+        TrunkKind.Bending { min_leaves, bend } => return try bending_trunk(e, ps, mut r, mut rand, t, mut g, height, min_leaves, bend, x, y, z),
+        TrunkKind.Upwards { steps, chance, length, .. } => return try upwards_trunk(e, ps, mut r, mut rand, t, mut g, height, steps, chance, length, x, y, z),
+        TrunkKind.Cherry { count, horizontal: hl, start_min, start_max, end } => return try cherry_trunk(e, ps, mut r, mut rand, t, mut g, height, count, hl, start_min, start_max, end, x, y, z),
+        TrunkKind.Poplar { above, branches } => return try poplar_trunk(e, ps, mut r, mut rand, t, mut g, height, above, branches, x, y, z),
+    }
+}
+
+// `ForkingTrunkPlacer.placeTrunk`.
+fn forking_trunk<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, height: i32, x: i32, y: i32, z: i32) -> List<Attachment> ! Thrown {
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x, y - 1, z)
+    var out = List<Attachment>()
+    let lean = random_horizontal(mut rand)
+    let lean_height = height - rand.next_int_below(4) - 1
+    var lean_steps = 3 - rand.next_int_below(3)
+    var tx = x
+    var tz = z
+    var ey: i32? = none
+    for yo in 0..height {
+        let yy = y + yo
+        if yo >= lean_height and lean_steps > 0 {
+            tx += step_x(lean)
+            tz += step_z(lean)
+            lean_steps -= 1
+        }
+        if try place_log(e, ps, mut r, mut rand, t, mut g, tx, yy, tz, -1) {
+            ey = some(yy + 1)
+        }
+    }
+    if let top = ey {
+        out.push(attach(tx, top, tz, 1, false))
+    }
+    tx = x
+    tz = z
+    let branch = random_horizontal(mut rand)
+    if branch != lean {
+        let branch_pos = lean_height - rand.next_int_below(2) - 1
+        var branch_steps = 1 + rand.next_int_below(3)
+        ey = none
+        var yo = branch_pos
+        while yo < height and branch_steps > 0 {
+            if yo >= 1 {
+                let yy = y + yo
+                tx += step_x(branch)
+                tz += step_z(branch)
+                if try place_log(e, ps, mut r, mut rand, t, mut g, tx, yy, tz, -1) {
+                    ey = some(yy + 1)
+                }
+            }
+            yo += 1
+            branch_steps -= 1
+        }
+        if let top = ey {
+            out.push(attach(tx, top, tz, 0, false))
+        }
+    }
+    return out
+}
+
+// `TrunkPlacer.placeLogIfFree`.
+fn place_log_if_free<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, x: i32, y: i32, z: i32) ! Thrown {
+    if try is_free(e.facts, r, t, x, y, z) {
+        _ = try place_log(e, ps, mut r, mut rand, t, mut g, x, y, z, -1)
+    }
+}
+
+// `GiantTrunkPlacer.placeTrunk`.
+fn giant_trunk<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, height: i32, x: i32, y: i32, z: i32) -> List<Attachment> ! Thrown {
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x, y - 1, z)
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x + 1, y - 1, z)
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x, y - 1, z + 1)
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x + 1, y - 1, z + 1)
+    for hh in 0..height {
+        try place_log_if_free(e, ps, mut r, mut rand, t, mut g, x, y + hh, z)
+        if hh < height - 1 {
+            try place_log_if_free(e, ps, mut r, mut rand, t, mut g, x + 1, y + hh, z)
+            try place_log_if_free(e, ps, mut r, mut rand, t, mut g, x + 1, y + hh, z + 1)
+            try place_log_if_free(e, ps, mut r, mut rand, t, mut g, x, y + hh, z + 1)
+        }
+    }
+    return [attach(x, y + height, z, 0, true)]
+}
+
+// `DarkOakTrunkPlacer.placeTrunk`.
+fn dark_oak_trunk<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, height: i32, x: i32, y: i32, z: i32) -> List<Attachment> ! Thrown {
+    let Env { facts: f, .. } = e
+    var out = List<Attachment>()
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x, y - 1, z)
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x + 1, y - 1, z)
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x, y - 1, z + 1)
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x + 1, y - 1, z + 1)
+    let lean = random_horizontal(mut rand)
+    let lean_height = height - rand.next_int_below(4)
+    var lean_steps = 2 - rand.next_int_below(3)
+    var tx = x
+    var tz = z
+    let ey = y + height - 1
+    for dy in 0..height {
+        if dy >= lean_height and lean_steps > 0 {
+            tx += step_x(lean)
+            tz += step_z(lean)
+            lean_steps -= 1
+        }
+        let yy = y + dy
+        let here = try r.state(f, tx, yy, tz)
+        // `TreeFeature.isAirOrLeaves`.
+        if f.is_air(here) or f.in_set(here, t.tags.leaves) {
+            _ = try place_log(e, ps, mut r, mut rand, t, mut g, tx, yy, tz, -1)
+            _ = try place_log(e, ps, mut r, mut rand, t, mut g, tx + 1, yy, tz, -1)
+            _ = try place_log(e, ps, mut r, mut rand, t, mut g, tx, yy, tz + 1, -1)
+            _ = try place_log(e, ps, mut r, mut rand, t, mut g, tx + 1, yy, tz + 1, -1)
+        }
+    }
+    out.push(attach(tx, ey, tz, 0, true))
+    for ox in -1..3 {
+        for oz in -1..3 {
+            if (ox < 0 or ox > 1 or oz < 0 or oz > 1) and rand.next_int_below(3) <= 0 {
+                let length = rand.next_int_below(3) + 2
+                for branch_y in 0..length {
+                    _ = try place_log(e, ps, mut r, mut rand, t, mut g, x + ox, ey - branch_y - 1, z + oz, -1)
+                }
+                out.push(attach(x + ox, ey, z + oz, 0, false))
+            }
+        }
+    }
+    return out
+}
+
+// `FancyTrunkPlacer.FoliageCoords`.
+struct FoliageCoords {
+    x: i32
+    y: i32
+    z: i32
+    branch_base: i32
+}
+
+// `FancyTrunkPlacer.placeTrunk`.
+fn fancy_trunk<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, tree_height: i32, x: i32, y: i32, z: i32) -> List<Attachment> ! Thrown {
+    let height = tree_height + 2
+    let trunk_height = floor(f64(height) * 0.618)
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x, y - 1, z)
+    let ratio = 1.0 * f64(height) / 13.0
+    let clusters = 1.min(floor(1.382 + ratio * ratio))
+    let trunk_top = y + trunk_height
+    var relative_y = height - 5
+    var coords: List<FoliageCoords> = [FoliageCoords { x: x, y: y + relative_y, z: z, branch_base: trunk_top }]
+    while relative_y >= 0 {
+        let shape = tree_shape(height, relative_y)
+        if not (shape < 0.0f32) {
+            for _ in 0..clusters {
+                let radius = 1.0 * f64(shape) * (f64(rand.next_float()) + 0.328)
+                let angle = f64(rand.next_float() * 2.0f32) * 3.141592653589793
+                let px = radius * sin(angle) + 0.5
+                let pz = radius * cos(angle) + 0.5
+                let sx = x + floor(px)
+                let sy = y + relative_y - 1
+                let sz = z + floor(pz)
+                if try make_limb(e, ps, mut r, mut rand, t, mut g, sx, sy, sz, sx, sy + 5, sz, false) {
+                    let dx = x - sx
+                    let dz = z - sz
+                    let branch_height = f64(sy) - f64(dx * dx + dz * dz).sqrt() * 0.381
+                    let branch_top = if branch_height > f64(trunk_top) { trunk_top } else { i32.saturate(branch_height) }
+                    if try make_limb(e, ps, mut r, mut rand, t, mut g, x, branch_top, z, sx, sy, sz, false) {
+                        coords.push(FoliageCoords { x: sx, y: sy, z: sz, branch_base: branch_top })
+                    }
+                }
+            }
+        }
+        relative_y -= 1
+    }
+    _ = try make_limb(e, ps, mut r, mut rand, t, mut g, x, y, z, x, y + trunk_height, z, true)
+    // `makeBranches`.
+    for c in coords {
+        let base_is_end = c.x == x and c.branch_base == c.y and c.z == z
+        if not base_is_end and trim_branches(height, c.branch_base - y) {
+            _ = try make_limb(e, ps, mut r, mut rand, t, mut g, x, c.branch_base, z, c.x, c.y, c.z, true)
+        }
+    }
+    var out = List<Attachment>()
+    for c in coords {
+        if trim_branches(height, c.branch_base - y) {
+            out.push(attach(c.x, c.y, c.z, 0, false))
+        }
+    }
+    return out
+}
+
+// `FancyTrunkPlacer.trimBranches`.
+fn trim_branches(height: i32, local_y: i32) -> bool {
+    return f64(local_y) >= f64(height) * 0.2
+}
+
+// `FancyTrunkPlacer.treeShape`.
+fn tree_shape(height: i32, y: i32) -> f32 {
+    if f32.nearest(y) < f32.nearest(height) * 0.3f32 {
+        return -1.0f32
+    }
+    let radius = f32.nearest(height) / 2.0f32
+    let adjacent = radius - f32.nearest(y)
+    var distance = f32.nearest(f64(radius * radius - adjacent * adjacent).sqrt())
+    if adjacent == 0.0f32 {
+        distance = radius
+    } else if adjacent.abs() >= radius {
+        return 0.0f32
+    }
+    return distance * 0.5f32
+}
+
+// `FancyTrunkPlacer.makeLimb`: the line from the start to the end, placed as logs along their
+// axis, or only checked free.
+fn make_limb<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, sx: i32, sy: i32, sz: i32, ex: i32, ey: i32, ez: i32, place: bool) -> bool ! Thrown {
+    if not place and sx == ex and sy == ey and sz == ez {
+        return true
+    }
+    let ddx = ex - sx
+    let ddy = ey - sy
+    let ddz = ez - sz
+    let steps = ddx.abs().max(ddy.abs().max(ddz.abs()))
+    let fx = f32.nearest(ddx) / f32.nearest(steps)
+    let fy = f32.nearest(ddy) / f32.nearest(steps)
+    let fz = f32.nearest(ddz) / f32.nearest(steps)
+    for i in 0..steps + 1 {
+        let fi = f32.nearest(i)
+        let px = sx + floor(f64(0.5f32 + fi * fx))
+        let py = sy + floor(f64(0.5f32 + fi * fy))
+        let pz = sz + floor(f64(0.5f32 + fi * fz))
+        if place {
+            // `getLogAxis`.
+            let xdiff = (px - sx).abs()
+            let zdiff = (pz - sz).abs()
+            let maxdiff = xdiff.max(zdiff)
+            var axis = 1
+            if maxdiff > 0 {
+                axis = if xdiff == maxdiff { 0 } else { 2 }
+            }
+            _ = try place_log(e, ps, mut r, mut rand, t, mut g, px, py, pz, axis)
+        } else if not try is_free(e.facts, r, t, px, py, pz) {
+            return false
+        }
+    }
+    return true
+}
+
+// `BendingTrunkPlacer.placeTrunk`.
+fn bending_trunk<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, height: i32, min_leaves: i32, bend: IntProvider, x: i32, y: i32, z: i32) -> List<Attachment> ! Thrown {
+    let Env { facts: f, .. } = e
+    let d = random_horizontal(mut rand)
+    let log_height = height - 1
+    var px = x
+    var py = y
+    var pz = z
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x, y - 1, z)
+    var out = List<Attachment>()
+    for i in 0..log_height + 1 {
+        if i + 1 >= log_height + rand.next_int_below(2) {
+            px += step_x(d)
+            pz += step_z(d)
+        }
+        if try valid_tree_pos(f, r, t, px, py, pz) {
+            _ = try place_log(e, ps, mut r, mut rand, t, mut g, px, py, pz, -1)
+        }
+        if i >= min_leaves {
+            out.push(attach(px, py, pz, 0, false))
+        }
+        py += 1
+    }
+    let length = try bend.sample(mut rand)
+    for _ in 0..length + 1 {
+        if try valid_tree_pos(f, r, t, px, py, pz) {
+            _ = try place_log(e, ps, mut r, mut rand, t, mut g, px, py, pz, -1)
+        }
+        out.push(attach(px, py, pz, 0, false))
+        px += step_x(d)
+        pz += step_z(d)
+    }
+    return out
+}
+
+// `UpwardsBranchingTrunkPlacer.placeTrunk`.
+fn upwards_trunk<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, height: i32, steps: IntProvider, chance: f32, length: IntProvider, x: i32, y: i32, z: i32) -> List<Attachment> ! Thrown {
+    var out = List<Attachment>()
+    for h in 0..height {
+        let current = y + h
+        if try place_log(e, ps, mut r, mut rand, t, mut g, x, current, z, -1) and h < height - 1 and rand.next_float() < chance {
+            let d = random_horizontal(mut rand)
+            let branch_len = try length.sample(mut rand)
+            let branch_pos = 0.max(branch_len - try length.sample(mut rand) - 1)
+            let branch_steps = try steps.sample(mut rand)
+            try upwards_branch(e, ps, mut r, mut rand, t, mut g, height, mut out, x, z, current, d, branch_pos, branch_steps)
+        }
+        if h == height - 1 {
+            out.push(attach(x, current + 1, z, 0, false))
+        }
+    }
+    return out
+}
+
+// `UpwardsBranchingTrunkPlacer.placeBranch`.
+fn upwards_branch<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, height: i32, out: mut List<Attachment>, x: i32, z: i32, current: i32, d: i32, branch_pos: i32, branch_steps: i32) ! Thrown {
+    var along = current + branch_pos
+    var lx = x
+    var lz = z
+    var index = branch_pos
+    var left = branch_steps
+    while index < height and left > 0 {
+        if index >= 1 {
+            let py = current + index
+            lx += step_x(d)
+            lz += step_z(d)
+            along = py
+            if try place_log(e, ps, mut r, mut rand, t, mut g, lx, py, lz, -1) {
+                along += 1
+            }
+            out.push(attach(lx, py, lz, 0, false))
+        }
+        index += 1
+        left -= 1
+    }
+    if along - current > 1 {
+        out.push(attach(lx, along, lz, 0, false))
+        out.push(attach(lx, along - 2, lz, 0, false))
+    }
+}
+
+// `CherryTrunkPlacer.placeTrunk`.
+fn cherry_trunk<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, height: i32, count: IntProvider, horizontal_length: IntProvider, start_min: i32, start_max: i32, end: IntProvider, x: i32, y: i32, z: i32) -> List<Attachment> ! Thrown {
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x, y - 1, z)
+    let first_start = rand.next_int_between(start_min, start_max)
+    let first = 0.max(height - 1 + first_start)
+    let second_start = rand.next_int_between(start_min, start_max - 1)
+    var second = 0.max(height - 1 + second_start)
+    if second >= first {
+        second += 1
+    }
+    let branches = try count.sample(mut rand)
+    let middle = branches == 3
+    let both = branches >= 2
+    let trunk_height = if middle { height } else if both { first.max(second) + 1 } else { first + 1 }
+    for i in 0..trunk_height {
+        _ = try place_log(e, ps, mut r, mut rand, t, mut g, x, y + i, z, -1)
+    }
+    var out = List<Attachment>()
+    if middle {
+        out.push(attach(x, y + trunk_height, z, 0, false))
+    }
+    let d = random_horizontal(mut rand)
+    out.push(try cherry_branch(e, ps, mut r, mut rand, t, mut g, height, horizontal_length, end, x, y, z, d, first, first < trunk_height - 1))
+    if both {
+        out.push(try cherry_branch(e, ps, mut r, mut rand, t, mut g, height, horizontal_length, end, x, y, z, opposite(d), second, second < trunk_height - 1))
+    }
+    return out
+}
+
+// `CherryTrunkPlacer.generateBranch`.
+fn cherry_branch<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, height: i32, horizontal_length: IntProvider, end: IntProvider, x: i32, y: i32, z: i32, d: i32, offset: i32, continues: bool) -> Attachment ! Thrown {
+    let sideways = axis_of(d)
+    var lx = x
+    var ly = y + offset
+    var lz = z
+    let end_offset = height - 1 + try end.sample(mut rand)
+    let away = continues or end_offset < offset
+    let distance = try horizontal_length.sample(mut rand) + (if away { 1 } else { 0 })
+    let ex = x + step_x(d) * distance
+    let ey = y + end_offset
+    let ez = z + step_z(d) * distance
+    let steps = if away { 2 } else { 1 }
+    for _ in 0..steps {
+        lx += step_x(d)
+        lz += step_z(d)
+        _ = try place_log(e, ps, mut r, mut rand, t, mut g, lx, ly, lz, sideways)
+    }
+    let vertical = if ey > ly { 1 } else { -1 }
+    loop {
+        let dist = (lx - ex).abs() + (ly - ey).abs() + (lz - ez).abs()
+        if dist == 0 {
+            return attach(ex, ey + 1, ez, 0, false)
+        }
+        let grow_chance = f32.nearest((ey - ly).abs()) / f32.nearest(dist)
+        let up = rand.next_float() < grow_chance
+        if up {
+            ly += vertical
+        } else {
+            lx += step_x(d)
+            lz += step_z(d)
+        }
+        _ = try place_log(e, ps, mut r, mut rand, t, mut g, lx, ly, lz, if up { -1 } else { sideways })
+    }
+}
+
+// `PoplarTrunkPlacer.placeTrunk`.
+fn poplar_trunk<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, height: i32, above: IntProvider, branches: IntProvider, x: i32, y: i32, z: i32) -> List<Attachment> ! Thrown {
+    try place_below_trunk(e, ps, mut r, mut rand, t, mut g, x, y - 1, z)
+    let up_to_branches = height - try above.sample(mut rand)
+    for i in 0..height {
+        _ = try place_log(e, ps, mut r, mut rand, t, mut g, x, y + i, z, -1)
+        // `getShuffledBranchDirections`: all six shuffled, the horizontal ones kept.
+        var directions = List<i32>()
+        for d in all_shuffled(mut rand) {
+            if d != UP and d != DOWN {
+                directions.push(d)
+            }
+        }
+        if up_to_branches - 1 == i {
+            let n = try branches.sample(mut rand)
+            for k in 0..n {
+                let d = directions[usize.wrap(k)]
+                _ = try place_log(e, ps, mut r, mut rand, t, mut g, x + step_x(d), y + i, z + step_z(d), axis_of(d))
+            }
+        }
+    }
+    return [attach(x, y + up_to_branches, z, 0, false)]
+}
+
+// Foliage.
+
+// `FoliagePlacer.foliageHeight`.
+fn foliage_height_of<T: RandomSource>(p: FoliagePlacer, rand: mut T, tree_height: i32) -> i32 ! Thrown {
+    match p.kind {
+        FoliageKind.Blob(h) => return h,
+        FoliageKind.Bush(h) => return h,
+        FoliageKind.Fancy(h) => return h,
+        FoliageKind.Jungle(h) => return h,
+        FoliageKind.Acacia => return 0,
+        FoliageKind.DarkOak => return 4,
+        FoliageKind.Spruce(trunk) => return 4.max(tree_height - try trunk.sample(mut rand)),
+        FoliageKind.Pine(h) => return try h.sample(mut rand),
+        FoliageKind.MegaPine(h) => return try h.sample(mut rand),
+        FoliageKind.RandomSpread { height, .. } => return try height.sample(mut rand),
+        FoliageKind.Cherry { height, .. } => return try height.sample(mut rand),
+        FoliageKind.Poplar { height, .. } => return try height.sample(mut rand),
+    }
+}
+
+// `FoliagePlacer.foliageRadius`: a pine adds to it with the trunk's height.
+fn foliage_radius<T: RandomSource>(p: FoliagePlacer, rand: mut T, trunk_height: i32) -> i32 ! Thrown {
+    let base = try p.radius.sample(mut rand)
+    match p.kind {
+        FoliageKind.Pine(_) => return base + rand.next_int_below((trunk_height + 1).max(1)),
+        _ => return base,
+    }
+}
+
+// `shouldSkipLocation` of the placer, at distances from the attachment.
+fn skip<T: RandomSource>(p: FoliagePlacer, rand: mut T, dx: i32, y: i32, dz: i32, radius: i32, double_trunk: bool) -> bool {
+    match p.kind {
+        FoliageKind.Blob(_) => return dx == radius and dz == radius and (rand.next_int_below(2) == 0 or y == 0),
+        FoliageKind.Bush(_) => return dx == radius and dz == radius and rand.next_int_below(2) == 0,
+        FoliageKind.Fancy(_) => {
+            let fx = f32.nearest(dx) + 0.5f32
+            let fz = f32.nearest(dz) + 0.5f32
+            return fx * fx + fz * fz > f32.nearest(radius * radius)
+        },
+        FoliageKind.Jungle(_) => return dx + dz >= 7 or dx * dx + dz * dz > radius * radius,
+        FoliageKind.MegaPine(_) => return dx + dz >= 7 or dx * dx + dz * dz > radius * radius,
+        FoliageKind.Acacia => {
+            if y == 0 {
+                return (dx > 1 or dz > 1) and dx != 0 and dz != 0
+            }
+            return dx == radius and dz == radius and radius > 0
+        },
+        FoliageKind.DarkOak => {
+            if y == -1 and not double_trunk {
+                return dx == radius and dz == radius
+            }
+            if y == 1 {
+                return dx + dz > radius * 2 - 2
+            }
+            return false
+        },
+        FoliageKind.Spruce(_) => return dx == radius and dz == radius and radius > 0,
+        FoliageKind.Pine(_) => return dx == radius and dz == radius and radius > 0,
+        FoliageKind.RandomSpread { .. } => return false,
+        FoliageKind.Cherry { wide_hole, corner_hole, .. } => {
+            if y == -1 and (dx == radius or dz == radius) and rand.next_float() < wide_hole {
+                return true
+            }
+            let corner = dx == radius and dz == radius
+            if radius > 2 {
+                return corner or (dx + dz > radius * 2 - 2 and rand.next_float() < corner_hole)
+            }
+            return corner and rand.next_float() < corner_hole
+        },
+        FoliageKind.Poplar { .. } => return false,
+    }
+}
+
+// `shouldSkipLocationSigned`: by the distances from the trunk, or a double trunk's nearer half.
+fn skip_signed<T: RandomSource>(p: FoliagePlacer, rand: mut T, dx: i32, y: i32, dz: i32, radius: i32, double_trunk: bool) -> bool {
+    match p.kind {
+        FoliageKind.DarkOak => {
+            if y == 0 and double_trunk and (dx == -radius or dx >= radius) and (dz == -radius or dz >= radius) {
+                return true
+            }
+        },
+        _ => {},
+    }
+    if double_trunk {
+        return skip(p, mut rand, dx.abs().min((dx - 1).abs()), y, dz.abs().min((dz - 1).abs()), radius, double_trunk)
+    }
+    return skip(p, mut rand, dx.abs(), y, dz.abs(), radius, double_trunk)
+}
+
+// `FoliagePlacer.placeLeavesRow`.
+fn leaves_row<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, x: i32, y: i32, z: i32, radius: i32, dy: i32, double_trunk: bool) ! Thrown {
+    let extra = if double_trunk { 1 } else { 0 }
+    for dx in -radius..radius + extra + 1 {
+        for dz in -radius..radius + extra + 1 {
+            if not skip_signed(t.foliage, mut rand, dx, dy, dz, radius, double_trunk) {
+                _ = try try_place_leaf(e, ps, mut r, mut rand, t, mut g, x + dx, y + dy, z + dz)
+            }
+        }
+    }
+}
+
+// `FoliagePlacer.placeLeavesRowWithHangingLeavesBelow`.
+fn leaves_row_hanging<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, x: i32, y: i32, z: i32, radius: i32, dy: i32, double_trunk: bool, hanging: f32, extension: f32) ! Thrown {
+    try leaves_row(e, ps, mut r, mut rand, t, mut g, x, y, z, radius, dy, double_trunk)
+    let extra = if double_trunk { 1 } else { 0 }
+    let log_y = y - 1
+    for i in 0..4 {
+        let along = horizontal(i)
+        let to_edge = clockwise(along)
+        let to_edge_distance = if to_edge == SOUTH or to_edge == EAST { radius + extra } else { radius }
+        var px = x + step_x(to_edge) * to_edge_distance - step_x(along) * radius
+        let py = y + dy - 1
+        var pz = z + step_z(to_edge) * to_edge_distance - step_z(along) * radius
+        var k = -radius
+        while k < radius + extra {
+            let above = g.foliage.contains(Pos { x: px, y: py + 1, z: pz })
+            if above and try place_extension(e, ps, mut r, mut rand, t, mut g, hanging, x, log_y, z, px, py, pz) {
+                _ = try place_extension(e, ps, mut r, mut rand, t, mut g, extension, x, log_y, z, px, py - 1, pz)
+            }
+            k += 1
+            px += step_x(along)
+            pz += step_z(along)
+        }
+    }
+}
+
+// `FoliagePlacer.tryPlaceExtension`.
+fn place_extension<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, chance: f32, lx: i32, ly: i32, lz: i32, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if (x - lx).abs() + (y - ly).abs() + (z - lz).abs() >= 7 {
+        return false
+    }
+    if rand.next_float() > chance {
+        return false
+    }
+    return try try_place_leaf(e, ps, mut r, mut rand, t, mut g, x, y, z)
+}
+
+// `FoliagePlacer.createFoliage` of the placer, at one attachment.
+fn create_foliage<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, _tree_height: i32, a: Attachment, foliage_height: i32, leaf_radius: i32) ! Thrown {
+    let offset = try t.foliage.offset.sample(mut rand)
+    let dt = a.double_trunk
+    let height = foliage_height + a.height_offset
+    match t.foliage.kind {
+        FoliageKind.Blob(_) => {
+            var yo = offset
+            while yo >= offset - height {
+                let radius = (leaf_radius + a.radius_offset - 1 - yo / 2).max(0)
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, a.y, a.z, radius, yo, dt)
+                yo -= 1
+            }
+        },
+        FoliageKind.Bush(_) => {
+            var yo = offset
+            while yo >= offset - height {
+                let radius = leaf_radius + a.radius_offset - 1 - yo
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, a.y, a.z, radius, yo, dt)
+                yo -= 1
+            }
+        },
+        FoliageKind.Fancy(_) => {
+            var yo = offset
+            while yo >= offset - foliage_height {
+                let radius = leaf_radius + (if yo != offset and yo != offset - foliage_height { 1 } else { 0 })
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, a.y, a.z, radius, yo, dt)
+                yo -= 1
+            }
+        },
+        FoliageKind.Jungle(_) => {
+            let leaf_height = (if dt { foliage_height } else { 1 + rand.next_int_below(2) }) + a.height_offset
+            var yo = offset
+            while yo >= offset - leaf_height {
+                let radius = leaf_radius + a.radius_offset + 1 - yo
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, a.y, a.z, radius, yo, dt)
+                yo -= 1
+            }
+        },
+        FoliageKind.Acacia => {
+            let fy = a.y + offset
+            try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, leaf_radius + a.radius_offset, -1 - height, dt)
+            try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, leaf_radius - 1, -height, dt)
+            try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, leaf_radius + a.radius_offset - 1, 0, dt)
+        },
+        FoliageKind.DarkOak => {
+            let fy = a.y + offset
+            if dt {
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, leaf_radius + 2, -1, dt)
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, leaf_radius + 3, 0, dt)
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, leaf_radius + 2, 1, dt)
+                if rand.next_boolean() {
+                    try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, leaf_radius, 2, dt)
+                }
+            } else {
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, leaf_radius + 2, -1, dt)
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, leaf_radius + 1, 0, dt)
+            }
+        },
+        FoliageKind.Spruce(_) => {
+            var radius = rand.next_int_below(2)
+            var max_radius = 1
+            var min_radius = 0
+            var yo = offset
+            while yo >= -height {
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, a.y, a.z, radius, yo, dt)
+                if radius >= max_radius {
+                    radius = min_radius
+                    min_radius = 1
+                    max_radius = (max_radius + 1).min(leaf_radius + a.radius_offset)
+                } else {
+                    radius += 1
+                }
+                yo -= 1
+            }
+        },
+        FoliageKind.Pine(_) => {
+            var radius = 0
+            var yo = offset
+            while yo >= offset - height {
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, a.y, a.z, radius, yo, dt)
+                if radius >= 1 and yo == offset - height + 1 {
+                    radius -= 1
+                } else if radius < leaf_radius + a.radius_offset {
+                    radius += 1
+                }
+                yo -= 1
+            }
+        },
+        FoliageKind.MegaPine(_) => {
+            var prev = 0
+            var yy = a.y - height + offset
+            while yy <= a.y + offset {
+                let yo = a.y - yy
+                let smooth = leaf_radius + a.radius_offset + floor(f64(f32.nearest(yo) / f32.nearest(height) * 3.5f32))
+                let jagged = if yo > 0 and smooth == prev and (yy & 1) == 0 { smooth + 1 } else { smooth }
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, yy, a.z, jagged, 0, dt)
+                prev = smooth
+                yy += 1
+            }
+        },
+        FoliageKind.RandomSpread { attempts, .. } => {
+            for _ in 0..attempts {
+                let dx = rand.next_int_below(leaf_radius) - rand.next_int_below(leaf_radius)
+                let dy = rand.next_int_below(foliage_height) - rand.next_int_below(foliage_height)
+                let dz = rand.next_int_below(leaf_radius) - rand.next_int_below(leaf_radius)
+                _ = try try_place_leaf(e, ps, mut r, mut rand, t, mut g, a.x + dx, a.y + dy, a.z + dz)
+            }
+        },
+        FoliageKind.Cherry { hanging, extension, .. } => {
+            let fy = a.y + offset
+            let radius = leaf_radius + a.radius_offset - 1
+            try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, radius - 2, height - 3, dt)
+            try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, radius - 1, height - 4, dt)
+            var yo = height - 5
+            while yo >= 0 {
+                try leaves_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, radius, yo, dt)
+                yo -= 1
+            }
+            try leaves_row_hanging(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, radius, -1, dt, hanging, extension)
+            try leaves_row_hanging(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, radius - 1, -2, dt, hanging, extension)
+        },
+        FoliageKind.Poplar { side_hole, .. } => {
+            let fy = a.y + offset
+            let radius = leaf_radius + a.radius_offset - 1
+            let flip = rand.next_boolean()
+            try poplar_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, radius - 2, height - 1, dt, height, flip, side_hole)
+            try poplar_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, radius - 1, height - 2, dt, height, flip, side_hole)
+            try poplar_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, radius - 1, height - 3, dt, height, flip, side_hole)
+            var yo = height - 4
+            while yo >= 1 {
+                try poplar_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, radius, yo, dt, height, flip, side_hole)
+                yo -= 1
+            }
+            try poplar_logs(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, radius, height - 4, dt, height, flip)
+            try poplar_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, radius - 1, 0, dt, height, flip, side_hole)
+            try poplar_row(e, ps, mut r, mut rand, t, mut g, a.x, fy, a.z, (radius - 2).max(1).min(2), -1, dt, height, flip, side_hole)
+        },
+    }
+}
+
+// `PoplarFoliagePlacer.shouldRowBePartialRhombusShape`.
+fn partial_rhombus(height: i32, y: i32) -> bool {
+    return height - 1 == y or height - 2 == y
+}
+
+// `PoplarFoliagePlacer.getCornerBlocksToCutForRhombusShape`.
+fn rhombus_cut(dx: i32, dz: i32, radius: i32, partial: bool, flip: bool) -> i32 {
+    let small = if flip { (dx > 0 and dz > 0) or (dz < 0 and dx < 0) } else { (dx > 0 and dz < 0) or (dz > 0 and dx < 0) }
+    if small {
+        return radius - 1
+    }
+    return if partial { radius + 1 } else { radius }
+}
+
+// `PoplarFoliagePlacer.isWithinRhombusShape`.
+fn within_rhombus(radius: i32, ax: i32, az: i32, cut: i32, extra: i32) -> bool {
+    return ax + az <= radius * 2 - (cut + extra)
+}
+
+// `PoplarFoliagePlacer.placeLeavesRow`.
+fn poplar_row<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, x: i32, y: i32, z: i32, radius: i32, dy: i32, double_trunk: bool, height: i32, flip: bool, side_hole: f32) ! Thrown {
+    let extra = if double_trunk { 1 } else { 0 }
+    for dx in -radius..radius + extra + 1 {
+        for dz in -radius..radius + extra + 1 {
+            let partial = partial_rhombus(height, dy)
+            let cut = rhombus_cut(dx, dz, radius, partial, flip)
+            let ax = dx.abs()
+            let az = dz.abs()
+            var skipped = false
+            if partial and (ax == radius or az == radius) {
+                skipped = true
+            } else {
+                let removal = if rand.next_float() <= side_hole { 1 } else { 0 }
+                skipped = not within_rhombus(radius, ax, az, cut, removal)
+            }
+            if not skipped {
+                _ = try try_place_leaf(e, ps, mut r, mut rand, t, mut g, x + dx, y + dy, z + dz)
+            }
+        }
+    }
+}
+
+// `PoplarFoliagePlacer.replaceLeavesWithLog`: logs along the row's middle lines, where the
+// foliage provider's own state is.
+fn poplar_logs<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, x: i32, y: i32, z: i32, radius: i32, dy: i32, double_trunk: bool, height: i32, flip: bool) ! Thrown {
+    let Env { facts: f, .. } = e
+    let extra = if double_trunk { 1 } else { 0 }
+    for dx in -radius..radius + extra + 1 {
+        for dz in -radius..radius + extra + 1 {
+            let az = dz.abs()
+            let ax = dx.abs()
+            let cut = rhombus_cut(dx, dz, radius, partial_rhombus(height, dy), flip)
+            if within_rhombus(radius, ax, az, cut, 2) and ((az == 0 and radius - ax >= 4) or (ax == 0 and radius - az >= 4)) {
+                let px = x + dx
+                let py = y + dy
+                let pz = z + dz
+                let here = try r.state(f, px, py, pz)
+                let leaf = try get_state(e, ps, r, mut rand, t.foliage_provider, px, py, pz)
+                if here == leaf {
+                    let log = try get_state(e, ps, r, mut rand, t.trunk_provider, px, py, pz)
+                    let axis = if az == 0 { 0 } else { 2 }
+                    set_tracked(f, mut r, mut g.foliage, px, py, pz, f.try_name(log, "axis", axis_name(axis)))
+                }
+            }
+        }
+    }
+}
+
+// Decorating.
+
+/// A set's positions in its order, sorted stably by height, as `TreeDecorator.Context` sorts its
+/// lists.
+pub fn by_y(set: JavaHashSet<Pos>) -> List<Pos> {
+    var all = List<Pos>()
+    for p in set {
+        all.push(p)
+    }
+    if all.is_empty() {
+        return all
+    }
+    var lo = all[0].y
+    var hi = all[0].y
+    for p in all {
+        lo = lo.min(p.y)
+        hi = hi.max(p.y)
+    }
+    var out = List<Pos>()
+    out.reserve(all.len())
+    for yy in lo..hi + 1 {
+        for p in all {
+            if p.y == yy {
+                out.push(p)
+            }
+        }
+    }
+    return out
+}
+
+// `TreeFeature.getLowestTrunkOrRootOfTree`.
+fn lowest_trunk_or_root(logs: List<Pos>, roots: List<Pos>) -> List<Pos> {
+    if roots.is_empty() {
+        return logs.copy()
+    }
+    if not logs.is_empty() and roots[0].y == logs[0].y {
+        var out = logs.copy()
+        for p in roots {
+            out.push(p)
+        }
+        return out
+    }
+    return roots.copy()
+}
+
+// `TreeDecorator.Context.placeVine`.
+fn place_vine(f: Facts, r: mut Region, g: mut Grow, x: i32, y: i32, z: i32, face: i32) ! Thrown {
+    let s = try f.with_bool(f.default_state(f.ids.vine), direction_name(face), true)
+    set_decoration(f, mut r, mut g, x, y, z, s)
+}
+
+fn is_air_at(f: Facts, r: Region, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    return f.is_air(try r.state(f, x, y, z))
+}
+
+/// `TreeDecorator.place` of every decorator but `pale_moss`, with the context's sorted lists.
+pub fn decorate<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, t: Tree, g: mut Grow, dec: Decorator, logs: List<Pos>, leaves: List<Pos>, roots: List<Pos>) ! Thrown {
+    let Env { facts: f, .. } = e
+    match dec {
+        Decorator.PlaceOnGround { tries, radius, height, provider } => {
+            let blocks = lowest_trunk_or_root(logs, roots)
+            if blocks.is_empty() {
+                return
+            }
+            let min_y = blocks[0].y
+            var min_x = blocks[0].x
+            var max_x = blocks[0].x
+            var min_z = blocks[0].z
+            var max_z = blocks[0].z
+            for p in blocks {
+                if p.y == min_y {
+                    min_x = min_x.min(p.x)
+                    max_x = max_x.max(p.x)
+                    min_z = min_z.min(p.z)
+                    max_z = max_z.max(p.z)
+                }
+            }
+            for _ in 0..tries {
+                let px = rand.next_int_between(min_x - radius, max_x + radius)
+                let py = rand.next_int_between(min_y - height, min_y + height)
+                let pz = rand.next_int_between(min_z - radius, max_z + radius)
+                let above = try r.state(f, px, py + 1, pz)
+                if (f.is_air(above) or f.is(above, f.ids.vine)) and f.solid_render(try r.state(f, px, py, pz)) {
+                    if try r.get_height(f, MOTION_BLOCKING_NO_LEAVES, px, pz) <= py + 1 {
+                        let s = try get_state(e, ps, r, mut rand, provider, px, py + 1, pz)
+                        set_decoration(f, mut r, mut g, px, py + 1, pz, s)
+                    }
+                }
+            }
+        },
+        Decorator.Beehive(chance) => try beehive(e, mut r, mut rand, mut g, chance, logs, leaves),
+        Decorator.LeaveVine(chance) => {
+            for p in leaves {
+                if rand.next_float() < chance and try is_air_at(f, r, p.x - 1, p.y, p.z) {
+                    try hanging_vine(f, mut r, mut g, p.x - 1, p.y, p.z, EAST)
+                }
+                if rand.next_float() < chance and try is_air_at(f, r, p.x + 1, p.y, p.z) {
+                    try hanging_vine(f, mut r, mut g, p.x + 1, p.y, p.z, WEST)
+                }
+                if rand.next_float() < chance and try is_air_at(f, r, p.x, p.y, p.z - 1) {
+                    try hanging_vine(f, mut r, mut g, p.x, p.y, p.z - 1, SOUTH)
+                }
+                if rand.next_float() < chance and try is_air_at(f, r, p.x, p.y, p.z + 1) {
+                    try hanging_vine(f, mut r, mut g, p.x, p.y, p.z + 1, NORTH)
+                }
+            }
+        },
+        Decorator.TrunkVine => {
+            for p in logs {
+                if rand.next_int_below(3) > 0 and try is_air_at(f, r, p.x - 1, p.y, p.z) {
+                    try place_vine(f, mut r, mut g, p.x - 1, p.y, p.z, EAST)
+                }
+                if rand.next_int_below(3) > 0 and try is_air_at(f, r, p.x + 1, p.y, p.z) {
+                    try place_vine(f, mut r, mut g, p.x + 1, p.y, p.z, WEST)
+                }
+                if rand.next_int_below(3) > 0 and try is_air_at(f, r, p.x, p.y, p.z - 1) {
+                    try place_vine(f, mut r, mut g, p.x, p.y, p.z - 1, SOUTH)
+                }
+                if rand.next_int_below(3) > 0 and try is_air_at(f, r, p.x, p.y, p.z + 1) {
+                    try place_vine(f, mut r, mut g, p.x, p.y, p.z + 1, NORTH)
+                }
+            }
+        },
+        Decorator.Cocoa(chance) => {
+            if rand.next_float() >= chance or logs.is_empty() {
+                return
+            }
+            let tree_y = logs[0].y
+            let cocoa = f.default_state(try f.named_block("cocoa"))
+            for p in logs {
+                if p.y - tree_y > 2 {
+                    continue
+                }
+                for i in 0..4 {
+                    let d = horizontal(i)
+                    if rand.next_float() <= 0.25f32 {
+                        let o = opposite(d)
+                        let cx = p.x + step_x(o)
+                        let cz = p.z + step_z(o)
+                        if try is_air_at(f, r, cx, p.y, cz) {
+                            let aged = try f.with_int(cocoa, "age", rand.next_int_below(3))
+                            set_decoration(f, mut r, mut g, cx, p.y, cz, try f.with_name(aged, "facing", direction_name(d)))
+                        }
+                    }
+                }
+            }
+        },
+        Decorator.AlterGround(provider) => {
+            let blocks = lowest_trunk_or_root(logs, roots)
+            if blocks.is_empty() {
+                return
+            }
+            let min_y = blocks[0].y
+            for p in blocks {
+                if p.y != min_y {
+                    continue
+                }
+                try alter_circle(e, ps, mut r, mut rand, mut g, provider, p.x - 1, p.y, p.z - 1)
+                try alter_circle(e, ps, mut r, mut rand, mut g, provider, p.x + 2, p.y, p.z - 1)
+                try alter_circle(e, ps, mut r, mut rand, mut g, provider, p.x - 1, p.y, p.z + 2)
+                try alter_circle(e, ps, mut r, mut rand, mut g, provider, p.x + 2, p.y, p.z + 2)
+                for _ in 0..5 {
+                    let placement = rand.next_int_below(64)
+                    let xx = placement % 8
+                    let zz = placement / 8
+                    if xx == 0 or xx == 7 or zz == 0 or zz == 7 {
+                        try alter_circle(e, ps, mut r, mut rand, mut g, provider, p.x - 3 + xx, p.y, p.z - 3 + zz)
+                    }
+                }
+            }
+        },
+        Decorator.AttachedToLeaves { chance, xz, y, provider, empty, directions } => {
+            var blacklist = JavaHashSet<Pos>()
+            var shuffled = leaves.copy()
+            shuffle_positions(mut shuffled, mut rand)
+            for p in shuffled {
+                let d = directions[usize.wrap(rand.next_int_below(i32.wrap(directions.len())))]
+                let px = p.x + step_x(d)
+                let py = p.y + step_y(d)
+                let pz = p.z + step_z(d)
+                if blacklist.contains(Pos { x: px, y: py, z: pz }) {
+                    continue
+                }
+                if not (rand.next_float() < chance) {
+                    continue
+                }
+                var clear = true
+                for i in 1..empty + 1 {
+                    if not try is_air_at(f, r, p.x + step_x(d) * i, p.y + step_y(d) * i, p.z + step_z(d) * i) {
+                        clear = false
+                        break
+                    }
+                }
+                if not clear {
+                    continue
+                }
+                // `BlockPos.betweenClosed`: `x` fastest, then `y`, then `z`.
+                for bz in pz - xz..pz + xz + 1 {
+                    for by in py - y..py + y + 1 {
+                        for bx in px - xz..px + xz + 1 {
+                            blacklist.insert(Pos { x: bx, y: by, z: bz })
+                        }
+                    }
+                }
+                let s = try get_state(e, ps, r, mut rand, provider, px, py, pz)
+                set_decoration(f, mut r, mut g, px, py, pz, s)
+            }
+        },
+        Decorator.AttachedToLogs { chance, provider, directions } => {
+            var shuffled = logs.copy()
+            shuffle_positions(mut shuffled, mut rand)
+            for p in shuffled {
+                let d = directions[usize.wrap(rand.next_int_below(i32.wrap(directions.len())))]
+                let px = p.x + step_x(d)
+                let py = p.y + step_y(d)
+                let pz = p.z + step_z(d)
+                if rand.next_float() <= chance and try is_air_at(f, r, px, py, pz) {
+                    let s = try get_state(e, ps, r, mut rand, provider, px, py, pz)
+                    set_decoration(f, mut r, mut g, px, py, pz, s)
+                }
+            }
+        },
+        Decorator.CreakingHeart(chance) => {
+            if logs.is_empty() or rand.next_float() >= chance {
+                return
+            }
+            var shuffled = logs.copy()
+            shuffle_positions(mut shuffled, mut rand)
+            for p in shuffled {
+                var surrounded = true
+                for dd in 0..6 {
+                    if not f.in_set(try r.state(f, p.x + step_x(dd), p.y + step_y(dd), p.z + step_z(dd)), t.tags.logs) {
+                        surrounded = false
+                        break
+                    }
+                }
+                if surrounded {
+                    let heart = f.default_state(try f.named_block("creaking_heart"))
+                    let dormant = try f.with_name(heart, "creaking_heart_state", "dormant")
+                    set_decoration(f, mut r, mut g, p.x, p.y, p.z, try f.with_bool(dormant, "natural", true))
+                    return
+                }
+            }
+        },
+        Decorator.ShelfMushroom(chance) => try shelf_mushrooms(f, mut r, mut rand, mut g, chance, logs),
+        Decorator.PaleMoss { .. } => fail Thrown { exception: "IllegalStateException", message: "pale_moss runs in features" },
+    }
+}
+
+// `LeaveVineDecorator.addHangingVine`: the vine, then up to four more below while there's air.
+fn hanging_vine(f: Facts, r: mut Region, g: mut Grow, x: i32, y: i32, z: i32, face: i32) ! Thrown {
+    try place_vine(f, mut r, mut g, x, y, z, face)
+    var left = 4
+    var py = y - 1
+    while left > 0 and try is_air_at(f, r, x, py, z) {
+        try place_vine(f, mut r, mut g, x, py, z, face)
+        py -= 1
+        left -= 1
+    }
+}
+
+// `AlterGroundDecorator.placeCircle`.
+fn alter_circle<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, g: mut Grow, provider: usize, x: i32, y: i32, z: i32) ! Thrown {
+    for xx in -2..3 {
+        for zz in -2..3 {
+            if xx.abs() != 2 or zz.abs() != 2 {
+                try alter_block(e, ps, mut r, mut rand, mut g, provider, x + xx, y, z + zz)
+            }
+        }
+    }
+}
+
+// `AlterGroundDecorator.placeBlockAt`: the first block from two above down to three below that
+// the provider gives a state for, stopping below the start at anything not air.
+fn alter_block<T: RandomSource>(e: Env, ps: Providers, r: mut Region, rand: mut T, g: mut Grow, provider: usize, x: i32, y: i32, z: i32) ! Thrown {
+    let Env { facts: f, .. } = e
+    var dy = 2
+    while dy >= -3 {
+        let py = y + dy
+        if let s = try optional_state(e, ps, r, mut rand, provider, x, py, z) {
+            set_decoration(f, mut r, mut g, x, py, z, s)
+            return
+        }
+        if not try is_air_at(f, r, x, py, z) and dy < 0 {
+            return
+        }
+        dy -= 1
+    }
+}
+
+// `BeehiveDecorator.place`.
+fn beehive<T: RandomSource>(e: Env, r: mut Region, rand: mut T, g: mut Grow, chance: f32, logs: List<Pos>, leaves: List<Pos>) ! Thrown {
+    let Env { facts: f, .. } = e
+    if logs.is_empty() {
+        return
+    }
+    if rand.next_float() >= chance {
+        return
+    }
+    let hive_y = if not leaves.is_empty() {
+        (leaves[0].y - 1).max(logs[0].y + 1)
+    } else {
+        (logs[0].y + 1 + rand.next_int_below(3)).min(logs[logs.len() - 1].y)
+    }
+    // `SPAWN_DIRECTIONS`: the horizontal directions but north.
+    let spawn: List<i32> = [EAST, SOUTH, WEST]
+    var places = List<Pos>()
+    for p in logs {
+        if p.y == hive_y {
+            for d in spawn {
+                places.push(Pos { x: p.x + step_x(d), y: p.y, z: p.z + step_z(d) })
+            }
+        }
+    }
+    if places.is_empty() {
+        return
+    }
+    shuffle_positions(mut places, mut rand)
+    for p in places {
+        if try is_air_at(f, r, p.x, p.y, p.z) and try is_air_at(f, r, p.x, p.y, p.z + 1) {
+            let nest = f.default_state(try f.named_block("bee_nest"))
+            set_decoration(f, mut r, mut g, p.x, p.y, p.z, try f.with_name(nest, "facing", "south"))
+            if let kind = try r.block_entity(f, p.x, p.y, p.z) {
+                if kind == "minecraft:beehive" {
+                    let bees = 2 + rand.next_int_below(2)
+                    for _ in 0..bees {
+                        r.store_bee(p.x, p.y, p.z, rand.next_int_below(599))
+                    }
+                }
+            }
+            return
+        }
+    }
+}
+
+// `ShelfMushroomDecorator.place`.
+fn shelf_mushrooms<T: RandomSource>(f: Facts, r: mut Region, rand: mut T, g: mut Grow, chance: f32, logs: List<Pos>) ! Thrown {
+    if rand.next_float() >= chance or logs.is_empty() {
+        return
+    }
+    let first = logs[0]
+    let last = logs[logs.len() - 1]
+    if first.y == last.y {
+        // A fallen log: the sides across it.
+        let across: List<i32> = if first.x != last.x { [NORTH, SOUTH] } else { [EAST, WEST] }
+        for p in logs {
+            for d in across {
+                if not (rand.next_float() > 0.25f32) {
+                    let mx = p.x + step_x(d)
+                    let mz = p.z + step_z(d)
+                    if try shelf_replaceable(f, r, mx, p.y, mz) {
+                        if not try shelf_beside(f, r, mx, p.y, mz) and not try shelf_beside(f, r, p.x, p.y, p.z) {
+                            try place_shelf(f, mut r, mut rand, mut g, mx, p.y, mz, d)
+                        }
+                    }
+                }
+            }
+        }
+        return
+    }
+    let d1 = random_horizontal(mut rand)
+    let ds: List<i32> = [d1, clockwise(d1)]
+    let base_y = first.y
+    for p in logs {
+        let dy = p.y - base_y
+        if dy < 1 or dy > 4 {
+            continue
+        }
+        for d in ds {
+            if not (rand.next_float() > 0.25f32) {
+                let mx = p.x + step_x(d)
+                let mz = p.z + step_z(d)
+                if try shelf_replaceable(f, r, mx, p.y, mz) and not f.is(try r.state(f, mx, p.y - 1, mz), try f.named_block("shelf_mushroom")) {
+                    try place_shelf(f, mut r, mut rand, mut g, mx, p.y, mz, d)
+                    break
+                }
+            }
+        }
+    }
+}
+
+// `ShelfMushroomDecorator.isBlockReplaceableWithShelfMushroom`.
+fn shelf_replaceable(f: Facts, r: Region, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if not f.replaceable(try r.state(f, x, y, z)) {
+        return false
+    }
+    let water = f.ids.water
+    if f.is(try r.state(f, x, y, z), water) or f.is(try r.state(f, x + 1, y, z), water) or f.is(try r.state(f, x - 1, y, z), water) {
+        return false
+    }
+    return not (f.is(try r.state(f, x, y, z - 1), water) or f.is(try r.state(f, x, y, z + 1), water))
+}
+
+// `ShelfMushroomDecorator.hasHorizontallyAdjacentShelfMushroom`.
+fn shelf_beside(f: Facts, r: Region, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let shelf = try f.named_block("shelf_mushroom")
+    for i in 0..4 {
+        let d = horizontal(i)
+        if f.is(try r.state(f, x + step_x(d), y, z + step_z(d)), shelf) {
+            return true
+        }
+    }
+    return false
+}
+
+// `ShelfMushroomDecorator.placeMushroom`.
+fn place_shelf<T: RandomSource>(f: Facts, r: mut Region, rand: mut T, g: mut Grow, x: i32, y: i32, z: i32, facing: i32) ! Thrown {
+    let shelf = f.default_state(try f.named_block("shelf_mushroom"))
+    let aged = try f.with_int(shelf, "age", rand.next_int_below(2))
+    set_decoration(f, mut r, mut g, x, y, z, try f.with_name(aged, "facing", direction_name(facing)))
+}
+
+// Finishing.
+
+// A bounding box and the shape filled in it, as `BitSetDiscreteVoxelShape` holds one.
+struct Shape {
+    min_x: i32
+    min_y: i32
+    min_z: i32
+    xs: i32
+    ys: i32
+    zs: i32
+    full: List<bool>
+}
+
+impl Shape {
+    fn inside(self, x: i32, y: i32, z: i32) -> bool {
+        return x >= self.min_x and y >= self.min_y and z >= self.min_z and x < self.min_x + self.xs and y < self.min_y + self.ys and z < self.min_z + self.zs
+    }
+
+    fn index(self, x: i32, y: i32, z: i32) -> usize {
+        return usize.wrap(((x - self.min_x) * self.ys + (y - self.min_y)) * self.zs + (z - self.min_z))
+    }
+
+    fn fill(mut self, x: i32, y: i32, z: i32) {
+        let i = self.index(x, y, z)
+        self.full[i] = true
+    }
+
+    fn is_full_local(self, x: i32, y: i32, z: i32) -> bool {
+        if x < 0 or y < 0 or z < 0 or x >= self.xs or y >= self.ys or z >= self.zs {
+            return false
+        }
+        return self.full[usize.wrap((x * self.ys + y) * self.zs + z)]
+    }
+}
+
+// `LeavesBlock.getOptionalDistanceAt`: 0 for what keeps leaves from decaying, else a leaf's
+// distance.
+fn optional_distance(f: Facts, t: Tree, state: u32) -> i32? {
+    if f.in_set(state, t.tags.prevents_decay) {
+        return some(0)
+    }
+    if f.is_a(f.block(state), "LeavesBlock") {
+        return f.get_int(state, "distance")
+    }
+    return none
+}
+
+/// The end of `TreeFeature.place`: the leaves' distances updated through the bounds of what the
+/// tree set, and the shapes at the edge of what it filled. False if it set nothing.
+pub fn finish(e: Env, r: mut Region, t: Tree, g: Grow) -> bool ! Thrown {
+    let Env { facts: f, .. } = e
+    var any = false
+    var min_x = 0
+    var min_y = 0
+    var min_z = 0
+    var max_x = 0
+    var max_y = 0
+    var max_z = 0
+    for set in [g.roots.copy(), g.trunks.copy(), g.foliage.copy(), g.decorations.copy()] {
+        for p in set {
+            if not any {
+                min_x = p.x
+                min_y = p.y
+                min_z = p.z
+                max_x = p.x
+                max_y = p.y
+                max_z = p.z
+                any = true
+            } else {
+                min_x = min_x.min(p.x)
+                min_y = min_y.min(p.y)
+                min_z = min_z.min(p.z)
+                max_x = max_x.max(p.x)
+                max_y = max_y.max(p.y)
+                max_z = max_z.max(p.z)
+            }
+        }
+    }
+    if not any {
+        return false
+    }
+    let xs = max_x - min_x + 1
+    let ys = max_y - min_y + 1
+    let zs = max_z - min_z + 1
+    var shape = Shape { min_x: min_x, min_y: min_y, min_z: min_z, xs: xs, ys: ys, zs: zs, full: [false; usize.wrap(xs * ys * zs)] }
+    // `updateLeaves`.
+    for p in g.decorations {
+        if shape.inside(p.x, p.y, p.z) {
+            shape.fill(p.x, p.y, p.z)
+        }
+    }
+    for p in g.roots {
+        if shape.inside(p.x, p.y, p.z) {
+            shape.fill(p.x, p.y, p.z)
+        }
+    }
+    var to_check = List<JavaHashSet<Pos>>()
+    for _ in 0..7 {
+        to_check.push(JavaHashSet<Pos>())
+    }
+    for p in g.trunks {
+        to_check[0].insert(p)
+    }
+    var smallest: usize = 0
+    loop {
+        while smallest >= 7 or not to_check[smallest].is_empty() {
+            if smallest >= 7 {
+                try update_edges(e, mut r, shape)
+                return true
+            }
+            var first = Pos { x: 0, y: 0, z: 0 }
+            for p in to_check[smallest] {
+                first = p
+                break
+            }
+            to_check[smallest].remove(first)
+            if not shape.inside(first.x, first.y, first.z) {
+                continue
+            }
+            if smallest != 0 {
+                let s = try r.state(f, first.x, first.y, first.z)
+                _ = r.set_block(f, first.x, first.y, first.z, try f.with_int(s, "distance", i32.wrap(smallest)), TREE_FLAGS)
+            }
+            shape.fill(first.x, first.y, first.z)
+            for d in 0..6 {
+                let nx = first.x + step_x(d)
+                let ny = first.y + step_y(d)
+                let nz = first.z + step_z(d)
+                if not shape.inside(nx, ny, nz) {
+                    continue
+                }
+                if shape.full[shape.index(nx, ny, nz)] {
+                    continue
+                }
+                let cs = try r.state(f, nx, ny, nz)
+                if let dist = optional_distance(f, t, cs) {
+                    let nd = dist.min(i32.wrap(smallest) + 1)
+                    if nd < 7 {
+                        to_check[usize.wrap(nd)].insert(Pos { x: nx, y: ny, z: nz })
+                        smallest = smallest.min(usize.wrap(nd))
+                    }
+                }
+            }
+        }
+        smallest += 1
+    }
+}
+
+// `StructureTemplate.updateShapeAtEdge` with `Block.UPDATE_ALL`: each face of the shape with
+// nothing beside it, the block inside updated by its neighbour, then the neighbour by it, as
+// `DiscreteVoxelShape.forAllFaces` goes over them: along `z`, then `y`, then `x`.
+fn update_edges(e: Env, r: mut Region, shape: Shape) ! Thrown {
+    // Faces across `z`: `x`, then `y`, then `z` along the line.
+    for a in 0..shape.xs {
+        for b in 0..shape.ys {
+            try update_line(e, mut r, shape, a, b, 0, shape.zs, 2)
+        }
+    }
+    // Across `y`: `z`, then `x`.
+    for a in 0..shape.zs {
+        for b in 0..shape.xs {
+            try update_line(e, mut r, shape, b, 0, a, shape.ys, 1)
+        }
+    }
+    // Across `x`: `y`, then `z`.
+    for a in 0..shape.ys {
+        for b in 0..shape.zs {
+            try update_line(e, mut r, shape, 0, a, b, shape.xs, 0)
+        }
+    }
+}
+
+// One line of `forAllAxisFaces` along the axis `axis` (0 `x`, 1 `y`, 2 `z`) from the local
+// position given, where the shape starts and ends.
+fn update_line(e: Env, r: mut Region, shape: Shape, x0: i32, y0: i32, z0: i32, size: i32, axis: i32) ! Thrown {
+    let negative = if axis == 0 { WEST } else if axis == 1 { DOWN } else { NORTH }
+    let positive = opposite(negative)
+    var last = false
+    for c in 0..size + 1 {
+        let lx = if axis == 0 { c } else { x0 }
+        let ly = if axis == 1 { c } else { y0 }
+        let lz = if axis == 2 { c } else { z0 }
+        let full = c != size and shape.is_full_local(lx, ly, lz)
+        if not last and full {
+            try update_face(e, mut r, negative, shape.min_x + lx, shape.min_y + ly, shape.min_z + lz)
+        }
+        if last and not full {
+            let px = if axis == 0 { c - 1 } else { x0 }
+            let py = if axis == 1 { c - 1 } else { y0 }
+            let pz = if axis == 2 { c - 1 } else { z0 }
+            try update_face(e, mut r, positive, shape.min_x + px, shape.min_y + py, shape.min_z + pz)
+        }
+        last = full
+    }
+}
+
+// One face of `updateShapeAtEdge`: the block and its neighbour toward `d` each updated by the
+// other, set with `UPDATE_ALL` without neighbour updates where they change.
+fn update_face(e: Env, r: mut Region, d: i32, x: i32, y: i32, z: i32) ! Thrown {
+    let Env { facts: f, .. } = e
+    let nx = x + step_x(d)
+    let ny = y + step_y(d)
+    let nz = z + step_z(d)
+    let state = try r.state(f, x, y, z)
+    let neighbour = try r.state(f, nx, ny, nz)
+    let changed = try update_shape(e, mut r, state, x, y, z, d, neighbour)
+    if changed != state {
+        _ = r.set_block(f, x, y, z, changed, 2)
+    }
+    let neighbour_changed = try update_shape(e, mut r, neighbour, nx, ny, nz, opposite(d), changed)
+    if neighbour_changed != neighbour {
+        _ = r.set_block(f, nx, ny, nz, neighbour_changed, 2)
+    }
+}
