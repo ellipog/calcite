@@ -341,6 +341,7 @@ def block_flags_module(index, flags):
 FACTS = [
     ("SOLID", 1, "`isSolid`: the legacy solidity, from its collision shape's size"),
     ("REPLACEABLE", 1 << 1, "`canBeReplaced()`: a block placed on it replaces it"),
+    ("COLLISION_EMPTY", 1 << 2, "Its collision shape at the origin of an empty world is empty"),
     ("COLLISION_FULL_BLOCK", 1 << 3, "`isCollisionShapeFullBlock` at the origin of an empty world"),
     ("LIQUID", 1 << 4, "`liquid`: the block is water or lava itself"),
     ("IGNITED_BY_LAVA", 1 << 5, "`ignitedByLava`"),

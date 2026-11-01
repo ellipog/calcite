@@ -66,6 +66,7 @@ final class BlockFlags {
     // What features ask of a state: its `facts`.
     static final int SOLID = 1;
     static final int REPLACEABLE = 1 << 1;
+    static final int COLLISION_EMPTY = 1 << 2;
     static final int COLLISION_FULL_BLOCK = 1 << 3;
     static final int LIQUID = 1 << 4;
     static final int IGNITED_BY_LAVA = 1 << 5;
@@ -273,6 +274,7 @@ final class BlockFlags {
             f |= Block.isFaceFull(collision, d) ? 1L << (COLLISION_FACE_SHIFT + d.ordinal()) : 0;
         }
         f |= collision.getFaceShape(Direction.UP).isEmpty() ? 0 : COLLISION_TOP_ANY & 0xFFFFFFFFL;
+        f |= collision.isEmpty() ? COLLISION_EMPTY : 0;
         int type = BuiltInRegistries.FLUID.getId(fluid.getType());
         if (type < 0 || type > 7 || fluid.getAmount() > 15) {
             throw new IllegalStateException("a fluid that doesn't fit: " + fluid);
