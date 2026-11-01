@@ -1,0 +1,448 @@
+/// Biome sources: where a dimension's biomes come from, read as a generator's `biome_source`
+/// is written, and the climate of a noise router that the multi-noise and End sources sample.
+/// Vanilla's `BiomeSource` and its four kinds, and `Climate.Sampler`.
+module worldgen.biome_source
+
+import json.tree.{Json, Member, as_i32, as_string, get}
+import pack.zip.{Zip}
+import registry.registry.{Registry}
+import resources.identifier.{Identifier}
+import worldgen.climate.{Parameter, Point, Target, Tree, point_of, quantize, target}
+import worldgen.density.{Functions, data_json, qualified}
+import worldgen.interval.{Thrown}
+import worldgen.presets.{Entry, nether, overworld}
+import worldgen.sampler.{Context, Program, fill, sample, volume, zeros}
+
+/// `NoiseRouter.createClimateSampler`: the samplers of a router's six climate fields.
+pub struct ClimateSampler {
+    pub temperature: usize
+    pub humidity: usize
+    pub continentalness: usize
+    pub erosion: usize
+    pub depth: usize
+    pub weirdness: usize
+}
+
+/// The climate sampler of a noise settings' router, written as its `noise_router` is: its
+/// `temperature`, `vegetation`, `continents`, `erosion`, `depth` and `ridges`, read and compiled
+/// in `functions`.
+pub fn climate_of(functions: mut Functions, zip: Zip, router: List<Member>) -> ClimateSampler ! String {
+    let names: List<str> = ["temperature", "vegetation", "continents", "erosion", "depth", "ridges"]
+    var samplers = List<usize>()
+    for name in names {
+        let value = member(router, name) else fail "the router has no `{name}`"
+        let f = try functions.read(zip, value)
+        match functions.sampler(f) {
+            ok(s) => samplers.push(s),
+            err(thrown) => fail "the router's `{name}` doesn't compile: {thrown.exception}: {thrown.message}",
+        }
+    }
+    return ClimateSampler { temperature: samplers[0], humidity: samplers[1], continentalness: samplers[2], erosion: samplers[3], depth: samplers[4], weirdness: samplers[5] }
+}
+
+/// `Climate.Sampler.sample`: the climate at a quart, sampled at its block.
+pub fn sample_climate(p: Program, ctx: mut Context, c: ClimateSampler, qx: i32, qy: i32, qz: i32) -> Target ! Thrown {
+    let x = qx << 2
+    let y = qy << 2
+    let z = qz << 2
+    let temperature = try sample(p, mut ctx, c.temperature, x, y, z)
+    let humidity = try sample(p, mut ctx, c.humidity, x, y, z)
+    let continentalness = try sample(p, mut ctx, c.continentalness, x, y, z)
+    let erosion = try sample(p, mut ctx, c.erosion, x, y, z)
+    let depth = try sample(p, mut ctx, c.depth, x, y, z)
+    let weirdness = try sample(p, mut ctx, c.weirdness, x, y, z)
+    return target(temperature, humidity, continentalness, erosion, depth, weirdness)
+}
+
+/// The kinds of biome source.
+pub enum Kind {
+    /// `minecraft:fixed`: one biome everywhere.
+    Fixed
+    /// `minecraft:multi_noise`: the entry of a parameter list nearest the climate.
+    Multi
+    /// `minecraft:checkerboard`: a set of biomes in diagonal stripes.
+    Checkerboard
+    /// `minecraft:the_end`: the central island, then the outer islands by their height.
+    End
+}
+
+/// A biome source. Biomes are IDs in the biome registry.
+pub struct BiomeSource {
+    pub kind: Kind
+    /// The fixed source's biome; the checkerboard's, in order; the End's central island, its
+    /// highlands, midlands, small islands and barrens; or each multi-noise entry's.
+    pub biomes: List<i32>
+    /// Each multi-noise entry's point, and their tree.
+    pub points: List<Point>
+    tree: Tree
+    // The checkerboard's shift, from quarts to its squares.
+    shift: i32 = 0
+}
+
+impl BiomeSource {
+    /// `possibleBiomes`: the source's biomes, each once, in the order it first names them.
+    pub fn possible(self) -> List<i32> {
+        var seen = Set<i32>()
+        var out = List<i32>()
+        for b in self.biomes {
+            if not seen.contains(b) {
+                seen.insert(b)
+                out.push(b)
+            }
+        }
+        return out
+    }
+
+    /// `createResolver(sampler).getNoiseBiome`: the biome at a quart. `last` is where a multi-
+    /// noise source's search starts, the entry found last or -1, as vanilla keeps one for each
+    /// list and thread; it becomes the entry found.
+    pub fn biome_at(self, p: Program, ctx: mut Context, c: ClimateSampler, qx: i32, qy: i32, qz: i32, last: mut i32) -> i32 ! Thrown {
+        match self.kind {
+            Kind.Fixed => return self.biomes[0],
+            Kind.Checkerboard => {
+                let n = i32.wrap(self.biomes.len())
+                if n == 0 {
+                    fail Thrown { exception: "ArithmeticException", message: "/ by zero" }
+                }
+                let i = ((qx >> self.shift) + (qz >> self.shift)).floor_mod(n)
+                return self.biomes[usize.wrap(i)]
+            },
+            Kind.End => return try self.end_biome(p, mut ctx, c, qx, qy, qz),
+            Kind.Multi => {
+                let t = try sample_climate(p, mut ctx, c, qx, qy, qz)
+                return try self.find(t, mut last)
+            },
+        }
+    }
+
+    /// `MultiNoiseBiomeSource.getNoiseBiome(TargetPoint)`: the biome of the entry nearest `t`.
+    pub fn find(self, t: Target, last: mut i32) -> i32 ! Thrown {
+        let leaf = self.tree.search(t, mut last)
+        if leaf < 0 {
+            fail Thrown { exception: "NullPointerException", message: "Cannot read field \"value\" because \"leaf\" is null" }
+        }
+        return self.biomes[usize.wrap(leaf)]
+    }
+
+    /// The biomes of a chunk, as `ChunkGenerator.createBiomes` fills them, through a context
+    /// of its own with caches: its sections from the bottom, and in each the quarts with `z`
+    /// fastest, then `y`, then `x`. A multi-noise source samples the climate over the chunk's
+    /// quarts first, as `createResolverForChunk` does.
+    pub fn chunk(self, p: Program, c: ClimateSampler, chunk_x: i32, chunk_z: i32, min_y: i32, height: i32, last: mut i32, out: mut List<i32>) ! Thrown {
+        var ctx = Context.new(true)
+        let qx = (chunk_x * 16) >> 2
+        let qz = (chunk_z * 16) >> 2
+        let qy = min_y >> 2
+        let bottom = min_y >> 4
+        let top = (min_y + height) >> 4
+        match self.kind {
+            Kind.Multi => {},
+            _ => {
+                for section in bottom..top {
+                    let sy = section * 4
+                    for x in 0..4 {
+                        for y in 0..4 {
+                            for z in 0..4 {
+                                out.push(try self.biome_at(p, mut ctx, c, qx + x, sy + y, qz + z, mut last))
+                            }
+                        }
+                    }
+                }
+                return
+            },
+        }
+        let v = try volume(4, height >> 2, 4, qx << 2, qy << 2, qz << 2, 4, 4, 4)
+        let size = v.size()
+        var temperature = try zeros(size)
+        var humidity = try zeros(size)
+        var continentalness = try zeros(size)
+        var erosion = try zeros(size)
+        var depth = try zeros(size)
+        var weirdness = try zeros(size)
+        try fill(p, mut ctx, c.temperature, mut temperature, v)
+        try fill(p, mut ctx, c.humidity, mut humidity, v)
+        try fill(p, mut ctx, c.continentalness, mut continentalness, v)
+        try fill(p, mut ctx, c.erosion, mut erosion, v)
+        try fill(p, mut ctx, c.depth, mut depth, v)
+        try fill(p, mut ctx, c.weirdness, mut weirdness, v)
+        for section in bottom..top {
+            let sy = section * 4
+            for x in 0..4 {
+                for y in 0..4 {
+                    for z in 0..4 {
+                        let i = usize.wrap(v.index(x, sy + y - qy, z))
+                        let t = target(temperature[i], humidity[i], continentalness[i], erosion[i], depth[i], weirdness[i])
+                        out.push(try self.find(t, mut last))
+                    }
+                }
+            }
+        }
+    }
+
+    // `TheEndBiomeSource.getNoiseBiome`: the central island within 64 chunks of the origin,
+    // then by the erosion at the middle of the chunk's pair of chunks, as the outer islands'
+    // height goes.
+    fn end_biome(self, p: Program, ctx: mut Context, c: ClimateSampler, qx: i32, qy: i32, qz: i32) -> i32 ! Thrown {
+        let bx = qx << 2
+        let by = qy << 2
+        let bz = qz << 2
+        let cx = bx >> 4
+        let cz = bz >> 4
+        if i64(cx) * i64(cx) + i64(cz) * i64(cz) <= 4096 {
+            return self.biomes[0]
+        }
+        let height = try sample(p, mut ctx, c.erosion, (cx * 2 + 1) * 8, by, (cz * 2 + 1) * 8)
+        if height > 0.25f32 {
+            return self.biomes[1]
+        }
+        if height >= -0.0625f32 {
+            return self.biomes[2]
+        }
+        if height < -0.21875f32 {
+            return self.biomes[3]
+        }
+        return self.biomes[4]
+    }
+}
+
+/// A biome source written as a generator's `biome_source` is, as `BiomeSource.CODEC` reads it,
+/// its biomes named in `biomes`, the biome registry, and its presets from `zip`.
+pub fn read_source(zip: Zip, biomes: Registry, value: Json) -> BiomeSource ! String {
+    let members = match value {
+        Json.Object(m) => m.copy(),
+        _ => fail "Not a map: {value}",
+    }
+    let type_value = member(members, "type") else fail "No key type in MapLike"
+    let type_name = as_string(type_value) else fail "Not a string: {type_value}"
+    let kind = qualified(type_name)
+    if kind == "minecraft:fixed" {
+        let b = try biome_field(biomes, members, "biome")
+        return source(Kind.Fixed, [b], List<Point>(), 0)
+    }
+    if kind == "minecraft:the_end" {
+        let names: List<str> = ["the_end", "end_highlands", "end_midlands", "small_end_islands", "end_barrens"]
+        var ids = List<i32>()
+        for name in names {
+            let id = biomes.id(Identifier { namespace: "minecraft", path: String(name) }) else fail "Missing element ResourceKey[minecraft:worldgen/biome / minecraft:{name}]"
+            ids.push(id)
+        }
+        return source(Kind.End, ids, List<Point>(), 0)
+    }
+    if kind == "minecraft:checkerboard" {
+        let set = member(members, "biomes") else fail "No key biomes in MapLike"
+        let ids = try holder_set(biomes, set)
+        var scale = 2
+        if let s = member(members, "scale") {
+            let v = as_i32(s) else fail "Not a number: {s}"
+            if v < 0 or v > 62 {
+                fail "Value {v} outside of range [0:62]"
+            }
+            scale = v
+        }
+        return source(Kind.Checkerboard, ids, List<Point>(), scale + 2)
+    }
+    if kind == "minecraft:multi_noise" {
+        // The list written out, or else a preset.
+        if let list = member(members, "biomes") {
+            var points = List<Point>()
+            var ids = List<i32>()
+            match read_list(biomes, list, mut points, mut ids) {
+                ok => return source(Kind.Multi, ids, points, 0),
+                err(e) => {
+                    if member(members, "preset") == none {
+                        fail e
+                    }
+                },
+            }
+        }
+        let preset = member(members, "preset") else fail "No key biomes in MapLike; No key preset in MapLike"
+        let entries = try preset_entries(zip, preset)
+        var points = List<Point>()
+        var ids = List<i32>()
+        for e in entries {
+            let id = try biome_named(biomes, e.biome)
+            points.push(e.point)
+            ids.push(id)
+        }
+        return source(Kind.Multi, ids, points, 0)
+    }
+    fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:worldgen/biome_source]: {kind}"
+}
+
+fn source(kind: Kind, biomes: own List<i32>, points: own List<Point>, shift: i32) -> BiomeSource {
+    let tree = if points.len() > 0 { Tree.new(points) } else { Tree.empty() }
+    return BiomeSource { kind: kind, biomes: biomes, points: points, tree: tree, shift: shift }
+}
+
+// A preset, by its ID in the registry of parameter lists or written out: its entries.
+fn preset_entries(zip: Zip, value: Json) -> List<Entry> ! String {
+    var preset_value = value.copy()
+    if let id = as_string(value) {
+        preset_value = try data_json(zip, qualified(id), String("multi_noise_biome_source_parameter_list"))
+    }
+    let members = match preset_value {
+        Json.Object(m) => m,
+        _ => fail "Not a map: {preset_value}",
+    }
+    let name_value = member(members, "preset") else fail "No key preset in MapLike"
+    let name = as_string(name_value) else fail "Not a string: {name_value}"
+    let preset = qualified(name)
+    if preset == "minecraft:overworld" {
+        return overworld()
+    }
+    if preset == "minecraft:nether" {
+        return nether()
+    }
+    fail "Unknown preset: {preset}"
+}
+
+// `Climate.ParameterList.codec`: a list, not empty, of `parameters` and `biome`.
+fn read_list(biomes: Registry, value: Json, points: mut List<Point>, ids: mut List<i32>) ! String {
+    let items = match value {
+        Json.Array(a) => a.copy(),
+        _ => fail "Not a list: {value}",
+    }
+    if items.len() == 0 {
+        fail "List must have contents"
+    }
+    for item in items {
+        let members = match item {
+            Json.Object(m) => m.copy(),
+            _ => fail "Not a map: {item}",
+        }
+        let p = member(members, "parameters") else fail "No key parameters in MapLike"
+        points.push(try read_point(p))
+        ids.push(try biome_field(biomes, members, "biome"))
+    }
+}
+
+// `Climate.ParameterPoint.CODEC`.
+fn read_point(value: Json) -> Point ! String {
+    let members = match value {
+        Json.Object(m) => m.copy(),
+        _ => fail "Not a map: {value}",
+    }
+    let t = try parameter_field(members, "temperature")
+    let h = try parameter_field(members, "humidity")
+    let c = try parameter_field(members, "continentalness")
+    let e = try parameter_field(members, "erosion")
+    let d = try parameter_field(members, "depth")
+    let w = try parameter_field(members, "weirdness")
+    let o = member(members, "offset") else fail "No key offset in MapLike"
+    let offset = try ranged(o, 0.0f32, 1.0f32)
+    return point_of(t, h, c, e, d, w, quantize(offset))
+}
+
+fn parameter_field(members: List<Member>, key: str) -> Parameter ! String {
+    let value = member(members, key) else fail "No key {key} in MapLike"
+    return try read_parameter(value)
+}
+
+// `Climate.Parameter.CODEC`: a number, or `[min, max]`, or `{"min": .., "max": ..}`, each from
+// -2 to 2, `min` no more than `max` as `Float.compareTo` has it.
+fn read_parameter(value: Json) -> Parameter ! String {
+    var lo = 0.0f32
+    var hi = 0.0f32
+    match value {
+        Json.Array(items) => {
+            if items.len() != 2 {
+                fail "Input is not a list of 2 elements"
+            }
+            lo = try ranged(items[0], -2.0f32, 2.0f32)
+            hi = try ranged(items[1], -2.0f32, 2.0f32)
+        },
+        Json.Object(members) => {
+            let a = member(members, "min") else fail "No key min in MapLike"
+            let b = member(members, "max") else fail "No key max in MapLike"
+            lo = try ranged(a, -2.0f32, 2.0f32)
+            hi = try ranged(b, -2.0f32, 2.0f32)
+        },
+        _ => {
+            lo = try ranged(value, -2.0f32, 2.0f32)
+            hi = lo
+        },
+    }
+    if compare(lo, hi) > 0 {
+        fail "Cannon construct interval, min > max ({lo} > {hi})"
+    }
+    return Parameter { min: quantize(lo), max: quantize(hi) }
+}
+
+// `Codec.floatRange(min, max)`: a number, as `JsonOps` reads one, and not a boolean.
+fn ranged(value: Json, min: f32, max: f32) -> f32 ! String {
+    var v = 0.0f32
+    match value {
+        Json.Number(text) => {
+            let parsed = f32.parse(text) else fail "Not a number: {text}"
+            v = parsed
+        },
+        _ => fail "Not a number: {value}",
+    }
+    if compare(v, min) < 0 or compare(v, max) > 0 {
+        fail "Value {v} outside of range [{min}:{max}]"
+    }
+    return v
+}
+
+// `Float.compare`: -0.0 below 0.0, and NaN above everything.
+fn compare(a: f32, b: f32) -> i32 {
+    if a < b {
+        return -1
+    }
+    if a > b {
+        return 1
+    }
+    let x = if a != a { 0x7fc00000 } else { i32.wrap(a.to_bits()) }
+    let y = if b != b { 0x7fc00000 } else { i32.wrap(b.to_bits()) }
+    return if x == y { 0 } else if x < y { -1 } else { 1 }
+}
+
+// `Biome.CODEC` in a field: a biome by its ID.
+fn biome_field(biomes: Registry, members: List<Member>, key: str) -> i32 ! String {
+    let value = member(members, key) else fail "No key {key} in MapLike"
+    let name = as_string(value) else fail "Inline definitions not allowed here"
+    return try biome_named(biomes, name)
+}
+
+fn biome_named(biomes: Registry, name: String) -> i32 ! String {
+    let id = match Identifier.parse(name.copy()) {
+        ok(i) => i,
+        err(_) => fail "Not a valid resource location: {name}",
+    }
+    let b = biomes.id(id) else fail "Failed to get element ResourceKey[minecraft:worldgen/biome / {id.to_string()}]"
+    return b
+}
+
+// `Biome.LIST_CODEC`: a tag as `#` and its ID, a biome, or a list of biomes.
+fn holder_set(biomes: Registry, value: Json) -> List<i32> ! String {
+    if let text = as_string(value) {
+        if text.starts_with("#") {
+            let id = match Identifier.parse(text[1..]) {
+                ok(i) => i,
+                err(_) => fail "Not a valid resource location: {text}",
+            }
+            for tag in biomes.tags {
+                if tag.name.namespace == id.namespace and tag.name.path == id.path {
+                    return tag.values.copy()
+                }
+            }
+            fail "Missing tag: '{id.to_string()}' in 'minecraft:worldgen/biome'"
+        }
+        return [try biome_named(biomes, text)]
+    }
+    let items = match value {
+        Json.Array(a) => a.copy(),
+        _ => fail "Not a list: {value}",
+    }
+    var out = List<i32>()
+    for item in items {
+        let name = as_string(item) else fail "Inline definitions not allowed here"
+        out.push(try biome_named(biomes, name))
+    }
+    return out
+}
+
+// The value of the last member named `key`, as Gson keeps the last of a repeated key.
+fn member(members: List<Member>, key: str) -> Json? {
+    return get(members, String(key))
+}

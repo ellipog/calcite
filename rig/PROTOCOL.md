@@ -654,6 +654,26 @@ First each function's `range()` and `domainAxes()` are worked out, in order, the
 
 If any of that throws, the result is the rejection, as `rng`'s is, and no blob. A function the codec doesn't read, an op that isn't one of those, a router field without `settings` or that the router doesn't have, `legacy_random` with `settings`, too many values and a blob of the wrong length are an `error` status.
 
+### `biomes` (v1)
+
+A biome source, read as a dimension's generator writes its `biome_source`, with the climate sampler of a noise settings' router, asked for biomes at quarts, at climate targets and over chunks. The registries are vanilla's own, as `density`'s are, so a biome, tag or preset named by ID is vanilla's.
+
+Input `{"seed": s, "settings": id, "source": v, "cached": b, "ops": [...]}` and one blob. `s` is a `long` as a decimal string, and the `RandomState` is `RandomState.create(noises, seed, settings)` of the noise settings `id`. `v` is read by `BiomeSource.CODEC` with the registries' ops. The climate sampler is `createClimateSampler` of a `SamplerContext.builder().enableCaches().build()` if `cached`, else of `SamplerContext.EMPTY_UNCACHED`, and the resolver is the source's `createResolver` of it.
+
+Each case runs on a thread of its own, so the parameter list's search starts from no last result, and every op after shares the one it leaves. The ops, in order:
+
+| Op | Reads from the blob | Writes to the blob |
+| --- | --- | --- |
+| `["list"]` | nothing | the multi-noise source's parameter list: its size as an `int`, then each entry's temperature, humidity, continentalness, erosion, depth and weirdness `min` and `max`, and its offset, as `long`s, and its biome's number as an `int` |
+| `["climate", n]` | `n` quart `int` triples | `sample(x, y, z)` of the climate sampler at each, its six values as `long`s |
+| `["points", n]` | `n` quart `int` triples | `getNoiseBiome(x, y, z)` of the resolver at each, as the biome's number |
+| `["search", n]` | `n` targets of six `int`s | the multi-noise source's `getNoiseBiome(new TargetPoint(...))` of each, as the biome's number |
+| `["chunk", x, z, min_y, height]` | nothing | the chunk's biomes as `ChunkGenerator.createBiomes` fills them: `createResolverForChunk` of a new climate sampler with caches, over the chunk's quarts from `min_y` for `height` blocks, then each section from the bottom, its quarts with `z` fastest, then `y`, then `x`, as the biome's number |
+
+`min_y` and `height` are whole sections, `height` positive, within -2032 and 2032. The ops give at most 2^20 values in all. A biome's number is the order the case first writes it in, from 0. The output is `{"possible": [...], "biomes": [...]}`: `possibleBiomes()` in order, then each number's biome, as IDs.
+
+A source the codec doesn't read is `{"invalid": true}` and no blob: the codec's messages are its own, so only that it doesn't read is compared. If anything else throws, the result is the rejection, as `rng`'s is, and no blob. Settings that don't exist, an op that isn't one of those or isn't whole sections, `list` or `search` with another kind of source, too many values and a blob of the wrong length are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

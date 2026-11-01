@@ -1,0 +1,299 @@
+/// The `biomes` probe (rig/PROTOCOL.md): a biome source read as a dimension's generator writes
+/// it, with the climate of a noise settings' router, asked for biomes at quarts, at climate
+/// targets and over chunks, all from one search start.
+module rig.biomes
+
+import json.tree.{Json, Member, as_i32, as_string, get, take}
+import pack.zip.{Zip}
+import registry.registry.{Registry}
+import rig.frame.{Outcome}
+import worldgen.biome_source.{BiomeSource, ClimateSampler, Kind, climate_of, read_source, sample_climate}
+import worldgen.climate.{Target}
+import worldgen.density.{Functions, data_json, qualified}
+import worldgen.interval.{Thrown}
+import worldgen.sampler.{Context, Program}
+
+/// The most values a case's ops may ask for.
+const MAX_VALUES: i64 = 1048576
+
+enum Step {
+    /// The source's parameter list, each entry's ranges, offset and biome.
+    List
+    /// The climate at `n` quarts from the blob.
+    Climate(i32)
+    /// The biome at `n` quarts from the blob.
+    Points(i32)
+    /// The biome nearest each of `n` climate targets from the blob.
+    Search(i32)
+    /// A chunk's biomes: its x and z, and the world's bottom and height.
+    Chunk([i32; 4])
+}
+
+pub fn run_biomes(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, biomes: Registry) -> Outcome {
+    var fields = input
+    let seed_value = take(mut fields, "seed") else return Outcome.Failed("missing field `seed`")
+    let seed_text = as_string(seed_value) else return Outcome.Failed("`seed` must be a string")
+    let seed = i64.parse(seed_text) else return Outcome.Failed("`seed` must be a decimal 64-bit integer")
+    let settings_value = take(mut fields, "settings") else return Outcome.Failed("missing field `settings`")
+    let name = as_string(settings_value) else return Outcome.Failed("`settings` must be an identifier")
+    let json = match data_json(zip, qualified(name), "noise_settings") {
+        ok(j) => j,
+        err(e) => return Outcome.Failed(e),
+    }
+    var members = match json {
+        Json.Object(m) => m,
+        _ => return Outcome.Failed("noise settings `{name}` isn't an object"),
+    }
+    let legacy = match get(members, "legacy_random_source") {
+        some(Json.Bool(b)) => b,
+        _ => false,
+    }
+    let router = match take(mut members, "noise_router") {
+        some(Json.Object(m)) => m,
+        _ => return Outcome.Failed("noise settings `{name}` have no router"),
+    }
+    let cached = match take(mut fields, "cached") {
+        some(Json.Bool(b)) => b,
+        _ => return Outcome.Failed("`cached` must be true or false"),
+    }
+    let op_list = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let ops = match op_list {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    var steps = List<Step>()
+    var reads: i64 = 0
+    var values: i64 = 0
+    var needs_multi = String()
+    for i in 0..ops.len() {
+        match read_step(ops[i], i) {
+            ok(step) => {
+                match step {
+                    Step.List => needs_multi = "`ops`[{i}]: `list` needs a `multi_noise` source",
+                    Step.Climate(n) => {
+                        reads += 12 * i64(n)
+                        values += i64(n)
+                    },
+                    Step.Points(n) => {
+                        reads += 12 * i64(n)
+                        values += i64(n)
+                    },
+                    Step.Search(n) => {
+                        needs_multi = "`ops`[{i}]: `search` needs a `multi_noise` source"
+                        reads += 24 * i64(n)
+                        values += i64(n)
+                    },
+                    Step.Chunk(c) => values += i64(c[3] / 16) * 64,
+                }
+                steps.push(step)
+            },
+            err(e) => return Outcome.Failed(e),
+        }
+    }
+    if values > MAX_VALUES {
+        return Outcome.Failed("the ops give more than {MAX_VALUES} values")
+    }
+    if blobs.len() != 1 {
+        return Outcome.Failed("expected 1 blob, got {blobs.len()}")
+    }
+    if i64.wrap(blobs[0].len()) != reads {
+        return Outcome.Failed("the blob must hold {reads} bytes of ints")
+    }
+    let source_value = take(mut fields, "source") else return Outcome.Failed("missing field `source`")
+    let source = match read_source(zip, biomes, source_value) {
+        ok(s) => s,
+        // A source that doesn't read is compared only as that, as the vanilla adapter reports it.
+        err(_) => {
+            let output: List<Member> = [Member { key: "invalid", value: Json.Bool(true) }]
+            return Outcome.Done { output: output, blobs: [] }
+        },
+    }
+    let multi = match source.kind {
+        Kind.Multi => true,
+        _ => false,
+    }
+    if needs_multi.len() > 0 and not multi {
+        return Outcome.Failed(needs_multi)
+    }
+    var possible = List<Json>()
+    for b in source.possible() {
+        possible.push(Json.Str(biomes.entries[usize.wrap(b)].to_string()))
+    }
+    var functions = Functions.new(legacy, seed)
+    let climate = match climate_of(mut functions, zip, router) {
+        ok(c) => c,
+        err(e) => return Outcome.Failed(e),
+    }
+    var index = List<i32>()
+    for _ in 0..biomes.entries.len() {
+        index.push(-1)
+    }
+    var named = List<i32>()
+    var out = List<u8>()
+    out.reserve(usize.wrap(values) * 4)
+    match evaluate(functions.program, source, climate, cached, steps, blobs[0], mut index, mut named, mut out) {
+        ok => {},
+        err(thrown) => return rejected(thrown),
+    }
+    var names = List<Json>()
+    for b in named {
+        names.push(Json.Str(biomes.entries[usize.wrap(b)].to_string()))
+    }
+    let output: List<Member> = [
+        Member { key: "possible", value: Json.Array(possible) },
+        Member { key: "biomes", value: Json.Array(names) },
+    ]
+    return Outcome.Done { output: output, blobs: [out] }
+}
+
+/// The ops, as the vanilla adapter does them: the first exception thrown is the case's.
+fn evaluate(p: Program, source: BiomeSource, c: ClimateSampler, cached: bool, steps: List<Step>, blob: List<u8>, index: mut List<i32>, named: mut List<i32>, out: mut List<u8>) ! Thrown {
+    var ctx = Context.new(cached)
+    var last: i32 = -1
+    var at: usize = 0
+    for step in steps {
+        match step {
+            Step.List => {
+                put_u32(mut out, u32.wrap(source.points.len()))
+                for i in 0..source.points.len() {
+                    let six: usize = 6
+                    for d in 0..six {
+                        put_u64(mut out, source.points[i].mins[d])
+                        put_u64(mut out, source.points[i].maxs[d])
+                    }
+                    put_u64(mut out, source.points[i].mins[6])
+                    put_u32(mut out, u32.wrap(number(mut index, mut named, source.biomes[i])))
+                }
+            },
+            Step.Climate(n) => {
+                for _ in 0..n {
+                    let t = try sample_climate(p, mut ctx, c, int_at(blob, at), int_at(blob, at + 4), int_at(blob, at + 8))
+                    at += 12
+                    let six: usize = 6
+                    for d in 0..six {
+                        put_u64(mut out, t.values[d])
+                    }
+                }
+            },
+            Step.Points(n) => {
+                for _ in 0..n {
+                    let b = try source.biome_at(p, mut ctx, c, int_at(blob, at), int_at(blob, at + 4), int_at(blob, at + 8), mut last)
+                    at += 12
+                    put_u32(mut out, u32.wrap(number(mut index, mut named, b)))
+                }
+            },
+            Step.Search(n) => {
+                for _ in 0..n {
+                    var t = Target { values: [0; 7] }
+                    let six: usize = 6
+                    for d in 0..six {
+                        t.values[d] = i64(int_at(blob, at + d * 4))
+                    }
+                    at += 24
+                    let b = try source.find(t, mut last)
+                    put_u32(mut out, u32.wrap(number(mut index, mut named, b)))
+                }
+            },
+            Step.Chunk(a) => {
+                var biomes = List<i32>()
+                try source.chunk(p, c, a[0], a[1], a[2], a[3], mut last, mut biomes)
+                for b in biomes {
+                    put_u32(mut out, u32.wrap(number(mut index, mut named, b)))
+                }
+            },
+        }
+    }
+}
+
+/// A biome's number in the output: the order the case first gives it in.
+fn number(index: mut List<i32>, named: mut List<i32>, biome: i32) -> i32 {
+    let at = usize.wrap(biome)
+    if index[at] < 0 {
+        index[at] = i32.wrap(named.len())
+        named.push(biome)
+    }
+    return index[at]
+}
+
+fn read_step(value: Json, i: usize) -> Step ! String {
+    let what = "`ops`[{i}]"
+    match value {
+        Json.Array(items) => return try step_of(items, what),
+        _ => {},
+    }
+    fail "{what} must be a non-empty array"
+}
+
+fn step_of(op: List<Json>, what: String) -> Step ! String {
+    if op.len() == 0 {
+        fail "{what} must be a non-empty array"
+    }
+    let kind = as_string(op[0]) else fail "{what}[0] must be a string"
+    if kind == "list" {
+        try arity(op, 1, what)
+        return Step.List
+    }
+    if kind == "climate" or kind == "points" or kind == "search" {
+        try arity(op, 2, what)
+        let n = as_i32(op[1]) else fail "{what}[1] must be an int"
+        if n < 0 {
+            fail "{what}'s count must not be negative"
+        }
+        if kind == "climate" {
+            return Step.Climate(n)
+        }
+        if kind == "points" {
+            return Step.Points(n)
+        }
+        return Step.Search(n)
+    }
+    if kind == "chunk" {
+        try arity(op, 5, what)
+        let min_y = as_i32(op[3]) else fail "{what}[3] must be an int"
+        let height = as_i32(op[4]) else fail "{what}[4] must be an int"
+        if min_y % 16 != 0 or height % 16 != 0 or height <= 0 or min_y < -2032 or min_y + height > 2032 {
+            fail "{what}: a chunk's `min_y` and `height` must be whole sections within the world"
+        }
+        let x = as_i32(op[1]) else fail "{what}[1] must be an int"
+        let z = as_i32(op[2]) else fail "{what}[2] must be an int"
+        return Step.Chunk([x, z, min_y, height])
+    }
+    fail "{what}: unknown op `{kind}`"
+}
+
+fn arity(op: List<Json>, size: usize, what: String) ! String {
+    if op.len() != size {
+        fail "{what} must have {size} elements"
+    }
+}
+
+/// A rejection, as the vanilla adapter reports an exception the game throws.
+fn rejected(thrown: Thrown) -> Outcome {
+    let output: List<Member> = [
+        Member { key: "exception", value: Json.Str(thrown.exception.copy()) },
+        Member { key: "error", value: Json.Str(thrown.message.copy()) },
+    ]
+    return Outcome.Done { output: output, blobs: [] }
+}
+
+/// A big-endian int from the blob.
+fn int_at(blob: List<u8>, at: usize) -> i32 {
+    var v: u32 = 0
+    for k in 0..4 {
+        v = (v << 8) | u32(blob[at + usize.wrap(k)])
+    }
+    return i32.wrap(v)
+}
+
+fn put_u32(out: mut List<u8>, v: u32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}
+
+fn put_u64(out: mut List<u8>, v: i64) {
+    let u = u64.wrap(v)
+    put_u32(mut out, u32.wrap(u >> 32))
+    put_u32(mut out, u32.wrap(u))
+}
