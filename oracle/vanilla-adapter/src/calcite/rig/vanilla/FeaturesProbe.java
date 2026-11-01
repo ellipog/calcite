@@ -775,6 +775,14 @@ final class FeaturesProbe implements Probe {
                         kept.put(key, entity.get(key).copy());
                     }
                 }
+                // A shulker keeps the yaw it was made with, drawn from its own random, which is
+                // seeded from the clock, since nothing that places one turns it: zeros instead.
+                if ("minecraft:shulker".equals(entity.getStringOr("id", "")) && kept.contains("Rotation")) {
+                    net.minecraft.nbt.ListTag zero = new net.minecraft.nbt.ListTag();
+                    zero.add(net.minecraft.nbt.FloatTag.valueOf(0.0F));
+                    zero.add(net.minecraft.nbt.FloatTag.valueOf(0.0F));
+                    kept.put("Rotation", zero);
+                }
                 masked = kept;
             }
             NbtIo.writeAnyTag(masked, out);

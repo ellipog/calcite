@@ -10,6 +10,12 @@ Each structure a set places by random spread gets a world of one biome it may st
 at a chunk its set may place it in, as the `structures` cases pick them; whether a start is made
 there is vanilla's to say. Abandoned camps, which differ only by their biome, get three of the
 eighteen.
+
+Strongholds, End cities and Nether fortresses also get chunks their pieces fill, a start's own
+chunk seldom holding much of them: each in a world of one biome with a seed of its own, at chunks
+picked by asking the `structures` probe where those worlds' starts are and which chunks their
+pieces reach, among them a stronghold's portal room and library, an End city's ship and a
+fortress's blaze spawner.
 """
 
 import sys
@@ -24,6 +30,21 @@ import gen as structures  # noqa: E402
 
 SEED = 20261110
 CAMPS = {"abandoned_camp_forest", "abandoned_camp_savanna", "abandoned_camp_snowy_taiga"}
+# Worlds of one biome, and the chunks in them where a structure's pieces are, by name.
+FILLED = [
+    ("stronghold", "plains", "20261110", [
+        ("start", -96, -36), ("portal", -95, -37), ("crossings", 85, -72), ("library", 85, -73),
+        ("stairs", 86, -71), ("library2", 12, 110), ("portal2", 11, 108),
+    ]),
+    ("end_city", "end_highlands", "20261111", [
+        ("start", 105, 3), ("towers", 104, 3), ("bridges", 104, 4), ("small", 144, 6),
+        ("far", 223, 4), ("long", 263, 2), ("farthest", 362, 26),
+    ]),
+    ("fortress", "nether_wastes", "20261112", [
+        ("start", 22, 9), ("well", 21, 9), ("corridors", 20, 6), ("spawner", 25, 10),
+        ("stalks", 21, 8), ("busy", 91, 21), ("bridges", 205, 6),
+    ]),
+]
 
 
 def main():
@@ -49,6 +70,11 @@ def main():
         x, z = structures.candidates(g, seed, placement, 1, False)[0]
         c.op("structured", x, z)
         cases.append(c.build())
+    for sid, biome, seed, chunks in FILLED:
+        for name, x, z in chunks:
+            c = structures.Case(f"structured-{sid}-{name}", seed, structures.world_of(biome), structures.fixed(biome))
+            c.op("structured", x, z)
+            cases.append(c.build())
     write_file(HERE / "structured.json", "features", f"cases/features/structured.py, seed {SEED}", cases, probe_version=4)
 
 
