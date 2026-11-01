@@ -740,6 +740,23 @@ A source that doesn't read is `{"invalid": "source"}`, and then a feature that d
 
 Calcite answers `unimplemented` for a case that reaches a feature type, a block's `canSurvive` or a placement it doesn't run yet.
 
+### `structures` (v1)
+
+Where 26.3's structure sets place structures, and the starts `ChunkGenerator.createStructures` makes. The registries are vanilla's own, as `features`' are, so the structure sets are every one in vanilla's data, in their registry's order.
+
+Input `{"seed": s, "settings": id, "level": [min_y, height], "source": v, "ops": [...]}` and no blobs, `s`, `id`, `level` and `v` as in `surface`. The generator is a `NoiseBasedChunkGenerator` with the settings and the source, and its structure state is `createState` of the structure set registry, the settings' random state and the seed, as a server makes it: the sets with a structure whose biomes the source may give, in order.
+
+| Op | Does |
+| --- | --- |
+| `["placement", cx, cz, size]` | For each of the state's structure sets: its ID with `writeUTF`, then how many chunks of the `size`×`size` square from chunk `cx`, `cz` its placement's `isStructureChunk` holds for, `size` 1 to 256, and each one's `x` and `z`, `z` outer |
+| `["rings"]` | For each set placed in concentric rings: its ID, then how many positions `getRingPositionsFor` gives, -1 for none, and each one's `x` and `z` |
+| `["starts", cx, cz]` | `createStructures` on a new `ProtoChunk` at chunk `cx`, `cz`, with a structure manager made without its constructor, which reads and writes only that chunk's starts, and a template manager that loads vanilla's templates as `features`' does; then the chunk's starts as a saved chunk's `structures.starts` compound has them, with `NbtIo.writeAnyTag` |
+| `["ring_starts", n]` | For each set placed in concentric rings, how many of its first `n` positions, 0 to 16, there are, then the starts made at each as `starts` makes them |
+
+The output is `{}`, with one blob of each op's bytes in order. A source that doesn't read is `{"invalid": "source"}` with no blob. If anything else throws, the result is the rejection, as `rng`'s.
+
+Calcite answers `unimplemented` for a case that reaches a structure type, a placement or a piece it doesn't make yet.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

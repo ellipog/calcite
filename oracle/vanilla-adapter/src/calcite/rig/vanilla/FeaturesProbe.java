@@ -247,7 +247,7 @@ final class FeaturesProbe implements Probe {
      * {@code NbtIo.readCompressed}, upgraded from its data version and loaded with the block
      * registry. One that isn't there is an empty template, as {@code getOrCreate} makes it.
      */
-    private static final class Templates extends StructureTemplateManager {
+    static final class Templates extends StructureTemplateManager {
         Map<Identifier, Optional<StructureTemplate>> loaded;
         HolderGetter<Block> blocks;
 
@@ -477,7 +477,7 @@ final class FeaturesProbe implements Probe {
     }
 
     /** The dimension type the settings' world has: the Nether's or the End's, or the Overworld's. */
-    private static DimensionType dimensionType(RegistryAccess access, Identifier settings) {
+    static DimensionType dimensionType(RegistryAccess access, Identifier settings) {
         ResourceKey<DimensionType> key = settings.getPath().equals("nether")
                 ? BuiltinDimensionTypes.NETHER
                 : settings.getPath().equals("end") ? BuiltinDimensionTypes.END : BuiltinDimensionTypes.OVERWORLD;
@@ -688,7 +688,7 @@ final class FeaturesProbe implements Probe {
         f.set(owner, value);
     }
 
-    private static Object allocate(Class<?> type) throws Exception {
+    static Object allocate(Class<?> type) throws Exception {
         // `sun.misc.Unsafe`, found by name, since the build takes no warnings.
         Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
         Field theUnsafe = unsafeClass.getDeclaredField("theUnsafe");
