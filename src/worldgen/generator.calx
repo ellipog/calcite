@@ -1,0 +1,572 @@
+/// The Overworld as the server generates it (CAL-68): each chunk made as vanilla's chunk statuses
+/// make it, with `worldgen`'s stages, from the structure starts to the features.
+///
+/// A chunk's terrain is its biomes, its fill with the beardifier of the structures it references,
+/// its materials and its carvers; it needs the starts of the chunks within 8, and the biomes of
+/// the chunks around it. Terrain depends on nothing else, so a `Terrain` of its own makes it on
+/// any thread, from a `TerrainJob` the generator plans with what it needs. A chunk is decorated,
+/// its structures placed and its features, as `applyBiomeDecoration` decorates it, in a region of
+/// the chunks around it with their terrain, whose blocks any of the nine's decorations may read
+/// and change.
+///
+/// Decorations whose regions overlap are in a fixed order (D29), so what a chunk comes to is the
+/// same whatever order chunks are asked for in, and on any thread. Chunks are colored by `x mod 3`
+/// and `z mod 3`, and the colors are ranked; two chunks whose regions overlap, 2 or less apart,
+/// never share a color. A chunk is decorated only after each chunk 2 or less from it of a lower
+/// rank, which makes every overlap go the same way: the lower rank first. Of the 9! rankings, the
+/// one here needs the fewest chunks decorated around those asked for, 5 to 8 more on each side of
+/// an area (D214). A chunk is finished once the nine around it are decorated, as nothing else
+/// writes to it.
+///
+/// Everything made is kept: the starts, each chunk's references and biomes, the terrain of the
+/// chunks still to be finished, and each chunk finished, as the server's chunk, which it's handed
+/// again if it's asked for again. What a decoration throws is noted in `problems` and the
+/// decoration stops there, as Calcite has no crash for it to be.
+module worldgen.generator
+
+import json.tree.{Json, Member, get}
+import std.zip.{Zip}
+import registry.registry.{Registry}
+import std.math.{PI, sin, cos}
+import std.palette.{PalettedContainer}
+import world.chunk.{AIR_STATE, BlockStates, Chunk, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, Section, WORLD_SURFACE}
+import worldgen.beardifier.{Beardifier, beard_kernel}
+import worldgen.biome_manager.{SourceBiomes, Zoom}
+import worldgen.biome_source.{BiomeSource, climate_of, holder_set, read_parameter, read_source}
+import worldgen.carver.{Carvers, carve_chunk}
+import worldgen.climate.{Parameter, quantize}
+import worldgen.density.{Functions, data_json}
+import worldgen.facts.{Facts}
+import worldgen.features.{Catalog, Decoration, Gen}
+import worldgen.interval.{Thrown}
+import worldgen.jigsaw.{Pools}
+import worldgen.material.{Materials, Rules, build_surface, materials, read_rules}
+import worldgen.placing.{Placer, decorate_structured}
+import worldgen.pool_pieces.{ElementCache}
+import worldgen.predicates.{Readers}
+import worldgen.references.{Refs, StartMap, beardifier_for, chunk_key, create_references, registry_order}
+import worldgen.region.{Region, RegionChunk}
+import worldgen.sampler.{Context, sample}
+import worldgen.structure_world.{StructureWorld}
+import worldgen.structures.{StructureState, Structures, create_structures}
+import worldgen.survive.{Env}
+import worldgen.template.{Templates}
+import worldgen.terrain.{Filled, Shape, clamped, fill_noise, read_shape}
+
+/// The Overworld's bottom and height.
+pub const MIN_Y: i32 = -64
+pub const HEIGHT: i32 = 384
+
+// Each color's rank, by `x mod 3 + 3 * (z mod 3)`: the colors go (0, 0), (0, 1), (0, 2), (1, 2),
+// (2, 2), (2, 1), (1, 1), (1, 0), (2, 0), as `(x mod 3, z mod 3)`.
+const RANKS: [i32; 9] = [0, 7, 8, 1, 6, 5, 2, 3, 4]
+
+/// The rank of the chunk at `x`, `z`'s color: of two chunks whose regions overlap, the one of
+/// the lower rank is decorated first.
+pub fn rank_of(x: i32, z: i32) -> i32 {
+    let mx = ((x % 3) + 3) % 3
+    let mz = ((z % 3) + 3) % 3
+    return RANKS[usize.wrap(mx + 3 * mz)]
+}
+
+/// What a generator is made from: the noise settings, such as `minecraft:overworld`, the block,
+/// fluid and biome registries, the block states' table, the blocks in `#uncarvable`, and the
+/// world's seed. Vanilla's data comes with it, as a generator is made on its own thread.
+pub struct GenSetup {
+    pub settings: String
+    pub blocks: Registry
+    pub fluids: Registry
+    pub biomes: Registry
+    pub table: BlockStates
+    pub uncarvable: List<i32>
+    pub seed: i64
+}
+
+// The noise settings' fields, and whether they use the legacy random source.
+fn noise_settings(zip: Zip, id: String) -> (List<Member>, bool) ! String {
+    let json = try data_json(zip, id.copy(), String("noise_settings"))
+    let members = match json {
+        Json.Object(m) => m,
+        _ => fail "the noise settings {id} aren't an object",
+    }
+    let legacy = match get(members, "legacy_random_source") {
+        some(Json.Bool(b)) => b,
+        _ => fail "the noise settings {id} have no `legacy_random_source`",
+    }
+    return (members, legacy)
+}
+
+// The Overworld's biome source, `multi_noise` with the `overworld` preset, as every preset of a
+// normal world's Overworld has it.
+fn overworld_source(zip: Zip, biomes: Registry) -> BiomeSource ! String {
+    let members: List<Member> = [Member { key: String("type"), value: Json.Str(String("minecraft:multi_noise")) }, Member { key: String("preset"), value: Json.Str(String("minecraft:overworld")) }]
+    return try read_source(zip, biomes, Json.Object(members))
+}
+
+/// A chunk whose terrain is to be made: where, the beardifier of the structures it references,
+/// and the biomes of the chunk and the eight around it, from the lower corner, `x` fastest.
+pub struct TerrainJob {
+    pub x: i32
+    pub z: i32
+    beard: Beardifier?
+    biomes: List<List<i32>>
+}
+
+/// What makes chunks' terrain, on one thread: the noise settings' functions with their caches,
+/// the shape, the materials and the carvers.
+pub struct Terrain {
+    functions: Functions
+    shape: Shape
+    biomes: SourceBiomes
+    mat: Materials
+    rules: Rules
+    carvers: Carvers
+    table: BlockStates
+    seed: i64
+}
+
+impl Terrain {
+    /// What makes terrain as `setup` says, from vanilla's data in `zip`.
+    pub fn new(zip: Zip, setup: GenSetup) -> Terrain ! String {
+        let facts = try Facts.new(setup.blocks, setup.fluids, setup.table.copy())
+        let (members, legacy) = try noise_settings(zip, setup.settings)
+        let source = try overworld_source(zip, setup.biomes)
+        var functions = Functions.new(legacy, setup.seed)
+        let rule_value = get(members, "material_rule") else fail "the noise settings {setup.settings} have no `material_rule`"
+        let rules = try read_rules(mut functions, zip, setup.biomes, facts.codec, rule_value)
+        let carvers = try Carvers.of_biomes(zip, setup.biomes, source.possible(), facts.codec, setup.uncarvable)
+        let router = match get(members, "noise_router") {
+            some(Json.Object(m)) => m,
+            _ => fail "the noise settings {setup.settings} have no router",
+        }
+        let climate = try climate_of(mut functions, zip, router)
+        let shape = try read_shape(mut functions, zip, members, facts.codec, facts.table)
+        let mat = try materials(mut functions, zip, members, shape, facts.codec, setup.biomes, source.possible(), MIN_Y, HEIGHT)
+        return Terrain { functions: functions, shape: shape, biomes: SourceBiomes.new(source, climate, setup.seed), mat: mat, rules: rules, carvers: carvers, table: facts.table.copy(), seed: setup.seed }
+    }
+
+    /// The chunk's terrain: filled, with its beardifier, then its materials, then carved.
+    pub fn make(mut self, job: own TerrainJob) -> Filled ! Thrown {
+        let x = job.x
+        let z = job.z
+        var zoom = Zoom { chunk_x: x, chunk_z: z, min_y: MIN_Y, height: HEIGHT, seed: self.biomes.seed, chunks: job.biomes }
+        var ctx = Context.new(true)
+        ctx.beard = job.beard
+        let (made, noise_aquifer) = try fill_noise(mut self.functions, self.shape, self.table, mut ctx, x, z, MIN_Y, HEIGHT)
+        var f = made
+        var aquifer = noise_aquifer
+        let (_, noise_height) = clamped(self.shape, MIN_Y, HEIGHT)
+        if noise_height > 0 {
+            try build_surface(mut f, mut self.functions, self.mat, self.rules, self.table, mut ctx, mut zoom, x, z)
+            try carve_chunk(mut f, mut self.functions, self.shape, self.mat, self.rules, self.table, mut ctx, mut aquifer, mut self.biomes, self.carvers, self.seed, x, z)
+        }
+        return f
+    }
+}
+
+// One of a spawn target's parameters: the density function's sampler, and its range.
+struct TargetParameter {
+    sampler: usize
+    range: Parameter
+}
+
+/// The Overworld's generator, with what it's made so far.
+pub struct Generator {
+    zip: Zip
+    rd: Readers
+    g: Gen
+    w: StructureWorld
+    placer: Placer
+    state: StructureState
+    terrain: Terrain
+    kernel: List<f32>
+    seed: i64
+    // The noise settings' `spawn_target`.
+    targets: List<List<TargetParameter>>
+    starts: StartMap
+    biomes: OpenHashMap<i64, List<i32>>
+    refs: OpenHashMap<i64, List<Refs>>
+    // The terrain of the chunks not yet finished, with what decorations left in it; the chunks
+    // whose terrain a job is making; those decorated; and those finished.
+    protos: OpenHashMap<i64, RegionChunk>
+    making: OpenHashSet<i64>
+    decorated: OpenHashSet<i64>
+    finished: OpenHashMap<i64, Chunk>
+    /// What went wrong decorating, to be logged, oldest first.
+    pub problems: List<String> = List<String>()
+}
+
+impl Generator {
+    /// The generator `setup` says, from vanilla's data in `zip`.
+    pub fn new(zip: own Zip, setup: GenSetup) -> Generator ! String {
+        let terrain = try Terrain.new(zip, setup)
+        let (members, legacy) = try noise_settings(zip, setup.settings)
+        let source = try overworld_source(zip, setup.biomes)
+        let facts = try Facts.new(setup.blocks, setup.fluids, setup.table.copy())
+        let rd = Readers { blocks: setup.blocks.copy(), fluids: setup.fluids.copy(), biomes: setup.biomes.copy() }
+        var catalog = Catalog.new()
+        let decoration = try Decoration.of_biomes(mut catalog, zip, facts, rd, source.possible())
+        // Structures sample the noise through functions of their own, as terrain does through
+        // its own, so neither's caches are the other's.
+        var functions = Functions.new(legacy, setup.seed)
+        let router = match get(members, "noise_router") {
+            some(Json.Object(m)) => m,
+            _ => fail "the noise settings {setup.settings} have no router",
+        }
+        let climate = try climate_of(mut functions, zip, router)
+        let shape = try read_shape(mut functions, zip, members, facts.codec, facts.table)
+        var targets = List<List<TargetParameter>>()
+        if let Json.Array(points) = get(members, "spawn_target") {
+            for point in points {
+                let Json.Object(entries) = point else fail "a spawn target isn't a map"
+                var parameters = List<TargetParameter>()
+                for e in entries {
+                    let f = try functions.read(zip, Json.Str(e.key.copy()))
+                    let s = match functions.sampler(f) {
+                        ok(s) => s,
+                        err(t) => fail "the spawn target's `{e.key}` doesn't compile: {t.exception}: {t.message}",
+                    }
+                    parameters.push(TargetParameter { sampler: s, range: try read_parameter(e.value) })
+                }
+                targets.push(parameters)
+            }
+        }
+        let structures = try Structures.read(zip, setup.biomes)
+        let state = StructureState.new(structures, source.possible(), setup.seed)
+        let order = registry_order(structures)
+        let blocking = try holder_set(setup.biomes, Json.Str(String("#minecraft:mineshaft_blocking")))
+        let placer = Placer { structures: structures, pools: Pools.new(), order: order, elements: ElementCache.new(), mineshaft_blocking: blocking }
+        let world_facts = facts.copy()
+        let env = Env { facts: facts, ctx: terrain.mat.gen, sky_light: true, gen_depth: shape.height }
+        let g = Gen.new(env, catalog, decoration, terrain.mat.temps.copy())
+        let w = StructureWorld { functions: functions, shape: shape, facts: world_facts, biomes: SourceBiomes.new(source, climate, setup.seed), templates: Templates.new(), temps: terrain.mat.temps.copy(), level_min: MIN_Y, level_height: HEIGHT, seed: setup.seed }
+        return Generator {
+            zip: zip,
+            rd: rd,
+            g: g,
+            w: w,
+            placer: placer,
+            state: state,
+            terrain: terrain,
+            kernel: beard_kernel(),
+            seed: setup.seed,
+            targets: targets,
+            starts: StartMap.new(),
+            biomes: OpenHashMap<i64, List<i32>>(),
+            refs: OpenHashMap<i64, List<Refs>>(),
+            protos: OpenHashMap<i64, RegionChunk>(),
+            making: OpenHashSet<i64>(),
+            decorated: OpenHashSet<i64>(),
+            finished: OpenHashMap<i64, Chunk>(),
+        }
+    }
+
+    /// The block states' table the chunks are made with.
+    pub fn table(self) -> BlockStates {
+        return self.g.env.facts.table.copy()
+    }
+
+    /// `NoiseBasedChunkGenerator.getOrigin`: the chunk a new world's spawn is looked for from, as
+    /// `NoiseSpawnFinder` finds it, where the settings' spawn target fits best near the origin.
+    /// The chunk at the origin if there's no target.
+    pub fn origin(self) -> (i32, i32) ! Thrown {
+        if self.targets.is_empty() {
+            return (0, 0)
+        }
+        var ctx = Context.new(true)
+        var best = (0, 0, try self.fitness(mut ctx, 0, 0))
+        best = try self.radial(mut ctx, best, 2048.0f32, 512.0f32)
+        best = try self.radial(mut ctx, best, 512.0f32, 32.0f32)
+        let (x, z, _) = best
+        return (x >> 4, z >> 4)
+    }
+
+    // `NoiseSpawnFinder.radialSearch`: rings around the best so far, `step` apart out to `most`,
+    // each with a point every `step` along it. Java's `Math.sin` may be a bit off the true sine,
+    // which `std.math.sin` is within half a unit of; only a product a hair from a whole number
+    // could tell them apart.
+    fn radial(self, ctx: mut Context, from: (i32, i32, i64), most: f32, step: f32) -> (i32, i32, i64) ! Thrown {
+        var best = from
+        let (ox, oz, _) = from
+        var angle = 0.0f32
+        var radius = step
+        while radius <= most {
+            let x = ox + i32.saturate(sin(f64(angle)) * f64(radius))
+            let z = oz + i32.saturate(cos(f64(angle)) * f64(radius))
+            let f = try self.fitness(mut ctx, x, z)
+            let (_, _, best_fitness) = best
+            if f < best_fitness {
+                best = (x, z, f)
+            }
+            angle += step / radius
+            if f64(angle) > PI * 2.0 {
+                angle = 0.0f32
+                radius += step
+            }
+        }
+        return best
+    }
+
+    // `getSpawnPositionAndFitness`: how far the climate at the quart holding the block is from
+    // the nearest target, scaled, plus the square of the distance to the origin.
+    fn fitness(self, ctx: mut Context, x: i32, z: i32) -> i64 ! Thrown {
+        let qx = (x >> 2) << 2
+        let qz = (z >> 2) << 2
+        var least = i64.MAX
+        for point in self.targets {
+            var fit: i64 = 0
+            for p in point {
+                let v = quantize(try sample(self.w.functions.program, mut ctx, p.sampler, qx, 0, qz))
+                let above = v - p.range.max
+                let below = p.range.min - v
+                let d = if above > 0 { above } else { below.max(0) }
+                fit += d * d
+            }
+            least = least.min(fit)
+        }
+        return least.wrapping_mul(2048 * 2048) + i64(x) * i64(x) + i64(z) * i64(z)
+    }
+
+    /// The terrain still to be made before the chunk at `x`, `z` can be finished, each chunk's
+    /// job handed out once, added to `jobs`; and every chunk whose terrain that waits for, being
+    /// made for it or before, added to `waits`. Its starts and references are made here.
+    pub fn plan(mut self, x: i32, z: i32, jobs: mut List<TerrainJob>, waits: mut List<i64>) ! Thrown {
+        if self.finished.contains(chunk_key(x, z)) {
+            return
+        }
+        var seen = OpenHashSet<i64>()
+        for dz in -1..2 {
+            for dx in -1..2 {
+                try self.plan_decoration(x + dx, z + dz, mut seen, mut jobs, mut waits)
+            }
+        }
+    }
+
+    // The terrain the decoration of the chunk at `x`, `z` needs, and that of the decorations
+    // before it.
+    fn plan_decoration(mut self, x: i32, z: i32, seen: mut OpenHashSet<i64>, jobs: mut List<TerrainJob>, waits: mut List<i64>) ! Thrown {
+        let key = chunk_key(x, z)
+        if self.decorated.contains(key) or seen.contains(key) {
+            return
+        }
+        seen.insert(key)
+        let rank = rank_of(x, z)
+        for dz in -2..3 {
+            for dx in -2..3 {
+                if rank_of(x + dx, z + dz) < rank {
+                    try self.plan_decoration(x + dx, z + dz, mut seen, mut jobs, mut waits)
+                }
+            }
+        }
+        for dz in -1..2 {
+            for dx in -1..2 {
+                let k = chunk_key(x + dx, z + dz)
+                if self.protos.contains(k) or self.finished.contains(k) {
+                    continue
+                }
+                if not self.making.contains(k) {
+                    jobs.push(try self.job(x + dx, z + dz))
+                    self.making.insert(k)
+                }
+                if not waits.contains(k) {
+                    waits.push(k)
+                }
+            }
+        }
+    }
+
+    /// Whether the terrain of the chunk `key`, by `chunk_key`, is still being made.
+    pub fn is_making(self, key: i64) -> bool {
+        return self.making.contains(key)
+    }
+
+    /// Takes in the terrain a job made of the chunk at `x`, `z`.
+    pub fn give(mut self, x: i32, z: i32, f: own Filled) {
+        let key = chunk_key(x, z)
+        self.making.remove(key)
+        if not self.protos.contains(key) and not self.finished.contains(key) {
+            self.protos.insert(key, RegionChunk.of(self.g.env.facts, f))
+        }
+    }
+
+    /// Takes back a job that didn't make its chunk's terrain, which is made here when it's
+    /// needed.
+    pub fn drop_job(mut self, x: i32, z: i32) {
+        self.making.remove(chunk_key(x, z))
+    }
+
+    /// The chunk at `x`, `z` finished: the nine around it decorated, as the server's chunk, its
+    /// heightmaps made from its blocks. Its light is the server's to work out. Terrain that wasn't
+    /// made by jobs is made here.
+    pub fn full(mut self, x: i32, z: i32) -> Chunk ! Thrown {
+        let key = chunk_key(x, z)
+        if self.finished.contains(key) {
+            return self.finished[key].copy()
+        }
+        for dz in -1..2 {
+            for dx in -1..2 {
+                try self.decorate(x + dx, z + dz)
+            }
+        }
+        let made = self.protos.remove(key) else fail Thrown { exception: "IllegalStateException", message: "chunk {x}, {z} has no terrain" }
+        let biomes = try self.chunk_biomes(x, z)
+        let chunk = to_chunk(self.g.env.facts.table, made, biomes)
+        self.finished.insert(key, chunk.copy())
+        return chunk
+    }
+
+    /// How many chunks are kept: with terrain still to be finished, and finished.
+    pub fn kept(self) -> (usize, usize) {
+        return (self.protos.len(), self.finished.len())
+    }
+
+    // Decorates the chunk at `x`, `z`, once: first each chunk 2 or less from it of a lower rank,
+    // then it, in the region of the nine around it.
+    fn decorate(mut self, x: i32, z: i32) ! Thrown {
+        let key = chunk_key(x, z)
+        if self.decorated.contains(key) {
+            return
+        }
+        let rank = rank_of(x, z)
+        for dz in -2..3 {
+            for dx in -2..3 {
+                if rank_of(x + dx, z + dz) < rank {
+                    try self.decorate(x + dx, z + dz)
+                }
+            }
+        }
+        for dz in -1..2 {
+            for dx in -1..2 {
+                try self.terrain_here(x + dx, z + dz)
+            }
+        }
+        var chunks = List<RegionChunk>()
+        for dz in -1..2 {
+            for dx in -1..2 {
+                let c = self.protos.remove(chunk_key(x + dx, z + dz)) else fail Thrown { exception: "IllegalStateException", message: "chunk {x + dx}, {z + dz} has no terrain" }
+                chunks.push(c)
+            }
+        }
+        let zoom = try self.zoom(x, z)
+        let refs = try self.refs_of(x, z)
+        var region_hash = self.w.functions.positional().from_hash_of(String("minecraft:worldgen_region_random"))
+        let region_random = region_hash.fork_positional().at(x * 16, 0, z * 16)
+        var r = Region.around(x, z, chunks, zoom, self.seed, self.w.shape.sea_level, region_random)
+        match decorate_structured(self.g, self.w, self.placer, mut self.starts, refs, mut r, self.seed) {
+            ok => {},
+            err(t) => self.problems.push("Couldn't decorate chunk [{x}, {z}]: {t.exception}: {t.message}"),
+        }
+        for dz in -1..2 {
+            for dx in -1..2 {
+                self.protos.insert(chunk_key(x + dx, z + dz), r.chunks.remove(0))
+            }
+        }
+        self.decorated.insert(key)
+    }
+
+    // Makes the terrain of the chunk at `x`, `z` on this thread, unless it's made.
+    fn terrain_here(mut self, x: i32, z: i32) ! Thrown {
+        let key = chunk_key(x, z)
+        if self.protos.contains(key) or self.finished.contains(key) {
+            return
+        }
+        let job = try self.job(x, z)
+        let f = try self.terrain.make(job)
+        self.making.remove(key)
+        self.protos.insert(key, RegionChunk.of(self.g.env.facts, f))
+    }
+
+    // The job of making the terrain of the chunk at `x`, `z`: its references' beardifier and the
+    // biomes around it.
+    fn job(mut self, x: i32, z: i32) -> TerrainJob ! Thrown {
+        let refs = try self.refs_of(x, z)
+        let beard = beardifier_for(self.placer.structures, self.starts, refs, x, z, self.kernel.copy())
+        let zoom = try self.zoom(x, z)
+        return TerrainJob { x: x, z: z, beard: beard, biomes: zoom.chunks }
+    }
+
+    // The chunk at `x`, `z`'s references to the structures started within 8 of it.
+    fn refs_of(mut self, x: i32, z: i32) -> List<Refs> ! Thrown {
+        let key = chunk_key(x, z)
+        if self.refs.contains(key) {
+            return self.refs[key].copy()
+        }
+        for sx in x - 8..x + 9 {
+            for sz in z - 8..z + 9 {
+                try self.start(sx, sz)
+            }
+        }
+        let made = create_references(self.placer.structures, self.starts, x, z)
+        self.refs.insert(key, made.copy())
+        return made
+    }
+
+    // Makes the starts of the chunk at `x`, `z`, once, with what their jigsaw pieces need loaded.
+    fn start(mut self, x: i32, z: i32) ! Thrown {
+        let key = chunk_key(x, z)
+        if self.starts.chunks.contains(key) {
+            return
+        }
+        let made = try create_structures(mut self.w, mut self.placer.pools, self.zip, self.placer.structures, mut self.state, x, z)
+        for start in made {
+            try self.placer.elements.prepare(mut self.g.catalog, mut self.w, self.placer.pools, self.zip, self.g.env.facts, self.rd, start.pieces)
+        }
+        self.starts.chunks.insert(key, made)
+    }
+
+    // The chunk at `x`, `z`'s biomes, as `BiomeSource.chunk` gives them.
+    fn chunk_biomes(mut self, x: i32, z: i32) -> List<i32> ! Thrown {
+        let key = chunk_key(x, z)
+        if self.biomes.contains(key) {
+            return self.biomes[key].copy()
+        }
+        var b = List<i32>()
+        try self.w.biomes.chunk(self.w.functions.program, x, z, MIN_Y, HEIGHT, mut b)
+        self.biomes.insert(key, b.copy())
+        return b
+    }
+
+    // The biomes of the chunk at `x`, `z` and the eight around it, for the biome manager.
+    fn zoom(mut self, x: i32, z: i32) -> Zoom ! Thrown {
+        var chunks = List<List<i32>>()
+        for nz in -1..2 {
+            for nx in -1..2 {
+                chunks.push(try self.chunk_biomes(x + nx, z + nz))
+            }
+        }
+        return Zoom { chunk_x: x, chunk_z: z, min_y: MIN_Y, height: HEIGHT, seed: self.w.biomes.seed, chunks: chunks }
+    }
+}
+
+// The server's chunk from a finished chunk's blocks and its biomes, as `BiomeSource.chunk` gives
+// them: a section at a time from the bottom, `x`, then `y`, then `z`.
+fn to_chunk(table: BlockStates, made: own RegionChunk, biomes: List<i32>) -> Chunk {
+    let f = made.filled
+    let count = f.states.len() / 4096
+    var sections = List<Section>()
+    for s in 0..count {
+        var states = PalettedContainer.new(AIR_STATE, table.block_strategy())
+        let base = s * 4096
+        for i in 0..4096usize {
+            let v = f.states[base + i]
+            if v != AIR_STATE {
+                states.set_at(i, v)
+            }
+        }
+        let quarts = s * 64
+        var b = PalettedContainer.new(u32.wrap(biomes[quarts]), table.biome_strategy())
+        var i = quarts
+        for x in 0..4 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    b.set(x, y, z, u32.wrap(biomes[i]))
+                    i += 1
+                }
+            }
+        }
+        sections.push(Section.from(table, states, b))
+    }
+    var chunk = Chunk.of(f.min_y, sections)
+    chunk.prime_heightmaps(table, [WORLD_SURFACE, OCEAN_FLOOR, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES])
+    return chunk
+}

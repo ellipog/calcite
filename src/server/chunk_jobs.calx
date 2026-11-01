@@ -10,11 +10,23 @@
 /// What the IO thread reads is the server's input, as the network's bytes are: the link records
 /// it, and a replay hands it over in the same order. What the workers make of it depends only on
 /// that, so a replay makes it again with `prepare` on its own thread.
+///
+/// A world that generates its chunks hands each the workers find nothing to use of to the
+/// generator's thread, which owns `worldgen.generator`'s generator, and its terrain workers, one
+/// fewer than the processors, each with a `Terrain` of its own. The generator plans what terrain
+/// a chunk needs, the workers make it, and the generator decorates the chunks around it in their
+/// fixed order (D29) and hands it back finished, unlit. It plans the next chunks while the
+/// workers are busy, up to four jobs a worker ahead, and finishes each chunk as soon as its
+/// terrain is all there. A chunk is a pure function of where it is, so what comes back depends
+/// on nothing but the read, and a replay generates it again. The generator's thread also finds a
+/// new world's spawn, as `setInitialSpawn` does: from the chunk `getOrigin` picks, the first
+/// column a player can stand on in the first chunk of the 11×11 around it that has one.
 module server.chunk_jobs
 
 import nbt.tag.{Tag}
 import protocol.play.{LightData, LightLayer}
 import server.log.{Entry}
+import pack.vanilla.{data_path, vanilla_data}
 import std.net.{Waker}
 import std.pool.{workers}
 import std.thread.{Task}
@@ -22,8 +34,13 @@ import storage.chunk.{ChunkData, ChunkFormat}
 import storage.region.{ReadError, Stored, unpack}
 import storage.regions.{ChunkRead, RegionStorage, read_root}
 import world.chunk.{BlockStates, Chunk, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, OCEAN_FLOOR_WG, Section, WORLD_SURFACE, WORLD_SURFACE_WG}
+import world.collision.{CollisionStates}
 import world.light.{LightStates, SkySources}
-import world.pos.{ChunkPos}
+import world.pos.{BlockPos, ChunkPos}
+import world.spawn.{respawn_pos}
+import worldgen.generator.{GenSetup, Generator, Terrain, TerrainJob}
+import worldgen.interval.{Thrown}
+import worldgen.terrain.{Filled}
 
 /// The thread vanilla's region files log on, `Util.ioPool`'s first.
 pub fn io_thread() -> String {
@@ -33,6 +50,11 @@ pub fn io_thread() -> String {
 /// The thread vanilla reads a chunk's NBT on, the background executor's first.
 pub fn parse_thread() -> String {
     return String("Worker-Main-1")
+}
+
+/// The thread Calcite's generator logs on.
+pub fn gen_thread() -> String {
+    return String("Worldgen")
 }
 
 // The most chunk workers, whatever the processors.
@@ -87,6 +109,23 @@ pub enum Done {
     /// The chunk, what the IO thread logged reading it and what it read, then what the workers
     /// logged making it, and what they made.
     Chunk(ChunkPos, List<Entry>, ChunkRead, List<Entry>, Loaded)
+    /// Where the generator found a new world's spawn, and what it logged finding it.
+    Spawn(BlockPos, List<Entry>)
+}
+
+/// A chunk the generator finished, as the server takes it: its sky's sources worked out from its
+/// blocks with `light`, and no light, which the server's engine works out. `sections` is the
+/// dimension's.
+pub fn generated(chunk: own Chunk, light: LightStates, sections: i32) -> SavedChunk {
+    var sources = SkySources.new(chunk.min_y())
+    sources.fill_from(chunk, light)
+    var sky = List<List<u8>?>()
+    var block = List<List<u8>?>()
+    for _ in 0..usize.wrap(sections + 2) {
+        sky.push(none)
+        block.push(none)
+    }
+    return SavedChunk { chunk: chunk, sources: sources, sky: sky, block: block, lighted: false }
 }
 
 /// What a chunk read from its region file comes to, as vanilla's `ChunkMap.scheduleChunkLoad`
@@ -366,12 +405,14 @@ impl Task for IoThread {
     }
 }
 
-// A chunk worker: it makes each chunk the IO thread read, sends it back, and wakes the poll. It
-// works out the block states' light properties with the first chunk it's handed.
+// A chunk worker: it makes each chunk the IO thread read, sends it back, and wakes the poll; one
+// with nothing to use goes to the generator, if the world generates. It works out the block
+// states' light properties with the first chunk it's handed.
 struct ChunkWorker {
     context: ChunkContext
     work: Receiver<Work>
     done: Sender<Done>
+    generate: Sender<GenIn>?
     waker: Waker
 }
 
@@ -379,25 +420,413 @@ impl Task for ChunkWorker {
     fn run(own self) {
         var work = self.work
         var done = self.done
+        var generate = self.generate
         var states: LightStates? = none
         while let w = work.wait() {
             var lines = List<Entry>()
             let made = states.take() ?? LightStates.new()
             let loaded = prepare(w.pos, w.read, self.context, made, mut lines)
             states = some(made)
-            done.send(Done.Chunk(w.pos, w.lines, w.read, lines, loaded))
-            self.waker.wake()
+            var handed = false
+            match loaded {
+                Loaded.Generate => {
+                    if let held = generate.take() {
+                        var g = held
+                        g.send(GenIn.Make(GenWork { pos: w.pos, io: w.lines.copy(), read: w.read.copy(), made: lines.copy() }))
+                        generate = some(g)
+                        handed = true
+                    }
+                },
+                _ => {},
+            }
+            if not handed {
+                done.send(Done.Chunk(w.pos, w.lines, w.read, lines, loaded))
+                self.waker.wake()
+            }
         }
     }
 }
 
-/// The IO thread and the chunk workers, and the queues to and from them, which start with the
-/// first thing asked.
+// What the generator's thread is handed: a chunk to generate, with what reading it logged; the
+// terrain a worker made, or what making it threw; or a new world's spawn to find.
+enum GenIn {
+    Make(GenWork)
+    Made(i32, i32, Filled)
+    Failed(i32, i32, Thrown)
+    Spawn
+}
+
+// A chunk to generate, with what the IO thread logged and read, and what the worker logged.
+struct GenWork {
+    pos: ChunkPos
+    io: List<Entry>
+    read: ChunkRead
+    made: List<Entry>
+}
+
+// A terrain worker: it makes the terrain of each job it's handed, and hands it to the generator.
+struct TerrainWorker {
+    terrain: Terrain
+    jobs: Receiver<TerrainJob>
+    out: Sender<GenIn>
+}
+
+impl Task for TerrainWorker {
+    fn run(own self) {
+        var terrain = self.terrain
+        var jobs = self.jobs
+        var out = self.out
+        while let job = jobs.wait() {
+            let x = job.x
+            let z = job.z
+            match terrain.make(job) {
+                ok(f) => out.send(GenIn.Made(x, z, f)),
+                err(t) => out.send(GenIn.Failed(x, z, t)),
+            }
+        }
+    }
+}
+
+// A chunk planned: what to hand back, and the chunks whose terrain it waits for.
+struct Planned {
+    work: GenWork
+    waits: List<i64>
+}
+
+// The search for a new world's spawn: the chunk it's from, the offsets of the chunks it tries in
+// order, the one it's trying, whether that one's planned, and the terrain that waits for.
+struct SpawnFind {
+    x: i32
+    z: i32
+    offsets: List<(i32, i32)>
+    at: usize
+    planned: bool
+    waits: List<i64>
+}
+
+// The offsets of the 11×11 chunks around a new world's spawn chunk, in the order
+// `setInitialSpawn` tries them: a spiral out from the middle.
+fn spiral() -> List<(i32, i32)> {
+    var out = List<(i32, i32)>()
+    var x = 0
+    var z = 0
+    var dx = 0
+    var dz = -1
+    for _ in 0..121 {
+        if x >= -5 and x <= 5 and z >= -5 and z <= 5 {
+            out.push((x, z))
+        }
+        if x == z or (x < 0 and x == -z) or (x > 0 and x == 1 - z) {
+            let old = dx
+            dx = -dz
+            dz = old
+        }
+        x += dx
+        z += dz
+    }
+    return out
+}
+
+// The generator's thread: the generator, if it could be made, and its terrain workers.
+struct GenThread {
+    setup: GenSetup
+    sections: i32
+    inbox: Receiver<GenIn>
+    to_inbox: Sender<GenIn>
+    done: Sender<Done>
+    waker: Waker
+    workers: usize
+}
+
+// Where the generator's thread hands back what it made: the dimension's sections, the queue
+// back, and what wakes the poll.
+struct GenOut {
+    sections: i32
+    done: Sender<Done>
+    waker: Waker
+}
+
+// What the generator's thread keeps as it goes.
+struct GenState {
+    gen: Generator?
+    to_jobs: Sender<TerrainJob>?
+    light: LightStates
+    collisions: CollisionStates? = none
+    // The chunks asked for and not planned, those planned, and the spawn's search.
+    queue: Deque<GenWork> = Deque<GenWork>()
+    planned: List<Planned> = List<Planned>()
+    spawn: SpawnFind? = none
+    // How many terrain jobs are with the workers, and what's been logged since the last chunk
+    // handed back.
+    away: usize = 0
+    lines: List<Entry> = List<Entry>()
+}
+
+impl Task for GenThread {
+    fn run(own self) {
+        let GenThread { setup: setup, sections: sections, inbox: taken, to_inbox: to_inbox, done: done, waker: waker, workers: count } = self
+        var inbox = taken
+        var out = GenOut { sections: sections, done: done, waker: waker }
+        var s = GenState { gen: none, to_jobs: none, light: LightStates.new() }
+        let jobs = Receiver<TerrainJob>()
+        match vanilla_data(data_path(), mut s.lines) {
+            ok(zip) => {
+                var terrains = List<Terrain>()
+                var failed: String? = none
+                for _ in 0..count {
+                    match Terrain.new(zip, setup) {
+                        ok(t) => terrains.push(t),
+                        err(e) => failed = some(e),
+                    }
+                }
+                if failed == none {
+                    match Generator.new(zip, setup) {
+                        ok(g) => s.gen = some(g),
+                        err(e) => failed = some(e),
+                    }
+                }
+                if let e = failed {
+                    s.lines.push(Entry.error("Can't generate the world, so its chunks are flat: {e}").on(gen_thread()))
+                    s.gen = none
+                } else {
+                    s.to_jobs = some(jobs.sender())
+                    while let t = terrains.pop() {
+                        _ = unsafe { Thread.spawn(TerrainWorker { terrain: t, jobs: jobs.share(), out: to_inbox.share() }) }
+                    }
+                }
+            },
+            err(e) => s.lines.push(Entry.error("Can't generate the world, so its chunks are flat: {e}").on(gen_thread())),
+        }
+        let ahead = count.max(1) * 4
+        loop {
+            var progressed = false
+            // What's come, without waiting.
+            while let m = inbox.next() {
+                take_in(mut s, m)
+                progressed = true
+            }
+            if out.step(mut s, ahead) {
+                progressed = true
+            }
+            if not progressed {
+                let m = inbox.wait() else return
+                take_in(mut s, m)
+            }
+        }
+    }
+}
+
+// Takes in what came to the generator's thread.
+fn take_in(s: mut GenState, m: own GenIn) {
+    match m {
+        GenIn.Make(w) => s.queue.push_last(w),
+        GenIn.Made(x, z, f) => {
+            s.away -= 1
+            if let g = s.gen.take() {
+                var gen = g
+                gen.give(x, z, f)
+                s.gen = some(gen)
+            }
+        },
+        GenIn.Failed(x, z, t) => {
+            s.away -= 1
+            s.lines.push(Entry.warn("Couldn't make the terrain of chunk [{x}, {z}]: {t.exception}: {t.message}").on(gen_thread()))
+            if let g = s.gen.take() {
+                var gen = g
+                gen.drop_job(x, z)
+                s.gen = some(gen)
+            }
+        },
+        GenIn.Spawn => {
+            var origin = (0, 0)
+            var problem: String? = none
+            if let g = s.gen {
+                match g.origin() {
+                    ok(o) => origin = o,
+                    err(t) => problem = some("Couldn't find the spawn's chunk: {t.exception}: {t.message}"),
+                }
+            }
+            if let message = problem {
+                s.lines.push(Entry.warn(message).on(gen_thread()))
+            }
+            let (x, z) = origin
+            s.spawn = some(SpawnFind { x: x, z: z, offsets: spiral(), at: 0, planned: false, waits: List<i64>() })
+        },
+    }
+}
+
+impl GenOut {
+    // Does what can be done without waiting: the spawn's next chunk planned, then the chunks
+    // asked for while the workers have fewer than `ahead` jobs, then each chunk whose terrain is
+    // all there finished, and the spawn's chunk checked. Whether anything was done.
+    fn step(mut self, s: mut GenState, ahead: usize) -> bool {
+        var gen = s.gen.take() else {
+            // Nothing generates: each chunk goes back to be flat, and the spawn is its chunk's
+            // middle.
+            var any = false
+            while let w = s.queue.pop_first() {
+                self.hand_back(mut s, w, Loaded.Generate)
+                any = true
+            }
+            if let find = s.spawn.take() {
+                self.spawn_found(mut s, BlockPos { x: find.x * 16 + 8, y: 64, z: find.z * 16 + 8 })
+                any = true
+            }
+            return any
+        }
+        var progressed = false
+        if let f = s.spawn.take() {
+            var find = f
+            if not find.planned {
+                let (ox, oz) = find.offsets[find.at]
+                plan_chunk(mut s, mut gen, find.x + ox, find.z + oz, mut find.waits)
+                find.planned = true
+                progressed = true
+            }
+            s.spawn = some(find)
+        }
+        while s.away < ahead and not s.queue.is_empty() {
+            let w = s.queue.pop_first() else break
+            var waits = List<i64>()
+            plan_chunk(mut s, mut gen, w.pos.x, w.pos.z, mut waits)
+            s.planned.push(Planned { work: w, waits: waits })
+            progressed = true
+        }
+        var i: usize = 0
+        while i < s.planned.len() {
+            if waiting(gen, s.planned[i].waits) {
+                i += 1
+                continue
+            }
+            let p = s.planned.remove(i)
+            let pos = p.work.pos
+            let loaded = match gen.full(pos.x, pos.z) {
+                ok(chunk) => Loaded.Saved(generated(chunk, s.light, self.sections)),
+                err(t) => {
+                    s.lines.push(Entry.warn("Couldn't generate chunk [{pos.x}, {pos.z}], so it's flat: {t.exception}: {t.message}").on(gen_thread()))
+                    Loaded.Generate
+                },
+            }
+            problems(mut gen, mut s.lines)
+            self.hand_back(mut s, p.work, loaded)
+            progressed = true
+        }
+        if let f = s.spawn.take() {
+            var find = f
+            if find.planned and not waiting(gen, find.waits) {
+                let (ox, oz) = find.offsets[find.at]
+                let cx = find.x + ox
+                let cz = find.z + oz
+                var found: BlockPos? = none
+                match gen.full(cx, cz) {
+                    ok(chunk) => {
+                        if s.collisions == none {
+                            s.collisions = some(CollisionStates.new())
+                        }
+                        if let states = s.collisions {
+                            found = spawn_in(states, chunk, cx, cz)
+                        }
+                    },
+                    err(t) => s.lines.push(Entry.warn("Couldn't generate chunk [{cx}, {cz}] for the spawn: {t.exception}: {t.message}").on(gen_thread())),
+                }
+                problems(mut gen, mut s.lines)
+                find.at += 1
+                find.planned = false
+                find.waits.clear()
+                if found == none and find.at >= find.offsets.len() {
+                    found = some(BlockPos { x: find.x * 16 + 8, y: 64, z: find.z * 16 + 8 })
+                }
+                if let pos = found {
+                    self.spawn_found(mut s, pos)
+                } else {
+                    s.spawn = some(find)
+                }
+                progressed = true
+            } else {
+                s.spawn = some(find)
+            }
+        }
+        s.gen = some(gen)
+        return progressed
+    }
+
+    // Hands back the chunk `w` asked for, with what was logged since the last.
+    fn hand_back(mut self, s: mut GenState, w: own GenWork, loaded: own Loaded) {
+        var made = w.made.copy()
+        for e in s.lines {
+            made.push(e.copy())
+        }
+        s.lines.clear()
+        self.done.send(Done.Chunk(w.pos, w.io, w.read, made, loaded))
+        self.waker.wake()
+    }
+
+    // Hands back where the spawn is, with what was logged since the last.
+    fn spawn_found(mut self, s: mut GenState, pos: BlockPos) {
+        self.done.send(Done.Spawn(pos, s.lines.copy()))
+        s.lines.clear()
+        self.waker.wake()
+    }
+}
+
+// Plans the chunk at `x`, `z`: its terrain jobs go to the workers, and what it waits for to
+// `waits`.
+fn plan_chunk(s: mut GenState, gen: mut Generator, x: i32, z: i32, waits: mut List<i64>) {
+    var planned_jobs = List<TerrainJob>()
+    match gen.plan(x, z, mut planned_jobs, mut waits) {
+        ok => {},
+        err(t) => s.lines.push(Entry.warn("Couldn't plan chunk [{x}, {z}]: {t.exception}: {t.message}").on(gen_thread())),
+    }
+    var sender = s.to_jobs.take() else return
+    s.away += planned_jobs.len()
+    while not planned_jobs.is_empty() {
+        sender.send(planned_jobs.remove(0))
+    }
+    s.to_jobs = some(sender)
+}
+
+// Logs what went wrong decorating.
+fn problems(gen: mut Generator, lines: mut List<Entry>) {
+    for p in gen.problems {
+        lines.push(Entry.warn(p.copy()).on(gen_thread()))
+    }
+    gen.problems.clear()
+}
+
+// Whether any of the chunks in `waits` is still having its terrain made.
+fn waiting(gen: Generator, waits: List<i64>) -> bool {
+    for k in waits {
+        if gen.is_making(k) {
+            return true
+        }
+    }
+    return false
+}
+
+// `PlayerSpawnFinder.getSpawnPosInChunk`: the first column of the chunk, `x` then `z` from its
+// lower corner, a player can stand on.
+fn spawn_in(states: CollisionStates, chunk: Chunk, cx: i32, cz: i32) -> BlockPos? {
+    for x in cx * 16..cx * 16 + 16 {
+        for z in cz * 16..cz * 16 + 16 {
+            if let pos = respawn_pos(states, chunk, x, z) {
+                return some(pos)
+            }
+        }
+    }
+    return none
+}
+
+/// The IO thread and the chunk workers, and the generator's thread if the world generates, and
+/// the queues to and from them, which start with the first thing asked.
 pub struct ChunkJobs {
     context: ChunkContext
     // The region files, until the IO thread takes them, and what wakes the poll.
     storage: RegionStorage?
     waker: Waker
+    // What the generator's made from, until its thread takes it, and the queue to that thread.
+    gen: GenSetup?
+    gen_inbox: Receiver<GenIn>
+    to_gen: Sender<GenIn>?
     asks: Receiver<Ask>
     to_asks: Sender<Ask>
     work: Receiver<Work>
@@ -406,15 +835,22 @@ pub struct ChunkJobs {
     to_done: Sender<Done>
     started: usize
     most: usize
-    // How many chunks are asked for and not back, and how many regions.
+    // How many chunks are asked for and not back, how many regions, and whether the spawn is.
     chunks_away: usize
     regions_away: usize
+    spawn_away: usize
 }
 
 impl ChunkJobs {
-    /// The jobs for the region files in `folder`, which make chunks with `context` and wake the
-    /// server's poll with `waker` as each is done.
-    pub fn new(folder: String, context: own ChunkContext, waker: Waker) -> ChunkJobs {
+    /// The jobs for the region files in `folder`, which make chunks with `context`, generate those
+    /// they find nothing to use of as `gen` says, if it's given, and wake the server's poll with
+    /// `waker` as each is done.
+    pub fn new(folder: String, context: own ChunkContext, gen: own GenSetup?, waker: Waker) -> ChunkJobs {
+        let gen_inbox = Receiver<GenIn>()
+        var to_gen: Sender<GenIn>? = none
+        if gen != none {
+            to_gen = some(gen_inbox.sender())
+        }
         let asks = Receiver<Ask>()
         let to_asks = asks.sender()
         let work = Receiver<Work>()
@@ -430,6 +866,9 @@ impl ChunkJobs {
             context: context,
             storage: some(RegionStorage.new(folder, false)),
             waker: waker,
+            gen: gen,
+            gen_inbox: gen_inbox,
+            to_gen: to_gen,
             asks: asks,
             to_asks: to_asks,
             work: work,
@@ -440,6 +879,18 @@ impl ChunkJobs {
             most: most,
             chunks_away: 0,
             regions_away: 0,
+            spawn_away: 0,
+        }
+    }
+
+    /// Asks the generator where a new world's spawn is.
+    pub fn ask_spawn(mut self) {
+        self.start()
+        if let held = self.to_gen.take() {
+            var g = held
+            g.send(GenIn.Spawn)
+            self.to_gen = some(g)
+            self.spawn_away += 1
         }
     }
 
@@ -454,7 +905,11 @@ impl ChunkJobs {
     pub fn ask_chunk(mut self, pos: ChunkPos) {
         self.start()
         if self.chunks_away >= self.started and self.started < self.most {
-            _ = unsafe { Thread.spawn(ChunkWorker { context: self.context.copy(), work: self.work.share(), done: self.to_done.share(), waker: self.waker }) }
+            var generate: Sender<GenIn>? = none
+            if let g = self.to_gen {
+                generate = some(g.share())
+            }
+            _ = unsafe { Thread.spawn(ChunkWorker { context: self.context.copy(), work: self.work.share(), done: self.to_done.share(), generate: generate, waker: self.waker }) }
             self.started += 1
         }
         self.to_asks.send(Ask.Chunk(pos))
@@ -468,15 +923,16 @@ impl ChunkJobs {
             match d {
                 Done.Region(_, _, _) => self.regions_away -= 1,
                 Done.Chunk(_, _, _, _, _) => self.chunks_away -= 1,
+                Done.Spawn(_, _) => self.spawn_away -= 1,
             }
             back.push_last(d)
         }
         return back
     }
 
-    /// How many chunks and regions are asked for and not back.
+    /// How many chunks and regions are asked for and not back, and the spawn if it is.
     pub fn away(self) -> usize {
-        return self.chunks_away + self.regions_away
+        return self.chunks_away + self.regions_away + self.spawn_away
     }
 
     /// How many chunk workers have started.
@@ -484,9 +940,15 @@ impl ChunkJobs {
         return self.started
     }
 
-    // Starts the IO thread, if it hasn't.
+    // Starts the IO thread, if it hasn't, and the generator's, with its terrain workers, one
+    // fewer than the processors.
     fn start(mut self) {
         let storage = self.storage.take() else return
         _ = unsafe { Thread.spawn(IoThread { storage: storage, asks: self.asks.share(), work: self.to_work.share(), done: self.to_done.share(), waker: self.waker }) }
+        let setup = self.gen.take() else return
+        let to_gen = self.to_gen else return
+        let processors = unsafe { workers() }
+        let terrain_workers = if processors > 2 { processors - 1 } else { 1 }
+        _ = unsafe { Thread.spawn(GenThread { setup: setup, sections: self.context.sections, inbox: self.gen_inbox.share(), to_inbox: to_gen.share(), done: self.to_done.share(), waker: self.waker, workers: terrain_workers }) }
     }
 }
