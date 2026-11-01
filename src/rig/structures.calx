@@ -4,16 +4,22 @@
 module rig.structures
 
 import json.tree.{Json, Member, as_i32, as_string, get, take}
+import nbt.tag.{Tag}
 import pack.zip.{Zip}
 import registry.registry.{Registry}
 import rig.frame.{Outcome}
 import rig.surface.{invalid, put_u32, rejected}
+import world.chunk.{BlockStates}
 import worldgen.biome_manager.{SourceBiomes}
 import worldgen.biome_source.{climate_of, read_source}
 import worldgen.density.{Functions, data_json, qualified}
+import worldgen.facts.{Facts}
 import worldgen.interval.{Thrown}
-import worldgen.sampler.{Program}
-import worldgen.structures.{Placement, StructureState, Structures}
+import worldgen.structure_world.{StructureWorld}
+import worldgen.structures.{Placement, StructureState, Structures, create_structures}
+import worldgen.temperature.{Temperatures}
+import worldgen.template.{Templates}
+import worldgen.terrain.{read_shape}
 
 /// The most ops a case may have, and the widest square a `placement` op may ask about, as the
 /// vanilla adapter allows.
@@ -32,10 +38,10 @@ enum Op {
 struct World {
     structures: Structures
     state: StructureState
-    biomes: SourceBiomes
+    gen: StructureWorld
 }
 
-pub fn run_structures(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, biomes: Registry) -> Outcome {
+pub fn run_structures(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, blocks: Registry, fluids: Registry, biomes: Registry, table: own BlockStates) -> Outcome {
     if blobs.len() != 0 {
         return Outcome.Failed("`structures` takes no blobs")
     }
@@ -103,11 +109,24 @@ pub fn run_structures(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, 
         ok(c) => c,
         err(e) => return Outcome.Failed(e),
     }
+    let facts = match Facts.new(blocks, fluids, table) {
+        ok(f) => f,
+        err(e) => return Outcome.Failed(e),
+    }
+    let shape = match read_shape(mut functions, zip, members, facts.codec, facts.table) {
+        ok(sh) => sh,
+        err(e) => return Outcome.Failed(e),
+    }
+    let temps = match Temperatures.read(zip, biomes, source.possible()) {
+        ok(t) => t,
+        err(e) => return Outcome.Failed(e),
+    }
     let state = StructureState.new(structures, source.possible(), seed)
-    var world = World { structures: structures, state: state, biomes: SourceBiomes.new(source, climate, seed) }
+    let gen = StructureWorld { functions: functions, shape: shape, facts: facts, biomes: SourceBiomes.new(source, climate, seed), templates: Templates.new(), temps: temps, level_min: min_y, level_height: height, seed: seed }
+    var world = World { structures: structures, state: state, gen: gen }
     var out = List<u8>()
     for op in ops {
-        match run_op(mut world, functions.program, op, mut out) {
+        match run_op(mut world, zip, op, mut out) {
             ok => {},
             err(thrown) => {
                 if thrown.exception == "Unimplemented" {
@@ -170,7 +189,7 @@ fn read_op(value: Json, i: usize) -> Op ! String {
     fail "{what}: unknown op `{kind}`"
 }
 
-fn run_op(w: mut World, p: Program, op: Op, out: mut List<u8>) ! Thrown {
+fn run_op(w: mut World, zip: Zip, op: Op, out: mut List<u8>) ! Thrown {
     match op {
         Op.Placement { x, z, size } => {
             put_u32(mut out, u32.wrap(w.state.possible.len()))
@@ -180,7 +199,7 @@ fn run_op(w: mut World, p: Program, op: Op, out: mut List<u8>) ! Thrown {
                 var count = 0u32
                 for cz in z..z + size {
                     for cx in x..x + size {
-                        if try w.state.is_structure_chunk(w.structures, mut w.biomes, p, set, cx, cz) {
+                        if try w.state.is_structure_chunk(w.structures, mut w.gen.biomes, w.gen.functions.program, set, cx, cz) {
                             put_u32(mut found, u32.wrap(cx))
                             put_u32(mut found, u32.wrap(cz))
                             count += 1
@@ -198,7 +217,7 @@ fn run_op(w: mut World, p: Program, op: Op, out: mut List<u8>) ! Thrown {
             put_u32(mut out, u32.wrap(sets.len()))
             for set in sets {
                 put_utf(mut out, w.structures.sets[set].id)
-                if let positions = try w.state.ring_positions(w.structures, mut w.biomes, p, set) {
+                if let positions = try w.state.ring_positions(w.structures, mut w.gen.biomes, w.gen.functions.program, set) {
                     put_u32(mut out, u32.wrap(positions.len()))
                     for (rx, rz) in positions {
                         put_u32(mut out, u32.wrap(rx))
@@ -209,15 +228,15 @@ fn run_op(w: mut World, p: Program, op: Op, out: mut List<u8>) ! Thrown {
                 }
             }
         },
-        Op.Starts { x, z } => try starts(mut w, p, x, z, mut out),
+        Op.Starts { x, z } => try starts(mut w, zip, x, z, mut out),
         Op.RingStarts(count) => {
             for set in ring_sets(w) {
-                let positions = try w.state.ring_positions(w.structures, mut w.biomes, p, set) ?? List<(i32, i32)>()
+                let positions = try w.state.ring_positions(w.structures, mut w.gen.biomes, w.gen.functions.program, set) ?? List<(i32, i32)>()
                 let n = positions.len().min(usize.wrap(count))
                 put_u32(mut out, u32.wrap(n))
                 for k in 0..n {
                     let (rx, rz) = positions[k]
-                    try starts(mut w, p, rx, rz, mut out)
+                    try starts(mut w, zip, rx, rz, mut out)
                 }
             }
         },
@@ -237,17 +256,16 @@ fn ring_sets(w: World) -> List<usize> {
 }
 
 // `createStructures` on a chunk with no starts: the starts a chunk saves, as one compound.
-fn starts(w: mut World, p: Program, x: i32, z: i32, out: mut List<u8>) ! Thrown {
-    for set in w.state.possible.copy() {
-        if try w.state.is_structure_chunk(w.structures, mut w.biomes, p, set, x, z) {
-            let first = w.structures.sets[set].structures[0]
-            let kind = w.structures.structures[first].kind.copy()
-            fail Thrown { exception: "Unimplemented", message: "the {kind} structure" }
-        }
+fn starts(w: mut World, zip: Zip, x: i32, z: i32, out: mut List<u8>) ! Thrown {
+    let made = try create_structures(mut w.gen, zip, w.structures, mut w.state, x, z)
+    var tag = JavaHashMap<String, Tag>()
+    for start in made {
+        tag.insert(start.id.copy(), start.tag())
     }
-    // An empty compound, as `NbtIo.writeAnyTag` writes it.
-    out.push(10u8)
-    out.push(0u8)
+    match Tag.Compound(tag).write_any(mut out) {
+        ok => {},
+        err(e) => fail Thrown { exception: "UTFDataFormatException", message: e },
+    }
 }
 
 // A string as Java's `writeUTF` writes it, for the ASCII of an identifier.
