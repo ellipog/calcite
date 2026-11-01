@@ -1,5 +1,7 @@
 """Writes cases/registries/configuration.json: the server's known packs, the synchronized
-registries' entries, and the tags of every registry the server sends tags for.
+registries' entries, the tags of every registry the server sends tags for, and each synchronized
+registry's entries with their contents, as a client that knows none of the server's packs is
+sent them.
 
     py -I cases/registries/gen.py
 
@@ -35,7 +37,9 @@ def main():
     registries = names("src/registry/registries.calx", "synced_names") + names("src/registry/builtin.calx", "builtin_names")
     for name in registries:
         cases.append({"id": "tags-" + name.replace("/", "."), "input": {"op": "tags", "registry": "minecraft:" + name}})
-    write_file(HERE / "configuration.json", "registries", "cases/registries/gen.py", cases)
+    for name in names("src/registry/registries.calx", "synced_names"):
+        cases.append({"id": "contents-" + name.replace("/", "."), "input": {"op": "contents", "registry": "minecraft:" + name}})
+    write_file(HERE / "configuration.json", "registries", "cases/registries/gen.py", cases, probe_version=2)
 
 
 if __name__ == "__main__":

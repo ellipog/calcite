@@ -5,6 +5,10 @@ import com.google.gson.JsonObject;
 import com.mojang.datafixers.util.Pair;
 import com.mojang.serialization.DynamicOps;
 import it.unimi.dsi.fastutil.ints.IntList;
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -15,6 +19,7 @@ import net.minecraft.core.LayeredRegistryAccess;
 import net.minecraft.core.Registry;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.RegistrySynchronization;
+import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.Identifier;
@@ -45,15 +50,16 @@ final class RegistriesProbe implements Probe {
 
     @Override
     public int version() {
-        return 1;
+        return 2;
     }
 
     @Override
-    public Result run(JsonObject input, List<byte[]> blobs) {
+    public Result run(JsonObject input, List<byte[]> blobs) throws IOException {
         String op = Args.string(input, "op");
         return switch (op) {
             case "known_packs" -> knownPacks();
             case "synced" -> synced();
+            case "contents" -> contents(Args.string(input, "registry"));
             case "tags" -> tags(Args.string(input, "registry"));
             default -> throw new CaseError("unknown `op`: `" + op + "`");
         };
@@ -123,6 +129,46 @@ final class RegistriesProbe implements Probe {
         JsonObject output = new JsonObject();
         output.add("registries", registries);
         return Result.ok(output);
+    }
+
+    /**
+     * Each entry of the synchronized registry as `registry_data` sends it to a client that knows
+     * none of the server's packs, so each with its contents, encoded with the registry's network
+     * codec: an `int` count, then each entry's ID as an `int` length and its UTF-8, then its
+     * contents as `NbtIo.writeAnyTag` writes them, as the packet does.
+     */
+    private static Result contents(String registry) throws IOException {
+        load();
+        DynamicOps<Tag> ops = layers.compositeAccess().createSerializationContext(NbtOps.INSTANCE);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(bytes);
+        boolean[] found = {false};
+        IOException[] failed = {null};
+        RegistrySynchronization.packRegistries(ops, layers.getAccessFrom(RegistryLayer.WORLD), Set.of(), (key, entries) -> {
+            if (!key.identifier().toString().equals(registry)) {
+                return;
+            }
+            found[0] = true;
+            try {
+                out.writeInt(entries.size());
+                for (RegistrySynchronization.PackedRegistryEntry e : entries) {
+                    byte[] id = e.id().toString().getBytes(StandardCharsets.UTF_8);
+                    out.writeInt(id.length);
+                    out.write(id);
+                    NbtIo.writeAnyTag(e.data().orElseThrow(), out);
+                }
+            } catch (IOException e) {
+                failed[0] = e;
+            }
+        });
+        if (failed[0] != null) {
+            throw failed[0];
+        }
+        if (!found[0]) {
+            throw new CaseError("no synchronized registry `" + registry + "`");
+        }
+        out.flush();
+        return Result.ok(new JsonObject(), bytes.toByteArray());
     }
 
     /**
