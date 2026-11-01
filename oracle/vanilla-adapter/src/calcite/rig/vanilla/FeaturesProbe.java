@@ -8,6 +8,7 @@ import com.mojang.serialization.JsonOps;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
@@ -28,10 +29,14 @@ import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtAccounter;
 import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtUtils;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.RegistryOps;
 import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.dedicated.DedicatedServer;
 import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.WorldGenRegion;
@@ -79,6 +84,11 @@ import net.minecraft.world.level.levelgen.blending.Blender;
 import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
 import net.minecraft.world.level.levelgen.material.rule.MaterialRule;
 import net.minecraft.world.level.levelgen.placement.PlacedFeature;
+import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
+import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplateManager;
+import net.minecraft.util.datafix.DataFixTypes;
+import net.minecraft.util.datafix.DataFixers;
+import net.minecraft.core.HolderGetter;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.storage.LevelData;
 import net.minecraft.world.ticks.ProtoChunkTicks;
@@ -121,7 +131,7 @@ final class FeaturesProbe implements Probe {
 
     @Override
     public int version() {
-        return 1;
+        return 2;
     }
 
     /** The level, as far as the region and features ask it. */
@@ -134,6 +144,7 @@ final class FeaturesProbe implements Probe {
         int seaLevel;
         List<int[]> poi;
         LevelLightEngine light;
+        MinecraftServer server;
 
         // Never run: the level is made with `Unsafe.allocateInstance`.
         private Level() {
@@ -153,6 +164,11 @@ final class FeaturesProbe implements Probe {
         @Override
         public RegistryAccess registryAccess() {
             return registries;
+        }
+
+        @Override
+        public MinecraftServer getServer() {
+            return server;
         }
 
         @Override
@@ -216,6 +232,54 @@ final class FeaturesProbe implements Probe {
         @Override
         public ChunkGenerator getGenerator() {
             return generator;
+        }
+    }
+
+    /**
+     * The server's structure templates, as its {@code StructureTemplateManager} loads them from
+     * the vanilla data pack: {@code data/<namespace>/structure/<path>.nbt} read with
+     * {@code NbtIo.readCompressed}, upgraded from its data version and loaded with the block
+     * registry. One that isn't there is an empty template, as {@code getOrCreate} makes it.
+     */
+    private static final class Templates extends StructureTemplateManager {
+        Map<Identifier, Optional<StructureTemplate>> loaded;
+        HolderGetter<Block> blocks;
+
+        // Never run, as the level's.
+        private Templates() {
+            super(null, null, null, null);
+        }
+
+        @Override
+        public StructureTemplate getOrCreate(Identifier id) {
+            Optional<StructureTemplate> found = get(id);
+            if (found.isPresent()) {
+                return found.get();
+            }
+            StructureTemplate made = new StructureTemplate();
+            loaded.put(id, Optional.of(made));
+            return made;
+        }
+
+        @Override
+        public Optional<StructureTemplate> get(Identifier id) {
+            return loaded.computeIfAbsent(id, this::load);
+        }
+
+        private Optional<StructureTemplate> load(Identifier id) {
+            String path = "data/" + id.getNamespace() + "/structure/" + id.getPath() + ".nbt";
+            try (InputStream in = FeaturesProbe.class.getClassLoader().getResourceAsStream(path)) {
+                if (in == null) {
+                    return Optional.empty();
+                }
+                CompoundTag tag = NbtIo.readCompressed(in, NbtAccounter.unlimitedHeap());
+                int version = NbtUtils.getDataVersion(tag, 500);
+                StructureTemplate template = new StructureTemplate();
+                template.load(blocks, DataFixTypes.STRUCTURE.updateToCurrentVersion(DataFixers.getDataFixer(), tag, version));
+                return Optional.of(template);
+            } catch (IOException e) {
+                throw new UncheckedIOException(e);
+            }
         }
     }
 
@@ -338,6 +402,15 @@ final class FeaturesProbe implements Probe {
             fake.source.generator = generator;
             fake.type = dimensionType(access, id);
             fake.registries = access;
+            // A server, made without its constructor, whose only part features ask for is its
+            // structure templates.
+            Templates templates = (Templates) allocate(Templates.class);
+            templates.loaded = new HashMap<>();
+            templates.blocks = access.lookupOrThrow(Registries.BLOCK);
+            fake.server = (MinecraftServer) allocate(DedicatedServer.class);
+            Field templateField = MinecraftServer.class.getDeclaredField("structureTemplateManager");
+            templateField.setAccessible(true);
+            templateField.set(fake.server, templates);
             fake.minY = minY;
             fake.height = height;
             fake.seaLevel = generator.getSeaLevel();

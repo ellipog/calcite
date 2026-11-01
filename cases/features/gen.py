@@ -364,7 +364,7 @@ def main():
     predicates(g, cases)
     providers(g, cases)
     unread(g, cases)
-    write_file(HERE / "generated.json", "features", f"cases/features/gen.py, seed {SEED}", cases)
+    write_file(HERE / "generated.json", "features", f"cases/features/gen.py, seed {SEED}", cases, probe_version=2)
 
 
 if __name__ == "__main__":
