@@ -14,11 +14,13 @@ import random.source.{RandomSource, position_seed}
 import resources.identifier.{Identifier}
 import storage.world.{read_gzipped}
 import world.chunk.{OCEAN_FLOOR_WG}
+import worldgen.block_entities.{randomizable}
 import worldgen.codec.{field, float_of, float_range_field, identifier_field, int_of, int_range_field, map_of}
 import worldgen.density.{data_json}
 import worldgen.facts.{BlockSet, Facts, NORTH, WATER_FLUID, WEST, clockwise, opposite, step_x, step_z}
 import worldgen.interval.{Thrown}
 import worldgen.predicates.{Readers, Rule, list_of, read_blocks, read_rule, read_state, test_rule}
+import worldgen.providers.{IntProvider, read_int}
 import worldgen.region.{Region}
 import worldgen.shapes.{Shape, update_edges, update_from_neighbours}
 import worldgen.survive.{Env}
@@ -299,6 +301,15 @@ pub enum Processor {
     /// `block_ignore`: these blocks aren't placed.
     Ignore(BlockSet)
     Nop
+    /// `JigsawReplacementProcessor`: a jigsaw block becomes its final state, or nothing for
+    /// structure void.
+    JigsawReplacement
+    /// `GravityProcessor`: each block moved to the heightmap's height plus `offset`, kept as high
+    /// above it as it is in the template.
+    Gravity { heightmap: i32, offset: i32 }
+    /// `capped`: after the rest, the delegate run on up to `limit` blocks picked at random, each
+    /// it changes counting.
+    Capped { delegate: Box<Processor>, limit: IntProvider }
     /// A processor type Calcite doesn't place yet.
     Unsupported(String)
 }
@@ -395,7 +406,13 @@ fn read_processor(facts: Facts, rd: Readers, value: Json) -> Processor ! String 
     if kind == "minecraft:nop" {
         return Processor.Nop
     }
-    let known: List<String> = ["blackstone_replace", "block_age", "capped", "gravity", "jigsaw_replacement", "lava_submerged_block"]
+    if kind == "minecraft:capped" {
+        let dv = field(m, "delegate") else fail "No key delegate in MapLike"
+        let delegate = try read_processor(facts, rd, dv)
+        let lv = field(m, "limit") else fail "No key limit in MapLike"
+        return Processor.Capped { delegate: Box(delegate), limit: try read_int(lv) }
+    }
+    let known: List<String> = ["blackstone_replace", "block_age", "gravity", "jigsaw_replacement", "lava_submerged_block"]
     for k in known {
         if kind == "minecraft:{k}" {
             return Processor.Unsupported(kind.copy())
@@ -597,13 +614,16 @@ impl Template {
     }
 }
 
-// A block to place, where it goes in the world.
+// A block to place, where it goes in the world, and where it is in the template.
 struct Placing {
     x: i32
     y: i32
     z: i32
     state: u32
     nbt: JavaHashMap<String, Tag>?
+    tx: i32
+    ty: i32
+    tz: i32
 }
 
 /// `StructureTemplate.placeInWorld`: the template placed from the block `x, y, z` with the
@@ -737,30 +757,140 @@ pub fn place_in_world<T: RandomSource>(e: Env, r: mut Region, t: Template, x: i3
     }
     if not s.ignore_entities {
         for entity in t.entities {
-            let (bx, by, bz) = transform(entity.bx, entity.by, entity.bz, s.mirror, s.rotation, s.pivot_x, s.pivot_z)
+            let (tbx, tby, tbz) = transform(entity.bx, entity.by, entity.bz, s.mirror, s.rotation, s.pivot_x, s.pivot_z)
+            let bx = tbx + x
+            let by = tby + y
+            let bz = tbz + z
             var inside = true
             if let b = s.bounds {
-                inside = b.inside(bx + x, by + y, bz + z)
+                inside = b.inside(bx, by, bz)
             }
             if inside {
-                fail Thrown { exception: "Unimplemented", message: "an entity of a structure template" }
+                try place_entity(mut r, entity, x, y, z, bx, by, bz, s)
             }
         }
     }
     return true
 }
 
-// Whether a block entity of this type is a `RandomizableContainer`, which a template gives a
-// new loot table seed.
-fn randomizable(kind: String) -> bool {
-    let kinds: List<String> = ["barrel", "chest", "trapped_chest", "crafter", "dispenser", "dropper", "hopper", "shulker_box", "decorated_pot"]
-    for k in kinds {
-        if kind == "minecraft:{k}" {
-            return true
+// `placeEntities` of one entity: its data with its position turned and moved, and no UUID; made,
+// turned as the template is, and added. Calcite keeps what the probe compares, the type, position
+// and rotation, with the rest of the template's data; a mob's `finalizeSpawn` isn't run, which
+// draws from the region's random and may make a jockey's mount.
+fn place_entity(r: mut Region, entity: EntityInfo, x: i32, y: i32, z: i32, bx: i32, by: i32, bz: i32, s: Settings) ! Thrown {
+    var tag = entity.nbt.copy()
+    let (ex, ey, ez) = transform_vec(entity.x, entity.y, entity.z, s.mirror, s.rotation, s.pivot_x, s.pivot_z)
+    let px = ex + f64(x)
+    let py = ey + f64(y)
+    let pz = ez + f64(z)
+    if not tag.contains("id") {
+        return
+    }
+    _ = tag.remove("UUID")
+    if tag.contains("block_pos") {
+        tag.insert("block_pos", Tag.IntArray([bx, by, bz]))
+    }
+    // `Entity.load`'s rotation, then `rotate` and `mirror`.
+    var yaw = 0.0f32
+    var pitch = 0.0f32
+    if tag.contains("Rotation") {
+        match tag["Rotation"] {
+            Tag.List(items) => {
+                if items.len() == 2 {
+                    yaw = items[0].number_float() ?? 0.0f32
+                    pitch = items[1].number_float() ?? 0.0f32
+                }
+            },
+            _ => {},
         }
     }
-    return false
+    let angle = wrap_degrees(yaw)
+    let turned = match s.rotation {
+        2 => angle + 180.0f32,
+        3 => angle + 270.0f32,
+        1 => angle + 90.0f32,
+        _ => angle,
+    }
+    let mirrored = match s.mirror {
+        2 => -angle,
+        1 => 180.0f32 - angle,
+        _ => angle,
+    }
+    let new_yaw = turned + (mirrored - yaw)
+    // `setXRot`: kept within a turn and between straight down and straight up.
+    let new_pitch = (pitch % 360.0f32).max(-90.0f32).min(90.0f32)
+    tag.insert("Pos", Tag.List([Tag.Double(px), Tag.Double(py), Tag.Double(pz)]))
+    tag.insert("Rotation", Tag.List([Tag.Float(new_yaw), Tag.Float(new_pitch)]))
+    try r.add_entity(i32.saturate(px.floor()), i32.saturate(pz.floor()), Tag.Compound(tag))
 }
+
+// `Mth.wrapDegrees` of a float.
+fn wrap_degrees(angle: f32) -> f32 {
+    var a = angle % 360.0f32
+    if a >= 180.0f32 {
+        a -= 360.0f32
+    }
+    if a < -180.0f32 {
+        a += 360.0f32
+    }
+    return a
+}
+
+/// `StructureTemplate.transform` of a point: mirrored about the block's middle, then turned
+/// about the pivot.
+pub fn transform_vec(x: f64, y: f64, z: f64, mirror: i32, rotation: i32, pivot_x: i32, pivot_z: i32) -> (f64, f64, f64) {
+    var mx = x
+    var mz = z
+    if mirror == LEFT_RIGHT {
+        mz = 1.0 - z
+    } else if mirror == FRONT_BACK {
+        mx = 1.0 - x
+    }
+    let px = f64(pivot_x)
+    let pz = f64(pivot_z)
+    return match rotation {
+        3 => (px - pz + mz, y, px + pz + 1.0 - mx),
+        1 => (px + pz + 1.0 - mz, y, pz - px + mx),
+        2 => (px + px + 1.0 - mx, y, pz + pz + 1.0 - mz),
+        _ => (mx, y, mz),
+    }
+}
+
+/// `BlockStateParser.parseForBlock` of a block and its properties, as `minecraft:name[a=b]`:
+/// none if it doesn't parse. Block data in braces isn't read yet.
+pub fn parse_state(f: Facts, text: String) -> u32? {
+    var name = text.copy()
+    var props = JavaHashMap<String, Tag>()
+    if let open = text.find("[") {
+        if not text.ends_with("]") {
+            return none
+        }
+        name = text[..open].copy()
+        let inside = text[open + 1..text.len() - 1].copy()
+        var rest = inside.copy()
+        while not rest.is_empty() {
+            let end = rest.find(",") ?? rest.len()
+            let pair = rest[..end].copy()
+            let eq = pair.find("=") else return none
+            props.insert(pair[..eq].copy(), Tag.Str(pair[eq + 1..].copy()))
+            rest = if end < rest.len() { rest[end + 1..].copy() } else { String() }
+        }
+    }
+    if name.contains("\{") {
+        return none
+    }
+    let id = if name.contains(":") { name.copy() } else { "minecraft:{name}" }
+    var tag = JavaHashMap<String, Tag>()
+    tag.insert("id", Tag.Str(id))
+    if props.len() > 0 {
+        tag.insert("properties", Tag.Compound(props))
+    }
+    return match f.codec.decode(Tag.Compound(tag)) {
+        ok(s) => some(s),
+        err(_) => none,
+    }
+}
+
 
 // `LiquidBlockContainer.placeLiquid` of the block, with the fluid of the state `fluid`: a
 // waterloggable block not yet waterlogged takes water and a tick of it; kelp and seagrass take
@@ -790,9 +920,7 @@ fn process_infos<T: RandomSource>(e: Env, r: Region, x: i32, y: i32, z: i32, rx:
     var whole = false
     for p in s.processors {
         match p {
-            Processor.Unsupported(kind) => if kind == "minecraft:capped" {
-                whole = true
-            },
+            Processor.Capped { .. } => whole = true,
             _ => {},
         }
     }
@@ -809,7 +937,7 @@ fn process_infos<T: RandomSource>(e: Env, r: Region, x: i32, y: i32, z: i32, rx:
                 }
             }
         }
-        var current = Placing { x: wx, y: wy, z: wz, state: info.state, nbt: info.nbt.copy() }
+        var current = Placing { x: wx, y: wy, z: wz, state: info.state, nbt: info.nbt.copy(), tx: info.x, ty: info.y, tz: info.z }
         var kept = true
         for p in s.processors {
             match try process(e, r, p, current, rx, ry, rz, s, mut rand) {
@@ -824,7 +952,69 @@ fn process_infos<T: RandomSource>(e: Env, r: Region, x: i32, y: i32, z: i32, rx:
             out.push(current)
         }
     }
+    // `finalizeProcessing`.
+    for p in s.processors {
+        match p {
+            Processor.Capped { delegate, limit } => try cap(e, r, delegate.value, limit, mut out, x, y, z, rx, ry, rz, s, mut rand),
+            _ => {},
+        }
+    }
     return out
+}
+
+// `CappedProcessor.finalizeProcessing`: up to a sample of `limit` blocks, picked in a shuffled
+// order from a random at the placing position seeded by the world's seed, run through the
+// delegate, until that many have changed.
+fn cap<T: RandomSource>(e: Env, r: Region, delegate: Processor, limit: IntProvider, out: mut List<Placing>, x: i32, y: i32, z: i32, rx: i32, ry: i32, rz: i32, s: Settings, rand: mut T) ! Thrown {
+    if limit.max() == 0 or out.is_empty() {
+        return
+    }
+    var seeded = LegacyRandom.new(r.seed)
+    var random = seeded.fork_positional().at(x, y, z)
+    let most = (try limit.sample(mut random)).min(i32.wrap(out.len()))
+    if most < 1 {
+        return
+    }
+    // `Util.toShuffledList`.
+    var order = List<usize>()
+    for i in 0..out.len() {
+        order.push(i)
+    }
+    var i = order.len()
+    while i > 1 {
+        let to = usize.wrap(random.next_int_below(i32.wrap(i)))
+        order.swap(i - 1, to)
+        i -= 1
+    }
+    var replaced = 0
+    for index in order {
+        if replaced >= most {
+            break
+        }
+        let current = out[index].copy()
+        if let after = try process(e, r, delegate, current, rx, ry, rz, s, mut rand) {
+            if not same(after, out[index]) {
+                replaced += 1
+                out[index] = after
+            }
+        }
+    }
+}
+
+// `StructureBlockInfo.equals`: the same position, state and data.
+fn same(a: Placing, b: Placing) -> bool {
+    if a.x != b.x or a.y != b.y or a.z != b.z or a.state != b.state {
+        return false
+    }
+    let at = match a.nbt {
+        some(m) => Tag.Compound(m.copy()),
+        none => Tag.End,
+    }
+    let bt = match b.nbt {
+        some(m) => Tag.Compound(m.copy()),
+        none => Tag.End,
+    }
+    return at == bt
 }
 
 // `processBlock` of one processor.
@@ -869,7 +1059,7 @@ fn process<T: RandomSource>(e: Env, r: Region, p: Processor, info: Placing, rx: 
                     continue
                 }
                 let nbt = try modified(rule.modifier, info.nbt.copy(), mut random)
-                return some(Placing { x: info.x, y: info.y, z: info.z, state: rule.output, nbt: nbt })
+                return some(Placing { x: info.x, y: info.y, z: info.z, state: rule.output, nbt: nbt, tx: info.tx, ty: info.ty, tz: info.tz })
             }
             return some(info.copy())
         },
@@ -880,6 +1070,30 @@ fn process<T: RandomSource>(e: Env, r: Region, p: Processor, info: Placing, rx: 
             return some(info.copy())
         },
         Processor.Nop => return some(info.copy()),
+        Processor.JigsawReplacement => {
+            if f.block(info.state) != try f.named_block(String("jigsaw")) {
+                return some(info.copy())
+            }
+            let nbt = info.nbt else return some(info.copy())
+            var text = String("minecraft:air")
+            if nbt.contains("final_state") {
+                match nbt["final_state"] {
+                    Tag.Str(t) => text = t.copy(),
+                    _ => {},
+                }
+            }
+            let state = parse_state(f, text) else return none
+            if f.block(state) == try f.named_block(String("structure_void")) {
+                return none
+            }
+            return some(Placing { x: info.x, y: info.y, z: info.z, state: state, nbt: none, tx: info.tx, ty: info.ty, tz: info.tz })
+        },
+        Processor.Gravity { heightmap, offset } => {
+            let height = try r.wg_height(heightmap, info.x, info.z) + offset
+            return some(Placing { x: info.x, y: height + info.ty, z: info.z, state: info.state, nbt: info.nbt.copy(), tx: info.tx, ty: info.ty, tz: info.tz })
+        },
+        // Run after the rest, in `finalizeProcessing`.
+        Processor.Capped { .. } => return some(info.copy()),
         Processor.Unsupported(kind) => fail Thrown { exception: "Unimplemented", message: "the {kind} structure processor" },
     }
 }

@@ -154,6 +154,9 @@ final class FeaturesProbe implements Probe {
         List<int[]> poi;
         LevelLightEngine light;
         MinecraftServer server;
+        long seed;
+        StructureManager structures;
+        EnvironmentAttributeSystem attributes;
 
         // Never run: the level is made with `Unsafe.allocateInstance`.
         private Level() {
@@ -204,6 +207,43 @@ final class FeaturesProbe implements Probe {
         @Override
         public int getSeaLevel() {
             return seaLevel;
+        }
+
+        // The level's data, as the region's: what a structure's mob asks as it's made.
+        @Override
+        public LevelData getLevelData() {
+            return DATA;
+        }
+
+        // The world's seed, which a capped processor seeds its random from.
+        @Override
+        public long getSeed() {
+            return seed;
+        }
+
+        // The decoration's structure manager, over the region's chunks, which are those of the
+        // chunk being decorated and around it: where a cat asks whether it's in a swamp hut.
+        @Override
+        public StructureManager structureManager() {
+            return structures;
+        }
+
+        // The region's attributes, the dimension's and its biomes': what a villager's schedule
+        // reads as it's made.
+        @Override
+        public EnvironmentAttributeSystem environmentAttributes() {
+            return attributes;
+        }
+
+        // A new world's clock, at 0 with a full moon: what a structure's mob's difficulty reads.
+        @Override
+        public long getOverworldClockTime() {
+            return 0L;
+        }
+
+        @Override
+        public float getMoonBrightness(BlockPos pos) {
+            return DimensionType.MOON_BRIGHTNESS_PER_PHASE[0];
         }
 
         /**
@@ -422,6 +462,7 @@ final class FeaturesProbe implements Probe {
             fake.source.generator = generator;
             fake.type = dimensionType(access, id);
             fake.registries = access;
+            fake.seed = seed;
             // A server, made without its constructor, whose only part features ask for is its
             // structure templates.
             Templates templates = (Templates) allocate(Templates.class);
@@ -474,6 +515,7 @@ final class FeaturesProbe implements Probe {
                 ProtoChunk center = chunks.get(ChunkPos.pack(cx, cz));
                 if (op[0] == 0) {
                     StructureManager structures = new StructureManager(region, new WorldOptions(seed, false, false), null);
+                    fake.structures = structures;
                     generator.applyBiomeDecoration(region, center, structures);
                 } else if (op[0] == 2) {
                     for (int dz = -1; dz <= 1; dz++) {
@@ -484,6 +526,7 @@ final class FeaturesProbe implements Probe {
                         }
                     }
                     StructureManager structures = new StructureManager(region, new WorldOptions(seed, true, false), null);
+                    fake.structures = structures;
                     generator.applyBiomeDecoration(region, center, structures);
                 } else {
                     WorldgenRandom random = new WorldgenRandom(new XoroshiroRandomSource(0L));
@@ -630,7 +673,7 @@ final class FeaturesProbe implements Probe {
         set(region, "center", center);
         set(region, "level", level);
         set(region, "seed", seed);
-        set(region, "levelData", new Data());
+        set(region, "levelData", DATA);
         set(region, "random", state.getOrCreateRandomFactory(Identifier.withDefaultNamespace("worldgen_region_random")).at(center.getPos().getWorldPosition()));
         set(region, "dimensionType", level.type);
         set(region, "blockTicks", new net.minecraft.world.ticks.WorldGenTickAccess<Block>(pos -> region.getChunk(pos).getBlockTicks()));
@@ -642,11 +685,15 @@ final class FeaturesProbe implements Probe {
         set(region, "centerChunkZ", cz);
         set(region, "writeRadius", ChunkPyramid.GENERATION_PYRAMID.getStepTo(ChunkStatus.FEATURES).blockStateWriteRadius());
         set(region, "biomeManager", new BiomeManager(region, BiomeManager.obfuscateSeed(seed)));
-        set(region, "environmentAttributes", EnvironmentAttributeSystem.builder().addStaticLayers(region).build());
+        EnvironmentAttributeSystem attributes = EnvironmentAttributeSystem.builder().addStaticLayers(region).build();
+        set(region, "environmentAttributes", attributes);
+        level.attributes = attributes;
         return region;
     }
 
-    /** The level's data, as far as ticks ask it: the time is 0. */
+    private static final Data DATA = new Data();
+
+    /** The level's data, as far as ticks and mobs ask it: the time is 0 and the difficulty normal. */
     private static final class Data implements LevelData {
         @Override
         public LevelData.RespawnData getRespawnData() {

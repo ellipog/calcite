@@ -482,6 +482,24 @@ def block_facts_module(index, flags):
     ]
     lines += ["        " + ", ".join(pairs[i:i + 24]) + "," for i in range(0, len(pairs), 24)]
     lines += ["    ]", "    return pairs", "}", ""]
+    types = sorted({t for _, t in flags["block_entities"]})
+    at = {t: i for i, t in enumerate(types)}
+    lines += [
+        "/// The block entity types blocks have, by name, sorted.",
+        "pub fn block_entity_names() -> List<str> {",
+        "    return [",
+    ]
+    lines += [f'        "{t}",' for t in types]
+    lines += ["    ]", "}", ""]
+    pairs = [str(v) for block, t in flags["block_entities"] for v in (block, at[t])]
+    lines += [
+        "/// Each block with a block entity, by ID, followed by its type's index in",
+        "/// `block_entity_names`: the type `BlockEntityType.isValid` holds for.",
+        "pub fn block_entity_blocks() -> List<u32> {",
+        "    let pairs: List<u32> = [",
+    ]
+    lines += ["        " + ", ".join(pairs[i:i + 24]) + "," for i in range(0, len(pairs), 24)]
+    lines += ["    ]", "    return pairs", "}", ""]
     return "\n".join(lines)
 
 

@@ -194,6 +194,18 @@ final class BlockFlags {
                 containers.append(containers.isEmpty() ? "" : ", ").append(id);
             }
         }
+        // Each block with a block entity and its type, as `BlockEntityType.isValid` names it.
+        StringBuilder blockEntities = new StringBuilder();
+        for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
+            BlockState state = BuiltInRegistries.BLOCK.byId(id).defaultBlockState();
+            for (net.minecraft.world.level.block.entity.BlockEntityType<?> type : BuiltInRegistries.BLOCK_ENTITY_TYPE) {
+                if (type.isValid(state)) {
+                    blockEntities.append(blockEntities.isEmpty() ? "[" : ", [").append(id).append(", \"")
+                            .append(BuiltInRegistries.BLOCK_ENTITY_TYPE.getKey(type)).append("\"]");
+                    break;
+                }
+            }
+        }
         StringBuilder parentJson = new StringBuilder();
         for (Map.Entry<String, String> e : parents.entrySet()) {
             parentJson.append(parentJson.isEmpty() ? "\"" : ", \"").append(e.getKey()).append("\": \"").append(e.getValue()).append("\"");
@@ -212,6 +224,7 @@ final class BlockFlags {
         json.append("  \"dynamic_shape_blocks\": [").append(dynamic).append("],\n");
         json.append("  \"class_parents\": {").append(parentJson).append("},\n");
         json.append("  \"poi\": [").append(poi).append("],\n");
+        json.append("  \"block_entities\": [").append(blockEntities).append("],\n");
         json.append("  \"turns\": [").append(turns).append("]");
         json.append(",\n  \"collision\": [").append(collision).append("],\n");
         json.append("  \"collision_boxes\": ");
