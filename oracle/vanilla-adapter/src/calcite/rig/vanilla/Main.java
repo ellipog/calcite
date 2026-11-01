@@ -60,7 +60,8 @@ public final class Main {
                 new SpawnProbe(),
                 new RegistriesProbe(),
                 new PacksProbe(),
-                new NoiseProbe())) {
+                new NoiseProbe(),
+                new DensityProbe())) {
             probes.put(probe.name(), probe);
         }
 

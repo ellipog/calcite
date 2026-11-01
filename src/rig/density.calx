@@ -1,0 +1,325 @@
+/// The `density` probe (rig/PROTOCOL.md): density functions read as a data pack writes them,
+/// compiled for a `RandomState` and sampled at points or over volumes, all through one context.
+module rig.density
+
+import json.tree.{Json, Member, as_i32, as_string, get, take}
+import pack.zip.{Zip}
+import rig.frame.{Outcome}
+import worldgen.density.{Functions, data_json, qualified}
+import worldgen.interval.{Thrown}
+import worldgen.noise.{Volume}
+import worldgen.sampler.{Context, fill, sample, zeros}
+
+/// The most values one `volume` may ask for.
+const MAX_VOLUME: i64 = 65536
+
+/// The most values a case's ops may ask for.
+const MAX_VALUES: i64 = 1048576
+
+/// One op: `points` points from the blob, or a volume.
+struct Op {
+    function: usize
+    points: usize
+    volume: Volume?
+}
+
+pub fn run_density(input: own List<Member>, blobs: List<List<u8>>, zip: Zip) -> Outcome {
+    var fields = input
+    var error = String()
+    let seed_text = string_field(mut fields, "seed", mut error) else return Outcome.Failed(error)
+    let seed = i64.parse(seed_text) else return Outcome.Failed("`seed` must be a decimal 64-bit integer")
+    var settings = false
+    var legacy = false
+    var router = List<Member>()
+    if let settings_value = take(mut fields, "settings") {
+        if get(fields, "legacy_random") != none {
+            return Outcome.Failed("`legacy_random` comes from the settings")
+        }
+        let name = as_string(settings_value) else return Outcome.Failed("`settings` must be an identifier")
+        let json = match data_json(zip, qualified(name), "noise_settings") {
+            ok(j) => j,
+            err(e) => return Outcome.Failed(e),
+        }
+        var members = match json {
+            Json.Object(m) => m,
+            _ => return Outcome.Failed("noise settings `{name}` isn't an object"),
+        }
+        legacy = match get(members, "legacy_random_source") {
+            some(Json.Bool(b)) => b,
+            _ => false,
+        }
+        router = match take(mut members, "noise_router") {
+            some(Json.Object(m)) => m,
+            _ => return Outcome.Failed("noise settings `{name}` have no router"),
+        }
+        settings = true
+    } else {
+        let chosen = bool_field(mut fields, "legacy_random", mut error) else return Outcome.Failed(error)
+        legacy = chosen
+    }
+    var functions = Functions.new(legacy, seed)
+    let list = take(mut fields, "functions") else return Outcome.Failed("missing field `functions`")
+    let entries = match list {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`functions` must be an array"),
+    }
+    var roots = List<usize>()
+    for i in 0..entries.len() {
+        match read_entry(mut functions, zip, entries[i], settings, router, i) {
+            ok(f) => roots.push(f),
+            err(e) => return Outcome.Failed(e),
+        }
+    }
+    let cached = bool_field(mut fields, "cached", mut error) else return Outcome.Failed(error)
+    let op_list = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let ops = match op_list {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    var steps = List<Op>()
+    var points: i64 = 0
+    var values: i64 = 0
+    for i in 0..ops.len() {
+        match read_op(ops[i], roots.len(), i) {
+            ok(op) => {
+                points += i64.wrap(op.points)
+                values += i64.wrap(op.points)
+                if let v = op.volume {
+                    values += i64(v.size())
+                }
+                steps.push(op)
+            },
+            err(e) => return Outcome.Failed(e),
+        }
+    }
+    if values > MAX_VALUES {
+        return Outcome.Failed("the ops give more than {MAX_VALUES} values")
+    }
+    if blobs.len() != 1 {
+        return Outcome.Failed("expected 1 blob, got {blobs.len()}")
+    }
+    if i64.wrap(blobs[0].len()) != points * 12 {
+        return Outcome.Failed("the blob must hold {points} (x, y, z) int triples")
+    }
+    var about = List<Json>()
+    var out = List<u8>()
+    out.reserve(usize.wrap(values) * 4)
+    match evaluate(mut functions, roots, cached, steps, blobs[0], mut about, mut out) {
+        ok => {},
+        err(thrown) => return rejected(thrown),
+    }
+    let output: List<Member> = [Member { key: "functions", value: Json.Array(about) }]
+    return Outcome.Done { output: output, blobs: [out] }
+}
+
+/// Each function's range and axes, then its sampler, then the ops, as the vanilla adapter does
+/// them: the first exception thrown is the case's.
+fn evaluate(functions: mut Functions, roots: List<usize>, cached: bool, steps: List<Op>, blob: List<u8>, about: mut List<Json>, out: mut List<u8>) ! Thrown {
+    for i in 0..roots.len() {
+        let r = try functions.range(roots[i])
+        var range = Json.Null
+        if not r.is_nai() {
+            range = Json.Array([Json.Str(hex8(bits(r.min))), Json.Str(hex8(bits(r.max)))])
+        }
+        let a = functions.axes(roots[i])
+        let fields: List<Member> = [
+            Member { key: "range", value: range },
+            Member { key: "axes", value: Json.Number("{a}") },
+        ]
+        about.push(Json.Object(fields))
+    }
+    var samplers = List<usize>()
+    for i in 0..roots.len() {
+        samplers.push(try functions.sampler(roots[i]))
+    }
+    var ctx = Context.new(cached)
+    var at: usize = 0
+    for step in steps {
+        let s = samplers[step.function]
+        if let v = step.volume {
+            var buffer = try zeros(v.size())
+            try fill(functions.program, mut ctx, s, mut buffer, v)
+            for x in buffer {
+                put_u32(mut out, bits(x))
+            }
+        } else {
+            for _ in 0..step.points {
+                let x = int_at(blob, at)
+                let y = int_at(blob, at + 4)
+                let z = int_at(blob, at + 8)
+                at += 12
+                put_u32(mut out, bits(try sample(functions.program, mut ctx, s, x, y, z)))
+            }
+        }
+    }
+}
+
+fn read_entry(functions: mut Functions, zip: Zip, entry: Json, settings: bool, router: List<Member>, i: usize) -> usize ! String {
+    let what = "`functions`[{i}]"
+    match entry {
+        Json.Object(members) => return try read_member(mut functions, zip, members, settings, router, what),
+        _ => {},
+    }
+    fail "{what} must be an object with one field"
+}
+
+fn read_member(functions: mut Functions, zip: Zip, members: List<Member>, settings: bool, router: List<Member>, what: String) -> usize ! String {
+    if members.len() != 1 {
+        fail "{what} must be an object with one field"
+    }
+    if members[0].key == "function" {
+        match functions.read(zip, members[0].value) {
+            ok(f) => return f,
+            err(e) => fail "{what}: {e}",
+        }
+    }
+    if members[0].key != "router" {
+        fail "{what} must be `function` or `router`"
+    }
+    if not settings {
+        fail "{what}: a router's field needs `settings`"
+    }
+    let field = as_string(members[0].value) else fail "{what} must be a string"
+    let known = field == "temperature" or field == "vegetation" or field == "continents" or field == "erosion"
+    let also = field == "depth" or field == "ridges" or field == "chunk_surface_level" or field == "final_density"
+    if not (known or also) {
+        fail "{what}: a router has no `{field}`"
+    }
+    let value = get(router, field) else fail "{what}: the router has no `{field}`"
+    match functions.read(zip, value) {
+        ok(f) => return f,
+        err(e) => fail "{what}: {e}",
+    }
+}
+
+fn read_op(value: Json, count: usize, i: usize) -> Op ! String {
+    let what = "`ops`[{i}]"
+    match value {
+        Json.Object(members) => return try op_of(members, count, what),
+        _ => {},
+    }
+    fail "{what} must be an object"
+}
+
+fn op_of(members: List<Member>, count: usize, what: String) -> Op ! String {
+    let fn_value = get(members, "fn") else fail "{what} has no `fn`"
+    let function = as_i32(fn_value) else fail "{what}'s `fn` must be an int"
+    if function < 0 or usize.wrap(function) >= count {
+        fail "{what}'s `fn` names no function"
+    }
+    let has_points = get(members, "points") != none
+    let has_volume = get(members, "volume") != none
+    if has_points == has_volume or members.len() != 2 {
+        fail "{what} must have `fn` and one of `points` and `volume`"
+    }
+    if let p = get(members, "points") {
+        let n = as_i32(p) else fail "{what}'s `points` must be an int"
+        if n < 0 {
+            fail "{what}'s `points` must not be negative"
+        }
+        return Op { function: usize.wrap(function), points: usize.wrap(n), volume: none }
+    }
+    let v = get(members, "volume") else fail "{what} has no `volume`"
+    let box = try read_volume(v, what)
+    return Op { function: usize.wrap(function), points: 0, volume: some(box) }
+}
+
+fn read_volume(value: Json, what: String) -> Volume ! String {
+    match value {
+        Json.Array(items) => return try volume_of(items, what),
+        _ => {},
+    }
+    fail "{what}'s `volume` must be an array"
+}
+
+fn volume_of(items: List<Json>, what: String) -> Volume ! String {
+    if items.len() != 9 {
+        fail "{what}'s `volume` must have 9 numbers"
+    }
+    var a: [i32; 9] = [0; 9]
+    let nine: usize = 9
+    for i in 0..nine {
+        let v = as_i32(items[i]) else fail "{what}'s `volume` must be ints"
+        a[i] = v
+    }
+    if a[0] <= 0 or a[1] <= 0 or a[2] <= 0 or a[6] <= 0 or a[7] <= 0 or a[8] <= 0 {
+        fail "{what}'s `volume` sizes and steps must be positive"
+    }
+    if i64(a[0]) * i64(a[1]) * i64(a[2]) > MAX_VOLUME {
+        fail "{what}'s `volume` is more than {MAX_VOLUME} values"
+    }
+    return Volume {
+        size_x: a[0], size_y: a[1], size_z: a[2],
+        min_x: a[3], min_y: a[4], min_z: a[5],
+        step_x: a[6], step_y: a[7], step_z: a[8],
+    }
+}
+
+/// A rejection, as the vanilla adapter reports an exception a function throws.
+fn rejected(thrown: Thrown) -> Outcome {
+    let output: List<Member> = [
+        Member { key: "exception", value: Json.Str(thrown.exception.copy()) },
+        Member { key: "error", value: Json.Str(thrown.message.copy()) },
+    ]
+    return Outcome.Done { output: output, blobs: [] }
+}
+
+fn string_field(fields: mut List<Member>, name: String, error: mut String) -> String? {
+    if let value = take(mut fields, name) {
+        if let s = as_string(value) {
+            return some(s)
+        }
+        error = "`{name}` must be a string"
+        return none
+    }
+    error = "missing field `{name}`"
+    return none
+}
+
+fn bool_field(fields: mut List<Member>, name: String, error: mut String) -> bool? {
+    match take(mut fields, name) {
+        some(Json.Bool(b)) => return some(b),
+        _ => {},
+    }
+    error = "`{name}` must be true or false"
+    return none
+}
+
+/// A big-endian int from the blob.
+fn int_at(blob: List<u8>, at: usize) -> i32 {
+    var v: u32 = 0
+    for k in 0..4 {
+        v = (v << 8) | u32(blob[at + usize.wrap(k)])
+    }
+    return i32.wrap(v)
+}
+
+/// A float's bits, every NaN written as `Float.floatToIntBits`'s one (D198).
+fn bits(v: f32) -> u32 {
+    if v.is_nan() {
+        return 0x7fc00000
+    }
+    return v.to_bits()
+}
+
+/// `String.format("%08x", bits)`.
+fn hex8(v: u32) -> String {
+    let digits = "0123456789abcdef"
+    var s = String()
+    var shift: u32 = 28
+    for _ in 0..8 {
+        let d = usize((v >> shift) & 15)
+        s.push_str(digits[d..d + 1])
+        if shift >= 4 {
+            shift -= 4
+        }
+    }
+    return s
+}
+
+fn put_u32(out: mut List<u8>, v: u32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}

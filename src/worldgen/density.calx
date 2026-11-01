@@ -1,0 +1,1802 @@
+/// Vanilla 26.3's density functions: read as a data pack writes them, their ranges and the axes
+/// they vary along worked out as vanilla works them out, and compiled the way a `RandomState`'s
+/// `DensityFunctionCompiler` compiles them, caches shared and uniform axes sliced off, into the
+/// samplers of worldgen.sampler.
+///
+/// Functions are hash-consed: two that vanilla's records call equal are the same node, so the
+/// compiler's maps keyed by function are maps keyed by index, and a node's range, axes, rewrites
+/// and sampler are each worked out once. Vanilla works them out the same way every time, and
+/// throws the same exception at the same point, so remembering them changes nothing it gives.
+module worldgen.density
+
+import json.tree.{Json, Member, as_i32, as_string, parse}
+import pack.zip.{Zip}
+import random.any.{AnyPositional, AnyRandom}
+import random.legacy.{LegacyRandom}
+import worldgen.interval.{Interval, Thrown}
+import worldgen.noise.{Noise, fbm, fbm_range}
+import worldgen.normal.{NormalNoise, read_parameters}
+import worldgen.sampler.{Axis, ConstOp, Curve, Metric, Program, RoundOp, Sampler, Tiling, UnaryOp, round_to_integer, unary}
+
+/// A function a chunk generator binds to its own: blending's alpha and offset, and the
+/// beardifier. Unbound, as here, they're constants.
+pub enum Marker {
+    BlendAlpha
+    BlendOffset
+    Beardifier
+}
+
+/// Which shift noise: `shift_a`, `shift_b` or `shift`.
+pub enum ShiftKind {
+    A
+    B
+    Xyz
+}
+
+/// `BinaryFunction.Type`.
+pub enum BinaryOp {
+    Add
+    Sub
+    Mul
+    Div
+    Min
+    Max
+}
+
+/// One density function. Fields that are functions are indices of nodes; `noise` indexes the
+/// noise holders, `Ref` the references, `Spline` the splines and `Prepared` the prepared caches.
+pub enum Df {
+    Constant(f32)
+    /// `DensityFunctions.HolderHolder`: the function the registry has under an id.
+    Ref(usize)
+    Simple(Marker)
+    Noise { noise: usize, xz: f64, ys: f64, sx: usize, sy: usize, sz: usize }
+    EndIslands
+    Distance { x: i32, y: i32, z: i32, metric: Metric }
+    Gradient { axis: Axis, tiling: Tiling, from: i32, to: i32, from_value: f32, to_value: f32 }
+    Shift { kind: ShiftKind, noise: usize }
+    Unary { op: UnaryOp, input: usize }
+    Round { op: RoundOp, input: usize, multiple: usize }
+    Binary { op: BinaryOp, left: usize, right: usize }
+    Pow { base: usize, exponent: usize }
+    Spline(usize)
+    Lerp { alpha: usize, first: usize, second: usize }
+    Clamp { input: usize, min: f32, max: f32 }
+    Choice { input: usize, min: f32, max: f32, inside: usize, outside: usize }
+    /// `thresholds` indexes the float lists and `functions` the lists.
+    Select { input: usize, thresholds: usize, functions: usize }
+    Cache(usize)
+    Blend(usize)
+    Interpolated { input: usize, xz: i32, ys: i32 }
+    Slice { axis: Axis, at: i32, input: usize }
+    FindTop { density: usize, upper: usize, lower: i32, cell: i32 }
+    /// `BlendedNoise`, the `old_blended_noise` type.
+    Blended { xz_scale: f64, y_scale: f64, xz_factor: f64, y_factor: f64, smear: f64 }
+    /// `DensityFunctionCompiler.PreparedCache`, which only the compiler makes.
+    Prepared(usize)
+}
+
+/// A `CubicSpline` over density functions. `locations` and `derivatives` index the float lists,
+/// and `values`, which are splines, the lists.
+enum SplineNode {
+    Constant(f32)
+    Points { coordinate: usize, locations: usize, derivatives: usize, values: usize }
+}
+
+/// A noise a function samples: one of the registry's, by id, or one written out in place.
+struct Holder {
+    id: String
+    inline: bool
+    noise: NormalNoise
+}
+
+/// A cache the compiler has prepared: its input's range and axes, and its sampler.
+struct Prepared {
+    range: Interval
+    axes: i32
+    sampler: usize
+}
+
+/// Density functions, read and compiled for one `RandomState`.
+pub struct Functions {
+    nodes: List<Df> = List<Df>()
+    keys: Map<List<u64>, usize> = Map<List<u64>, usize>()
+    splines: List<SplineNode> = List<SplineNode>()
+    spline_keys: Map<List<u64>, usize> = Map<List<u64>, usize>()
+    floats: List<List<f32>> = List<List<f32>>()
+    lists: List<List<usize>> = List<List<usize>>()
+    holders: List<Holder> = List<Holder>()
+    holder_ids: Map<String, usize> = Map<String, usize>()
+    /// Each reference's function, by the reference's index.
+    refs: List<usize> = List<usize>()
+    ref_ids: Map<String, usize> = Map<String, usize>()
+    prepared: List<Prepared> = List<Prepared>()
+    /// `DensityFunctionCompiler.preparedCaches`: by the cache's input as read, not as rewritten.
+    prepared_by_input: Map<usize, usize> = Map<usize, usize>()
+    ranges: Map<usize, Interval> = Map<usize, Interval>()
+    spline_ranges: Map<usize, Interval> = Map<usize, Interval>()
+    axes_known: Map<usize, i32> = Map<usize, i32>()
+    first_pass: Map<usize, usize> = Map<usize, usize>()
+    /// `SliceUniformAxes(parent)` of a node, by `node << 3 | parent`.
+    sliced: Map<u64, usize> = Map<u64, usize>()
+    compiled: Map<usize, usize> = Map<usize, usize>()
+    noise_samplers: Map<usize, usize> = Map<usize, usize>()
+    legacy: bool
+    seed: i64
+    random: AnyPositional
+    /// The samplers compiled so far.
+    pub program: Program
+}
+
+impl Functions {
+    /// Functions for a `RandomState` of this seed, with the legacy random source or not.
+    pub fn new(legacy: bool, seed: i64) -> Functions {
+        var r = AnyRandom.of(legacy, seed)
+        return Functions { legacy: legacy, seed: seed, random: r.fork_positional(), program: Program.new() }
+    }
+
+    // Reading.
+
+    /// `DensityFunction.CODEC`: a function by its id in the registry, or one written out.
+    pub fn read(mut self, zip: Zip, value: Json) -> usize ! String {
+        match value {
+            Json.Str(name) => return try self.reference(zip, name),
+            _ => return try self.direct(zip, value),
+        }
+    }
+
+    /// The function the vanilla data pack has under `name`, read the first time it's named.
+    fn reference(mut self, zip: Zip, name: String) -> usize ! String {
+        let id = qualified(name)
+        if let r = self.ref_ids.get(id) {
+            return self.node(Df.Ref(r))
+        }
+        let r = self.refs.len()
+        self.refs.push(0)
+        self.ref_ids.insert(id.copy(), r)
+        let json = try data_json(zip, id, "density_function")
+        let root = try self.direct(zip, json)
+        self.refs[r] = root
+        return self.node(Df.Ref(r))
+    }
+
+    /// `DensityFunction.DIRECT_CODEC`: a constant, or a function with a type.
+    fn direct(mut self, zip: Zip, value: Json) -> usize ! String {
+        match value {
+            Json.Number(text) => {
+                let v = try noise_value_of(text)
+                return self.node(Df.Constant(v))
+            },
+            Json.Bool(b) => return self.node(Df.Constant(if b { 1.0f32 } else { 0.0f32 })),
+            Json.Object(members) => return try self.typed(zip, members),
+            _ => {},
+        }
+        fail "Not a density function: {value}"
+    }
+
+    fn typed(mut self, zip: Zip, members: List<Member>) -> usize ! String {
+        let full = try string_of(members, "type")
+        var kind = full.copy()
+        if full.starts_with("minecraft:") {
+            kind = full[10..]
+        }
+        if kind == "constant" {
+            let v = try noise_value(members, "value")
+            return self.node(Df.Constant(v))
+        }
+        if kind == "noise" {
+            let h = try self.noise_holder(zip, members, "noise")
+            let xz = try double_of(members, "xz_scale")
+            let ys = try double_of(members, "y_scale")
+            let sx = try self.optional(zip, members, "shift_x", 0.0f32)
+            let sy = try self.optional(zip, members, "shift_y", 0.0f32)
+            let sz = try self.optional(zip, members, "shift_z", 0.0f32)
+            return self.node(Df.Noise { noise: h, xz: xz, ys: ys, sx: sx, sy: sy, sz: sz })
+        }
+        if kind == "end_outer_islands" {
+            return self.node(Df.EndIslands)
+        }
+        if kind == "distance_to_point" {
+            let p = try ints_of(members, "point")
+            if p.len() != 3 {
+                fail "`point` must be 3 integers"
+            }
+            let metric = try metric_named(try string_of(members, "metric"))
+            return self.node(Df.Distance { x: p[0], y: p[1], z: p[2], metric: metric })
+        }
+        if kind == "gradient" {
+            let axis = try axis_named(try string_of(members, "axis"))
+            var tiling = Tiling.Clamp
+            if last_index(members, "tiling") != none {
+                tiling = try tiling_named(try string_of(members, "tiling"))
+            }
+            let from = try int_of(members, "from_coordinate")
+            let to = try int_of(members, "to_coordinate")
+            let from_value = try noise_value(members, "from_value")
+            let to_value = try noise_value(members, "to_value")
+            if from == to {
+                fail "from_coordinate cannot be equal to to_coordinate"
+            }
+            return self.node(Df.Gradient { axis: axis, tiling: tiling, from: from, to: to, from_value: from_value, to_value: to_value })
+        }
+        if kind == "shift_a" or kind == "shift_b" or kind == "shift" {
+            let h = try self.noise_holder(zip, members, "noise")
+            let shift = if kind == "shift_a" { ShiftKind.A } else if kind == "shift_b" { ShiftKind.B } else { ShiftKind.Xyz }
+            return self.node(Df.Shift { kind: shift, noise: h })
+        }
+        if kind == "blend_alpha" {
+            return self.node(Df.Simple(Marker.BlendAlpha))
+        }
+        if kind == "blend_offset" {
+            return self.node(Df.Simple(Marker.BlendOffset))
+        }
+        if kind == "beardifier" {
+            return self.node(Df.Simple(Marker.Beardifier))
+        }
+        if let op = unary_named(kind) {
+            let input = try self.field_function(zip, members, "input")
+            return self.node(Df.Unary { op: op, input: input })
+        }
+        if let op = round_named(kind) {
+            let input = try self.field_function(zip, members, "input")
+            let multiple = try self.optional(zip, members, "multiple", 1.0f32)
+            return self.node(Df.Round { op: op, input: input, multiple: multiple })
+        }
+        if let op = binary_named(kind) {
+            let left = try self.field_function(zip, members, "left")
+            let right = try self.field_function(zip, members, "right")
+            return self.node(Df.Binary { op: op, left: left, right: right })
+        }
+        if kind == "pow" {
+            let base = try self.field_function(zip, members, "base")
+            let exponent = try self.field_function(zip, members, "exponent")
+            return self.node(Df.Pow { base: base, exponent: exponent })
+        }
+        if kind == "spline" {
+            let i = last_index(members, "spline") else fail "No key spline in MapLike"
+            let s = try self.spline(zip, members[i].value)
+            return self.node(Df.Spline(s))
+        }
+        if kind == "lerp" {
+            let alpha = try self.field_function(zip, members, "alpha")
+            let first = try self.field_function(zip, members, "first")
+            let second = try self.field_function(zip, members, "second")
+            return self.node(Df.Lerp { alpha: alpha, first: first, second: second })
+        }
+        if kind == "clamp" {
+            let input = try self.field_function(zip, members, "input")
+            let min = try noise_value(members, "min")
+            let max = try noise_value(members, "max")
+            if max < min {
+                fail "The max value of {max} has to be larger than the min value of {min}"
+            }
+            return self.node(Df.Clamp { input: input, min: min, max: max })
+        }
+        if kind == "range_choice" {
+            let input = try self.field_function(zip, members, "input")
+            let min = try noise_value(members, "min_inclusive")
+            let max = try noise_value(members, "max_exclusive")
+            let inside = try self.field_function(zip, members, "when_in_range")
+            let outside = try self.field_function(zip, members, "when_out_of_range")
+            return self.node(Df.Choice { input: input, min: min, max: max, inside: inside, outside: outside })
+        }
+        if kind == "interval_select" {
+            return try self.interval_select(zip, members)
+        }
+        if kind == "cache" {
+            let input = try self.field_function(zip, members, "input")
+            return self.node(Df.Cache(input))
+        }
+        if kind == "blend_density" {
+            let input = try self.field_function(zip, members, "input")
+            return self.node(Df.Blend(input))
+        }
+        if kind == "interpolated" {
+            let input = try self.field_function(zip, members, "input")
+            let xz = try positive_of(members, "cell_size_xz")
+            let ys = try positive_of(members, "cell_size_y")
+            return self.node(Df.Interpolated { input: input, xz: xz, ys: ys })
+        }
+        if kind == "slice" {
+            let axis = try axis_named(try string_of(members, "axis"))
+            let at = try int_of(members, "coordinate")
+            let input = try self.field_function(zip, members, "input")
+            return self.node(Df.Slice { axis: axis, at: at, input: input })
+        }
+        if kind == "find_top_surface" {
+            let density = try self.field_function(zip, members, "density")
+            let upper = try self.field_function(zip, members, "upper_bound")
+            let lower = try int_of(members, "lower_bound")
+            if lower < -4064 or lower > 4062 {
+                fail "Value {lower} outside of range [-4064:4062]"
+            }
+            let cell = try positive_of(members, "cell_height")
+            return self.node(Df.FindTop { density: density, upper: upper, lower: lower, cell: cell })
+        }
+        if kind == "old_blended_noise" {
+            let xz_scale = try scale_of(members, "xz_scale", 0.001, 1000.0)
+            let y_scale = try scale_of(members, "y_scale", 0.001, 1000.0)
+            let xz_factor = try scale_of(members, "xz_factor", 0.001, 1000.0)
+            let y_factor = try scale_of(members, "y_factor", 0.001, 1000.0)
+            let smear = try scale_of(members, "smear_scale_multiplier", 1.0, 8.0)
+            return self.node(Df.Blended { xz_scale: xz_scale, y_scale: y_scale, xz_factor: xz_factor, y_factor: y_factor, smear: smear })
+        }
+        fail "Unknown density function type {full}"
+    }
+
+    fn interval_select(mut self, zip: Zip, members: List<Member>) -> usize ! String {
+        let input = try self.field_function(zip, members, "input")
+        let t = last_index(members, "thresholds") else fail "No key thresholds in MapLike"
+        var thresholds = List<f32>()
+        match members[t].value {
+            Json.Array(items) => {
+                for k in 0..items.len() {
+                    match items[k] {
+                        Json.Number(text) => thresholds.push(try noise_value_of(text)),
+                        _ => fail "Not a number: {items[k]}",
+                    }
+                }
+            },
+            _ => fail "Not a list: {members[t].value}",
+        }
+        let f = last_index(members, "functions") else fail "No key functions in MapLike"
+        var functions = List<usize>()
+        match members[f].value {
+            Json.Array(items) => {
+                for k in 0..items.len() {
+                    functions.push(try self.read(zip, items[k]))
+                }
+            },
+            _ => fail "Not a list: {members[f].value}",
+        }
+        if functions.len() < 2 {
+            fail "Expected at least 2 functions, got {functions.len()}"
+        }
+        if functions.len() != thresholds.len() + 1 {
+            fail "Expected {functions.len() - 1} thresholds, got {thresholds.len()}"
+        }
+        for k in 1..thresholds.len() {
+            if thresholds[k] < thresholds[k - 1] {
+                fail "Thresholds must be in ascending order"
+            }
+        }
+        self.floats.push(thresholds)
+        let ts = self.floats.len() - 1
+        self.lists.push(functions)
+        let fs = self.lists.len() - 1
+        return self.node(Df.Select { input: input, thresholds: ts, functions: fs })
+    }
+
+    /// `CubicSpline.codec`: a constant, or points along a coordinate.
+    fn spline(mut self, zip: Zip, value: Json) -> usize ! String {
+        match value {
+            Json.Number(text) => {
+                let v = f32.parse(text) else fail "Not a number: {text}"
+                return self.spline_node(SplineNode.Constant(v))
+            },
+            Json.Bool(b) => return self.spline_node(SplineNode.Constant(if b { 1.0f32 } else { 0.0f32 })),
+            Json.Object(members) => return try self.spline_points(zip, members),
+            _ => {},
+        }
+        fail "Not a spline: {value}"
+    }
+
+    fn spline_points(mut self, zip: Zip, members: List<Member>) -> usize ! String {
+        let coordinate = try self.field_function(zip, members, "coordinate")
+        let p = last_index(members, "points") else fail "No key points in MapLike"
+        var locations = List<f32>()
+        var derivatives = List<f32>()
+        var values = List<usize>()
+        match members[p].value {
+            Json.Array(items) => {
+                for k in 0..items.len() {
+                    match items[k] {
+                        Json.Object(point) => {
+                            locations.push(try float_of(point, "location"))
+                            let v = last_index(point, "value") else fail "No key value in MapLike"
+                            values.push(try self.spline(zip, point[v].value))
+                            derivatives.push(try float_of(point, "derivative"))
+                        },
+                        _ => fail "Not a spline point: {items[k]}",
+                    }
+                }
+            },
+            _ => fail "Not a list: {members[p].value}",
+        }
+        if values.is_empty() {
+            fail "List must have contents"
+        }
+        self.floats.push(locations)
+        let l = self.floats.len() - 1
+        self.floats.push(derivatives)
+        let d = self.floats.len() - 1
+        self.lists.push(values)
+        let v = self.lists.len() - 1
+        return self.spline_node(SplineNode.Points { coordinate: coordinate, locations: l, derivatives: d, values: v })
+    }
+
+    /// `NormalNoise.CODEC`: a noise by its id in the registry, or its parameters written out.
+    fn noise_holder(mut self, zip: Zip, members: List<Member>, key: String) -> usize ! String {
+        let i = last_index(members, key) else fail "No key {key} in MapLike"
+        var error = String()
+        match members[i].value {
+            Json.Str(name) => {
+                let id = qualified(name)
+                if let h = self.holder_ids.get(id) {
+                    return h
+                }
+                let json = try data_json(zip, id, "noise")
+                let p = read_parameters(json, mut error) else fail "{id}: {error}"
+                self.holders.push(Holder { id: id.copy(), inline: false, noise: NormalNoise.new(p) })
+                let h = self.holders.len() - 1
+                self.holder_ids.insert(id, h)
+                return h
+            },
+            _ => {},
+        }
+        let p = read_parameters(members[i].value, mut error) else fail error
+        self.holders.push(Holder { id: String(), inline: true, noise: NormalNoise.new(p) })
+        return self.holders.len() - 1
+    }
+
+    fn field_function(mut self, zip: Zip, members: List<Member>, key: String) -> usize ! String {
+        let i = last_index(members, key) else fail "No key {key} in MapLike"
+        return try self.read(zip, members[i].value)
+    }
+
+    /// A function that may be left out, for a constant.
+    fn optional(mut self, zip: Zip, members: List<Member>, key: String, otherwise: f32) -> usize ! String {
+        if let i = last_index(members, key) {
+            return try self.read(zip, members[i].value)
+        }
+        return self.node(Df.Constant(otherwise))
+    }
+
+    // Nodes.
+
+    /// The node for `d`: the one already made, if an equal function was.
+    fn node(mut self, d: Df) -> usize {
+        let key = self.key_of(d)
+        if let at = self.keys.get(key) {
+            return at
+        }
+        self.nodes.push(d)
+        let at = self.nodes.len() - 1
+        self.keys.insert(key, at)
+        return at
+    }
+
+    /// What vanilla's records compare, for `d`: floats by `Float.compare`, so `-0.0` isn't `0.0`
+    /// and every NaN is one, and functions by node.
+    fn key_of(self, d: Df) -> List<u64> {
+        return match d {
+            Constant(v) => [1, float_key(v)],
+            Ref(r) => [2, u64(r)],
+            Simple(m) => [3, marker_code(m)],
+            Noise { noise, xz, ys, sx, sy, sz } => [4, u64(noise), double_key(xz), double_key(ys), u64(sx), u64(sy), u64(sz)],
+            EndIslands => [5],
+            Distance { x, y, z, metric } => [6, int_key(x), int_key(y), int_key(z), metric_code(metric)],
+            Gradient { axis, tiling, from, to, from_value, to_value } => [7, axis_code(axis), tiling_code(tiling), int_key(from), int_key(to), float_key(from_value), float_key(to_value)],
+            Shift { kind, noise } => [8, shift_code(kind), u64(noise)],
+            Unary { op, input } => [9, unary_code(op), u64(input)],
+            Round { op, input, multiple } => [10, round_code(op), u64(input), u64(multiple)],
+            Binary { op, left, right } => [11, binary_code(op), u64(left), u64(right)],
+            Pow { base, exponent } => [12, u64(base), u64(exponent)],
+            Spline(s) => [13, u64(s)],
+            Lerp { alpha, first, second } => [14, u64(alpha), u64(first), u64(second)],
+            Clamp { input, min, max } => [15, u64(input), float_key(min), float_key(max)],
+            Choice { input, min, max, inside, outside } => [16, u64(input), float_key(min), float_key(max), u64(inside), u64(outside)],
+            Select { input, thresholds, functions } => self.select_key(input, thresholds, functions),
+            Cache(input) => [18, u64(input)],
+            Blend(input) => [19, u64(input)],
+            Interpolated { input, xz, ys } => [20, u64(input), int_key(xz), int_key(ys)],
+            Slice { axis, at, input } => [21, axis_code(axis), int_key(at), u64(input)],
+            FindTop { density, upper, lower, cell } => [22, u64(density), u64(upper), int_key(lower), int_key(cell)],
+            Blended { xz_scale, y_scale, xz_factor, y_factor, smear } => [23, double_key(xz_scale), double_key(y_scale), double_key(xz_factor), double_key(y_factor), double_key(smear)],
+            Prepared(p) => [24, u64(p)],
+        }
+    }
+
+    /// An interval select's thresholds compare as a `FloatArrayList` does, by `==`, so `-0.0`
+    /// is `0.0` there.
+    fn select_key(self, input: usize, thresholds: usize, functions: usize) -> List<u64> {
+        var key: List<u64> = [17, u64(input), u64(self.floats[thresholds].len())]
+        for i in 0..self.floats[thresholds].len() {
+            let t = self.floats[thresholds][i]
+            key.push(float_key(if t == 0.0f32 { 0.0f32 } else { t }))
+        }
+        for i in 0..self.lists[functions].len() {
+            key.push(u64(self.lists[functions][i]))
+        }
+        return key
+    }
+
+    /// The spline for `n`, the one already made if an equal one was: `Multipoint.equals`
+    /// compares the locations and derivatives as `Arrays.equals` does.
+    fn spline_node(mut self, n: SplineNode) -> usize {
+        var key = List<u64>()
+        match n {
+            Constant(v) => {
+                key.push(1)
+                key.push(float_key(v))
+            },
+            Points { coordinate, locations, derivatives, values } => {
+                key.push(2)
+                key.push(u64(coordinate))
+                let count = self.lists[values].len()
+                key.push(u64(count))
+                for i in 0..count {
+                    key.push(float_key(self.floats[locations][i]))
+                    key.push(float_key(self.floats[derivatives][i]))
+                    key.push(u64(self.lists[values][i]))
+                }
+            },
+        }
+        if let at = self.spline_keys.get(key) {
+            return at
+        }
+        self.splines.push(n)
+        let at = self.splines.len() - 1
+        self.spline_keys.insert(key, at)
+        return at
+    }
+
+    fn constant_of(self, f: usize) -> f32? {
+        return match self.nodes[f] {
+            Constant(v) => some(v),
+            _ => none,
+        }
+    }
+
+    /// `DensityFunctions.zero()`.
+    fn zero(mut self) -> usize {
+        return self.node(Df.Constant(0.0f32))
+    }
+
+    // Ranges and axes.
+
+    /// `DensityFunction.range()`.
+    pub fn range(mut self, f: usize) -> Interval ! Thrown {
+        if let r = self.ranges.get(f) {
+            return r
+        }
+        let r = try self.range_of(f)
+        self.ranges.insert(f, r)
+        return r
+    }
+
+    fn range_of(mut self, f: usize) -> Interval ! Thrown {
+        let d = self.nodes[f]
+        match d {
+            Constant(v) => return try Interval.exact(v),
+            Ref(r) => {
+                let root = self.refs[r]
+                return try self.range(root)
+            },
+            Simple(m) => return match m {
+                BlendAlpha => try Interval.of(0.0f32, 1.0f32),
+                _ => Interval.infinite(),
+            },
+            Noise { noise, .. } => return self.holders[noise].noise.range,
+            EndIslands => return try Interval.of(-0.84375f32, 0.5625f32),
+            Distance { .. } => return try Interval.of(0.0f32, f32.INFINITY),
+            Gradient { from_value, to_value, .. } => return try Interval.around(from_value, to_value),
+            Shift { noise, .. } => {
+                let four = try Interval.exact(4.0f32)
+                return try self.holders[noise].noise.range.mul(four)
+            },
+            Unary { op, input } => {
+                let r = try self.range(input)
+                return try unary_range(op, r)
+            },
+            Round { op, input, multiple } => {
+                let m = try self.range(multiple)
+                let i = try self.range(input)
+                let q = try i.div(m)
+                if q.is_nai() {
+                    return try q.mul(m)
+                }
+                let rounded = try Interval.mapped(round_to_integer(op, q.min), round_to_integer(op, q.max))
+                return try rounded.mul(m)
+            },
+            Binary { op, left, right } => {
+                let l = try self.range(left)
+                let r = try self.range(right)
+                return match op {
+                    Add => try l.add(r),
+                    Sub => try l.sub(r),
+                    Mul => try l.mul(r),
+                    Div => try l.div(r),
+                    Min => try l.min_of(r),
+                    Max => try l.max_of(r),
+                }
+            },
+            Pow { base, exponent } => {
+                let b = try self.range(base)
+                let e = try self.range(exponent)
+                return try b.pow(e)
+            },
+            Spline(s) => return try self.spline_range(s),
+            Lerp { alpha, first, second } => {
+                let a = try self.range(alpha)
+                let x = try self.range(first)
+                let y = try self.range(second)
+                return try a.lerp(x, y)
+            },
+            Clamp { input, min, max } => {
+                let r = try self.range(input)
+                return try r.clamp(min, max)
+            },
+            Choice { inside, outside, .. } => {
+                let a = try self.range(inside)
+                let b = try self.range(outside)
+                return try Interval.encapsulating([a, b])
+            },
+            Select { functions, .. } => {
+                var all = List<Interval>()
+                for i in 0..self.lists[functions].len() {
+                    let g = self.lists[functions][i]
+                    all.push(try self.range(g))
+                }
+                return try Interval.encapsulating(all)
+            },
+            Cache(input) => return try self.range(input),
+            Blend(input) => return try self.range(input),
+            Interpolated { input, .. } => return try self.range(input),
+            Slice { input, .. } => return try self.range(input),
+            FindTop { upper, lower, .. } => {
+                let u = try self.range(upper)
+                let low = f32.nearest(lower)
+                return try Interval.of(low, low.max(u.max))
+            },
+            Blended { y_scale, smear, .. } => return try fbm_range(-15, 684.412 * y_scale * smear, f64(0.99998474f32)),
+            Prepared(p) => return self.prepared[p].range,
+        }
+    }
+
+    /// `CubicSpline.range()`.
+    fn spline_range(mut self, s: usize) -> Interval ! Thrown {
+        if let r = self.spline_ranges.get(s) {
+            return r
+        }
+        let shape = self.splines[s]
+        let r = match shape {
+            Constant(v) => try Interval.exact(v),
+            Points { coordinate, locations, derivatives, values } => try self.points_range(coordinate, locations, derivatives, values),
+        }
+        self.spline_ranges.insert(s, r)
+        return r
+    }
+
+    fn points_range(mut self, coordinate: usize, locations: usize, derivatives: usize, values: usize) -> Interval ! Thrown {
+        let n = self.lists[values].len()
+        let last = n - 1
+        var min = f32.INFINITY
+        var max = -f32.INFINITY
+        let input = try self.range(coordinate)
+        if input.is_nai() {
+            return input
+        }
+        let first_location = self.floats[locations][0]
+        if input.min < first_location {
+            let v = self.lists[values][0]
+            let first = try self.spline_range(v)
+            let d = self.floats[derivatives][0]
+            let e1 = extend_edge(input.min, first_location, first.min, d)
+            let e2 = extend_edge(input.min, first_location, first.max, d)
+            min = min.min(e1.min(e2))
+            max = max.max(e1.max(e2))
+        }
+        let last_location = self.floats[locations][last]
+        if input.max > last_location {
+            let v = self.lists[values][last]
+            let end = try self.spline_range(v)
+            let d = self.floats[derivatives][last]
+            let e1 = extend_edge(input.max, last_location, end.min, d)
+            let e2 = extend_edge(input.max, last_location, end.max, d)
+            min = min.min(e1.min(e2))
+            max = max.max(e1.max(e2))
+        }
+        var all = List<Interval>()
+        for i in 0..n {
+            let v = self.lists[values][i]
+            all.push(try self.spline_range(v))
+        }
+        for r in all {
+            min = min.min(r.min)
+            max = max.max(r.max)
+        }
+        for i in 0..last {
+            let x1 = self.floats[locations][i]
+            let x2 = self.floats[locations][i + 1]
+            let x_diff = x2 - x1
+            let r1 = all[i]
+            let r2 = all[i + 1]
+            let d1 = self.floats[derivatives][i]
+            let d2 = self.floats[derivatives][i + 1]
+            if d1 != 0.0f32 or d2 != 0.0f32 {
+                let p1 = d1 * x_diff
+                let p2 = d2 * x_diff
+                let min_lerp1 = r1.min.min(r2.min)
+                let max_lerp1 = r1.max.max(r2.max)
+                let min_a = p1 - r2.max + r1.min
+                let max_a = p1 - r2.min + r1.max
+                let min_b = -p2 + r2.min - r1.max
+                let max_b = -p2 + r2.max - r1.min
+                let min_lerp2 = min_a.min(min_b)
+                let max_lerp2 = max_a.max(max_b)
+                min = min.min(min_lerp1 + 0.25f32 * min_lerp2)
+                max = max.max(max_lerp1 + 0.25f32 * max_lerp2)
+            }
+        }
+        return try Interval.of(min, max)
+    }
+
+    /// `DensityFunction.domainAxes()`: the axes the function varies along, X 1, Y 2 and Z 4.
+    pub fn axes(mut self, f: usize) -> i32 {
+        if let a = self.axes_known.get(f) {
+            return a
+        }
+        let a = self.axes_of(f)
+        self.axes_known.insert(f, a)
+        return a
+    }
+
+    fn axes_of(mut self, f: usize) -> i32 {
+        let d = self.nodes[f]
+        return match d {
+            Constant(_) => 0,
+            Ref(r) => {
+                let root = self.refs[r]
+                self.axes(root)
+            },
+            Simple(m) => match m {
+                Beardifier => 7,
+                _ => 5,
+            },
+            Noise { xz, ys, sx, sy, sz, .. } => {
+                var a: i32 = 7
+                if ys == 0.0 {
+                    a &= -3
+                }
+                if xz == 0.0 {
+                    a &= -6
+                }
+                a | self.axes(sx) | self.axes(sy) | self.axes(sz)
+            },
+            EndIslands => 5,
+            Distance { .. } => 7,
+            Gradient { axis, .. } => axis_bit(axis),
+            Shift { kind, .. } => match kind {
+                Xyz => 7,
+                _ => 5,
+            },
+            Unary { input, .. } => self.axes(input),
+            Round { input, multiple, .. } => self.axes(input) | self.axes(multiple),
+            Binary { left, right, .. } => self.axes(left) | self.axes(right),
+            Pow { base, exponent } => self.axes(base) | self.axes(exponent),
+            Spline(s) => self.spline_axes(s),
+            Lerp { alpha, first, second } => self.axes(alpha) | self.axes(first) | self.axes(second),
+            Clamp { input, .. } => self.axes(input),
+            Choice { input, inside, outside, .. } => self.axes(input) | self.axes(inside) | self.axes(outside),
+            Select { input, functions, .. } => {
+                var a = self.axes(input)
+                for i in 0..self.lists[functions].len() {
+                    let g = self.lists[functions][i]
+                    a |= self.axes(g)
+                }
+                a
+            },
+            Cache(input) => self.axes(input),
+            Blend(input) => self.axes(input),
+            Interpolated { input, .. } => self.axes(input),
+            Slice { axis, input, .. } => self.axes(input) & ~axis_bit(axis),
+            FindTop { density, upper, .. } => (self.axes(density) | self.axes(upper)) & -3,
+            Blended { .. } => 7,
+            Prepared(p) => self.prepared[p].axes,
+        }
+    }
+
+    fn spline_axes(mut self, s: usize) -> i32 {
+        let shape = self.splines[s]
+        return match shape {
+            Constant(_) => 0,
+            Points { coordinate, values, .. } => {
+                var a = self.axes(coordinate)
+                for i in 0..self.lists[values].len() {
+                    let v = self.lists[values][i]
+                    a |= self.spline_axes(v)
+                }
+                a
+            },
+        }
+    }
+
+    // The optimizer.
+
+    /// `RandomState.getSampler`: the function optimized and compiled. An equal function gets
+    /// the same sampler.
+    pub fn sampler(mut self, f: usize) -> usize ! Thrown {
+        let optimized = try self.optimize(f)
+        return try self.compile(optimized)
+    }
+
+    /// `DensityFunctionCompiler.optimizerRule`: the first pass, then `SLICE_UNIFORM_AXES`.
+    fn optimize(mut self, f: usize) -> usize ! Thrown {
+        let g = try self.pass_one(f)
+        return try self.slice_uniform(g, 7)
+    }
+
+    /// The optimizer's first pass: a reference becomes the function it names, and a cache the
+    /// cache prepared for its input.
+    fn pass_one(mut self, f: usize) -> usize ! Thrown {
+        if let done = self.first_pass.get(f) {
+            return done
+        }
+        var g = f
+        match self.nodes[f] {
+            Ref(r) => g = self.refs[r],
+            _ => {},
+        }
+        let d = self.nodes[g]
+        let result = match d {
+            Cache(input) => try self.prepare(input),
+            _ => try self.rewrite_children(g, -1),
+        }
+        self.first_pass.insert(f, result)
+        return result
+    }
+
+    /// `reuseOrPrepareCache`: the cache's id is taken before its input is optimized, and its
+    /// range and axes are the optimized input's, worked out after it compiles.
+    fn prepare(mut self, input: usize) -> usize ! Thrown {
+        if let p = self.prepared_by_input.get(input) {
+            return self.node(Df.Prepared(p))
+        }
+        let id = self.prepared.len()
+        self.prepared.push(Prepared { range: Interval.nai(), axes: 0, sampler: 0 })
+        let optimized = try self.optimize(input)
+        let inner = try self.compile(optimized)
+        let sampler = self.program.add(Sampler.Caching { id: id, input: inner })
+        let range = try self.range(optimized)
+        let axes = self.axes(optimized)
+        self.prepared[id] = Prepared { range: range, axes: axes, sampler: sampler }
+        self.prepared_by_input.insert(input, id)
+        return self.node(Df.Prepared(id))
+    }
+
+    /// The rule `rule`: the first pass if negative, else `SliceUniformAxes(rule)`.
+    fn rewrite(mut self, f: usize, rule: i32) -> usize ! Thrown {
+        if rule < 0 {
+            return try self.pass_one(f)
+        }
+        return try self.slice_uniform(f, rule)
+    }
+
+    /// `DfRewriteRule.SliceUniformAxes(parent)`: where a function varies along fewer axes than
+    /// the one it's in, it's sliced at 0 along the others, so its caches are shared.
+    fn slice_uniform(mut self, f: usize, parent: i32) -> usize ! Thrown {
+        let key = (u64(f) << 3) | u64.wrap(parent)
+        if let done = self.sliced.get(key) {
+            return done
+        }
+        let skip = match self.nodes[f] {
+            Constant(_) => true,
+            Gradient { .. } => true,
+            _ => false,
+        }
+        var result = f
+        if not skip {
+            let mine = self.axes(f)
+            if parent == mine {
+                result = try self.rewrite_children(f, parent)
+            } else {
+                let rewritten = try self.rewrite_children(f, mine)
+                result = self.remove_axes(rewritten, parent & ~mine)
+            }
+        }
+        self.sliced.insert(key, result)
+        return result
+    }
+
+    fn remove_axes(mut self, f: usize, axes: i32) -> usize {
+        let filtered = axes & ~self.removed_axes(f)
+        var g = f
+        if (filtered & 1) != 0 {
+            g = self.node(Df.Slice { axis: Axis.X, at: 0, input: g })
+        }
+        if (filtered & 4) != 0 {
+            g = self.node(Df.Slice { axis: Axis.Z, at: 0, input: g })
+        }
+        if (filtered & 2) != 0 {
+            g = self.node(Df.Slice { axis: Axis.Y, at: 0, input: g })
+        }
+        return g
+    }
+
+    /// The axes the slices at the top of `f` already remove.
+    fn removed_axes(self, f: usize) -> i32 {
+        return match self.nodes[f] {
+            Slice { axis, input, .. } => axis_bit(axis) | self.removed_axes(input),
+            _ => 0,
+        }
+    }
+
+    /// `rewriteChildren`: the function with each of its children rewritten, in vanilla's order.
+    fn rewrite_children(mut self, f: usize, rule: i32) -> usize ! Thrown {
+        let d = self.nodes[f]
+        match d {
+            Ref(r) => {
+                let root = self.refs[r]
+                let done = try self.rewrite(root, rule)
+                return if done == root { f } else { done }
+            },
+            Noise { noise, xz, ys, sx, sy, sz } => {
+                let a = try self.rewrite(sx, rule)
+                let b = try self.rewrite(sy, rule)
+                let c = try self.rewrite(sz, rule)
+                return self.node(Df.Noise { noise: noise, xz: xz, ys: ys, sx: a, sy: b, sz: c })
+            },
+            Unary { op, input } => {
+                let a = try self.rewrite(input, rule)
+                return self.node(Df.Unary { op: op, input: a })
+            },
+            Round { op, input, multiple } => {
+                let a = try self.rewrite(input, rule)
+                let b = try self.rewrite(multiple, rule)
+                return self.node(Df.Round { op: op, input: a, multiple: b })
+            },
+            Binary { op, left, right } => {
+                let a = try self.rewrite(left, rule)
+                let b = try self.rewrite(right, rule)
+                return self.node(Df.Binary { op: op, left: a, right: b })
+            },
+            Pow { base, exponent } => {
+                let a = try self.rewrite(base, rule)
+                let b = try self.rewrite(exponent, rule)
+                return self.node(Df.Pow { base: a, exponent: b })
+            },
+            Spline(s) => {
+                let t = try self.rewrite_spline(s, rule)
+                return self.node(Df.Spline(t))
+            },
+            Lerp { alpha, first, second } => {
+                let a = try self.rewrite(alpha, rule)
+                let b = try self.rewrite(first, rule)
+                let c = try self.rewrite(second, rule)
+                return self.node(Df.Lerp { alpha: a, first: b, second: c })
+            },
+            Clamp { input, min, max } => {
+                let a = try self.rewrite(input, rule)
+                return self.node(Df.Clamp { input: a, min: min, max: max })
+            },
+            Choice { input, min, max, inside, outside } => {
+                let a = try self.rewrite(input, rule)
+                let b = try self.rewrite(inside, rule)
+                let c = try self.rewrite(outside, rule)
+                return self.node(Df.Choice { input: a, min: min, max: max, inside: b, outside: c })
+            },
+            Select { input, thresholds, functions } => {
+                let a = try self.rewrite(input, rule)
+                var all = List<usize>()
+                for i in 0..self.lists[functions].len() {
+                    let g = self.lists[functions][i]
+                    all.push(try self.rewrite(g, rule))
+                }
+                self.lists.push(all)
+                let fs = self.lists.len() - 1
+                return self.node(Df.Select { input: a, thresholds: thresholds, functions: fs })
+            },
+            Cache(input) => {
+                let a = try self.rewrite(input, rule)
+                return self.node(Df.Cache(a))
+            },
+            Blend(input) => {
+                let a = try self.rewrite(input, rule)
+                return self.node(Df.Blend(a))
+            },
+            Interpolated { input, xz, ys } => {
+                let a = try self.rewrite(input, rule)
+                return self.node(Df.Interpolated { input: a, xz: xz, ys: ys })
+            },
+            Slice { axis, at, input } => {
+                let a = try self.rewrite(input, rule)
+                return self.node(Df.Slice { axis: axis, at: at, input: a })
+            },
+            FindTop { density, upper, lower, cell } => {
+                let a = try self.rewrite(density, rule)
+                let b = try self.rewrite(upper, rule)
+                return self.node(Df.FindTop { density: a, upper: b, lower: lower, cell: cell })
+            },
+            _ => return f,
+        }
+    }
+
+    /// `CubicSpline.mapCoordinates`: the coordinate first, then the values in order.
+    fn rewrite_spline(mut self, s: usize, rule: i32) -> usize ! Thrown {
+        let shape = self.splines[s]
+        match shape {
+            Points { coordinate, locations, derivatives, values } => {
+                let c = try self.rewrite(coordinate, rule)
+                var all = List<usize>()
+                for i in 0..self.lists[values].len() {
+                    let v = self.lists[values][i]
+                    all.push(try self.rewrite_spline(v, rule))
+                }
+                self.lists.push(all)
+                let vs = self.lists.len() - 1
+                return self.spline_node(SplineNode.Points { coordinate: c, locations: locations, derivatives: derivatives, values: vs })
+            },
+            _ => return s,
+        }
+    }
+
+    // Compiling.
+
+    /// `compileSampler`, on an optimized function.
+    fn compile(mut self, f: usize) -> usize ! Thrown {
+        if let s = self.compiled.get(f) {
+            return s
+        }
+        let s = try self.compile_node(f)
+        self.compiled.insert(f, s)
+        return s
+    }
+
+    fn compile_node(mut self, f: usize) -> usize ! Thrown {
+        let d = self.nodes[f]
+        match d {
+            Constant(v) => return self.program.add(Sampler.Constant(v)),
+            Ref(r) => {
+                let root = self.refs[r]
+                return try self.compile(root)
+            },
+            Simple(m) => {
+                let v = match m {
+                    BlendAlpha => 1.0f32,
+                    _ => 0.0f32,
+                }
+                return self.program.add(Sampler.Constant(v))
+            },
+            Noise { noise, xz, ys, sx, sy, sz } => {
+                let n = try self.noise_sampler(noise)
+                let z0 = self.zero()
+                if sx == z0 and sy == z0 and sz == z0 {
+                    return self.program.add(Sampler.Noise { noise: n, xz: xz, ys: ys })
+                }
+                let a = try self.compile(sx)
+                let c = try self.compile(sz)
+                if sy == z0 {
+                    return self.program.add(Sampler.ShiftedXz { sx: a, sz: c, noise: n, xz: xz, ys: ys })
+                }
+                let b = try self.compile(sy)
+                return self.program.add(Sampler.ShiftedXyz { sx: a, sy: b, sz: c, noise: n, xz: xz, ys: ys })
+            },
+            EndIslands => {
+                var r = LegacyRandom.new(self.seed)
+                r.consume(17292)
+                self.program.noises.push(Noise.simplex(mut r, true))
+                let n = self.program.noises.len() - 1
+                return self.program.add(Sampler.EndIslands { noise: n })
+            },
+            Distance { x, y, z, metric } => return self.program.add(Sampler.Distance { px: x, py: y, pz: z, metric: metric }),
+            Gradient { axis, tiling, from, to, from_value, to_value } => {
+                let span = to - from
+                let factor = (to_value - from_value) / f32.nearest(span)
+                return self.program.add(Sampler.Gradient {
+                    axis: axis, tiling: tiling, from: from, low: from.min(to), high: from.max(to), span: span,
+                    from_value: from_value, factor: factor,
+                })
+            },
+            Shift { kind, noise } => {
+                let n = try self.noise_sampler(noise)
+                return match kind {
+                    A => {
+                        let inner = self.program.add(Sampler.Noise { noise: n, xz: 0.25, ys: 0.0 })
+                        self.program.add(Sampler.Const { op: ConstOp.Mul, input: inner, value: 4.0f32 })
+                    },
+                    Xyz => {
+                        let inner = self.program.add(Sampler.Noise { noise: n, xz: 0.25, ys: 0.25 })
+                        self.program.add(Sampler.Const { op: ConstOp.Mul, input: inner, value: 4.0f32 })
+                    },
+                    B => self.program.add(Sampler.ShiftB { noise: n }),
+                }
+            },
+            Unary { op, input } => {
+                let s = try self.compile(input)
+                return self.program.add(Sampler.Unary { op: op, input: s })
+            },
+            Round { op, input, multiple } => {
+                let s = try self.compile(input)
+                let one = match self.nodes[multiple] {
+                    Constant(v) => v == 1.0f32,
+                    _ => false,
+                }
+                if one {
+                    return self.program.add(Sampler.RoundInteger { op: op, input: s })
+                }
+                let m = try self.compile(multiple)
+                return self.program.add(Sampler.Round { op: op, input: s, multiple: m })
+            },
+            Binary { op, left, right } => return try self.compile_binary(op, left, right),
+            Pow { base, exponent } => {
+                let b = try self.compile(base)
+                let e = try self.compile(exponent)
+                if let v = self.constant_of(base) {
+                    return self.program.add(Sampler.ConstBasePow { base: f64(v), exponent: e })
+                }
+                if let v = self.constant_of(exponent) {
+                    return self.const_exponent(b, v)
+                }
+                return self.program.add(Sampler.Pow { base: b, exponent: e })
+            },
+            Spline(s) => {
+                var coordinates = Map<usize, usize>()
+                var samplers = List<usize>()
+                let curve = try self.compile_curve(s, mut coordinates, mut samplers)
+                return self.program.add(Sampler.Spline { curve: curve, count: samplers.len() })
+            },
+            Lerp { alpha, first, second } => {
+                let a = try self.compile(alpha)
+                let x = try self.compile(first)
+                let y = try self.compile(second)
+                if let v = self.constant_of(first) {
+                    return self.program.add(Sampler.LerpConstFirst { alpha: a, first: v, second: y })
+                }
+                if let v = self.constant_of(second) {
+                    return self.program.add(Sampler.LerpConstSecond { alpha: a, first: x, second: v })
+                }
+                return self.program.add(Sampler.Lerp { alpha: a, first: x, second: y })
+            },
+            Clamp { input, min, max } => {
+                let s = try self.compile(input)
+                return self.program.add(Sampler.Clamp { input: s, low: min, high: max })
+            },
+            Choice { input, min, max, inside, outside } => {
+                let s = try self.compile(input)
+                if let a = self.constant_of(inside) {
+                    if let b = self.constant_of(outside) {
+                        return self.program.add(Sampler.ChoiceConst { input: s, low: min, high: max, inside: a, outside: b })
+                    }
+                }
+                let a = try self.compile(inside)
+                let b = try self.compile(outside)
+                return self.program.add(Sampler.Choice { input: s, low: min, high: max, inside: a, outside: b })
+            },
+            Select { input, thresholds, functions } => return try self.compile_select(input, thresholds, functions),
+            Cache(_) => fail Thrown { exception: "IllegalStateException", message: "Cannot compile cache before it has been deduplicated" },
+            Blend(input) => return try self.compile(input),
+            Interpolated { input, xz, ys } => {
+                let s = try self.compile(input)
+                return self.program.add(Sampler.Interpolated {
+                    input: s, xz: xz, ys: ys, xz_inv: 1.0f32 / f32.nearest(xz), y_inv: 1.0f32 / f32.nearest(ys),
+                })
+            },
+            Slice { axis, at, input } => return try self.compile_slice(axis, at, input),
+            FindTop { density, upper, lower, cell } => {
+                let a = try self.compile(density)
+                let b = try self.compile(upper)
+                let top = self.program.add(Sampler.FindTop { density: a, upper: b, lower: lower, cell: cell })
+                return self.program.add(Sampler.SliceY { input: top, at: 0 })
+            },
+            Blended { xz_scale, y_scale, xz_factor, y_factor, smear } => return try self.compile_blended(xz_scale, y_scale, xz_factor, y_factor, smear),
+            Prepared(p) => return self.prepared[p].sampler,
+        }
+    }
+
+    /// `BinaryFunction.compileSampler`: a constant side folds in, and `min` and `max` of ranges
+    /// that don't meet are the side that wins.
+    fn compile_binary(mut self, op: BinaryOp, left: usize, right: usize) -> usize ! Thrown {
+        let l = try self.compile(left)
+        let r = try self.compile(right)
+        let lc = self.constant_of(left)
+        let rc = self.constant_of(right)
+        match op {
+            Add => {
+                if let v = lc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Add, input: r, value: v })
+                }
+                if let v = rc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Add, input: l, value: v })
+                }
+                return self.program.add(Sampler.Add { left: l, right: r })
+            },
+            Sub => {
+                if let v = lc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Sub, input: r, value: v })
+                }
+                if let v = rc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Add, input: l, value: -v })
+                }
+                return self.program.add(Sampler.Sub { left: l, right: r })
+            },
+            Mul => {
+                if let v = lc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Mul, input: r, value: v })
+                }
+                if let v = rc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Mul, input: l, value: v })
+                }
+                return self.program.add(Sampler.Mul { left: l, right: r })
+            },
+            Div => {
+                if let v = lc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Div, input: r, value: v })
+                }
+                if let v = rc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Mul, input: l, value: 1.0f32 / v })
+                }
+                return self.program.add(Sampler.Div { left: l, right: r })
+            },
+            Min => {
+                let lr = try self.range(left)
+                let rr = try self.range(right)
+                if lr.max < rr.min {
+                    return l
+                }
+                if rr.max < lr.min {
+                    return r
+                }
+                if let v = lc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Min, input: r, value: v })
+                }
+                if let v = rc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Min, input: l, value: v })
+                }
+                return self.program.add(Sampler.Min { left: l, right: r, bound: rr.min })
+            },
+            Max => {
+                let lr = try self.range(left)
+                let rr = try self.range(right)
+                if lr.min > rr.max {
+                    return l
+                }
+                if rr.min > lr.max {
+                    return r
+                }
+                if let v = lc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Max, input: r, value: v })
+                }
+                if let v = rc {
+                    return self.program.add(Sampler.Const { op: ConstOp.Max, input: l, value: v })
+                }
+                return self.program.add(Sampler.Max { left: l, right: r, bound: rr.max })
+            },
+        }
+    }
+
+    /// `PowFunction.compileConstExponent`.
+    fn const_exponent(mut self, b: usize, e: f32) -> usize {
+        let a = e.abs()
+        var special = b
+        if a == 0.5f32 {
+            special = self.program.add(Sampler.Unary { op: UnaryOp.Sqrt, input: b })
+        } else if a == 2.0f32 {
+            special = self.program.add(Sampler.Unary { op: UnaryOp.Square, input: b })
+        } else if a == 3.0f32 {
+            special = self.program.add(Sampler.Unary { op: UnaryOp.Cube, input: b })
+        } else if a != 1.0f32 {
+            return self.program.add(Sampler.ConstExponentPow { base: b, exponent: f64(e) })
+        }
+        if e >= 0.0f32 {
+            return special
+        }
+        return self.program.add(Sampler.Unary { op: UnaryOp.Reciprocal, input: special })
+    }
+
+    /// `SplineFunction.Sampler`'s constructor: each distinct coordinate is compiled once, numbered
+    /// in the order `mapCoordinates` meets it, and its range worked out.
+    fn compile_curve(mut self, s: usize, coordinates: mut Map<usize, usize>, samplers: mut List<usize>) -> usize ! Thrown {
+        let shape = self.splines[s]
+        match shape {
+            Constant(v) => {
+                self.program.curves.push(Curve.Constant(v))
+                return self.program.curves.len() - 1
+            },
+            Points { coordinate, locations, derivatives, values } => {
+                var k = samplers.len()
+                if let known = coordinates.get(coordinate) {
+                    k = known
+                } else {
+                    let compiled = try self.compile(coordinate)
+                    _ = try self.range(coordinate)
+                    samplers.push(compiled)
+                    coordinates.insert(coordinate, k)
+                }
+                var curves = List<usize>()
+                for i in 0..self.lists[values].len() {
+                    let v = self.lists[values][i]
+                    curves.push(try self.compile_curve(v, mut coordinates, mut samplers))
+                }
+                let locs = self.floats[locations].copy()
+                self.program.floats.push(locs)
+                let l = self.program.floats.len() - 1
+                let ders = self.floats[derivatives].copy()
+                self.program.floats.push(ders)
+                let d = self.program.floats.len() - 1
+                self.program.lists.push(curves)
+                let vs = self.program.lists.len() - 1
+                self.program.curves.push(Curve.Points { coordinate: k, sampler: samplers[k], locations: l, derivatives: d, values: vs })
+                return self.program.curves.len() - 1
+            },
+        }
+    }
+
+    fn compile_select(mut self, input: usize, thresholds: usize, functions: usize) -> usize ! Thrown {
+        let s = try self.compile(input)
+        let n = self.lists[functions].len()
+        if self.floats[thresholds].len() == 1 {
+            let t = self.floats[thresholds][0]
+            let first = self.lists[functions][0]
+            let end = self.lists[functions][n - 1]
+            let below = try self.compile(first)
+            let above = try self.compile(end)
+            return self.program.add(Sampler.SelectOne { input: s, threshold: t, below: below, above: above })
+        }
+        var all = List<usize>()
+        for i in 0..n {
+            let g = self.lists[functions][i]
+            all.push(try self.compile(g))
+        }
+        let ts = self.floats[thresholds].copy()
+        self.program.floats.push(ts)
+        let t = self.program.floats.len() - 1
+        self.program.lists.push(all)
+        let fs = self.program.lists.len() - 1
+        return self.program.add(Sampler.Select { input: s, thresholds: t, functions: fs })
+    }
+
+    /// `SliceFunction.compileSampler`: a slice in X over one in Z, or in Z over one in X, is one
+    /// sampler.
+    fn compile_slice(mut self, axis: Axis, at: i32, input: usize) -> usize ! Thrown {
+        let inner = self.nodes[input]
+        match inner {
+            Slice { axis: inner_axis, at: inner_at, input: inner_input } => {
+                let x_over_z = is_x(axis) and is_z(inner_axis)
+                let z_over_x = is_z(axis) and is_x(inner_axis)
+                if x_over_z or z_over_x {
+                    let s = try self.compile(inner_input)
+                    let x = if x_over_z { at } else { inner_at }
+                    let z = if x_over_z { inner_at } else { at }
+                    return self.program.add(Sampler.SliceXz { input: s, x_at: x, z_at: z })
+                }
+            },
+            _ => {},
+        }
+        let s = try self.compile(input)
+        return match axis {
+            X => self.program.add(Sampler.SliceX { input: s, at: at }),
+            Y => self.program.add(Sampler.SliceY { input: s, at: at }),
+            Z => self.program.add(Sampler.SliceZ { input: s, at: at }),
+        }
+    }
+
+    /// `BlendedNoise.compileSampler`, from the context's random for `minecraft:terrain`.
+    fn compile_blended(mut self, xz_scale: f64, y_scale: f64, xz_factor: f64, y_factor: f64, smear: f64) -> usize ! Thrown {
+        var r = if self.legacy { AnyRandom.of(true, self.seed) } else { self.random.from_hash_of("minecraft:terrain") }
+        let limit_smear = 684.412 * y_scale * smear
+        let main_smear = limit_smear / y_factor
+        let min_noise = try fbm(mut r, -15, limit_smear, f64(0.99998474f32))
+        let max_noise = try fbm(mut r, -15, limit_smear, f64(0.99998474f32))
+        let main_noise = try fbm(mut r, -7, main_smear, 12.75)
+        let xz = 684.412 * xz_scale
+        let ys = 684.412 * y_scale
+        self.program.noises.push(Noise.Stack(min_noise))
+        let lo = self.program.noises.len() - 1
+        self.program.noises.push(Noise.Stack(max_noise))
+        let hi = self.program.noises.len() - 1
+        self.program.noises.push(Noise.Stack(main_noise))
+        let mid = self.program.noises.len() - 1
+        let lower = self.program.add(Sampler.Noise { noise: lo, xz: xz, ys: ys })
+        let upper = self.program.add(Sampler.Noise { noise: hi, xz: xz, ys: ys })
+        let main = self.program.add(Sampler.Noise { noise: mid, xz: xz / xz_factor, ys: ys / y_factor })
+        let shifted = self.program.add(Sampler.Const { op: ConstOp.Add, input: main, value: 0.5f32 })
+        let choice = self.program.add(Sampler.Clamp { input: shifted, low: 0.0f32, high: 1.0f32 })
+        return self.program.add(Sampler.Lerp { alpha: choice, first: lower, second: upper })
+    }
+
+    /// `CompileContext.createNoiseSampler`: the Nether's two biome noises made the legacy way
+    /// from the seed, an inline noise refused, and the rest made once each from the random
+    /// for their id.
+    fn noise_sampler(mut self, h: usize) -> usize ! Thrown {
+        if let n = self.noise_samplers.get(h) {
+            return n
+        }
+        let id = self.holders[h].id.copy()
+        if id == "minecraft:nether/temperature" or id == "minecraft:nether/vegetation" {
+            let offset: i64 = if id == "minecraft:nether/temperature" { 0 } else { 1 }
+            var r = LegacyRandom.new(self.seed + offset)
+            let stack = try self.holders[h].noise.legacy_nether(mut r)
+            self.program.noises.push(Noise.Stack(stack))
+        } else if self.holders[h].inline {
+            fail Thrown { exception: "NoSuchElementException", message: "No value present" }
+        } else {
+            var r = self.random.from_hash_of(id)
+            let stack = self.holders[h].noise.create(mut r)
+            self.program.noises.push(Noise.Stack(stack))
+        }
+        let n = self.program.noises.len() - 1
+        self.noise_samplers.insert(h, n)
+        return n
+    }
+}
+
+/// The vanilla data pack's file for `id` in the worldgen registry `kind`, read as JSON.
+pub fn data_json(zip: Zip, id: String, kind: String) -> Json ! String {
+    let colon = id.find(":") else fail "`{id}` isn't an identifier"
+    let path = "data/{id[..colon]}/worldgen/{kind}/{id[colon + 1..]}.json"
+    if zip.find(path) == none {
+        fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:worldgen/{kind}]: {id}"
+    }
+    let bytes = try zip.read_named(path)
+    let text = String.from_utf8(bytes) else fail "{path} isn't UTF-8"
+    let value = parse(text) else fail "{path} isn't JSON"
+    return value
+}
+
+/// `Identifier.parse`'s default namespace.
+pub fn qualified(name: String) -> String {
+    if name.contains(":") {
+        return name.copy()
+    }
+    return "minecraft:{name}"
+}
+
+/// The index of the last member named `key`: Gson keeps the last of repeated keys.
+fn last_index(members: List<Member>, key: String) -> usize? {
+    var at: usize? = none
+    for i in 0..members.len() {
+        if members[i].key == key {
+            at = some(i)
+        }
+    }
+    return at
+}
+
+/// A number's text, as `JsonOps` reads a number, a boolean being 1 or 0.
+fn number_text(members: List<Member>, key: String) -> String ! String {
+    let i = last_index(members, key) else fail "No key {key} in MapLike"
+    match members[i].value {
+        Json.Number(text) => return text.copy(),
+        Json.Bool(b) => return if b { String("1") } else { String("0") },
+        _ => {},
+    }
+    fail "Not a number: {members[i].value}"
+}
+
+/// `Codec.FLOAT`.
+fn float_of(members: List<Member>, key: String) -> f32 ! String {
+    let text = try number_text(members, key)
+    let v = f32.parse(text) else fail "Not a number: {text}"
+    return v
+}
+
+/// `NOISE_VALUE_CODEC`: a float from -1e6 to 1e6.
+fn noise_value(members: List<Member>, key: String) -> f32 ! String {
+    let text = try number_text(members, key)
+    return try noise_value_of(text)
+}
+
+fn noise_value_of(text: String) -> f32 ! String {
+    let v = f32.parse(text) else fail "Not a number: {text}"
+    if not (v >= -1000000.0f32 and v <= 1000000.0f32) {
+        fail "Value {v} outside of range [-1000000.0:1000000.0]"
+    }
+    return v
+}
+
+/// `Codec.DOUBLE`.
+fn double_of(members: List<Member>, key: String) -> f64 ! String {
+    let text = try number_text(members, key)
+    let v = f64.parse(text) else fail "Not a number: {text}"
+    return v
+}
+
+/// `Codec.doubleRange(min, max)`.
+fn scale_of(members: List<Member>, key: String, min: f64, max: f64) -> f64 ! String {
+    let v = try double_of(members, key)
+    if not (v >= min and v <= max) {
+        fail "Value {v} outside of range [{min}:{max}]"
+    }
+    return v
+}
+
+/// `Codec.INT`.
+fn int_of(members: List<Member>, key: String) -> i32 ! String {
+    let i = last_index(members, key) else fail "No key {key} in MapLike"
+    let v = as_i32(members[i].value) else fail "Not an int: {members[i].value}"
+    return v
+}
+
+/// `ExtraCodecs.POSITIVE_INT`.
+fn positive_of(members: List<Member>, key: String) -> i32 ! String {
+    let v = try int_of(members, key)
+    if v <= 0 {
+        fail "Value must be positive: {v}"
+    }
+    return v
+}
+
+fn ints_of(members: List<Member>, key: String) -> List<i32> ! String {
+    let i = last_index(members, key) else fail "No key {key} in MapLike"
+    var out = List<i32>()
+    match members[i].value {
+        Json.Array(items) => {
+            for k in 0..items.len() {
+                let v = as_i32(items[k]) else fail "Not an int: {items[k]}"
+                out.push(v)
+            }
+        },
+        _ => fail "Not a list: {members[i].value}",
+    }
+    return out
+}
+
+fn string_of(members: List<Member>, key: String) -> String ! String {
+    let i = last_index(members, key) else fail "No key {key} in MapLike"
+    let s = as_string(members[i].value) else fail "Not a string: {members[i].value}"
+    return s
+}
+
+fn axis_named(name: String) -> Axis ! String {
+    if name == "x" {
+        return Axis.X
+    }
+    if name == "y" {
+        return Axis.Y
+    }
+    if name == "z" {
+        return Axis.Z
+    }
+    fail "Unknown axis {name}"
+}
+
+fn tiling_named(name: String) -> Tiling ! String {
+    if name == "clamp_to_edge" {
+        return Tiling.Clamp
+    }
+    if name == "repeat" {
+        return Tiling.Repeat
+    }
+    if name == "mirrored_repeat" {
+        return Tiling.Mirrored
+    }
+    fail "Unknown tiling mode {name}"
+}
+
+fn metric_named(name: String) -> Metric ! String {
+    if name == "euclidean" {
+        return Metric.Euclidean
+    }
+    if name == "euclidean_squared" {
+        return Metric.Squared
+    }
+    if name == "manhattan" {
+        return Metric.Manhattan
+    }
+    if name == "chebyshev" {
+        return Metric.Chebyshev
+    }
+    fail "Unknown distance metric {name}"
+}
+
+fn unary_named(name: String) -> UnaryOp? {
+    if name == "abs" {
+        return some(UnaryOp.Abs)
+    }
+    if name == "square" {
+        return some(UnaryOp.Square)
+    }
+    if name == "cube" {
+        return some(UnaryOp.Cube)
+    }
+    if name == "sqrt" {
+        return some(UnaryOp.Sqrt)
+    }
+    if name == "half_negative" {
+        return some(UnaryOp.HalfNegative)
+    }
+    if name == "quarter_negative" {
+        return some(UnaryOp.QuarterNegative)
+    }
+    if name == "reciprocal" {
+        return some(UnaryOp.Reciprocal)
+    }
+    if name == "negate" {
+        return some(UnaryOp.Negate)
+    }
+    if name == "squeeze" {
+        return some(UnaryOp.Squeeze)
+    }
+    if name == "log" {
+        return some(UnaryOp.Log)
+    }
+    if name == "sign" {
+        return some(UnaryOp.Sign)
+    }
+    return none
+}
+
+fn round_named(name: String) -> RoundOp? {
+    if name == "floor" {
+        return some(RoundOp.Floor)
+    }
+    if name == "round" {
+        return some(RoundOp.Round)
+    }
+    if name == "ceil" {
+        return some(RoundOp.Ceil)
+    }
+    if name == "truncate" {
+        return some(RoundOp.Truncate)
+    }
+    return none
+}
+
+fn binary_named(name: String) -> BinaryOp? {
+    if name == "add" {
+        return some(BinaryOp.Add)
+    }
+    if name == "sub" {
+        return some(BinaryOp.Sub)
+    }
+    if name == "mul" {
+        return some(BinaryOp.Mul)
+    }
+    if name == "div" {
+        return some(BinaryOp.Div)
+    }
+    if name == "min" {
+        return some(BinaryOp.Min)
+    }
+    if name == "max" {
+        return some(BinaryOp.Max)
+    }
+    return none
+}
+
+/// `UnaryFunction.range()` over the input's range.
+fn unary_range(op: UnaryOp, r: Interval) -> Interval ! Thrown {
+    match op {
+        Abs => return try r.abs(),
+        Square => return try r.square(),
+        Sqrt => {
+            let half = try Interval.exact(0.5f32)
+            return try r.pow(half)
+        },
+        Reciprocal => return try r.reciprocal(),
+        Negate => {
+            let z0 = try Interval.exact(0.0f32)
+            return try z0.sub(r)
+        },
+        Log => return try r.log(),
+        Sign => return try r.sign(),
+        _ => {},
+    }
+    if r.is_nai() {
+        return r
+    }
+    return try Interval.mapped(unary(op, r.min), unary(op, r.max))
+}
+
+/// `CubicSpline.Multipoint.linearExtend`.
+fn extend_edge(input: f32, location: f32, value: f32, derivative: f32) -> f32 {
+    if derivative == 0.0f32 {
+        return value
+    }
+    return value + derivative * (input - location)
+}
+
+fn axis_bit(axis: Axis) -> i32 {
+    return match axis {
+        X => 1,
+        Y => 2,
+        Z => 4,
+    }
+}
+
+fn is_x(axis: Axis) -> bool {
+    return match axis {
+        X => true,
+        _ => false,
+    }
+}
+
+fn is_z(axis: Axis) -> bool {
+    return match axis {
+        Z => true,
+        _ => false,
+    }
+}
+
+/// A float as `Float.compare` tells floats apart.
+fn float_key(v: f32) -> u64 {
+    if v.is_nan() {
+        return 0x7fc00000
+    }
+    return u64(v.to_bits())
+}
+
+fn double_key(v: f64) -> u64 {
+    if v.is_nan() {
+        return 0x7ff8000000000000
+    }
+    return v.to_bits()
+}
+
+fn int_key(v: i32) -> u64 {
+    return u64.wrap(v)
+}
+
+fn axis_code(axis: Axis) -> u64 {
+    return u64.wrap(axis_bit(axis))
+}
+
+fn tiling_code(t: Tiling) -> u64 {
+    return match t {
+        Clamp => 0,
+        Repeat => 1,
+        Mirrored => 2,
+    }
+}
+
+fn metric_code(m: Metric) -> u64 {
+    return match m {
+        Euclidean => 0,
+        Squared => 1,
+        Manhattan => 2,
+        Chebyshev => 3,
+    }
+}
+
+fn marker_code(m: Marker) -> u64 {
+    return match m {
+        BlendAlpha => 0,
+        BlendOffset => 1,
+        Beardifier => 2,
+    }
+}
+
+fn shift_code(k: ShiftKind) -> u64 {
+    return match k {
+        A => 0,
+        B => 1,
+        Xyz => 2,
+    }
+}
+
+fn unary_code(op: UnaryOp) -> u64 {
+    return match op {
+        Abs => 0,
+        Square => 1,
+        Cube => 2,
+        Sqrt => 3,
+        HalfNegative => 4,
+        QuarterNegative => 5,
+        Reciprocal => 6,
+        Negate => 7,
+        Squeeze => 8,
+        Log => 9,
+        Sign => 10,
+    }
+}
+
+fn round_code(op: RoundOp) -> u64 {
+    return match op {
+        Floor => 0,
+        Round => 1,
+        Ceil => 2,
+        Truncate => 3,
+    }
+}
+
+fn binary_code(op: BinaryOp) -> u64 {
+    return match op {
+        Add => 0,
+        Sub => 1,
+        Mul => 2,
+        Div => 3,
+        Min => 4,
+        Max => 5,
+    }
+}

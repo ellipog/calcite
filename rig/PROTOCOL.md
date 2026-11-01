@@ -642,6 +642,18 @@ Every NaN is written as `0x7fc00000`, `Float.floatToIntBits`'s NaN, whatever its
 
 If making the noise throws, the result is the rejection, as `rng`'s is, and no blob. Parameters the codec doesn't read, a noise or `fn` it doesn't have, a field missing or of the wrong type, a blob it doesn't take or of the wrong length, and a volume too big or not positive are an `error` status.
 
+### `density` (v1)
+
+Density functions, read as a data pack writes them, compiled by a `RandomState` and sampled at points or over volumes, every op through one `SamplerContext`. The registries are vanilla's own, from the pinned server jar, so a function or noise named by ID is vanilla's.
+
+Input `{"seed": s, "functions": [...], "cached": b, "ops": [...]}`, with `"settings": id` or `"legacy_random": b`, and one blob. `s` is a `long` as a decimal string. With `settings`, the `RandomState` is `RandomState.create(noises, seed, settings)` of those noise settings, and their `useLegacyRandomSource` picks the random; without, it's `RandomState.create(noises, seed, legacy_random, stone, 63, router)` with a router of zeros. Each function is `{"function": f}`, `f` read by `DensityFunction.CODEC` with the registries' ops, so an ID, a number or an object; or `{"router": field}`, the settings' router's `temperature`, `vegetation`, `continents`, `erosion`, `depth`, `ridges`, `chunk_surface_level` or `final_density`. The context is `SamplerContext.builder().enableCaches().build()` if `cached`, else `SamplerContext.EMPTY_UNCACHED`.
+
+Each op is `{"fn": i, "points": n}`, `n` points from the blob, an `int` triple each, with `sampleValue` of function `i`'s sampler; or `{"fn": i, "volume": [sx, sy, sz, x, y, z, stepx, stepy, stepz]}`, `sampleVolume` into a `DensityBuffer` of zeros over `new DensityVolume(...)` of those `int`s, at most 65,536 values. The ops give at most 2^20 values in all, and the blob holds each `points` op's triples in order.
+
+First each function's `range()` and `domainAxes()` are worked out, in order, then each one's sampler with `getSampler`, then the ops in order. The output is `{"functions": [{"range": r, "axes": a}, ...]}`: `r` the range's `min` and `max` as `%08x` of their `Float.floatToIntBits`, or `null` if it's `NaI`, and `a` the axes, X 1, Y 2 and Z 4. The blob is every value the ops give, in order, as `f32` bits, a volume's `y` fastest, then `x`, then `z`. Every NaN is `0x7fc00000` (D198).
+
+If any of that throws, the result is the rejection, as `rng`'s is, and no blob. A function the codec doesn't read, an op that isn't one of those, a router field without `settings` or that the router doesn't have, `legacy_random` with `settings`, too many values and a blob of the wrong length are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

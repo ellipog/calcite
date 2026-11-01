@@ -82,11 +82,15 @@ def _generate(spec):
                 u = (next(rand) >> 11) * 2.0**-53
                 out += struct.pack(fmt, lo + (hi - lo) * u)
     elif gen == "i32_range":
-        lo, hi = int(spec["min"]), int(spec["max"])
-        if not (-(1 << 31) <= lo <= hi < (1 << 31)):
-            raise CaseFileError(f"generator {spec!r}: bad i32 range")
+        # As with the float ranges, `ranges` makes tuples, one value from each range in turn.
+        ranges = spec.get("ranges") or [[spec["min"], spec["max"]]]
+        bounds = [(int(lo), int(hi)) for lo, hi in ranges]
+        for lo, hi in bounds:
+            if not (-(1 << 31) <= lo <= hi < (1 << 31)):
+                raise CaseFileError(f"generator {spec!r}: bad i32 range")
         for _ in range(count):
-            out += struct.pack(">i", lo + next(rand) % (hi - lo + 1))
+            for lo, hi in bounds:
+                out += struct.pack(">i", lo + next(rand) % (hi - lo + 1))
     else:
         raise CaseFileError(f"unknown generator `{gen}`")
     return bytes(out)

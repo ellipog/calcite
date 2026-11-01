@@ -1,0 +1,1207 @@
+/// Vanilla's density samplers: what a `RandomState` compiles density functions into
+/// (worldgen.density), kept as a program of samplers that refer to each other by index, and
+/// sampled at a block or over a volume, through a context that holds the caches. Each sampler
+/// works in `float` with vanilla's operations in vanilla's order, takes the buffers vanilla takes
+/// and fills them as vanilla does, so a value is the same bits vanilla gives, and where vanilla
+/// throws, sampling fails with the same exception and message.
+module worldgen.sampler
+
+import worldgen.interval.{Thrown, java_log, java_pow, signum}
+import worldgen.noise.{Noise, Volume}
+
+/// An axis, as `Direction.Axis`.
+pub enum Axis {
+    X
+    Y
+    Z
+}
+
+/// A gradient's `TilingMode`.
+pub enum Tiling {
+    Clamp
+    Repeat
+    Mirrored
+}
+
+/// `DistanceMetric`.
+pub enum Metric {
+    Euclidean
+    Squared
+    Manhattan
+    Chebyshev
+}
+
+/// `UnaryFunction.Type`.
+pub enum UnaryOp {
+    Abs
+    Square
+    Cube
+    Sqrt
+    HalfNegative
+    QuarterNegative
+    Reciprocal
+    Negate
+    Squeeze
+    Log
+    Sign
+}
+
+/// `RoundFunction.Type`.
+pub enum RoundOp {
+    Floor
+    Round
+    Ceil
+    Truncate
+}
+
+/// The samplers of `BinaryFunction` with a constant side: `Sub` is the constant minus the input
+/// and `Div` the constant over it.
+pub enum ConstOp {
+    Add
+    Sub
+    Mul
+    Div
+    Min
+    Max
+}
+
+/// One of vanilla's samplers. Fields that are samplers are indices into `Program.samplers`.
+pub enum Sampler {
+    Constant(f32)
+    /// `NoiseFunction.Sampler`: noise `noise` at the block times the scales.
+    Noise { noise: usize, xz: f64, ys: f64 }
+    /// `NoiseFunction.ShiftedXzSampler`.
+    ShiftedXz { sx: usize, sz: usize, noise: usize, xz: f64, ys: f64 }
+    /// `NoiseFunction.ShiftedXyzSampler`.
+    ShiftedXyz { sx: usize, sy: usize, sz: usize, noise: usize, xz: f64, ys: f64 }
+    /// `ShiftNoiseFunction.ShiftB`'s sampler.
+    ShiftB { noise: usize }
+    /// `EndIslandFunction.Sampler`, over a simplex noise.
+    EndIslands { noise: usize }
+    /// `DistanceToPointFunction.Sampler`.
+    Distance { px: i32, py: i32, pz: i32, metric: Metric }
+    /// A `GradientFunction` sampler: `low` and `high` are the clamped one's bounds and `span` the
+    /// repeating ones' `coordinateRange`.
+    Gradient { axis: Axis, tiling: Tiling, from: i32, low: i32, high: i32, span: i32, from_value: f32, factor: f32 }
+    Unary { op: UnaryOp, input: usize }
+    Add { left: usize, right: usize }
+    Sub { left: usize, right: usize }
+    Mul { left: usize, right: usize }
+    Div { left: usize, right: usize }
+    /// `MinSampler`, which skips the right side where the left is at most its least value.
+    Min { left: usize, right: usize, bound: f32 }
+    /// `MaxSampler`, which skips the right side where the left is at least its greatest value.
+    Max { left: usize, right: usize, bound: f32 }
+    Const { op: ConstOp, input: usize, value: f32 }
+    ConstBasePow { base: f64, exponent: usize }
+    ConstExponentPow { base: usize, exponent: f64 }
+    Pow { base: usize, exponent: usize }
+    /// `RoundFunction.IntegerMultipleSampler`: rounded to a whole number.
+    RoundInteger { op: RoundOp, input: usize }
+    Round { op: RoundOp, input: usize, multiple: usize }
+    Lerp { alpha: usize, first: usize, second: usize }
+    LerpConstFirst { alpha: usize, first: f32, second: usize }
+    LerpConstSecond { alpha: usize, first: usize, second: f32 }
+    Clamp { input: usize, low: f32, high: f32 }
+    /// `RangeChoiceFunction.ConstSampler`: `inside` where `low <= input < high`, else `outside`.
+    ChoiceConst { input: usize, low: f32, high: f32, inside: f32, outside: f32 }
+    Choice { input: usize, low: f32, high: f32, inside: usize, outside: usize }
+    /// `IntervalSelectFunction.SingleThresholdSampler`.
+    SelectOne { input: usize, threshold: f32, below: usize, above: usize }
+    /// `IntervalSelectFunction.Sampler`: `thresholds` indexes `Program.floats` and `functions`
+    /// `Program.lists`.
+    Select { input: usize, thresholds: usize, functions: usize }
+    /// `SplineFunction.Sampler`: curve `curve`, over `count` coordinates.
+    Spline { curve: usize, count: usize }
+    /// `CachingDensitySampler`, cache `id` of the context.
+    Caching { id: usize, input: usize }
+    Interpolated { input: usize, xz: i32, ys: i32, xz_inv: f32, y_inv: f32 }
+    SliceX { input: usize, at: i32 }
+    SliceY { input: usize, at: i32 }
+    SliceZ { input: usize, at: i32 }
+    /// `SliceFunction.XzSampler`: slices in X and Z at once.
+    SliceXz { input: usize, x_at: i32, z_at: i32 }
+    /// `FindTopSurfaceFunction`'s sampler, under a slice at Y 0.
+    FindTop { density: usize, upper: usize, lower: i32, cell: i32 }
+}
+
+/// A cubic spline as a spline sampler holds it, `CubicSpline` with its coordinates compiled.
+pub enum Curve {
+    Constant(f32)
+    /// `coordinate` is the coordinate's index in its spline sampler and `sampler` its sampler.
+    /// `locations` and `derivatives` index `Program.floats`, and `values`, which are curves,
+    /// `Program.lists`.
+    Points { coordinate: usize, sampler: usize, locations: usize, derivatives: usize, values: usize }
+}
+
+/// Compiled samplers, the noises they sample and the lists they hold.
+pub struct Program {
+    pub samplers: List<Sampler>
+    pub noises: List<Noise>
+    pub curves: List<Curve>
+    pub floats: List<List<f32>>
+    pub lists: List<List<usize>>
+}
+
+impl Program {
+    pub fn new() -> Program {
+        return Program { samplers: [], noises: [], curves: [], floats: [], lists: [] }
+    }
+
+    pub fn add(mut self, s: Sampler) -> usize {
+        self.samplers.push(s)
+        return self.samplers.len() - 1
+    }
+}
+
+/// `SamplerContext.CacheCell`: the volume last sampled and its values, and the block last
+/// sampled and its value.
+struct Cell {
+    filled: bool
+    volume: Volume
+    buffer: List<f32>
+    key: i64
+    value: f32
+}
+
+/// `SamplerContext`: with caches, as `enableCaches` makes one, or without, as `EMPTY_UNCACHED`.
+pub struct Context {
+    cached: bool
+    cells: List<Cell>
+}
+
+impl Context {
+    pub fn new(cached: bool) -> Context {
+        return Context { cached: cached, cells: [] }
+    }
+
+    fn cell(mut self, id: usize) {
+        while self.cells.len() <= id {
+            self.cells.push(Cell {
+                filled: false,
+                volume: Volume { size_x: 0, size_y: 0, size_z: 0, min_x: 0, min_y: 0, min_z: 0 },
+                buffer: [],
+                key: 0,
+                value: f32.NAN,
+            })
+        }
+    }
+}
+
+fn illegal_argument(message: own String) -> Thrown {
+    return Thrown { exception: "IllegalArgumentException", message: message }
+}
+
+/// `new DensityVolume(...)`, with its checks.
+pub fn volume(sx: i32, sy: i32, sz: i32, mx: i32, my: i32, mz: i32, tx: i32, ty: i32, tz: i32) -> Volume ! Thrown {
+    if sx <= 0 or sy <= 0 or sz <= 0 {
+        fail illegal_argument("Size must be positive, was: {sx}x{sy}x{sz}")
+    }
+    if not (tx > 0 and ty > 0 and tz > 0) {
+        fail illegal_argument("Step must be positive, was: {tx}; {ty}; {tz}")
+    }
+    return Volume { size_x: sx, size_y: sy, size_z: sz, min_x: mx, min_y: my, min_z: mz, step_x: tx, step_y: ty, step_z: tz }
+}
+
+/// A buffer as `DensityBufferArena.GLOBAL` gives one: `new float[size]`, all zeros.
+pub fn zeros(size: i32) -> List<f32> ! Thrown {
+    if size < 0 {
+        fail Thrown { exception: "NegativeArraySizeException", message: "{size}" }
+    }
+    return [0.0f32; usize.wrap(size)]
+}
+
+fn at(i: i32) -> usize {
+    return usize.wrap(i)
+}
+
+/// `Arrays.fill(values, from, from + count, value)`.
+fn set_range(out: mut List<f32>, from: i32, count: i32, value: f32) {
+    var i = from
+    let end = from + count
+    while i < end {
+        out[at(i)] = value
+        i += 1
+    }
+}
+
+/// `Mth.lerp`.
+fn lerp(alpha: f32, first: f32, second: f32) -> f32 {
+    return first + alpha * (second - first)
+}
+
+/// `Mth.clamp(float, float, float)`.
+fn clamp(v: f32, low: f32, high: f32) -> f32 {
+    return if v < low { low } else { v.min(high) }
+}
+
+/// `BlockPos.asLong`.
+fn block_key(x: i32, y: i32, z: i32) -> i64 {
+    return ((i64(x) & 0x3FFFFFF) << 38) | ((i64(z) & 0x3FFFFFF) << 12) | (i64(y) & 0xFFF)
+}
+
+/// A unary function's value, as its sampler gives it.
+pub fn unary(op: UnaryOp, x: f32) -> f32 {
+    return match op {
+        Abs => x.abs(),
+        Square => x * x,
+        Cube => x * x * x,
+        Sqrt => f32.nearest(f64(x).sqrt()),
+        HalfNegative => if x > 0.0f32 { x } else { x * 0.5f32 },
+        QuarterNegative => if x > 0.0f32 { x } else { x * 0.25f32 },
+        Reciprocal => 1.0f32 / x,
+        Negate => -x,
+        Squeeze => {
+            let c = clamp(x, -1.0f32, 1.0f32)
+            c / 2.0f32 - c * c * c / 24.0f32
+        },
+        Log => java_log(x),
+        Sign => signum(x),
+    }
+}
+
+/// `RoundFunction.Type.roundToInteger`.
+pub fn round_to_integer(op: RoundOp, x: f32) -> f32 {
+    return match op {
+        Floor => x.floor(),
+        Round => f32.nearest(i32.round(x)),
+        Ceil => x.ceil(),
+        Truncate => if x > 0.0f32 { x.floor() } else { x.ceil() },
+    }
+}
+
+fn round_multiple(op: RoundOp, x: f32, multiple: f32) -> f32 {
+    if multiple == 0.0f32 {
+        return x
+    }
+    return round_to_integer(op, x / multiple) * multiple
+}
+
+fn metric(m: Metric, dx: f32, dy: f32, dz: f32) -> f32 {
+    return match m {
+        Euclidean => f32.nearest(f64(dx * dx + dy * dy + dz * dz).sqrt()),
+        Squared => dx * dx + dy * dy + dz * dz,
+        Manhattan => dx.abs() + dy.abs() + dz.abs(),
+        Chebyshev => dx.abs().max(dy.abs()).max(dz.abs()),
+    }
+}
+
+fn divide_by_zero() -> Thrown {
+    return Thrown { exception: "ArithmeticException", message: "/ by zero" }
+}
+
+fn gradient(tiling: Tiling, c: i32, from: i32, low: i32, high: i32, span: i32, from_value: f32, factor: f32) -> f32 ! Thrown {
+    match tiling {
+        Clamp => {
+            let rel = (if c < low { low } else { c.min(high) }) - from
+            return from_value + f32.nearest(rel) * factor
+        },
+        Repeat => {
+            if span == 0 {
+                fail divide_by_zero()
+            }
+            return from_value + f32.nearest((c - from).floor_mod(span)) * factor
+        },
+        Mirrored => {
+            if span == 0 {
+                fail divide_by_zero()
+            }
+            let rel = c - from
+            let tile = rel.floor_div(span)
+            let local = rel - tile * span
+            if (tile & 1) == 0 {
+                return from_value + f32.nearest(local) * factor
+            }
+            return from_value + f32.nearest(span - local) * factor
+        },
+    }
+}
+
+/// `EndIslandFunction.getHeightValue`.
+fn island_height(noise: Noise, section_x: i32, section_z: i32) -> f32 {
+    let chunk_x = section_x / 2
+    let chunk_z = section_z / 2
+    let sub_x = section_x % 2
+    let sub_z = section_z % 2
+    var doffs = -100.0f32
+    for xo in -12..13 {
+        for zo in -12..13 {
+            let tx = i64(chunk_x + xo)
+            let tz = i64(chunk_z + zo)
+            if tx * tx + tz * tz > 4096 and noise.get2(f64.nearest(tx), f64.nearest(tz)) < -0.9f32 {
+                let size = (f32.nearest(tx).abs() * 3439.0f32 + f32.nearest(tz).abs() * 147.0f32) % 13.0f32 + 9.0f32
+                let xd = f32.nearest(sub_x - xo * 2)
+                let zd = f32.nearest(sub_z - zo * 2)
+                let nd = clamp(100.0f32 - f32.nearest(f64(xd * xd + zd * zd).sqrt()) * size, -100.0f32, 80.0f32)
+                doffs = doffs.max(nd)
+            }
+        }
+    }
+    return doffs
+}
+
+fn island_value(noise: Noise, x: i32, z: i32) -> f32 {
+    return (island_height(noise, x / 8, z / 8) - 8.0f32) / 128.0f32
+}
+
+/// What a spline's coordinates are sampled from: a block, each coordinate sampled once
+/// (`PointSplineInput`), or a volume, each coordinate's buffer filled the first time it's
+/// needed (`BufferSplineInput`).
+struct SplineInput {
+    point: bool
+    x: i32
+    y: i32
+    z: i32
+    values: List<f32>
+    filled: List<bool>
+    buffers: List<List<f32>>
+    volume: Volume
+    index: usize
+}
+
+fn coordinate(p: Program, ctx: mut Context, input: mut SplineInput, sampler: usize, k: usize) -> f32 ! Thrown {
+    if input.point {
+        let cached = input.values[k]
+        if not cached.is_nan() {
+            return cached
+        }
+        let v = try sample(p, mut ctx, sampler, input.x, input.y, input.z)
+        input.values[k] = v
+        return v
+    }
+    if not input.filled[k] {
+        var buffer = try zeros(input.volume.size())
+        try fill(p, mut ctx, sampler, mut buffer, input.volume)
+        input.buffers[k] = buffer
+        input.filled[k] = true
+    }
+    return input.buffers[k][input.index]
+}
+
+/// `Mth.binarySearch(0, n, i -> x < locations[i])`: the first location above `x`.
+fn search(locations: List<f32>, x: f32) -> i32 {
+    var from: i32 = 0
+    var len = i32.wrap(locations.len())
+    while len > 0 {
+        let half = len / 2
+        let mid = from + half
+        if x < locations[at(mid)] {
+            len = half
+        } else {
+            from = mid + 1
+            len -= half + 1
+        }
+    }
+    return from
+}
+
+fn extend(x: f32, location: f32, value: f32, derivative: f32) -> f32 {
+    return if derivative == 0.0f32 { value } else { value + derivative * (x - location) }
+}
+
+/// `CubicSpline.Multipoint.sample`.
+fn curve(p: Program, ctx: mut Context, input: mut SplineInput, c: usize) -> f32 ! Thrown {
+    match p.curves[c] {
+        Constant(v) => return v,
+        Points { coordinate: k, sampler, locations, derivatives, values } => {
+            let x = try coordinate(p, mut ctx, mut input, sampler, k)
+            return try points(p, mut ctx, mut input, x, p.floats[locations], p.floats[derivatives], p.lists[values])
+        },
+    }
+}
+
+fn points(p: Program, ctx: mut Context, input: mut SplineInput, x: f32, locs: List<f32>, ds: List<f32>, vs: List<usize>) -> f32 ! Thrown {
+    let start = search(locs, x) - 1
+    let last = locs.len() - 1
+    if start < 0 {
+        let y = try curve(p, mut ctx, mut input, vs[0])
+        return extend(x, locs[0], y, ds[0])
+    }
+    let s = at(start)
+    if s == last {
+        let y = try curve(p, mut ctx, mut input, vs[last])
+        return extend(x, locs[last], y, ds[last])
+    }
+    let x1 = locs[s]
+    let x2 = locs[s + 1]
+    let t = (x - x1) / (x2 - x1)
+    let d1 = ds[s]
+    let d2 = ds[s + 1]
+    let y1 = try curve(p, mut ctx, mut input, vs[s])
+    let y2 = try curve(p, mut ctx, mut input, vs[s + 1])
+    let a = d1 * (x2 - x1) - (y2 - y1)
+    let b = -d2 * (x2 - x1) + (y2 - y1)
+    return lerp(t, y1, y2) + t * (1.0f32 - t) * lerp(t, a, b)
+}
+
+/// The first of `functions` whose threshold is above `x`, or the last if none is.
+fn select(x: f32, thresholds: List<f32>, functions: List<usize>) -> usize {
+    for i in 0..thresholds.len() {
+        if x < thresholds[i] {
+            return functions[i]
+        }
+    }
+    return functions[functions.len() - 1]
+}
+
+/// `sampleValue`: sampler `s` at the block.
+pub fn sample(p: Program, ctx: mut Context, s: usize, bx: i32, by: i32, bz: i32) -> f32 ! Thrown {
+    match p.samplers[s] {
+        Constant(v) => return v,
+        Noise { noise, xz, ys } => return p.noises[noise].get(f64(bx) * xz, f64(by) * ys, f64(bz) * xz),
+        ShiftedXz { sx, sz, noise, xz, ys } => {
+            let x = f64(bx) * xz + f64(try sample(p, mut ctx, sx, bx, by, bz))
+            let y = f64(by) * ys
+            let z = f64(bz) * xz + f64(try sample(p, mut ctx, sz, bx, by, bz))
+            return p.noises[noise].get(x, y, z)
+        },
+        ShiftedXyz { sx, sy, sz, noise, xz, ys } => {
+            let x = f64(bx) * xz + f64(try sample(p, mut ctx, sx, bx, by, bz))
+            let y = f64(by) * ys + f64(try sample(p, mut ctx, sy, bx, by, bz))
+            let z = f64(bz) * xz + f64(try sample(p, mut ctx, sz, bx, by, bz))
+            return p.noises[noise].get(x, y, z)
+        },
+        ShiftB { noise } => return p.noises[noise].get(f64(bz) * 0.25, f64(bx) * 0.25, 0.0) * 4.0f32,
+        EndIslands { noise } => return island_value(p.noises[noise], bx, bz),
+        Distance { px, py, pz, metric: m } => return metric(m, f32.nearest(px - bx), f32.nearest(py - by), f32.nearest(pz - bz)),
+        Gradient { axis, tiling, from, low, high, span, from_value, factor } => {
+            let c = match axis {
+                X => bx,
+                Y => by,
+                Z => bz,
+            }
+            return try gradient(tiling, c, from, low, high, span, from_value, factor)
+        },
+        Unary { op, input } => return unary(op, try sample(p, mut ctx, input, bx, by, bz)),
+        Add { left, right } => {
+            let l = try sample(p, mut ctx, left, bx, by, bz)
+            return l + try sample(p, mut ctx, right, bx, by, bz)
+        },
+        Sub { left, right } => {
+            let l = try sample(p, mut ctx, left, bx, by, bz)
+            return l - try sample(p, mut ctx, right, bx, by, bz)
+        },
+        Mul { left, right } => {
+            let l = try sample(p, mut ctx, left, bx, by, bz)
+            if l == 0.0f32 {
+                return 0.0f32
+            }
+            return l * try sample(p, mut ctx, right, bx, by, bz)
+        },
+        Div { left, right } => {
+            let l = try sample(p, mut ctx, left, bx, by, bz)
+            if l == 0.0f32 {
+                return 0.0f32
+            }
+            return l / try sample(p, mut ctx, right, bx, by, bz)
+        },
+        Min { left, right, bound } => {
+            let l = try sample(p, mut ctx, left, bx, by, bz)
+            if l <= bound {
+                return l
+            }
+            return l.min(try sample(p, mut ctx, right, bx, by, bz))
+        },
+        Max { left, right, bound } => {
+            let l = try sample(p, mut ctx, left, bx, by, bz)
+            if l >= bound {
+                return l
+            }
+            return l.max(try sample(p, mut ctx, right, bx, by, bz))
+        },
+        Const { op, input, value: c } => {
+            let v = try sample(p, mut ctx, input, bx, by, bz)
+            return match op {
+                Add => v + c,
+                Sub => c - v,
+                Mul => v * c,
+                Div => c / v,
+                Min => v.min(c),
+                Max => v.max(c),
+            }
+        },
+        ConstBasePow { base, exponent } => return java_pow(base, f64(try sample(p, mut ctx, exponent, bx, by, bz))),
+        ConstExponentPow { base, exponent } => return java_pow(f64(try sample(p, mut ctx, base, bx, by, bz)), exponent),
+        Pow { base, exponent } => {
+            let b = try sample(p, mut ctx, base, bx, by, bz)
+            return java_pow(f64(b), f64(try sample(p, mut ctx, exponent, bx, by, bz)))
+        },
+        RoundInteger { op, input } => return round_to_integer(op, try sample(p, mut ctx, input, bx, by, bz)),
+        Round { op, input, multiple } => {
+            let v = try sample(p, mut ctx, input, bx, by, bz)
+            return round_multiple(op, v, try sample(p, mut ctx, multiple, bx, by, bz))
+        },
+        Lerp { alpha, first, second } => {
+            let a = try sample(p, mut ctx, alpha, bx, by, bz)
+            if a == 0.0f32 {
+                return try sample(p, mut ctx, first, bx, by, bz)
+            }
+            if a == 1.0f32 {
+                return try sample(p, mut ctx, second, bx, by, bz)
+            }
+            let f = try sample(p, mut ctx, first, bx, by, bz)
+            return lerp(a, f, try sample(p, mut ctx, second, bx, by, bz))
+        },
+        LerpConstFirst { alpha, first, second } => {
+            let a = try sample(p, mut ctx, alpha, bx, by, bz)
+            if a == 0.0f32 {
+                return first
+            }
+            if a == 1.0f32 {
+                return try sample(p, mut ctx, second, bx, by, bz)
+            }
+            return lerp(a, first, try sample(p, mut ctx, second, bx, by, bz))
+        },
+        LerpConstSecond { alpha, first, second } => {
+            let a = try sample(p, mut ctx, alpha, bx, by, bz)
+            if a == 0.0f32 {
+                return try sample(p, mut ctx, first, bx, by, bz)
+            }
+            if a == 1.0f32 {
+                return second
+            }
+            return lerp(a, try sample(p, mut ctx, first, bx, by, bz), second)
+        },
+        Clamp { input, low, high } => return clamp(try sample(p, mut ctx, input, bx, by, bz), low, high),
+        ChoiceConst { input, low, high, inside, outside } => {
+            let v = try sample(p, mut ctx, input, bx, by, bz)
+            return if v >= low and v < high { inside } else { outside }
+        },
+        Choice { input, low, high, inside, outside } => {
+            let v = try sample(p, mut ctx, input, bx, by, bz)
+            if v >= low and v < high {
+                return try sample(p, mut ctx, inside, bx, by, bz)
+            }
+            return try sample(p, mut ctx, outside, bx, by, bz)
+        },
+        SelectOne { input, threshold, below, above } => {
+            let v = try sample(p, mut ctx, input, bx, by, bz)
+            if v < threshold {
+                return try sample(p, mut ctx, below, bx, by, bz)
+            }
+            return try sample(p, mut ctx, above, bx, by, bz)
+        },
+        Select { input, thresholds, functions } => {
+            let v = try sample(p, mut ctx, input, bx, by, bz)
+            return try sample(p, mut ctx, select(v, p.floats[thresholds], p.lists[functions]), bx, by, bz)
+        },
+        Spline { curve: c, count } => {
+            var input = SplineInput {
+                point: true,
+                x: bx,
+                y: by,
+                z: bz,
+                values: [f32.NAN; count],
+                filled: [],
+                buffers: [],
+                volume: Volume { size_x: 0, size_y: 0, size_z: 0, min_x: 0, min_y: 0, min_z: 0 },
+                index: 0,
+            }
+            return try curve(p, mut ctx, mut input, c)
+        },
+        Caching { id, input } => {
+            if not ctx.cached {
+                return try sample(p, mut ctx, input, bx, by, bz)
+            }
+            ctx.cell(id)
+            let key = block_key(bx, by, bz)
+            let held = ctx.cells[id].value
+            if ctx.cells[id].key == key and not held.is_nan() {
+                return held
+            }
+            if ctx.cells[id].filled {
+                let i = ctx.cells[id].volume.index_of_block(bx, by, bz)
+                if i != -1 {
+                    return ctx.cells[id].buffer[at(i)]
+                }
+            }
+            let v = try sample(p, mut ctx, input, bx, by, bz)
+            ctx.cells[id].key = key
+            ctx.cells[id].value = v
+            return v
+        },
+        Interpolated { input, xz, ys, xz_inv: _, y_inv: _ } => {
+            let xi = bx.floor_mod(xz)
+            let yi = by.floor_mod(ys)
+            let zi = bz.floor_mod(xz)
+            if xi == 0 and yi == 0 and zi == 0 {
+                return try sample(p, mut ctx, input, bx, by, bz)
+            }
+            let v = try volume(2, 2, 2, bx - xi, by - yi, bz - zi, xz, ys, xz)
+            var buf = try zeros(v.size())
+            try fill(p, mut ctx, input, mut buf, v)
+            let a1 = f32.nearest(xi) / f32.nearest(xz)
+            let a2 = f32.nearest(yi) / f32.nearest(ys)
+            let a3 = f32.nearest(zi) / f32.nearest(xz)
+            let x00 = lerp(a1, buf[at(v.index(0, 0, 0))], buf[at(v.index(1, 0, 0))])
+            let x10 = lerp(a1, buf[at(v.index(0, 1, 0))], buf[at(v.index(1, 1, 0))])
+            let x01 = lerp(a1, buf[at(v.index(0, 0, 1))], buf[at(v.index(1, 0, 1))])
+            let x11 = lerp(a1, buf[at(v.index(0, 1, 1))], buf[at(v.index(1, 1, 1))])
+            return lerp(a3, lerp(a2, x00, x10), lerp(a2, x01, x11))
+        },
+        SliceX { input, at: c } => return try sample(p, mut ctx, input, c, by, bz),
+        SliceY { input, at: c } => return try sample(p, mut ctx, input, bx, c, bz),
+        SliceZ { input, at: c } => return try sample(p, mut ctx, input, bx, by, c),
+        SliceXz { input, x_at, z_at } => return try sample(p, mut ctx, input, x_at, by, z_at),
+        FindTop { density, upper, lower, cell } => {
+            let u = try sample(p, mut ctx, upper, bx, by, bz)
+            return try find_top(p, mut ctx, density, lower, cell, bx, bz, u)
+        },
+    }
+}
+
+/// `FindTopSurfaceFunction`'s search: from the cell at or below `upper` down to `lower`, the
+/// first block where the density is above 0.
+fn find_top(p: Program, ctx: mut Context, density: usize, lower: i32, cell: i32, x: i32, z: i32, upper: f32) -> f32 ! Thrown {
+    let top = i32.saturate(f64(upper / f32.nearest(cell)).floor()) * cell
+    if top <= lower {
+        return f32.nearest(lower)
+    }
+    var y = top
+    while y >= lower {
+        if try sample(p, mut ctx, density, x, y, z) > 0.0f32 {
+            return f32.nearest(y)
+        }
+        y -= cell
+    }
+    return f32.nearest(lower)
+}
+
+/// `sampleVolume`: sampler `s` over `v`, into `out`, which holds `v.size()` values.
+pub fn fill(p: Program, ctx: mut Context, s: usize, out: mut List<f32>, v: Volume) ! Thrown {
+    match p.samplers[s] {
+        Constant(c) => {
+            for i in 0..out.len() {
+                out[i] = c
+            }
+        },
+        Noise { noise, xz, ys } => {
+            for i in 0..out.len() {
+                out[i] = 0.0f32
+            }
+            p.noises[noise].add_to_volume(mut out, v, xz, ys, 1.0f32)
+        },
+        ShiftedXz { sx, sz, noise, xz, ys } => {
+            try fill(p, mut ctx, sx, mut out, v)
+            var zs = try zeros(v.size())
+            try fill(p, mut ctx, sz, mut zs, v)
+            var i: usize = 0
+            for z in 0..v.size_z {
+                let base_z = f64(v.block_z(z)) * xz
+                for x in 0..v.size_x {
+                    let base_x = f64(v.block_x(x)) * xz
+                    for y in 0..v.size_y {
+                        let nx = base_x + f64(out[i])
+                        let ny = f64(v.block_y(y)) * ys
+                        let nz = base_z + f64(zs[i])
+                        out[i] = p.noises[noise].get(nx, ny, nz)
+                        i += 1
+                    }
+                }
+            }
+        },
+        ShiftedXyz { sx, sy, sz, noise, xz, ys } => {
+            try fill(p, mut ctx, sx, mut out, v)
+            var yb = try zeros(v.size())
+            try fill(p, mut ctx, sy, mut yb, v)
+            var zs = try zeros(v.size())
+            try fill(p, mut ctx, sz, mut zs, v)
+            var i: usize = 0
+            for z in 0..v.size_z {
+                let base_z = f64(v.block_z(z)) * xz
+                for x in 0..v.size_x {
+                    let base_x = f64(v.block_x(x)) * xz
+                    for y in 0..v.size_y {
+                        let nx = base_x + f64(out[i])
+                        let ny = f64(v.block_y(y)) * ys + f64(yb[i])
+                        let nz = base_z + f64(zs[i])
+                        out[i] = p.noises[noise].get(nx, ny, nz)
+                        i += 1
+                    }
+                }
+            }
+        },
+        ShiftB { noise } => {
+            // The noise is sampled at (z, x), so over a volume with x and z swapped.
+            let tv = try volume(v.size_z, v.size_x, 1, v.min_z, v.min_x, 0, v.step_z, v.step_x, 1)
+            var buf = try zeros(tv.size())
+            p.noises[noise].add_to_volume(mut buf, tv, 0.25, 0.25, 4.0f32)
+            for z in 0..v.size_z {
+                for x in 0..v.size_x {
+                    let value = buf[at(tv.index(z, x, 0))]
+                    set_range(mut out, v.index(x, 0, z), v.size_y, value)
+                }
+            }
+        },
+        EndIslands { noise } => {
+            for z in 0..v.size_z {
+                let bz = v.block_z(z)
+                for x in 0..v.size_x {
+                    let bx = v.block_x(x)
+                    set_range(mut out, v.index(x, 0, z), v.size_y, island_value(p.noises[noise], bx, bz))
+                }
+            }
+        },
+        Distance { px, py, pz, metric: m } => {
+            var i: usize = 0
+            for z in 0..v.size_z {
+                let bz = v.block_z(z)
+                for x in 0..v.size_x {
+                    let bx = v.block_x(x)
+                    for y in 0..v.size_y {
+                        let by = v.block_y(y)
+                        out[i] = metric(m, f32.nearest(px - bx), f32.nearest(py - by), f32.nearest(pz - bz))
+                        i += 1
+                    }
+                }
+            }
+        },
+        Gradient { axis, tiling, from, low, high, span, from_value, factor } => {
+            match axis {
+                X => {
+                    for x in 0..v.size_x {
+                        let g = try gradient(tiling, v.block_x(x), from, low, high, span, from_value, factor)
+                        for z in 0..v.size_z {
+                            set_range(mut out, v.index(x, 0, z), v.size_y, g)
+                        }
+                    }
+                },
+                Y => {
+                    for y in 0..v.size_y {
+                        let g = try gradient(tiling, v.block_y(y), from, low, high, span, from_value, factor)
+                        for z in 0..v.size_z {
+                            for x in 0..v.size_x {
+                                out[at(v.index(x, y, z))] = g
+                            }
+                        }
+                    }
+                },
+                Z => {
+                    for z in 0..v.size_z {
+                        let g = try gradient(tiling, v.block_z(z), from, low, high, span, from_value, factor)
+                        set_range(mut out, v.index(0, 0, z), v.size_x * v.size_y, g)
+                    }
+                },
+            }
+        },
+        Unary { op, input } => {
+            try fill(p, mut ctx, input, mut out, v)
+            for i in 0..out.len() {
+                out[i] = unary(op, out[i])
+            }
+        },
+        Add { left, right } => {
+            try fill(p, mut ctx, left, mut out, v)
+            let r = try sampled(p, mut ctx, right, v)
+            for i in 0..out.len() {
+                out[i] = out[i] + r[i]
+            }
+        },
+        Sub { left, right } => {
+            try fill(p, mut ctx, left, mut out, v)
+            let r = try sampled(p, mut ctx, right, v)
+            for i in 0..out.len() {
+                out[i] = out[i] + -r[i]
+            }
+        },
+        Mul { left, right } => {
+            try fill(p, mut ctx, left, mut out, v)
+            let r = try sampled(p, mut ctx, right, v)
+            for i in 0..out.len() {
+                out[i] = out[i] * r[i]
+            }
+        },
+        Div { left, right } => {
+            try fill(p, mut ctx, left, mut out, v)
+            let r = try sampled(p, mut ctx, right, v)
+            for i in 0..out.len() {
+                out[i] = out[i] / r[i]
+            }
+        },
+        Min { left, right, bound: _ } => {
+            try fill(p, mut ctx, left, mut out, v)
+            let r = try sampled(p, mut ctx, right, v)
+            for i in 0..out.len() {
+                if r[i] < out[i] {
+                    out[i] = r[i]
+                }
+            }
+        },
+        Max { left, right, bound: _ } => {
+            try fill(p, mut ctx, left, mut out, v)
+            let r = try sampled(p, mut ctx, right, v)
+            for i in 0..out.len() {
+                if r[i] > out[i] {
+                    out[i] = r[i]
+                }
+            }
+        },
+        Const { op, input, value: c } => {
+            try fill(p, mut ctx, input, mut out, v)
+            match op {
+                Add => {
+                    for i in 0..out.len() {
+                        out[i] = out[i] + c
+                    }
+                },
+                Sub => {
+                    for i in 0..out.len() {
+                        out[i] = c - out[i]
+                    }
+                },
+                Mul => {
+                    for i in 0..out.len() {
+                        out[i] = out[i] * c
+                    }
+                },
+                Div => {
+                    for i in 0..out.len() {
+                        out[i] = c / out[i]
+                    }
+                },
+                Min => {
+                    for i in 0..out.len() {
+                        if c < out[i] {
+                            out[i] = c
+                        }
+                    }
+                },
+                Max => {
+                    for i in 0..out.len() {
+                        if c > out[i] {
+                            out[i] = c
+                        }
+                    }
+                },
+            }
+        },
+        ConstBasePow { base, exponent } => {
+            try fill(p, mut ctx, exponent, mut out, v)
+            for i in 0..out.len() {
+                out[i] = java_pow(base, f64(out[i]))
+            }
+        },
+        ConstExponentPow { base, exponent } => {
+            try fill(p, mut ctx, base, mut out, v)
+            for i in 0..out.len() {
+                out[i] = java_pow(f64(out[i]), exponent)
+            }
+        },
+        Pow { base, exponent } => {
+            try fill(p, mut ctx, base, mut out, v)
+            let e = try sampled(p, mut ctx, exponent, v)
+            for i in 0..out.len() {
+                out[i] = java_pow(f64(out[i]), f64(e[i]))
+            }
+        },
+        RoundInteger { op, input } => {
+            try fill(p, mut ctx, input, mut out, v)
+            for i in 0..out.len() {
+                out[i] = round_to_integer(op, out[i])
+            }
+        },
+        Round { op, input, multiple } => {
+            try fill(p, mut ctx, input, mut out, v)
+            let m = try sampled(p, mut ctx, multiple, v)
+            for i in 0..out.len() {
+                out[i] = round_multiple(op, out[i], m[i])
+            }
+        },
+        Lerp { alpha, first, second } => {
+            try fill(p, mut ctx, alpha, mut out, v)
+            let f = try sampled(p, mut ctx, first, v)
+            let s2 = try sampled(p, mut ctx, second, v)
+            for i in 0..out.len() {
+                let a = out[i]
+                out[i] = if a == 0.0f32 { f[i] } else if a == 1.0f32 { s2[i] } else { lerp(a, f[i], s2[i]) }
+            }
+        },
+        LerpConstFirst { alpha, first, second } => {
+            try fill(p, mut ctx, alpha, mut out, v)
+            let s2 = try sampled(p, mut ctx, second, v)
+            for i in 0..out.len() {
+                let a = out[i]
+                out[i] = if a == 0.0f32 { first } else if a == 1.0f32 { s2[i] } else { lerp(a, first, s2[i]) }
+            }
+        },
+        LerpConstSecond { alpha, first, second } => {
+            try fill(p, mut ctx, alpha, mut out, v)
+            let f = try sampled(p, mut ctx, first, v)
+            for i in 0..out.len() {
+                let a = out[i]
+                out[i] = if a == 0.0f32 { f[i] } else if a == 1.0f32 { second } else { lerp(a, f[i], second) }
+            }
+        },
+        Clamp { input, low, high } => {
+            try fill(p, mut ctx, input, mut out, v)
+            for i in 0..out.len() {
+                out[i] = clamp(out[i], low, high)
+            }
+        },
+        ChoiceConst { input, low, high, inside, outside } => {
+            try fill(p, mut ctx, input, mut out, v)
+            for i in 0..out.len() {
+                let x = out[i]
+                out[i] = if x >= low and x < high { inside } else { outside }
+            }
+        },
+        Choice { input, low, high, inside, outside } => {
+            try fill(p, mut ctx, inside, mut out, v)
+            let ins = try sampled(p, mut ctx, input, v)
+            let outs = try sampled(p, mut ctx, outside, v)
+            for i in 0..out.len() {
+                let x = ins[i]
+                if not (x >= low) or not (x < high) {
+                    out[i] = outs[i]
+                }
+            }
+        },
+        SelectOne { input, threshold, below, above } => {
+            try fill(p, mut ctx, input, mut out, v)
+            let lo = try sampled(p, mut ctx, below, v)
+            let hi = try sampled(p, mut ctx, above, v)
+            for i in 0..out.len() {
+                out[i] = if out[i] < threshold { lo[i] } else { hi[i] }
+            }
+        },
+        Select { input, thresholds, functions } => {
+            try fill(p, mut ctx, input, mut out, v)
+            var bufs = List<List<f32>>()
+            for f in p.lists[functions] {
+                bufs.push(try sampled(p, mut ctx, f, v))
+            }
+            var order = List<usize>()
+            for k in 0..p.lists[functions].len() {
+                order.push(k)
+            }
+            for i in 0..out.len() {
+                out[i] = bufs[select(out[i], p.floats[thresholds], order)][i]
+            }
+        },
+        Spline { curve: c, count } => {
+            var input = SplineInput {
+                point: false,
+                x: 0,
+                y: 0,
+                z: 0,
+                values: [],
+                filled: [false; count],
+                buffers: [],
+                volume: v,
+                index: 0,
+            }
+            for _ in 0..count {
+                input.buffers.push([])
+            }
+            for i in 0..out.len() {
+                input.index = i
+                out[i] = try curve(p, mut ctx, mut input, c)
+            }
+        },
+        Caching { id, input } => {
+            if not ctx.cached {
+                try fill(p, mut ctx, input, mut out, v)
+                return
+            }
+            ctx.cell(id)
+            if not ctx.cells[id].filled or ctx.cells[id].volume != v {
+                ctx.cells[id].volume = v
+                var buf = try zeros(v.size())
+                try fill(p, mut ctx, input, mut buf, v)
+                ctx.cells[id].buffer = buf
+                ctx.cells[id].filled = true
+            }
+            let n = ctx.cells[id].buffer.len()
+            if n != out.len() {
+                fail illegal_argument("Cannot copy from buffer with size={n}, expected{out.len()}")
+            }
+            for i in 0..n {
+                out[i] = ctx.cells[id].buffer[i]
+            }
+        },
+        Interpolated { input, xz, ys, xz_inv, y_inv } => {
+            let steps = (v.step_x == xz or v.size_x == 1) and (v.step_y == ys or v.size_y == 1) and (v.step_z == xz or v.size_z == 1)
+            if steps and v.min_x.floor_mod(xz) == 0 and v.min_y.floor_mod(ys) == 0 and v.min_z.floor_mod(xz) == 0 {
+                try fill(p, mut ctx, input, mut out, v)
+            } else if v.step_x == 1 and v.step_y == 1 and v.step_z == 1 {
+                try interpolate(p, mut ctx, input, xz, ys, xz_inv, y_inv, mut out, v)
+            } else {
+                let bv = try volume(v.size_x * v.step_x, v.size_y * v.step_y, v.size_z * v.step_z, v.min_x, v.min_y, v.min_z, 1, 1, 1)
+                var buf = try zeros(bv.size())
+                try interpolate(p, mut ctx, input, xz, ys, xz_inv, y_inv, mut buf, bv)
+                for z in 0..v.size_z {
+                    for x in 0..v.size_x {
+                        for y in 0..v.size_y {
+                            out[at(v.index(x, y, z))] = buf[at(bv.index(x * v.step_x, y * v.step_y, z * v.step_z))]
+                        }
+                    }
+                }
+            }
+        },
+        SliceX { input, at: c } => {
+            if v.size_x == 1 and v.min_x == c {
+                try fill(p, mut ctx, input, mut out, v)
+                return
+            }
+            let iv = try volume(1, v.size_y, v.size_z, c, v.min_y, v.min_z, v.step_x, v.step_y, v.step_z)
+            let buf = try sampled(p, mut ctx, input, iv)
+            var i: usize = 0
+            for z in 0..v.size_z {
+                for _ in 0..v.size_x {
+                    for y in 0..v.size_y {
+                        out[i] = buf[at(iv.index(0, y, z))]
+                        i += 1
+                    }
+                }
+            }
+        },
+        SliceY { input, at: c } => {
+            if v.size_y == 1 and v.min_y == c {
+                try fill(p, mut ctx, input, mut out, v)
+                return
+            }
+            let iv = try volume(v.size_x, 1, v.size_z, v.min_x, c, v.min_z, v.step_x, v.step_y, v.step_z)
+            let buf = try sampled(p, mut ctx, input, iv)
+            for z in 0..v.size_z {
+                for x in 0..v.size_x {
+                    set_range(mut out, v.index(x, 0, z), v.size_y, buf[at(iv.index(x, 0, z))])
+                }
+            }
+        },
+        SliceZ { input, at: c } => {
+            if v.size_z == 1 and v.min_z == c {
+                try fill(p, mut ctx, input, mut out, v)
+                return
+            }
+            let iv = try volume(v.size_x, v.size_y, 1, v.min_x, v.min_y, c, v.step_x, v.step_y, v.step_z)
+            let buf = try sampled(p, mut ctx, input, iv)
+            var i: usize = 0
+            for _ in 0..v.size_z {
+                for x in 0..v.size_x {
+                    for y in 0..v.size_y {
+                        out[i] = buf[at(iv.index(x, y, 0))]
+                        i += 1
+                    }
+                }
+            }
+        },
+        SliceXz { input, x_at, z_at } => {
+            if v.size_x == 1 and v.size_z == 1 and v.min_x == x_at and v.min_z == z_at {
+                try fill(p, mut ctx, input, mut out, v)
+                return
+            }
+            let iv = try volume(1, v.size_y, 1, x_at, v.min_y, z_at, v.step_x, v.step_y, v.step_z)
+            let buf = try sampled(p, mut ctx, input, iv)
+            for y in 0..v.size_y {
+                let value = buf[at(iv.index(0, y, 0))]
+                var i = v.index(0, y, 0)
+                for _ in 0..v.size_z {
+                    for _ in 0..v.size_x {
+                        out[at(i)] = value
+                        i += v.size_y
+                    }
+                }
+            }
+        },
+        FindTop { density, upper, lower, cell } => {
+            if v.size_y != 1 {
+                fail illegal_argument("Cannot sample with sizeY={v.size_y}")
+            }
+            try fill(p, mut ctx, upper, mut out, v)
+            var i: usize = 0
+            for z in 0..v.size_z {
+                let bz = v.block_z(z)
+                for x in 0..v.size_x {
+                    let bx = v.block_x(x)
+                    out[i] = try find_top(p, mut ctx, density, lower, cell, bx, bz, out[i])
+                    i += 1
+                }
+            }
+        },
+    }
+}
+
+/// Sampler `s` over `v`, into a buffer of its own, as `acquireBuffer` gives one.
+fn sampled(p: Program, ctx: mut Context, s: usize, v: Volume) -> List<f32> ! Thrown {
+    var buf = try zeros(v.size())
+    try fill(p, mut ctx, s, mut buf, v)
+    return buf
+}
+
+/// `InterpolatedFunction.Sampler.sampleWithBlockStep`: the input at the corners of each cell
+/// the volume touches, and the volume's blocks lerped between them.
+fn interpolate(p: Program, ctx: mut Context, input: usize, xz: i32, ys: i32, xz_inv: f32, y_inv: f32, out: mut List<f32>, v: Volume) ! Thrown {
+    let min_cx = v.min_x.floor_div(xz)
+    let min_cy = v.min_y.floor_div(ys)
+    let min_cz = v.min_z.floor_div(xz)
+    let max_cx = v.max_block_x().floor_div(xz)
+    let max_cy = v.max_block_y().floor_div(ys)
+    let max_cz = v.max_block_z().floor_div(xz)
+    let count_x = max_cx - min_cx + 1
+    let count_y = max_cy - min_cy + 1
+    let count_z = max_cz - min_cz + 1
+    let cv = try volume(
+        if v.max_block_x().floor_mod(xz) == 0 { count_x } else { count_x + 1 },
+        if v.max_block_y().floor_mod(ys) == 0 { count_y } else { count_y + 1 },
+        if v.max_block_z().floor_mod(xz) == 0 { count_z } else { count_z + 1 },
+        min_cx * xz, min_cy * ys, min_cz * xz, xz, ys, xz,
+    )
+    let cells = try sampled(p, mut ctx, input, cv)
+    for cz in 0..count_z {
+        let nz = (cz + 1).min(cv.size_z - 1)
+        for cx in 0..count_x {
+            let nx = (cx + 1).min(cv.size_x - 1)
+            var v000 = cells[at(cv.index(cx, 0, cz))]
+            var v100 = cells[at(cv.index(nx, 0, cz))]
+            var v001 = cells[at(cv.index(cx, 0, nz))]
+            var v101 = cells[at(cv.index(nx, 0, nz))]
+            for cy in 0..count_y {
+                let ny = (cy + 1).min(cv.size_y - 1)
+                let v010 = cells[at(cv.index(cx, ny, cz))]
+                let v110 = cells[at(cv.index(nx, ny, cz))]
+                let v011 = cells[at(cv.index(cx, ny, nz))]
+                let v111 = cells[at(cv.index(nx, ny, nz))]
+                let ox = cv.block_x(cx) - v.min_x
+                let oy = cv.block_y(cy) - v.min_y
+                let oz = cv.block_z(cz) - v.min_z
+                let x0 = (0).max(-ox)
+                let y0 = (0).max(-oy)
+                let z0 = (0).max(-oz)
+                let x1 = xz.min(v.size_x - ox) - 1
+                let y1 = ys.min(v.size_y - oy) - 1
+                let z1 = xz.min(v.size_z - oz) - 1
+                var z = z0
+                while z <= z1 {
+                    let out_z = oz + z
+                    let az = f32.nearest(z) * xz_inv
+                    let v00 = lerp(az, v000, v001)
+                    let v01 = lerp(az, v010, v011)
+                    let v10 = lerp(az, v100, v101)
+                    let v11 = lerp(az, v110, v111)
+                    var x = x0
+                    while x <= x1 {
+                        let ax = f32.nearest(x) * xz_inv
+                        let w0 = lerp(ax, v00, v10)
+                        let w1 = lerp(ax, v01, v11)
+                        let step = (w1 - w0) * y_inv
+                        var value = w0 + step * f32.nearest(y0)
+                        var i = v.index(ox + x, oy + y0, out_z)
+                        var y = y0
+                        while y <= y1 {
+                            out[at(i)] = value
+                            i += 1
+                            value += step
+                            y += 1
+                        }
+                        x += 1
+                    }
+                    z += 1
+                }
+                v000 = v010
+                v100 = v110
+                v001 = v011
+                v101 = v111
+            }
+        }
+    }
+}
