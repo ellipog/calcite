@@ -115,6 +115,7 @@ Case inputs are committed in `cases/<probe>/<group>.json`:
 - A case with blobs lists them in `"blobs"`. Each is base64, or a readable form such as `{"f64": ["1.5", "nan"]}` or a seeded generator, which the runner expands to bytes before sending. Adapters only ever see bytes. The forms are listed in [`README.md`](README.md#blobs-in-case-files).
 - Generated case files say what generated them in a top-level `"generated_by"` field, and the generator is committed beside them with its seed.
 - A case that only one system can run, such as one that makes symbolic links, which Windows doesn't let most users make, or one whose paths only one system writes, says so with `"system": "windows"` or `"linux"`. On any other system it isn't recorded or run, and scores as elsewhere; its expected hash, recorded on its own system, is kept when the others are recorded again.
+- A case whose blobs vanilla fills in an order that changes from run to run says `"unordered": true`. The runner sorts each NBT compound in its blobs by key, by the bytes of its name, before it hashes them, for every adapter, so only what's in them is compared. Only `registries` contents cases use it, where vanilla's `Map.copyOf` over keys hashed by identity puts entries that share a bucket in a different order each run (D192).
 
 ## Probes
 
@@ -312,7 +313,7 @@ What a server with only the vanilla data pack sends a client in configuration: i
 | `{"op": "known_packs"}` | `packs`: the server's known packs in order, each `[namespace, id, version]` |
 | `{"op": "synced"}` | `registries`: each synchronized registry in the order the server sends them, `{name, entries}`, with `entries` in ID order, each `[id, sent_with_data]`. An entry from a pack the client knows goes without its data |
 | `{"op": "tags", "registry": name}` | `tags`: the registry's tags as `update_tags` sends them, by name in string order, each `[name, ids]` with the entries' IDs in the order sent. An empty list for a registry it sends no tags for |
-| `{"op": "contents", "registry": name}` | One blob: the synchronized registry's entries in ID order with their contents, as `registry_data` sends them to a client that knows none of the server's packs (`RegistrySynchronization.packRegistries` with no known packs). An `int` count, then each entry's ID as an `int` length and its UTF-8, then its contents, encoded with the registry's network codec and `NbtOps`, as `NbtIo.writeAnyTag` writes them. Big-endian. Added in v2 |
+| `{"op": "contents", "registry": name}` | One blob: the synchronized registry's entries in ID order with their contents, as `registry_data` sends them to a client that knows none of the server's packs (`RegistrySynchronization.packRegistries` with no known packs). An `int` count, then each entry's ID as an `int` length and its UTF-8, then its contents, encoded with the registry's network codec and `NbtOps`, as `NbtIo.writeAnyTag` writes them. Big-endian. Added in v2. The cases for `timeline`, `dimension_type` and `worldgen/biome` are `unordered` |
 
 ### `palette` (v1)
 

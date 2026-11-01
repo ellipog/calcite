@@ -23,6 +23,7 @@ import cases as cases_mod  # noqa: E402
 import differences as differences_mod  # noqa: E402
 from protocol import Adapter, ProtocolError, Result, canonical_json  # noqa: E402
 from store import Store  # noqa: E402
+from unordered import sorted_contents  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 PLATFORM = "windows" if os.name == "nt" else sys.platform
@@ -93,7 +94,7 @@ class Session:
         if version is not None and version != case.probe_version:
             return Result("error", {}, [], f"adapter has {case.probe} v{version}, case is v{case.probe_version}")
         try:
-            return self.adapter.run(case.probe, case.id, case.input, case.blobs)
+            result = self.adapter.run(case.probe, case.id, case.input, case.blobs)
         except ProtocolError as e:
             self.adapter.close()
             if self.restarts >= self.MAX_RESTARTS:
@@ -101,6 +102,12 @@ class Session:
             self.restarts += 1
             self.adapter = self._start()
             return Result("error", {}, [], f"adapter crashed: {e} (log: {self.log})")
+        if case.unordered and result.status == "ok":
+            try:
+                result.blobs = [sorted_contents(b) for b in result.blobs]
+            except ValueError as e:
+                return Result("error", {}, [], f"its blob isn't a contents blob to sort: {e}")
+        return result
 
     def close(self):
         self.adapter.close()

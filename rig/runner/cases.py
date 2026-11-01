@@ -27,6 +27,8 @@ class Case:
     source: Path
     # The one system the case runs on, or None for every system.
     system: str = None
+    # Whether its blobs are compared with each compound sorted by key (`unordered.py`).
+    unordered: bool = False
 
     @property
     def key(self):
@@ -161,7 +163,10 @@ def load_file(path):
         system = raw.get("system")
         if system is not None and system not in SYSTEMS:
             raise CaseFileError(f"{path}: case `{cid}`: `system` is {system!r}, not one of {', '.join(SYSTEMS)}")
-        cases.append(Case(probe, version, cid, raw.get("input", {}), blobs, Path(path), system))
+        unordered = raw.get("unordered", False)
+        if not isinstance(unordered, bool):
+            raise CaseFileError(f"{path}: case `{cid}`: `unordered` is {unordered!r}, not true or false")
+        cases.append(Case(probe, version, cid, raw.get("input", {}), blobs, Path(path), system, unordered))
     return probe, cases
 
 

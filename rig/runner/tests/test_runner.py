@@ -23,6 +23,7 @@ import differences  # noqa: E402
 import sessiondiff  # noqa: E402
 from protocol import Adapter, Result, canonical_json, read_frame, result_hash, write_frame  # noqa: E402
 from store import Store  # noqa: E402
+from unordered import sorted_contents  # noqa: E402
 
 PING_ADAPTER = Path(__file__).resolve().parent / "ping-adapter"
 
@@ -125,6 +126,17 @@ class CaseFiles(unittest.TestCase):
             changed = sorted(str(p.relative_to(ROOT)) for p in after if before.get(p) != after[p])
             self.assertEqual(changed, [], f"{gen.relative_to(ROOT)} doesn't match its committed output; rerun it")
 
+    def test_unordered_flag(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.json"
+            path.write_text(json.dumps({"probe": "p", "probe_version": 1, "cases": [
+                {"id": "a", "unordered": True}, {"id": "b"}]}), encoding="utf-8")
+            _, items = cases.load_file(path)
+            self.assertEqual([c.unordered for c in items], [True, False])
+            path.write_text(json.dumps({"probe": "p", "probe_version": 1, "cases": [{"id": "a", "unordered": 1}]}), encoding="utf-8")
+            with self.assertRaises(cases.CaseFileError):
+                cases.load_file(path)
+
     def test_expected_hashes_cover_cases(self):
         store = Store(ROOT, "26.3")
         quarantine = store.quarantine()
@@ -132,6 +144,52 @@ class CaseFiles(unittest.TestCase):
             expected = store.expected(probe)
             missing = [c.id for c in items if c.id not in expected and c.key not in quarantine]
             self.assertEqual(missing, [], f"{probe}: cases without an expected hash; run `rig.py record --config all`")
+
+
+class Unordered(unittest.TestCase):
+    @staticmethod
+    def entry(name, tag):
+        return struct.pack(">i", len(name)) + name.encode() + tag
+
+    @staticmethod
+    def named(kind, name, payload):
+        return bytes([kind]) + struct.pack(">H", len(name)) + name.encode() + payload
+
+    def compound(self, *entries):
+        return b"".join(entries) + b"\x00"
+
+    def test_sorts_nested_compounds(self):
+        inner_ba = self.compound(self.named(3, "b", struct.pack(">i", 2)), self.named(1, "a", b"\x01"))
+        inner_ab = self.compound(self.named(1, "a", b"\x01"), self.named(3, "b", struct.pack(">i", 2)))
+        listed = lambda inner: bytes([10]) + struct.pack(">i", 2) + inner + inner
+        one = self.compound(self.named(9, "z", listed(inner_ba)), self.named(8, "y", struct.pack(">H", 2) + b"hi"))
+        other = self.compound(self.named(8, "y", struct.pack(">H", 2) + b"hi"), self.named(9, "z", listed(inner_ab)))
+        blob = lambda c: struct.pack(">i", 2) + self.entry("minecraft:a", b"\x0a" + c) + self.entry("minecraft:b", b"\x03" + struct.pack(">i", 7))
+        self.assertNotEqual(blob(one), blob(other))
+        self.assertEqual(sorted_contents(blob(one)), sorted_contents(blob(other)))
+        self.assertEqual(sorted_contents(blob(other)), blob(other))
+
+    def test_arrays_and_numbers_kept(self):
+        tag = self.compound(
+            self.named(11, "i", struct.pack(">i", 2) + struct.pack(">ii", 1, -1)),
+            self.named(12, "l", struct.pack(">i", 1) + struct.pack(">q", 5)),
+            self.named(7, "b", struct.pack(">i", 3) + b"\x01\x02\x03"),
+            self.named(6, "d", struct.pack(">d", 1.5)),
+        )
+        blob = struct.pack(">i", 1) + self.entry("x", b"\x0a" + tag)
+        want = struct.pack(">i", 1) + self.entry("x", b"\x0a" + self.compound(
+            self.named(7, "b", struct.pack(">i", 3) + b"\x01\x02\x03"),
+            self.named(6, "d", struct.pack(">d", 1.5)),
+            self.named(11, "i", struct.pack(">i", 2) + struct.pack(">ii", 1, -1)),
+            self.named(12, "l", struct.pack(">i", 1) + struct.pack(">q", 5)),
+        ))
+        self.assertEqual(sorted_contents(blob), want)
+
+    def test_rejects_trailing_bytes(self):
+        with self.assertRaises(ValueError):
+            sorted_contents(struct.pack(">i", 0) + b"\x00")
+        with self.assertRaises(ValueError):
+            sorted_contents(struct.pack(">i", 1) + struct.pack(">i", 1) + b"x\x0a\x01")
 
 
 class Differences(unittest.TestCase):

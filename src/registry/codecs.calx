@@ -5,15 +5,16 @@
 /// out their spawn conditions, the description reads only the ones it keeps.
 module registry.codecs
 
-import chat.component.{Component, Style, chat_string}
+import chat.component.{Component, Style, as_8bit_channel, chat_string}
 import java.categories.{is_letter_or_digit}
 import java.uri.{Uri, exception_message}
 import json.gson.{int_value}
 import json.tree.{Json, Member}
 import nbt.tag.{Tag}
 import registry.builtin.{builtin_entries, builtin_names}
-import registry.codec.{Codec, Codecs, Dispatched, DoubleRange, Field, FloatRange, HolderCodec, HolderKind, IntRange, Kinds, LongRange, Many, Need, Read, Then, given, json_text}
+import registry.codec.{Codec, Codecs, Dispatched, DoubleRange, Field, FloatRange, HolderCodec, HolderKind, IntRange, Kinds, LongRange, Many, MapOf, Need, Read, Then, after, given, json_text, same}
 import registry.registries.{Registries}
+import resources.identifier.{Identifier}
 import world.states.{StateCodec}
 
 /// The network codec of the synchronized registry `name`, such as `damage_type` or
@@ -166,6 +167,15 @@ pub fn network_codec(c: mut Codecs, name: String) -> usize? {
     }
     if name == "dialog" {
         return some(dialog_direct(mut c))
+    }
+    if name == "timeline" {
+        return some(timeline_codec(mut c))
+    }
+    if name == "dimension_type" {
+        return some(dimension_type(mut c))
+    }
+    if name == "worldgen/biome" {
+        return some(biome(mut c))
     }
     return none
 }
@@ -924,29 +934,30 @@ fn vec3i(c: mut Codecs) -> usize {
 
 fn read_vec3i(_c: Codecs, value: Json, _r: Registries) -> Read {
     return match value {
-        Json.Array(items) => vec3i_of(value, items),
+        Json.Array(items) => ints_of(value, items, 3),
         _ => Read.bad("Not a json array: {json_text(value)}"),
     }
 }
 
-// The `Vec3i` of `items`, the items of the array `value`.
-fn vec3i_of(value: Json, items: List<Json>) -> Read {
+// The `n` ints of `items`, the items of the array `value`, as `Codec.INT_STREAM` and
+// `Util.fixedSize` read them.
+fn ints_of(value: Json, items: List<Json>, n: usize) -> Read {
     var ints = List<i32>()
     for item in items {
         let v = match item {
             Json.Number(digits) => int_value(digits),
             _ => none,
         }
-        let n = v else return Read.bad("Some elements are not ints: {json_text(value)}")
-        if ints.len() < 3 {
-            ints.push(n)
+        let i = v else return Read.bad("Some elements are not ints: {json_text(value)}")
+        if ints.len() < n {
+            ints.push(i)
         }
     }
-    if items.len() < 3 {
-        return Read.bad(String("Input is not a list of 3 ints"))
+    if items.len() < n {
+        return Read.bad("Input is not a list of {n} ints")
     }
-    if items.len() > 3 {
-        return Read { value: some(Tag.IntArray(ints)), error: some(String("Input is not a list of 3 ints")) }
+    if items.len() > n {
+        return Read { value: some(Tag.IntArray(ints)), error: some("Input is not a list of {n} ints") }
     }
     return Read.ok(Tag.IntArray(ints))
 }
@@ -1685,4 +1696,1350 @@ fn make_sound(c: mut Codecs) -> Codec {
     let fields: List<Field> = [req("sound_id", id(mut c)), Field { name: "range", of: range, need: Need.Loose }]
     let direct = c.add(Codec.Record(fields))
     return Codec.Holder(HolderCodec { registry: "minecraft:sound_event", inline: some(direct) })
+}
+
+// `Timeline.NETWORK_CODEC`: `DIRECT_CODEC`, then only the tracks of attributes clients are sent.
+// The checks of its markers and tracks go in the order they're given, so it reads its record
+// itself.
+fn timeline_codec(c: mut Codecs) -> usize {
+    let clock = c.add(Codec.Holder(HolderCodec { registry: "minecraft:world_clock", inline: none, kind: HolderKind.Fixed }))
+    let key = by_name(mut c, "minecraft:environment_attribute")
+    var tracks = List<(String, usize)>()
+    for (name, kind, _flags) in environment_attributes() {
+        let track = attribute_track(mut c, name, kind)
+        tracks.push(("minecraft:{name}", track))
+    }
+    let track_map = c.add(Codec.Dispatched(Dispatched { key: key, values: tracks }))
+    let marker = time_marker(mut c)
+    let marker_key = id(mut c)
+    let markers = c.add(Codec.MapOf(MapOf { key: marker_key, value: marker, before: "ResourceKey[minecraft:clock_time_marker / ", after: "]" }))
+    let fields: List<Field> = [
+        req("clock", clock),
+        opt("period_ticks", positive_int(mut c)),
+        def("tracks", track_map, Tag.Compound(JavaHashMap<String, Tag>())),
+        def("time_markers", markers, Tag.Compound(JavaHashMap<String, Tag>())),
+    ]
+    let _direct = c.shared(String("timeline_direct"), Codec.Record(fields))
+    return c.add(Codec.Custom(read_timeline))
+}
+
+fn read_timeline(c: Codecs, value: Json, r: Registries) -> Read {
+    let at = c.find(String("timeline_direct")) else return Read.bad(String("no codec for timelines"))
+    var got = c.read(at, value, r)
+    let v = got.value.take() else return got
+    var done = after(got.error.take(), check_timeline(v, value))
+    let w = done.value.take() else return done
+    return Read { value: some(synced_tracks(w)), error: done.error.take() }
+}
+
+// `Timeline.validateInternal`: with a period, each marker within it, and then each track's
+// keyframes, the errors newest first, as `apply2stable` puts them.
+fn check_timeline(value: Tag, json: Json) -> Read {
+    let period = match field(value, "period_ticks") {
+        Tag.Int(p) => p,
+        _ => return Read.ok(value.copy()),
+    }
+    let markers = field(value, "time_markers")
+    for name in ids_in_order(json, "time_markers") {
+        let marker = field(markers, name)
+        // A marker is written as its tick unless it's shown in commands.
+        let ticks = match marker {
+            Tag.Int(t) => t,
+            _ => int_tag(field(marker, "ticks")),
+        }
+        if ticks >= period {
+            return Read.bad("Time Marker ResourceKey[minecraft:clock_time_marker / {name}] must be in range [0; {period})")
+        }
+    }
+    var message: String? = none
+    let tracks = field(value, "tracks")
+    for name in ids_in_order(json, "tracks") {
+        match field(field(tracks, name), "keyframes") {
+            Tag.List(frames) => {
+                for f in frames {
+                    let t = int_tag(field(f, "ticks"))
+                    if t < 0 or t > period {
+                        let e = "Keyframe at tick {t} must be in range [0; {period}]"
+                        message = some(match message.take() {
+                            some(old) => "{e}; {old}",
+                            none => e,
+                        })
+                        break
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    let e = message else return Read.ok(value.copy())
+    return Read.bad(e)
+}
+
+// The keys of the object under `key` in `json`, as the identifiers they name, each once, in the
+// order they're first given, as an `ImmutableMap` read from them keeps them.
+fn ids_in_order(json: Json, key: String) -> List<String> {
+    match json {
+        Json.Object(members) => {
+            if let at = given(members, key) {
+                return object_ids(members[at].value)
+            }
+        },
+        _ => {},
+    }
+    return List<String>()
+}
+
+// The keys of the object `json`, as the identifiers they name, each once, in the order they're
+// first given.
+fn object_ids(json: Json) -> List<String> {
+    var out = List<String>()
+    match json {
+        Json.Object(members) => {
+            for m in members {
+                match Identifier.parse(m.key) {
+                    ok(i) => {
+                        let s = i.to_string()
+                        if not listed(out, s) {
+                            out.push(s)
+                        }
+                    },
+                    err(_) => {},
+                }
+            }
+        },
+        _ => {},
+    }
+    return out
+}
+
+fn has_field(value: Tag, key: String) -> bool {
+    return match value {
+        Tag.Compound(fields) => fields.contains(key),
+        _ => false,
+    }
+}
+
+fn listed(names: List<String>, name: String) -> bool {
+    for n in names {
+        if n == name {
+            return true
+        }
+    }
+    return false
+}
+
+// A timeline as `NETWORK_CODEC` writes it: only the tracks clients are sent, and none at all if
+// that's none.
+fn synced_tracks(value: Tag) -> Tag {
+    match value {
+        Tag.Compound(fields) => {
+            var out = JavaHashMap<String, Tag>()
+            for (k, v) in fields {
+                if k == "tracks" {
+                    let kept = synced_only(v)
+                    if not is_empty_compound(kept) {
+                        out.insert(k.copy(), kept)
+                    }
+                } else {
+                    out.insert(k.copy(), v.copy())
+                }
+            }
+            return Tag.Compound(out)
+        },
+        _ => return value.copy(),
+    }
+}
+
+// The entries of a map of attributes whose attribute clients are sent, as
+// `EnvironmentAttribute.isSyncable` picks them.
+fn synced_only(value: Tag) -> Tag {
+    var out = JavaHashMap<String, Tag>()
+    match value {
+        Tag.Compound(fields) => {
+            for (k, v) in fields {
+                if attribute_flag(k, "s") {
+                    out.insert(k.copy(), v.copy())
+                }
+            }
+        },
+        _ => {},
+    }
+    return Tag.Compound(out)
+}
+
+fn is_empty_compound(value: Tag) -> bool {
+    return match value {
+        Tag.Compound(fields) => fields.is_empty(),
+        _ => false,
+    }
+}
+
+// Whether the attribute `key` has the flag `flag` in `environment_attributes`.
+fn attribute_flag(key: String, flag: String) -> bool {
+    for (name, _kind, flags) in environment_attributes() {
+        if key == "minecraft:{name}" {
+            return flags.contains(flag)
+        }
+    }
+    return false
+}
+
+// `Timeline.TimeMarkerInfo.CODEC`: its tick, or `{ticks, show_in_commands}`, written as its tick
+// unless it's shown in commands.
+fn time_marker(c: mut Codecs) -> usize {
+    let ticks = non_negative_int(mut c)
+    let fields: List<Field> = [req("ticks", ticks), def("show_in_commands", bool_codec(mut c), Tag.Byte(0i8))]
+    let full = c.add(Codec.Record(fields))
+    let either = c.add(Codec.Either(ticks, full))
+    return c.add(Codec.Then(Then { of: either, then: marker_of, with: Tag.End }))
+}
+
+fn marker_of(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    match value {
+        Tag.Compound(fields) => {
+            if not fields.contains("show_in_commands") {
+                return Read.ok(field(value, "ticks"))
+            }
+        },
+        _ => {},
+    }
+    return Read.ok(value.copy())
+}
+
+// `EnvironmentAttributes`: each attribute's name and type, with `s` where clients are sent it,
+// `isSyncable`, and `n` where it can't be set for a place, only for a dimension, as
+// `isPositional` says.
+fn environment_attributes() -> List<(String, String, String)> {
+    return [
+        ("visual/fog_color", "rgb_color", "s"),
+        ("visual/fog_start_distance", "float", "s"),
+        ("visual/fog_end_distance", "float", "s"),
+        ("visual/sky_fog_end_distance", "float", "s"),
+        ("visual/cloud_fog_end_distance", "float", "s"),
+        ("visual/water_fog_color", "rgb_color", "s"),
+        ("visual/water_fog_start_distance", "float", "s"),
+        ("visual/water_fog_end_distance", "float", "s"),
+        ("visual/sky_color", "rgb_color", "s"),
+        ("visual/sunrise_sunset_color", "argb_color", "s"),
+        ("visual/cloud_color", "argb_color", "s"),
+        ("visual/cloud_height", "float", "s"),
+        ("visual/sun_angle", "angle_degrees", "s"),
+        ("visual/moon_angle", "angle_degrees", "s"),
+        ("visual/star_angle", "angle_degrees", "s"),
+        ("visual/moon_phase", "moon_phase", "s"),
+        ("visual/star_brightness", "float", "s"),
+        ("visual/block_light_tint", "rgb_color", "s"),
+        ("visual/sky_light_color", "rgb_color", "s"),
+        ("visual/sky_light_factor", "float", "s"),
+        ("visual/night_vision_color", "rgb_color", "s"),
+        ("visual/ambient_light_color", "rgb_color", "s"),
+        ("visual/default_dripstone_particle", "particle", "s"),
+        ("visual/ambient_particles", "ambient_particles", "s"),
+        ("audio/background_music", "background_music", "s"),
+        ("audio/music_volume", "float", "s"),
+        ("audio/ambient_sounds", "ambient_sounds", "s"),
+        ("audio/firefly_bush_sounds", "boolean", "s"),
+        ("gameplay/sky_light_level", "float", "sn"),
+        ("gameplay/can_start_raid", "boolean", ""),
+        ("gameplay/water_evaporates", "boolean", "s"),
+        ("gameplay/bed_rule", "bed_rule", ""),
+        ("gameplay/straw_bed_rule", "bed_rule", ""),
+        ("gameplay/respawn_anchor_works", "boolean", ""),
+        ("gameplay/nether_portal_spawns_piglin", "boolean", ""),
+        ("gameplay/fast_lava", "boolean", "sn"),
+        ("gameplay/increased_fire_burnout", "boolean", ""),
+        ("gameplay/eyeblossom_open", "tri_state", ""),
+        ("gameplay/turtle_egg_hatch_chance", "float", ""),
+        ("gameplay/piglins_zombify", "boolean", "s"),
+        ("gameplay/snow_golem_melts", "boolean", ""),
+        ("gameplay/creaking_active", "boolean", "s"),
+        ("gameplay/surface_slime_spawn_chance", "float", ""),
+        ("gameplay/cat_waking_up_gift_chance", "float", ""),
+        ("gameplay/bees_stay_in_hive", "boolean", ""),
+        ("gameplay/monsters_burn", "boolean", ""),
+        ("gameplay/can_pillager_patrol_spawn", "boolean", ""),
+        ("gameplay/natural_mob_spawns", "mob_spawn_settings", ""),
+        ("gameplay/creature_world_gen_spawn_probability", "float", ""),
+        ("gameplay/villager_activity", "activity", ""),
+        ("gameplay/baby_villager_activity", "activity", ""),
+    ]
+}
+
+// The least and most the float attribute `name` may be, its `AttributeRange`, or nothing where
+// it may be anything.
+fn attribute_range(name: String) -> List<f32> {
+    if name == "visual/fog_end_distance" or name == "visual/sky_fog_end_distance" or name == "visual/cloud_fog_end_distance" or name == "visual/water_fog_end_distance" {
+        return [0.0f32, f32.INFINITY]
+    }
+    if name == "visual/star_brightness" or name == "visual/sky_light_factor" or name == "audio/music_volume" or name == "gameplay/turtle_egg_hatch_chance" or name == "gameplay/surface_slime_spawn_chance" or name == "gameplay/cat_waking_up_gift_chance" {
+        return [0.0f32, 1.0f32]
+    }
+    if name == "gameplay/sky_light_level" {
+        return [0.0f32, 15.0f32]
+    }
+    if name == "gameplay/creature_world_gen_spawn_probability" {
+        return [0.0f32, 0.9999999f32]
+    }
+    return List<f32>()
+}
+
+// `EnvironmentAttribute.valueCodec`: its type's codec, then its range.
+fn attribute_value(c: mut Codecs, name: String, kind: String) -> usize {
+    let of = attribute_type(mut c, kind)
+    let range = attribute_range(name)
+    if range.is_empty() {
+        return of
+    }
+    let bounds: List<Tag> = [Tag.Float(range[0]), Tag.Float(range[1])]
+    return c.shared("attribute value {name}", Codec.Then(Then { of: of, then: check_attribute_range, with: Tag.List(bounds) }))
+}
+
+// `AttributeRange.ofFloat`'s check, which compares as `float`s do, so `-0.0` is in a range from
+// `0.0`.
+fn check_attribute_range(_c: Codecs, value: Tag, with: Tag) -> Read {
+    let v = float_tag(value)
+    let (min, max) = match with {
+        Tag.List(b) => (float_tag(b[0]), float_tag(b[1])),
+        _ => (f32.NEG_INFINITY, f32.INFINITY),
+    }
+    if v >= min and v <= max {
+        return Read.ok(value.copy())
+    }
+    return Read.bad("{v} is not in range [{min}; {max}]")
+}
+
+// `AttributeTypes`: the codec of each type of attribute's values.
+fn attribute_type(c: mut Codecs, kind: String) -> usize {
+    if kind == "boolean" {
+        return bool_codec(mut c)
+    }
+    if kind == "tri_state" {
+        return tri_state(mut c)
+    }
+    if kind == "float" or kind == "angle_degrees" {
+        return f32_codec(mut c)
+    }
+    if kind == "rgb_color" {
+        return rgb_color(mut c)
+    }
+    if kind == "argb_color" {
+        return argb_color(mut c)
+    }
+    if kind == "integer" {
+        return i32_codec(mut c)
+    }
+    if kind == "moon_phase" {
+        return c.shared(String("moon_phase"), Codec.Names([
+            "full_moon", "waning_gibbous", "third_quarter", "waning_crescent", "new_moon", "waxing_crescent",
+            "first_quarter", "waxing_gibbous",
+        ]))
+    }
+    if kind == "activity" {
+        return by_name(mut c, "minecraft:activity")
+    }
+    if kind == "bed_rule" {
+        return c.named(String("bed_rule"), make_bed_rule)
+    }
+    if kind == "particle" {
+        return particle(mut c)
+    }
+    if kind == "ambient_particles" {
+        return c.named(String("ambient_particles"), make_ambient_particles)
+    }
+    if kind == "background_music" {
+        return c.named(String("background_music"), make_background_music)
+    }
+    if kind == "ambient_sounds" {
+        return c.named(String("ambient_sounds"), make_ambient_sounds)
+    }
+    return c.named(String("mob_spawn_settings"), make_mob_spawn_settings)
+}
+
+// `AttributeModifier.OperationId.CODEC`, every operation by name.
+fn operation_names(c: mut Codecs) -> usize {
+    return c.shared(String("attribute operations"), Codec.Names([
+        "override", "alpha_blend", "add", "subtract", "multiply", "blend_to_gray", "minimum", "maximum",
+        "and", "nand", "or", "nor", "xor", "xnor", "append", "overlay",
+    ]))
+}
+
+// The operations an attribute of the type `kind` can have besides `override`, its
+// `modifierLibrary`.
+fn modifier_names(kind: String) -> List<String> {
+    if kind == "boolean" {
+        return ["and", "nand", "or", "nor", "xor", "xnor"]
+    }
+    if kind == "float" or kind == "angle_degrees" {
+        return ["alpha_blend", "add", "subtract", "multiply", "minimum", "maximum"]
+    }
+    if kind == "rgb_color" or kind == "argb_color" {
+        return ["alpha_blend", "add", "subtract", "multiply", "blend_to_gray"]
+    }
+    if kind == "integer" {
+        return ["add", "subtract", "multiply", "minimum", "maximum"]
+    }
+    if kind == "ambient_particles" {
+        return ["append"]
+    }
+    if kind == "mob_spawn_settings" {
+        return ["overlay"]
+    }
+    return []
+}
+
+// `AttributeType.modifierCodec`: an operation by name, if attributes of the type `kind` can have
+// it, as `ExtraCodecs.idResolverCodec` reads it.
+fn modifier_codec(c: mut Codecs, kind: String) -> usize {
+    let names = operation_names(mut c)
+    var allowed = List<Tag>()
+    for n in modifier_names(kind) {
+        allowed.push(Tag.Str(n.copy()))
+    }
+    return c.shared("modifier {kind}", Codec.Then(Then { of: names, then: check_modifier, with: Tag.List(allowed) }))
+}
+
+fn check_modifier(_c: Codecs, value: Tag, with: Tag) -> Read {
+    let name = match value {
+        Tag.Str(s) => s.copy(),
+        _ => String(),
+    }
+    if name == "override" {
+        return Read.ok(value.copy())
+    }
+    match with {
+        Tag.List(allowed) => {
+            for a in allowed {
+                if same(a, value) {
+                    return Read.ok(value.copy())
+                }
+            }
+        },
+        _ => {},
+    }
+    // The operation as its enum constant's `toString` gives it.
+    var upper = String()
+    for i in 0..name.len() {
+        let b = name.byte_at(i)
+        upper.push(rune(if b >= 97 and b <= 122 { b - 32 } else { b }))
+    }
+    return Read.bad("Unknown element id: {upper}")
+}
+
+// `modifier.argumentCodec(attribute)`: what the operation `op` takes for the attribute `name` of
+// the type `kind`.
+fn argument_codec(c: mut Codecs, name: String, kind: String, op: String) -> usize {
+    if op == "override" or op == "append" or op == "overlay" {
+        return attribute_value(mut c, name, kind)
+    }
+    if kind == "boolean" {
+        return bool_codec(mut c)
+    }
+    if kind == "integer" {
+        return i32_codec(mut c)
+    }
+    if kind == "float" or kind == "angle_degrees" {
+        if op == "alpha_blend" {
+            return c.named(String("float_with_alpha"), make_float_with_alpha)
+        }
+        return f32_codec(mut c)
+    }
+    if op == "blend_to_gray" {
+        return c.named(String("blend_to_gray"), make_blend_to_gray)
+    }
+    // A color: `ArgbModifier`s take an ARGB color, `RgbModifier`s an RGB one.
+    if op == "alpha_blend" or (op == "multiply" and kind == "argb_color") {
+        return argb_color(mut c)
+    }
+    return rgb_color(mut c)
+}
+
+// `AttributeTrack.createCodec`: its modifier, `override` if it isn't given, and keyframes of
+// what the modifier takes.
+fn attribute_track(c: mut Codecs, name: String, kind: String) -> usize {
+    let by = modifier_codec(mut c, kind)
+    var kinds = List<(String, usize)>()
+    var ops: List<String> = ["override"]
+    for n in modifier_names(kind) {
+        ops.push(n.copy())
+    }
+    for op in ops {
+        let argument = argument_codec(mut c, name, kind, op)
+        let track = keyframe_track(mut c, argument)
+        kinds.push((op.copy(), track))
+    }
+    return c.add(Codec.Dispatch(Kinds { key: "modifier", by: by, kinds: kinds, default: "override" }))
+}
+
+// `EnvironmentAttributeMap.Entry.createCodec`: a value, or `{modifier, argument}`, written as the
+// value alone where it overrides.
+fn attribute_entry(c: mut Codecs, name: String, kind: String) -> usize {
+    let value = attribute_value(mut c, name, kind)
+    let by = modifier_codec(mut c, kind)
+    var kinds = List<(String, usize)>()
+    var ops: List<String> = ["override"]
+    for n in modifier_names(kind) {
+        ops.push(n.copy())
+    }
+    for op in ops {
+        let argument = argument_codec(mut c, name, kind, op)
+        let fields: List<Field> = [req("argument", argument)]
+        let full = c.add(Codec.Record(fields))
+        kinds.push((op.copy(), full))
+    }
+    let full = c.add(Codec.Dispatch(Kinds { key: "modifier", by: by, kinds: kinds }))
+    let either = c.add(Codec.Either(value, full))
+    return c.add(Codec.Then(Then { of: either, then: unwrap_override, with: Tag.End }))
+}
+
+fn unwrap_override(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    match field(value, "modifier") {
+        Tag.Str(s) => {
+            if s == "override" {
+                return Read.ok(field(value, "argument"))
+            }
+        },
+        _ => {},
+    }
+    return Read.ok(value.copy())
+}
+
+// `EnvironmentAttributeMap.CODEC`: attributes by name, each with its value or a modifier.
+fn attribute_map(c: mut Codecs) -> usize {
+    return c.named(String("attribute_map"), make_attribute_map)
+}
+
+fn make_attribute_map(c: mut Codecs) -> Codec {
+    let key = by_name(mut c, "minecraft:environment_attribute")
+    var values = List<(String, usize)>()
+    for (name, kind, _flags) in environment_attributes() {
+        let entry = attribute_entry(mut c, name, kind)
+        values.push(("minecraft:{name}", entry))
+    }
+    return Codec.Dispatched(Dispatched { key: key, values: values })
+}
+
+// `KeyframeTrack.mapCodec(value)`: keyframes of the value, in order, and how to ease between
+// them.
+fn keyframe_track(c: mut Codecs, value: usize) -> usize {
+    if let at = c.find("keyframe track {value}") {
+        return at
+    }
+    let ticks = non_negative_int(mut c)
+    let keyframe_fields: List<Field> = [req("ticks", ticks), req("value", value)]
+    let keyframe = c.add(Codec.Record(keyframe_fields))
+    let list = c.add(Codec.ListOf(Many { of: keyframe }))
+    let keyframes = c.add(Codec.Then(Then { of: list, then: check_keyframes, with: Tag.End }))
+    let ease = c.named(String("easing"), make_easing)
+    let fields: List<Field> = [req("keyframes", keyframes), def("ease", ease, Tag.Str(String("linear")))]
+    return c.shared("keyframe track {value}", Codec.Record(fields))
+}
+
+// `KeyframeTrack.validateKeyframes`.
+fn check_keyframes(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    match value {
+        Tag.List(frames) => {
+            if frames.is_empty() {
+                return Read.bad(String("Keyframes must not be empty"))
+            }
+            for i in 1..frames.len() {
+                if int_tag(field(frames[i - 1], "ticks")) > int_tag(field(frames[i], "ticks")) {
+                    return Read.bad(String("Keyframes must be ordered by ticks field"))
+                }
+            }
+            if frames.len() > 1 {
+                // As vanilla counts them: from the last keyframe's tick, and from 0 again after
+                // a new tick.
+                var repeats = 0
+                var last = int_tag(field(frames[frames.len() - 1], "ticks"))
+                for f in frames {
+                    let t = int_tag(field(f, "ticks"))
+                    if t == last {
+                        repeats += 1
+                        if repeats > 2 {
+                            return Read.bad("More than 2 keyframes on same tick: {t}")
+                        }
+                    } else {
+                        repeats = 0
+                    }
+                    last = t
+                }
+            }
+        },
+        _ => {},
+    }
+    return Read.ok(value.copy())
+}
+
+// `EasingType.CODEC`: an easing by name, or `{cubic_bezier: [x1, y1, x2, y2]}`.
+fn make_easing(c: mut Codecs) -> Codec {
+    let s = string(mut c)
+    let simple = c.add(Codec.Then(Then { of: s, then: check_easing, with: Tag.End }))
+    let f = f32_codec(mut c)
+    let floats = c.add(Codec.ListOf(Many { of: f, min: 4, max: 4 }))
+    let controls = c.add(Codec.Then(Then { of: floats, then: check_bezier, with: Tag.End }))
+    let fields: List<Field> = [req("cubic_bezier", controls)]
+    let bezier = c.add(Codec.Record(fields))
+    return Codec.Either(simple, bezier)
+}
+
+fn check_easing(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let name = match value {
+        Tag.Str(s) => s.copy(),
+        _ => String(),
+    }
+    let names: List<String> = [
+        "constant", "linear", "in_back", "in_bounce", "in_circ", "in_cubic", "in_elastic", "in_expo", "in_quad",
+        "in_quart", "in_quint", "in_sine", "in_out_back", "in_out_bounce", "in_out_circ", "in_out_cubic",
+        "in_out_elastic", "in_out_expo", "in_out_quad", "in_out_quart", "in_out_quint", "in_out_sine", "out_back",
+        "out_bounce", "out_circ", "out_cubic", "out_elastic", "out_expo", "out_quad", "out_quart", "out_quint",
+        "out_sine",
+    ]
+    if listed(names, name) {
+        return Read.ok(value.copy())
+    }
+    return Read.bad("Unknown element id: {name}")
+}
+
+// `EasingType.CubicBezierControls.validate`.
+fn check_bezier(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    match value {
+        Tag.List(items) => {
+            if items.len() >= 4 {
+                let x1 = float_tag(items[0])
+                let x2 = float_tag(items[2])
+                if x1 < 0.0f32 or x1 > 1.0f32 {
+                    return Read.bad(String("x1 must be in range [0; 1]"))
+                }
+                if x2 < 0.0f32 or x2 > 1.0f32 {
+                    return Read.bad(String("x2 must be in range [0; 1]"))
+                }
+            }
+        },
+        _ => {},
+    }
+    return Read.ok(value.copy())
+}
+
+// `FloatWithAlpha.CODEC`: a float, or `{value, alpha}`, written as the float where the alpha is 1.
+fn make_float_with_alpha(c: mut Codecs) -> Codec {
+    let f = f32_codec(mut c)
+    let fields: List<Field> = [req("value", f), def("alpha", unit_float(mut c), Tag.Float(1.0f32))]
+    let full = c.add(Codec.Record(fields))
+    let either = c.add(Codec.Either(f, full))
+    return Codec.Then(Then { of: either, then: unwrap_alpha, with: Tag.End })
+}
+
+fn unwrap_alpha(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    match value {
+        Tag.Compound(fields) => {
+            if not fields.contains("alpha") {
+                return Read.ok(field(value, "value"))
+            }
+        },
+        _ => {},
+    }
+    return Read.ok(value.copy())
+}
+
+// `ColorModifier.BlendToGray.CODEC`.
+fn make_blend_to_gray(c: mut Codecs) -> Codec {
+    let unit = unit_float(mut c)
+    let fields: List<Field> = [req("brightness", unit), req("factor", unit)]
+    return Codec.Record(fields)
+}
+
+// `Codec.floatRange(0.0F, 1.0F)`.
+fn unit_float(c: mut Codecs) -> usize {
+    return c.shared(String("unit_float"), Codec.Float(FloatRange { min: 0.0f32, max: 1.0f32, checked: true, before: "Value ", after: " outside of range [0.0:1.0]" }))
+}
+
+// `TriState.CODEC`: a boolean, or `true`, `false` or `default`, written as a boolean unless it's
+// `default`.
+fn tri_state(c: mut Codecs) -> usize {
+    let b = bool_codec(mut c)
+    let names = c.add(Codec.Names(["true", "false", "default"]))
+    let either = c.add(Codec.Either(b, names))
+    return c.shared(String("tri_state"), Codec.Then(Then { of: either, then: tri_state_of, with: Tag.End }))
+}
+
+fn tri_state_of(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    match value {
+        Tag.Str(s) => {
+            if s == "true" {
+                return Read.ok(Tag.Byte(1i8))
+            }
+            if s == "false" {
+                return Read.ok(Tag.Byte(0i8))
+            }
+        },
+        _ => {},
+    }
+    return Read.ok(value.copy())
+}
+
+// `ExtraCodecs.STRING_RGB_VEC3_COLOR`: `#rrggbb`, three floats or an int, each made the floats
+// `ARGB.vector3fFromRGB24` gives, and written as `#rrggbb` again.
+fn rgb_color(c: mut Codecs) -> usize {
+    return c.named(String("rgb_color"), make_rgb_color)
+}
+
+fn make_rgb_color(c: mut Codecs) -> Codec {
+    let hex = hex_color(mut c, 6, rgb_of_int)
+    let floats = vector_of(mut c, 3, rgb_of_floats)
+    let i = i32_codec(mut c)
+    let int = c.add(Codec.Then(Then { of: i, then: rgb_of_int, with: Tag.End }))
+    let rest = c.add(Codec.Either(floats, int))
+    return Codec.Either(hex, rest)
+}
+
+// `ExtraCodecs.STRING_ARGB_VEC4_COLOR`: `#aarrggbb`, four floats, red first, or an int.
+fn argb_color(c: mut Codecs) -> usize {
+    return c.named(String("argb_color"), make_argb_color)
+}
+
+fn make_argb_color(c: mut Codecs) -> Codec {
+    let hex = hex_color(mut c, 8, argb_of_int)
+    let floats = vector_of(mut c, 4, argb_of_floats)
+    let i = i32_codec(mut c)
+    let int = c.add(Codec.Then(Then { of: i, then: argb_of_int, with: Tag.End }))
+    let rest = c.add(Codec.Either(floats, int))
+    return Codec.Either(hex, rest)
+}
+
+// `ExtraCodecs.RGB_COLOR_CODEC`: an int, or three floats made one opaque, written as the int.
+fn rgb_int(c: mut Codecs) -> usize {
+    return c.named(String("rgb_int"), make_rgb_int)
+}
+
+fn make_rgb_int(c: mut Codecs) -> Codec {
+    let i = i32_codec(mut c)
+    let floats = vector_of(mut c, 3, rgb_int_of_floats)
+    return Codec.Either(i, floats)
+}
+
+// `ExtraCodecs.ARGB_COLOR_CODEC`: an int, or four floats, alpha last.
+fn argb_int(c: mut Codecs) -> usize {
+    return c.named(String("argb_int"), make_argb_int)
+}
+
+fn make_argb_int(c: mut Codecs) -> Codec {
+    let i = i32_codec(mut c)
+    let floats = vector_of(mut c, 4, argb_int_of_floats)
+    return Codec.Either(i, floats)
+}
+
+// `ExtraCodecs.hexColor(digits)`, then what `next` makes of the color.
+fn hex_color(c: mut Codecs, digits: i32, next: fn(Codecs, Tag, Tag) -> Read) -> usize {
+    let s = string(mut c)
+    let hex = c.add(Codec.Then(Then { of: s, then: read_hex, with: Tag.Int(digits) }))
+    return c.add(Codec.Then(Then { of: hex, then: next, with: Tag.End }))
+}
+
+fn read_hex(_c: Codecs, value: Tag, with: Tag) -> Read {
+    let digits = int_tag(with)
+    let s = match value {
+        Tag.Str(t) => t.copy(),
+        _ => String(),
+    }
+    if not s.starts_with("#") {
+        return Read.bad(String("Hex color must begin with #"))
+    }
+    let got = i64.wrap(s.utf16_len()) - 1
+    if got != i64(digits) {
+        return Read.bad("Hex color is wrong size, expected {digits} digits but got {got}")
+    }
+    var v: i64 = 0
+    for i in 1..s.len() {
+        let d = hex_value(s.byte_at(i)) else return Read.bad("Invalid color value: {s}")
+        v = (v << 4) | i64(d)
+    }
+    return Read.ok(Tag.Int(i32.wrap(v)))
+}
+
+// An ASCII hex digit's value, as `HexFormat.fromHexDigit` reads it.
+fn hex_value(b: u8) -> u8? {
+    if b >= 48 and b <= 57 {
+        return some(b - 48)
+    }
+    if b >= 97 and b <= 102 {
+        return some(b - 87)
+    }
+    if b >= 65 and b <= 70 {
+        return some(b - 55)
+    }
+    return none
+}
+
+// `ExtraCodecs.VECTOR3F` and `VECTOR4F`: `n` floats, then what `next` makes of them.
+fn vector_of(c: mut Codecs, n: i32, next: fn(Codecs, Tag, Tag) -> Read) -> usize {
+    let f = f32_codec(mut c)
+    let list = c.add(Codec.ListOf(Many { of: f }))
+    let fixed = c.add(Codec.Then(Then { of: list, then: fixed_size, with: Tag.Int(n) }))
+    return c.add(Codec.Then(Then { of: fixed, then: next, with: Tag.End }))
+}
+
+// `Util.fixedSize(list, n)`: the list if it has `n` items, and else an error, with its first `n`
+// if it has more.
+fn fixed_size(_c: Codecs, value: Tag, with: Tag) -> Read {
+    let n = usize.wrap(i64(int_tag(with)))
+    match value {
+        Tag.List(items) => {
+            if items.len() == n {
+                return Read.ok(value.copy())
+            }
+            let message = "Input is not a list of {n} elements"
+            if items.len() < n {
+                return Read.bad(message)
+            }
+            var first = List<Tag>()
+            for i in 0..n {
+                first.push(items[i].copy())
+            }
+            return Read { value: some(Tag.List(first)), error: some(message) }
+        },
+        _ => return Read.ok(value.copy()),
+    }
+}
+
+fn floats_of(value: Tag) -> List<f32> {
+    var out = List<f32>()
+    match value {
+        Tag.List(items) => {
+            for t in items {
+                out.push(float_tag(t))
+            }
+        },
+        _ => {},
+    }
+    while out.len() < 4 {
+        out.push(0.0f32)
+    }
+    return out
+}
+
+// `ARGB.redFloat` and the like: the 8 bits `shift` up in `color`, from 0 to 1.
+fn channel_of(color: i32, shift: i32) -> f32 {
+    return f32(u8.wrap(color >> shift)) / 255.0f32
+}
+
+// `ARGB.colorFromFloat`.
+fn color_of(a: f32, r: f32, g: f32, b: f32) -> i32 {
+    return (as_8bit_channel(a) << 24) | (as_8bit_channel(r) << 16) | (as_8bit_channel(g) << 8) | as_8bit_channel(b)
+}
+
+// `#` and the low `digits` hex digits of `v`, in lower case, as `hexColor` writes a color.
+fn hex_text(v: i32, digits: i32) -> String {
+    let chars = "0123456789abcdef"
+    var out = String("#")
+    var shift = (digits - 1) * 4
+    while shift >= 0 {
+        out.push(rune(chars.byte_at(usize.wrap(i64((v >> shift) & 15)))))
+        shift -= 4
+    }
+    return out
+}
+
+// An RGB color, as `ARGB.colorFromVector3f` and `hexColor(6)` write it.
+fn rgb_hex(r: f32, g: f32, b: f32) -> Tag {
+    return Tag.Str(hex_text(color_of(1.0f32, r, g, b), 6))
+}
+
+fn rgb_of_int(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let v = int_tag(value)
+    return Read.ok(rgb_hex(channel_of(v, 16), channel_of(v, 8), channel_of(v, 0)))
+}
+
+fn rgb_of_floats(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let f = floats_of(value)
+    return Read.ok(rgb_hex(f[0], f[1], f[2]))
+}
+
+fn argb_of_int(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let v = int_tag(value)
+    let color = color_of(channel_of(v, 24), channel_of(v, 16), channel_of(v, 8), channel_of(v, 0))
+    return Read.ok(Tag.Str(hex_text(color, 8)))
+}
+
+// Four floats, red first and alpha last, as `ARGB.colorFromVector4f` writes them.
+fn argb_of_floats(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let f = floats_of(value)
+    return Read.ok(Tag.Str(hex_text(color_of(f[3], f[0], f[1], f[2]), 8)))
+}
+
+fn rgb_int_of_floats(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let f = floats_of(value)
+    return Read.ok(Tag.Int(color_of(1.0f32, f[0], f[1], f[2])))
+}
+
+fn argb_int_of_floats(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let f = floats_of(value)
+    return Read.ok(Tag.Int(color_of(f[3], f[0], f[1], f[2])))
+}
+
+// `BedRule.CODEC`.
+fn make_bed_rule(c: mut Codecs) -> Codec {
+    let rule = c.add(Codec.Names(["always", "when_dark", "never"]))
+    let flag = bool_codec(mut c)
+    let fields: List<Field> = [
+        req("can_sleep", rule),
+        req("can_set_spawn", rule),
+        def("destroy_on_use", flag, Tag.Byte(0i8)),
+        def("destroy_on_leave", flag, Tag.Byte(0i8)),
+        opt("error_message", text(mut c)),
+    ]
+    return Codec.Record(fields)
+}
+
+// `BackgroundMusic.CODEC`, each of its kinds a `Music.CODEC`.
+fn make_background_music(c: mut Codecs) -> Codec {
+    let n = non_negative_int(mut c)
+    let music_fields: List<Field> = [
+        req("sound", sound(mut c)),
+        req("min_delay", n),
+        req("max_delay", n),
+        def("replace_current_music", bool_codec(mut c), Tag.Byte(0i8)),
+    ]
+    let music = c.add(Codec.Record(music_fields))
+    let fields: List<Field> = [opt("default", music), opt("creative", music), opt("underwater", music)]
+    return Codec.Record(fields)
+}
+
+// `AmbientSounds.CODEC`.
+fn make_ambient_sounds(c: mut Codecs) -> Codec {
+    let s = sound(mut c)
+    let i = i32_codec(mut c)
+    let d = f64_codec(mut c)
+    let mood_fields: List<Field> = [req("sound", s), req("tick_delay", i), req("block_search_extent", i), req("offset", d)]
+    let mood = c.add(Codec.Record(mood_fields))
+    let addition_fields: List<Field> = [req("sound", s), req("tick_chance", d)]
+    let addition = c.add(Codec.Record(addition_fields))
+    let additions = c.add(Codec.Compact(addition))
+    let fields: List<Field> = [opt("loop", s), opt("mood", mood), def("additions", additions, Tag.List(List<Tag>()))]
+    return Codec.Record(fields)
+}
+
+// `AmbientParticle.CODEC.listOf()`.
+fn make_ambient_particles(c: mut Codecs) -> Codec {
+    let p = particle(mut c)
+    let fields: List<Field> = [req("particle", p), req("probability", unit_float(mut c))]
+    let one = c.add(Codec.Record(fields))
+    return Codec.ListOf(Many { of: one })
+}
+
+// `MobSpawnSettings.CODEC`: the mobs that spawn, by category, and what each costs.
+fn make_mob_spawn_settings(c: mut Codecs) -> Codec {
+    let categories = c.add(Codec.Names([
+        "monster", "creature", "ambient", "axolotls", "underground_water_creature", "water_creature", "water_ambient",
+        "misc",
+    ]))
+    let entity = by_name(mut c, "minecraft:entity_type")
+    let spawner_fields: List<Field> = [
+        req("type", entity),
+        req("count", int_provider(mut c)),
+        req("weight", non_negative_int(mut c)),
+    ]
+    let spawner = c.add(Codec.Record(spawner_fields))
+    // `WeightedList.codec(SpawnerData.CODEC).promotePartial`: the spawners that read, whatever
+    // didn't.
+    let spawners = c.add(Codec.ListOf(Many { of: spawner }))
+    let promoted = c.add(Codec.Promote(spawners))
+    let d = f64_codec(mut c)
+    let cost_fields: List<Field> = [req("energy_budget", d), req("charge", d)]
+    let cost = c.add(Codec.Record(cost_fields))
+    // A category's `toString` is its constant's name, and an entity type's its description ID.
+    let by_category = c.add(Codec.MapOf(MapOf { key: categories, value: promoted, upper: true }))
+    let costs = c.add(Codec.MapOf(MapOf { key: entity, value: cost, before: "entity.", dotted: true }))
+    let fields: List<Field> = [req("spawns_by_category", by_category), req("spawn_costs", costs)]
+    return Codec.Record(fields)
+}
+
+// `ParticleTypes.CODEC`: a particle by its type, with that type's options.
+fn particle(c: mut Codecs) -> usize {
+    return c.named(String("particle"), make_particle)
+}
+
+fn make_particle(c: mut Codecs) -> Codec {
+    let no_fields: List<Field> = []
+    let simple = c.add(Codec.Record(no_fields))
+    let state = particle_block_state(mut c)
+    let block_fields: List<Field> = [req("block_state", state)]
+    let block = c.add(Codec.Record(block_fields))
+    let positive = positive_int(mut c)
+    let f = f32_codec(mut c)
+    let i = i32_codec(mut c)
+    let geyser_fields: List<Field> = [req("water_blocks", positive)]
+    let geyser = c.add(Codec.Record(geyser_fields))
+    let base_fields: List<Field> = [req("water_blocks", positive), req("burst_impulse_base", f)]
+    let geyser_base = c.add(Codec.Record(base_fields))
+    // Its default is an option made anew each time a particle is read or written, which isn't
+    // equal to another, so it's always written.
+    let power_fields: List<Field> = [Field { name: "power", of: f, need: Need.Always(Tag.Float(1.0f32)) }]
+    let power = c.add(Codec.Record(power_fields))
+    let rgb = rgb_int(mut c)
+    let argb = argb_int(mut c)
+    let scale = c.add(Codec.Then(Then { of: f, then: check_scale, with: Tag.End }))
+    let dust_fields: List<Field> = [req("color", rgb), req("scale", scale)]
+    let dust = c.add(Codec.Record(dust_fields))
+    let transition_fields: List<Field> = [req("from_color", rgb), req("to_color", rgb), req("scale", scale)]
+    let transition = c.add(Codec.Record(transition_fields))
+    let spell_fields: List<Field> = [def("color", rgb, Tag.Int(-1)), def("power", f, Tag.Float(1.0f32))]
+    let spell = c.add(Codec.Record(spell_fields))
+    let color_fields: List<Field> = [req("color", argb)]
+    let color = c.add(Codec.Record(color_fields))
+    let item_fields: List<Field> = [req("item", item_stack_template(mut c))]
+    let item = c.add(Codec.Record(item_fields))
+    let vibration_fields: List<Field> = [req("destination", position_source(mut c)), req("arrival_in_ticks", i)]
+    let vibration = c.add(Codec.Record(vibration_fields))
+    let trail_fields: List<Field> = [req("target", vec3(mut c)), req("color", rgb), req("duration", positive)]
+    let trail = c.add(Codec.Record(trail_fields))
+    let shriek_fields: List<Field> = [req("delay", i)]
+    let shriek = c.add(Codec.Record(shriek_fields))
+    let charge_fields: List<Field> = [req("roll", f)]
+    let charge = c.add(Codec.Record(charge_fields))
+    let with_options: List<(String, usize)> = [
+        ("block", block), ("block_marker", block), ("falling_dust", block), ("dust_pillar", block),
+        ("block_crumble", block), ("geyser", geyser), ("geyser_plume", geyser), ("geyser_base", geyser_base),
+        ("geyser_poof", geyser_base), ("dragon_breath", power), ("dust", dust),
+        ("dust_color_transition", transition), ("effect", spell), ("instant_effect", spell),
+        ("entity_effect", color), ("tinted_leaves", color), ("flash", color), ("item", item),
+        ("vibration", vibration), ("trail", trail), ("shriek", shriek), ("sculk_charge", charge),
+    ]
+    var kinds = List<(String, usize)>()
+    let names = builtin_names()
+    for n in 0..names.len() {
+        if names[n] != "particle_type" {
+            continue
+        }
+        for p in builtin_entries(n) {
+            var of = simple
+            for (name, options) in with_options {
+                if name == p {
+                    of = options
+                }
+            }
+            kinds.push(("minecraft:{p}", of))
+        }
+    }
+    let by = by_name(mut c, "minecraft:particle_type")
+    return Codec.Dispatch(Kinds { key: "type", by: by, kinds: kinds })
+}
+
+// `ScalableParticleOptionsBase.SCALE`.
+fn check_scale(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let v = float_tag(value)
+    if v >= 0.01f32 and v <= 4.0f32 {
+        return Read.ok(value.copy())
+    }
+    return Read.bad("Value must be within range [0.01;4.0]: {v}")
+}
+
+// `BlockParticleOption`'s block state: `BlockState.CODEC`, or a block by name for its default
+// state.
+fn particle_block_state(c: mut Codecs) -> usize {
+    let state = block_state(mut c)
+    let blocks = by_name(mut c, "minecraft:block")
+    let block = c.add(Codec.Then(Then { of: blocks, then: default_state_of, with: Tag.End }))
+    return c.add(Codec.Either(state, block))
+}
+
+// The default state of the block `value` names, as `BlockState.CODEC` writes it.
+fn default_state_of(c: Codecs, value: Tag, _with: Tag) -> Read {
+    let name = match value {
+        Tag.Str(s) => s.copy(),
+        _ => String(),
+    }
+    match c.states {
+        some(states) => {
+            return match states.blocks.parse(name) {
+                ok(block) => Read.ok(states.encode(states.default_state(block))),
+                err(e) => Read.bad(e),
+            }
+        },
+        none => return Read.bad(String("no block states to read")),
+    }
+}
+
+// `VibrationParticleOption`'s destination: `PositionSource.CODEC`, without entities.
+fn position_source(c: mut Codecs) -> usize {
+    let pos_fields: List<Field> = [req("pos", vec3i(mut c))]
+    let block = c.add(Codec.Record(pos_fields))
+    let entity_fields: List<Field> = [req("source_entity", uuid(mut c)), def("y_offset", f32_codec(mut c), Tag.Float(0.0f32))]
+    let entity = c.add(Codec.Record(entity_fields))
+    let kinds: List<(String, usize)> = [("minecraft:block", block), ("minecraft:entity", entity)]
+    let by = by_name(mut c, "minecraft:position_source_type")
+    let source = c.add(Codec.Dispatch(Kinds { key: "type", by: by, kinds: kinds }))
+    return c.add(Codec.Then(Then { of: source, then: no_entity_source, with: Tag.End }))
+}
+
+fn no_entity_source(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    if kind_of(value) == "minecraft:entity" {
+        return Read.bad(String("Entity position sources are not allowed"))
+    }
+    return Read.ok(value.copy())
+}
+
+// `UUIDUtil.CODEC`: four ints, written as an int array.
+fn uuid(c: mut Codecs) -> usize {
+    return c.shared(String("uuid"), Codec.Custom(read_uuid))
+}
+
+fn read_uuid(_c: Codecs, value: Json, _r: Registries) -> Read {
+    return match value {
+        Json.Array(items) => ints_of(value, items, 4),
+        _ => Read.bad("Not a json array: {json_text(value)}"),
+    }
+}
+
+// `Vec3.CODEC`: three doubles.
+fn vec3(c: mut Codecs) -> usize {
+    let d = f64_codec(mut c)
+    let list = c.add(Codec.ListOf(Many { of: d }))
+    return c.shared(String("vec3"), Codec.Then(Then { of: list, then: fixed_size, with: Tag.Int(3) }))
+}
+
+// `DimensionType.NETWORK_CODEC`. Its constructor's checks fail it with their message alone, as
+// `ExtraCodecs.catchDecoderException` gives it, so it reads its record itself.
+fn dimension_type(c: mut Codecs) -> usize {
+    let flag = bool_codec(mut c)
+    // `Codec.doubleRange(1.0E-5F, 3.0E7)`: its least is the `float` nearest 1.0E-5.
+    let least = f64(0.00001f32)
+    let most = 30000000.0
+    let scale = c.add(Codec.Double(DoubleRange { min: least, max: most, checked: true, before: "Value ", after: " outside of range [{least}:{most}]" }))
+    let min_y = c.add(Codec.Int(IntRange { min: -2032, max: 2031, before: "Value ", after: " outside of range [-2032:2031]" }))
+    let height = c.add(Codec.Int(IntRange { min: 16, max: 4064, before: "Value ", after: " outside of range [16:4064]" }))
+    let logical = c.add(Codec.Int(IntRange { min: 0, max: 4064, before: "Value ", after: " outside of range [0:4064]" }))
+    let light = c.add(Codec.Int(IntRange { min: 0, max: 15, before: "Value ", after: " outside of range [0:15]" }))
+    let blocks = c.add(Codec.Holders(HolderCodec { registry: "minecraft:block", inline: none, kind: HolderKind.Fixed }))
+    let timelines = c.add(Codec.Holders(HolderCodec { registry: "minecraft:timeline", inline: none, kind: HolderKind.Fixed }))
+    let clock = c.add(Codec.Holder(HolderCodec { registry: "minecraft:world_clock", inline: none, kind: HolderKind.Fixed }))
+    let skyboxes = c.add(Codec.Names(["none", "overworld", "end"]))
+    let lights = c.add(Codec.Names(["default", "nether"]))
+    let provider = int_provider(mut c)
+    let bounds: List<i32> = [0, 15]
+    let light_test = c.add(Codec.Then(Then { of: provider, then: int_provider_within, with: Tag.IntArray(bounds) }))
+    let fields: List<Field> = [
+        def("has_fixed_time", flag, Tag.Byte(0i8)),
+        req("has_skylight", flag),
+        req("has_ceiling", flag),
+        req("has_ender_dragon_fight", flag),
+        req("coordinate_scale", scale),
+        req("min_y", min_y),
+        req("height", height),
+        req("logical_height", logical),
+        req("infiniburn", blocks),
+        req("ambient_light", f32_codec(mut c)),
+        req("monster_spawn_light_level", light_test),
+        req("monster_spawn_block_light_limit", light),
+        def("skybox", skyboxes, Tag.Str(String("overworld"))),
+        def("cardinal_light", lights, Tag.Str(String("default"))),
+        // Only the attributes clients are sent are written, but the field is left out only where
+        // there were none at all, as `optionalFieldOf` compares the map before
+        // `EnvironmentAttributeMap.NETWORK_CODEC` filters it.
+        def("attributes", attribute_map(mut c), Tag.Compound(JavaHashMap<String, Tag>())),
+        def("timelines", timelines, Tag.List(List<Tag>())),
+        opt("default_clock", clock),
+    ]
+    let _record = c.shared(String("dimension_type_record"), Codec.Record(fields))
+    return c.add(Codec.Custom(read_dimension_type))
+}
+
+fn read_dimension_type(c: Codecs, value: Json, r: Registries) -> Read {
+    let at = c.find(String("dimension_type_record")) else return Read.bad(String("no codec for dimension types"))
+    var got = c.read(at, value, r)
+    let v = got.value.take() else return got
+    // `DimensionType`'s constructor, which runs on a partial value too. The height is at least 16,
+    // as its codec reads it.
+    let min_y = int_tag(field(v, "min_y"))
+    let height = int_tag(field(v, "height"))
+    if min_y + height > 2032 {
+        return Read.bad(String("min_y + height cannot be higher than: 2032"))
+    }
+    if int_tag(field(v, "logical_height")) > height {
+        return Read.bad(String("logical_height cannot be higher than height"))
+    }
+    if height % 16 != 0 {
+        return Read.bad(String("height has to be multiple of 16"))
+    }
+    if min_y % 16 != 0 {
+        return Read.bad(String("min_y has to be a multiple of 16"))
+    }
+    return Read { value: some(synced_field(v, "attributes")), error: got.error.take() }
+}
+
+// `value` with only the attributes clients are sent in its map of attributes under `key`, if it
+// has one.
+fn synced_field(value: Tag, key: String) -> Tag {
+    match value {
+        Tag.Compound(fields) => {
+            var out = JavaHashMap<String, Tag>()
+            for (k, v) in fields {
+                if k == key {
+                    out.insert(k.copy(), synced_only(v))
+                } else {
+                    out.insert(k.copy(), v.copy())
+                }
+            }
+            return Tag.Compound(out)
+        },
+        _ => return value.copy(),
+    }
+}
+
+// `IntProviders.validateCodec(min, max, CODEC)`'s check of what a provider gives.
+fn int_provider_within(_c: Codecs, value: Tag, with: Tag) -> Read {
+    let (least, most) = match with {
+        Tag.IntArray(b) => (b[0], b[1]),
+        _ => (i32.MIN, i32.MAX),
+    }
+    let (min, max) = int_bounds(value)
+    if min < least {
+        return Read.bad("Value provider too low: {least} [{min}-{max}]")
+    }
+    if max > most {
+        return Read.bad("Value provider too high: {most} [{min}-{max}]")
+    }
+    return Read.ok(value.copy())
+}
+
+// The least and most an int provider gives, as `IntProvider.minInclusive` and `maxInclusive` give
+// them.
+fn int_bounds(value: Tag) -> (i32, i32) {
+    match value {
+        Tag.Int(v) => return (v, v),
+        _ => {},
+    }
+    let kind = kind_of(value)
+    if kind == "minecraft:trapezoid" {
+        return (int_tag(field(value, "min")), int_tag(field(value, "max")))
+    }
+    if kind == "minecraft:weighted_list" {
+        var min = i32.MAX
+        var max = i32.MIN
+        match field(value, "distribution") {
+            Tag.List(entries) => {
+                for e in entries {
+                    let (low, high) = int_bounds(field(e, "data"))
+                    if low < min {
+                        min = low
+                    }
+                    if high > max {
+                        max = high
+                    }
+                }
+            },
+            _ => {},
+        }
+        return (min, max)
+    }
+    return (int_tag(field(value, "min_inclusive")), int_tag(field(value, "max_inclusive")))
+}
+
+// `Biome.NETWORK_CODEC`: a biome's climate, the attributes clients are sent and its effects, read
+// as `DIRECT_CODEC` reads one from a data pack, with what it generates, which isn't sent.
+fn biome(c: mut Codecs) -> usize {
+    let flag = bool_codec(mut c)
+    let f = f32_codec(mut c)
+    let modifiers = c.add(Codec.Names(["none", "frozen"]))
+    let _map = attribute_map(mut c)
+    let attributes = c.add(Codec.Custom(read_positional_attributes))
+    let color = c.named(String("string_rgb_color"), make_string_rgb_color)
+    let grass = c.add(Codec.Names(["none", "dark_forest", "swamp"]))
+    let effect_fields: List<Field> = [
+        req("water_color", color),
+        opt("foliage_color", color),
+        opt("dry_foliage_color", color),
+        opt("grass_color", color),
+        def("grass_color_modifier", grass, Tag.Str(String("none"))),
+    ]
+    let effects = c.add(Codec.Record(effect_fields))
+    // `BiomeGenerationSettings.CODEC`: its carvers and its features by step, each logged and left
+    // out where they don't read.
+    let unchecked = c.shared(String("unchecked inline"), Codec.Custom(read_unchecked))
+    let carver_set = c.add(Codec.Holders(HolderCodec { registry: "minecraft:worldgen/carver", inline: some(unchecked) }))
+    let carvers = c.add(Codec.Promote(carver_set))
+    let feature_set = c.add(Codec.Holders(HolderCodec { registry: "minecraft:worldgen/placed_feature", inline: some(unchecked) }))
+    let feature_steps = c.add(Codec.ListOf(Many { of: feature_set }))
+    let features = c.add(Codec.Promote(feature_steps))
+    let fields: List<Field> = [
+        req("has_precipitation", flag),
+        req("temperature", f),
+        def("temperature_modifier", modifiers, Tag.Str(String("none"))),
+        req("downfall", f),
+        // As a dimension type's: left out only where there were none at all.
+        def("attributes", attributes, Tag.Compound(JavaHashMap<String, Tag>())),
+        req("effects", effects),
+        req("carvers", carvers),
+        req("features", features),
+    ]
+    let _record = c.shared(String("biome_record"), Codec.Record(fields))
+    return c.add(Codec.Custom(read_biome))
+}
+
+fn read_biome(c: Codecs, value: Json, r: Registries) -> Read {
+    let at = c.find(String("biome_record")) else return Read.bad(String("no codec for biomes"))
+    var got = c.read(at, value, r)
+    let v = got.value.take() else return got
+    return Read { value: some(network_biome(v)), error: got.error.take() }
+}
+
+// A biome as `NETWORK_CODEC` writes it: without what it generates, and with only the attributes
+// clients are sent.
+fn network_biome(value: Tag) -> Tag {
+    let synced = synced_field(value, "attributes")
+    match synced {
+        Tag.Compound(fields) => {
+            var out = JavaHashMap<String, Tag>()
+            for (k, v) in fields {
+                if k != "carvers" and k != "features" {
+                    out.insert(k.copy(), v.copy())
+                }
+            }
+            return Tag.Compound(out)
+        },
+        _ => return synced.copy(),
+    }
+}
+
+// `EnvironmentAttributeMap.CODEC_ONLY_POSITIONAL`: attributes as `CODEC` reads them, with none
+// that can only be set for a whole dimension, named in the order they're given.
+fn read_positional_attributes(c: Codecs, value: Json, r: Registries) -> Read {
+    let at = c.find(String("attribute_map")) else return Read.bad(String("no codec for attributes"))
+    var got = c.read(at, value, r)
+    let v = got.value.take() else return got
+    var wrong = String()
+    for name in object_ids(value) {
+        if has_field(v, name) and attribute_flag(name, "n") {
+            if not wrong.is_empty() {
+                wrong.push_str(", ")
+            }
+            wrong.push_str(name)
+        }
+    }
+    if wrong.is_empty() {
+        return Read { value: some(v), error: got.error.take() }
+    }
+    return after(got.error.take(), Read.bad("The following attributes cannot be positional: [{wrong}]"))
+}
+
+// `ExtraCodecs.STRING_RGB_COLOR`: `#rrggbb`, or an int or three floats as `RGB_COLOR_CODEC` reads
+// them, written as `#rrggbb`.
+fn make_string_rgb_color(c: mut Codecs) -> Codec {
+    let hex = hex_color(mut c, 6, hex6_of_int)
+    let ints = rgb_int(mut c)
+    let int = c.add(Codec.Then(Then { of: ints, then: hex6_of_int, with: Tag.End }))
+    return Codec.Either(hex, int)
+}
+
+// A color as `hexColor(6)` writes it, with `ARGB.transparent`: its low 24 bits.
+fn hex6_of_int(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    return Read.ok(Tag.Str(hex_text(int_tag(value), 6)))
+}
+
+// An inline definition of a carver or a placed feature, which isn't sent. Only that it's an object
+// is checked for now: the worldgen codecs that read them in full come with worldgen.
+fn read_unchecked(_c: Codecs, value: Json, _r: Registries) -> Read {
+    return match value {
+        Json.Object(_) => Read.ok(Tag.End),
+        _ => Read.bad("Not a JSON object: {json_text(value)}"),
+    }
 }

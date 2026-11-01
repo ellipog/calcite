@@ -50,6 +50,11 @@ def rebalance_meta():
     return meta(features={"enabled": [REBALANCE]})
 
 
+# The time each file in a zip says it was written, fixed so the cases come out the same on every
+# run: the time the committed ones were first written.
+WRITTEN = (2026, 11, 1, 3, 19, 0)
+
+
 def zipped(files, deflate=True):
     """A zip of the files, each a name and its text or bytes, as Java's zip tools would read it."""
     out = io.BytesIO()
@@ -58,7 +63,11 @@ def zipped(files, deflate=True):
             if name.endswith("/"):
                 z.writestr(zipfile.ZipInfo(name), b"")
             else:
-                z.writestr(name, data.encode() if isinstance(data, str) else data)
+                # As `writestr` makes it for a name, but at a fixed time.
+                info = zipfile.ZipInfo(name, date_time=WRITTEN)
+                info.compress_type = z.compression
+                info.external_attr = 0o600 << 16
+                z.writestr(info, data.encode() if isinstance(data, str) else data)
     return out.getvalue()
 
 

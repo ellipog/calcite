@@ -19,6 +19,11 @@ CALCITE = HERE.parents[1]
 sys.path.insert(0, str(CALCITE / "rig" / "runner"))
 from cases import write_file  # noqa: E402
 
+# The registries whose contents have maps vanilla fills in an order that changes from run to run,
+# `Map.copyOf` over attributes hashed by identity: a timeline's tracks, and a dimension type's and
+# a biome's attributes. Their compounds are compared sorted by key (D192).
+UNORDERED = {"timeline", "dimension_type", "worldgen/biome"}
+
 
 def names(path, function):
     """The string list `function` in the Calx module at `path` returns."""
@@ -38,7 +43,10 @@ def main():
     for name in registries:
         cases.append({"id": "tags-" + name.replace("/", "."), "input": {"op": "tags", "registry": "minecraft:" + name}})
     for name in names("src/registry/registries.calx", "synced_names"):
-        cases.append({"id": "contents-" + name.replace("/", "."), "input": {"op": "contents", "registry": "minecraft:" + name}})
+        case = {"id": "contents-" + name.replace("/", "."), "input": {"op": "contents", "registry": "minecraft:" + name}}
+        if name in UNORDERED:
+            case["unordered"] = True
+        cases.append(case)
     write_file(HERE / "configuration.json", "registries", "cases/registries/gen.py", cases, probe_version=2)
 
 
