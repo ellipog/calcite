@@ -1,0 +1,262 @@
+/// The `structures` probe (rig/PROTOCOL.md): where a world's structure sets place structures, its
+/// strongholds' rings, and the structure starts made in chunks, for a noise generator with the
+/// case's settings and biome source.
+module rig.structures
+
+import json.tree.{Json, Member, as_i32, as_string, get, take}
+import pack.zip.{Zip}
+import registry.registry.{Registry}
+import rig.frame.{Outcome}
+import rig.surface.{invalid, put_u32, rejected}
+import worldgen.biome_manager.{SourceBiomes}
+import worldgen.biome_source.{climate_of, read_source}
+import worldgen.density.{Functions, data_json, qualified}
+import worldgen.interval.{Thrown}
+import worldgen.sampler.{Program}
+import worldgen.structures.{Placement, StructureState, Structures}
+
+/// The most ops a case may have, and the widest square a `placement` op may ask about, as the
+/// vanilla adapter allows.
+const MAX_OPS: usize = 64
+const MAX_SQUARE: i32 = 256
+
+/// An op, as the case gives it.
+enum Op {
+    Placement { x: i32, z: i32, size: i32 }
+    Rings
+    Starts { x: i32, z: i32 }
+    RingStarts(i32)
+}
+
+/// What the generator has: the structures, its state, and its biomes.
+struct World {
+    structures: Structures
+    state: StructureState
+    biomes: SourceBiomes
+}
+
+pub fn run_structures(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, biomes: Registry) -> Outcome {
+    if blobs.len() != 0 {
+        return Outcome.Failed("`structures` takes no blobs")
+    }
+    var fields = input
+    let seed_value = take(mut fields, "seed") else return Outcome.Failed("missing field `seed`")
+    let seed_text = as_string(seed_value) else return Outcome.Failed("`seed` must be a string")
+    let seed = i64.parse(seed_text) else return Outcome.Failed("`seed` must be a decimal 64-bit integer")
+    let settings_value = take(mut fields, "settings") else return Outcome.Failed("missing field `settings`")
+    let name = as_string(settings_value) else return Outcome.Failed("`settings` must be an identifier")
+    let settings_id = qualified(name)
+    let json = match data_json(zip, settings_id.copy(), "noise_settings") {
+        ok(j) => j,
+        err(e) => return Outcome.Failed(e),
+    }
+    let members = match json {
+        Json.Object(m) => m,
+        _ => return Outcome.Failed("noise settings `{name}` isn't an object"),
+    }
+    let legacy = match get(members, "legacy_random_source") {
+        some(Json.Bool(b)) => b,
+        _ => return Outcome.Failed("noise settings `{name}` have no `legacy_random_source`"),
+    }
+    let level = match take(mut fields, "level") {
+        some(Json.Array(items)) => items,
+        _ => return Outcome.Failed("`level` must be [min_y, height]"),
+    }
+    if level.len() != 2 {
+        return Outcome.Failed("`level` must be [min_y, height]")
+    }
+    let min_y = as_i32(level[0]) else return Outcome.Failed("`level`[0] must be an int")
+    let height = as_i32(level[1]) else return Outcome.Failed("`level`[1] must be an int")
+    if min_y % 16 != 0 or height % 16 != 0 or height <= 0 or min_y < -2032 or min_y + height > 2032 {
+        return Outcome.Failed("`level` must be whole sections within the world")
+    }
+    let op_list = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let items = match op_list {
+        Json.Array(a) => a,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    if items.len() > MAX_OPS {
+        return Outcome.Failed("at most {MAX_OPS} ops")
+    }
+    var ops = List<Op>()
+    for i in 0..items.len() {
+        match read_op(items[i], i) {
+            ok(op) => ops.push(op),
+            err(e) => return Outcome.Failed(e),
+        }
+    }
+    let source_value = take(mut fields, "source") else return Outcome.Failed("missing field `source`")
+    let source = match read_source(zip, biomes, source_value) {
+        ok(s) => s,
+        err(_) => return invalid("source"),
+    }
+    let structures = match Structures.read(zip, biomes) {
+        ok(s) => s,
+        err(e) => return Outcome.Failed(e),
+    }
+    var functions = Functions.new(legacy, seed)
+    let router = match get(members, "noise_router") {
+        some(Json.Object(m)) => m,
+        _ => return Outcome.Failed("noise settings `{name}` have no router"),
+    }
+    let climate = match climate_of(mut functions, zip, router) {
+        ok(c) => c,
+        err(e) => return Outcome.Failed(e),
+    }
+    let state = StructureState.new(structures, source.possible(), seed)
+    var world = World { structures: structures, state: state, biomes: SourceBiomes.new(source, climate, seed) }
+    var out = List<u8>()
+    for op in ops {
+        match run_op(mut world, functions.program, op, mut out) {
+            ok => {},
+            err(thrown) => {
+                if thrown.exception == "Unimplemented" {
+                    return Outcome.Unimplemented(thrown.message.copy())
+                }
+                return rejected(thrown)
+            },
+        }
+    }
+    let output: List<Member> = []
+    return Outcome.Done { output: output, blobs: [out] }
+}
+
+fn read_op(value: Json, i: usize) -> Op ! String {
+    let what = "`ops`[{i}]"
+    let parts = match value {
+        Json.Array(a) => a.copy(),
+        _ => fail "{what} must be a non-empty array",
+    }
+    if parts.len() == 0 {
+        fail "{what} must be a non-empty array"
+    }
+    let kind = as_string(parts[0]) else fail "{what}[0] must be a string"
+    let ints = List<i32>()
+    var numbers = ints
+    for k in 1..parts.len() {
+        let v = as_i32(parts[k]) else fail "{what}[{k}] must be an int"
+        numbers.push(v)
+    }
+    if kind == "placement" {
+        if parts.len() != 4 {
+            fail "{what} must have 4 elements"
+        }
+        if numbers[2] < 1 or numbers[2] > MAX_SQUARE {
+            fail "{what}[3] must be 1 to {MAX_SQUARE}"
+        }
+        return Op.Placement { x: numbers[0], z: numbers[1], size: numbers[2] }
+    }
+    if kind == "rings" {
+        if parts.len() != 1 {
+            fail "{what} must have 1 element"
+        }
+        return Op.Rings
+    }
+    if kind == "starts" {
+        if parts.len() != 3 {
+            fail "{what} must have 3 elements"
+        }
+        return Op.Starts { x: numbers[0], z: numbers[1] }
+    }
+    if kind == "ring_starts" {
+        if parts.len() != 2 {
+            fail "{what} must have 2 elements"
+        }
+        if numbers[0] < 0 or numbers[0] > 16 {
+            fail "{what}[1] must be 0 to 16"
+        }
+        return Op.RingStarts(numbers[0])
+    }
+    fail "{what}: unknown op `{kind}`"
+}
+
+fn run_op(w: mut World, p: Program, op: Op, out: mut List<u8>) ! Thrown {
+    match op {
+        Op.Placement { x, z, size } => {
+            put_u32(mut out, u32.wrap(w.state.possible.len()))
+            for set in w.state.possible.copy() {
+                put_utf(mut out, w.structures.sets[set].id)
+                var found = List<u8>()
+                var count = 0u32
+                for cz in z..z + size {
+                    for cx in x..x + size {
+                        if try w.state.is_structure_chunk(w.structures, mut w.biomes, p, set, cx, cz) {
+                            put_u32(mut found, u32.wrap(cx))
+                            put_u32(mut found, u32.wrap(cz))
+                            count += 1
+                        }
+                    }
+                }
+                put_u32(mut out, count)
+                for b in found {
+                    out.push(b)
+                }
+            }
+        },
+        Op.Rings => {
+            let sets = ring_sets(w)
+            put_u32(mut out, u32.wrap(sets.len()))
+            for set in sets {
+                put_utf(mut out, w.structures.sets[set].id)
+                if let positions = try w.state.ring_positions(w.structures, mut w.biomes, p, set) {
+                    put_u32(mut out, u32.wrap(positions.len()))
+                    for (rx, rz) in positions {
+                        put_u32(mut out, u32.wrap(rx))
+                        put_u32(mut out, u32.wrap(rz))
+                    }
+                } else {
+                    put_u32(mut out, u32.wrap(-1))
+                }
+            }
+        },
+        Op.Starts { x, z } => try starts(mut w, p, x, z, mut out),
+        Op.RingStarts(count) => {
+            for set in ring_sets(w) {
+                let positions = try w.state.ring_positions(w.structures, mut w.biomes, p, set) ?? List<(i32, i32)>()
+                let n = positions.len().min(usize.wrap(count))
+                put_u32(mut out, u32.wrap(n))
+                for k in 0..n {
+                    let (rx, rz) = positions[k]
+                    try starts(mut w, p, rx, rz, mut out)
+                }
+            }
+        },
+    }
+}
+
+// The possible sets placed in concentric rings, in order.
+fn ring_sets(w: World) -> List<usize> {
+    var out = List<usize>()
+    for set in w.state.possible {
+        match w.structures.sets[set].placement {
+            Placement.Rings { .. } => out.push(set),
+            _ => {},
+        }
+    }
+    return out
+}
+
+// `createStructures` on a chunk with no starts: the starts a chunk saves, as one compound.
+fn starts(w: mut World, p: Program, x: i32, z: i32, out: mut List<u8>) ! Thrown {
+    for set in w.state.possible.copy() {
+        if try w.state.is_structure_chunk(w.structures, mut w.biomes, p, set, x, z) {
+            let first = w.structures.sets[set].structures[0]
+            let kind = w.structures.structures[first].kind.copy()
+            fail Thrown { exception: "Unimplemented", message: "the {kind} structure" }
+        }
+    }
+    // An empty compound, as `NbtIo.writeAnyTag` writes it.
+    out.push(10u8)
+    out.push(0u8)
+}
+
+// A string as Java's `writeUTF` writes it, for the ASCII of an identifier.
+fn put_utf(out: mut List<u8>, s: String) {
+    let bytes = s.to_bytes()
+    let n = u32.wrap(bytes.len())
+    out.push(u8.wrap(n >> 8))
+    out.push(u8.wrap(n))
+    for b in bytes {
+        out.push(b)
+    }
+}

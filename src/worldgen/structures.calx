@@ -1,0 +1,564 @@
+/// Structures: vanilla's structure sets and structures, read as their codecs read them, and where
+/// each set's placement puts structures, as 26.3's `ChunkGeneratorStructureState` and the
+/// `StructurePlacement`s work it out: random spread with its frequency reduction and exclusion
+/// zones, and the strongholds' concentric rings, found near their preferred biomes.
+module worldgen.structures
+
+import json.tree.{Json, Member, as_string}
+import pack.zip.{Zip}
+import random.legacy.{LegacyRandom}
+import random.source.{RandomSource}
+import random.worldgen.{WorldgenRandom}
+import registry.registry.{Registry}
+import resources.identifier.{Identifier}
+import std.java.math.{cos, sin}
+import worldgen.biome_manager.{SourceBiomes}
+import worldgen.biome_source.{Kind, holder_set}
+import worldgen.codec.{field, float_range_field, int_of, int_range_field, map_of, type_of}
+import worldgen.density.{data_json}
+import worldgen.interval.{Thrown}
+import worldgen.predicates.{limited, list_of, vec3}
+import worldgen.sampler.{Program}
+
+/// `Math.PI`.
+const PI: f64 = 3.141592653589793
+
+/// `AbstractSpreadingStructurePlacement.FrequencyReductionMethod`.
+pub enum Reducer {
+    Default
+    /// `legacy_type_1`, the pillager outposts'.
+    Legacy1
+    /// `legacy_type_2`, buried treasure's.
+    Legacy2
+    /// `legacy_type_3`, mineshafts'.
+    Legacy3
+}
+
+/// What random spread and concentric rings placements share.
+pub struct Spreading {
+    pub locate_x: i32
+    pub locate_y: i32
+    pub locate_z: i32
+    pub reducer: Reducer
+    pub frequency: f32
+    pub salt: i32
+    /// The set whose structures keep this one's away, by index, and how many chunks away.
+    pub exclusion: usize?
+    pub exclusion_chunks: i32
+}
+
+/// A `StructurePlacement`.
+pub enum Placement {
+    RandomSpread { common: Spreading, spacing: i32, separation: i32, triangular: bool }
+    /// Concentric rings about the origin, each position moved to a preferred biome near it.
+    Rings { common: Spreading, distance: i32, spread: i32, count: i32, preferred: List<i32> }
+    DimensionOrigin
+}
+
+/// A structure set: its placement and its structures, weighted.
+pub struct StructureSet {
+    pub id: String
+    pub placement: Placement
+    pub structures: List<usize>
+    pub weights: List<i32>
+}
+
+/// A `Structure`: its type, the biomes it may start in, its step and terrain adaptation, and
+/// its own fields, which its type reads.
+pub struct Structure {
+    pub id: String
+    pub kind: String
+    pub biomes: List<i32>
+    pub step: i32
+    pub adaptation: i32
+    pub fields: List<Member>
+}
+
+/// `TerrainAdjustment`.
+pub const ADAPT_NONE: i32 = 0
+pub const ADAPT_BURY: i32 = 1
+pub const ADAPT_BEARD_THIN: i32 = 2
+pub const ADAPT_BEARD_BOX: i32 = 3
+pub const ADAPT_ENCAPSULATE: i32 = 4
+
+/// Vanilla's structure sets and the structures they name, as the registries hold them.
+pub struct Structures {
+    /// The registry's sets, in its order, then any written out in another's exclusion zone.
+    pub sets: List<StructureSet>
+    /// How many of `sets` the registry has.
+    pub registered: usize
+    pub structures: List<Structure>
+    structure_ids: Map<String, usize>
+}
+
+impl Structures {
+    /// Every structure set in the data, in the registry's order, by identifier: path, then
+    /// namespace.
+    pub fn read(zip: Zip, biomes: Registry) -> Structures ! String {
+        var ids = List<(String, String)>()
+        for i in 0..zip.len() {
+            let name = zip.name(i)
+            if not name.starts_with("data/") or not name.ends_with(".json") {
+                continue
+            }
+            let rest = name[5..].copy()
+            let slash = rest.find("/") else continue
+            let namespace = rest[..slash].copy()
+            let path = rest[slash + 1..].copy()
+            let prefix = "worldgen/structure_set/"
+            if path.starts_with(prefix) {
+                ids.push((path[prefix.len()..path.len() - 5].copy(), namespace))
+            }
+        }
+        // By path, then namespace, as `Identifier.compareTo`.
+        for i in 1..ids.len() {
+            var j = i
+            while j > 0 and ordered_after(ids[j - 1], ids[j]) {
+                ids.swap(j - 1, j)
+                j -= 1
+            }
+        }
+        var out = Structures { sets: List<StructureSet>(), registered: ids.len(), structures: List<Structure>(), structure_ids: Map<String, usize>() }
+        // The registry's sets first, so that one named in an exclusion zone is found by ID.
+        for (path, namespace) in ids {
+            out.sets.push(StructureSet { id: "{namespace}:{path}", placement: Placement.DimensionOrigin, structures: List<usize>(), weights: List<i32>() })
+        }
+        for i in 0..ids.len() {
+            let id = out.sets[i].id.copy()
+            let json = try data_json(zip, id.copy(), String("structure_set"))
+            let set = try out.read_set(zip, biomes, id, json)
+            out.sets[i] = set
+        }
+        return out
+    }
+
+    // `StructureSet.DIRECT_CODEC`.
+    fn read_set(mut self, zip: Zip, biomes: Registry, id: own String, value: Json) -> StructureSet ! String {
+        let m = try map_of(value)
+        let sv = field(m, "structures") else fail "No key structures in MapLike"
+        var structures = List<usize>()
+        var weights = List<i32>()
+        for item in try list_of(sv) {
+            let em = try map_of(item)
+            let s = field(em, "structure") else fail "No key structure in MapLike"
+            let w = field(em, "weight") else fail "No key weight in MapLike"
+            structures.push(try self.read_structure(zip, biomes, s))
+            let weight = try int_of(w)
+            if weight < 1 {
+                fail "Value must be positive: {weight}"
+            }
+            weights.push(weight)
+        }
+        let pv = field(m, "placement") else fail "No key placement in MapLike"
+        let placement = try self.read_placement(zip, biomes, pv)
+        return StructureSet { id: id, placement: placement, structures: structures, weights: weights }
+    }
+
+    // `Structure.CODEC`: a structure by its ID, or written out.
+    fn read_structure(mut self, zip: Zip, biomes: Registry, value: Json) -> usize ! String {
+        if let text = as_string(value) {
+            let id = (try Identifier.parse(text)).to_string()
+            if let i = self.structure_ids.get(id) {
+                return i
+            }
+            let json = try data_json(zip, id.copy(), String("structure"))
+            let s = try read_structure_direct(biomes, id.copy(), json)
+            self.structures.push(s)
+            let i = self.structures.len() - 1
+            self.structure_ids.insert(id, i)
+            return i
+        }
+        let s = try read_structure_direct(biomes, String(), value)
+        self.structures.push(s)
+        return self.structures.len() - 1
+    }
+
+    // `StructurePlacement.CODEC`.
+    fn read_placement(mut self, zip: Zip, biomes: Registry, value: Json) -> Placement ! String {
+        let m = try map_of(value)
+        let kind = try type_of(m)
+        if kind == "minecraft:dimension_origin" {
+            return Placement.DimensionOrigin
+        }
+        if kind != "minecraft:random_spread" and kind != "minecraft:concentric_rings" {
+            fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:worldgen/structure_placement]: {kind}"
+        }
+        // `placementCodec`.
+        var lx = 0
+        var ly = 0
+        var lz = 0
+        if let v = field(m, "locate_offset") {
+            let (ox, oy, oz) = try limited(try vec3(v), 16)
+            lx = ox
+            ly = oy
+            lz = oz
+        }
+        var reducer = Reducer.Default
+        if let v = field(m, "frequency_reduction_method") {
+            let name = as_string(v) else fail "Not a string: {v}"
+            reducer = if name == "default" {
+                Reducer.Default
+            } else if name == "legacy_type_1" {
+                Reducer.Legacy1
+            } else if name == "legacy_type_2" {
+                Reducer.Legacy2
+            } else if name == "legacy_type_3" {
+                Reducer.Legacy3
+            } else {
+                fail "Unknown element name:{name}"
+            }
+        }
+        var frequency = 1.0f32
+        if field(m, "frequency") != none {
+            frequency = try float_range_field(m, "frequency", 0.0f32, 1.0f32)
+        }
+        let sv = field(m, "salt") else fail "No key salt in MapLike"
+        let salt = try int_of(sv)
+        if salt < 0 {
+            fail "Value must be non-negative: {salt}"
+        }
+        var exclusion: usize? = none
+        var exclusion_chunks = 0
+        if let v = field(m, "exclusion_zone") {
+            let em = try map_of(v)
+            let other = field(em, "other_set") else fail "No key other_set in MapLike"
+            exclusion = some(try self.set_named(zip, biomes, other))
+            exclusion_chunks = try int_range_field(em, "chunk_count", 1, 16)
+        }
+        let common = Spreading { locate_x: lx, locate_y: ly, locate_z: lz, reducer: reducer, frequency: frequency, salt: salt, exclusion: exclusion, exclusion_chunks: exclusion_chunks }
+        if kind == "minecraft:random_spread" {
+            let spacing = try int_range_field(m, "spacing", 0, 4096)
+            let separation = try int_range_field(m, "separation", 0, 4096)
+            var triangular = false
+            if let v = field(m, "spread_type") {
+                let name = as_string(v) else fail "Not a string: {v}"
+                if name == "triangular" {
+                    triangular = true
+                } else if name != "linear" {
+                    fail "Unknown element name:{name}"
+                }
+            }
+            if spacing <= separation {
+                fail "Spacing has to be larger than separation"
+            }
+            return Placement.RandomSpread { common: common, spacing: spacing, separation: separation, triangular: triangular }
+        }
+        let distance = try int_range_field(m, "distance", 0, 1023)
+        let spread = try int_range_field(m, "spread", 0, 1023)
+        let count = try int_range_field(m, "count", 1, 4095)
+        let pv = field(m, "preferred_biomes") else fail "No key preferred_biomes in MapLike"
+        let preferred = try holder_set(biomes, pv)
+        return Placement.Rings { common: common, distance: distance, spread: spread, count: count, preferred: preferred }
+    }
+
+    // An exclusion zone's set: one of the registry's by ID, or one written out, read now.
+    fn set_named(mut self, zip: Zip, biomes: Registry, value: Json) -> usize ! String {
+        if let text = as_string(value) {
+            let id = (try Identifier.parse(text)).to_string()
+            for i in 0..self.registered {
+                if self.sets[i].id == id {
+                    return i
+                }
+            }
+            fail "Failed to get element ResourceKey[minecraft:worldgen/structure_set / {id}]"
+        }
+        let set = try self.read_set(zip, biomes, String(), value)
+        self.sets.push(set)
+        return self.sets.len() - 1
+    }
+}
+
+// Whether identifier `a` sorts after `b`: by path, then namespace.
+fn ordered_after(a: (String, String), b: (String, String)) -> bool {
+    let (ap, an) = a
+    let (bp, bn) = b
+    if ap != bp {
+        return ap > bp
+    }
+    return an > bn
+}
+
+// `Structure.DIRECT_CODEC`'s shared fields: `StructureSettings.CODEC`.
+fn read_structure_direct(biomes: Registry, id: own String, value: Json) -> Structure ! String {
+    let m = try map_of(value)
+    let kind = try type_of(m)
+    let bv = field(m, "biomes") else fail "No key biomes in MapLike"
+    let set = try holder_set(biomes, bv)
+    if field(m, "spawn_overrides") == none {
+        fail "No key spawn_overrides in MapLike"
+    }
+    let sv = field(m, "step") else fail "No key step in MapLike"
+    let step = try step_named(sv)
+    var adaptation = ADAPT_NONE
+    if let v = field(m, "terrain_adaptation") {
+        let name = as_string(v) else fail "Not a string: {v}"
+        adaptation = if name == "none" {
+            ADAPT_NONE
+        } else if name == "bury" {
+            ADAPT_BURY
+        } else if name == "beard_thin" {
+            ADAPT_BEARD_THIN
+        } else if name == "beard_box" {
+            ADAPT_BEARD_BOX
+        } else if name == "encapsulate" {
+            ADAPT_ENCAPSULATE
+        } else {
+            fail "Unknown element name:{name}"
+        }
+    }
+    return Structure { id: id, kind: kind, biomes: set, step: step, adaptation: adaptation, fields: m.copy() }
+}
+
+// `GenerationStep.Decoration.CODEC`: a step by name, as its index.
+fn step_named(value: Json) -> i32 ! String {
+    let name = as_string(value) else fail "Not a string: {value}"
+    let steps: List<str> = [
+        "raw_generation", "lakes", "local_modifications", "underground_structures", "surface_structures", "strongholds",
+        "underground_ores", "underground_decoration", "fluid_springs", "vegetal_decoration", "top_layer_modification",
+    ]
+    for i in 0..steps.len() {
+        if name == String(steps[i]) {
+            return i32.wrap(i)
+        }
+    }
+    fail "Unknown element name:{name}"
+}
+
+/// `ChunkGeneratorStructureState`: the sets a world may place, and where their rings are.
+pub struct StructureState {
+    pub seed: i64
+    /// The sets with a structure whose biomes the biome source may give, in the registry's
+    /// order.
+    pub possible: List<usize>
+    possible_biomes: List<i32>
+    rings_made: bool
+    ring_sets: List<usize>
+    ring_lists: List<List<(i32, i32)>>
+}
+
+impl StructureState {
+    /// `createState` for a noise generator: the sets the source's biomes allow.
+    pub fn new(s: Structures, possible_biomes: List<i32>, seed: i64) -> StructureState {
+        var possible = List<usize>()
+        for i in 0..s.registered {
+            if set_has_biomes(s, i, possible_biomes) {
+                possible.push(i)
+            }
+        }
+        return StructureState { seed: seed, possible: possible, possible_biomes: possible_biomes.copy(), rings_made: false, ring_sets: List<usize>(), ring_lists: List<List<(i32, i32)>>() }
+    }
+
+    /// `getRingPositionsFor`: the ring positions of the set, none if it isn't placed in rings
+    /// or has no structure the source's biomes allow.
+    pub fn ring_positions(mut self, s: Structures, biomes: mut SourceBiomes, p: Program, set: usize) -> List<(i32, i32)>? ! Thrown {
+        try self.make_rings(s, mut biomes, p)
+        for i in 0..self.ring_sets.len() {
+            if self.ring_sets[i] == set {
+                return some(self.ring_lists[i].copy())
+            }
+        }
+        return none
+    }
+
+    // `generatePositions`: each possible set in rings with a structure the biomes allow.
+    fn make_rings(mut self, s: Structures, biomes: mut SourceBiomes, p: Program) ! Thrown {
+        if self.rings_made {
+            return
+        }
+        self.rings_made = true
+        for set in self.possible {
+            match s.sets[set].placement {
+                Placement.Rings { distance, spread, count, preferred, .. } => {
+                    if set_has_biomes(s, set, self.possible_biomes) {
+                        self.ring_sets.push(set)
+                        self.ring_lists.push(try ring_positions_of(mut biomes, p, self.seed, distance, spread, count, preferred))
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+
+    /// `StructurePlacement.isStructureChunk` of the set's placement at the chunk.
+    pub fn is_structure_chunk(mut self, s: Structures, biomes: mut SourceBiomes, p: Program, set: usize, x: i32, z: i32) -> bool ! Thrown {
+        match s.sets[set].placement {
+            Placement.DimensionOrigin => fail Thrown { exception: "Unimplemented", message: "the dimension origin structure placement" },
+            Placement.RandomSpread { common, spacing, separation, triangular } => {
+                let (px, pz) = potential_chunk(self.seed, common.salt, spacing, separation, triangular, x, z)
+                if px != x or pz != z {
+                    return false
+                }
+                return try self.spreading_allows(s, mut biomes, p, common, x, z)
+            },
+            Placement.Rings { common, .. } => {
+                let positions = try self.ring_positions(s, mut biomes, p, set) else return false
+                var found = false
+                for (rx, rz) in positions {
+                    if rx == x and rz == z {
+                        found = true
+                        break
+                    }
+                }
+                if not found {
+                    return false
+                }
+                return try self.spreading_allows(s, mut biomes, p, common, x, z)
+            },
+        }
+    }
+
+    // `applyAdditionalChunkRestrictions` and `applyInteractionsWithOtherStructures`.
+    fn spreading_allows(mut self, s: Structures, biomes: mut SourceBiomes, p: Program, common: Spreading, x: i32, z: i32) -> bool ! Thrown {
+        if common.frequency < 1.0f32 and not reduce(common.reducer, self.seed, common.salt, x, z, common.frequency) {
+            return false
+        }
+        if let other = common.exclusion {
+            let range = common.exclusion_chunks
+            for tx in x - range..x + range + 1 {
+                for tz in z - range..z + range + 1 {
+                    if try self.is_structure_chunk(s, mut biomes, p, other, tx, tz) {
+                        return false
+                    }
+                }
+            }
+        }
+        return true
+    }
+}
+
+// Whether a structure of the set may start in one of the biomes.
+fn set_has_biomes(s: Structures, set: usize, possible_biomes: List<i32>) -> bool {
+    for st in s.sets[set].structures {
+        for b in s.structures[st].biomes {
+            if possible_biomes.contains(b) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+/// `RandomSpreadStructurePlacement.getPotentialStructureChunk`: the chunk the grid cell of the
+/// chunk places in.
+pub fn potential_chunk(seed: i64, salt: i32, spacing: i32, separation: i32, triangular: bool, x: i32, z: i32) -> (i32, i32) {
+    let gx = x.floor_div(spacing)
+    let gz = z.floor_div(spacing)
+    var random = WorldgenRandom.new(LegacyRandom.new(0))
+    random.set_large_feature_with_salt(seed, gx, gz, salt)
+    let limit = spacing - separation
+    var sx = 0
+    var sz = 0
+    if triangular {
+        sx = (random.next_int_below(limit) + random.next_int_below(limit)) / 2
+        sz = (random.next_int_below(limit) + random.next_int_below(limit)) / 2
+    } else {
+        sx = random.next_int_below(limit)
+        sz = random.next_int_below(limit)
+    }
+    return (gx * spacing + sx, gz * spacing + sz)
+}
+
+// The frequency reducers.
+fn reduce(r: Reducer, seed: i64, salt: i32, x: i32, z: i32, probability: f32) -> bool {
+    var random = WorldgenRandom.new(LegacyRandom.new(0))
+    match r {
+        // `probabilityReducer`, which passes the salt where the chunk's `x` goes.
+        Reducer.Default => {
+            random.set_large_feature_with_salt(seed, salt, x, z)
+            return random.next_float() < probability
+        },
+        Reducer.Legacy1 => {
+            let cx = x >> 4
+            let cz = z >> 4
+            random.set_seed(i64(cx ^ (cz << 4)) ^ seed)
+            _ = random.next_int()
+            return random.next_int_below(i32.saturate(f64(1.0f32 / probability))) == 0
+        },
+        Reducer.Legacy2 => {
+            random.set_large_feature_with_salt(seed, x, z, 10387320)
+            return random.next_float() < probability
+        },
+        Reducer.Legacy3 => {
+            random.set_large_feature_seed(seed, x, z)
+            return random.next_double() < f64(probability)
+        },
+    }
+}
+
+// `generateRingPositions`: `count` positions on rings about the origin, each moved to a
+// preferred biome found within 112 blocks of it, if there's one.
+fn ring_positions_of(biomes: mut SourceBiomes, p: Program, seed: i64, distance: i32, spread_start: i32, count: i32, preferred: List<i32>) -> List<(i32, i32)> ! Thrown {
+    var out = List<(i32, i32)>()
+    var random = LegacyRandom.new(seed)
+    var angle = random.next_double() * PI * 2.0
+    var position = 0
+    var circle = 0
+    var spread = spread_start
+    for i in 0..count {
+        let dist = f64(4 * distance + distance * circle * 6) + (random.next_double() - 0.5) * (f64(distance) * 2.5)
+        let initial_x = i32.wrap(java_round(cos(angle) * dist))
+        let initial_z = i32.wrap(java_round(sin(angle) * dist))
+        var search = random.fork()
+        if let (bx, bz) = try find_biome_horizontal(mut biomes, p, (initial_x << 4) + 8, 0, (initial_z << 4) + 8, 112, preferred, mut search) {
+            out.push((bx >> 4, bz >> 4))
+        } else {
+            out.push((initial_x, initial_z))
+        }
+        angle += PI * 2.0 / f64(spread)
+        position += 1
+        if position == spread {
+            circle += 1
+            position = 0
+            spread += 2 * spread / (circle + 1)
+            spread = spread.min(count - i)
+            angle += random.next_double() * PI * 2.0
+        }
+    }
+    return out
+}
+
+// `Math.round`: the nearest long, ties up.
+fn java_round(v: f64) -> i64 {
+    if v.is_nan() {
+        return 0
+    }
+    let f = v.floor()
+    let r = if v - f >= 0.5 { f + 1.0 } else { f }
+    return i64.saturate(r)
+}
+
+/// `BiomeSource.findBiomeHorizontal` without `findClosest`: for most sources, among the quarts of the square
+/// about the block, out to `radius` blocks, at its height, one whose biome is allowed, each
+/// found replacing the one before with the chance of one in how many were found; the block
+/// of its quart, or none.
+pub fn find_biome_horizontal<T: RandomSource>(biomes: mut SourceBiomes, p: Program, x: i32, y: i32, z: i32, radius: i32, allowed: List<i32>, random: mut T) -> (i32, i32)? ! Thrown {
+    // `FixedBiomeSource`'s own: a block of the square picked at random, if its biome is allowed.
+    if biomes.source.kind == Kind.Fixed {
+        if not allowed.contains(biomes.source.biomes[0]) {
+            return none
+        }
+        let rx = x - radius + random.next_int_below(radius * 2 + 1)
+        let rz = z - radius + random.next_int_below(radius * 2 + 1)
+        return some((rx, rz))
+    }
+    let cx = x >> 2
+    let cz = z >> 2
+    let r = radius >> 2
+    let qy = y >> 2
+    var result: (i32, i32)? = none
+    var found = 0
+    for dz in -r..r + 1 {
+        for dx in -r..r + 1 {
+            let qx = cx + dx
+            let qz = cz + dz
+            let b = try biomes.at(p, qx, qy, qz)
+            if allowed.contains(b) {
+                if result == none or random.next_int_below(found + 1) == 0 {
+                    result = some((qx << 2, qz << 2))
+                }
+                found += 1
+            }
+        }
+    }
+    return result
+}
