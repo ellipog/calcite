@@ -78,6 +78,8 @@ final class BlockFlags {
     // The fluid, in a long's high half.
     static final int FLUID_TYPE_SHIFT = 32;
     static final int FLUID_AMOUNT_SHIFT = 36;
+    // Which faces the occlusion shape covers whole, a bit each from here.
+    static final int OCCLUSION_FACE_SHIFT = 40;
 
     private BlockFlags() {}
 
@@ -260,6 +262,9 @@ final class BlockFlags {
         }
         f |= (long) type << FLUID_TYPE_SHIFT;
         f |= (long) fluid.getAmount() << FLUID_AMOUNT_SHIFT;
+        for (Direction d : Direction.values()) {
+            f |= Block.isShapeFullBlock(state.getFaceOcclusionShape(d)) ? 1L << (OCCLUSION_FACE_SHIFT + d.ordinal()) : 0;
+        }
         return f;
     }
 

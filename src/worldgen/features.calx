@@ -20,10 +20,10 @@ import std.java.math.{cos, sin}
 import world.chunk.{MOTION_BLOCKING, OCEAN_FLOOR, OCEAN_FLOOR_WG, WORLD_SURFACE}
 import worldgen.codec.{bool_of, double_of, field, float_range_field, int_field, int_of, int_range_field, map_of, type_of}
 import worldgen.density.{data_json}
-import worldgen.facts.{Facts}
+import worldgen.facts.{BlockSet, EMPTY_FLUID, FLOWING_LAVA, FLOWING_WATER, Facts, LAVA_FLUID, UP, WATER_FLUID, clockwise, direction_name, direction_named, horizontal, opposite, step_x, step_z}
 import worldgen.interval.{Thrown}
 import worldgen.noise.{Noise}
-import worldgen.predicates.{Pred, Readers, Rule, list_of, read_pred, read_rule, read_state, test, test_rule}
+import worldgen.predicates.{Pred, Readers, Rule, list_of, read_blocks, read_pred, read_rule, read_state, test, test_rule}
 import worldgen.providers.{HeightProvider, IntProvider, int_provider_field, read_height}
 import worldgen.region.{Region}
 import worldgen.state_providers.{Providers, optional_state, pick}
@@ -74,6 +74,10 @@ pub enum Feature {
     RandomBooleanSelector { yes: usize, no: usize }
     WeightedRandomSelector { features: List<usize>, weights: List<i32>, total: i32 }
     Sequence(List<usize>)
+    MonsterRoom
+    /// A spring: the fluid by ID and the block it's placed as.
+    Spring { fluid: u32, legacy: u32, below: bool, rocks: i32, holes: i32, valid: BlockSet }
+    UnderwaterMagma { search: i32, radius: i32, chance: f32 }
     /// A feature of a type that isn't placed yet, by the type's ID.
     Unsupported(String)
 }
@@ -185,6 +189,34 @@ impl Catalog {
     fn read_typed(mut self, zip: Zip, facts: Facts, rd: Readers, m: List<Member>, kind: String) -> Feature ! String {
         if kind == "minecraft:no_op" {
             return Feature.NoOp
+        }
+        if kind == "minecraft:monster_room" {
+            return Feature.MonsterRoom
+        }
+        if kind == "minecraft:spring_feature" {
+            let s = field(m, "state") else fail "No key state in MapLike"
+            let (fluid, legacy) = try read_fluid_state(facts, rd, s)
+            var below = true
+            if let v = field(m, "requires_block_below") {
+                below = try bool_of(v)
+            }
+            var rocks = 4
+            if let v = field(m, "rock_count") {
+                rocks = try int_of(v)
+            }
+            var holes = 1
+            if let v = field(m, "hole_count") {
+                holes = try int_of(v)
+            }
+            let vb = field(m, "valid_blocks") else fail "No key valid_blocks in MapLike"
+            let valid = try read_blocks(facts, rd.blocks, vb)
+            return Feature.Spring { fluid: fluid, legacy: legacy, below: below, rocks: rocks, holes: holes, valid: valid }
+        }
+        if kind == "minecraft:underwater_magma" {
+            let search = try int_range_field(m, "floor_search_range", 0, 512)
+            let radius = try int_range_field(m, "placement_radius_around_floor", 0, 64)
+            let chance = try float_range_field(m, "placement_probability_per_valid_position", 0.0f32, 1.0f32)
+            return Feature.UnderwaterMagma { search: search, radius: radius, chance: chance }
         }
         if kind == "minecraft:ore" or kind == "minecraft:scattered_ore" {
             let t = field(m, "targets") else fail "No key targets in MapLike"
@@ -934,6 +966,9 @@ pub fn place_feature<T: RandomSource>(g: Gen, r: mut Region, rand: mut T, fi: us
             }
             return true
         },
+        Feature.MonsterRoom => return try place_monster_room(g, mut r, mut rand, x, y, z),
+        Feature.Spring { fluid, legacy, below, rocks, holes, valid } => return try place_spring(g.env.facts, mut r, fluid, legacy, below, rocks, holes, valid, x, y, z),
+        Feature.UnderwaterMagma { search, radius, chance } => return try place_underwater_magma(g.env.facts, mut r, mut rand, search, radius, chance, x, y, z),
         Feature.Unsupported(kind) => fail unimplemented("the feature type `{kind}`"),
     }
 }
@@ -1168,4 +1203,281 @@ fn copy_waterlogged(f: Facts, state: u32, here: u32) -> u32 {
         return state
     }
     return f.try_bool(state, "waterlogged", f.is_water(here))
+}
+
+/// `Feature.safeSetBlock`: the block set with flags 2 if what's there may be replaced.
+pub fn safe_set(f: Facts, r: mut Region, x: i32, y: i32, z: i32, state: u32, cannot: BlockSet) ! Thrown {
+    let here = try r.state(f, x, y, z)
+    if not f.in_set(here, cannot) {
+        _ = r.set_block(f, x, y, z, state, 2)
+    }
+}
+
+// `MonsterRoomFeature.place`: a room of 5 to 7 blocks across with a floor and ceiling of solid
+// blocks and 1 to 5 openings in its walls at floor level, walled with cobblestone and a mossy
+// floor, with up to two chests against a wall and a spawner in the middle.
+fn place_monster_room<T: RandomSource>(g: Gen, r: mut Region, rand: mut T, ox: i32, oy: i32, oz: i32) -> bool ! Thrown {
+    let Env { facts: f, .. } = g.env
+    let cannot = f.tag("minecraft:features_cannot_replace")
+    let xr = rand.next_int_below(2) + 2
+    let min_x = -xr - 1
+    let max_x = xr + 1
+    let zr = rand.next_int_below(2) + 2
+    let min_z = -zr - 1
+    let max_z = zr + 1
+    var holes = 0
+    for dx in min_x..max_x + 1 {
+        for dy in -1..5 {
+            for dz in min_z..max_z + 1 {
+                let solid = f.is_solid(try r.state(f, ox + dx, oy + dy, oz + dz))
+                if (dy == -1 or dy == 4) and not solid {
+                    return false
+                }
+                let edge = dx == min_x or dx == max_x or dz == min_z or dz == max_z
+                if edge and dy == 0 and f.is_air(try r.state(f, ox + dx, oy, oz + dz)) and f.is_air(try r.state(f, ox + dx, oy + 1, oz + dz)) {
+                    holes += 1
+                }
+            }
+        }
+    }
+    if holes < 1 or holes > 5 {
+        return false
+    }
+    let cave_air = f.ids.cave_air_state
+    for dx in min_x..max_x + 1 {
+        var dy = 3
+        while dy >= -1 {
+            for dz in min_z..max_z + 1 {
+                let x = ox + dx
+                let y = oy + dy
+                let z = oz + dz
+                let wall = try r.state(f, x, y, z)
+                if dx == min_x or dy == -1 or dz == min_z or dx == max_x or dz == max_z {
+                    if y >= r.min_y and not f.is_solid(try r.state(f, x, y - 1, z)) {
+                        _ = r.set_block(f, x, y, z, cave_air, 2)
+                    } else if f.is_solid(wall) and not f.is(wall, f.ids.chest) {
+                        if dy == -1 and rand.next_int_below(4) != 0 {
+                            try safe_set(f, mut r, x, y, z, f.default_state(f.ids.mossy_cobblestone), cannot)
+                        } else {
+                            try safe_set(f, mut r, x, y, z, f.default_state(f.ids.cobblestone), cannot)
+                        }
+                    }
+                } else if not f.is(wall, f.ids.chest) and not f.is(wall, f.ids.spawner) {
+                    try safe_set(f, mut r, x, y, z, cave_air, cannot)
+                }
+            }
+            dy -= 1
+        }
+    }
+    for _ in 0..2 {
+        for _ in 0..3 {
+            let xc = ox + rand.next_int_below(xr * 2 + 1) - xr
+            let zc = oz + rand.next_int_below(zr * 2 + 1) - zr
+            if not f.is_air(try r.state(f, xc, oy, zc)) {
+                continue
+            }
+            var walls = 0
+            for i in 0..4 {
+                let d = horizontal(i)
+                if f.is_solid(try r.state(f, xc + step_x(d), oy, zc + step_z(d))) {
+                    walls += 1
+                }
+            }
+            if walls == 1 {
+                let chest = try reorient(f, r, xc, oy, zc, f.default_state(f.ids.chest))
+                try safe_set(f, mut r, xc, oy, zc, chest, cannot)
+                // `RandomizableContainer.setBlockEntityLootTable`.
+                if let kind = try r.block_entity(f, xc, oy, zc) {
+                    if kind == "minecraft:chest" {
+                        r.set_loot_table(xc, oy, zc, "minecraft:chests/simple_dungeon", rand.next_long())
+                    }
+                }
+                break
+            }
+        }
+    }
+    try safe_set(f, mut r, ox, oy, oz, f.default_state(f.ids.spawner), cannot)
+    if let kind = try r.block_entity(f, ox, oy, oz) {
+        if kind == "minecraft:mob_spawner" {
+            let mobs: List<String> = ["minecraft:skeleton", "minecraft:zombie", "minecraft:zombie", "minecraft:spider"]
+            let mob = rand.next_int_below(4)
+            r.set_spawner_entity(ox, oy, oz, mobs[usize.wrap(mob)].copy())
+        }
+    }
+    return true
+}
+
+/// `StructurePiece.reorient`: a chest turned away from the one solid wall beside it, or, with
+/// none or more, from its own facing on to one that isn't against a solid block. Next to
+/// another chest, it stays as it is.
+pub fn reorient(f: Facts, r: Region, x: i32, y: i32, z: i32, state: u32) -> u32 ! Thrown {
+    var solid = -1
+    for i in 0..4 {
+        let d = horizontal(i)
+        let s = try r.state(f, x + step_x(d), y, z + step_z(d))
+        if f.is(s, f.ids.chest) {
+            return state
+        }
+        if f.solid_render(s) {
+            if solid != -1 {
+                solid = -1
+                break
+            }
+            solid = d
+        }
+    }
+    if solid != -1 {
+        return try f.with_name(state, "facing", direction_name(opposite(solid)))
+    }
+    let name = f.get_name(state, "facing") ?? String()
+    var lock = direction_named(name) ?? 2
+    if f.solid_render(try r.state(f, x + step_x(lock), y, z + step_z(lock))) {
+        lock = opposite(lock)
+    }
+    if f.solid_render(try r.state(f, x + step_x(lock), y, z + step_z(lock))) {
+        lock = clockwise(lock)
+    }
+    if f.solid_render(try r.state(f, x + step_x(lock), y, z + step_z(lock))) {
+        lock = opposite(lock)
+    }
+    return try f.with_name(state, "facing", direction_name(lock))
+}
+
+/// `FluidState.CODEC`: a fluid by name and its properties, the default's where one isn't there or
+/// isn't one of the property's values. Gives the fluid's ID and `createLegacyBlock`'s state.
+pub fn read_fluid_state(f: Facts, rd: Readers, value: Json) -> (u32, u32) ! String {
+    let m = try map_of(value)
+    let id_value = field(m, "id") else fail "No key id in MapLike"
+    let name = as_string(id_value) else fail "Not a string: {id_value}"
+    let fid = try Identifier.parse(name)
+    let found = rd.fluids.id(fid) else fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:fluid]: {name}"
+    let fluid = u32.wrap(found)
+    // A flowing fluid's default state is `LEVEL` 7, not falling.
+    var falling = false
+    var amount = if fluid == FLOWING_WATER or fluid == FLOWING_LAVA { 7 } else { 8 }
+    if let pv = field(m, "properties") {
+        let props = try map_of(pv)
+        if let fv = field(props, "falling") {
+            if let text = as_string(fv) {
+                if text == "true" {
+                    falling = true
+                } else if text == "false" {
+                    falling = false
+                }
+            }
+        }
+        if fluid == FLOWING_WATER or fluid == FLOWING_LAVA {
+            if let lv = field(props, "level") {
+                if let text = as_string(lv) {
+                    if let v = i32.parse(text) {
+                        if v >= 1 and v <= 8 {
+                            amount = v
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if fluid == EMPTY_FLUID {
+        return (fluid, f.ids.air_state)
+    }
+    let source = fluid == WATER_FLUID or fluid == LAVA_FLUID
+    // `getLegacyLevel`.
+    let level = if source { 0 } else { 8 - amount.min(8) + (if falling { 8 } else { 0 }) }
+    let block = if fluid == WATER_FLUID or fluid == FLOWING_WATER { f.ids.water } else { f.ids.lava }
+    let state = match f.with_int(f.default_state(block), "level", level) {
+        ok(s) => s,
+        err(e) => fail e.message,
+    }
+    return (fluid, state)
+}
+
+// `SpringFeature.place`: the fluid where the block above, and if asked the one below, are valid,
+// with as many valid blocks and empty ones beside and below it as it asks, and a tick for it.
+fn place_spring(f: Facts, r: mut Region, fluid: u32, legacy: u32, below: bool, rocks: i32, holes: i32, valid: BlockSet, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if not f.in_set(try r.state(f, x, y + 1, z), valid) {
+        return false
+    }
+    if below and not f.in_set(try r.state(f, x, y - 1, z), valid) {
+        return false
+    }
+    let here = try r.state(f, x, y, z)
+    if not f.is_air(here) and not f.in_set(here, valid) {
+        return false
+    }
+    // West, east, north, south, below.
+    let dxs: List<i32> = [-1, 1, 0, 0, 0]
+    let dys: List<i32> = [0, 0, 0, 0, -1]
+    let dzs: List<i32> = [0, 0, -1, 1, 0]
+    var rock_count = 0
+    for i in 0..5usize {
+        if f.in_set(try r.state(f, x + dxs[i], y + dys[i], z + dzs[i]), valid) {
+            rock_count += 1
+        }
+    }
+    var hole_count = 0
+    for i in 0..5usize {
+        if f.is_air(try r.state(f, x + dxs[i], y + dys[i], z + dzs[i])) {
+            hole_count += 1
+        }
+    }
+    if rock_count == rocks and hole_count == holes {
+        _ = r.set_block(f, x, y, z, legacy, 2)
+        r.schedule_fluid(fluid, x, y, z)
+        return true
+    }
+    return false
+}
+
+// `UnderwaterMagmaFeature.place`: the floor of the water column at the origin, then each block
+// within the radius of it, by chance, made magma where it's hidden from outside.
+fn place_underwater_magma<T: RandomSource>(f: Facts, r: mut Region, rand: mut T, search: i32, radius: i32, chance: f32, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    // `Column.scan` with water inside and anything else as the edge: only its floor is used,
+    // and scanning up reads nothing that could throw.
+    if not f.is(try r.state(f, x, y, z), f.ids.water) {
+        return false
+    }
+    var fy = y
+    var i = 1
+    while i < search and f.is(try r.state(f, x, fy, z), f.ids.water) {
+        fy -= 1
+        i += 1
+    }
+    if f.is(try r.state(f, x, fy, z), f.ids.water) {
+        return false
+    }
+    var placed = 0
+    for bz in z - radius..z + radius + 1 {
+        for by in fy - radius..fy + radius + 1 {
+            for bx in x - radius..x + radius + 1 {
+                if not (rand.next_float() < chance) {
+                    continue
+                }
+                if try magma_fits(f, r, bx, by, bz) {
+                    _ = r.set_block(f, bx, by, bz, f.default_state(f.ids.magma_block), 2)
+                    placed += 1
+                }
+            }
+        }
+    }
+    return placed > 0
+}
+
+// `UnderwaterMagmaFeature.isValidPlacement`: not water or air, and covered below and on every
+// side.
+fn magma_fits(f: Facts, r: Region, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let here = try r.state(f, x, y, z)
+    if f.is(here, f.ids.water) or f.is_air(here) {
+        return false
+    }
+    if not f.occludes_face(try r.state(f, x, y - 1, z), UP) {
+        return false
+    }
+    for i in 0..4 {
+        let d = horizontal(i)
+        if not f.occludes_face(try r.state(f, x + step_x(d), y, z + step_z(d)), opposite(d)) {
+            return false
+        }
+    }
+    return true
 }

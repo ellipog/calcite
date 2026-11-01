@@ -221,6 +221,20 @@ def each_feature(g, cases, biomes, placed, features):
         cases.append(c.build())
 
 
+def dungeons(g, cases):
+    """Monster rooms tried hundreds of times a chunk, so that some are built: their walls,
+    chests turned to a wall with their loot tables, and spawners with their mobs."""
+    for i in range(8):
+        settings = "caves" if i % 2 else "overworld"
+        placement = [{"type": "minecraft:count", "count": 4096}, {"type": "minecraft:in_square"},
+                     {"type": "minecraft:height_range", "height": {"type": "minecraft:uniform", "min_inclusive": {"absolute": -58}, "max_inclusive": {"absolute": 100}}}]
+        c = Case(f"dungeons-{i}", g.seed(), settings, preset("overworld"), {"feature": m("monster_room"), "placement": placement})
+        for _ in range(2):
+            cx, cz = g.chunk(2000)
+            c.place(cx, cz, cx * 16, 0, cz * 16, g.long())
+        cases.append(c.build())
+
+
 def stone(placement):
     return {"feature": {"type": "minecraft:simple_block", "to_place": {"id": "minecraft:stone"}}, "placement": placement}
 
@@ -345,6 +359,7 @@ def main():
     cases = []
     decorations(g, cases, biomes)
     each_feature(g, cases, biomes, placed, features)
+    dungeons(g, cases)
     modifiers(g, cases)
     predicates(g, cases)
     providers(g, cases)

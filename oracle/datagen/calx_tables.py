@@ -353,6 +353,7 @@ COLLISION_FACE_SHIFT = 25
 COLLISION_TOP_ANY = 1 << 31
 FLUID_TYPE_SHIFT = 32
 FLUID_AMOUNT_SHIFT = 36
+OCCLUSION_FACE_SHIFT = 40
 
 
 def block_facts_module(index, flags):
@@ -400,6 +401,11 @@ def block_facts_module(index, flags):
     ]
     fluids = [((v >> FLUID_TYPE_SHIFT) & 7) << 4 | (v >> FLUID_AMOUNT_SHIFT) & 15 for v in values]
     lines += encoded_table("state_fluids", "fluids", fluids)
+    lines += [
+        "/// Which of each state's faces its occlusion shape covers whole, in state ID order:",
+        "/// `Block.isShapeFullBlock` of `getFaceOcclusionShape`, a bit for each face in `Direction` order.",
+    ]
+    lines += encoded_table("state_occlusion", "occlusion", [(v >> OCCLUSION_FACE_SHIFT) & 63 for v in values])
     lines += [
         "/// The names of the classes vanilla's blocks are and the classes they extend, sorted: an",
         "/// anonymous class by the class it extends.",
