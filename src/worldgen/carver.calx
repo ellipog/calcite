@@ -1,0 +1,633 @@
+/// Vanilla's carvers, which finish `buildTerrain` after the fill and the surface: caves and
+/// canyons started in the chunks up to 8 away, each carving the blocks of its tunnels that fall in
+/// the chunk into a mask, then the carved blocks filled through the aquifer, as
+/// `NoiseBasedChunkGenerator.generateCarvers` and `applyCarvingMask` do in 26.3.
+module worldgen.carver
+
+import json.tree.{Json, as_string, get}
+import math.mth.{SinTable, floor}
+import pack.zip.{Zip}
+import random.legacy.{LegacyRandom}
+import random.source.{RandomSource}
+import random.worldgen.{WorldgenRandom}
+import registry.registry.{Registry}
+import resources.identifier.{Identifier}
+import world.block_flags.{FLUID}
+import world.chunk.{BlockStates}
+import world.states.{StateCodec}
+import worldgen.biome_manager.{SourceBiomes}
+import worldgen.codec.{field, float_field, float_range_field, int_range_field, map_of, optional_bool_field, type_of}
+import worldgen.density.{Functions, data_json}
+import worldgen.interval.{Thrown}
+import worldgen.material.{Materials, NONE, Rules, block_at, mark, place, top_material}
+import worldgen.providers.{FloatProvider, GenContext, HeightProvider, IntProvider, float_provider_field, height_field, int_provider_field, read_float}
+import worldgen.sampler.{Context}
+import worldgen.terrain.{Aquifer, Filled, Shape}
+
+/// How far a carver's tunnels reach: `getRange() * 2 - 1` chunks, 112 blocks.
+const MAX_DISTANCE: i32 = 112
+/// How many chunks around the chunk the carvers start in: `range`.
+const RANGE: i32 = 8
+/// The blocks under the top of the generated world no carver reaches: `protectedBlocksOnTop`.
+const PROTECTED_ON_TOP: i32 = 7
+/// `(float) (Math.PI * 2)`, `(float) (Math.PI / 2)` and `(float) Math.PI`.
+const TURN: f32 = 6.2831855f32
+const QUARTER_TURN: f32 = 1.5707964f32
+const HALF_TURN: f32 = 3.1415927f32
+
+/// A `WorldCarver`.
+pub enum Carver {
+    Cave(CaveCarver)
+    Canyon(CanyonCarver)
+}
+
+/// `CaveWorldCarver`: caves of tunnels, some from a room.
+pub struct CaveCarver {
+    probability: f32
+    y: HeightProvider
+    count: IntProvider
+    thickness: FloatProvider
+    weird_thickness_bias: bool
+    room_vertical: FloatProvider
+    horizontal: FloatProvider
+    vertical: FloatProvider
+    start_vertical: FloatProvider
+    floor_level: FloatProvider
+}
+
+/// `CanyonWorldCarver`, with its `Shape`.
+pub struct CanyonCarver {
+    probability: f32
+    y: HeightProvider
+    vertical_rotation: FloatProvider
+    distance_factor: FloatProvider
+    thickness: FloatProvider
+    width_smoothness: i32
+    horizontal_factor: FloatProvider
+    vertical_default: f32
+    vertical_center: f32
+    y_scale: FloatProvider
+}
+
+impl Carver {
+    /// `isStartChunk`.
+    fn starts<T: RandomSource>(self, r: mut T) -> bool {
+        let probability = match self {
+            Carver.Cave(c) => c.probability,
+            Carver.Canyon(c) => c.probability,
+        }
+        return r.next_float() <= probability
+    }
+}
+
+// Reading.
+
+/// `WorldCarver.DIRECT_CODEC`: a carver by its `type`.
+pub fn read_carver(value: Json) -> Carver ! String {
+    let m = try map_of(value)
+    let kind = try type_of(m)
+    if kind == "minecraft:cave" {
+        let probability = try float_range_field(m, "probability", 0.0f32, 1.0f32)
+        let y = try height_field(m, "y")
+        let count = try int_provider_field(m, "count", 0, i32.MAX)
+        let thickness = try float_provider_field(m, "thickness", some(0.0f32), none)
+        let weird = try optional_bool_field(m, "weird_thickness_bias", false)
+        let room = try float_provider_field(m, "room_vertical_radius_multiplier", none, none)
+        let horizontal = try float_provider_field(m, "horizontal_radius_multiplier", none, none)
+        let vertical = try float_provider_field(m, "vertical_radius_multiplier", none, none)
+        var start_vertical = FloatProvider.Constant(1.0f32)
+        if let v = field(m, "start_vertical_radius_multiplier") {
+            start_vertical = try read_float(v)
+        }
+        let floor_level = try float_provider_field(m, "floor_level", some(-1.0f32), some(1.0f32))
+        return Carver.Cave(CaveCarver {
+            probability: probability,
+            y: y,
+            count: count,
+            thickness: thickness,
+            weird_thickness_bias: weird,
+            room_vertical: room,
+            horizontal: horizontal,
+            vertical: vertical,
+            start_vertical: start_vertical,
+            floor_level: floor_level,
+        })
+    }
+    if kind == "minecraft:canyon" {
+        let probability = try float_range_field(m, "probability", 0.0f32, 1.0f32)
+        let y = try height_field(m, "y")
+        let rotation = try float_provider_field(m, "vertical_rotation", none, none)
+        let shape_value = field(m, "shape") else fail "No key shape in MapLike"
+        let s = try map_of(shape_value)
+        let distance_factor = try float_provider_field(s, "distance_factor", none, none)
+        let thickness = try float_provider_field(s, "thickness", none, none)
+        let smoothness = try int_range_field(s, "width_smoothness", 1, i32.MAX)
+        let horizontal = try float_provider_field(s, "horizontal_radius_factor", none, none)
+        let vertical_default = try float_field(s, "vertical_radius_default_factor")
+        let vertical_center = try float_field(s, "vertical_radius_center_factor")
+        let y_scale = try float_provider_field(s, "y_scale", none, none)
+        return Carver.Canyon(CanyonCarver {
+            probability: probability,
+            y: y,
+            vertical_rotation: rotation,
+            distance_factor: distance_factor,
+            thickness: thickness,
+            width_smoothness: smoothness,
+            horizontal_factor: horizontal,
+            vertical_default: vertical_default,
+            vertical_center: vertical_center,
+            y_scale: y_scale,
+        })
+    }
+    fail "Unknown carver type: {kind}"
+}
+
+/// A world's carvers: each biome's, as its generation settings list them, read from the pack,
+/// and what carving the chunks needs besides.
+pub struct Carvers {
+    /// Every carver read, each once.
+    table: List<Carver>
+    /// The carvers each biome lists, by the biome's ID, as indexes into `table`.
+    by_biome: List<List<usize>>
+    /// The carvers every chunk has, where the biomes' aren't asked: the `carvers` probe's own.
+    everywhere: List<usize>
+    fixed: bool
+    /// The carvers read by reference, by ID.
+    refs: Map<String, usize>
+    sin: SinTable
+    /// The blocks of `#minecraft:uncarvable`, and grass, mycelium and dirt, by block ID.
+    uncarvable: List<u32>
+    grass_block: u32
+    mycelium: u32
+    dirt: u32
+}
+
+impl Carvers {
+    /// The carvers of the biomes in `possible`, from their JSON in the pack, with the blocks of
+    /// the tag `uncarvable` by ID.
+    pub fn of_biomes(zip: Zip, biomes: Registry, possible: List<i32>, codec: StateCodec, uncarvable: List<i32>) -> Carvers ! String {
+        var c = try Carvers.empty(biomes, codec, uncarvable)
+        for b in possible {
+            let id = biomes.entries[usize.wrap(b)].to_string()
+            let json = try data_json(zip, id.copy(), "biome")
+            let m = match json {
+                Json.Object(m) => m,
+                _ => fail "biome `{id}` isn't an object",
+            }
+            let value = get(m, String("carvers")) else fail "biome `{id}` has no `carvers`"
+            let list = try c.read_set(zip, value)
+            c.by_biome[usize.wrap(b)] = list
+        }
+        return c
+    }
+
+    /// The carvers `value` lists, as `WorldCarver.LIST_CODEC` reads them, in every chunk.
+    pub fn written(zip: Zip, biomes: Registry, codec: StateCodec, uncarvable: List<i32>, value: Json) -> Carvers ! String {
+        var c = try Carvers.empty(biomes, codec, uncarvable)
+        c.everywhere = try c.read_set(zip, value)
+        c.fixed = true
+        return c
+    }
+
+    fn empty(biomes: Registry, codec: StateCodec, uncarvable: List<i32>) -> Carvers ! String {
+        var by_biome = List<List<usize>>()
+        for _ in 0..biomes.entries.len() {
+            by_biome.push(List<usize>())
+        }
+        var tagged = List<u32>()
+        for b in uncarvable {
+            tagged.push(u32.wrap(b))
+        }
+        return Carvers {
+            table: [],
+            by_biome: by_biome,
+            everywhere: [],
+            fixed: false,
+            refs: Map<String, usize>(),
+            sin: SinTable.new(),
+            uncarvable: tagged,
+            grass_block: try codec.blocks.parse(String("minecraft:grass_block")),
+            mycelium: try codec.blocks.parse(String("minecraft:mycelium")),
+            dirt: try codec.blocks.parse(String("minecraft:dirt")),
+        }
+    }
+
+    /// `WorldCarver.LIST_CODEC`: one carver or a list of them, each by reference or written out,
+    /// in any mix. Carver tags aren't read: vanilla's pack defines none, so every tag is missing
+    /// (D206).
+    fn read_set(mut self, zip: Zip, value: Json) -> List<usize> ! String {
+        if let text = as_string(value) {
+            if text.starts_with("#") {
+                fail "Missing tag: '{text[1..]}' in 'minecraft:worldgen/carver'"
+            }
+        }
+        let items = match value {
+            Json.Array(a) => a.copy(),
+            _ => return [try self.read_holder(zip, value)],
+        }
+        var out = List<usize>()
+        for item in items {
+            out.push(try self.read_holder(zip, item))
+        }
+        return out
+    }
+
+    /// `RegistryFileCodec`: a carver by its ID, or written out where the value isn't one.
+    fn read_holder(mut self, zip: Zip, value: Json) -> usize ! String {
+        if let text = as_string(value) {
+            match Identifier.parse(text.copy()) {
+                ok(id) => {
+                    let key = id.to_string()
+                    if let i = self.refs.get(key) {
+                        return i
+                    }
+                    let json = try data_json(zip, key.copy(), "carver")
+                    let carver = try read_carver(json)
+                    self.table.push(carver)
+                    let i = self.table.len() - 1
+                    self.refs.insert(key, i)
+                    return i
+                },
+                err(_) => {},
+            }
+        }
+        let carver = try read_carver(value)
+        self.table.push(carver)
+        return self.table.len() - 1
+    }
+}
+
+// Carving.
+
+/// `CarvingMask`: the blocks the carvers carve, in the chunk's columns from `min_y` up to
+/// `max_y`, each column's run of heights after the one before, the columns `z` fastest.
+struct Mask {
+    min_y: i32
+    max_y: i32
+    height: i32
+    bits: List<bool>
+    any: bool
+}
+
+impl Mask {
+    fn carve(mut self, x: i32, y: i32, z: i32) {
+        self.bits[usize.wrap(y - self.min_y + (z + (x << 4)) * self.height)] = true
+        self.any = true
+    }
+}
+
+/// What keeps a carver from a block of its ellipsoid: the cave's floor, or the canyon's widths.
+enum Skip {
+    Cave(f64)
+    Canyon
+}
+
+/// The chunk's carving: where it is, its generated world, and what it carves into.
+struct Carving {
+    chunk_x: i32
+    chunk_z: i32
+    gen: GenContext
+    mask: Mask
+}
+
+/// `generateCarvers` of the chunk at `cx`, `cz` in a world of seed `seed`, filled into `f` with
+/// `aquifer` through `ctx` and given its materials with `rules`: the carvers of each chunk up to
+/// 8 away, by the biome of its corner at height 0, then the carved blocks filled.
+pub fn carve_chunk(f: mut Filled, functions: mut Functions, shape: Shape, mat: Materials, rules: Rules, states: BlockStates, ctx: mut Context, aquifer: mut Aquifer, biomes: mut SourceBiomes, carvers: Carvers, seed: i64, cx: i32, cz: i32) ! Thrown {
+    let gen = mat.gen
+    let max_y = gen.min_y + gen.depth - 1 - PROTECTED_ON_TOP
+    let min_y = gen.min_y + 1
+    let height = max_y - min_y + 1
+    var c = Carving {
+        chunk_x: cx,
+        chunk_z: cz,
+        gen: gen,
+        mask: Mask { min_y: min_y, max_y: max_y, height: height, bits: [false; usize.wrap(256 * height)], any: false },
+    }
+    var random = WorldgenRandom.new(LegacyRandom.new(0))
+    for dx in -RANGE..RANGE + 1 {
+        for dz in -RANGE..RANGE + 1 {
+            let sx = cx + dx
+            let sz = cz + dz
+            if carvers.fixed {
+                try start(carvers, carvers.everywhere, mut random, mut c, seed, sx, sz)
+            } else {
+                let biome = try biomes.at(functions.program, (sx << 4) >> 2, 0, (sz << 4) >> 2)
+                try start(carvers, carvers.by_biome[usize.wrap(biome)], mut random, mut c, seed, sx, sz)
+            }
+        }
+    }
+    if c.mask.any {
+        try apply_mask(mut f, mut functions, shape, mat, rules, states, mut ctx, mut aquifer, mut biomes, carvers, c.mask, cx, cz)
+    }
+}
+
+/// The carvers `list` of the chunk at `sx`, `sz`, each seeded by its index, carving if it
+/// starts there.
+fn start(carvers: Carvers, list: List<usize>, r: mut WorldgenRandom<LegacyRandom>, c: mut Carving, seed: i64, sx: i32, sz: i32) ! Thrown {
+    var index: i64 = 0
+    for k in list {
+        r.set_large_feature_seed(seed + index, sx, sz)
+        if carvers.table[k].starts(mut r) {
+            match carvers.table[k] {
+                Carver.Cave(cave) => try carve_cave(cave, carvers.sin, mut r, mut c, sx, sz),
+                Carver.Canyon(canyon) => try carve_canyon(canyon, carvers.sin, mut r, mut c, sx, sz),
+            }
+        }
+        index += 1
+    }
+}
+
+/// `CaveWorldCarver.carve`: caves started in the chunk at `sx`, `sz`, each with a room or not
+/// and its tunnels.
+fn carve_cave(cave: CaveCarver, sin: SinTable, r: mut WorldgenRandom<LegacyRandom>, c: mut Carving, sx: i32, sz: i32) ! Thrown {
+    let count = try cave.count.sample(mut r)
+    for _ in 0..count {
+        let x = f64((sx << 4) + r.next_int_below(16))
+        let y = f64(try cave.y.sample(mut r, c.gen))
+        let z = f64((sz << 4) + r.next_int_below(16))
+        let horizontal = f64(cave.horizontal.sample(mut r))
+        let vertical = f64(cave.vertical.sample(mut r))
+        let start_vertical = f64(cave.start_vertical.sample(mut r))
+        let floor_level = f64(cave.floor_level.sample(mut r))
+        let skip = Skip.Cave(floor_level)
+        var tunnels = 1
+        if r.next_int_below(4) == 0 {
+            let y_scale = f64(cave.room_vertical.sample(mut r))
+            let thickness = 1.0f32 + r.next_float() * 6.0f32
+            // `createRoom`.
+            let horizontal_radius = 1.5 + f64(sin.sin(f64(QUARTER_TURN)) * thickness)
+            let vertical_radius = horizontal_radius * y_scale
+            carve_ellipsoid(mut c, x + 1.0, y, z, horizontal_radius, vertical_radius, skip, [])
+            tunnels += r.next_int_below(4)
+        }
+        for _ in 0..tunnels {
+            let horizontal_rotation = r.next_float() * TURN
+            let vertical_rotation = (r.next_float() - 0.5f32) / 4.0f32
+            var thickness = cave.thickness.sample(mut r)
+            if cave.weird_thickness_bias and r.next_int_below(10) == 0 {
+                let a = r.next_float()
+                let b = r.next_float()
+                thickness *= a * b * 3.0f32 + 1.0f32
+            }
+            let distance = MAX_DISTANCE - r.next_int_below(MAX_DISTANCE / 4)
+            let tunnel_seed = r.next_long()
+            let t = Tunnel { x: x, y: y, z: z, horizontal: horizontal, vertical: vertical, thickness: thickness, horizontal_rotation: horizontal_rotation, vertical_rotation: vertical_rotation, step: 0, distance: distance, y_scale: start_vertical }
+            create_tunnel(mut c, sin, tunnel_seed, t, skip)
+        }
+    }
+}
+
+/// Where a tunnel starts and how it's shaped: `createTunnel`'s arguments.
+struct Tunnel {
+    x: f64
+    y: f64
+    z: f64
+    horizontal: f64
+    vertical: f64
+    thickness: f32
+    horizontal_rotation: f32
+    vertical_rotation: f32
+    step: i32
+    distance: i32
+    y_scale: f64
+}
+
+/// `createTunnel`: a tunnel from its step to its end, carving at three steps in four, which at
+/// its split point, if it's thick, splits into two thinner ones a quarter turn to each side.
+fn create_tunnel(c: mut Carving, sin: SinTable, seed: i64, t: Tunnel, skip: Skip) {
+    var r = LegacyRandom.new(seed)
+    let split = r.next_int_below(t.distance / 2) + t.distance / 4
+    let steep = r.next_int_below(6) == 0
+    var y_rota = 0.0f32
+    var x_rota = 0.0f32
+    var x = t.x
+    var y = t.y
+    var z = t.z
+    var horizontal_rotation = t.horizontal_rotation
+    var vertical_rotation = t.vertical_rotation
+    var step = t.step
+    while step < t.distance {
+        let horizontal_radius = 1.5 + f64(sin.sin(f64(HALF_TURN * f32.nearest(step) / f32.nearest(t.distance))) * t.thickness)
+        let vertical_radius = horizontal_radius * t.y_scale
+        let cos_x = sin.cos(f64(vertical_rotation))
+        x += f64(sin.cos(f64(horizontal_rotation)) * cos_x)
+        y += f64(sin.sin(f64(vertical_rotation)))
+        z += f64(sin.sin(f64(horizontal_rotation)) * cos_x)
+        vertical_rotation *= if steep { 0.92f32 } else { 0.7f32 }
+        vertical_rotation += x_rota * 0.1f32
+        horizontal_rotation += y_rota * 0.1f32
+        x_rota *= 0.9f32
+        y_rota *= 0.75f32
+        let a = r.next_float()
+        let b = r.next_float()
+        let d = r.next_float()
+        x_rota += (a - b) * d * 2.0f32
+        let e = r.next_float()
+        let g = r.next_float()
+        let h = r.next_float()
+        y_rota += (e - g) * h * 4.0f32
+        if step == split and t.thickness > 1.0f32 {
+            let left_seed = r.next_long()
+            let left_thickness = r.next_float() * 0.5f32 + 0.5f32
+            let left = Tunnel { x: x, y: y, z: z, horizontal: t.horizontal, vertical: t.vertical, thickness: left_thickness, horizontal_rotation: horizontal_rotation - QUARTER_TURN, vertical_rotation: vertical_rotation / 3.0f32, step: step, distance: t.distance, y_scale: 1.0 }
+            create_tunnel(mut c, sin, left_seed, left, skip)
+            let right_seed = r.next_long()
+            let right_thickness = r.next_float() * 0.5f32 + 0.5f32
+            let right = Tunnel { x: x, y: y, z: z, horizontal: t.horizontal, vertical: t.vertical, thickness: right_thickness, horizontal_rotation: horizontal_rotation + QUARTER_TURN, vertical_rotation: vertical_rotation / 3.0f32, step: step, distance: t.distance, y_scale: 1.0 }
+            create_tunnel(mut c, sin, right_seed, right, skip)
+            return
+        }
+        if r.next_int_below(4) != 0 {
+            if not can_reach(c, x, z, step, t.distance, t.thickness) {
+                return
+            }
+            carve_ellipsoid(mut c, x, y, z, horizontal_radius * t.horizontal, vertical_radius * t.vertical, skip, [])
+        }
+        step += 1
+    }
+}
+
+/// `CanyonWorldCarver.carve`: one canyon started in the chunk at `sx`, `sz`.
+fn carve_canyon(canyon: CanyonCarver, sin: SinTable, r: mut WorldgenRandom<LegacyRandom>, c: mut Carving, sx: i32, sz: i32) ! Thrown {
+    let x = f64((sx << 4) + r.next_int_below(16))
+    let y = try canyon.y.sample(mut r, c.gen)
+    let z = f64((sz << 4) + r.next_int_below(16))
+    let horizontal_rotation = r.next_float() * TURN
+    let vertical_rotation = canyon.vertical_rotation.sample(mut r)
+    let y_scale = f64(canyon.y_scale.sample(mut r))
+    let thickness = canyon.thickness.sample(mut r)
+    let distance = i32.saturate(f64(f32.nearest(MAX_DISTANCE) * canyon.distance_factor.sample(mut r)))
+    let tunnel_seed = r.next_long()
+    // `doCarve`.
+    var t = LegacyRandom.new(tunnel_seed)
+    let widths = width_factors(canyon, c.gen, mut t)
+    var x_now = x
+    var y_now = f64(y)
+    var z_now = z
+    var horizontal = horizontal_rotation
+    var vertical = vertical_rotation
+    var y_rota = 0.0f32
+    var x_rota = 0.0f32
+    var step = 0
+    while step < distance {
+        var horizontal_radius = 1.5 + f64(sin.sin(f64(f32.nearest(step) * HALF_TURN / f32.nearest(distance))) * thickness)
+        var vertical_radius = horizontal_radius * y_scale
+        horizontal_radius *= f64(canyon.horizontal_factor.sample(mut t))
+        // `updateVerticalRadius`, of the step and distance as floats.
+        let multiplier = 1.0f32 - (0.5f32 - f32.nearest(step) / f32.nearest(distance)).abs() * 2.0f32
+        let factor = canyon.vertical_default + canyon.vertical_center * multiplier
+        let between = t.next_float() * (1.0f32 - 0.75f32) + 0.75f32
+        vertical_radius = f64(factor) * vertical_radius * f64(between)
+        let xc = sin.cos(f64(vertical))
+        let xs = sin.sin(f64(vertical))
+        x_now += f64(sin.cos(f64(horizontal)) * xc)
+        y_now += f64(xs)
+        z_now += f64(sin.sin(f64(horizontal)) * xc)
+        vertical *= 0.7f32
+        vertical += x_rota * 0.05f32
+        horizontal += y_rota * 0.05f32
+        x_rota *= 0.8f32
+        y_rota *= 0.5f32
+        let a = t.next_float()
+        let b = t.next_float()
+        let d = t.next_float()
+        x_rota += (a - b) * d * 2.0f32
+        let e = t.next_float()
+        let g = t.next_float()
+        let h = t.next_float()
+        y_rota += (e - g) * h * 4.0f32
+        if t.next_int_below(4) != 0 {
+            if not can_reach(c, x_now, z_now, step, distance, thickness) {
+                return
+            }
+            carve_ellipsoid(mut c, x_now, y_now, z_now, horizontal_radius, vertical_radius, Skip.Canyon, widths)
+        }
+        step += 1
+    }
+}
+
+/// `initWidthFactors`: for each height of the generated world, how much narrower the canyon is
+/// there, changing at random every few blocks.
+fn width_factors(canyon: CanyonCarver, gen: GenContext, r: mut LegacyRandom) -> List<f32> {
+    var widths: List<f32> = [0.0f32; usize.wrap(gen.depth.max(0))]
+    var factor = 1.0f32
+    for i in 0..gen.depth {
+        if i == 0 or r.next_int_below(canyon.width_smoothness) == 0 {
+            let a = r.next_float()
+            let b = r.next_float()
+            factor = 1.0f32 + a * b
+        }
+        widths[usize.wrap(i)] = factor * factor
+    }
+    return widths
+}
+
+/// `WorldCarver.canReach`: whether the tunnel's remaining steps can still bring it to the chunk.
+fn can_reach(c: Carving, x: f64, z: f64, step: i32, distance: i32, thickness: f32) -> bool {
+    let dx = x - f64((c.chunk_x << 4) + 8)
+    let dz = z - f64((c.chunk_z << 4) + 8)
+    let remaining = f64(distance - step)
+    let rr = f64(thickness + 2.0f32 + 16.0f32)
+    return dx * dx + dz * dz - remaining * remaining <= rr * rr
+}
+
+/// `WorldCarver.carveEllipsoid`: the blocks of the chunk in the ellipsoid, each column from the
+/// top down, that the skip doesn't keep, into the mask.
+fn carve_ellipsoid(c: mut Carving, x: f64, y: f64, z: f64, horizontal_radius: f64, vertical_radius: f64, skip: Skip, widths: List<f32>) {
+    let min_x = c.chunk_x << 4
+    let min_z = c.chunk_z << 4
+    let max_delta = 16.0 + horizontal_radius * 2.0
+    if (x - f64(min_x + 8)).abs() > max_delta or (z - f64(min_z + 8)).abs() > max_delta {
+        return
+    }
+    let min_xi = (floor(x - horizontal_radius) - min_x - 1).max(0)
+    let max_xi = (floor(x + horizontal_radius) - min_x).min(15)
+    let min_y = (floor(y - vertical_radius) - 1).max(c.mask.min_y)
+    let max_y = (floor(y + vertical_radius) + 1).min(c.mask.max_y)
+    let min_zi = (floor(z - horizontal_radius) - min_z - 1).max(0)
+    let max_zi = (floor(z + horizontal_radius) - min_z).min(15)
+    var xi = min_xi
+    while xi <= max_xi {
+        let xd = (f64(min_x + xi) + 0.5 - x) / horizontal_radius
+        var zi = min_zi
+        while zi <= max_zi {
+            let zd = (f64(min_z + zi) + 0.5 - z) / horizontal_radius
+            if not (xd * xd + zd * zd >= 1.0) {
+                var wy = max_y
+                while wy > min_y {
+                    let yd = (f64(wy) - 0.5 - y) / vertical_radius
+                    let skipped = match skip {
+                        Skip.Cave(floor_level) => yd <= floor_level or xd * xd + yd * yd + zd * zd >= 1.0,
+                        Skip.Canyon => (xd * xd + zd * zd) * f64(widths[usize.wrap(wy - c.gen.min_y - 1)]) + yd * yd / 6.0 >= 1.0,
+                    }
+                    if not skipped {
+                        c.mask.carve(xi, wy, zi)
+                    }
+                    wy -= 1
+                }
+            }
+            zi += 1
+        }
+        xi += 1
+    }
+}
+
+/// `applyCarvingMask`: each column's runs of carved blocks, each from its top down, filled
+/// through the aquifer where the block isn't uncarvable; where a run cut through grass or
+/// mycelium down to dirt, the dirt gets the rule's top material.
+fn apply_mask(f: mut Filled, functions: mut Functions, shape: Shape, mat: Materials, rules: Rules, states: BlockStates, ctx: mut Context, aquifer: mut Aquifer, biomes: mut SourceBiomes, carvers: Carvers, mask: Mask, cx: i32, cz: i32) ! Thrown {
+    let h = mask.height
+    for column in 0..256 {
+        let x = column >> 4
+        let z = column & 15
+        let base = column * h
+        var i = 0
+        while i < h {
+            if mask.bits[usize.wrap(base + i)] {
+                var end = i
+                while end + 1 < h and mask.bits[usize.wrap(base + end + 1)] {
+                    end += 1
+                }
+                try fill_run(mut f, mut functions, shape, mat, rules, states, mut ctx, mut aquifer, mut biomes, carvers, cx, cz, x, z, mask.min_y + i, mask.min_y + end)
+                i = end + 1
+            } else {
+                i += 1
+            }
+        }
+    }
+}
+
+/// The mask's visitor, for one run of a column, from `top` down to `bottom`.
+fn fill_run(f: mut Filled, functions: mut Functions, shape: Shape, mat: Materials, rules: Rules, states: BlockStates, ctx: mut Context, aquifer: mut Aquifer, biomes: mut SourceBiomes, carvers: Carvers, cx: i32, cz: i32, x: i32, z: i32, bottom: i32, top: i32) ! Thrown {
+    var grass = false
+    let wx = (cx << 4) + x
+    let wz = (cz << 4) + z
+    var y = top
+    while y >= bottom {
+        let block = states.block_of(block_at(f, mat.void_air, x, z, y))
+        if not carvers.uncarvable.contains(block) {
+            if block == carvers.grass_block or block == carvers.mycelium {
+                grass = true
+            }
+            let carved = try aquifer.carved(functions.program, mut ctx, shape, wx, y, wz)
+            if let state = carved {
+                place(mut f, states, x, z, y, state)
+                let fluid = states.flags(state) & FLUID != 0
+                if aquifer.schedules() and fluid {
+                    mark(mut f, x, z, y)
+                }
+                if grass and states.block_of(block_at(f, mat.void_air, x, z, y - 1)) == carvers.dirt {
+                    let material = try top_material(f, mut functions, mat, rules, mut ctx, mut biomes, wx, y - 1, wz, fluid)
+                    if material != NONE {
+                        place(mut f, states, x, z, y - 1, material)
+                        if states.flags(material) & FLUID != 0 {
+                            mark(mut f, x, z, y - 1)
+                        }
+                    }
+                }
+            }
+        }
+        y -= 1
+    }
+}

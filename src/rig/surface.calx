@@ -1,6 +1,8 @@
 /// The `surface` probe (rig/PROTOCOL.md): chunks filled with a noise settings' terrain shape and
 /// then given their materials, as `buildTerrain` does before its carvers, with the settings'
-/// material rule or one the case writes out, and the biomes of a biome source.
+/// material rule or one the case writes out, and the biomes of a biome source. The `carvers`
+/// probe runs the carvers after, the biomes' or ones the case writes out, to finish
+/// `buildTerrain`.
 module rig.surface
 
 import json.tree.{Json, Member, as_i32, as_string, get, take}
@@ -9,13 +11,14 @@ import registry.registry.{Registry}
 import rig.frame.{Outcome}
 import world.chunk.{AIR_STATE, BlockStates}
 import world.states.{StateCodec}
-import worldgen.biome_manager.{Zoom, obfuscate_seed}
-import worldgen.biome_source.{BiomeSource, ClimateSampler, climate_of, read_source}
+import worldgen.biome_manager.{SourceBiomes, Zoom}
+import worldgen.biome_source.{climate_of, read_source}
+import worldgen.carver.{Carvers, carve_chunk}
 import worldgen.density.{Functions, data_json, qualified}
 import worldgen.interval.{Thrown}
 import worldgen.material.{Materials, Rules, build_surface, materials, read_rules}
 import worldgen.sampler.{Context}
-import worldgen.terrain.{Filled, Shape, clamped, fill_in, read_shape}
+import worldgen.terrain.{Filled, Shape, clamped, fill_noise, read_shape}
 
 /// The most blocks a case's ops may ask for.
 const MAX_VALUES: i64 = 4194304
@@ -26,16 +29,26 @@ struct World {
     shape: Shape
     mat: Materials
     rules: Rules
-    source: BiomeSource
-    climate: ClimateSampler
+    biomes: SourceBiomes
     seed: i64
     min_y: i32
     height: i32
 }
 
 pub fn run_surface(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, codec: StateCodec, states: BlockStates, biomes: Registry) -> Outcome {
+    return run(input, blobs, zip, codec, states, biomes, false, [])
+}
+
+/// The `carvers` probe, with the blocks of `#minecraft:uncarvable` by ID.
+pub fn run_carvers(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, codec: StateCodec, states: BlockStates, biomes: Registry, uncarvable: List<i32>) -> Outcome {
+    return run(input, blobs, zip, codec, states, biomes, true, uncarvable)
+}
+
+fn run(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, codec: StateCodec, states: BlockStates, biomes: Registry, carve: bool, uncarvable: List<i32>) -> Outcome {
+    let probe = if carve { "carvers" } else { "surface" }
+    let op_name = if carve { "carve" } else { "surface" }
     if blobs.len() != 0 {
-        return Outcome.Failed("`surface` takes no blobs")
+        return Outcome.Failed("`{probe}` takes no blobs")
     }
     var fields = input
     let seed_value = take(mut fields, "seed") else return Outcome.Failed("missing field `seed`")
@@ -75,7 +88,7 @@ pub fn run_surface(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, cod
     var steps = List<(i32, i32)>()
     var values: i64 = 0
     for i in 0..ops.len() {
-        match read_op(ops[i], i) {
+        match read_op(ops[i], i, op_name) {
             ok(op) => {
                 values += 256 * i64(height)
                 steps.push(op)
@@ -105,6 +118,19 @@ pub fn run_surface(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, cod
         ok(r) => r,
         err(_) => return invalid("rule"),
     }
+    var carvers: Carvers? = none
+    if carve {
+        match take(mut fields, "carvers") {
+            some(value) => match Carvers.written(zip, biomes, codec, uncarvable, value) {
+                ok(c) => carvers = some(c),
+                err(_) => return invalid("carvers"),
+            },
+            none => match Carvers.of_biomes(zip, biomes, source.possible(), codec, uncarvable) {
+                ok(c) => carvers = some(c),
+                err(e) => return Outcome.Failed(e),
+            },
+        }
+    }
     let router = match get(members, "noise_router") {
         some(Json.Object(m)) => m,
         _ => return Outcome.Failed("noise settings `{name}` have no router"),
@@ -121,9 +147,9 @@ pub fn run_surface(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, cod
         ok(m) => m,
         err(e) => return Outcome.Failed(e),
     }
-    let world = World { shape: shape, mat: mat, rules: rules, source: source, climate: climate, seed: seed, min_y: min_y, height: height }
+    var world = World { shape: shape, mat: mat, rules: rules, biomes: SourceBiomes.new(source, climate, seed), seed: seed, min_y: min_y, height: height }
     var out = List<u8>()
-    match evaluate(mut functions, world, states, steps, mut out) {
+    match evaluate(mut functions, mut world, states, carvers, steps, mut out) {
         ok => {},
         err(thrown) => return rejected(thrown),
     }
@@ -133,25 +159,28 @@ pub fn run_surface(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, cod
 
 /// The ops, as the vanilla adapter does them: the first exception thrown is the case's. A
 /// parameter list's search starts from the entry it found last, across the case.
-fn evaluate(functions: mut Functions, w: World, states: BlockStates, steps: List<(i32, i32)>, out: mut List<u8>) ! Thrown {
-    var last: i32 = -1
-    let hashed = obfuscate_seed(w.seed)
+fn evaluate(functions: mut Functions, w: mut World, states: BlockStates, carvers: Carvers?, steps: List<(i32, i32)>, out: mut List<u8>) ! Thrown {
     for (cx, cz) in steps {
         // The chunk and its neighbours, with their biomes, as `createBiomes` gives them.
         var chunks = List<List<i32>>()
         for dz in 0..3 {
             for dx in 0..3 {
                 var biomes = List<i32>()
-                try w.source.chunk(functions.program, w.climate, cx + dx - 1, cz + dz - 1, w.min_y, w.height, mut last, mut biomes)
+                try w.biomes.chunk(functions.program, cx + dx - 1, cz + dz - 1, w.min_y, w.height, mut biomes)
                 chunks.push(biomes)
             }
         }
-        let zoom = Zoom { chunk_x: cx, chunk_z: cz, min_y: w.min_y, height: w.height, seed: hashed, chunks: chunks }
+        var zoom = Zoom { chunk_x: cx, chunk_z: cz, min_y: w.min_y, height: w.height, seed: w.biomes.seed, chunks: chunks }
         var ctx = Context.new(true)
-        var f = try fill_in(mut functions, w.shape, states, mut ctx, cx, cz, w.min_y, w.height)
+        let (filled, noise_aquifer) = try fill_noise(mut functions, w.shape, states, mut ctx, cx, cz, w.min_y, w.height)
+        var f = filled
+        var aquifer = noise_aquifer
         let (_, noise_height) = clamped(w.shape, w.min_y, w.height)
         if noise_height > 0 {
-            try build_surface(mut f, mut functions, w.mat, w.rules, states, mut ctx, zoom, cx, cz)
+            try build_surface(mut f, mut functions, w.mat, w.rules, states, mut ctx, mut zoom, cx, cz)
+            if let k = carvers {
+                try carve_chunk(mut f, mut functions, w.shape, w.mat, w.rules, states, mut ctx, mut aquifer, mut w.biomes, k, w.seed, cx, cz)
+            }
         }
         write(f, states, mut out)
     }
@@ -201,21 +230,21 @@ fn write(f: Filled, states: BlockStates, out: mut List<u8>) {
     }
 }
 
-fn read_op(value: Json, i: usize) -> (i32, i32) ! String {
+fn read_op(value: Json, i: usize, name: str) -> (i32, i32) ! String {
     let what = "`ops`[{i}]"
     match value {
-        Json.Array(items) => return try op_of(items, what),
+        Json.Array(items) => return try op_of(items, what, name),
         _ => {},
     }
     fail "{what} must be a non-empty array"
 }
 
-fn op_of(op: List<Json>, what: String) -> (i32, i32) ! String {
+fn op_of(op: List<Json>, what: String, name: str) -> (i32, i32) ! String {
     if op.len() == 0 {
         fail "{what} must be a non-empty array"
     }
     let kind = as_string(op[0]) else fail "{what}[0] must be a string"
-    if kind != "surface" {
+    if kind != String(name) {
         fail "{what}: unknown op `{kind}`"
     }
     if op.len() != 3 {

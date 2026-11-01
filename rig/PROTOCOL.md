@@ -706,6 +706,17 @@ The ops give at most 2^22 blocks in all, 256 times the world's height for each. 
 
 A source the codec doesn't read is `{"invalid": "source"}`, and then a rule it doesn't read `{"invalid": "rule"}`, each with no blob: the codecs' messages are their own, so only that they don't read is compared. If anything else throws, the result is the rejection, as `rng`'s is, and no blob. Settings that don't exist, a world that isn't whole sections within the limits, an op that isn't `surface`, too many blocks and any blob are an `error` status.
 
+### `carvers` (v1)
+
+Chunks filled, given their materials and then carved: the whole of 26.3's `buildTerrain`, whose carvers run after the surface in the same `NoiseChunk`. Everything is as in `surface`, with these differences.
+
+The input may also have `"carvers": c`, read by `WorldCarver.LIST_CODEC` with the registries' ops: one carver or a list, each by ID or written out. Each op is `["carve", x, z]`, and step 3 goes on, if any of the noise is left, to carve the chunk:
+
+- Without `c`, `generateCarvers` itself, through reflection, with `Blender.empty()`, the biome manager of step 2, no `WorldGenRegion`, and the rule. So the carvers are those of the biome the generator's uncached resolver gives at each chunk's corner at height 0, for the chunks up to 8 away.
+- With `c`, a copy of `generateCarvers`' loop with `c` in every chunk up to 8 away in place of its biome's: the same `WorldgenRandom`, seeded with `setLargeFeatureSeed(seed + index, x, z)` for each carver, the same `WorldGenerationContext` and `CarvingMask`, then vanilla's own `applyCarvingMask`, through reflection, with the biome manager over the uncached resolver and no filter.
+
+The chunk is written as in `surface`. After a source and a rule, carvers that don't read are `{"invalid": "carvers"}`, with no blob; a weighted list whose weights add up past an `int` throws as it's read, and counts as not reading. An op that isn't `carve` is an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

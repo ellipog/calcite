@@ -1,9 +1,13 @@
 /// `BiomeManager`: the biome at a block, picked from the quarts around it by a distance the
-/// hashed seed fiddles, as 26.3 zooms the biomes in from quarts to blocks.
+/// hashed seed fiddles, as 26.3 zooms the biomes in from quarts to blocks. The quarts come from a
+/// chunk and its neighbours, as a `WorldGenRegion` reads them, or from the biome source itself,
+/// as vanilla's carvers read them.
 module worldgen.biome_manager
 
 import std.hash.{sha256}
+import worldgen.biome_source.{BiomeSource, ClimateSampler}
 import worldgen.interval.{Thrown}
+import worldgen.sampler.{Context, Program}
 
 /// `BiomeManager.obfuscateSeed`: the first 8 bytes of the SHA-256 of the seed's 8 bytes, each
 /// little-endian, as Guava's `hashLong` and `asLong` take them. The client gets it as the
@@ -21,6 +25,17 @@ pub fn obfuscate_seed(seed: i64) -> i64 {
     return out
 }
 
+/// Where the biomes at blocks come from: `BiomeManager.getBiome`, through whichever quarts the
+/// manager reads. `p` is the program the source's climate samples through.
+pub interface BlockBiomes {
+    fn biome(mut self, p: Program, x: i32, y: i32, z: i32) -> i32 ! Thrown
+}
+
+/// The quarts a biome manager reads: `BiomeManager.NoiseBiomeSource.getNoiseBiome`.
+interface NoiseBiomes {
+    fn noise_biome(mut self, p: Program, qx: i32, qy: i32, qz: i32) -> i32 ! Thrown
+}
+
 /// The biomes of a chunk and the eight around it, as a `WorldGenRegion` reads them for the
 /// chunk in its middle. The zoom never reaches further than a quart past the chunk.
 pub struct Zoom {
@@ -36,46 +51,11 @@ pub struct Zoom {
     pub chunks: List<List<i32>>
 }
 
-impl Zoom {
-    /// `BiomeManager.getBiome`: the biome of the corner of the block's quart cell nearest it,
-    /// each corner's distance fiddled. Only at the ends of `int`, where the block's coordinates
-    /// wrap, does the corner fall outside the chunk's neighbours, and a region has no biome there.
-    pub fn biome(self, x: i32, y: i32, z: i32) -> i32 ! Thrown {
-        let ax = x - 2
-        let ay = y - 2
-        let az = z - 2
-        let px = ax >> 2
-        let py = ay >> 2
-        let pz = az >> 2
-        let fx = f64(ax & 3) / 4.0
-        let fy = f64(ay & 3) / 4.0
-        let fz = f64(az & 3) / 4.0
-        var min_i = 0
-        var min = f64.INFINITY
-        for i in 0..8 {
-            let x_even = (i & 4) == 0
-            let y_even = (i & 2) == 0
-            let z_even = (i & 1) == 0
-            let cx = if x_even { px } else { px + 1 }
-            let cy = if y_even { py } else { py + 1 }
-            let cz = if z_even { pz } else { pz + 1 }
-            let dx = if x_even { fx } else { fx - 1.0 }
-            let dy = if y_even { fy } else { fy - 1.0 }
-            let dz = if z_even { fz } else { fz - 1.0 }
-            let next = fiddled(self.seed, cx, cy, cz, dx, dy, dz)
-            if min > next {
-                min_i = i
-                min = next
-            }
-        }
-        let bx = if (min_i & 4) == 0 { px } else { px + 1 }
-        let by = if (min_i & 2) == 0 { py } else { py + 1 }
-        let bz = if (min_i & 1) == 0 { pz } else { pz + 1 }
-        return try self.noise_biome(bx, by, bz)
-    }
-
+impl NoiseBiomes for Zoom {
     /// `ChunkAccess.getNoiseBiome` of the chunk the quart is in: its `y` clamped to the world.
-    fn noise_biome(self, qx: i32, qy: i32, qz: i32) -> i32 ! Thrown {
+    /// Only at the ends of `int`, where the block's coordinates wrap, does a quart fall outside
+    /// the chunk's neighbours, and a region has no biome there.
+    fn noise_biome(mut self, p: Program, qx: i32, qy: i32, qz: i32) -> i32 ! Thrown {
         let dx = (qx >> 2) - self.chunk_x
         let dz = (qz >> 2) - self.chunk_z
         if dx < -1 or dx > 1 or dz < -1 or dz > 1 {
@@ -88,6 +68,95 @@ impl Zoom {
         let i = ((((cy >> 2) - (self.min_y >> 4)) * 4 + (qx & 3)) * 4 + (cy & 3)) * 4 + (qz & 3)
         return self.chunks[c][usize.wrap(i)]
     }
+}
+
+impl BlockBiomes for Zoom {
+    fn biome(mut self, p: Program, x: i32, y: i32, z: i32) -> i32 ! Thrown {
+        let seed = self.seed
+        return try zoom(mut self, p, seed, x, y, z)
+    }
+}
+
+/// A world's biome source, with the climate it samples, as its chunks and carvers ask it:
+/// `createBiomes` fills a chunk's quarts through a context with caches, and `createUncachedResolver`
+/// answers single quarts. A multi-noise source's search starts from the entry it found last, one
+/// `last` for the world here as vanilla keeps one for each thread (D200).
+pub struct SourceBiomes {
+    pub source: BiomeSource
+    pub climate: ClimateSampler
+    /// The obfuscated seed.
+    pub seed: i64
+    pub last: i32 = -1
+    uncached: Context
+}
+
+impl SourceBiomes {
+    /// The source's biomes in a world of seed `seed`.
+    pub fn new(source: own BiomeSource, climate: own ClimateSampler, seed: i64) -> SourceBiomes {
+        return SourceBiomes { source: source, climate: climate, seed: obfuscate_seed(seed), uncached: Context.new(false) }
+    }
+
+    /// `ChunkGenerator.createBiomes` of the chunk at `x`, `z` in a world `height` blocks tall
+    /// from `min_y`, as `BiomeSource.chunk` gives them.
+    pub fn chunk(mut self, p: Program, x: i32, z: i32, min_y: i32, height: i32, out: mut List<i32>) ! Thrown {
+        try self.source.chunk(p, self.climate, x, z, min_y, height, mut self.last, mut out)
+    }
+
+    /// The uncached resolver's biome at a quart.
+    pub fn at(mut self, p: Program, qx: i32, qy: i32, qz: i32) -> i32 ! Thrown {
+        return try self.source.biome_at(p, mut self.uncached, self.climate, qx, qy, qz, mut self.last)
+    }
+}
+
+impl NoiseBiomes for SourceBiomes {
+    fn noise_biome(mut self, p: Program, qx: i32, qy: i32, qz: i32) -> i32 ! Thrown {
+        return try self.at(p, qx, qy, qz)
+    }
+}
+
+impl BlockBiomes for SourceBiomes {
+    /// `BiomeManager.withDifferentSource(createUncachedResolver)`'s `getBiome`, as vanilla's
+    /// carvers ask it.
+    fn biome(mut self, p: Program, x: i32, y: i32, z: i32) -> i32 ! Thrown {
+        let seed = self.seed
+        return try zoom(mut self, p, seed, x, y, z)
+    }
+}
+
+/// `BiomeManager.getBiome`: the biome of the corner of the block's quart cell nearest it, each
+/// corner's distance fiddled.
+fn zoom<T: NoiseBiomes>(b: mut T, p: Program, seed: i64, x: i32, y: i32, z: i32) -> i32 ! Thrown {
+    let ax = x - 2
+    let ay = y - 2
+    let az = z - 2
+    let px = ax >> 2
+    let py = ay >> 2
+    let pz = az >> 2
+    let fx = f64(ax & 3) / 4.0
+    let fy = f64(ay & 3) / 4.0
+    let fz = f64(az & 3) / 4.0
+    var min_i = 0
+    var min = f64.INFINITY
+    for i in 0..8 {
+        let x_even = (i & 4) == 0
+        let y_even = (i & 2) == 0
+        let z_even = (i & 1) == 0
+        let cx = if x_even { px } else { px + 1 }
+        let cy = if y_even { py } else { py + 1 }
+        let cz = if z_even { pz } else { pz + 1 }
+        let dx = if x_even { fx } else { fx - 1.0 }
+        let dy = if y_even { fy } else { fy - 1.0 }
+        let dz = if z_even { fz } else { fz - 1.0 }
+        let next = fiddled(seed, cx, cy, cz, dx, dy, dz)
+        if min > next {
+            min_i = i
+            min = next
+        }
+    }
+    let bx = if (min_i & 4) == 0 { px } else { px + 1 }
+    let by = if (min_i & 2) == 0 { py } else { py + 1 }
+    let bz = if (min_i & 1) == 0 { pz } else { pz + 1 }
+    return try b.noise_biome(p, bx, by, bz)
 }
 
 /// `getFiddledDistance`: a corner's squared distance, each axis moved by up to 0.45 by the

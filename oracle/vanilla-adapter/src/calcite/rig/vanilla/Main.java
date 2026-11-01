@@ -64,7 +64,8 @@ public final class Main {
                 new DensityProbe(),
                 new BiomesProbe(),
                 new TerrainProbe(),
-                new SurfaceProbe())) {
+                new SurfaceProbe(false),
+                new SurfaceProbe(true))) {
             probes.put(probe.name(), probe);
         }
 

@@ -79,7 +79,7 @@ final class TerrainProbe implements Probe {
         }
     }
 
-    private static Method method(String name, Class<?>... parameters) {
+    static Method method(String name, Class<?>... parameters) {
         try {
             Method m = NoiseBasedChunkGenerator.class.getDeclaredMethod(name, parameters);
             m.setAccessible(true);
@@ -260,7 +260,7 @@ final class TerrainProbe implements Probe {
         }
     }
 
-    private static Object invoke(Method m, Object owner, Object... arguments) {
+    static Object invoke(Method m, Object owner, Object... arguments) {
         try {
             return m.invoke(owner, arguments);
         } catch (IllegalAccessException e) {
