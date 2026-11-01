@@ -1,0 +1,248 @@
+/// The `surface` probe (rig/PROTOCOL.md): chunks filled with a noise settings' terrain shape and
+/// then given their materials, as `buildTerrain` does before its carvers, with the settings'
+/// material rule or one the case writes out, and the biomes of a biome source.
+module rig.surface
+
+import json.tree.{Json, Member, as_i32, as_string, get, take}
+import pack.zip.{Zip}
+import registry.registry.{Registry}
+import rig.frame.{Outcome}
+import world.chunk.{AIR_STATE, BlockStates}
+import world.states.{StateCodec}
+import worldgen.biome_manager.{Zoom, obfuscate_seed}
+import worldgen.biome_source.{BiomeSource, ClimateSampler, climate_of, read_source}
+import worldgen.density.{Functions, data_json, qualified}
+import worldgen.interval.{Thrown}
+import worldgen.material.{Materials, Rules, build_surface, materials, read_rules}
+import worldgen.sampler.{Context}
+import worldgen.terrain.{Filled, Shape, clamped, fill_in, read_shape}
+
+/// The most blocks a case's ops may ask for.
+const MAX_VALUES: i64 = 4194304
+
+/// What a case runs with: the settings' shape and materials, the rule, and the source with its
+/// climate.
+struct World {
+    shape: Shape
+    mat: Materials
+    rules: Rules
+    source: BiomeSource
+    climate: ClimateSampler
+    seed: i64
+    min_y: i32
+    height: i32
+}
+
+pub fn run_surface(input: own List<Member>, blobs: List<List<u8>>, zip: Zip, codec: StateCodec, states: BlockStates, biomes: Registry) -> Outcome {
+    if blobs.len() != 0 {
+        return Outcome.Failed("`surface` takes no blobs")
+    }
+    var fields = input
+    let seed_value = take(mut fields, "seed") else return Outcome.Failed("missing field `seed`")
+    let seed_text = as_string(seed_value) else return Outcome.Failed("`seed` must be a string")
+    let seed = i64.parse(seed_text) else return Outcome.Failed("`seed` must be a decimal 64-bit integer")
+    let settings_value = take(mut fields, "settings") else return Outcome.Failed("missing field `settings`")
+    let name = as_string(settings_value) else return Outcome.Failed("`settings` must be an identifier")
+    let json = match data_json(zip, qualified(name), "noise_settings") {
+        ok(j) => j,
+        err(e) => return Outcome.Failed(e),
+    }
+    let members = match json {
+        Json.Object(m) => m,
+        _ => return Outcome.Failed("noise settings `{name}` isn't an object"),
+    }
+    let legacy = match get(members, "legacy_random_source") {
+        some(Json.Bool(b)) => b,
+        _ => return Outcome.Failed("noise settings `{name}` have no `legacy_random_source`"),
+    }
+    let level = match take(mut fields, "level") {
+        some(Json.Array(items)) => items,
+        _ => return Outcome.Failed("`level` must be [min_y, height]"),
+    }
+    if level.len() != 2 {
+        return Outcome.Failed("`level` must be [min_y, height]")
+    }
+    let min_y = as_i32(level[0]) else return Outcome.Failed("`level`[0] must be an int")
+    let height = as_i32(level[1]) else return Outcome.Failed("`level`[1] must be an int")
+    if min_y % 16 != 0 or height % 16 != 0 or height <= 0 or min_y < -2032 or min_y + height > 2032 {
+        return Outcome.Failed("`level` must be whole sections within the world")
+    }
+    let op_list = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let ops = match op_list {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    var steps = List<(i32, i32)>()
+    var values: i64 = 0
+    for i in 0..ops.len() {
+        match read_op(ops[i], i) {
+            ok(op) => {
+                values += 256 * i64(height)
+                steps.push(op)
+            },
+            err(e) => return Outcome.Failed(e),
+        }
+    }
+    if values > MAX_VALUES {
+        return Outcome.Failed("the ops give more than {MAX_VALUES} values")
+    }
+    // A source or rule that doesn't read is compared only as that, the source first, as the
+    // vanilla adapter reports them: the codecs' messages are their own.
+    let source_value = take(mut fields, "source") else return Outcome.Failed("missing field `source`")
+    let source = match read_source(zip, biomes, source_value) {
+        ok(s) => s,
+        err(_) => return invalid("source"),
+    }
+    var functions = Functions.new(legacy, seed)
+    let rule_value = match take(mut fields, "rule") {
+        some(v) => v,
+        none => {
+            let own_rule = get(members, "material_rule") else return Outcome.Failed("noise settings `{name}` have no `material_rule`")
+            own_rule
+        },
+    }
+    let rules = match read_rules(mut functions, zip, biomes, codec, rule_value) {
+        ok(r) => r,
+        err(_) => return invalid("rule"),
+    }
+    let router = match get(members, "noise_router") {
+        some(Json.Object(m)) => m,
+        _ => return Outcome.Failed("noise settings `{name}` have no router"),
+    }
+    let climate = match climate_of(mut functions, zip, router) {
+        ok(c) => c,
+        err(e) => return Outcome.Failed(e),
+    }
+    let shape = match read_shape(mut functions, zip, members, codec, states) {
+        ok(s) => s,
+        err(e) => return Outcome.Failed(e),
+    }
+    let mat = match materials(mut functions, zip, members, shape, codec, biomes, source.possible(), min_y, height) {
+        ok(m) => m,
+        err(e) => return Outcome.Failed(e),
+    }
+    let world = World { shape: shape, mat: mat, rules: rules, source: source, climate: climate, seed: seed, min_y: min_y, height: height }
+    var out = List<u8>()
+    match evaluate(mut functions, world, states, steps, mut out) {
+        ok => {},
+        err(thrown) => return rejected(thrown),
+    }
+    let output: List<Member> = []
+    return Outcome.Done { output: output, blobs: [out] }
+}
+
+/// The ops, as the vanilla adapter does them: the first exception thrown is the case's. A
+/// parameter list's search starts from the entry it found last, across the case.
+fn evaluate(functions: mut Functions, w: World, states: BlockStates, steps: List<(i32, i32)>, out: mut List<u8>) ! Thrown {
+    var last: i32 = -1
+    let hashed = obfuscate_seed(w.seed)
+    for (cx, cz) in steps {
+        // The chunk and its neighbours, with their biomes, as `createBiomes` gives them.
+        var chunks = List<List<i32>>()
+        for dz in 0..3 {
+            for dx in 0..3 {
+                var biomes = List<i32>()
+                try w.source.chunk(functions.program, w.climate, cx + dx - 1, cz + dz - 1, w.min_y, w.height, mut last, mut biomes)
+                chunks.push(biomes)
+            }
+        }
+        let zoom = Zoom { chunk_x: cx, chunk_z: cz, min_y: w.min_y, height: w.height, seed: hashed, chunks: chunks }
+        var ctx = Context.new(true)
+        var f = try fill_in(mut functions, w.shape, states, mut ctx, cx, cz, w.min_y, w.height)
+        let (_, noise_height) = clamped(w.shape, w.min_y, w.height)
+        if noise_height > 0 {
+            try build_surface(mut f, mut functions, w.mat, w.rules, states, mut ctx, zoom, cx, cz)
+        }
+        write(f, states, mut out)
+    }
+}
+
+/// The chunk as the vanilla adapter writes it: its blocks as runs of one state, as
+/// `ProtoChunk.getBlockState` reads them, so a section of only air, cave air and void air reads as
+/// air; then its `_WG` heightmaps and the blocks marked for post-processing.
+fn write(f: Filled, states: BlockStates, out: mut List<u8>) {
+    var runs = List<u32>()
+    let sections = f.states.len() / 4096
+    for s in 0..sections {
+        let start = s * 4096
+        var only_air = true
+        for i in start..start + 4096 {
+            if not states.is_air(f.states[i]) {
+                only_air = false
+                break
+            }
+        }
+        for i in start..start + 4096 {
+            let state = if only_air { AIR_STATE } else { f.states[i] }
+            let n = runs.len()
+            if n > 0 and runs[n - 2] == state {
+                runs[n - 1] += 1
+            } else {
+                runs.push(state)
+                runs.push(1)
+            }
+        }
+    }
+    put_u32(mut out, u32.wrap(runs.len() / 2))
+    for v in runs {
+        put_u32(mut out, v)
+    }
+    for h in f.ocean_floor {
+        put_u32(mut out, u32.wrap(h))
+    }
+    for h in f.world_surface {
+        put_u32(mut out, u32.wrap(h))
+    }
+    for list in f.marked {
+        put_u32(mut out, u32.wrap(list.len()))
+        for packed in list {
+            put_u32(mut out, u32(packed))
+        }
+    }
+}
+
+fn read_op(value: Json, i: usize) -> (i32, i32) ! String {
+    let what = "`ops`[{i}]"
+    match value {
+        Json.Array(items) => return try op_of(items, what),
+        _ => {},
+    }
+    fail "{what} must be a non-empty array"
+}
+
+fn op_of(op: List<Json>, what: String) -> (i32, i32) ! String {
+    if op.len() == 0 {
+        fail "{what} must be a non-empty array"
+    }
+    let kind = as_string(op[0]) else fail "{what}[0] must be a string"
+    if kind != "surface" {
+        fail "{what}: unknown op `{kind}`"
+    }
+    if op.len() != 3 {
+        fail "{what} must have 3 elements"
+    }
+    let a = as_i32(op[1]) else fail "{what}[1] must be an int"
+    let b = as_i32(op[2]) else fail "{what}[2] must be an int"
+    return (a, b)
+}
+
+fn invalid(what: str) -> Outcome {
+    let output: List<Member> = [Member { key: "invalid", value: Json.Str(String(what)) }]
+    return Outcome.Done { output: output, blobs: [] }
+}
+
+/// A rejection, as the vanilla adapter reports an exception the game throws.
+fn rejected(thrown: Thrown) -> Outcome {
+    let output: List<Member> = [
+        Member { key: "exception", value: Json.Str(thrown.exception.copy()) },
+        Member { key: "error", value: Json.Str(thrown.message.copy()) },
+    ]
+    return Outcome.Done { output: output, blobs: [] }
+}
+
+fn put_u32(out: mut List<u8>, v: u32) {
+    out.push(u8.wrap(v >> 24))
+    out.push(u8.wrap(v >> 16))
+    out.push(u8.wrap(v >> 8))
+    out.push(u8.wrap(v))
+}

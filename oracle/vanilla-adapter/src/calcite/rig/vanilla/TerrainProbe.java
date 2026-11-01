@@ -171,11 +171,24 @@ final class TerrainProbe implements Probe {
             throws IOException {
         NoiseSettings noise = settings.noiseSettings().clampToHeightAccessor(chunk.getHeightAccessorForGeneration());
         if (noise.height() > 0) {
-            try (NoiseChunk noiseChunk = new NoiseChunk(
-                    state, null, settings, fluidPicker(generator), Blender.empty(), (DensityVolume) invoke(CHUNK_VOLUME, null, chunk, noise))) {
-                invoke(DO_FILL, generator, noiseChunk, chunk);
+            try (NoiseChunk noiseChunk = noiseChunk(generator, settings, state, chunk, noise)) {
+                doFill(generator, noiseChunk, chunk);
             }
         }
+        write(chunk, out);
+    }
+
+    /** The {@code NoiseChunk} {@code buildTerrain} makes, with no structures and nothing to blend. */
+    static NoiseChunk noiseChunk(NoiseBasedChunkGenerator generator, NoiseGeneratorSettings settings, RandomState state, ChunkAccess chunk, NoiseSettings noise) {
+        return new NoiseChunk(state, null, settings, fluidPicker(generator), Blender.empty(), (DensityVolume) invoke(CHUNK_VOLUME, null, chunk, noise));
+    }
+
+    static void doFill(NoiseBasedChunkGenerator generator, NoiseChunk noiseChunk, ChunkAccess chunk) {
+        invoke(DO_FILL, generator, noiseChunk, chunk);
+    }
+
+    /** The chunk's blocks, `_WG` heightmaps and marked blocks. */
+    static void write(ProtoChunk chunk, DataOutputStream out) throws IOException {
         // The blocks as runs of one state, from the bottom up, each section in y, z, x order.
         List<int[]> runs = new ArrayList<>();
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();

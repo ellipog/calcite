@@ -1,0 +1,1311 @@
+/// A noise settings' materials: its material rule, read as `MaterialRule.CODEC` reads one, and
+/// `MaterialSystem.buildSurface`, which gives a filled chunk its surface, bedrock, bandlands, ore
+/// veins, eroded badlands pillars and frozen ocean icebergs, in 26.3.
+///
+/// The rule is read once and compiled for each chunk, as vanilla compiles it in the chunk's
+/// `MaterialRuleContext`. Vanilla's conditions are pure functions of the block and its column
+/// (the caches its lazy conditions keep only save work), so each condition here is worked out at
+/// most once for a block, and a rule named twice compiles once.
+module worldgen.material
+
+import json.tree.{Json, Member, as_string, get}
+import json.gson.{int_value}
+import nbt.tag.{Tag}
+import pack.zip.{Zip}
+import random.any.{AnyPositional, AnyRandom}
+import random.legacy.{LegacyRandom}
+import registry.registry.{Registry}
+import resources.identifier.{Identifier}
+import world.block_flags.{FLUID}
+import world.chunk.{BlockStates, OCEAN_FLOOR_WG, WORLD_SURFACE_WG}
+import world.states.{StateCodec}
+import worldgen.biome_manager.{Zoom}
+import worldgen.biome_source.{holder_set}
+import worldgen.density.{Functions, data_json}
+import worldgen.interval.{Thrown}
+import worldgen.noise.{Layer, Noise, Stack, Volume}
+import worldgen.normal.{NormalNoise, read_parameters}
+import worldgen.sampler.{Context, Program, fill, sample, volume, zeros}
+import worldgen.terrain.{Filled, Shape, clamped, update}
+
+/// What a rule gives where it gives nothing: vanilla's `null`.
+const NONE: u32 = 0xFFFFFFFF
+/// `DimensionType.WAY_BELOW_MIN_Y`.
+const WAY_BELOW: i32 = -32512
+/// `DimensionType.MIN_Y` and `MAX_Y`, the range of a vertical anchor.
+const ANCHOR_MIN: i32 = -2032
+const ANCHOR_MAX: i32 = 2031
+/// How many clay bands there are.
+const BANDS: i32 = 192
+
+/// `VerticalAnchor`: a height, absolute or from the bottom or top of the generated world or from
+/// the sea.
+enum Anchor {
+    Absolute(i32)
+    AboveBottom(i32)
+    BelowTop(i32)
+    Sea(i32)
+}
+
+/// A `MaterialCondition`, as read.
+enum Condition {
+    /// `biome`: whether the block's biome is one of these, by biome ID.
+    Biomes(List<bool>)
+    /// `noise_threshold`: the noise `noise` of `Rules.stacks` between `min` and `max`.
+    Threshold { noise: usize, min: f64, max: f64, three_d: bool }
+    /// `vertical_gradient`: true at and below one height, false at and above another, and
+    /// randomly between.
+    Gradient { random: AnyPositional, true_at: Anchor, false_at: Anchor }
+    /// `y_above`.
+    YAbove { anchor: Anchor, multiplier: i32, add: bool }
+    /// `water`.
+    Water { offset: i32, multiplier: i32, add: bool }
+    /// `temperature`: cold enough to snow.
+    Temperature
+    /// `steep`.
+    Steep
+    /// `not`.
+    Not(usize)
+    /// `hole`: a column with no surface depth.
+    Hole
+    /// `above_preliminary_surface`.
+    Preliminary
+    /// `stone_depth`, from the floor or the ceiling.
+    StoneDepth { offset: i32, add: bool, range: i32, ceiling: bool }
+}
+
+/// A `MaterialRule`, as read.
+enum Rule {
+    /// `block`: a state.
+    Block(u32)
+    /// `bandlands`: the clay band at the block's height.
+    Bands
+    /// `sequence`: the first of its rules that gives a block.
+    Sequence(List<usize>)
+    /// `condition`: its rule where its condition holds.
+    If { condition: usize, then_run: usize }
+    /// `ore_vein`: the vein of `Rules.ores`.
+    Ore(usize)
+}
+
+/// An `ore_vein` rule: its states, its chance of raw ore, and its density functions, read into
+/// the case's `Functions`.
+struct OreRule {
+    ore: u32
+    raw: u32
+    filler: u32
+    chance: f32
+    density: usize
+    richness: usize
+    gap: usize
+}
+
+/// A material rule, read: its rules and conditions, the noises its conditions name, and the
+/// random its ore veins draw from.
+pub struct Rules {
+    rules: List<Rule> = List<Rule>()
+    conditions: List<Condition> = List<Condition>()
+    ores: List<OreRule> = List<OreRule>()
+    /// The rule the case gives, or the settings' own.
+    pub root: usize = 0
+    /// The rules and conditions named by ID, read the first time they're named.
+    rule_refs: Map<String, usize> = Map<String, usize>()
+    condition_refs: Map<String, usize> = Map<String, usize>()
+    /// The noises the conditions name, made as `RandomState.getOrCreateNoise` makes them, and
+    /// which of them vanilla's data doesn't have: naming one throws when the rule compiles.
+    stacks: List<Stack> = List<Stack>()
+    missing: List<bool> = List<bool>()
+    noise_ids: List<String> = List<String>()
+    noise_index: Map<String, usize> = Map<String, usize>()
+    /// `getOrCreateRandomFactory("minecraft:ore")`.
+    ore_random: AnyPositional
+}
+
+impl Rules {
+    fn add_rule(mut self, r: own Rule) -> usize {
+        self.rules.push(r)
+        return self.rules.len() - 1
+    }
+
+    fn add_condition(mut self, c: own Condition) -> usize {
+        self.conditions.push(c)
+        return self.conditions.len() - 1
+    }
+}
+
+// Reading.
+
+/// The material rule `value`, as `MaterialRule.CODEC` reads it, with vanilla's data for the
+/// rules, conditions, biomes, noises and density functions it names. Fails where vanilla's codec
+/// does; the message is only this reader's.
+pub fn read_rules(functions: mut Functions, zip: Zip, biomes: Registry, codec: StateCodec, value: Json) -> Rules ! String {
+    var rules = Rules { ore_random: functions.random_factory(String("minecraft:ore")) }
+    rules.root = try read_rule(mut rules, mut functions, zip, biomes, codec, value)
+    return rules
+}
+
+/// `MaterialRule.CODEC`: a rule by its ID in the registry, or one written out.
+fn read_rule(rules: mut Rules, functions: mut Functions, zip: Zip, biomes: Registry, codec: StateCodec, value: Json) -> usize ! String {
+    if let text = as_string(value) {
+        match Identifier.parse(text) {
+            ok(id) => {
+                let key = id.to_string()
+                if let r = rules.rule_refs.get(key) {
+                    return r
+                }
+                let json = try data_json(zip, key, "material_rule")
+                let r = try read_direct_rule(mut rules, mut functions, zip, biomes, codec, json)
+                rules.rule_refs.insert(key, r)
+                return r
+            },
+            // Not an ID: read as written out, which a string isn't.
+            err(_) => {},
+        }
+    }
+    return try read_direct_rule(mut rules, mut functions, zip, biomes, codec, value)
+}
+
+fn read_direct_rule(rules: mut Rules, functions: mut Functions, zip: Zip, biomes: Registry, codec: StateCodec, value: Json) -> usize ! String {
+    match value {
+        Json.Object(members) => return try read_typed_rule(mut rules, mut functions, zip, biomes, codec, members),
+        _ => {},
+    }
+    fail "Not a map: {value}"
+}
+
+fn read_typed_rule(rules: mut Rules, functions: mut Functions, zip: Zip, biomes: Registry, codec: StateCodec, members: List<Member>) -> usize ! String {
+    let kind = try type_of(members)
+    if kind == "minecraft:block" {
+        let state = try state_field(members, "result_state", codec)
+        return rules.add_rule(Rule.Block(state))
+    }
+    if kind == "minecraft:bandlands" {
+        return rules.add_rule(Rule.Bands)
+    }
+    if kind == "minecraft:sequence" {
+        let list = match field(members, "sequence") {
+            some(Json.Array(items)) => items,
+            some(other) => fail "Not a list: {other}",
+            none => fail "No key sequence in MapLike",
+        }
+        var entries = List<usize>()
+        for item in list {
+            entries.push(try read_rule(mut rules, mut functions, zip, biomes, codec, item))
+        }
+        return rules.add_rule(Rule.Sequence(entries))
+    }
+    if kind == "minecraft:condition" {
+        let if_true = field(members, "if_true") else fail "No key if_true in MapLike"
+        let then_value = field(members, "then_run") else fail "No key then_run in MapLike"
+        let condition = try read_condition(mut rules, functions, zip, biomes, if_true)
+        let then_run = try read_rule(mut rules, mut functions, zip, biomes, codec, then_value)
+        return rules.add_rule(Rule.If { condition: condition, then_run: then_run })
+    }
+    if kind == "minecraft:ore_vein" {
+        let ore = try state_field(members, "ore_block", codec)
+        let raw = try state_field(members, "raw_ore_block", codec)
+        let filler = try state_field(members, "filler_block", codec)
+        let chance_value = field(members, "raw_ore_chance") else fail "No key raw_ore_chance in MapLike"
+        let chance = try unit_float(chance_value)
+        let density = try function_field(mut functions, zip, members, "density")
+        let richness = try function_field(mut functions, zip, members, "richness")
+        let gap = try function_field(mut functions, zip, members, "filler_gap")
+        rules.ores.push(OreRule { ore: ore, raw: raw, filler: filler, chance: chance, density: density, richness: richness, gap: gap })
+        let k = rules.ores.len() - 1
+        return rules.add_rule(Rule.Ore(k))
+    }
+    fail "Unknown material rule type: {kind}"
+}
+
+/// `MaterialCondition.CODEC`: a condition by its ID in the registry, or one written out.
+fn read_condition(rules: mut Rules, functions: Functions, zip: Zip, biomes: Registry, value: Json) -> usize ! String {
+    if let text = as_string(value) {
+        match Identifier.parse(text) {
+            ok(id) => {
+                let key = id.to_string()
+                if let c = rules.condition_refs.get(key) {
+                    return c
+                }
+                let json = try data_json(zip, key, "material_condition")
+                let c = try read_direct_condition(mut rules, functions, zip, biomes, json)
+                rules.condition_refs.insert(key, c)
+                return c
+            },
+            err(_) => {},
+        }
+    }
+    return try read_direct_condition(mut rules, functions, zip, biomes, value)
+}
+
+fn read_direct_condition(rules: mut Rules, functions: Functions, zip: Zip, biomes: Registry, value: Json) -> usize ! String {
+    match value {
+        Json.Object(members) => return try read_typed_condition(mut rules, functions, zip, biomes, members),
+        _ => {},
+    }
+    fail "Not a map: {value}"
+}
+
+fn read_typed_condition(rules: mut Rules, functions: Functions, zip: Zip, biomes: Registry, members: List<Member>) -> usize ! String {
+    let kind = try type_of(members)
+    if kind == "minecraft:biome" {
+        let value = field(members, "biome_is") else fail "No key biome_is in MapLike"
+        let ids = try holder_set(biomes, value)
+        var set: List<bool> = [false; biomes.entries.len()]
+        for b in ids {
+            set[usize.wrap(b)] = true
+        }
+        return rules.add_condition(Condition.Biomes(set))
+    }
+    if kind == "minecraft:noise_threshold" {
+        let id = try identifier_field(members, "noise")
+        let min = try double_field(members, "min_threshold")
+        let max = try double_field(members, "max_threshold")
+        var three_d = false
+        if let v = field(members, "is_3d") {
+            three_d = try bool_of(v)
+        }
+        let noise = try noise_named(mut rules, functions, zip, id)
+        return rules.add_condition(Condition.Threshold { noise: noise, min: min, max: max, three_d: three_d })
+    }
+    if kind == "minecraft:vertical_gradient" {
+        let name = try identifier_field(members, "random_name")
+        let true_at = try anchor_field(members, "true_at_and_below")
+        let false_at = try anchor_field(members, "false_at_and_above")
+        return rules.add_condition(Condition.Gradient { random: functions.random_factory(name), true_at: true_at, false_at: false_at })
+    }
+    if kind == "minecraft:y_above" {
+        let anchor = try anchor_field(members, "anchor")
+        let multiplier = try multiplier_field(members)
+        let add = try bool_field(members, "add_stone_depth")
+        return rules.add_condition(Condition.YAbove { anchor: anchor, multiplier: multiplier, add: add })
+    }
+    if kind == "minecraft:water" {
+        let offset = try int_field(members, "offset")
+        let multiplier = try multiplier_field(members)
+        let add = try bool_field(members, "add_stone_depth")
+        return rules.add_condition(Condition.Water { offset: offset, multiplier: multiplier, add: add })
+    }
+    if kind == "minecraft:temperature" {
+        return rules.add_condition(Condition.Temperature)
+    }
+    if kind == "minecraft:steep" {
+        return rules.add_condition(Condition.Steep)
+    }
+    if kind == "minecraft:not" {
+        let value = field(members, "invert") else fail "No key invert in MapLike"
+        let inner = try read_condition(mut rules, functions, zip, biomes, value)
+        return rules.add_condition(Condition.Not(inner))
+    }
+    if kind == "minecraft:hole" {
+        return rules.add_condition(Condition.Hole)
+    }
+    if kind == "minecraft:above_preliminary_surface" {
+        return rules.add_condition(Condition.Preliminary)
+    }
+    if kind == "minecraft:stone_depth" {
+        let offset = try int_field(members, "offset")
+        let add = try bool_field(members, "add_surface_depth")
+        let range = try int_field(members, "secondary_depth_range")
+        let surface = field(members, "surface_type") else fail "No key surface_type in MapLike"
+        let name = as_string(surface) else fail "Not a string: {surface}"
+        if name != "floor" and name != "ceiling" {
+            fail "Unknown element name:{name}"
+        }
+        return rules.add_condition(Condition.StoneDepth { offset: offset, add: add, range: range, ceiling: name == "ceiling" })
+    }
+    fail "Unknown material condition type: {kind}"
+}
+
+/// The noise named `id`, made the first time it's named; one vanilla's data doesn't have is
+/// kept as missing.
+fn noise_named(rules: mut Rules, functions: Functions, zip: Zip, id: String) -> usize ! String {
+    if let n = rules.noise_index.get(id) {
+        return n
+    }
+    var missing = true
+    var stack = Stack.new(List<Layer>(), false)
+    match data_json(zip, id, "noise") {
+        ok(json) => {
+            var error = String()
+            let p = read_parameters(json, mut error) else fail "{id}: {error}"
+            var r = functions.positional().from_hash_of(id)
+            stack = NormalNoise.new(p).create(mut r)
+            missing = false
+        },
+        err(_) => {},
+    }
+    rules.stacks.push(stack)
+    rules.missing.push(missing)
+    rules.noise_ids.push(id.copy())
+    let n = rules.stacks.len() - 1
+    rules.noise_index.insert(id.copy(), n)
+    return n
+}
+
+// The codecs' pieces, as `JsonOps` reads JSON.
+
+/// The value of the last member named `key`, a JSON null being no value, as `JsonOps` reads a
+/// map.
+fn field(members: List<Member>, key: str) -> Json? {
+    let value = get(members, String(key)) else return none
+    match value {
+        Json.Null => return none,
+        _ => {},
+    }
+    return some(value)
+}
+
+/// A dispatched type: an identifier, with its namespace.
+fn type_of(members: List<Member>) -> String ! String {
+    let value = field(members, "type") else fail "No key type in MapLike"
+    let text = as_string(value) else fail "Not a string: {value}"
+    let id = try Identifier.parse(text)
+    return id.to_string()
+}
+
+fn identifier_field(members: List<Member>, key: str) -> String ! String {
+    let value = field(members, key) else fail "No key {key} in MapLike"
+    let text = as_string(value) else fail "Not a string: {value}"
+    let id = try Identifier.parse(text)
+    return id.to_string()
+}
+
+/// `BlockState.CODEC`.
+fn state_field(members: List<Member>, key: str, codec: StateCodec) -> u32 ! String {
+    let value = field(members, key) else fail "No key {key} in MapLike"
+    return try codec.decode(Tag.from_json(value))
+}
+
+/// `DensityFunction.CODEC`.
+fn function_field(functions: mut Functions, zip: Zip, members: List<Member>, key: str) -> usize ! String {
+    let value = field(members, key) else fail "No key {key} in MapLike"
+    return try functions.read(zip, value)
+}
+
+/// `Codec.INT`: a number's `intValue`, or a boolean's 1 or 0.
+fn int_of(value: Json) -> i32 ! String {
+    match value {
+        Json.Number(text) => {
+            let v = int_value(text) else fail "Not a number: {text}"
+            return v
+        },
+        Json.Bool(b) => return if b { 1 } else { 0 },
+        _ => {},
+    }
+    fail "Not a number: {value}"
+}
+
+fn int_field(members: List<Member>, key: str) -> i32 ! String {
+    let value = field(members, key) else fail "No key {key} in MapLike"
+    return try int_of(value)
+}
+
+/// `surface_depth_multiplier`: `Codec.intRange(-20, 20)`.
+fn multiplier_field(members: List<Member>) -> i32 ! String {
+    let v = try int_field(members, "surface_depth_multiplier")
+    if v < -20 or v > 20 {
+        fail "Value {v} outside of range [-20:20]"
+    }
+    return v
+}
+
+/// `Codec.BOOL`: a boolean, or a number whose `byteValue` isn't 0.
+fn bool_of(value: Json) -> bool ! String {
+    match value {
+        Json.Bool(b) => return b,
+        Json.Number(text) => {
+            let v = int_value(text) else fail "Not a number: {text}"
+            return (v & 0xFF) != 0
+        },
+        _ => {},
+    }
+    fail "Not a boolean: {value}"
+}
+
+fn bool_field(members: List<Member>, key: str) -> bool ! String {
+    let value = field(members, key) else fail "No key {key} in MapLike"
+    return try bool_of(value)
+}
+
+/// `Codec.DOUBLE`.
+fn double_field(members: List<Member>, key: str) -> f64 ! String {
+    let value = field(members, key) else fail "No key {key} in MapLike"
+    match value {
+        Json.Number(text) => {
+            let v = f64.parse(text) else fail "Not a number: {text}"
+            return v
+        },
+        Json.Bool(b) => return if b { 1.0 } else { 0.0 },
+        _ => {},
+    }
+    fail "Not a number: {value}"
+}
+
+/// `Codec.floatRange(0, 1)`, which compares as `Float.compare` does: -0 and NaN are outside.
+fn unit_float(value: Json) -> f32 ! String {
+    var v: f32 = 0.0
+    match value {
+        Json.Number(text) => {
+            let parsed = f32.parse(text) else fail "Not a number: {text}"
+            v = parsed
+        },
+        Json.Bool(b) => v = if b { 1.0f32 } else { 0.0f32 },
+        _ => fail "Not a number: {value}",
+    }
+    let negative_zero = v == 0.0f32 and 1.0f32 / v < 0.0f32
+    if v != v or v < 0.0f32 or v > 1.0f32 or negative_zero {
+        fail "Value {v} outside of range [0.0:1.0]"
+    }
+    return v
+}
+
+/// `VerticalAnchor.CODEC`: `xor(absolute, xor(above_bottom, xor(below_top,
+/// relative_to_sea_level)))`, each a field holding an int from -2032 to 2031. An `xor` reads
+/// only if exactly one of its sides does.
+fn anchor_field(members: List<Member>, key: str) -> Anchor ! String {
+    let value = field(members, key) else fail "No key {key} in MapLike"
+    let m = match value {
+        Json.Object(m) => m,
+        _ => fail "Not a map: {value}",
+    }
+    let absolute = anchor_part(m, "absolute")
+    let bottom = anchor_part(m, "above_bottom")
+    let top = anchor_part(m, "below_top")
+    let sea = anchor_part(m, "relative_to_sea_level")
+    var inner: Anchor? = none
+    if let t = top {
+        if sea == none {
+            inner = some(Anchor.BelowTop(t))
+        }
+    } else if let s = sea {
+        inner = some(Anchor.Sea(s))
+    }
+    var middle: Anchor? = none
+    if let b = bottom {
+        if inner == none {
+            middle = some(Anchor.AboveBottom(b))
+        }
+    } else {
+        middle = inner
+    }
+    if let a = absolute {
+        if middle == none {
+            return Anchor.Absolute(a)
+        }
+        fail "Both alternatives read successfully"
+    }
+    let anchor = middle else fail "No anchor"
+    return anchor
+}
+
+/// One side of the anchor's `xor`: the field `key`, if it reads.
+fn anchor_part(members: List<Member>, key: str) -> i32? {
+    let value = field(members, key) else return none
+    match int_of(value) {
+        ok(v) => {
+            if v >= ANCHOR_MIN and v <= ANCHOR_MAX {
+                return some(v)
+            }
+        },
+        err(_) => {},
+    }
+    return none
+}
+
+// The material system.
+
+/// `MaterialSystem` and what its rules' context needs of the noise settings and the world: the
+/// settings' default block and sea level, its preliminary surface, its noises and clay bands, the
+/// biomes' temperatures, and the world's heights.
+pub struct Materials {
+    default_block: u32
+    default_block_id: u32
+    sea: i32
+    /// `WorldGenerationContext`'s bottom and depth: the world's, cut to the noise's.
+    min_gen_y: i32
+    gen_depth: i32
+    /// The bottom of the noise inside the world.
+    low: i32
+    /// The router's `chunk_surface_level`, as read.
+    preliminary: usize
+    /// The `RandomState`'s positional random.
+    noise_random: AnyPositional
+    bands: List<u32>
+    clay: Stack
+    surface: Stack
+    secondary: Stack
+    badlands_pillar: Stack
+    badlands_roof: Stack
+    badlands_surface: Stack
+    iceberg_pillar: Stack
+    iceberg_roof: Stack
+    iceberg_surface: Stack
+    /// `Biome.TEMPERATURE_NOISE`, `BIOME_INFO_NOISE` and the layers of
+    /// `FROZEN_TEMPERATURE_NOISE`.
+    temperature_noise: Noise
+    info_noise: Noise
+    frozen_noises: List<Noise>
+    /// Each biome's base temperature, and whether its temperature modifier is `frozen`, by ID,
+    /// for the biomes the source can give.
+    temperatures: List<f32>
+    frozen: List<bool>
+    water: u32
+    packed_ice: u32
+    snow_block: u32
+    void_air: u32
+    /// The biomes with extensions of their own, or -1.
+    eroded_badlands: i32
+    frozen_ocean: i32
+    deep_frozen_ocean: i32
+}
+
+/// The material system of the noise settings `members`, with `shape` read from them, for a
+/// world `level_height` blocks tall from `level_min` whose biomes are among `possible`.
+pub fn materials(functions: mut Functions, zip: Zip, members: List<Member>, shape: Shape, codec: StateCodec, biomes: Registry, possible: List<i32>, level_min: i32, level_height: i32) -> Materials ! String {
+    let router = match get(members, String("noise_router")) {
+        some(Json.Object(m)) => m,
+        _ => fail "the noise settings have no `noise_router`",
+    }
+    let preliminary_value = get(router, String("chunk_surface_level")) else fail "the router has no `chunk_surface_level`"
+    let preliminary = try functions.read(zip, preliminary_value)
+    let (low, _) = clamped(shape, level_min, level_height)
+    var band_random = functions.positional().from_hash_of(String("minecraft:clay_bands"))
+    let bands = try generate_bands(mut band_random, codec)
+    var temperature_random = LegacyRandom.new(1234)
+    var info_random = LegacyRandom.new(2345)
+    var frozen_random = LegacyRandom.new(3456)
+    var frozen_noises = List<Noise>()
+    for _ in 0..3 {
+        frozen_noises.push(Noise.simplex(mut frozen_random, true))
+    }
+    var temperatures: List<f32> = [0.0f32; biomes.entries.len()]
+    var frozen: List<bool> = [false; biomes.entries.len()]
+    for b in possible {
+        let id = biomes.entries[usize.wrap(b)].to_string()
+        let json = try data_json(zip, id, "biome")
+        let m = match json {
+            Json.Object(m) => m,
+            _ => fail "biome `{id}` isn't an object",
+        }
+        let text = match get(m, String("temperature")) {
+            some(Json.Number(t)) => t,
+            _ => fail "biome `{id}` has no `temperature`",
+        }
+        let t = f32.parse(text) else fail "biome `{id}`'s temperature isn't a number"
+        temperatures[usize.wrap(b)] = t
+        match get(m, String("temperature_modifier")) {
+            some(Json.Str(s)) => frozen[usize.wrap(b)] = s == "frozen",
+            _ => {},
+        }
+    }
+    return Materials {
+        default_block: shape.default_block,
+        default_block_id: codec.block_of(shape.default_block),
+        sea: shape.sea_level,
+        min_gen_y: level_min.max(shape.min_y),
+        gen_depth: level_height.min(shape.height),
+        low: low,
+        preliminary: preliminary,
+        noise_random: functions.positional(),
+        bands: bands,
+        clay: try material_noise(functions, zip, "minecraft:clay_bands_offset"),
+        surface: try material_noise(functions, zip, "minecraft:surface"),
+        secondary: try material_noise(functions, zip, "minecraft:surface_secondary"),
+        badlands_pillar: try material_noise(functions, zip, "minecraft:badlands_pillar"),
+        badlands_roof: try material_noise(functions, zip, "minecraft:badlands_pillar_roof"),
+        badlands_surface: try material_noise(functions, zip, "minecraft:badlands_surface"),
+        iceberg_pillar: try material_noise(functions, zip, "minecraft:iceberg_pillar"),
+        iceberg_roof: try material_noise(functions, zip, "minecraft:iceberg_pillar_roof"),
+        iceberg_surface: try material_noise(functions, zip, "minecraft:iceberg_surface"),
+        temperature_noise: Noise.simplex(mut temperature_random, true),
+        info_noise: Noise.simplex(mut info_random, true),
+        frozen_noises: frozen_noises,
+        temperatures: temperatures,
+        frozen: frozen,
+        water: try codec.blocks.parse(String("minecraft:water")),
+        packed_ice: try block_state(codec, "minecraft:packed_ice"),
+        snow_block: try block_state(codec, "minecraft:snow_block"),
+        void_air: try block_state(codec, "minecraft:void_air"),
+        eroded_badlands: biome_id(biomes, "eroded_badlands"),
+        frozen_ocean: biome_id(biomes, "frozen_ocean"),
+        deep_frozen_ocean: biome_id(biomes, "deep_frozen_ocean"),
+    }
+}
+
+/// `Noises.instantiate`: the noise `id` of vanilla's data, from the hash of its ID.
+fn material_noise(functions: Functions, zip: Zip, id: str) -> Stack ! String {
+    let json = try data_json(zip, String(id), "noise")
+    var error = String()
+    let p = read_parameters(json, mut error) else fail "{id}: {error}"
+    var r = functions.positional().from_hash_of(String(id))
+    return NormalNoise.new(p).create(mut r)
+}
+
+fn block_state(codec: StateCodec, name: str) -> u32 ! String {
+    let block = try codec.blocks.parse(String(name))
+    return codec.default_state(block)
+}
+
+fn biome_id(biomes: Registry, path: str) -> i32 {
+    let id = biomes.id(Identifier { namespace: "minecraft", path: String(path) }) else return -1
+    return id
+}
+
+/// `generateBands`: terracotta, with orange every few blocks, bands of yellow, brown and red,
+/// and white ones edged with light gray.
+fn generate_bands(r: mut AnyRandom, codec: StateCodec) -> List<u32> ! String {
+    let terracotta = try block_state(codec, "minecraft:terracotta")
+    let orange = try block_state(codec, "minecraft:orange_terracotta")
+    let yellow = try block_state(codec, "minecraft:yellow_terracotta")
+    let brown = try block_state(codec, "minecraft:brown_terracotta")
+    let red = try block_state(codec, "minecraft:red_terracotta")
+    let white = try block_state(codec, "minecraft:white_terracotta")
+    let light_gray = try block_state(codec, "minecraft:light_gray_terracotta")
+    var bands: List<u32> = [terracotta; usize.wrap(BANDS)]
+    var i = 0
+    while i < BANDS {
+        i += r.next_int_below(5) + 1
+        if i < BANDS {
+            bands[usize.wrap(i)] = orange
+        }
+        i += 1
+    }
+    make_bands(mut r, mut bands, 1, yellow)
+    make_bands(mut r, mut bands, 2, brown)
+    make_bands(mut r, mut bands, 1, red)
+    let count = r.next_int_between(9, 15)
+    var n = 0
+    var start = 0
+    while n < count and start < BANDS {
+        bands[usize.wrap(start)] = white
+        if start - 1 > 0 and r.next_boolean() {
+            bands[usize.wrap(start - 1)] = light_gray
+        }
+        if start + 1 < BANDS and r.next_boolean() {
+            bands[usize.wrap(start + 1)] = light_gray
+        }
+        n += 1
+        start += r.next_int_below(16) + 4
+    }
+    return bands
+}
+
+/// `makeBands`.
+fn make_bands(r: mut AnyRandom, bands: mut List<u32>, base: i32, state: u32) {
+    let count = r.next_int_between(6, 15)
+    for _ in 0..count {
+        let width = base + r.next_int_below(3)
+        let start = r.next_int_below(BANDS)
+        var p = 0
+        while start + p < BANDS and p < width {
+            bands[usize.wrap(start + p)] = state
+            p += 1
+        }
+    }
+}
+
+/// `getBand`: the clay band at the block, its height moved by the offset noise. A height far
+/// enough below 0 makes the index negative, and Java's array throws.
+fn band(mat: Materials, x: i32, y: i32, z: i32) -> u32 ! Thrown {
+    let offset = i32.round(mat.clay.get(f64(x), 0.0, f64(z)) * 4.0f32)
+    let i = (y + offset + BANDS) % BANDS
+    if i < 0 {
+        fail Thrown { exception: "ArrayIndexOutOfBoundsException", message: "Index {i} out of bounds for length {BANDS}" }
+    }
+    return mat.bands[usize.wrap(i)]
+}
+
+/// `Biome.getTemperature` at the block, with the sea level of the settings: the base
+/// temperature, made 0.2 in a frozen biome's ice patches, falling with height above the snow
+/// line. Vanilla keeps the last 1024 for each biome and thread by `BlockPos.asLong`, whose 26 bits
+/// of `x` and `z` wrap only past 33,554,431, beyond the world border, so the cache never changes
+/// a temperature and Calcite keeps none.
+fn temperature(mat: Materials, biome: i32, x: i32, y: i32, z: i32) -> f32 {
+    let b = usize.wrap(biome)
+    var t = mat.temperatures[b]
+    if mat.frozen[b] {
+        // `TemperatureModifier.FROZEN`.
+        let large = f64(frozen_sum(mat, f64(x) * 0.05, f64(z) * 0.05) * 7.0f32)
+        let edge = f64(mat.info_noise.get2(f64(x) * 0.2, f64(z) * 0.2))
+        if large + edge < 0.3 {
+            let small = f64(mat.info_noise.get2(f64(x) * 0.09, f64(z) * 0.09))
+            if small < 0.8 {
+                t = 0.2f32
+            }
+        }
+    }
+    let snow = mat.sea + 17
+    if y > snow {
+        let v = mat.temperature_noise.get2(f64(f32.nearest(x) / 8.0f32), f64(f32.nearest(z) / 8.0f32)) * 8.0f32
+        return t - (v + f32.nearest(y) - f32.nearest(snow)) * 0.05f32 / 40.0f32
+    }
+    return t
+}
+
+/// `FROZEN_TEMPERATURE_NOISE.get(x, z)`: its three layers, summed in `float`.
+fn frozen_sum(mat: Materials, x: f64, z: f64) -> f32 {
+    var value: f32 = 0.0
+    value += 0.14285715f32 * mat.frozen_noises[0].get2(x * 1.0, z * 1.0)
+    value += 0.2857143f32 * mat.frozen_noises[1].get2(x * 0.5, z * 0.5)
+    value += 0.5714286f32 * mat.frozen_noises[2].get2(x * 0.25, z * 0.25)
+    return value
+}
+
+/// `getSurfaceDepth`.
+fn surface_depth(mat: Materials, x: i32, z: i32) -> i32 {
+    let noise = f64(mat.surface.get(f64(x), 0.0, f64(z)))
+    var r = mat.noise_random.at(x, 0, z)
+    return i32.saturate(noise * 2.75 + 3.0 + r.next_double() * 0.25)
+}
+
+/// `VerticalAnchor.resolveY` in the chunk's `WorldGenerationContext`.
+fn resolve(mat: Materials, a: Anchor) -> i32 {
+    return match a {
+        Anchor.Absolute(v) => v,
+        Anchor.AboveBottom(v) => mat.min_gen_y + v,
+        Anchor.BelowTop(v) => mat.gen_depth - 1 + mat.min_gen_y - v,
+        Anchor.Sea(v) => mat.sea + v,
+    }
+}
+
+// Compiling, for a chunk.
+
+/// An ore vein's samplers, and its density and richness over the chunk's filled part.
+struct OreBuffers {
+    density: usize
+    richness: usize
+    gap: usize
+    density_values: List<f32>
+    richness_values: List<f32>
+}
+
+/// A rule compiled for a chunk: the volume its prefilled densities cover, the preliminary
+/// surface's volume and sampler, or what compiling it threw, and its ore veins'.
+struct Compiled {
+    narrowed: Volume
+    preliminary_volume: Volume
+    preliminary: usize
+    preliminary_thrown: Thrown?
+    ores: List<OreBuffers>
+}
+
+/// `compile` of the rule `i` and what it holds, each once, in vanilla's order.
+fn compile_rule(functions: mut Functions, rules: Rules, ctx: mut Context, c: mut Compiled, seen: mut List<bool>, seen_conditions: mut List<bool>, i: usize) ! Thrown {
+    if seen[i] {
+        return
+    }
+    seen[i] = true
+    match rules.rules[i] {
+        Rule.Sequence(list) => {
+            for r in list {
+                try compile_rule(mut functions, rules, mut ctx, mut c, mut seen, mut seen_conditions, r)
+            }
+        },
+        Rule.If { condition, then_run } => {
+            try compile_condition(rules, mut seen_conditions, condition)
+            try compile_rule(mut functions, rules, mut ctx, mut c, mut seen, mut seen_conditions, then_run)
+        },
+        Rule.Ore(k) => {
+            // `getDensitiesInChunk`: the density and richness prefilled, the gap not.
+            let ds = try functions.sampler(rules.ores[k].density)
+            var dv = try zeros(c.narrowed.size())
+            try fill(functions.program, mut ctx, ds, mut dv, c.narrowed)
+            let rs = try functions.sampler(rules.ores[k].richness)
+            var rv = try zeros(c.narrowed.size())
+            try fill(functions.program, mut ctx, rs, mut rv, c.narrowed)
+            let gs = try functions.sampler(rules.ores[k].gap)
+            c.ores[k] = OreBuffers { density: ds, richness: rs, gap: gs, density_values: dv, richness_values: rv }
+        },
+        _ => {},
+    }
+}
+
+/// `compile` of the condition `i`: a noise vanilla's data doesn't have throws, as
+/// `RandomState.getOrCreateNoise` does.
+fn compile_condition(rules: Rules, seen: mut List<bool>, i: usize) ! Thrown {
+    if seen[i] {
+        return
+    }
+    seen[i] = true
+    match rules.conditions[i] {
+        Condition.Threshold { noise, .. } => {
+            if rules.missing[noise] {
+                fail Thrown { exception: "IllegalStateException", message: "Missing element ResourceKey[minecraft:worldgen/noise / {rules.noise_ids[noise]}]" }
+            }
+        },
+        Condition.Not(inner) => try compile_condition(rules, mut seen, inner),
+        _ => {},
+    }
+}
+
+// Applying.
+
+/// `MaterialRuleContext`: the block and its column, and what's been worked out for them. A
+/// stamp counts the context's updates; a value is known for the stamp it was worked out at.
+struct Cursor {
+    bx: i32 = 0
+    bz: i32 = 0
+    gx: i32 = 0
+    gz: i32 = 0
+    depth: i32 = 0
+    y: i32 = 0
+    above: i32 = 0
+    below: i32 = 0
+    water: i32 = 0
+    /// `lastUpdateXZ`, and the stamp of every update, `XZ` or `Y`.
+    xz: i64 = 0
+    stamp: i64 = 0
+    secondary_at: i64 = -1
+    secondary: f64 = 0.0
+    min_at: i64 = -1
+    min_surface: i32 = 0
+    biome_at: i64 = -1
+    biome: i32 = 0
+    noise2_at: List<i64>
+    noise2: List<f64>
+    noise3_at: List<i64>
+    noise3: List<f64>
+    condition_at: List<i64>
+    condition: List<bool>
+    /// The preliminary surface over the chunk, sampled the first time it's needed.
+    preliminary: List<f32> = List<f32>()
+    preliminary_filled: bool = false
+}
+
+impl Cursor {
+    fn update_xz(mut self, mat: Materials, bx: i32, bz: i32, gx: i32, gz: i32) {
+        self.xz += 1
+        self.stamp += 1
+        self.bx = bx
+        self.bz = bz
+        self.gx = gx
+        self.gz = gz
+        self.depth = surface_depth(mat, bx, bz)
+    }
+
+    fn update_y(mut self, above: i32, below: i32, water: i32, y: i32) {
+        self.stamp += 1
+        self.above = above
+        self.below = below
+        self.water = water
+        self.y = y
+    }
+}
+
+/// `getSurfaceSecondary`.
+fn secondary(mat: Materials, cur: mut Cursor) -> f64 {
+    if cur.secondary_at != cur.xz {
+        cur.secondary = f64(mat.secondary.get(f64(cur.bx), 0.0, f64(cur.bz)))
+        cur.secondary_at = cur.xz
+    }
+    return cur.secondary
+}
+
+/// `getBiome`: the biome at the block, as the biome manager zooms to it.
+fn biome_of(zoom: Zoom, cur: mut Cursor) -> i32 ! Thrown {
+    if cur.biome_at != cur.stamp {
+        cur.biome = try zoom.biome(cur.bx, cur.y, cur.bz)
+        cur.biome_at = cur.stamp
+    }
+    return cur.biome
+}
+
+/// `getMinSurfaceLevel`: 8 blocks less the surface depth below the preliminary surface. Vanilla
+/// compiles the preliminary surface here, the first time it's needed, so a compile that throws
+/// throws here.
+fn min_surface(c: Compiled, p: Program, cur: mut Cursor, ctx: mut Context) -> i32 ! Thrown {
+    if cur.min_at == cur.xz {
+        return cur.min_surface
+    }
+    if let thrown = c.preliminary_thrown {
+        fail thrown.copy()
+    }
+    let index = c.preliminary_volume.index_of_block(cur.bx, 0, cur.bz)
+    var level: f32 = 0.0
+    if index != -1 {
+        if not cur.preliminary_filled {
+            var buffer = try zeros(c.preliminary_volume.size())
+            try fill(p, mut ctx, c.preliminary, mut buffer, c.preliminary_volume)
+            cur.preliminary = buffer
+            cur.preliminary_filled = true
+        }
+        level = cur.preliminary[usize.wrap(index)]
+    } else {
+        level = try sample(p, mut ctx, c.preliminary, cur.bx, 0, cur.bz)
+    }
+    cur.min_surface = floor(f64(level)) + cur.depth - 8
+    cur.min_at = cur.xz
+    return cur.min_surface
+}
+
+/// `getNoiseSampler`: the noise at the column, or at the block.
+fn noise_value(rules: Rules, cur: mut Cursor, n: usize, three_d: bool) -> f64 {
+    if three_d {
+        if cur.noise3_at[n] != cur.stamp {
+            cur.noise3[n] = f64(rules.stacks[n].get(f64(cur.bx), f64(cur.y), f64(cur.bz)))
+            cur.noise3_at[n] = cur.stamp
+        }
+        return cur.noise3[n]
+    }
+    if cur.noise2_at[n] != cur.xz {
+        cur.noise2[n] = f64(rules.stacks[n].get(f64(cur.bx), 0.0, f64(cur.bz)))
+        cur.noise2_at[n] = cur.xz
+    }
+    return cur.noise2[n]
+}
+
+/// `RuleEvaluator.tryApply` of the rule `i` at the cursor's block: a state, or `NONE`.
+fn apply(rules: Rules, c: Compiled, mat: Materials, p: Program, zoom: Zoom, cur: mut Cursor, ctx: mut Context, i: usize) -> u32 ! Thrown {
+    match rules.rules[i] {
+        Rule.Block(state) => return state,
+        Rule.Bands => return try band(mat, cur.bx, cur.y, cur.bz),
+        Rule.Sequence(list) => {
+            for r in list {
+                let state = try apply(rules, c, mat, p, zoom, mut cur, mut ctx, r)
+                if state != NONE {
+                    return state
+                }
+            }
+            return NONE
+        },
+        Rule.If { condition, then_run } => {
+            let holds = try test(rules, c, mat, p, zoom, mut cur, mut ctx, condition)
+            if not holds {
+                return NONE
+            }
+            return try apply(rules, c, mat, p, zoom, mut cur, mut ctx, then_run)
+        },
+        Rule.Ore(k) => return try ore_vein(rules.ores[k], c.ores[k], c.narrowed, rules.ore_random, p, cur, mut ctx),
+    }
+}
+
+/// `OreVeinRule`'s evaluator: the vein's ore, raw ore or filler where its density and random
+/// let it be.
+fn ore_vein(o: OreRule, b: OreBuffers, narrowed: Volume, random: AnyPositional, p: Program, cur: Cursor, ctx: mut Context) -> u32 ! Thrown {
+    let density = try density_at(narrowed, b.density_values, b.density, p, mut ctx, cur)
+    if density <= 0.0f32 {
+        return NONE
+    }
+    var r = random.at(cur.bx, cur.y, cur.bz)
+    if r.next_float() > density {
+        return NONE
+    }
+    let richness = try density_at(narrowed, b.richness_values, b.richness, p, mut ctx, cur)
+    if r.next_float() < richness {
+        let gap = try sample(p, mut ctx, b.gap, cur.bx, cur.y, cur.bz)
+        if gap < 0.0f32 {
+            return if r.next_float() < o.chance { o.raw } else { o.ore }
+        }
+    }
+    return o.filler
+}
+
+/// A prefilled `DensityGetter`: the buffer's value at the block, or a sample outside it.
+fn density_at(v: Volume, values: List<f32>, s: usize, p: Program, ctx: mut Context, cur: Cursor) -> f32 ! Thrown {
+    let index = v.index_of_block(cur.bx, cur.y, cur.bz)
+    if index == -1 {
+        return try sample(p, mut ctx, s, cur.bx, cur.y, cur.bz)
+    }
+    return values[usize.wrap(index)]
+}
+
+/// `ConditionEvaluator.test` of the condition `i`, worked out once for each update.
+fn test(rules: Rules, c: Compiled, mat: Materials, p: Program, zoom: Zoom, cur: mut Cursor, ctx: mut Context, i: usize) -> bool ! Thrown {
+    if cur.condition_at[i] == cur.stamp {
+        return cur.condition[i]
+    }
+    let v = try compute(rules, c, mat, p, zoom, mut cur, mut ctx, i)
+    cur.condition_at[i] = cur.stamp
+    cur.condition[i] = v
+    return v
+}
+
+fn compute(rules: Rules, c: Compiled, mat: Materials, p: Program, zoom: Zoom, cur: mut Cursor, ctx: mut Context, i: usize) -> bool ! Thrown {
+    match rules.conditions[i] {
+        Condition.Biomes(set) => {
+            let b = try biome_of(zoom, mut cur)
+            return set[usize.wrap(b)]
+        },
+        Condition.Threshold { noise, min, max, three_d } => {
+            let v = noise_value(rules, mut cur, noise, three_d)
+            return v >= min and v <= max
+        },
+        Condition.Gradient { random, true_at, false_at } => {
+            let t = resolve(mat, true_at)
+            let f = resolve(mat, false_at)
+            let y = cur.y
+            if y <= t {
+                return true
+            }
+            if y >= f {
+                return false
+            }
+            // `Mth.map(y, t, f, 1, 0)`.
+            let probability = 1.0 + ((f64(y) - f64(t)) / (f64(f) - f64(t))) * (0.0 - 1.0)
+            var r = random.at(cur.bx, y, cur.bz)
+            return f64(r.next_float()) < probability
+        },
+        Condition.YAbove { anchor, multiplier, add } => {
+            let stone = if add { cur.above } else { 0 }
+            return cur.y + stone >= resolve(mat, anchor) + cur.depth * multiplier
+        },
+        Condition.Water { offset, multiplier, add } => {
+            if cur.water == i32.MIN {
+                return true
+            }
+            let stone = if add { cur.above } else { 0 }
+            return cur.y + stone >= cur.water + offset + cur.depth * multiplier
+        },
+        Condition.Temperature => {
+            let b = try biome_of(zoom, mut cur)
+            return not (temperature(mat, b, cur.bx, cur.y, cur.bz) >= 0.15f32)
+        },
+        Condition.Steep => return cur.gx <= -4 or cur.gz >= 4,
+        Condition.Not(inner) => {
+            let v = try test(rules, c, mat, p, zoom, mut cur, mut ctx, inner)
+            return not v
+        },
+        Condition.Hole => return cur.depth <= 0,
+        Condition.Preliminary => {
+            let level = try min_surface(c, p, mut cur, mut ctx)
+            return cur.y >= level
+        },
+        Condition.StoneDepth { offset, add, range, ceiling } => {
+            let depth = if ceiling { cur.below } else { cur.above }
+            let surface = if add { cur.depth } else { 0 }
+            var extra = 0
+            if range != 0 {
+                // `(int) Mth.map(secondary, -1, 1, 0, range)`.
+                let s = secondary(mat, mut cur)
+                extra = i32.saturate(0.0 + ((s - -1.0) / (1.0 - -1.0)) * (f64(range) - 0.0))
+            }
+            return depth <= 1 + offset + surface + extra
+        },
+    }
+}
+
+// Building the surface.
+
+/// `MaterialSystem.buildSurface` of the chunk at `cx`, `cz`, filled into `f` through `ctx`, with
+/// the biomes `zoom` reads: the rule compiled for the chunk, then each column from its top down,
+/// with the eroded badlands' pillars before and the frozen oceans' icebergs after.
+pub fn build_surface(f: mut Filled, functions: mut Functions, mat: Materials, rules: Rules, states: BlockStates, ctx: mut Context, zoom: Zoom, cx: i32, cz: i32) ! Thrown {
+    let level_min = f.min_y
+    let level_max = f.min_y + f.height - 1
+    var highest = -1
+    var section = (f.height >> 4) - 1
+    while section >= 0 {
+        if filled_section(f, states, section) {
+            highest = section
+            break
+        }
+        section -= 1
+    }
+    let max_block_y = (highest + (level_min >> 4)) * 16 + 15
+    var c = Compiled {
+        narrowed: try volume(16, (max_block_y - mat.low + 1).max(1), 16, cx << 4, mat.low, cz << 4, 1, 1, 1),
+        preliminary_volume: try volume(16, 1, 16, cx << 4, 0, cz << 4, 1, 1, 1),
+        preliminary: 0,
+        preliminary_thrown: none,
+        ores: [],
+    }
+    for _ in 0..rules.ores.len() {
+        c.ores.push(OreBuffers { density: 0, richness: 0, gap: 0, density_values: [], richness_values: [] })
+    }
+    var seen: List<bool> = [false; rules.rules.len()]
+    var seen_conditions: List<bool> = [false; rules.conditions.len()]
+    try compile_rule(mut functions, rules, mut ctx, mut c, mut seen, mut seen_conditions, rules.root)
+    match functions.sampler(mat.preliminary) {
+        ok(s) => c.preliminary = s,
+        err(thrown) => c.preliminary_thrown = some(thrown),
+    }
+    let noises = rules.stacks.len()
+    let conditions = rules.conditions.len()
+    var cur = Cursor {
+        noise2_at: [-1; noises],
+        noise2: [0.0; noises],
+        noise3_at: [-1; noises],
+        noise3: [0.0; noises],
+        condition_at: [-1; conditions],
+        condition: [false; conditions],
+    }
+    for x in 0..16 {
+        for z in 0..16 {
+            let bx = (cx << 4) + x
+            let bz = (cz << 4) + z
+            let column = usize.wrap(x + z * 16)
+            let starting = f.world_surface[column]
+            let surface_biome = try zoom.biome(bx, starting, bz)
+            if surface_biome == mat.eroded_badlands {
+                eroded_badlands(mut f, mat, states, bx, bz, x, z, starting)
+            }
+            let height = f.world_surface[column]
+            let gx = f.world_surface[usize.wrap((x + 1).min(15) + z * 16)] - f.world_surface[usize.wrap((x - 1).max(0) + z * 16)]
+            let gz = f.world_surface[usize.wrap(x + (z + 1).min(15) * 16)] - f.world_surface[usize.wrap(x + (z - 1).max(0) * 16)]
+            cur.update_xz(mat, bx, bz, gx, gz)
+            var above = 0
+            var water = i32.MIN
+            var next_ceiling = i32.MAX
+            var y = height
+            while y >= level_min {
+                let old = block_at(f, mat.void_air, x, z, y)
+                if states.is_air(old) {
+                    above = 0
+                    water = i32.MIN
+                } else if states.flags(old) & FLUID != 0 {
+                    if water == i32.MIN {
+                        water = y + 1
+                    }
+                } else {
+                    if next_ceiling >= y {
+                        next_ceiling = WAY_BELOW
+                        var look = y - 1
+                        while look >= level_min - 1 {
+                            let next = block_at(f, mat.void_air, x, z, look)
+                            if states.is_air(next) or states.flags(next) & FLUID != 0 {
+                                next_ceiling = look + 1
+                                break
+                            }
+                            look -= 1
+                        }
+                    }
+                    above += 1
+                    cur.update_y(above, y - next_ceiling + 1, water, y)
+                    if y >= level_min and y <= level_max {
+                        let state = try apply(rules, c, mat, functions.program, zoom, mut cur, mut ctx, rules.root)
+                        if state != NONE {
+                            set_block(mut f, states, x, z, y, state)
+                        }
+                    }
+                }
+                y -= 1
+            }
+            if surface_biome == mat.frozen_ocean or surface_biome == mat.deep_frozen_ocean {
+                let level = try min_surface(c, functions.program, mut cur, mut ctx)
+                frozen_ocean(mut f, mat, states, level, surface_biome, bx, bz, x, z, starting)
+            }
+        }
+    }
+}
+
+/// Whether the section `s` of the chunk has a block that isn't air: `hasOnlyAir`, negated.
+fn filled_section(f: Filled, states: BlockStates, s: i32) -> bool {
+    let start = usize.wrap(s) * 4096
+    for i in start..start + 4096 {
+        if not states.is_air(f.states[i]) {
+            return true
+        }
+    }
+    return false
+}
+
+/// `ProtoChunk.getBlockState` in the column: void air outside the world.
+fn block_at(f: Filled, void_air: u32, x: i32, z: i32, y: i32) -> u32 {
+    if y < f.min_y or y >= f.min_y + f.height {
+        return void_air
+    }
+    return f.states[usize.wrap(((y - f.min_y) << 8) | (z << 4) | x)]
+}
+
+/// The column's `setBlock`: inside the world, the block and the `_WG` heightmaps, and the block
+/// marked for post-processing if it holds a fluid.
+fn set_block(f: mut Filled, states: BlockStates, x: i32, z: i32, y: i32, state: u32) {
+    if y < f.min_y or y >= f.min_y + f.height {
+        return
+    }
+    let column = usize.wrap(x + z * 16)
+    f.states[usize.wrap(((y - f.min_y) << 8) | (z << 4) | x)] = state
+    update(mut f.ocean_floor, f.states, states, OCEAN_FLOOR_WG, column, x, z, y, state, f.min_y)
+    update(mut f.world_surface, f.states, states, WORLD_SURFACE_WG, column, x, z, y, state, f.min_y)
+    if states.flags(state) & FLUID != 0 {
+        f.marked[usize.wrap((y - f.min_y) >> 4)].push(u16.wrap(x | ((y & 15) << 4) | (z << 8)))
+    }
+}
+
+/// `erodedBadlandsExtension`: a pillar of the default block up from the ground, where the
+/// pillar noise is high and no water is under it.
+fn eroded_badlands(f: mut Filled, mat: Materials, states: BlockStates, bx: i32, bz: i32, x: i32, z: i32, height: i32) {
+    let surface = (f64(mat.badlands_surface.get(f64(bx), 0.0, f64(bz))) * 8.25).abs()
+    let pillar = f64(mat.badlands_pillar.get(f64(bx) * 0.2, 0.0, f64(bz) * 0.2) * 15.0f32)
+    let buffer = java_min(surface, pillar)
+    if buffer <= 0.0 {
+        return
+    }
+    let floor_value = (f64(mat.badlands_roof.get(f64(bx) * 0.75, 0.0, f64(bz) * 0.75)) * 1.5).abs()
+    let top = 64.0 + java_min(buffer * buffer * 2.5, (floor_value * 50.0).ceil() + 24.0)
+    let start = floor(top)
+    if height > start {
+        return
+    }
+    var y = start
+    while y >= f.min_y {
+        let old = states.block_of(block_at(f, mat.void_air, x, z, y))
+        if old == mat.default_block_id {
+            break
+        }
+        if old == mat.water {
+            return
+        }
+        y -= 1
+    }
+    y = start
+    while y >= f.min_y and states.is_air(block_at(f, mat.void_air, x, z, y)) {
+        set_block(mut f, states, x, z, y, mat.default_block)
+        y -= 1
+    }
+}
+
+/// `frozenOceanExtension`: an iceberg of packed ice, snow on its top, where the iceberg noise is
+/// high, from above the sea down to the column's least surface.
+fn frozen_ocean(f: mut Filled, mat: Materials, states: BlockStates, lowest: i32, biome: i32, bx: i32, bz: i32, x: i32, z: i32, height: i32) {
+    let surface = (f64(mat.iceberg_surface.get(f64(bx), 0.0, f64(bz))) * 8.25).abs()
+    let pillar = f64(mat.iceberg_pillar.get(f64(bx) * 1.28, 0.0, f64(bz) * 1.28) * 15.0f32)
+    let iceberg = java_min(surface, pillar)
+    if iceberg <= 1.8 {
+        return
+    }
+    let roof = (f64(mat.iceberg_roof.get(f64(bx) * 1.17, 0.0, f64(bz) * 1.17)) * 1.5).abs()
+    var top = java_min(iceberg * iceberg * 1.2, (roof * 40.0).ceil() + 14.0)
+    // `shouldMeltFrozenOceanIcebergSlightly` at the sea.
+    if temperature(mat, biome, bx, mat.sea, bz) > 0.1f32 {
+        top -= 2.0
+    }
+    if top <= 2.0 {
+        return
+    }
+    let bottom = f64(mat.sea) - top - 7.0
+    top += f64(mat.sea)
+    let top_y = i32.saturate(top)
+    let bottom_y = i32.saturate(bottom)
+    var r = mat.noise_random.at(bx, 0, bz)
+    let max_snow = 2 + r.next_int_below(4)
+    let min_snow_height = mat.sea + 18 + r.next_int_below(10)
+    var snow = 0
+    var y = height.max(top_y + 1)
+    while y >= lowest {
+        let state = block_at(f, mat.void_air, x, z, y)
+        let ice = (states.is_air(state) and y < top_y and r.next_double() > 0.01) or (states.block_of(state) == mat.water and y > bottom_y and y < mat.sea and r.next_double() > 0.15)
+        if ice {
+            if snow <= max_snow and y > min_snow_height {
+                set_block(mut f, states, x, z, y, mat.snow_block)
+                snow += 1
+            } else {
+                set_block(mut f, states, x, z, y, mat.packed_ice)
+            }
+        }
+        y -= 1
+    }
+}
+
+/// `Math.min(double, double)`, NaN if either is.
+fn java_min(a: f64, b: f64) -> f64 {
+    if a != a {
+        return a
+    }
+    return if a <= b { a } else { b }
+}
+
+/// `Mth.floor`.
+fn floor(v: f64) -> i32 {
+    return i32.saturate(v.floor())
+}

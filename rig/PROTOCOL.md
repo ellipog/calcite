@@ -689,6 +689,23 @@ The ops give at most 2^22 blocks in all, 256 times the world's height for each `
 
 If anything throws, the result is the rejection, as `rng`'s is, and no blob. Settings that don't exist, a world that isn't whole sections within the limits, an op that isn't one of those, too many blocks and any blob are an `error` status.
 
+### `surface` (v1)
+
+Chunks filled with a noise settings' terrain shape and then given their materials, as `NoiseBasedChunkGenerator.buildTerrain` does before its carvers: `doFill`, then 26.3's `MaterialSystem.buildSurface` in the same `NoiseChunk`, with the biomes of a biome source. The registries are vanilla's own, as `density`'s are, so a rule, condition, noise, biome or tag named by ID is vanilla's.
+
+Input `{"seed": s, "settings": id, "level": [min_y, height], "source": v, "ops": [...]}`, with `"rule": r` or without, and no blobs. `s` is a `long` as a decimal string, and the `RandomState` is `RandomState.create(noises, seed, settings)` of the noise settings `id`. `v` is read by `BiomeSource.CODEC` and `r` by `MaterialRule.CODEC`, both with the registries' ops; without `r`, the rule is the settings' own `material_rule`. The generator is a `NoiseBasedChunkGenerator` of `v` and the settings, and the world is `LevelHeightAccessor.create(min_y, height)`, whole sections, `height` positive, within -2032 and 2032.
+
+Each case runs on a thread of its own, as `biomes`' do, so the parameter list's search starts from no last result. Each op is `["surface", x, z]`, in order:
+
+1. The chunk at `x`, `z` and the eight around it, `z` outer and `x` inner from the lower corner, each a new `ProtoChunk` given its biomes as `createBiomes` gives them, through a climate sampler with caches of its own, and marked done with `biomes`.
+2. A `BiomeManager` of the obfuscated seed that reads biomes from those nine chunks, as a `WorldGenRegion` does; the possible biomes are those in their palettes.
+3. The settings' noise clamped to the world, and if any is left, a new `NoiseChunk` over the chunk's volume with no structures and nothing to blend, `doFill` with it, and `buildSurface` with the same `NoiseChunk`, a `WorldGenerationContext` of the generator and the chunk, the rule and the possible biomes.
+4. The chunk written as `terrain`'s `fill` writes it: its blocks as runs, each read with `getBlockState`, so a section that holds only air, cave air and void air reads as air; the two `_WG` heightmaps; and the blocks marked for post-processing.
+
+The ops give at most 2^22 blocks in all, 256 times the world's height for each. The output is `{}`.
+
+A source the codec doesn't read is `{"invalid": "source"}`, and then a rule it doesn't read `{"invalid": "rule"}`, each with no blob: the codecs' messages are their own, so only that they don't read is compared. If anything else throws, the result is the rejection, as `rng`'s is, and no blob. Settings that don't exist, a world that isn't whole sections within the limits, an op that isn't `surface`, too many blocks and any blob are an `error` status.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.
