@@ -131,7 +131,7 @@ final class FeaturesProbe implements Probe {
 
     @Override
     public int version() {
-        return 2;
+        return 3;
     }
 
     /** The level, as far as the region and features ask it. */
@@ -159,6 +159,12 @@ final class FeaturesProbe implements Probe {
         @Override
         public ServerChunkCache getChunkSource() {
             return source;
+        }
+
+        // An entity's network ID, which a feature's entity is made with and which isn't saved.
+        @Override
+        public int getNextEntityId() {
+            return 1;
         }
 
         @Override
@@ -622,7 +628,8 @@ final class FeaturesProbe implements Probe {
     /**
      * A chunk as `terrain`'s fill writes it, then its four final heightmaps, primed if they
      * weren't, its block entities by position, its block and fluid ticks in order, and its
-     * entities.
+     * entities, each with its UUID zeroed: an entity's UUID comes from a random seeded by the
+     * clock, so no two runs give the same.
      */
     private static void write(ProtoChunk chunk, RegistryAccess access, DataOutputStream out) throws IOException {
         TerrainProbe.write(chunk, out);
@@ -660,7 +667,11 @@ final class FeaturesProbe implements Probe {
         }
         out.writeInt(chunk.getEntities().size());
         for (CompoundTag entity : chunk.getEntities()) {
-            NbtIo.writeAnyTag(entity, out);
+            CompoundTag masked = entity.copy();
+            if (masked.contains("UUID")) {
+                masked.putIntArray("UUID", new int[4]);
+            }
+            NbtIo.writeAnyTag(masked, out);
         }
     }
 

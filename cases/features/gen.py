@@ -16,6 +16,7 @@ features, placements and providers vanilla doesn't read are compared as that.
 
 import io
 import json
+import math
 import sys
 import zipfile
 from pathlib import Path
@@ -353,6 +354,28 @@ def unread(g, cases):
     cases.append(c.decorate(0, 0).build())
 
 
+def end_spikes(g, cases):
+    """The End's ten spikes, each placed from its own chunk, so that each is built with its cage
+    and its end crystal, an entity; and spikes of a config's own, with a beam target and
+    crystals that can't be hurt."""
+    for i in range(3):
+        c = Case(f"end-spikes-{i}", g.seed(), "end", fixed("the_end"), {"feature": m("end_spike"), "placement": []})
+        for n in range(10):
+            # `EndSpikeFeature.getSpikesForLevel`: centers on a ring of 42 about the origin.
+            angle = 2.0 * (-math.pi + math.pi / 10.0 * n)
+            x = math.floor(42.0 * math.cos(angle))
+            z = math.floor(42.0 * math.sin(angle))
+            c.place(x >> 4, z >> 4, x, 64, z, g.long())
+        cases.append(c.build())
+    spikes = [{"centerX": 3, "centerZ": 5, "radius": 3, "height": 80, "guarded": True},
+              {"centerX": -20, "centerZ": 9, "radius": 2, "height": 70}]
+    feature = {"feature": {"type": "minecraft:end_spike", "crystal_invulnerable": True, "crystal_beam_target": [0, 128, 0], "spikes": spikes}, "placement": []}
+    c = Case("end-spikes-config", g.seed(), "end", fixed("the_end"), feature)
+    for s in spikes:
+        c.place(s["centerX"] >> 4, s["centerZ"] >> 4, s["centerX"], 64, s["centerZ"], g.long())
+    cases.append(c.build())
+
+
 def main():
     g = Gen(SEED)
     biomes, placed, features = vanilla()
@@ -364,7 +387,8 @@ def main():
     predicates(g, cases)
     providers(g, cases)
     unread(g, cases)
-    write_file(HERE / "generated.json", "features", f"cases/features/gen.py, seed {SEED}", cases, probe_version=2)
+    end_spikes(g, cases)
+    write_file(HERE / "generated.json", "features", f"cases/features/gen.py, seed {SEED}", cases, probe_version=3)
 
 
 if __name__ == "__main__":
