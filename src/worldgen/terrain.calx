@@ -252,18 +252,66 @@ pub fn fill_noise(functions: mut Functions, s: Shape, states: BlockStates, ctx: 
     let v = try volume(16, height, 16, cx << 4, low, cz << 4, 1, 1, 1)
     var aquifer = try Aquifer.new(mut functions, s, mut ctx, v)
     let fd = try functions.sampler(s.final_density)
-    var density = try zeros(v.size())
-    try fill(functions.program, mut ctx, fd, mut density, v)
-    for z in 0..16 {
-        for x in 0..16 {
+    // The density is filled a column of cells at a time, small enough for what each step of it
+    // works out to stay near at hand, with each interpolated function's corners worked out once
+    // for the chunk; a point's density is the same whatever part it's filled with.
+    ctx.whole = some(v)
+    let tile = TILE
+    var density: List<f32> = [0.0f32; usize.wrap(tile * height * tile)]
+    var marks = List<u64>()
+    for tz in 0..16 / tile {
+        for tx in 0..16 / tile {
+            let tv = try volume(tile, height, tile, (cx << 4) + tx * tile, low, (cz << 4) + tz * tile, 1, 1, 1)
+            try fill(functions.program, mut ctx, fd, mut density, tv)
+            for lz in 0..tile {
+                for lx in 0..tile {
+                    let x = tx * tile + lx
+                    let z = tz * tile + lz
+                    try fill_column(mut out, mut aquifer, mut marks, functions.program, mut ctx, s, states, density, tv, lx, lz, x, z, cx, cz, low, height, level_min)
+                }
+            }
+        }
+    }
+    ctx.whole = none
+    // The fluids to update, marked in the order the chunk's columns are filled whole.
+    marks.sort()
+    for m in marks {
+        let by = low + height - 1 - i32.wrap((m >> 16) & 0xFFFF)
+        out.marked[usize.wrap((by - level_min) >> 4)].push(u16.wrap(m & 0xFFFF))
+    }
+    return (out, aquifer)
+}
+
+// The blocks across a tile of columns, in blocks: its columns' densities are filled together.
+const TILE: i32 = 4
+
+// The column at `x`, `z` of the chunk, from the top down, from its densities at `lx`, `lz` of
+// `tv`: a solid block wherever the density is above 0, else what the aquifer says. Each fluid to
+// update is noted in `marks` by its column, `z` first, then from the top down.
+fn fill_column(out: mut Filled, aquifer: mut Aquifer, marks: mut List<u64>, p: Program, ctx: mut Context, s: Shape, states: BlockStates, density: List<f32>, tv: Volume, lx: i32, lz: i32, x: i32, z: i32, cx: i32, cz: i32, low: i32, height: i32, level_min: i32) ! Thrown {
+    {
+        {
             let column = usize.wrap(x + z * 16)
             var y = height - 1
+            var at = tv.index(lx, y, lz)
             while y >= 0 {
                 let by = low + y
-                let d = f64(density[usize.wrap(v.index(x, y, z))])
-                var state = try aquifer.substance(functions.program, mut ctx, s, (cx << 4) + x, by, (cz << 4) + z, d)
-                if state == SOLID {
-                    state = s.default_block
+                let d = f64(density[usize.wrap(at)])
+                at -= 1
+                // `computeSubstance` gives a solid block wherever the density is above 0, and
+                // what it notes for the fluid's update is noted afresh with each block it's asked.
+                var state = s.default_block
+                if not (d > 0.0) {
+                    if aquifer.enabled and by > aquifer.skip_above {
+                        // Above every aquifer it gives the global fluid, as `substance` would.
+                        aquifer.schedule = false
+                        state = s.global(by).at(by)
+                    } else {
+                        state = try aquifer.substance(p, mut ctx, s, (cx << 4) + x, by, (cz << 4) + z, d)
+                        if state == SOLID {
+                            state = s.default_block
+                        }
+                    }
                 }
                 if state != AIR_STATE {
                     out.states[usize.wrap(((by - level_min) << 8) | (z << 4) | x)] = state
@@ -271,14 +319,13 @@ pub fn fill_noise(functions: mut Functions, s: Shape, states: BlockStates, ctx: 
                     update(mut out.world_surface, out.states, states, WORLD_SURFACE_WG, column, x, z, by, state, level_min)
                     if aquifer.schedule and states.flags(state) & FLUID != 0 {
                         let packed = x | ((by & 15) << 4) | (z << 8)
-                        out.marked[usize.wrap((by - level_min) >> 4)].push(u16.wrap(packed))
+                        marks.push((u64(column) << 32) | (u64.wrap(height - 1 - y) << 16) | u64.wrap(packed))
                     }
                 }
                 y -= 1
             }
         }
     }
-    return (out, aquifer)
 }
 
 /// `Heightmap.update` of a column of `filled`, after the block at `y` became `state`.
@@ -366,6 +413,13 @@ pub struct Aquifer {
     size_x: i32
     size_z: i32
     surface_cache: Map<i64, i32>
+    // The grid cell the twelve near cells were found about, and each one's index and location,
+    // in the order `computeSubstance` looks at them.
+    near_at: (i32, i32, i32)
+    near_index: [usize; 12]
+    near_x: [i32; 12]
+    near_y: [i32; 12]
+    near_z: [i32; 12]
 }
 
 impl Aquifer {
@@ -387,6 +441,11 @@ impl Aquifer {
             size_x: 0,
             size_z: 0,
             surface_cache: Map<i64, i32>(),
+            near_at: (i32.MIN, i32.MIN, i32.MIN),
+            near_index: [0; 12],
+            near_x: [0; 12],
+            near_y: [0; 12],
+            near_z: [0; 12],
         }
     }
 
@@ -515,62 +574,47 @@ impl Aquifer {
         let xa = (x + -5) >> 4
         let ya = (y + 1).floor_div(12)
         let za = (z + -5) >> 4
-        var d1 = i32.MAX
-        var d2 = i32.MAX
-        var d3 = i32.MAX
-        var d4 = i32.MAX
-        var c1: usize = 0
-        var c2: usize = 0
-        var c3: usize = 0
-        var c4: usize = 0
-        for x1 in 0..2 {
-            for y1 in -1..2 {
-                for z1 in 0..2 {
-                    let gx = xa + x1
-                    let gy = ya + y1
-                    let gz = za + z1
-                    let index = try self.index(gx, gy, gz)
-                    var location = self.locations[index]
-                    if location == NO_LOCATION {
-                        var r = self.random.at(gx, gy, gz)
-                        let ox = r.next_int_below(10)
-                        let oy = r.next_int_below(9)
-                        let oz = r.next_int_below(10)
-                        location = block_pack((gx << 4) + ox, gy * 12 + oy, (gz << 4) + oz)
-                        self.locations[index] = location
-                    }
-                    let dx = block_x(location) - x
-                    let dy = block_y(location) - y
-                    let dz = block_z(location) - z
-                    let d = dx * dx + dy * dy + dz * dz
-                    if d1 >= d {
-                        c4 = c3
-                        c3 = c2
-                        c2 = c1
-                        c1 = index
-                        d4 = d3
-                        d3 = d2
-                        d2 = d1
-                        d1 = d
-                    } else if d2 >= d {
-                        c4 = c3
-                        c3 = c2
-                        c2 = index
-                        d4 = d3
-                        d3 = d2
-                        d2 = d
-                    } else if d3 >= d {
-                        c4 = c3
-                        c3 = index
-                        d4 = d3
-                        d3 = d
-                    } else if d4 >= d {
-                        c4 = index
-                        d4 = d
-                    }
-                }
-            }
+        if self.near_at != (xa, ya, za) {
+            try self.find_near(xa, ya, za)
         }
+        // The four nearest, as vanilla's insertion keeps them: by distance, and of two as near,
+        // the later first. Each cell's key is its distance, then 15 less its place, so the four
+        // least keys are those four in that order. A cell is at most 25 blocks away on each
+        // axis, so a key fits easily.
+        var keys: [i32; 12] = [0; 12]
+        for k in 0..12usize {
+            let dx = self.near_x[k] - x
+            let dy = self.near_y[k] - y
+            let dz = self.near_z[k] - z
+            keys[k] = ((dx * dx + dy * dy + dz * dz) << 4) | (15 - i32.wrap(k))
+        }
+        var k1 = i32.MAX
+        for k in 0..12usize {
+            k1 = k1.min(keys[k])
+        }
+        var k2 = i32.MAX
+        for k in 0..12usize {
+            let key = keys[k]
+            k2 = if key > k1 { k2.min(key) } else { k2 }
+        }
+        var k3 = i32.MAX
+        for k in 0..12usize {
+            let key = keys[k]
+            k3 = if key > k2 { k3.min(key) } else { k3 }
+        }
+        var k4 = i32.MAX
+        for k in 0..12usize {
+            let key = keys[k]
+            k4 = if key > k3 { k4.min(key) } else { k4 }
+        }
+        let d1 = k1 >> 4
+        let d2 = k2 >> 4
+        let d3 = k3 >> 4
+        let d4 = k4 >> 4
+        let c1 = self.near_index[usize.wrap(15 - (k1 & 15))]
+        let c2 = self.near_index[usize.wrap(15 - (k2 & 15))]
+        let c3 = self.near_index[usize.wrap(15 - (k3 & 15))]
+        let c4 = self.near_index[usize.wrap(15 - (k4 & 15))]
         let st1 = try self.status(p, mut ctx, s, c1)
         let sim12 = similarity(d1, d2)
         let fluid = st1.at(y)
@@ -625,6 +669,37 @@ impl Aquifer {
             self.schedule = true
         }
         return fluid
+    }
+
+    // The twelve cells about the grid cell, each's location worked out the first time it's
+    // needed, as `computeSubstance` goes over them: `x` outermost, then `y` from below, then `z`.
+    fn find_near(mut self, xa: i32, ya: i32, za: i32) ! Thrown {
+        var k: usize = 0
+        for x1 in 0..2 {
+            for y1 in -1..2 {
+                for z1 in 0..2 {
+                    let gx = xa + x1
+                    let gy = ya + y1
+                    let gz = za + z1
+                    let index = try self.index(gx, gy, gz)
+                    var location = self.locations[index]
+                    if location == NO_LOCATION {
+                        var r = self.random.at(gx, gy, gz)
+                        let ox = r.next_int_below(10)
+                        let oy = r.next_int_below(9)
+                        let oz = r.next_int_below(10)
+                        location = block_pack((gx << 4) + ox, gy * 12 + oy, (gz << 4) + oz)
+                        self.locations[index] = location
+                    }
+                    self.near_index[k] = index
+                    self.near_x[k] = block_x(location)
+                    self.near_y[k] = block_y(location)
+                    self.near_z[k] = block_z(location)
+                    k += 1
+                }
+            }
+        }
+        self.near_at = (xa, ya, za)
     }
 
     /// `calculatePressure`: how much the barrier between two aquifers holds, sampling the
