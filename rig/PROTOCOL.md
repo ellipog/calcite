@@ -595,6 +595,22 @@ The result is one blob, each operation's result after the last's. A place is `Ve
 
 Blobs, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, an argument that isn't an `int` where one is wanted or is out of its range, a seed that isn't a decimal `long`, a state that isn't one, an empty list of states, a block in a chunk that isn't there, and a search with a candidate in one are an `error` status.
 
+### `packs` (v1)
+
+A world's data packs: found as a server starting finds them, by `ServerPacksSource.createPackRepository` with the validator `LevelStorageSource.parseValidator` makes from `allowed_symlinks.txt`; picked as `MinecraftServer.configurePackRepository` picks them; and their files listed by a `MultiPackResourceManager` over the picked packs, as the server's resources are made. The operations work on `world`, in a new folder of its own, the universe, as `world_folder`'s do, and vanilla's own pack and its feature packs come from the pinned server jar.
+
+Input `{"ops": [...]}`, with blobs, as `world_folder`'s. The result is one blob, each operation's result after what it logged. A line logged is its level as a byte, 1 for a warning, 2 for an error and 0 for anything else, then its words as a message, an `int` length and its UTF-8, with a line break and what was thrown after it, as `Throwable.toString` writes it. What an operation logged is an `int` count and each line. In the lines the folder's path is taken out, and `/` goes between names. A list of names is an `int` count and each as a message, and feature flags are their IDs in the order `FeatureFlagRegistry.toNames` gives them.
+
+| Operation | Result |
+| --- | --- |
+| `["put", name, blob]`, `["dir", name]`, `["link", name, target]`, `["allow", blob]` | nothing, as `world_folder`'s |
+| `["pick", setup]` | the packs found and picked, once. `setup` is `{"enabled": [...], "disabled": [...], "features": [...], "init": b, "safe": b}`: the packs on and off, as a world's `DataPackConfig` has them; its feature flags by ID; whether the world is new, so that the packs are server.properties' `initial-enabled-packs` and `initial-disabled-packs`; and `--safeMode`. The result is an `int` count of the packs found, then each in ID order: its ID as a message; its source as a byte, 0 built in, 1 a feature pack, 2 the world's; its `PackCompatibility` as a byte, 0 too old, 1 too new, 2 unknown, 3 compatible; the feature flags it asks for; and its description, as `ComponentSerialization.CODEC` encodes it to JSON, as a message. Then come the packs picked and the packs off, as names, and the world's feature flags |
+| `["list", folder, suffix]` | the picked packs' files in the folder whose paths end with the suffix, as `listResources` gives them. The first `list` opens the packs, with `openAllSelected`, and what that logs is logged with it. The result is an `int` count, then each file's identifier and its pack's ID, as messages, then an `int` length and the file's bytes |
+
+A second `pick`, a `list` before one, a setup that isn't an object with those fields, a feature flag that isn't one, and anything `world_folder` refuses are an `error` status.
+
+Vanilla finds a folder's entries in the order the file system lists them. NTFS lists a folder in the same order on every machine, by name; a Linux file system needn't, since ext4 lists by a hash of each name with a seed of each file system's own. So a case where more than one entry in a folder logs something is Windows'.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

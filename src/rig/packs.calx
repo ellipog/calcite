@@ -1,0 +1,250 @@
+/// The `packs` probe (rig/PROTOCOL.md): a world's data packs found and picked as a server starting
+/// finds and picks them, in a world's folder, `world`, in a new folder of its own, run by a list
+/// of operations. Some make the world's `datapacks` folder and `allowed_symlinks.txt`, as
+/// `world_folder`'s do; `pick` finds the packs with `pack.repository.discover` and picks them with
+/// `select`; and `list` lists the picked packs' files with `open` and `Resources.list`. Each
+/// result is written to one blob after what was logged, which the rig compares with what
+/// vanilla's `ServerPacksSource`, `configurePackRepository` and `MultiPackResourceManager` give
+/// for the same operations, with vanilla's own pack from the pinned server jar at oracle/jars/.
+module rig.packs
+
+import json.tree.{Json, Member, as_string, get, take}
+import pack.repository.{Repository, Selection, Setup, Source, discover}
+import pack.meta.{Compatibility}
+import pack.resources.{Resources}
+import pack.zip.{Zip}
+import resources.identifier.{Identifier}
+import rig.frame.{Outcome}
+import rig.world_folder.{Problem, blob, describe, expect, inside, items_of, parent, put_i32, put_message, replaced, replaced_bytes, without}
+import server.log.{Entry, Level}
+import std.fs.{make_dir_all, make_link, remove_dir_all, separator, temp_dir, write}
+import storage.level.{DataPacks, feature_ids, feature_names}
+import storage.symlinks.{read_allow_list}
+import storage.world.{join}
+
+pub fn run_packs(input: own List<Member>, blobs: List<List<u8>>, vanilla: Zip) -> Outcome {
+    var fields = input
+    let ops_value = take(mut fields, "ops") else return Outcome.Failed("missing field `ops`")
+    let ops = match ops_value {
+        Json.Array(items) => items,
+        _ => return Outcome.Failed("`ops` must be an array"),
+    }
+    let universe = match temp_dir() {
+        ok(d) => d,
+        err(e) => return Outcome.Failed("no temporary folder: {describe(e)}"),
+    }
+    var out: List<u8> = []
+    let failed: String? = match packs(universe, ops, blobs, vanilla, mut out) {
+        ok => none,
+        err(Problem.Case(message)) => some(message),
+        err(Problem.Files(e)) => some(describe(e)),
+    }
+    match remove_dir_all(universe) {
+        ok => {},
+        err(e) => return Outcome.Failed("the folder wasn't removed: {describe(e)}"),
+    }
+    if let message = failed {
+        return Outcome.Failed(message)
+    }
+    return Outcome.Done { output: [], blobs: [out] }
+}
+
+fn packs(universe: String, ops: List<Json>, blobs: List<List<u8>>, vanilla: Zip, out: mut List<u8>) ! Problem {
+    let world = join(universe, "world")
+    try make_dir_all(world)
+    let folder = "{universe}{separator()}"
+    var repository: Repository? = none
+    var selection: Selection? = none
+    var resources: Resources? = none
+    var lines: List<Entry> = []
+    for k in 0..ops.len() {
+        let items = try items_of(ops, k)
+        let name = as_string(items[0]) ?? String()
+        lines.clear()
+        if name == "put" {
+            try expect(items, k, 2)
+            let file = try inside(items, k)
+            try make_dir_all(join(world, parent(file)))
+            try write(join(world, file), try blob(blobs, items, k, 2))
+        } else if name == "dir" {
+            try expect(items, k, 1)
+            try make_dir_all(join(world, try inside(items, k)))
+        } else if name == "link" {
+            try expect(items, k, 2)
+            let at = try inside(items, k)
+            let target = as_string(items[2]) else fail Problem.Case("operation {k}'s target must be a string")
+            let to = replaced(target, "<folder>", folder)
+            if to.is_empty() {
+                fail Problem.Case("operation {k}: a link needs a target")
+            }
+            try make_dir_all(join(world, parent(at)))
+            try make_link(to, join(world, at))
+        } else if name == "allow" {
+            try expect(items, k, 1)
+            try write(join(universe, "allowed_symlinks.txt"), replaced_bytes(try blob(blobs, items, k, 1), folder))
+        } else if name == "pick" {
+            try expect(items, k, 1)
+            if repository != none {
+                fail Problem.Case("operation {k}: the packs are picked already")
+            }
+            let setup = try setup_of(items[1], join(world, "datapacks"), k)
+            // As `Main` makes them: the allow list read as the level storage is made, then the
+            // packs found once the world's folder is open, and picked.
+            var allow = read_allow_list(join(universe, "allowed_symlinks.txt"), mut lines)
+            let found = discover(vanilla.copy(), setup, mut allow, mut lines)
+            let picked = found.select(setup, mut lines)
+            put_lines(mut out, lines, folder)
+            put_i32(mut out, i32.wrap(found.packs.len()))
+            for p in found.packs {
+                put_message(mut out, p.id)
+                out.push(match p.source {
+                    Source.BuiltIn => 0,
+                    Source.Feature => 1,
+                    Source.World => 2,
+                })
+                out.push(match p.meta.compatibility {
+                    Compatibility.TooOld => 0,
+                    Compatibility.TooNew => 1,
+                    Compatibility.Unknown => 2,
+                    Compatibility.Compatible => 3,
+                })
+                put_names(mut out, p.meta.features)
+                put_message(mut out, p.meta.description.to_json())
+            }
+            put_strings(mut out, picked.packs.enabled)
+            put_strings(mut out, picked.packs.disabled)
+            put_names(mut out, picked.features)
+            repository = some(found)
+            selection = some(picked)
+            continue
+        } else if name == "list" {
+            try expect(items, k, 2)
+            let directory = as_string(items[1]) else fail Problem.Case("operation {k}'s folder must be a string")
+            let suffix = as_string(items[2]) else fail Problem.Case("operation {k}'s suffix must be a string")
+            // The picked packs are opened once, as the server's resources are made, with what
+            // opening them logs the first time.
+            if resources == none {
+                let r = repository.take() else fail Problem.Case("operation {k}: the packs aren't picked")
+                let s = selection.take() else fail Problem.Case("operation {k}: the packs aren't picked")
+                resources = some(r.open(s, mut lines))
+            }
+            let opened = resources.take() else fail Problem.Case("operation {k}: the packs aren't picked")
+            let files = opened.list(directory, suffix, mut lines)
+            put_lines(mut out, lines, folder)
+            put_i32(mut out, i32.wrap(files.len()))
+            for f in files {
+                put_message(mut out, f.id.to_string())
+                put_message(mut out, opened.pack_id(f.pack))
+                let content = match opened.read(f) {
+                    ok(b) => b,
+                    err(message) => fail Problem.Case("operation {k}: {f.id.to_string()} couldn't be read: {message}"),
+                }
+                put_i32(mut out, i32.wrap(content.len()))
+                for b in content {
+                    out.push(b)
+                }
+            }
+            resources = some(opened)
+            continue
+        } else {
+            fail Problem.Case("operation {k}: no operation `{name}`")
+        }
+        put_lines(mut out, lines, folder)
+    }
+}
+
+// The setup `pick` is given: `enabled` and `disabled`, the packs on and off, `features`, the
+// world's feature flags by ID, and `init` and `safe`.
+fn setup_of(value: Json, datapacks: String, k: usize) -> Setup ! Problem {
+    let members = match value {
+        Json.Object(m) => m.copy(),
+        _ => fail Problem.Case("operation {k}'s setup must be an object"),
+    }
+    let enabled = try strings_of(members, "enabled", k)
+    let disabled = try strings_of(members, "disabled", k)
+    var features: u32 = 0
+    let names = feature_names()
+    for f in try strings_of(members, "features", k) {
+        let id = match Identifier.parse(f) {
+            ok(i) => i,
+            err(_) => fail Problem.Case("operation {k}: `{f}` isn't a feature flag's ID"),
+        }
+        var bit: u32 = 1
+        var known = false
+        for n in names {
+            if id.namespace == "minecraft" and id.path == n {
+                features = features | bit
+                known = true
+            }
+            bit = bit << 1
+        }
+        if not known {
+            fail Problem.Case("operation {k}: no feature flag `{f}`")
+        }
+    }
+    return Setup {
+        datapacks: datapacks.copy(),
+        make: true,
+        safe: try bool_of(members, "safe", k),
+        init: try bool_of(members, "init", k),
+        config: DataPacks { enabled: enabled, disabled: disabled },
+        features: features,
+    }
+}
+
+fn strings_of(members: List<Member>, key: String, k: usize) -> List<String> ! Problem {
+    let value = get(members, key) else fail Problem.Case("operation {k}'s setup has no `{key}`")
+    let items = match value {
+        Json.Array(a) => a,
+        _ => fail Problem.Case("operation {k}'s `{key}` must be an array"),
+    }
+    var out = List<String>()
+    for item in items {
+        let s = as_string(item) else fail Problem.Case("operation {k}'s `{key}` must hold strings")
+        out.push(s)
+    }
+    return out
+}
+
+fn bool_of(members: List<Member>, key: String, k: usize) -> bool ! Problem {
+    let value = get(members, key) else fail Problem.Case("operation {k}'s setup has no `{key}`")
+    return match value {
+        Json.Bool(b) => b,
+        _ => fail Problem.Case("operation {k}'s `{key}` must be true or false"),
+    }
+}
+
+// What an operation logged, each line's level and its words, with the folder the world's in
+// taken out and `/` between names, as vanilla's probe writes them.
+fn put_lines(out: mut List<u8>, lines: List<Entry>, folder: String) {
+    let sep = separator()
+    put_i32(mut out, i32.wrap(lines.len()))
+    for line in lines {
+        out.push(match line.level {
+            Level.Warn => 1,
+            Level.Error => 2,
+            _ => 0,
+        })
+        var text = without(line.message, folder)
+        if sep != "/" {
+            text = replaced(text, sep, "/")
+        }
+        put_message(mut out, text)
+    }
+}
+
+// The feature flags' IDs, in the order vanilla's `toNames` gives them.
+fn put_names(out: mut List<u8>, features: u32) {
+    var ids = List<String>()
+    for id in feature_ids(features) {
+        ids.push(id.to_string())
+    }
+    put_strings(mut out, ids)
+}
+
+fn put_strings(out: mut List<u8>, list: List<String>) {
+    put_i32(mut out, i32.wrap(list.len()))
+    for s in list {
+        put_message(mut out, s)
+    }
+}

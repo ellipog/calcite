@@ -58,7 +58,8 @@ public final class Main {
                 new DistanceProbe(),
                 new LightProbe(),
                 new SpawnProbe(),
-                new RegistriesProbe())) {
+                new RegistriesProbe(),
+                new PacksProbe())) {
             probes.put(probe.name(), probe);
         }
 
