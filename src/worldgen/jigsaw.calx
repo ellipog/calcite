@@ -1,0 +1,1028 @@
+/// Jigsaw structures: template pools and their elements read as their codecs read them, the
+/// jigsaw blocks of templates, pool aliases, and `JigsawPlacement.addPieces`, which grows a
+/// structure from a start element, piece by piece, joining jigsaws where the next piece fits in
+/// the space left.
+module worldgen.jigsaw
+
+import json.tree.{Json, Member, as_string}
+import nbt.tag.{Tag}
+import pack.zip.{Zip}
+import random.legacy.{LegacyRandom}
+import random.source.{RandomSource, position_seed}
+import random.worldgen.{WorldgenRandom}
+import resources.identifier.{Identifier}
+import world.chunk.{WORLD_SURFACE_WG}
+import worldgen.codec.{bool_field, field, int_of, int_range_field, map_of, type_of}
+import worldgen.density.{data_json}
+import worldgen.facts.{DOWN, SOUTH, UP, direction_named, opposite, step_x, step_y, step_z}
+import worldgen.features.{read_heightmap}
+import worldgen.interval.{Thrown}
+import worldgen.pieces.{JigsawPiece, Junction, Piece, PieceData}
+import worldgen.predicates.{list_of}
+import worldgen.providers.{HeightProvider, read_height}
+import worldgen.structure_world.{StructureWorld}
+import worldgen.template.{Bounds, Settings, rotate_direction, transform}
+
+/// `Pools.EMPTY`.
+fn empty_pool() -> String {
+    return String("minecraft:empty")
+}
+
+/// The kinds of pool element.
+pub enum ElementKind {
+    Single
+    Legacy
+    Feature
+    List
+    /// `EmptyPoolElement.INSTANCE`.
+    Empty
+}
+
+/// A `StructurePoolElement`.
+pub struct Element {
+    pub kind: ElementKind
+    /// A single element's template, or a feature element's placed feature.
+    pub location: String
+    /// The processors as the element saves them: an ID, or the list written out.
+    pub processors: Tag
+    pub rigid: bool
+    /// `override_liquid_settings`: -1 for none, 0 to ignore waterlogging, 1 to apply it.
+    pub liquid: i32
+    pub children: List<Element>
+}
+
+/// A `StructureTemplatePool`.
+pub struct Pool {
+    pub id: String
+    pub fallback: String
+    pub elements: List<Element>
+    /// Each element's index, as many times as its weight.
+    pub templates: List<usize>
+    max_size: i32?
+}
+
+/// A jigsaw block: where it is, which way it faces and its top, how it joins, its name, the pool
+/// it draws from, the name it joins, and its priorities.
+pub struct Jigsaw {
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub front: i32
+    pub top: i32
+    pub rollable: bool
+    pub name: String?
+    pub pool: String
+    pub target: String
+    pub placement: i32
+    pub selection: i32
+}
+
+/// The template pools loaded, each once, by ID, and each template's jigsaws.
+pub struct Pools {
+    pub list: List<Pool>
+    ids: Map<String, usize>
+    missing: Set<String>
+    jigsaws: Map<usize, List<List<Jigsaw>>>
+}
+
+impl Pools {
+    pub fn new() -> Pools {
+        return Pools { list: List<Pool>(), ids: Map<String, usize>(), missing: Set<String>(), jigsaws: Map<usize, List<List<Jigsaw>>>() }
+    }
+
+    /// The registry's pool `id`, read from the data the first time, or none if there's none.
+    pub fn get(mut self, zip: Zip, id: String) -> usize? ! Thrown {
+        if let i = self.ids.get(id) {
+            return some(i)
+        }
+        if self.missing.contains(id) {
+            return none
+        }
+        let colon = id.find(":") else return none
+        let path = "data/{id[..colon]}/worldgen/template_pool/{id[colon + 1..]}.json"
+        if zip.find(path) == none {
+            self.missing.insert(id.copy())
+            return none
+        }
+        let json = match data_json(zip, id.copy(), String("template_pool")) {
+            ok(j) => j,
+            err(e) => fail Thrown { exception: "IllegalStateException", message: e },
+        }
+        let pool = match read_pool(id.copy(), json) {
+            ok(p) => p,
+            err(e) => fail Thrown { exception: "IllegalStateException", message: e },
+        }
+        self.list.push(pool)
+        let i = self.list.len() - 1
+        self.ids.insert(id.copy(), i)
+        return some(i)
+    }
+}
+
+// `StructureTemplatePool.DIRECT_CODEC`.
+fn read_pool(id: own String, value: Json) -> Pool ! String {
+    let m = try map_of(value)
+    let fv = field(m, "fallback") else fail "No key fallback in MapLike"
+    let ft = as_string(fv) else fail "a fallback pool written out isn't supported"
+    let fallback = (try Identifier.parse(ft)).to_string()
+    let ev = field(m, "elements") else fail "No key elements in MapLike"
+    var elements = List<Element>()
+    var templates = List<usize>()
+    for item in try list_of(ev) {
+        let im = try map_of(item)
+        let el = field(im, "element") else fail "No key element in MapLike"
+        let element = try read_element(el)
+        let weight = try int_range_field(im, "weight", 1, 150)
+        elements.push(element)
+        for _ in 0..weight {
+            templates.push(elements.len() - 1)
+        }
+    }
+    return Pool { id: id, fallback: fallback, elements: elements, templates: templates, max_size: none }
+}
+
+// `StructurePoolElement.CODEC`.
+fn read_element(value: Json) -> Element ! String {
+    let m = try map_of(value)
+    let tv = field(m, "element_type") else fail "No key element_type in MapLike"
+    let tt = as_string(tv) else fail "Not a string: {tv}"
+    let kind = (try Identifier.parse(tt)).to_string()
+    if kind == "minecraft:empty_pool_element" {
+        return Element { kind: ElementKind.Empty, location: String(), processors: Tag.End, rigid: false, liquid: -1, children: List<Element>() }
+    }
+    let pv = field(m, "projection") else fail "No key projection in MapLike"
+    let projection = as_string(pv) else fail "Not a string: {pv}"
+    if projection != "rigid" and projection != "terrain_matching" {
+        fail "Unknown element name:{projection}"
+    }
+    let rigid = projection == "rigid"
+    if kind == "minecraft:single_pool_element" or kind == "minecraft:legacy_single_pool_element" {
+        let lv = field(m, "location") else fail "No key location in MapLike"
+        let lt = as_string(lv) else fail "Not a string: {lv}"
+        let location = (try Identifier.parse(lt)).to_string()
+        let prv = field(m, "processors") else fail "No key processors in MapLike"
+        let processors = try processors_tag(prv)
+        var liquid = -1
+        if let v = field(m, "override_liquid_settings") {
+            let name = as_string(v) else fail "Not a string: {v}"
+            liquid = if name == "ignore_waterlogging" { 0 } else if name == "apply_waterlogging" { 1 } else { fail "Unknown element name:{name}" }
+        }
+        let k = if kind == "minecraft:single_pool_element" { ElementKind.Single } else { ElementKind.Legacy }
+        return Element { kind: k, location: location, processors: processors, rigid: rigid, liquid: liquid, children: List<Element>() }
+    }
+    if kind == "minecraft:feature_pool_element" {
+        let fv = field(m, "feature") else fail "No key feature in MapLike"
+        let ft = as_string(fv) else fail "a placed feature written out in a pool element isn't supported"
+        let feature = (try Identifier.parse(ft)).to_string()
+        return Element { kind: ElementKind.Feature, location: feature, processors: Tag.End, rigid: rigid, liquid: -1, children: List<Element>() }
+    }
+    if kind == "minecraft:list_pool_element" {
+        let ev = field(m, "elements") else fail "No key elements in MapLike"
+        var children = List<Element>()
+        for item in try list_of(ev) {
+            var child = try read_element(item)
+            set_projection(mut child, rigid)
+            children.push(child)
+        }
+        if children.is_empty() {
+            fail "Elements are empty"
+        }
+        return Element { kind: ElementKind.List, location: String(), processors: Tag.End, rigid: rigid, liquid: -1, children: children }
+    }
+    fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:worldgen/structure_pool_element]: {kind}"
+}
+
+// `ListPoolElement.setProjectionOnEachElement`.
+fn set_projection(e: mut Element, rigid: bool) {
+    if e.kind == ElementKind.Empty {
+        return
+    }
+    e.rigid = rigid
+    for i in 0..e.children.len() {
+        set_projection(mut e.children[i], rigid)
+    }
+}
+
+// `StructureProcessorType.LIST_CODEC`, as it saves: an ID, or the list as `{processors: [...]}`.
+fn processors_tag(value: Json) -> Tag ! String {
+    if let text = as_string(value) {
+        return Tag.Str((try Identifier.parse(text)).to_string())
+    }
+    var items = List<Json>()
+    match value {
+        Json.Array(a) => items = a.copy(),
+        Json.Object(m) => {
+            let pv = field(m, "processors") else fail "No key processors in MapLike"
+            items = try list_of(pv)
+        },
+        _ => fail "Not a processor list: {value}",
+    }
+    if not items.is_empty() {
+        fail "a processor list written out in a pool element isn't supported"
+    }
+    var t = JavaHashMap<String, Tag>()
+    t.insert("processors", Tag.List(List<Tag>()))
+    return Tag.Compound(t)
+}
+
+/// The element as `StructurePoolElement.CODEC` saves it.
+pub fn element_tag(e: Element) -> Tag {
+    var t = JavaHashMap<String, Tag>()
+    let projection = Tag.Str(String(if e.rigid { "rigid" } else { "terrain_matching" }))
+    var kind = "minecraft:empty_pool_element"
+    match e.kind {
+        ElementKind.Single => {
+            kind = "minecraft:single_pool_element"
+            t.insert("location", Tag.Str(e.location.copy()))
+            t.insert("processors", e.processors.copy())
+            t.insert("projection", projection)
+            if e.liquid >= 0 {
+                t.insert("override_liquid_settings", Tag.Str(String(if e.liquid == 0 { "ignore_waterlogging" } else { "apply_waterlogging" })))
+            }
+        },
+        ElementKind.Legacy => {
+            kind = "minecraft:legacy_single_pool_element"
+            t.insert("location", Tag.Str(e.location.copy()))
+            t.insert("processors", e.processors.copy())
+            t.insert("projection", projection)
+            if e.liquid >= 0 {
+                t.insert("override_liquid_settings", Tag.Str(String(if e.liquid == 0 { "ignore_waterlogging" } else { "apply_waterlogging" })))
+            }
+        },
+        ElementKind.Feature => {
+            kind = "minecraft:feature_pool_element"
+            t.insert("feature", Tag.Str(e.location.copy()))
+            t.insert("projection", projection)
+        },
+        ElementKind.List => {
+            kind = "minecraft:list_pool_element"
+            var children = List<Tag>()
+            for c in e.children {
+                children.push(element_tag(c))
+            }
+            t.insert("elements", Tag.List(children))
+            t.insert("projection", projection)
+        },
+        ElementKind.Empty => {},
+    }
+    t.insert("element_type", Tag.Str(String(kind)))
+    return Tag.Compound(t)
+}
+
+/// A pool alias binding.
+pub enum Alias {
+    Direct { alias: String, target: String }
+    Random { alias: String, targets: List<String>, weights: List<i32> }
+    Group { groups: List<List<Alias>>, weights: List<i32> }
+}
+
+/// What a jigsaw structure reads of its own.
+pub struct JigsawConfig {
+    pub start_pool: String
+    pub start_jigsaw: String?
+    pub max_depth: i32
+    pub start_height: HeightProvider
+    pub expansion_hack: bool
+    pub project: i32?
+    pub horizontal: i32
+    pub vertical: i32
+    pub aliases: List<Alias>
+    /// The dimension padding, and whether it was given: vanilla checks a start against it only
+    /// then.
+    pub padding_given: bool
+    pub padding_bottom: i32
+    pub padding_top: i32
+    pub ignore_waterlogging: bool
+}
+
+/// `JigsawStructure.CODEC`'s own fields.
+pub fn read_jigsaw(m: List<Member>, adaptation_edge: i32) -> JigsawConfig ! String {
+    let sv = field(m, "start_pool") else fail "No key start_pool in MapLike"
+    let st = as_string(sv) else fail "a start pool written out isn't supported"
+    let start_pool = (try Identifier.parse(st)).to_string()
+    var start_jigsaw: String? = none
+    if let v = field(m, "start_jigsaw_name") {
+        let t = as_string(v) else fail "Not a string: {v}"
+        start_jigsaw = some((try Identifier.parse(t)).to_string())
+    }
+    let max_depth = try int_range_field(m, "size", 0, 20)
+    let hv = field(m, "start_height") else fail "No key start_height in MapLike"
+    let start_height = try read_height(hv)
+    let expansion_hack = try bool_field(m, "use_expansion_hack")
+    var project: i32? = none
+    if let v = field(m, "project_start_to_heightmap") {
+        project = some(try read_heightmap(v))
+    }
+    let dv = field(m, "max_distance_from_center") else fail "No key max_distance_from_center in MapLike"
+    var horizontal = 0
+    var vertical = 0
+    match dv {
+        Json.Object(dm) => {
+            horizontal = try int_range_field(dm, "horizontal", 1, 128)
+            vertical = 4064
+            if field(dm, "vertical") != none {
+                vertical = try int_range_field(dm, "vertical", 1, 4064)
+            }
+        },
+        _ => {
+            horizontal = try int_of(dv)
+            if horizontal < 1 or horizontal > 128 {
+                fail "Value {horizontal} outside of range [1:128]"
+            }
+            vertical = horizontal
+        },
+    }
+    var aliases = List<Alias>()
+    if let v = field(m, "pool_aliases") {
+        for item in try list_of(v) {
+            aliases.push(try read_alias(item))
+        }
+    }
+    var padding_given = false
+    var bottom = 0
+    var top = 0
+    if let v = field(m, "dimension_padding") {
+        padding_given = true
+        match v {
+            Json.Object(pm) => {
+                if let b = field(pm, "bottom") {
+                    bottom = match int_of(b) {
+                        ok(n) => n.max(0),
+                        err(_) => 0,
+                    }
+                }
+                if let t = field(pm, "top") {
+                    top = match int_of(t) {
+                        ok(n) => n.max(0),
+                        err(_) => 0,
+                    }
+                }
+            },
+            _ => {
+                bottom = try int_of(v)
+                if bottom < 0 {
+                    fail "Value must be non-negative: {bottom}"
+                }
+                top = bottom
+            },
+        }
+    }
+    var ignore = false
+    if let v = field(m, "liquid_settings") {
+        let name = as_string(v) else fail "Not a string: {v}"
+        if name == "ignore_waterlogging" {
+            ignore = true
+        } else if name != "apply_waterlogging" {
+            fail "Unknown element name:{name}"
+        }
+    }
+    if horizontal + adaptation_edge > 128 {
+        fail "Horizontal structure size including terrain adaptation must not exceed 128"
+    }
+    return JigsawConfig {
+        start_pool: start_pool, start_jigsaw: start_jigsaw, max_depth: max_depth, start_height: start_height, expansion_hack: expansion_hack,
+        project: project, horizontal: horizontal, vertical: vertical, aliases: aliases, padding_given: padding_given, padding_bottom: bottom,
+        padding_top: top, ignore_waterlogging: ignore,
+    }
+}
+
+// `PoolAliasBinding.CODEC`.
+fn read_alias(value: Json) -> Alias ! String {
+    let m = try map_of(value)
+    let kind = try type_of(m)
+    if kind == "minecraft:direct" {
+        let a = field(m, "alias") else fail "No key alias in MapLike"
+        let t = field(m, "target") else fail "No key target in MapLike"
+        return Alias.Direct { alias: try id_of(a), target: try id_of(t) }
+    }
+    if kind == "minecraft:random" {
+        let a = field(m, "alias") else fail "No key alias in MapLike"
+        let tv = field(m, "targets") else fail "No key targets in MapLike"
+        var targets = List<String>()
+        var weights = List<i32>()
+        for item in try list_of(tv) {
+            let im = try map_of(item)
+            let d = field(im, "data") else fail "No key data in MapLike"
+            targets.push(try id_of(d))
+            weights.push(try weight_of(im))
+        }
+        if targets.is_empty() {
+            fail "List must have contents"
+        }
+        return Alias.Random { alias: try id_of(a), targets: targets, weights: weights }
+    }
+    if kind == "minecraft:random_group" {
+        let gv = field(m, "groups") else fail "No key groups in MapLike"
+        var groups = List<List<Alias>>()
+        var weights = List<i32>()
+        for item in try list_of(gv) {
+            let im = try map_of(item)
+            let d = field(im, "data") else fail "No key data in MapLike"
+            var group = List<Alias>()
+            for b in try list_of(d) {
+                group.push(try read_alias(b))
+            }
+            groups.push(group)
+            weights.push(try weight_of(im))
+        }
+        if groups.is_empty() {
+            fail "List must have contents"
+        }
+        return Alias.Group { groups: groups, weights: weights }
+    }
+    fail "Unknown registry key in ResourceKey[minecraft:root / minecraft:worldgen/pool_alias_binding]: {kind}"
+}
+
+fn id_of(value: Json) -> String ! String {
+    let text = as_string(value) else fail "Not a string: {value}"
+    return (try Identifier.parse(text)).to_string()
+}
+
+fn weight_of(m: List<Member>) -> i32 ! String {
+    let w = field(m, "weight") else fail "No key weight in MapLike"
+    let weight = try int_of(w)
+    if weight < 0 {
+        fail "Value must be non-negative: {weight}"
+    }
+    return weight
+}
+
+// `WeightedList.getRandomOrThrow`: the index whose weight the draw falls in.
+fn pick_weighted<T: RandomSource>(weights: List<i32>, random: mut T) -> usize {
+    var total = 0
+    for w in weights {
+        total += w
+    }
+    var selection = random.next_int_below(total)
+    for i in 0..weights.len() {
+        selection -= weights[i]
+        if selection < 0 {
+            return i
+        }
+    }
+    return weights.len() - 1
+}
+
+// `forEachResolved`: each alias bound, in order.
+fn resolve<T: RandomSource>(a: Alias, random: mut T, out: mut List<(String, String)>) {
+    match a {
+        Alias.Direct { alias, target } => out.push((alias.copy(), target.copy())),
+        Alias.Random { alias, targets, weights } => {
+            let i = pick_weighted(weights, mut random)
+            out.push((alias.copy(), targets[i].copy()))
+        },
+        Alias.Group { groups, weights } => {
+            let i = pick_weighted(weights, mut random)
+            for b in groups[i] {
+                resolve(b, mut random, mut out)
+            }
+        },
+    }
+}
+
+/// `PoolAliasLookup.create`: the aliases bound with a random from the seed and the start.
+fn bind_aliases(aliases: List<Alias>, x: i32, y: i32, z: i32, seed: i64) -> List<(String, String)> {
+    var out = List<(String, String)>()
+    if aliases.is_empty() {
+        return out
+    }
+    var base = LegacyRandom.new(seed)
+    let positional = base.fork_positional()
+    var random = positional.at(x, y, z)
+    for a in aliases {
+        resolve(a, mut random, mut out)
+    }
+    return out
+}
+
+// `PoolAliasLookup.lookup`.
+fn lookup(bound: List<(String, String)>, pool: String) -> String {
+    for (alias, target) in bound {
+        if alias == pool {
+            return target.copy()
+        }
+    }
+    return pool.copy()
+}
+
+// A direction turned by a rotation, up and down as they are.
+fn turn(rotation: i32, d: i32) -> i32 {
+    if d == UP or d == DOWN {
+        return d
+    }
+    return rotate_direction(rotation, d)
+}
+
+// What one piece being placed holds.
+struct JPiece {
+    pool: usize
+    index: usize
+    x: i32
+    y: i32
+    z: i32
+    ground: i32
+    rotation: i32
+    bb: Bounds
+    junctions: List<Junction>
+}
+
+// The space left for pieces: a box less the boxes taken from it.
+struct Free {
+    empty: bool
+    min_x: i32
+    min_y: i32
+    min_z: i32
+    max_x: i32
+    max_y: i32
+    max_z: i32
+    taken: List<Bounds>
+}
+
+impl Free {
+    // `Shapes.create` of a box's corners, ends exclusive.
+    fn of(min_x: i32, min_y: i32, min_z: i32, max_x: i32, max_y: i32, max_z: i32) -> Free {
+        let empty = max_x <= min_x or max_y <= min_y or max_z <= min_z
+        return Free { empty: empty, min_x: min_x, min_y: min_y, min_z: min_z, max_x: max_x, max_y: max_y, max_z: max_z, taken: List<Bounds>() }
+    }
+
+    // Whether the box is all in the space: `!joinIsNotEmpty(free, box.deflate(0.25), ONLY_SECOND)`.
+    fn fits(self, b: Bounds) -> bool {
+        if self.empty {
+            return false
+        }
+        if b.min_x < self.min_x or b.max_x + 1 > self.max_x or b.min_y < self.min_y or b.max_y + 1 > self.max_y or b.min_z < self.min_z or b.max_z + 1 > self.max_z {
+            return false
+        }
+        for t in self.taken {
+            if overlaps(t, b) {
+                return false
+            }
+        }
+        return true
+    }
+}
+
+fn overlaps(a: Bounds, b: Bounds) -> bool {
+    return a.max_x >= b.min_x and a.min_x <= b.max_x and a.max_z >= b.min_z and a.min_z <= b.max_z and a.max_y >= b.min_y and a.min_y <= b.max_y
+}
+
+// A piece waiting to have its children placed.
+struct Waiting {
+    piece: usize
+    free: usize
+    depth: i32
+    priority: i32
+}
+
+// The placer's state.
+struct Placer {
+    pieces: List<JPiece>
+    frees: List<Free>
+    waiting: List<Waiting>
+    bound: List<(String, String)>
+    max_depth: i32
+    expansion_hack: bool
+}
+
+/// `JigsawStructure.findGenerationPoint` and its pieces: none if it doesn't start in the
+/// chunk, or its biome isn't allowed.
+pub fn jigsaw(w: mut StructureWorld, pools: mut Pools, zip: Zip, cx: i32, cz: i32, allowed: List<i32>, random: mut WorldgenRandom<LegacyRandom>, c: JigsawConfig) -> List<Piece> ! Thrown {
+    let height = try c.start_height.sample(mut random, w.gen_context())
+    let px = cx << 4
+    let py = height
+    let pz = cz << 4
+    let bound = bind_aliases(c.aliases, px, py, pz, w.seed)
+    let rotation = random.next_int_below(4)
+    let start_pool = try pools.get(zip, c.start_pool) else fail Thrown { exception: "IllegalStateException", message: "Failed to get element ResourceKey[minecraft:worldgen/template_pool / {c.start_pool}]" }
+    var center_pool = start_pool
+    if let aliased = try pools.get(zip, lookup(bound, c.start_pool)) {
+        center_pool = aliased
+    }
+    // `getRandomTemplate`.
+    let count = pools.list[center_pool].templates.len()
+    if count == 0 {
+        return List<Piece>()
+    }
+    let center_index = pools.list[center_pool].templates[usize.wrap(random.next_int_below(i32.wrap(count)))]
+    if pools.list[center_pool].elements[center_index].kind == ElementKind.Empty {
+        return List<Piece>()
+    }
+    var ax = px
+    var ay = py
+    var az = pz
+    if let name = c.start_jigsaw {
+        let js = try shuffled_jigsaws(mut w, mut pools, zip, center_pool, center_index, px, py, pz, rotation, mut random)
+        var found = false
+        for j in js {
+            if j.name == some(name.copy()) {
+                ax = j.x
+                ay = j.y
+                az = j.z
+                found = true
+                break
+            }
+        }
+        if not found {
+            return List<Piece>()
+        }
+    }
+    let lx = ax - px
+    let ly = ay - py
+    let lz = az - pz
+    let x = px - lx
+    let y = py - ly
+    let z = pz - lz
+    var bb = try box_of(mut w, zip, pools.list[center_pool].elements[center_index], x, y, z, rotation)
+    let center_x = (bb.max_x + bb.min_x) / 2
+    let center_z = (bb.max_z + bb.min_z) / 2
+    var bottom = y
+    if let kind = c.project {
+        let low = w.level_min
+        let high = w.level_min + w.level_height - 1
+        if not try w.valid_in_range(center_x, center_z, low, high, allowed) {
+            return List<Piece>()
+        }
+        bottom = py + try w.base_height(center_x, center_z, kind)
+    }
+    let dy = bottom - (bb.min_y + 1)
+    bb = moved(bb, dy)
+    let center = JPiece { pool: center_pool, index: center_index, x: x, y: y + dy, z: z, ground: 1, rotation: rotation, bb: bb, junctions: List<Junction>() }
+    if c.padding_given {
+        let low = w.level_min + c.padding_bottom
+        let high = w.level_min + w.level_height - 1 - c.padding_top
+        if bb.min_y < low or bb.max_y > high {
+            return List<Piece>()
+        }
+    }
+    let center_y = bottom + ly
+    if not try w.valid_biome(center_x, center_y, center_z, allowed) {
+        return List<Piece>()
+    }
+    if c.max_depth <= 0 {
+        return List<Piece>()
+    }
+    let level_max = w.level_min + w.level_height - 1
+    var free = Free.of(
+        center_x - c.horizontal,
+        (center_y - c.vertical).max(w.level_min + c.padding_bottom),
+        center_z - c.horizontal,
+        center_x + c.horizontal + 1,
+        (center_y + c.vertical + 1).min(level_max + 1 - c.padding_top),
+        center_z + c.horizontal + 1,
+    )
+    free.taken.push(bb)
+    var placer = Placer { pieces: [center], frees: [free], waiting: List<Waiting>(), bound: bound, max_depth: c.max_depth, expansion_hack: c.expansion_hack }
+    try place_children(mut w, mut pools, zip, mut placer, 0, 0, 0, mut random)
+    while not placer.waiting.is_empty() {
+        // `SequencedPriorityIterator`: the highest priority first, in the order they came.
+        var best = 0usize
+        for i in 1..placer.waiting.len() {
+            if placer.waiting[i].priority > placer.waiting[best].priority {
+                best = i
+            }
+        }
+        let next = placer.waiting.remove(best)
+        try place_children(mut w, mut pools, zip, mut placer, next.piece, next.free, next.depth, mut random)
+    }
+    var out = List<Piece>()
+    for p in placer.pieces {
+        let data = JigsawPiece {
+            x: p.x, y: p.y, z: p.z, ground: p.ground, element: element_tag(pools.list[p.pool].elements[p.index]), rotation: p.rotation,
+            junctions: p.junctions.copy(), ignore_waterlogging: c.ignore_waterlogging, pool: p.pool, index: p.index,
+        }
+        out.push(Piece { kind: String("minecraft:jigsaw"), bb: p.bb, orientation: -1, gen_depth: 0, data: PieceData.Jigsaw(data) })
+    }
+    return out
+}
+
+fn moved(b: Bounds, dy: i32) -> Bounds {
+    return Bounds { min_x: b.min_x, min_y: b.min_y + dy, min_z: b.min_z, max_x: b.max_x, max_y: b.max_y + dy, max_z: b.max_z }
+}
+
+// `Placer.tryPlacingChildren`.
+fn place_children(w: mut StructureWorld, pools: mut Pools, zip: Zip, p: mut Placer, source: usize, context_free: usize, depth: i32, random: mut WorldgenRandom<LegacyRandom>) ! Thrown {
+    let src_pool = p.pieces[source].pool
+    let src_index = p.pieces[source].index
+    let src_rigid = pools.list[src_pool].elements[src_index].rigid
+    let src_bb = p.pieces[source].bb
+    let src_box_y = src_bb.min_y
+    var source_free: usize? = none
+    let jigsaws = try shuffled_jigsaws(mut w, mut pools, zip, src_pool, src_index, p.pieces[source].x, p.pieces[source].y, p.pieces[source].z, p.pieces[source].rotation, mut random)
+    for sj in jigsaws {
+        let tx = sj.x + step_x(sj.front)
+        let ty = sj.y + step_y(sj.front)
+        let tz = sj.z + step_z(sj.front)
+        let sj_local_y = sj.y - src_box_y
+        var base: i32? = none
+        let pool_name = lookup(p.bound, sj.pool)
+        let target_pool = try pools.get(zip, pool_name) else continue
+        if pools.list[target_pool].templates.is_empty() and pool_name != empty_pool() {
+            continue
+        }
+        let fallback_name = pools.list[target_pool].fallback.copy()
+        let fallback = try pools.get(zip, fallback_name) else fail Thrown { exception: "IllegalStateException", message: "Failed to get element ResourceKey[minecraft:worldgen/template_pool / {fallback_name}]" }
+        if pools.list[fallback].templates.is_empty() and fallback_name != empty_pool() {
+            continue
+        }
+        var children_free = context_free
+        if src_bb.inside(tx, ty, tz) {
+            if source_free == none {
+                p.frees.push(Free.of(src_bb.min_x, src_bb.min_y, src_bb.min_z, src_bb.max_x + 1, src_bb.max_y + 1, src_bb.max_z + 1))
+                source_free = some(p.frees.len() - 1)
+            }
+            children_free = source_free ?? context_free
+        }
+        // `getShuffledTemplates` of the pool, unless at the deepest, then of its fallback.
+        var targets = List<(usize, usize)>()
+        if depth != p.max_depth {
+            for i in shuffled(pools.list[target_pool].templates, mut random) {
+                targets.push((target_pool, i))
+            }
+        }
+        for i in shuffled(pools.list[fallback].templates, mut random) {
+            targets.push((fallback, i))
+        }
+        var placed = false
+        for (tp, ti) in targets {
+            if pools.list[tp].elements[ti].kind == ElementKind.Empty {
+                break
+            }
+            let t_rigid = pools.list[tp].elements[ti].rigid
+            for turn_index in shuffled([0, 1, 2, 3], mut random) {
+                let tr = i32.wrap(turn_index)
+                let tjs = try shuffled_jigsaws(mut w, mut pools, zip, tp, ti, 0, 0, 0, tr, mut random)
+                let hack = try box_of(mut w, zip, pools.list[tp].elements[ti], 0, 0, 0, tr)
+                var expand_to = 0
+                if p.expansion_hack and hack.max_y - hack.min_y + 1 <= 16 {
+                    for tj in tjs {
+                        if not hack.inside(tj.x + step_x(tj.front), tj.y + step_y(tj.front), tj.z + step_z(tj.front)) {
+                            continue
+                        }
+                        var size = 0
+                        if let child = try pools.get(zip, lookup(p.bound, tj.pool)) {
+                            size = try max_size(mut w, mut pools, zip, child)
+                            let child_fallback = pools.list[child].fallback.copy()
+                            if let cf = try pools.get(zip, child_fallback) {
+                                size = size.max(try max_size(mut w, mut pools, zip, cf))
+                            }
+                        }
+                        expand_to = expand_to.max(size)
+                    }
+                }
+                for tj in tjs {
+                    if not can_attach(sj, tj) {
+                        continue
+                    }
+                    let rx = tx - tj.x
+                    let ry = ty - tj.y
+                    let rz = tz - tj.z
+                    let raw = try box_of(mut w, zip, pools.list[tp].elements[ti], rx, ry, rz, tr)
+                    let tj_local_y = tj.y
+                    let delta_y = sj_local_y - tj_local_y + step_y(sj.front)
+                    var target_box_y = 0
+                    if src_rigid and t_rigid {
+                        target_box_y = src_box_y + delta_y
+                    } else {
+                        if base == none {
+                            base = some(try w.base_height(sj.x, sj.z, WORLD_SURFACE_WG))
+                        }
+                        target_box_y = (base ?? 0) - tj_local_y
+                    }
+                    let y_off = target_box_y - raw.min_y
+                    var target_bb = moved(raw, y_off)
+                    if expand_to > 0 {
+                        let new_size = (expand_to + 1).max(target_bb.max_y - target_bb.min_y)
+                        target_bb.max_y = target_bb.max_y.max(target_bb.min_y + new_size)
+                    }
+                    if not p.frees[children_free].fits(target_bb) {
+                        continue
+                    }
+                    p.frees[children_free].taken.push(target_bb)
+                    let src_ground = p.pieces[source].ground
+                    let t_ground = if t_rigid { src_ground - delta_y } else { 1 }
+                    var junction_y = 0
+                    if src_rigid {
+                        junction_y = src_box_y + sj_local_y
+                    } else if t_rigid {
+                        junction_y = target_box_y + tj_local_y
+                    } else {
+                        if base == none {
+                            base = some(try w.base_height(sj.x, sj.z, WORLD_SURFACE_WG))
+                        }
+                        junction_y = (base ?? 0) + delta_y / 2
+                    }
+                    p.pieces[source].junctions.push(Junction { x: tx, ground_y: junction_y - sj_local_y + src_ground, z: tz, delta_y: delta_y, rigid: t_rigid })
+                    var target = JPiece { pool: tp, index: ti, x: rx, y: ry + y_off, z: rz, ground: t_ground, rotation: tr, bb: target_bb, junctions: List<Junction>() }
+                    target.junctions.push(Junction { x: sj.x, ground_y: junction_y - tj_local_y + t_ground, z: sj.z, delta_y: -delta_y, rigid: src_rigid })
+                    p.pieces.push(target)
+                    if depth + 1 <= p.max_depth {
+                        p.waiting.push(Waiting { piece: p.pieces.len() - 1, free: children_free, depth: depth + 1, priority: sj.placement })
+                    }
+                    placed = true
+                    break
+                }
+                if placed {
+                    break
+                }
+            }
+            if placed {
+                break
+            }
+        }
+    }
+}
+
+// `JigsawBlock.canAttach`.
+fn can_attach(source: Jigsaw, target: Jigsaw) -> bool {
+    if source.front != opposite(target.front) {
+        return false
+    }
+    if not source.rollable and source.top != target.top {
+        return false
+    }
+    if let name = target.name {
+        return source.target == name
+    }
+    return true
+}
+
+// `Util.shuffledCopy`.
+fn shuffled<T: RandomSource>(items: List<usize>, random: mut T) -> List<usize> {
+    var out = items.copy()
+    var i = out.len()
+    while i > 1 {
+        let j = usize.wrap(random.next_int_below(i32.wrap(i)))
+        out.swap(i - 1, j)
+        i -= 1
+    }
+    return out
+}
+
+// `getMaxSize`: the tallest of the pool's elements but the empty one, at no turn.
+fn max_size(w: mut StructureWorld, pools: mut Pools, zip: Zip, pool: usize) -> i32 ! Thrown {
+    if let m = pools.list[pool].max_size {
+        return m
+    }
+    var best: i32? = none
+    for i in pools.list[pool].templates.copy() {
+        if pools.list[pool].elements[i].kind == ElementKind.Empty {
+            continue
+        }
+        let b = try box_of(mut w, zip, pools.list[pool].elements[i], 0, 0, 0, 0)
+        let span = b.max_y - b.min_y + 1
+        best = some(if let v = best { v.max(span) } else { span })
+    }
+    let size = best ?? 0
+    pools.list[pool].max_size = some(size)
+    return size
+}
+
+/// `getBoundingBox` of the element placed from the block, turned.
+pub fn box_of(w: mut StructureWorld, zip: Zip, e: Element, x: i32, y: i32, z: i32, rotation: i32) -> Bounds ! Thrown {
+    match e.kind {
+        ElementKind.Single => {
+            let t = try w.template(zip, e.location.copy())
+            return w.templates.list[t].bounding_box(Settings { rotation: rotation }, x, y, z)
+        },
+        ElementKind.Legacy => {
+            let t = try w.template(zip, e.location.copy())
+            return w.templates.list[t].bounding_box(Settings { rotation: rotation }, x, y, z)
+        },
+        ElementKind.Feature => return Bounds { min_x: x, min_y: y, min_z: z, max_x: x, max_y: y, max_z: z },
+        ElementKind.List => {
+            var out: Bounds? = none
+            for c in e.children {
+                if c.kind == ElementKind.Empty {
+                    continue
+                }
+                let b = try box_of(mut w, zip, c, x, y, z, rotation)
+                if let o = out {
+                    out = some(Bounds { min_x: o.min_x.min(b.min_x), min_y: o.min_y.min(b.min_y), min_z: o.min_z.min(b.min_z), max_x: o.max_x.max(b.max_x), max_y: o.max_y.max(b.max_y), max_z: o.max_z.max(b.max_z) })
+                } else {
+                    out = some(b)
+                }
+            }
+            let found = out else fail Thrown { exception: "IllegalStateException", message: "Unable to calculate boundingbox for ListPoolElement" }
+            return found
+        },
+        ElementKind.Empty => fail Thrown { exception: "IllegalStateException", message: "Invalid call to EmtyPoolElement.getBoundingBox, filter me!" },
+    }
+}
+
+// `getShuffledJigsawBlocks` of the pool's element placed from the block, turned.
+fn shuffled_jigsaws(w: mut StructureWorld, pools: mut Pools, zip: Zip, pool: usize, index: usize, x: i32, y: i32, z: i32, rotation: i32, random: mut WorldgenRandom<LegacyRandom>) -> List<Jigsaw> ! Thrown {
+    let e = pools.list[pool].elements[index].copy()
+    return try element_jigsaws(mut w, mut pools, zip, e, x, y, z, rotation, mut random)
+}
+
+fn element_jigsaws(w: mut StructureWorld, pools: mut Pools, zip: Zip, e: Element, x: i32, y: i32, z: i32, rotation: i32, random: mut WorldgenRandom<LegacyRandom>) -> List<Jigsaw> ! Thrown {
+    match e.kind {
+        ElementKind.Empty => return List<Jigsaw>(),
+        ElementKind.Feature => {
+            return [Jigsaw { x: x, y: y, z: z, front: DOWN, top: SOUTH, rollable: true, name: none, pool: empty_pool(), target: empty_pool(), placement: 0, selection: 0 }]
+        },
+        ElementKind.List => return try element_jigsaws(mut w, mut pools, zip, e.children[0], x, y, z, rotation, mut random),
+        _ => {},
+    }
+    let t = try w.template(zip, e.location.copy())
+    let palettes = try template_jigsaws(w, mut pools, t)
+    if palettes.is_empty() {
+        return List<Jigsaw>()
+    }
+    // `getRandomPalette`, from the position.
+    var seeded = LegacyRandom.new(position_seed(x, y, z))
+    let pi = usize.wrap(seeded.next_int_below(i32.wrap(palettes.len())))
+    var out = List<Jigsaw>()
+    for j in palettes[pi] {
+        let (rx, ry, rz) = transform(j.x, j.y, j.z, 0, rotation, 0, 0)
+        var placed = j.copy()
+        placed.x = rx + x
+        placed.y = ry + y
+        placed.z = rz + z
+        placed.front = turn(rotation, j.front)
+        placed.top = turn(rotation, j.top)
+        out.push(placed)
+    }
+    // `Util.shuffle`, then a stable sort by selection priority, highest first.
+    var i = out.len()
+    while i > 1 {
+        let k = usize.wrap(random.next_int_below(i32.wrap(i)))
+        out.swap(i - 1, k)
+        i -= 1
+    }
+    for a in 1..out.len() {
+        var b = a
+        while b > 0 and out[b - 1].selection < out[b].selection {
+            out.swap(b - 1, b)
+            b -= 1
+        }
+    }
+    return out
+}
+
+// Each palette's jigsaw blocks, in its order, read once for each template.
+fn template_jigsaws(w: StructureWorld, pools: mut Pools, t: usize) -> List<List<Jigsaw>> ! Thrown {
+    if pools.jigsaws.contains(t) {
+        return pools.jigsaws[t].copy()
+    }
+    let jigsaw_block = w.facts.block_named(String("minecraft:jigsaw")) else fail Thrown { exception: "IllegalStateException", message: "there's no jigsaw block" }
+    var out = List<List<Jigsaw>>()
+    for palette in w.templates.list[t].palettes {
+        var list = List<Jigsaw>()
+        for b in palette {
+            if w.facts.block(b.state) != jigsaw_block {
+                continue
+            }
+            let orientation = w.facts.get_name(b.state, String("orientation")) ?? String("north_up")
+            let underscore = orientation.find("_") ?? 0
+            let front = direction_named(orientation[..underscore].copy()) ?? DOWN
+            let top = direction_named(orientation[underscore + 1..].copy()) ?? DOWN
+            let nbt = b.nbt.copy() ?? JavaHashMap<String, Tag>()
+            var rollable = not (front != UP and front != DOWN)
+            if let jt = string_tag(nbt, "joint") {
+                if jt == "rollable" {
+                    rollable = true
+                } else if jt == "aligned" {
+                    rollable = false
+                }
+            }
+            list.push(Jigsaw {
+                x: b.x, y: b.y, z: b.z, front: front, top: top, rollable: rollable,
+                name: some(identifier_tag(nbt, "name")), pool: identifier_tag(nbt, "pool"), target: identifier_tag(nbt, "target"),
+                placement: int_tag(nbt, "placement_priority"), selection: int_tag(nbt, "selection_priority"),
+            })
+        }
+        out.push(list)
+    }
+    pools.jigsaws.insert(t, out.copy())
+    return out
+}
+
+fn string_tag(nbt: JavaHashMap<String, Tag>, key: str) -> String? {
+    if not nbt.contains(key) {
+        return none
+    }
+    return match nbt[key] {
+        Tag.Str(s) => some(s.copy()),
+        _ => none,
+    }
+}
+
+// An identifier the jigsaw holds, `minecraft:empty` if it holds none or one that won't parse.
+fn identifier_tag(nbt: JavaHashMap<String, Tag>, key: str) -> String {
+    if let text = string_tag(nbt, key) {
+        match Identifier.parse(text) {
+            ok(id) => return id.to_string(),
+            err(_) => {},
+        }
+    }
+    return empty_pool()
+}
+
+// `getIntOr`: a number's int value, 0 if it isn't a number.
+fn int_tag(nbt: JavaHashMap<String, Tag>, key: str) -> i32 {
+    if not nbt.contains(key) {
+        return 0
+    }
+    return nbt[key].number_int() ?? 0
+}
