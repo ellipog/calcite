@@ -121,9 +121,9 @@ def mth_cases():
 
 def main():
     cases = math_cases()
-    write_file(CASES / "math" / "generated.json", "math", f"cases/math/gen.py, seed {SEED}", cases)
-    write_file(CASES / "strictmath" / "generated.json", "strictmath", f"cases/math/gen.py, seed {SEED}", cases)
-    write_file(CASES / "mth" / "generated.json", "mth", f"cases/math/gen.py, seed {SEED}", mth_cases())
+    write_file(CASES / "math" / "generated.json", "math", f"cases/math/gen.py, seed {SEED}", cases, probe_version=2)
+    write_file(CASES / "strictmath" / "generated.json", "strictmath", f"cases/math/gen.py, seed {SEED}", cases, probe_version=2)
+    write_file(CASES / "mth" / "generated.json", "mth", f"cases/math/gen.py, seed {SEED}", mth_cases(), probe_version=2)
 
 
 if __name__ == "__main__":

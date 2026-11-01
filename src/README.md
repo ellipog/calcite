@@ -17,7 +17,7 @@ Calcite is written in [Calx](https://calxlang.com). Module `a.b` is the file `sr
 | `hash.md5` | MD5, for seeding from names and for offline players' UUIDs | Guava's `Hashing.md5()` |
 | `java.text` | `string_hash`, Java's `String.hashCode` over UTF-16 code units, `compare_to`, its `compareTo`, and `split_trimmed`, Guava's `Splitter.on(c).trimResults()`, which trims Unicode's whitespace. Java's UTF-8 decoder and `BufferedReader.readLine` are Calx's `std.text.utf8.decode_lossy` and `std.io.Lines` (D156) | `String.hashCode`, `String.compareTo`, Guava's `Splitter` |
 | `java.date` | `to_string`, a moment as `Date.toString` writes it, and `zone_name`, the zone's name there | `java.util.Date.toString` |
-| `math.mth` | `SinTable`, Minecraft's table of 65536 sines that angles turn through, built once and passed along, as Calx keeps no global state; `floor`, `Mth.floor` | `Mth.sin`, `Mth.cos`, `Mth.floor` |
+| `math.mth` | `SinTable`, Minecraft's table of 65536 sines that angles turn through, and `AsinTable`, the arcsines its `atan2` starts from, each built once and passed along, as Calx keeps no global state; `fast_inv_sqrt`, `wrap_degrees` and `floor` | `Mth.sin`, `Mth.cos`, `Mth.atan2`, `Mth.fastInvSqrt`, `Mth.wrapDegrees`, `Mth.floor` |
 | `java.uuid` | `Uuid`, two `i64`s, written and read as Java writes and reads them, and as four ints as NBT keeps them; name-based (version 3) and random (version 4) UUIDs | `java.util.UUID` |
 | `java.base64` | `encode`, Base64 with padding and no line breaks, and `decode`, which takes what Java's decoder takes | `java.util.Base64.getEncoder()`, `getDecoder()` |
 | `java.properties` | `Properties`, a `.properties` file read with Java's rules for escapes, continued lines and comments, and written as `store` writes it | `java.util.Properties.load`, `store` |
@@ -157,6 +157,7 @@ Calcite is written in [Calx](https://calxlang.com). Module `a.b` is the file `sr
 | `rig.noise` | The `noise` probe: `worldgen.noise`'s and `worldgen.normal`'s noises, made from a seeded source, sampled at points and over volumes, and their ranges, against vanilla's | |
 | `rig.density` | The `density` probe: `worldgen.density`'s functions, from vanilla's data and the routers of its noise settings, their ranges, axes and samples at points and over volumes, against vanilla's | |
 | `rig.terrain` | The `terrain` probe: `worldgen.terrain`'s chunks and base columns, from vanilla's noise settings in worlds of any height, against vanilla's | |
+| `rig.math` | The `math` and `strictmath` probes, `std.java.math`'s fdlibm for both, and the `mth` probe, `math.mth`'s, against vanilla's | |
 | `rig.surface` | The `surface` probe: chunks filled by `worldgen.terrain` and given their materials by `worldgen.material`, with vanilla's rules or rules written out, over the biomes of any source, against vanilla's; and the `carvers` probe, the same chunks carved by `worldgen.carver` with their biomes' carvers or carvers written out | |
 | `rig.biomes` | The `biomes` probe: `worldgen.biome_source`'s sources, from vanilla's presets, tags and biomes or written out, with the climate of vanilla's noise settings, their lists, climates and biomes at quarts, at targets and over chunks, against vanilla's | |
 | `rig.nbt` | The `nbt` probe: binary NBT read, printed and written back, and SNBT parsed, against vanilla's | |

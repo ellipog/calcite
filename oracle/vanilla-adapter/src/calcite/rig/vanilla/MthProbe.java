@@ -15,7 +15,7 @@ final class MthProbe implements Probe {
 
     @Override
     public int version() {
-        return 1;
+        return 2;
     }
 
     @Override
@@ -32,7 +32,7 @@ final class MthProbe implements Probe {
                 float[] table = (float[]) field.get(null);
                 ByteBuffer out = ByteBuffer.allocate(table.length * 4);
                 for (float v : table) {
-                    out.putInt(Float.floatToRawIntBits(v));
+                    out.putInt(Float.floatToIntBits(v));
                 }
                 yield out.array();
             }
@@ -41,7 +41,7 @@ final class MthProbe implements Probe {
                 ByteBuffer out = ByteBuffer.allocate(args.capacity() / 2);
                 while (args.hasRemaining()) {
                     double x = args.getDouble();
-                    out.putInt(Float.floatToRawIntBits(fn.equals("sin") ? Mth.sin(x) : Mth.cos(x)));
+                    out.putInt(Float.floatToIntBits(fn.equals("sin") ? Mth.sin(x) : Mth.cos(x)));
                 }
                 yield out.array();
             }
@@ -49,7 +49,7 @@ final class MthProbe implements Probe {
                 ByteBuffer args = Args.records(blobs, 16);
                 ByteBuffer out = ByteBuffer.allocate(args.capacity() / 2);
                 while (args.hasRemaining()) {
-                    out.putLong(Double.doubleToRawLongBits(Mth.atan2(args.getDouble(), args.getDouble())));
+                    out.putLong(Double.doubleToLongBits(Mth.atan2(args.getDouble(), args.getDouble())));
                 }
                 yield out.array();
             }
@@ -57,7 +57,7 @@ final class MthProbe implements Probe {
                 ByteBuffer args = Args.records(blobs, 8);
                 ByteBuffer out = ByteBuffer.allocate(args.capacity());
                 while (args.hasRemaining()) {
-                    out.putLong(Double.doubleToRawLongBits(Mth.fastInvSqrt(args.getDouble())));
+                    out.putLong(Double.doubleToLongBits(Mth.fastInvSqrt(args.getDouble())));
                 }
                 yield out.array();
             }
@@ -65,7 +65,7 @@ final class MthProbe implements Probe {
                 ByteBuffer args = Args.records(blobs, 4);
                 ByteBuffer out = ByteBuffer.allocate(args.capacity());
                 while (args.hasRemaining()) {
-                    out.putInt(Float.floatToRawIntBits(Mth.wrapDegrees(args.getFloat())));
+                    out.putInt(Float.floatToIntBits(Mth.wrapDegrees(args.getFloat())));
                 }
                 yield out.array();
             }

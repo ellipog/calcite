@@ -50,7 +50,7 @@ final class MathProbe implements Probe {
 
     @Override
     public int version() {
-        return 1;
+        return 2;
     }
 
     @Override
@@ -65,7 +65,8 @@ final class MathProbe implements Probe {
         ByteBuffer out = ByteBuffer.allocate(f1 != null ? args.capacity() : args.capacity() / 2);
         while (args.hasRemaining()) {
             double r = f1 != null ? f1.applyAsDouble(args.getDouble()) : f2.applyAsDouble(args.getDouble(), args.getDouble());
-            out.putLong(Double.doubleToRawLongBits(r));
+            // NaNs as NaNs: no code sees a NaN's sign or payload (D198, D208).
+            out.putLong(Double.doubleToLongBits(r));
         }
         return Result.ok(new JsonObject(), out.array());
     }

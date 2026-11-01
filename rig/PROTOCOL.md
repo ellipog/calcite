@@ -199,19 +199,19 @@ Output: `{"json": <re-encoded with the same codec, written by GsonHelper.toStabl
 
 If the JSON or SNBT doesn't parse, the output is the rejection. If the codec rejects it: `{"error": <the codec's message>}`.
 
-### `math` and `strictmath` (v1)
+### `math` and `strictmath` (v2)
 
 Input `{"fn": <name>}` and one blob of `f64` arguments, big-endian. `atan2`, `pow` and `hypot` take them in pairs.
 
-Output: `{}` and one blob, `java.lang.Math.<fn>` (for `math`) or `java.lang.StrictMath.<fn>` (for `strictmath`) of each argument, as `f64` bits.
+Output: `{}` and one blob, `java.lang.Math.<fn>` (for `math`) or `java.lang.StrictMath.<fn>` (for `strictmath`) of each argument, as `f64` bits from `Double.doubleToLongBits`, so every NaN is `0x7ff8000000000000`. v1 wrote `doubleToRawLongBits`, where `Math.log` of a negative gave `0x7ff8…` and `StrictMath.log` x86's `0xfff8…`: no code sees a NaN's sign, so v2 compares NaNs as NaNs (D208).
 
 Functions: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `exp`, `log`, `log10`, `log1p`, `pow`, `sqrt`, `cbrt`, `sinh`, `cosh`, `tanh`, `expm1`, `hypot`.
 
-Vanilla calls `Math`. In the rig's reference configuration (HotSpot's LIBM intrinsics off, D60), `Math` gives exactly `StrictMath`'s results, so both probes' hashes are the same there. With HotSpot's default intrinsics they differ, and `rig/runner/mathcmp.py` measures by how much (`P1.5`).
+Vanilla calls `Math`. In the rig's reference configuration (HotSpot's LIBM intrinsics off, D60), `Math` gives exactly `StrictMath`'s results but for NaNs' signs, so both probes' hashes are the same there. With HotSpot's default intrinsics they differ, and `rig/runner/mathcmp.py` measures by how much (`P1.5`).
 
-### `mth` (v1)
+### `mth` (v2)
 
-Vanilla's `Mth` helpers that use lookup tables or bit tricks, where a natural reimplementation would round differently.
+Vanilla's `Mth` helpers that use lookup tables or bit tricks, where a natural reimplementation would round differently. Floats and doubles are written with `Float.floatToIntBits` and `Double.doubleToLongBits`, every NaN as one, as in `math` (v2, D208).
 
 | Input | Output blob |
 | --- | --- |
