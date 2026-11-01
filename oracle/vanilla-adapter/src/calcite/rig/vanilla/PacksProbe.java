@@ -3,12 +3,14 @@ package calcite.rig.vanilla;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.mojang.serialization.DynamicOps;
 import com.mojang.serialization.JsonOps;
 import java.io.ByteArrayOutputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -16,18 +18,33 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletionException;
 import java.util.stream.Stream;
 import net.minecraft.IdentifierException;
+import net.minecraft.ReportedException;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.LayeredRegistryAccess;
+import net.minecraft.core.Registry;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.RegistrySynchronization;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.Tag;
 import net.minecraft.network.chat.ComponentSerialization;
 import net.minecraft.resources.Identifier;
+import net.minecraft.resources.RegistryDataLoader;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.server.RegistryLayer;
 import net.minecraft.server.packs.PackType;
+import net.minecraft.server.packs.repository.KnownPack;
 import net.minecraft.server.packs.repository.Pack;
 import net.minecraft.server.packs.repository.PackRepository;
 import net.minecraft.server.packs.repository.PackSource;
 import net.minecraft.server.packs.repository.ServerPacksSource;
 import net.minecraft.server.packs.resources.MultiPackResourceManager;
 import net.minecraft.server.packs.resources.Resource;
+import net.minecraft.tags.TagLoader;
 import net.minecraft.world.flag.FeatureFlagSet;
 import net.minecraft.world.flag.FeatureFlags;
 import net.minecraft.world.level.DataPackConfig;
@@ -47,7 +64,9 @@ import org.apache.logging.log4j.core.config.Property;
  * allow list with {@link LevelStorageSource#parseValidator}, makes the repository with
  * {@link ServerPacksSource#createPackRepository(Path, DirectoryValidator)} and picks its packs
  * with {@link MinecraftServer#configurePackRepository}, and `list` lists the picked packs' files
- * with a {@link MultiPackResourceManager} over them, as the server's resources are made. Each
+ * with a {@link MultiPackResourceManager} over them, as the server's resources are made. `load`
+ * loads the registries from them as {@code WorldLoader.load} does, and gives what
+ * {@link RegistrySynchronization#packRegistries} sends a client with every known pack. Each
  * result goes into one blob, after what was logged.
  */
 final class PacksProbe implements Probe {
@@ -58,7 +77,7 @@ final class PacksProbe implements Probe {
 
     @Override
     public int version() {
-        return 1;
+        return 2;
     }
 
     @Override
@@ -72,6 +91,7 @@ final class PacksProbe implements Probe {
         root.addAppender(lines);
         PackRepository repository = null;
         MultiPackResourceManager manager = null;
+        boolean loaded = false;
         try {
             ByteArrayOutputStream bytes = new ByteArrayOutputStream();
             DataOutputStream out = new DataOutputStream(bytes);
@@ -181,6 +201,20 @@ final class PacksProbe implements Probe {
                             out.write(content);
                         }
                     }
+                    case "load" -> {
+                        expect(op, k, 0);
+                        if (repository == null) {
+                            throw new CaseError("operation " + k + ": the packs aren't picked");
+                        }
+                        if (loaded) {
+                            throw new CaseError("operation " + k + ": the registries are loaded already");
+                        }
+                        loaded = true;
+                        if (manager == null) {
+                            manager = new MultiPackResourceManager(PackType.SERVER_DATA, repository.openAllSelected());
+                        }
+                        load(manager, lines, out);
+                    }
                     default -> throw new CaseError("operation " + k + ": no operation `" + name + "`");
                 }
             }
@@ -197,6 +231,89 @@ final class PacksProbe implements Probe {
                 }
             }
         }
+    }
+
+    /**
+     * The registries loaded from the picked packs as {@code WorldLoader.load} loads them, on one
+     * thread: the built-in registries' tags, then the world's registries. They aren't kept past
+     * the case, so the built-in ones' tags aren't bound. Then what was logged, sorted, whether
+     * they loaded, and if they did, each synchronized registry as `registry_data` sends it to a
+     * client with every known pack: its name, an `int` count of its entries, then each one's ID
+     * and a byte, 1 if its contents go with it, then an `int` length and the contents as
+     * `NbtIo.writeAnyTag` writes them, or 0.
+     */
+    private static void load(MultiPackResourceManager manager, Lines lines, DataOutputStream out) throws IOException {
+        LayeredRegistryAccess<RegistryLayer> initial = RegistryLayer.createRegistryAccess();
+        List<Registry.PendingTags<?>> staticTags = TagLoader.loadTagsForExistingRegistries(manager, initial.getLayer(RegistryLayer.STATIC));
+        RegistryAccess.Frozen context = initial.getAccessForLoading(RegistryLayer.WORLD);
+        List<HolderLookup.RegistryLookup<?>> contextRegistries = TagLoader.buildUpdatedLookups(context, staticTags);
+        RegistryAccess.Frozen world = null;
+        try {
+            world = RegistryDataLoader.load(manager, contextRegistries, RegistryDataLoader.WORLD_REGISTRIES, Runnable::run).join();
+        } catch (CompletionException e) {
+            if (!(e.getCause() instanceof ReportedException)) {
+                throw e;
+            }
+        }
+        lines.writeSorted(out);
+        out.writeByte(world == null ? 0 : 1);
+        if (world == null) {
+            return;
+        }
+        LayeredRegistryAccess<RegistryLayer> layers = initial.replaceFrom(RegistryLayer.WORLD, world);
+        DynamicOps<Tag> ops = layers.compositeAccess().createSerializationContext(NbtOps.INSTANCE);
+        Set<KnownPack> known = Set.copyOf(manager.listPacks().flatMap(p -> p.location().knownPackInfo().stream()).toList());
+        try {
+            RegistrySynchronization.packRegistries(ops, layers.getAccessFrom(RegistryLayer.WORLD), known, (key, entries) -> {
+                try {
+                    text(out, key.identifier().toString());
+                    out.writeInt(entries.size());
+                    for (RegistrySynchronization.PackedRegistryEntry e : entries) {
+                        text(out, e.id().toString());
+                        if (e.data().isPresent()) {
+                            ByteArrayOutputStream contents = new ByteArrayOutputStream();
+                            NbtIo.writeAnyTag(e.data().get(), new DataOutputStream(contents));
+                            out.writeByte(1);
+                            out.writeInt(contents.size());
+                            out.write(contents.toByteArray());
+                        } else {
+                            out.writeByte(0);
+                        }
+                    }
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
+        } catch (UncheckedIOException e) {
+            throw e.getCause();
+        }
+    }
+
+    /**
+     * The text `RegistryDataLoader` logs of what stopped the registries loading, as Calcite gives
+     * it: each exception's stack frames left out, `\n` between lines, and an exception of Gson's
+     * named alone, without its message, which may run over lines, or what caused it, up to the
+     * next element's or registry's heading, or the end.
+     */
+    static String registryErrors(String message) {
+        List<String> out = new ArrayList<>();
+        boolean gson = false;
+        for (String line : message.replace("\r\n", "\n").split("\n", -1)) {
+            if (line.startsWith("\tat ") || line.startsWith("\t... ")) {
+                continue;
+            }
+            if (line.startsWith(">") || line.isEmpty()) {
+                gson = false;
+            } else if (gson) {
+                continue;
+            } else if (line.startsWith("Caused by: com.google.gson.")) {
+                int colon = line.indexOf(':', "Caused by: ".length());
+                line = colon < 0 ? line : line.substring(0, colon);
+                gson = true;
+            }
+            out.add(line);
+        }
+        return String.join("\n", out);
     }
 
     // A pack's source as a byte: 0 built in, 1 a feature pack, 2 the world's.
@@ -324,15 +441,45 @@ final class PacksProbe implements Probe {
         void write(DataOutputStream out) throws IOException {
             out.writeInt(taken.size());
             for (LogEvent event : taken) {
-                out.writeByte(switch (event.getLevel().name()) {
-                    case "WARN" -> 1;
-                    case "ERROR" -> 2;
-                    default -> 0;
-                });
-                String message = event.getMessage().getFormattedMessage();
-                Throwable thrown = event.getThrown();
-                text(out, normal(thrown == null ? message : message + "\n" + thrown));
+                out.writeByte(level(event));
+                text(out, words(event));
             }
+        }
+
+        /**
+         * The lines in order of their words, then their levels, as `load` writes them: a server
+         * loads the registries on many threads, so the order their lines come in isn't fixed.
+         * What stopped them loading is given as {@link #registryErrors} gives it.
+         */
+        void writeSorted(DataOutputStream out) throws IOException {
+            List<Map.Entry<String, Integer>> sorted = new ArrayList<>();
+            for (LogEvent event : taken) {
+                String text = words(event);
+                if (text.startsWith("Registry loading errors:")) {
+                    text = registryErrors(text);
+                }
+                sorted.add(Map.entry(text, level(event)));
+            }
+            sorted.sort(Map.Entry.<String, Integer>comparingByKey().thenComparing(Map.Entry.comparingByValue()));
+            out.writeInt(sorted.size());
+            for (Map.Entry<String, Integer> line : sorted) {
+                out.writeByte(line.getValue());
+                text(out, line.getKey());
+            }
+        }
+
+        private static int level(LogEvent event) {
+            return switch (event.getLevel().name()) {
+                case "WARN" -> 1;
+                case "ERROR" -> 2;
+                default -> 0;
+            };
+        }
+
+        private String words(LogEvent event) {
+            String message = event.getMessage().getFormattedMessage();
+            Throwable thrown = event.getThrown();
+            return normal(thrown == null ? message : message + "\n" + thrown);
         }
     }
 }

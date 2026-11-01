@@ -1,0 +1,293 @@
+/// Loading the registries a client is sent, as vanilla's `RegistryDataLoader.load` loads the
+/// world's: the built-in ones' tags, then each synchronized registry's entries from the data
+/// packs' files, each read with its registry's network codec, whose NBT goes to a client that
+/// doesn't know the entry's pack, then the registry's tags. An entry that can't be read, an entry or
+/// tag that's named but never comes, and a registry of mob variants left empty stop the server,
+/// and are logged together, as vanilla's `printFullDetailsToLog` logs them.
+module registry.load
+
+import chat.language.{Language}
+import json.strict.{Unread, parse_strict}
+import nbt.tag.{Accounter, Tag, read_any}
+import pack.resources.{Resource, Resources, order}
+import registry.codec.{Codecs, Refs}
+import registry.network.{network_codec}
+import registry.registries.{Registries, builtin_registries, synced_names}
+import registry.registry.{Registry}
+import registry.tags.{load_tags}
+import resources.identifier.{Identifier}
+import server.log.{Entry}
+import world.states.{StateCodec}
+
+// A problem loading the registries, as vanilla keeps one in its `loadingErrors`: under the key of
+// the element it's about, by the registry and the element, a registry's own under
+// `minecraft:root`, with its exception as `printStackTrace` prints it, less the stack frames.
+struct Problem {
+    registry: Identifier
+    element: Identifier
+    exception: String
+}
+
+// By registry, then element, each in vanilla's order of identifiers.
+impl Order for Problem {
+    fn cmp(self, other: Self) -> Ordering {
+        let by_registry = order(self.registry, other.registry)
+        if by_registry != Ordering.Equal {
+            return by_registry
+        }
+        return order(self.element, other.element)
+    }
+}
+
+/// The registries from `resources`, with each synchronized entry's contents, or `none` if a
+/// problem stops the server, which is logged in `logs` with the rest. `lang` is the language an
+/// SNBT syntax error's message is given in, or `none` for its key.
+pub fn load_registries(resources: Resources, lang: own Language?, logs: mut List<Entry>) -> Registries? {
+    var made = List<Registry>()
+    var files = List<List<Resource>>()
+    for name in synced_names() {
+        var r = Registry.new(Identifier { namespace: "minecraft", path: name.copy() }, true)
+        // An entry's ID is its place in the order of its file's identifier, as vanilla
+        // registers them.
+        let prefix_len = name.len() + 1
+        let found = resources.list(name, String(".json"), mut logs)
+        for f in found {
+            let path = f.id.path[prefix_len..f.id.path.len() - 5]
+            r.add(Identifier { namespace: f.id.namespace.copy(), path: path }, some(f.pack))
+        }
+        made.push(r)
+        files.push(found)
+    }
+    // The built-in registries' tags load first, as `loadTagsForExistingRegistries` loads them.
+    var builtin = builtin_registries()
+    for i in 0..builtin.len() {
+        _ = load_tags(resources, mut builtin[i], mut logs)
+    }
+    var registries = Registries { synced: made, builtin: builtin }
+    var problems = List<Problem>()
+    var refs = Refs.new()
+    let contents = read_contents(registries, files, resources, lang, mut refs, mut problems)
+    // Then each synchronized registry has the entries that were read, in order, as
+    // `ResourceManagerRegistryLoadTask` registers them, and then its tags, which need what they
+    // name to be there.
+    var unbound = List<List<Identifier>>()
+    for i in 0..registries.synced.len() {
+        var r = Registry.new(registries.synced[i].name.copy(), true)
+        for k in 0..contents[i].len() {
+            if let bytes = contents[i][k] {
+                r.add(registries.synced[i].entries[k].copy(), registries.synced[i].packs[k])
+                r.contents.push(bytes.copy())
+            }
+        }
+        unbound.push(load_tags(resources, mut r, mut logs))
+        registries.synced[i] = r
+    }
+    // Then each is frozen, as `MappedRegistry.freeze` freezes it: an entry or a tag that was
+    // named and never came is an error.
+    for i in 0..registries.synced.len() {
+        var values = unbound[i].copy()
+        var tags = List<Identifier>()
+        for (at, id) in refs.values {
+            if at == i and registries.synced[i].id(id) == none {
+                values.push(id.copy())
+            }
+        }
+        for (at, id) in refs.tags {
+            if at == i and not registries.synced[i].has_tag(id) {
+                tags.push(id.copy())
+            }
+        }
+        let name = registries.synced[i].name.copy()
+        if not values.is_empty() {
+            add(mut problems, Problem { registry: root(), element: name.copy(), exception: "java.lang.IllegalStateException: Unbound values in registry ResourceKey[minecraft:root / {name.to_string()}]: [{listed(values)}]" })
+        } else if not tags.is_empty() {
+            add(mut problems, Problem { registry: root(), element: name.copy(), exception: "java.lang.IllegalStateException: Unbound tags in registry ResourceKey[minecraft:root / {name.to_string()}]: [{listed(tags)}]" })
+        }
+    }
+    if not problems.is_empty() {
+        log_problems(problems, mut logs)
+        return none
+    }
+    // Then they're validated, with their validators.
+    for r in registries.synced {
+        if r.entries.is_empty() and must_have_entries(r.name.path) {
+            add(mut problems, Problem { registry: root(), element: r.name.copy(), exception: "java.lang.IllegalStateException: Registry must be non-empty: {r.name.to_string()}" })
+        }
+        if r.name.path == "timeline" {
+            check_markers(r, mut problems)
+        }
+    }
+    if not problems.is_empty() {
+        log_problems(problems, mut logs)
+        return none
+    }
+    return some(registries)
+}
+
+// Each synchronized registry's entries read with its network codec, in NBT as `writeAnyTag`
+// writes it, by registry and then entry. An entry that can't be read is a problem, and has none.
+fn read_contents(registries: Registries, files: List<List<Resource>>, resources: Resources, lang: own Language?, refs: mut Refs, problems: mut List<Problem>) -> List<List<List<u8>?>> {
+    var codecs = Codecs.new()
+    if let b = registries.find_builtin(String("block")) {
+        codecs.states = some(StateCodec.new(registries.builtin[b]))
+    }
+    codecs.lang = lang
+    var out = List<List<List<u8>?>>()
+    for i in 0..registries.synced.len() {
+        var mine = List<List<u8>?>()
+        let found = network_codec(mut codecs, registries.synced[i].name.path)
+        let codec = found else panic("no network codec for {registries.synced[i].name.to_string()}")
+        for k in 0..files[i].len() {
+            match read_entry(codecs, codec, resources, files[i][k], registries, mut refs) {
+                ok(bytes) => mine.push(some(bytes)),
+                err(cause) => {
+                    let id = registries.synced[i].entries[k].copy()
+                    let pack = resources.pack_id(files[i][k].pack)
+                    add(mut problems, Problem { registry: registries.synced[i].name.copy(), element: id.copy(), exception: "java.lang.IllegalStateException: Failed to parse {id.to_string()} from pack {pack}\nCaused by: {cause}" })
+                    mine.push(none)
+                },
+            }
+        }
+        out.push(mine)
+    }
+    return out
+}
+
+// An entry's contents: its file's JSON, read as `StrictJsonParser` reads it, then with `codec`,
+// in NBT as `NbtIo.writeAnyTag` writes it. Or the exception that stopped it, as the cause of the
+// one vanilla's `loadFromResource` throws; Gson's messages aren't given.
+fn read_entry(codecs: Codecs, codec: usize, resources: Resources, file: Resource, registries: Registries, refs: mut Refs) -> List<u8> ! String {
+    let bytes = match resources.read(file) {
+        ok(b) => b,
+        err(e) => fail "java.io.IOException: {e}",
+    }
+    let json = match parse_strict(bytes) {
+        ok(j) => j,
+        err(Unread.Io) => fail String("com.google.gson.JsonIOException"),
+        err(Unread.Syntax) => fail String("com.google.gson.JsonSyntaxException"),
+    }
+    var got = codecs.read(codec, json, registries, mut refs)
+    if let e = got.error.take() {
+        fail "java.lang.IllegalStateException: {e}"
+    }
+    let value = got.value.take() else fail String("java.lang.IllegalStateException: nothing was read")
+    var out = List<u8>()
+    match value.write_any(mut out) {
+        ok => {},
+        err(e) => fail "java.lang.IllegalArgumentException: {e}",
+    }
+    return out
+}
+
+// The registries whose validator is `RegistryValidator.nonEmpty`: the mob variants.
+fn must_have_entries(path: String) -> bool {
+    for name in ["wolf_variant", "wolf_sound_variant", "pig_variant", "pig_sound_variant", "frog_variant", "cat_variant", "cat_sound_variant", "cow_variant", "cow_sound_variant", "chicken_variant", "chicken_sound_variant", "zombie_nautilus_variant", "painting_variant"] {
+        if path == String(name) {
+            return true
+        }
+    }
+    return false
+}
+
+// `Timeline.validateRegistry`: no two timelines of one clock define the same time marker. The
+// timeline that defines one again has the problem, the last it has if there are more.
+fn check_markers(r: Registry, problems: mut List<Problem>) {
+    var seen = Set<String>()
+    for k in 0..r.entries.len() {
+        if k >= r.contents.len() {
+            return
+        }
+        var at: usize = 0
+        var accounter = Accounter.unlimited()
+        let value = match read_any(r.contents[k], mut at, mut accounter) {
+            ok(v) => v,
+            err(_) => continue,
+        }
+        let Tag.Compound(fields) = value else continue
+        var clock = String("[unregistered]")
+        if fields.contains(String("clock")) {
+            if let Tag.Str(s) = fields[String("clock")] {
+                clock = s.copy()
+            }
+        }
+        if not fields.contains(String("time_markers")) {
+            continue
+        }
+        let Tag.Compound(markers) = fields[String("time_markers")] else continue
+        for (marker, _) in markers {
+            let key = "{clock} {marker}"
+            if seen.contains(key) {
+                add(mut problems, Problem { registry: r.name.copy(), element: r.entries[k].copy(), exception: "java.lang.IllegalStateException: ResourceKey[minecraft:clock_time_marker / {marker}] was defined multiple times in {clock}" })
+            } else {
+                seen.insert(key)
+            }
+        }
+    }
+}
+
+// `minecraft:root`, the registry of registries, which a registry's own problems are under.
+fn root() -> Identifier {
+    return Identifier { namespace: "minecraft", path: "root" }
+}
+
+// Puts `p` in, in place of one under the same key, as `Map.put` does.
+fn add(problems: mut List<Problem>, p: own Problem) {
+    for i in 0..problems.len() {
+        if order(problems[i].registry, p.registry) == Ordering.Equal and order(problems[i].element, p.element) == Ordering.Equal {
+            problems[i] = p
+            return
+        }
+    }
+    problems.push(p)
+}
+
+// An identifier, in vanilla's order.
+struct Key {
+    id: Identifier
+}
+
+impl Order for Key {
+    fn cmp(self, other: Self) -> Ordering {
+        return order(self.id, other.id)
+    }
+}
+
+// IDs as a sorted `List<Identifier>`'s `toString` lists them, each once.
+fn listed(ids: List<Identifier>) -> String {
+    var keys = List<Key>()
+    for id in ids {
+        keys.push(Key { id: id.copy() })
+    }
+    keys.sort()
+    var out = String()
+    for i in 0..keys.len() {
+        if i > 0 and order(keys[i - 1].id, keys[i].id) == Ordering.Equal {
+            continue
+        }
+        if not out.is_empty() {
+            out.push_str(", ")
+        }
+        out.push_str(keys[i].id.to_string())
+    }
+    return out
+}
+
+// What `printFullDetailsToLog` logs: each registry's problems, by element, in order.
+fn log_problems(problems: own List<Problem>, logs: mut List<Entry>) {
+    var all = problems
+    all.sort()
+    var text = String()
+    var last: Identifier? = none
+    for p in all {
+        let fresh = match last {
+            some(l) => order(l, p.registry) != Ordering.Equal,
+            none => true,
+        }
+        if fresh {
+            text.push_str("> Errors in registry {p.registry.to_string()}:\n")
+            last = some(p.registry.copy())
+        }
+        text.push_str(">> Errors in element {p.element.to_string()}:\n{p.exception}\n")
+    }
+    logs.push(Entry.error("Registry loading errors:\n{text}"))
+}

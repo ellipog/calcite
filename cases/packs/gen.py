@@ -1,6 +1,7 @@
 """Writes cases/packs/generated.json: a world's data packs found and picked as a server starting
 finds and picks them, by vanilla's ServerPacksSource and MinecraftServer.configurePackRepository,
-then their files listed by a MultiPackResourceManager over the picked packs.
+then their files listed by a MultiPackResourceManager over the picked packs, or the registries
+loaded from them by RegistryDataLoader.
 
     py -I cases/packs/gen.py
 
@@ -8,7 +9,14 @@ Each case makes the world's `datapacks` folder, with folder packs, zips and entr
 packs, then picks: as a new world does, from server.properties' `initial-enabled-packs` and
 `initial-disabled-packs`, or as an old world does, from what its level.dat has on and off and its
 feature flags, with or without `--safeMode`. Then it lists a folder of the picked packs' files,
-which shows which pack's file wins, what filters hide and which overlays apply.
+which shows which pack's file wins, what filters hide and which overlays apply. Or it loads the
+world's registries from them, which shows what's logged, whether they load and what each
+synchronized entry sends a client.
+
+An entry a case loads is read by vanilla with its registry's codec for the server and by Calcite
+with its codec for the network, which leaves out what only the server uses. So the entries are
+in registries whose two codecs read the same fields, or keep to those they share, and a broken
+one is broken in a field both read.
 
 Making a link takes a privilege Windows doesn't give everyone, so the cases with links are
 Linux's. And vanilla finds what's in a folder in the order the file system lists it, so a folder
@@ -121,6 +129,10 @@ class Case:
 
     def list(self, folder="dimension_type", suffix=".json"):
         self.ops.append(["list", folder, suffix])
+        return self
+
+    def load(self):
+        self.ops.append(["load"])
         return self
 
     def done(self):
@@ -351,9 +363,144 @@ def links():
     return cases
 
 
+def painting(width=1, height=1, asset="w:a", **more):
+    data = {"width": width, "height": height, "asset_id": asset}
+    data.update(more)
+    return json.dumps(data)
+
+
+def damage(message="d", scaling="never", exhaustion=0.0, **more):
+    data = {"message_id": message, "scaling": scaling, "exhaustion": exhaustion}
+    data.update(more)
+    return json.dumps(data)
+
+
+def dimension(**more):
+    """A dimension type with what it must have and no environment attributes, which only the
+    server's codec reads all of."""
+    data = {
+        "has_skylight": True,
+        "has_ceiling": False,
+        "has_ender_dragon_fight": False,
+        "coordinate_scale": 1.0,
+        "min_y": 0,
+        "height": 256,
+        "logical_height": 256,
+        "infiniburn": "#minecraft:infiniburn_overworld",
+        "ambient_light": 0.0,
+        "monster_spawn_light_level": 0,
+        "monster_spawn_block_light_limit": 0,
+    }
+    data.update(more)
+    return json.dumps(data)
+
+
+def tag(*values, replace=None):
+    data = {"values": list(values)}
+    if replace is not None:
+        data["replace"] = replace
+    return json.dumps(data)
+
+
+def loading():
+    """The registries loaded from the picked packs, in a new world with one folder pack, `p`."""
+    cases = [new_world(Case("load-vanilla")).load().done()]
+    cases.append(Case("load-feature-pack").pick(["vanilla", "trade_rebalance"], [""], [VANILLA], True).load().done())
+
+    def world(name, files, mcmeta=None):
+        return new_world(Case(name).folder_pack("p", mcmeta or meta(), files)).load().done()
+
+    # New entries in several registries and namespaces, in vanilla's order of identifiers, by
+    # path and then namespace, among vanilla's.
+    cases.append(world("load-new-entries", [
+        ("data/w/painting_variant/a.json", painting(2, 1, "w:a", title={"text": "A", "color": "gold"}, author="me")),
+        ("data/w/painting_variant/b.json", painting(16, 16, "b")),
+        ("data/a/painting_variant/z.json", painting(1, 2, "a:z", title=["x", {"text": "y", "italic": True}])),
+        ("data/w/banner_pattern/x.json", json.dumps({"asset_id": "w:x", "translation_key": "block.w.x"})),
+        ("data/w/damage_type/d.json", damage("d", "never", 0.5)),
+        ("data/w/damage_type/e.json", damage("e", "always", 0, effects="burning", death_message_type="fall_variants")),
+        ("data/w/jukebox_song/s.json", json.dumps({"sound_event": "minecraft:music_disc.cat", "description": {"translate": "jukebox_song.w.s"}, "length_in_seconds": 12.5, "comparator_output": 3})),
+        ("data/w/jukebox_song/t.json", json.dumps({"sound_event": {"sound_id": "w:t", "range": 16.0}, "description": "T", "length_in_seconds": 1, "comparator_output": 15})),
+        ("data/w/world_clock/c.json", "{}"),
+        ("data/w/timeline/t.json", json.dumps({"clock": "w:c", "period_ticks": 100, "time_markers": {"w:m": 5, "w:n": {"ticks": 7, "show_in_commands": True}}})),
+        ("data/w/timeline/u.json", json.dumps({"clock": "minecraft:overworld"})),
+        ("data/w/tags/timeline/all.json", tag("w:t", {"id": "w:gone", "required": False})),
+        ("data/w/dimension_type/d.json", dimension(timelines="#w:all", default_clock="w:c")),
+        ("data/w/dimension_type/e.json", dimension(timelines=["w:t", "w:u"], min_y=-64, height=384, logical_height=384, coordinate_scale=8, has_ceiling=True)),
+    ]))
+    # Vanilla's own entries, from the world's pack instead, which a client is sent.
+    cases.append(world("load-override", [
+        ("data/minecraft/painting_variant/kebab.json", painting(3, 3, "minecraft:kebab")),
+        ("data/minecraft/damage_type/generic.json", damage("generic", "never", 0.0)),
+        ("data/minecraft/dimension_type/overworld.json", dimension()),
+    ]))
+    # What a codec has a default for, given, which isn't written; and numbers in other shapes.
+    cases.append(world("load-defaults-given", [
+        ("data/w/damage_type/d.json", damage("d", "when_caused_by_living_non_player", 1, effects="hurt", death_message_type="default")),
+        ("data/w/dimension_type/d.json", dimension(has_fixed_time=False, skybox="overworld", cardinal_light="default", timelines=[], attributes={})),
+        ("data/w/timeline/t.json", json.dumps({"clock": "minecraft:overworld", "tracks": {}, "time_markers": {}})),
+        ("data/w/painting_variant/p.json", painting(2.0, 1.5, "w:p")),
+        ("data/w/jukebox_song/s.json", json.dumps({"sound_event": "minecraft:music_disc.cat", "description": "s", "length_in_seconds": 3e2, "comparator_output": 1.9})),
+    ]))
+    # Tags of the world's: a synchronized registry's, which may name what's optional and missing,
+    # and a built-in one's that names a block there isn't, which is logged, and isn't built.
+    cases.append(world("load-world-tags", [
+        ("data/w/painting_variant/a.json", painting()),
+        ("data/w/tags/painting_variant/t.json", tag("w:a", "#minecraft:placeable", {"id": "w:gone", "required": False}, {"id": "#w:nope", "required": False})),
+        ("data/minecraft/tags/painting_variant/placeable.json", tag("w:a")),
+        ("data/w/tags/block/bad.json", tag("minecraft:stone", "minecraft:nope")),
+        ("data/w/tags/block/good.json", tag("minecraft:stone", {"id": "minecraft:nope", "required": False})),
+    ]))
+
+    # What stops the registries loading.
+    bad = "data/w/painting_variant/bad.json"
+    broken = {
+        "bad-json": [(bad, "{")],
+        "not-json": [(bad, "not json")],
+        "trailing": [(bad, "{} {}")],
+        "empty-file": [(bad, "")],
+        "null": [(bad, "null")],
+        "array": [(bad, "[]")],
+        "missing-field": [(bad, json.dumps({"asset_id": "w:a", "width": 1}))],
+        "missing-fields": [(bad, json.dumps({"asset_id": "w:a"}))],
+        "out-of-range": [(bad, painting(17, 0))],
+        "bad-identifier": [(bad, painting(asset="W:A"))],
+        "wrong-types": [("data/w/damage_type/bad.json", damage(5, "never", "x"))],
+        "bad-enum": [("data/w/damage_type/bad.json", damage("m", "sometimes"))],
+        "bad-height": [("data/w/dimension_type/bad.json", dimension(height=20, logical_height=20))],
+        "missing-clock": [("data/w/timeline/bad.json", json.dumps({"clock": "w:nowhere"}))],
+        "missing-default-clock": [("data/w/dimension_type/bad.json", dimension(default_clock="w:nowhere"))],
+        "missing-block-tag": [("data/w/dimension_type/bad.json", dimension(infiniburn="#w:absent"))],
+        "missing-timeline-tag": [("data/w/dimension_type/bad.json", dimension(timelines="#w:missing"))],
+        "missing-timeline": [("data/w/dimension_type/bad.json", dimension(timelines=["w:gone", "w:gone_too"]))],
+        "duplicate-marker": [
+            ("data/w/world_clock/c.json", "{}"),
+            ("data/w/timeline/a.json", json.dumps({"clock": "w:c", "time_markers": {"w:m": 1}})),
+            ("data/w/timeline/b.json", json.dumps({"clock": "w:c", "time_markers": {"w:m": 2, "w:n": 3}})),
+            ("data/w/timeline/c.json", json.dumps({"clock": "w:c", "time_markers": {"w:n": 4}})),
+        ],
+        "tag-of-broken": [(bad, "{"), ("data/w/tags/painting_variant/t.json", tag("w:bad"))],
+        "tag-missing-entry": [("data/w/tags/painting_variant/t.json", tag("w:gone", "w:gone_too"))],
+        "several": [
+            (bad, "{"),
+            ("data/w/painting_variant/worse.json", json.dumps({"width": 1})),
+            ("data/w/damage_type/bad.json", damage("m", "sometimes")),
+            ("data/w/banner_pattern/bad.json", json.dumps({"asset_id": "w:x"})),
+            ("data/w/timeline/bad.json", json.dumps({"clock": "w:nowhere"})),
+            ("data/w/dimension_type/bad.json", dimension(timelines="#w:missing")),
+        ],
+    }
+    for name, files in broken.items():
+        cases.append(world(f"load-{name}", files))
+    # A registry of variants left empty, by a filter that hides vanilla's paintings and their tags.
+    hide = {"block": [{"namespace": "minecraft", "path": "(tags/)?painting_variant/.*"}]}
+    cases.append(world("load-no-paintings", [], meta(filter=hide)))
+    return cases
+
+
 def main():
-    cases = picking() + metadata() + files() + entries() + links()
-    write_file(HERE / "generated.json", "packs", "cases/packs/gen.py", cases, probe_version=1)
+    cases = picking() + metadata() + files() + entries() + links() + loading()
+    write_file(HERE / "generated.json", "packs", "cases/packs/gen.py", cases, probe_version=2)
 
 
 main()
