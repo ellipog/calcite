@@ -1,0 +1,601 @@
+/// The data packs a server finds and those it loads, as vanilla's `PackRepository` finds them and
+/// `MinecraftServer.configurePackRepository` picks them as the server starts: vanilla's own pack,
+/// `vanilla`; its feature packs, such as `trade_rebalance`, folders of Mojang's archive under
+/// `data/minecraft/datapacks/`; and the world's, each folder with a `pack.mcmeta` and each `.zip`
+/// file in its `datapacks` folder, named `file/` and its name. Each one's `pack.mcmeta` is read as
+/// `pack.meta` reads it, and a pack whose can't be is left out. Then what `level.dat` says, or a
+/// new world's server.properties, picks the packs that load, with vanilla's lines, and `open`
+/// lists their files as `pack.resources` lists them.
+///
+/// The world's packs are checked for symbolic links as vanilla checks them, against
+/// `allowed_symlinks.txt` (`storage.symlinks`). `fingerprint` names everything the packs are
+/// read from, for the boot cache (D190).
+module pack.repository
+
+import chat.component.{Component}
+import java.text.{compare_to}
+import pack.meta.{Compatibility, PackMeta, read_filter, read_meta}
+import pack.resources.{Pack, Resources}
+import pack.vanilla.{core, feature_known}
+import pack.zip.{Zip}
+import server.log.{Entry}
+import std.fs.{FsError, Kind, is_file, kind, make_dir_all, metadata, read, read_link, real_path, separator}
+import std.hash.{Algorithm, Digest}
+import storage.level.{DataPacks, VANILLA_FEATURES, feature_ids, feature_names}
+import storage.symlinks.{AllowList, Forbidden, WalkError, forbidden_links, listed, refusal, resolve}
+import storage.world.{exception}
+
+// How deep the fingerprint walks the world's packs, past which it gives up.
+const DEEPEST: usize = 256
+
+/// Where a pack comes from, vanilla's `PackSource`.
+pub enum Source {
+    /// Vanilla's own pack.
+    BuiltIn
+    /// One of vanilla's feature packs, which loads only when it's picked, or when the world's
+    /// features need it.
+    Feature
+    /// The world's `datapacks` folder.
+    World
+}
+
+// Where a pack's files are.
+enum Place {
+    // Vanilla's own pack, in Mojang's archive.
+    Vanilla
+    // A folder of Mojang's archive, by where it starts, such as
+    // `data/minecraft/datapacks/trade_rebalance/`.
+    Bundled(String)
+    // A folder on the disk.
+    Folder(String)
+    // A zip on the disk, read into the repository's archive `archive`.
+    Zipped { path: String, archive: usize }
+}
+
+/// A pack found, with what its `pack.mcmeta` says.
+pub struct Found {
+    pub id: String
+    pub source: Source
+    pub meta: PackMeta
+    place: Place
+    // Its `pack.mcmeta`, which its filter is read from when it's opened.
+    mcmeta: List<u8>?
+}
+
+// Vanilla's `TreeMap` of packs by ID, in the order of `String.compareTo`.
+impl Order for Found {
+    fn cmp(self, other: Self) -> Ordering {
+        return compare_to(self.id, other.id)
+    }
+}
+
+/// What picks the packs: where the world's are, what `level.dat` says of them, and how the
+/// server started.
+pub struct Setup {
+    /// The world's `datapacks` folder, as Java's `Path` writes it, such as `.\world\datapacks`.
+    pub datapacks: String
+    /// Whether it's made if it's missing, as vanilla makes it, which a replay doesn't.
+    pub make: bool
+    /// Whether the server started with `--safeMode`, which loads only vanilla's pack.
+    pub safe: bool
+    /// Whether the world is new, without a `level.dat`, so its packs are server.properties'
+    /// `initial-enabled-packs` and `initial-disabled-packs`, and any feature may be on.
+    pub init: bool
+    /// The packs on and off: `level.dat`'s `DataPacks`, or a new world's from
+    /// server.properties.
+    pub config: DataPacks
+    /// The world's feature flags, a bit for each of `storage.level.feature_names`, which the
+    /// packs that load must need no more than, and which the feature packs that give them are
+    /// forced on for. A new world's are vanilla's.
+    pub features: u32
+}
+
+/// The packs picked, as `configurePackRepository` leaves them.
+pub struct Selection {
+    /// The packs that load, by their place in `Repository.packs`, the bottom first.
+    pub order: List<usize>
+    /// What `level.dat` saves of them, vanilla's `DataPackConfig`: those that load, in order,
+    /// and every other pack found as off.
+    pub packs: DataPacks
+    /// The world's feature flags from now: those its packs need and those it had.
+    pub features: u32
+}
+
+/// The packs found.
+pub struct Repository {
+    /// The packs, by ID, in the order of Java's `String.compareTo`.
+    pub packs: List<Found>
+    // Mojang's archive, then each of the world's zips.
+    archives: List<Zip>
+}
+
+/// The packs there are, as `PackRepository.reload` finds them: vanilla's from `vanilla`, the
+/// archive of Mojang's data, then the world's from `setup.datapacks`, made first if it's missing
+/// and `setup.make`. What vanilla logs finding them goes into `logs`: a world's entry that isn't
+/// a pack, a link `allow` doesn't allow, and a pack whose metadata can't be read.
+pub fn discover(vanilla: own Zip, setup: Setup, allow: mut AllowList, logs: mut List<Entry>) -> Repository {
+    var packs = List<Found>()
+    // `ServerPacksSource`'s metadata of vanilla's pack, which it has no pack.mcmeta for.
+    let description = Component.translatable(String("dataPack.vanilla.description"), [])
+    let builtin = PackMeta { description: description, compatibility: Compatibility.Compatible, features: VANILLA_FEATURES, overlays: [] }
+    packs.push(Found { id: String("vanilla"), source: Source.BuiltIn, meta: builtin, place: Place.Vanilla, mcmeta: none })
+    // The feature packs, each folder of `data/minecraft/datapacks/` with a pack.mcmeta, which
+    // `listBundledPacks` reads in the order of its `HashMap` of them.
+    let prefix = String("data/minecraft/datapacks/")
+    var bundled = JavaHashSet<String>()
+    for i in 0..vanilla.len() {
+        let name = vanilla.name(i)
+        if not name.starts_with(prefix) or not name.ends_with("/pack.mcmeta") {
+            continue
+        }
+        let id = name[prefix.len()..name.len() - 12]
+        if not id.is_empty() and id.find("/") == none {
+            bundled.insert(id)
+        }
+    }
+    for id in bundled {
+        let at = "{prefix}{id}/"
+        // Mojang's archive is pinned, so its files read.
+        let bytes: List<u8>? = match vanilla.read_named("{at}pack.mcmeta") {
+            ok(b) => some(b),
+            err(_) => none,
+        }
+        if let meta = read_meta(id, bytes, mut logs) {
+            packs.push(Found { id: id.copy(), source: Source.Feature, meta: meta, place: Place.Bundled(at), mcmeta: bytes })
+        }
+    }
+    var archives = List<Zip>()
+    archives.push(vanilla)
+    world_packs(setup, mut allow, mut packs, mut archives, mut logs)
+    packs.sort()
+    return Repository { packs: packs, archives: archives }
+}
+
+// What's at a world's entry, as `PackDetector.detectPackResources` takes it.
+enum Detected {
+    // Not a pack.
+    Nothing
+    // A link to where it may not lead, or a folder with one in it, and the message vanilla's
+    // `ContentValidationException` gives for it.
+    Refused(String)
+    // A folder pack, where it really is.
+    Folder(String)
+    // A zip, where it really is.
+    Zipped(String)
+}
+
+// The world's packs, as `FolderRepositorySource.loadPacks` finds them: each entry of the folder
+// in the order Java lists them.
+fn world_packs(setup: Setup, allow: mut AllowList, packs: mut List<Found>, archives: mut List<Zip>, logs: mut List<Entry>) {
+    let folder = setup.datapacks.copy()
+    if setup.make {
+        // Made as `FileUtil.createDirectoriesSafe` makes it: where it really is, if it's there.
+        let made = match real_path(folder) {
+            ok(real) => real,
+            err(_) => folder.copy(),
+        }
+        match make_dir_all(made) {
+            ok => {},
+            err(e) => {
+                logs.push(Entry.warn("Failed to list packs in {folder}\n{exception(e, made)}"))
+                return
+            },
+        }
+    }
+    let names = match listed(folder) {
+        ok(n) => n,
+        // A replay's world may have no folder, which it doesn't make.
+        err(FsError.NotFound) => {
+            if setup.make {
+                logs.push(Entry.warn("Failed to list packs in {folder}\n{exception(FsError.NotFound, folder)}"))
+            }
+            return
+        },
+        err(e) => {
+            logs.push(Entry.warn("Failed to list packs in {folder}\n{exception(e, folder)}"))
+            return
+        },
+    }
+    for name in names {
+        let content = resolve(folder, name)
+        let id = "file/{name}"
+        match detect(content, mut allow, mut logs) {
+            ok(Detected.Nothing) => logs.push(Entry.info("Found non-pack entry '{content}', ignoring")),
+            ok(Detected.Refused(message)) => logs.push(Entry.warn("Ignoring potential pack entry: {message}")),
+            ok(Detected.Folder(root)) => {
+                let file = resolve(root, String("pack.mcmeta"))
+                let bytes: List<u8>? = match read(file) {
+                    ok(b) => some(b),
+                    err(FsError.NotFound) => none,
+                    err(e) => {
+                        logs.push(Entry.warn("Failed to read pack {id} metadata\n{exception(e, file)}"))
+                        continue
+                    },
+                }
+                if let meta = read_meta(id, bytes, mut logs) {
+                    packs.push(Found { id: id.copy(), source: Source.World, meta: meta, place: Place.Folder(root.copy()), mcmeta: bytes })
+                }
+            },
+            ok(Detected.Zipped(path)) => {
+                // Vanilla opens the zip as it reads its metadata, and finds none if it can't.
+                let zip = match open_zip(path) {
+                    ok(z) => z,
+                    err(thrown) => {
+                        logs.push(Entry.error("Failed to open pack {path}\n{thrown}"))
+                        logs.push(Entry.warn("Missing metadata in pack {id}"))
+                        continue
+                    },
+                }
+                let bytes: List<u8>? = match zip.find(String("pack.mcmeta")) {
+                    some(i) => match zip.read(i) {
+                        ok(b) => some(b),
+                        err(message) => {
+                            logs.push(Entry.warn("Failed to read pack {id} metadata\njava.util.zip.ZipException: {message}"))
+                            continue
+                        },
+                    },
+                    none => none,
+                }
+                if let meta = read_meta(id, bytes, mut logs) {
+                    packs.push(Found { id: id.copy(), source: Source.World, meta: meta, place: Place.Zipped { path: path.copy(), archive: archives.len() }, mcmeta: bytes })
+                    archives.push(zip)
+                }
+            },
+            err(thrown) => logs.push(Entry.warn("Failed to read properties of '{content}', ignoring\n{thrown}")),
+        }
+    }
+}
+
+// The zip at `path`, read whole, or the exception Java's `ZipFile` throws opening it.
+fn open_zip(path: String) -> Zip ! String {
+    let whole = match read(path) {
+        ok(b) => b,
+        err(e) => fail exception(e, path),
+    }
+    return match Zip.open(whole) {
+        ok(z) => z,
+        err(message) => fail "java.util.zip.ZipException: {message}",
+    }
+}
+
+// What's at `content`, or the exception reading it throws: a link is checked against `allow`
+// and followed, its target as it's written, from the folder the server runs in, as vanilla
+// follows it; a folder is walked for links and is a pack if it has a pack.mcmeta; and a file is
+// a pack if its name ends `.zip`. A Windows junction is a folder, as Java takes it.
+fn detect(content: String, allow: mut AllowList, logs: mut List<Entry>) -> Detected ! String {
+    var target = content.copy()
+    var k = match kind(content) {
+        ok(some(found)) => found,
+        ok(none) => return Detected.Nothing,
+        err(e) => fail exception(e, content),
+    }
+    if is_link(k) {
+        let link = match read_link(content) {
+            ok(some(l)) => l,
+            ok(none) => fail exception(FsError.NotFound, content),
+            err(e) => fail exception(e, content),
+        }
+        if link.junction {
+            k = Kind.Dir
+        } else {
+            if not allow.matches(link.target, mut logs) {
+                let found: List<Forbidden> = [Forbidden { link: content.copy(), target: link.target.copy() }]
+                return Detected.Refused(refusal(content, found))
+            }
+            target = link.target.copy()
+            k = match kind(target) {
+                ok(some(found)) => found,
+                ok(none) => fail exception(FsError.NotFound, target),
+                err(e) => fail exception(e, target),
+            }
+            if is_link(k) {
+                match read_link(target) {
+                    ok(some(l)) => if l.junction { k = Kind.Dir },
+                    _ => {},
+                }
+            }
+        }
+    }
+    return match k {
+        Kind.Dir => {
+            match forbidden_links(target, mut allow, mut logs) {
+                ok(found) => {
+                    if not found.is_empty() {
+                        return Detected.Refused(refusal(content, found))
+                    }
+                },
+                err(WalkError.NotDirectory) => return Detected.Nothing,
+                err(WalkError.Files { error, path }) => fail exception(error, path),
+            }
+            if is_file(resolve(target, String("pack.mcmeta"))) { Detected.Folder(target) } else { Detected.Nothing }
+        },
+        Kind.File => if file_name(target).ends_with(".zip") { Detected.Zipped(target) } else { Detected.Nothing },
+        _ => Detected.Nothing,
+    }
+}
+
+fn is_link(k: Kind) -> bool {
+    return match k {
+        Kind.Link => true,
+        _ => false,
+    }
+}
+
+// The last name of `path`, as Java's `Path.getFileName` gives it.
+fn file_name(path: String) -> String {
+    let windows = separator() == "\\"
+    var start: usize = 0
+    for i in 0..path.len() {
+        let b = path.byte_at(i)
+        if b == 47 or (windows and b == 92) {
+            start = i + 1
+        }
+    }
+    return path[start..]
+}
+
+impl Repository {
+    /// The packs that load, as `configurePackRepository` picks them, with its lines in `logs`:
+    /// with `setup.safe`, only vanilla's; otherwise those `setup.config` has on that are there,
+    /// then each other built-in or world pack it hasn't off, if the world's features allow it,
+    /// less those on that need features the world hasn't. Then any feature pack the world's
+    /// features need that those don't give.
+    pub fn select(self, setup: Setup, logs: mut List<Entry>) -> Selection {
+        let forced: u32 = if setup.init { 0 } else { setup.features }
+        let allowed = if setup.init { all_features() } else { setup.features }
+        if setup.safe {
+            let only: List<String> = ["vanilla"]
+            return self.selection(only, forced, false, mut logs)
+        }
+        // Vanilla's `LinkedHashSet` of IDs.
+        var selected = List<String>()
+        for id in setup.config.enabled {
+            if self.find(id) == none {
+                logs.push(Entry.warn("Missing data pack {id}"))
+            } else if not selected.contains(id) {
+                selected.push(id.copy())
+            }
+        }
+        for p in self.packs {
+            if setup.config.disabled.contains(p.id) {
+                continue
+            }
+            let wanted = p.meta.features
+            let fits = wanted & allowed == wanted
+            let was = selected.contains(p.id)
+            if not was and automatic(p.source) {
+                if fits {
+                    logs.push(Entry.info("Found new data pack {p.id}, loading it automatically"))
+                    selected.push(p.id.copy())
+                } else {
+                    logs.push(Entry.info("Found new data pack {p.id}, but can't load it due to missing features {missing_flags(allowed, wanted)}"))
+                }
+            }
+            if was and not fits {
+                logs.push(Entry.warn("Pack {p.id} requires features {missing_flags(allowed, wanted)} that are not enabled for this world, disabling pack."))
+                for k in 0..selected.len() {
+                    if selected[k] == p.id {
+                        _ = selected.remove(k)
+                        break
+                    }
+                }
+            }
+        }
+        if selected.is_empty() {
+            logs.push(Entry.info("No datapacks selected, forcing vanilla"))
+            selected.push(String("vanilla"))
+        }
+        return self.selection(selected, forced, true, mut logs)
+    }
+
+    // The packs `names` pick, as `configureRepositoryWithSelection` leaves them: those there, in
+    // that order, then each feature pack, in order, that gives features `forced` has and they
+    // don't, and needs no others, as `enableForcedFeaturePacks` adds them. One already on gives
+    // its features already, so vanilla's `IllegalStateException` for it can't be thrown. Each
+    // pack not picked is off, if `disable_inactive`.
+    fn selection(self, names: List<String>, forced: u32, disable_inactive: bool, logs: mut List<Entry>) -> Selection {
+        var order = List<usize>()
+        var provided: u32 = 0
+        for n in names {
+            if let i = self.find(n) {
+                order.push(i)
+                provided = provided | self.packs[i].meta.features
+            }
+        }
+        var missing = forced ^ (forced & provided)
+        for i in 0..self.packs.len() {
+            if missing == 0 {
+                break
+            }
+            if not is_feature(self.packs[i].source) {
+                continue
+            }
+            let gives = self.packs[i].meta.features
+            if gives != 0 and gives & missing != 0 and gives & forced == gives {
+                order.push(i)
+                logs.push(Entry.info("Found feature pack ('{self.packs[i].id}') for requested feature, forcing to enabled"))
+                missing = missing ^ (missing & gives)
+            }
+        }
+        var enabled = List<String>()
+        var features = forced
+        for i in order {
+            enabled.push(self.packs[i].id.copy())
+            features = features | self.packs[i].meta.features
+        }
+        var disabled = List<String>()
+        if disable_inactive {
+            for i in 0..self.packs.len() {
+                if not order.contains(i) {
+                    disabled.push(self.packs[i].id.copy())
+                }
+            }
+        }
+        return Selection { order: order, packs: DataPacks { enabled: enabled, disabled: disabled }, features: features }
+    }
+
+    // Where the pack `id` is in `packs`.
+    fn find(self, id: String) -> usize? {
+        for i in 0..self.packs.len() {
+            if self.packs[i].id == id {
+                return some(i)
+            }
+        }
+        return none
+    }
+
+    /// The files of the packs `selection` picked, the bottom first, as `MultiPackResourceManager`
+    /// lists them, with what reading their filters and namespaces logs: each pack's overlays
+    /// over it, the last listed on top.
+    pub fn open(own self, selection: Selection, logs: mut List<Entry>) -> Resources {
+        var packs = List<Pack>()
+        for i in selection.order {
+            var filter_lines = List<Entry>()
+            let overlays = self.packs[i].meta.overlays.copy()
+            match self.packs[i].place {
+                Place.Vanilla => packs.push(Pack.builtin(String("vanilla"), some(core()), 0, self.archives[0])),
+                Place.Bundled(at) => {
+                    let filter = read_filter(self.packs[i].id, self.packs[i].mcmeta, mut filter_lines)
+                    var layers = List<String>()
+                    var k = overlays.len()
+                    while k > 0 {
+                        k -= 1
+                        layers.push("{at}{overlays[k]}/")
+                    }
+                    layers.push(at.copy())
+                    packs.push(Pack.in_archive(self.packs[i].id.copy(), some(feature_known(self.packs[i].id)), 0, self.archives[0], layers, none, filter, filter_lines))
+                },
+                Place.Folder(root) => {
+                    let filter = read_filter(self.packs[i].id, self.packs[i].mcmeta, mut filter_lines)
+                    var roots = List<String>()
+                    var k = overlays.len()
+                    while k > 0 {
+                        k -= 1
+                        roots.push(resolve(root, overlays[k]))
+                    }
+                    roots.push(root.copy())
+                    packs.push(Pack.folder(self.packs[i].id.copy(), roots, filter, filter_lines))
+                },
+                Place.Zipped { path, archive } => {
+                    let filter = read_filter(self.packs[i].id, self.packs[i].mcmeta, mut filter_lines)
+                    var layers = List<String>()
+                    var k = overlays.len()
+                    while k > 0 {
+                        k -= 1
+                        layers.push("{overlays[k]}/")
+                    }
+                    layers.push(String())
+                    packs.push(Pack.in_archive(self.packs[i].id.copy(), none, archive, self.archives[archive], layers, some(path.copy()), filter, filter_lines))
+                },
+            }
+        }
+        return Resources.new(self.archives, packs, mut logs)
+    }
+}
+
+// Whether a pack from `source` loads by itself when it's new, vanilla's `shouldAddAutomatically`.
+fn automatic(source: Source) -> bool {
+    return match source {
+        Source.Feature => false,
+        _ => true,
+    }
+}
+
+fn is_feature(source: Source) -> bool {
+    return match source {
+        Source.Feature => true,
+        _ => false,
+    }
+}
+
+// Every feature flag, vanilla's `FeatureFlags.REGISTRY.allFlags()`.
+fn all_features() -> u32 {
+    return (1u32 << u32.wrap(feature_names().len())) - 1
+}
+
+/// The flags `requested` has that `allowed` hasn't, as `FeatureFlags.printMissingFlags` writes
+/// them: in the order of a `HashSet` of their IDs, between commas.
+pub fn missing_flags(allowed: u32, requested: u32) -> String {
+    var out = String()
+    for id in feature_ids(requested & ~allowed) {
+        if not out.is_empty() {
+            out.push_str(", ")
+        }
+        out.push_str(id.to_string())
+    }
+    return out
+}
+
+/// What the packs `setup` picks are made from, as a SHA-256 in hex: the setup, and the name, kind,
+/// size and time of each thing in the world's `datapacks` folder, walked, which the boot cache
+/// is keyed by (D190). `none` if the folder has a link in it, or something in it can't be read,
+/// or if it's missing and about to be made, so the packs aren't cached.
+pub fn fingerprint(setup: Setup) -> String? {
+    var d = Digest.new(Algorithm.Sha256)
+    d.add_text("{setup.datapacks.len()}:{setup.datapacks}{setup.make}/{setup.safe}/{setup.init}/{setup.features}/")
+    for list in [setup.config.enabled.copy(), setup.config.disabled.copy()] {
+        d.add_text("{list.len()}[")
+        for id in list {
+            d.add_text("{id.len()}:{id}")
+        }
+    }
+    match kind(setup.datapacks) {
+        ok(none) => {
+            if setup.make {
+                return none
+            }
+            d.add_text("missing")
+        },
+        ok(some(Kind.Dir)) => {
+            if not stamp(mut d, setup.datapacks, 0) {
+                return none
+            }
+        },
+        _ => return none,
+    }
+    return some(hex(d.finish()))
+}
+
+// Adds the folder `dir`'s things to `d`, each one's name and kind, a file's size and time, and a
+// folder's things. Whether it could, without a link in it.
+fn stamp(d: mut Digest, dir: String, depth: usize) -> bool {
+    if depth > DEEPEST {
+        return false
+    }
+    let names = match listed(dir) {
+        ok(n) => n,
+        err(_) => return false,
+    }
+    d.add_text("{names.len()}[")
+    for name in names {
+        let path = resolve(dir, name)
+        match kind(path) {
+            ok(some(Kind.File)) => {
+                let m = match metadata(path) {
+                    ok(m) => m,
+                    err(_) => return false,
+                }
+                d.add_text("f{name.len()}:{name}{m.size}/{m.modified.unix_ms}/")
+            },
+            ok(some(Kind.Dir)) => {
+                d.add_text("d{name.len()}:{name}")
+                if not stamp(mut d, path, depth + 1) {
+                    return false
+                }
+            },
+            ok(some(Kind.Other)) => d.add_text("o{name.len()}:{name}"),
+            _ => return false,
+        }
+    }
+    return true
+}
+
+fn hex(bytes: List<u8>) -> String {
+    let digits: [rune; 16] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f']
+    var out = String()
+    for b in bytes {
+        out.push(digits[usize(b / 16)])
+        out.push(digits[usize(b % 16)])
+    }
+    return out
+}

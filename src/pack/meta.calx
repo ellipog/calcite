@@ -1,0 +1,720 @@
+/// A data pack's `pack.mcmeta`, read as vanilla reads it: by `Pack.readPackMetadata` as the
+/// server finds its packs, and by `MultiPackResourceManager` for the pack's filter as it opens
+/// them.
+///
+/// The file is read as `ResourceMetadata.fromJsonStream` reads it: decoded from UTF-8 with
+/// U+FFFD for what isn't, then its first value read by strict Gson, which must be an object and
+/// after which nothing is looked at. Its `pack` section has the pack's description and the
+/// formats it's for, checked as `PackFormat` checks them; if that can't be read, its
+/// description alone is, and the pack's formats are unknown. Then `features` names the feature
+/// flags it needs and `overlays` its overlays, of which those whose formats take 26.3's are
+/// kept. A pack whose metadata can't be read is left out, with vanilla's warnings.
+///
+/// Each warning has the exception vanilla logs with it on its next line, with its class, and a
+/// message in vanilla's words where they're DataFixerUpper's own checks, such as
+/// `PackFormat`'s, and in Calcite's where vanilla's are Gson's or DataFixerUpper's wording of
+/// where in the JSON it went wrong (D190).
+module pack.meta
+
+import chat.component.{Component}
+import java.regex.{Pattern}
+import json.gson.{int_value}
+import json.strict.{parse_first}
+import json.tree.{Json, Member, get, write}
+import protocol.ids.{DATA_PACK_MAJOR, DATA_PACK_MINOR}
+import resources.identifier.{Identifier}
+import server.log.{Entry}
+import std.text.utf8.{decode_lossy}
+import storage.level.{feature_names}
+
+/// The newest major format that packs from before minor formats, 1.21.9's, must still declare
+/// the old way for data packs, vanilla's `PackFormat.lastPreMinorVersion`.
+pub const LAST_PRE_MINOR: i32 = 81
+
+/// A pack format, `major.minor`, vanilla's `PackFormat`.
+pub struct Format {
+    pub major: i32
+    pub minor: i32
+}
+
+impl Format {
+    /// The format 26.3 reads.
+    pub fn current() -> Format {
+        return Format { major: DATA_PACK_MAJOR, minor: DATA_PACK_MINOR }
+    }
+
+    /// How it compares with `other`, by its major and then its minor.
+    pub fn compare(self, other: Format) -> Ordering {
+        let by_major = self.major.cmp(other.major)
+        if by_major != Ordering.Equal {
+            return by_major
+        }
+        return self.minor.cmp(other.minor)
+    }
+
+    /// As vanilla writes it: `121.0`, or `121.*` for every minor.
+    pub fn to_string(self) -> String {
+        if self.minor == i32.MAX {
+            return "{self.major}.*"
+        }
+        return "{self.major}.{self.minor}"
+    }
+}
+
+/// Whether a pack is for this version, vanilla's `PackCompatibility`, which only shows: a pack
+/// for another is loaded all the same.
+pub enum Compatibility {
+    TooOld
+    TooNew
+    /// Its formats couldn't be read.
+    Unknown
+    Compatible
+}
+
+/// What a pack's metadata says, vanilla's `Pack.Metadata`.
+pub struct PackMeta {
+    pub description: Component
+    pub compatibility: Compatibility
+    /// The feature flags it needs, a bit for each of `storage.level.feature_names`.
+    pub features: u32
+    /// The folders of its overlays whose formats take 26.3's, in the order it lists them.
+    pub overlays: List<String>
+}
+
+/// A pattern of a pack's filter, vanilla's `IdentifierPattern`: what it blocks of the packs
+/// below. A part that's `none` takes everything.
+pub struct Block {
+    pub namespace: Pattern?
+    pub path: Pattern?
+}
+
+/// Whether any of the filter's patterns takes `namespace`, vanilla's `isNamespaceFiltered`.
+pub fn blocks_namespace(filter: List<Block>, namespace: String) -> bool {
+    for b in filter {
+        match b.namespace {
+            some(p) => if p.find(namespace) { return true },
+            none => return true,
+        }
+    }
+    return false
+}
+
+/// Whether any of the filter's patterns takes `path`, vanilla's `isPathFiltered`, whichever
+/// pattern took the namespace.
+pub fn blocks_path(filter: List<Block>, path: String) -> bool {
+    for b in filter {
+        match b.path {
+            some(p) => if p.find(path) { return true },
+            none => return true,
+        }
+    }
+    return false
+}
+
+/// The metadata of the pack `id`, from its `pack.mcmeta`, `none` if it hasn't one, as
+/// `readPackMetadata` reads it, with its warnings in `logs`. `none` if it can't be read, and the
+/// pack is left out.
+pub fn read_meta(id: String, file: List<u8>?, logs: mut List<Entry>) -> PackMeta? {
+    let bytes = file else {
+        logs.push(Entry.warn("Missing metadata in pack {id}"))
+        return none
+    }
+    let root = match parse_file(bytes) {
+        ok(r) => r,
+        err(line) => {
+            // The fallback reads the file again, and fails as the first read did.
+            logs.push(Entry.warn("Error reading pack metadata, attempting fallback type\n{line}"))
+            logs.push(Entry.warn("Failed to read pack {id} metadata\n{line}"))
+            return none
+        },
+    }
+    let section = get(root, "pack") else {
+        logs.push(Entry.warn("Missing metadata in pack {id}"))
+        return none
+    }
+    let pack = match pack_section(section) {
+        ok(p) => p,
+        err(Fault.Codec(message)) => {
+            logs.push(Entry.warn("Error reading pack metadata, attempting fallback type\n{parse_exception(message)}"))
+            match description_of(section) {
+                ok(d) => Section { description: d, min: Format { major: i32.MAX, minor: 0 }, max: Format { major: i32.MAX, minor: 0 } },
+                err(f) => {
+                    logs.push(failed(id, f))
+                    return none
+                },
+            }
+        },
+        err(f) => {
+            logs.push(failed(id, f))
+            return none
+        },
+    }
+    var features: u32 = 0
+    if let f = get(root, "features") {
+        features = match features_section(f) {
+            ok(bits) => bits,
+            err(fault) => {
+                logs.push(failed(id, fault))
+                return none
+            },
+        }
+    }
+    var overlays = List<String>()
+    if let o = get(root, "overlays") {
+        overlays = match overlays_section(o, mut logs) {
+            ok(dirs) => dirs,
+            err(fault) => {
+                logs.push(failed(id, fault))
+                return none
+            },
+        }
+    }
+    return some(PackMeta { description: pack.description, compatibility: compatibility(pack.min, pack.max), features: features, overlays: overlays })
+}
+
+/// The filter of the pack `id`, from its `pack.mcmeta`, as `getPackFilterSection` reads it:
+/// `none` if it has none, or if it can't be read, which logs vanilla's error. A pattern Calcite
+/// can't match yet, such as one with Unicode properties, leaves the filter out, with a warning
+/// that says so (D190).
+pub fn read_filter(id: String, file: List<u8>?, logs: mut List<Entry>) -> List<Block>? {
+    let bytes = file else return none
+    let root = match parse_file(bytes) {
+        ok(r) => r,
+        err(_) => {
+            logs.push(Entry.error("Failed to get filter section from pack {id}"))
+            return none
+        },
+    }
+    let section = get(root, "filter") else return none
+    return match filter_section(section) {
+        ok(blocks) => some(blocks),
+        err(Refusal.Unsupported(pattern, what)) => {
+            logs.push(Entry.warn("Calcite can't match the pattern `{pattern}` in the filter of pack {id} yet, which uses {what}, so the filter is left out"))
+            none
+        },
+        err(Refusal.Broken) => {
+            logs.push(Entry.error("Failed to get filter section from pack {id}"))
+            none
+        },
+    }
+}
+
+/// Whether `dir` can name an overlay's folder, `[-_a-zA-Z0-9.]+`.
+pub fn valid_overlay(dir: String) -> bool {
+    if dir.is_empty() {
+        return false
+    }
+    for i in 0..dir.len() {
+        let c = dir.byte_at(i)
+        let allowed = c == 45 or c == 95 or c == 46 or (c >= 97 and c <= 122) or (c >= 65 and c <= 90) or (c >= 48 and c <= 57)
+        if not allowed {
+            return false
+        }
+    }
+    return true
+}
+
+// Why a section can't be read: DataFixerUpper's error, which `getOrThrow` throws as a
+// `JsonParseException`, or an exception thrown as it's read, its whole line.
+enum Fault {
+    Codec(String)
+    Thrown(String)
+}
+
+// Why a filter can't be read.
+enum Refusal {
+    Broken
+    // A pattern, and what in it Calcite can't match yet.
+    Unsupported(String, String)
+}
+
+// What a pack's `pack` section says.
+struct Section {
+    description: Component
+    min: Format
+    max: Format
+}
+
+// The line that says why the pack `id` is left out.
+fn failed(id: String, fault: Fault) -> Entry {
+    let line = match fault {
+        Fault.Codec(message) => parse_exception(message),
+        Fault.Thrown(line) => line.copy(),
+    }
+    return Entry.warn("Failed to read pack {id} metadata\n{line}")
+}
+
+fn parse_exception(message: String) -> String {
+    return "com.google.gson.JsonParseException: {message}"
+}
+
+// The object in a `pack.mcmeta`, as `GsonHelper.parse` reads it, or the line of the exception
+// it throws.
+fn parse_file(bytes: List<u8>) -> List<Member> ! String {
+    let decoded = decode_lossy(bytes, 0, bytes.len())
+    var units = List<u16>()
+    for c in decoded.chars() {
+        units.push(u16(c))
+    }
+    // Where the text ends, which Gson's `EOFException` says: its line, and its column, after a
+    // byte order mark at the start.
+    var line: usize = 1
+    var line_start: usize = if units.len() > 0 and units[0] == 0xFEFF { 1 } else { 0 }
+    for i in 0..units.len() {
+        if units[i] == 10 {
+            line += 1
+            line_start = i + 1
+        }
+    }
+    let column = units.len() - line_start + 1
+    return match parse_first(units) {
+        ok(some(Json.Object(members))) => members,
+        ok(some(v)) => {
+            fail "com.google.gson.JsonSyntaxException: Expected a com.google.gson.JsonObject but was {gson_class(v)}; at path $"
+        },
+        ok(none) => {
+            fail "com.google.gson.JsonParseException: java.io.EOFException: End of input at line {line} column {column} path $"
+        },
+        err(_) => {
+            fail String("com.google.gson.JsonParseException: com.google.gson.stream.MalformedJsonException: pack.mcmeta isn't JSON as strict Gson reads it")
+        },
+    }
+}
+
+// The class of Gson's tree a value is.
+fn gson_class(v: Json) -> String {
+    return match v {
+        Json.Null => String("com.google.gson.JsonNull"),
+        Json.Array(_) => String("com.google.gson.JsonArray"),
+        Json.Object(_) => String("com.google.gson.JsonObject"),
+        _ => String("com.google.gson.JsonPrimitive"),
+    }
+}
+
+// The value as Gson writes it.
+fn text(v: Json) -> String {
+    var out = List<u8>()
+    write(mut out, v)
+    return String.from_utf8(out) ?? String("?")
+}
+
+// A member's value as `JsonOps` gives it to a codec: a member that's `null` isn't there.
+fn field(members: List<Member>, key: String) -> Json? {
+    let v = get(members, key) else return none
+    return match v {
+        Json.Null => none,
+        _ => some(v),
+    }
+}
+
+// The members of an object, as `JsonOps.getMap` takes them.
+fn object(v: Json) -> List<Member> ! Fault {
+    return match v {
+        Json.Object(members) => members.copy(),
+        _ => {
+            fail Fault.Codec("Not a JSON object: {text(v)}")
+        },
+    }
+}
+
+// The items of an array, as `JsonOps.getStream` takes them.
+fn array(v: Json) -> List<Json> ! Fault {
+    return match v {
+        Json.Array(items) => items.copy(),
+        _ => {
+            fail Fault.Codec("Not a json array: {text(v)}")
+        },
+    }
+}
+
+// A field a codec needs.
+fn needed(v: Json, members: List<Member>, key: String) -> Json ! Fault {
+    let found = field(members, key) else {
+        fail Fault.Codec("No key {key} in MapLike[{text(v)}]")
+    }
+    return found
+}
+
+// A string as `Codec.STRING` reads it from JSON: a string, or a number as its text.
+fn string(v: Json) -> String ! Fault {
+    return match v {
+        Json.Str(s) => s.copy(),
+        Json.Number(t) => t.copy(),
+        _ => {
+            fail Fault.Codec("Not a string: {text(v)}")
+        },
+    }
+}
+
+// An int as `Codec.INT` reads it from JSON: a number as Gson's `intValue` reads it, or a
+// boolean as 1 or 0.
+fn int(v: Json) -> i32 ! Fault {
+    match v {
+        Json.Number(t) => {
+            let n = int_value(t) else {
+                fail Fault.Thrown("java.lang.NumberFormatException: {t} can't be read as an int")
+            }
+            return n
+        },
+        Json.Bool(b) => return if b { 1 } else { 0 },
+        _ => {
+            fail Fault.Codec("Not a number: {text(v)}")
+        },
+    }
+}
+
+fn non_negative(v: Json) -> i32 ! Fault {
+    let n = try int(v)
+    if n < 0 {
+        fail Fault.Codec("Value must be non-negative: {n}")
+    }
+    return n
+}
+
+// The description, as `ComponentSerialization.CODEC.fieldOf("description")` reads it.
+fn description_of(section: Json) -> Component ! Fault {
+    let members = try object(section)
+    let d = try needed(section, members, String("description"))
+    return match Component.from_json(d) {
+        ok(c) => c,
+        err(message) => {
+            fail Fault.Codec(message)
+        },
+    }
+}
+
+// The `pack` section, as the codec `PackMetadataSection.SERVER_TYPE` reads it.
+fn pack_section(section: Json) -> Section ! Fault {
+    let members = try object(section)
+    let description = try description_of(section)
+    let min = try format_at(members, String("min_format"), 0)
+    let max = try format_at(members, String("max_format"), i32.MAX)
+    var format: i32? = none
+    if let f = field(members, String("pack_format")) {
+        format = some(try int(f))
+    }
+    let supported = try range_at(members, String("supported_formats"))
+    let range = try validate(min, max, format, supported, true, false, String("Pack"), String("supported_formats"))
+    return Section { description: description, min: range.0, max: range.1 }
+}
+
+// A format, as `PackFormat.BOTTOM_CODEC` or `TOP_CODEC` reads it: a major alone, or a list of
+// one to 256 numbers, of which the first two are the major and the minor, each from 0 up. A
+// major alone has `minor`.
+fn format_at(members: List<Member>, key: String, minor: i32) -> Format? ! Fault {
+    let v = field(members, key) else return none
+    match v {
+        Json.Array(items) => {
+            // `compactListCodec` tries the list first and then the number, and says why
+            // neither took it.
+            let neither = "; Second: Not a number: {text(v)}"
+            if items.is_empty() {
+                fail Fault.Codec("Failed to parse either. First: List is too short: 0, expected range [1-256]{neither}")
+            }
+            if items.len() > 256 {
+                fail Fault.Codec("Failed to parse either. First: List is too long: {items.len()}, expected range [1-256]{neither}")
+            }
+            var numbers = List<i32>()
+            for item in items {
+                let n = match non_negative(item) {
+                    ok(n) => n,
+                    err(Fault.Codec(first)) => {
+                        fail Fault.Codec("Failed to parse either. First: {first}{neither}")
+                    },
+                    err(f) => {
+                        fail f
+                    },
+                }
+                numbers.push(n)
+            }
+            if numbers.len() > 1 {
+                return some(Format { major: numbers[0], minor: numbers[1] })
+            }
+            return some(Format { major: numbers[0], minor: minor })
+        },
+        _ => {
+            let major = match non_negative(v) {
+                ok(n) => n,
+                err(Fault.Codec(second)) => {
+                    fail Fault.Codec("Failed to parse either. First: Not a json array: {text(v)}; Second: {second}")
+                },
+                err(f) => {
+                    fail f
+                },
+            }
+            return some(Format { major: major, minor: minor })
+        },
+    }
+}
+
+// A range of majors, as `InclusiveRange.codec(Codec.INT)` reads it: one number, or two in a
+// list, or an object of `min_inclusive` and `max_inclusive`, the first no more than the second.
+fn range_at(members: List<Member>, key: String) -> (i32, i32)? ! Fault {
+    let v = field(members, key) else return none
+    var low: i32 = 0
+    var high: i32 = 0
+    match v {
+        Json.Array(items) => {
+            if items.len() != 2 {
+                fail Fault.Codec("Input is not a list of 2 elements")
+            }
+            low = try int(items[0])
+            high = try int(items[1])
+        },
+        Json.Object(fields) => {
+            low = try int(try needed(v, fields, String("min_inclusive")))
+            high = try int(try needed(v, fields, String("max_inclusive")))
+        },
+        _ => {
+            low = try int(v)
+            high = low
+        },
+    }
+    if low > high {
+        fail Fault.Codec("min_inclusive must be less than or equal to max_inclusive")
+    }
+    return some((low, high))
+}
+
+// The formats a pack or an overlay is for, checked as `PackFormat.IntermediaryFormat.validate`
+// checks them, with its messages.
+fn validate(min: Format?, max: Format?, format: i32?, supported: (i32, i32)?, has_format: bool, require_old: bool, context: String, old: String) -> (Format, Format) ! Fault {
+    let last = LAST_PRE_MINOR
+    if (min == none) != (max == none) {
+        fail Fault.Codec("{context} missing field, must declare both min_format and max_format")
+    }
+    if require_old and supported == none {
+        fail Fault.Codec("{context} missing required field {old}, must be present in all overlays for any overlays to work across game versions")
+    }
+    if let lo = min {
+        let hi = max!
+        if lo.compare(hi) == Ordering.Greater {
+            fail Fault.Codec("{context} min_format ({lo.to_string()}) is greater than max_format ({hi.to_string()})")
+        }
+        if lo.major > last and not require_old {
+            if supported != none {
+                fail Fault.Codec("{context} key {old} is deprecated starting from pack format {last + 1}. Remove {old} from your pack.mcmeta.")
+            }
+            if has_format {
+                if let f = format {
+                    try format_in(f, lo.major, hi.major)
+                }
+            }
+        } else {
+            let range = supported else {
+                fail Fault.Codec("{context} declares support for format {lo.major}, but game versions supporting formats 15 to {last} require a {old} field. Add \"{old}\": [{lo.major}, {last}] or require a version greater or equal to {last + 1}.0.")
+            }
+            if range.0 != lo.major {
+                fail Fault.Codec("{context} version declaration mismatch between {old} (from {range.0}) and min_format ({lo.to_string()})")
+            }
+            if range.1 != hi.major and range.1 != last {
+                fail Fault.Codec("{context} version declaration mismatch between {old} (up to {range.1}) and max_format ({hi.to_string()})")
+            }
+            if has_format {
+                let f = format else {
+                    fail Fault.Codec("{context} declares support for formats up to {last}, but game versions supporting formats 15 to {last} require a pack_format field. Add \"pack_format\": {lo.major} or require a version greater or equal to {last + 1}.0.")
+                }
+                try format_in(f, lo.major, hi.major)
+            }
+        }
+        return (lo, hi)
+    }
+    if let range = supported {
+        if range.1 > last {
+            fail Fault.Codec("{context} declares support for version newer than {last}, but is missing mandatory fields min_format and max_format")
+        }
+        if has_format {
+            let f = format else {
+                fail Fault.Codec("{context} declares support for formats up to {last}, but game versions supporting formats 15 to {last} require a pack_format field. Add \"pack_format\": {range.0} or require a version greater or equal to {last + 1}.0.")
+            }
+            try format_in(f, range.0, range.1)
+        }
+        return (Format { major: range.0, minor: 0 }, Format { major: range.1, minor: 0 })
+    }
+    if has_format {
+        if let f = format {
+            if f > last {
+                fail Fault.Codec("{context} declares support for version newer than {last}, but is missing mandatory fields min_format and max_format")
+            }
+            return (Format { major: f, minor: 0 }, Format { major: f, minor: 0 })
+        }
+    }
+    fail Fault.Codec("{context} could not be parsed, missing format version information")
+}
+
+// `validatePackFormatForRange`: the main format must be in the range, and from 15 up.
+fn format_in(format: i32, min: i32, max: i32) ! Fault {
+    if format < min or format > max {
+        fail Fault.Codec("Pack declared support for versions {min} to {max} but declared main format is {format}")
+    }
+    if format < 15 {
+        fail Fault.Codec(String("Multi-version packs cannot support minimum version of less than 15, since this will leave versions in range unable to load pack."))
+    }
+}
+
+// `PackCompatibility.forVersion` for 26.3's format.
+fn compatibility(min: Format, max: Format) -> Compatibility {
+    let current = Format.current()
+    if min.major == i32.MAX {
+        return Compatibility.Unknown
+    }
+    if max.compare(current) == Ordering.Less {
+        return Compatibility.TooOld
+    }
+    if current.compare(min) == Ordering.Less {
+        return Compatibility.TooNew
+    }
+    return Compatibility.Compatible
+}
+
+// The `features` section, as `FeatureFlagsMetadataSection.TYPE` reads it: the flags in
+// `enabled`, each an identifier, all of them known.
+fn features_section(section: Json) -> u32 ! Fault {
+    let members = try object(section)
+    let items = try array(try needed(section, members, String("enabled")))
+    let names = feature_names()
+    var bits: u32 = 0
+    // Listed as vanilla's `HashSet` lists them.
+    var unknown = JavaHashSet<Identifier>()
+    for item in items {
+        let s = try string(item)
+        let id = match Identifier.parse(s) {
+            ok(id) => id,
+            err(e) => {
+                fail Fault.Codec("Not a valid resource location: {s} {e}")
+            },
+        }
+        var found = false
+        var bit: u32 = 1
+        for name in names {
+            if id.namespace == "minecraft" and id.path == name {
+                bits = bits | bit
+                found = true
+            }
+            bit = bit << 1
+        }
+        if not found {
+            unknown.insert(id)
+        }
+    }
+    if not unknown.is_empty() {
+        var list = String()
+        for u in unknown {
+            if not list.is_empty() {
+                list.push_str(", ")
+            }
+            list.push_str(u.to_string())
+        }
+        fail Fault.Codec("Unknown feature ids: [{list}]")
+    }
+    return bits
+}
+
+// An overlay as the codec reads it, before its formats are checked.
+struct Overlay {
+    min: Format?
+    max: Format?
+    formats: (i32, i32)?
+    directory: String
+}
+
+// The `overlays` section, as `OverlayMetadataSection.SERVER_TYPE` reads it: each entry read,
+// then checked as `PackFormat.validateHolderList` checks them, an entry with no formats at all
+// left out with a warning. The folders of those that take 26.3's format, in order.
+fn overlays_section(section: Json, logs: mut List<Entry>) -> List<String> ! Fault {
+    let members = try object(section)
+    let items = try array(try needed(section, members, String("entries")))
+    var entries = List<Overlay>()
+    for item in items {
+        let fields = try object(item)
+        let min = try format_at(fields, String("min_format"), 0)
+        let max = try format_at(fields, String("max_format"), i32.MAX)
+        let formats = try range_at(fields, String("formats"))
+        let dir = try string(try needed(item, fields, String("directory")))
+        if not valid_overlay(dir) {
+            fail Fault.Codec("{dir} is not accepted directory name")
+        }
+        entries.push(Overlay { min: min, max: max, formats: formats, directory: dir })
+    }
+    // The lowest major any entry is for, which says whether all must give the old field too.
+    var lowest = i32.MAX
+    for e in entries {
+        var m = i32.MAX
+        if let lo = e.min {
+            m = lo.major
+            if let f = e.formats {
+                if f.0 < m {
+                    m = f.0
+                }
+            }
+        } else if let f = e.formats {
+            m = f.0
+        }
+        if m < lowest {
+            lowest = m
+        }
+    }
+    let current = Format.current()
+    var out = List<String>()
+    for e in entries {
+        if e.min == none and e.max == none and e.formats == none {
+            logs.push(Entry.warn("Unknown or broken overlay entry {e.directory}"))
+            continue
+        }
+        let range = try validate(e.min, e.max, none, e.formats, false, lowest <= LAST_PRE_MINOR, "Overlay \"{e.directory}\"", String("formats"))
+        if current.compare(range.0) != Ordering.Less and current.compare(range.1) != Ordering.Greater {
+            out.push(e.directory.copy())
+        }
+    }
+    return out
+}
+
+// The `filter` section, as `ResourceFilterSection.TYPE` reads it: the patterns in `block`, each
+// a namespace pattern and a path pattern, either left out, compiled as Java compiles them.
+fn filter_section(section: Json) -> List<Block> ! Refusal {
+    let members = match section {
+        Json.Object(m) => m.copy(),
+        _ => {
+            fail Refusal.Broken
+        },
+    }
+    let items = match field(members, String("block")) {
+        some(Json.Array(items)) => items,
+        _ => {
+            fail Refusal.Broken
+        },
+    }
+    var out = List<Block>()
+    for item in items {
+        let fields = match item {
+            Json.Object(f) => f.copy(),
+            _ => {
+                fail Refusal.Broken
+            },
+        }
+        let namespace = try pattern_at(fields, String("namespace"))
+        let path = try pattern_at(fields, String("path"))
+        out.push(Block { namespace: namespace, path: path })
+    }
+    return out
+}
+
+// A pattern as `ExtraCodecs.PATTERN` reads one, if it's there.
+fn pattern_at(fields: List<Member>, key: String) -> Pattern? ! Refusal {
+    let v = field(fields, key) else return none
+    let s = match string(v) {
+        ok(s) => s,
+        err(_) => {
+            fail Refusal.Broken
+        },
+    }
+    return match Pattern.compile(s, 0) {
+        ok(p) => some(p),
+        err(e) => {
+            if e.unsupported {
+                fail Refusal.Unsupported(s, e.description[13..])
+            }
+            fail Refusal.Broken
+        },
+    }
+}

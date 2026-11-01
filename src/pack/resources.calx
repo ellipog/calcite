@@ -1,11 +1,26 @@
-/// Data packs and the files in them, as vanilla's `ResourceManager` lists them: each file under
-/// `data/<namespace>/`, named by an identifier of its namespace and path, packs later in the list
-/// over earlier ones, and lists in `Identifier` order, path first and then namespace.
+/// Data packs and the files in them, as vanilla's `MultiPackResourceManager` lists them: each
+/// file under `data/<namespace>/`, named by an identifier of its namespace and path, packs later
+/// in the list over earlier ones, a pack's filter hiding what the packs below it have, and lists
+/// in `Identifier` order, path first and then namespace.
+///
+/// A pack is in a zip archive or a folder, and may have overlays, folders in it whose files go
+/// over its own, the last listed on top, as `OverlayedPackResources` stacks them. Vanilla's own
+/// pack and its feature packs are in the archive of Mojang's data; a world's packs are in its
+/// `datapacks` folder, a zip read whole into memory or a folder walked once, as the server
+/// starts. What vanilla logs reading a pack's namespaces is logged when the packs are opened,
+/// twice as vanilla logs it, and a file whose path can't be an identifier is logged when the
+/// folder it's in is listed, as vanilla logs it then, from a zip as `FilePackResources` and
+/// from a folder as `PathPackResources` logs it.
 module pack.resources
 
+import pack.meta.{Block, blocks_namespace, blocks_path}
 import pack.zip.{Zip}
 import protocol.codegen.{wire}
-import resources.identifier.{Identifier}
+import resources.identifier.{Identifier, valid_namespace, valid_path}
+import server.log.{Entry}
+import std.fs.{FsError, Kind, is_dir, is_file, kind, read as read_path, read_link}
+import storage.symlinks.{listed, resolve}
+import storage.world.{exception}
 
 /// A pack the client may have too, so what's in it needn't be sent: vanilla's `KnownPack`. It
 /// goes over the wire as its three strings, in configuration's `select_known_packs`.
@@ -16,28 +31,59 @@ pub struct KnownPack {
     pub version: String
 }
 
+// How deep a folder pack is walked, past which a junction leading back up stops it.
+const DEEPEST: usize = 256
+
 /// A data pack.
 pub struct Pack {
-    /// Its ID, which logs name it by: `vanilla` for the built-in pack.
+    /// Its ID, which logs name it by: `vanilla` for the built-in pack, `file/` and its name for
+    /// a world's.
     pub id: String
     /// Whether the client may know it, as vanilla's `core` pack, which every client of the same
     /// version has.
     pub known: KnownPack?
-    zip: Zip
-    // Each file under data/, sorted, and its index in `zip`.
+    // The archive in `Resources` its files are in, or `none` for a folder's.
+    archive: usize?
+    // Whether a path that can't be an identifier is logged as a zip's, or else as a folder's.
+    as_zip: bool
+    // Each file under data/, with the top layer's of each identifier, sorted.
     files: List<PackFile>
+    // Where each file of a folder's is, by its `at`.
+    paths: List<String>
+    // Its namespaces, in the order of vanilla's `HashSet` of them.
+    namespaces: List<String>
+    // The files whose paths can't be identifiers, a layer at a time from the top.
+    invalid: List<Invalid>
+    filter: List<Block>?
+    // What reading its namespaces logs, each time they're read.
+    namespace_lines: List<Entry>
+    // What reading its filter logged.
+    filter_lines: List<Entry>
 }
 
 struct PackFile {
     id: Identifier
-    index: usize
+    // Its layer, the top first.
+    layer: usize
+    // Its index in the archive, or in the pack's `paths`.
+    at: usize
+}
+
+struct Invalid {
+    namespace: String
+    path: String
 }
 
 // Vanilla's order of identifiers, its `compareTo`: by path, then by namespace. Identifiers are
-// ASCII, so comparing bytes is comparing Java's UTF-16 units.
+// ASCII, so comparing bytes is comparing Java's UTF-16 units. Of one identifier's, the top
+// layer's goes first.
 impl Order for PackFile {
     fn cmp(self, other: Self) -> Ordering {
-        return order(self.id, other.id)
+        let by_id = order(self.id, other.id)
+        if by_id != Ordering.Equal {
+            return by_id
+        }
+        return self.layer.cmp(other.layer)
     }
 }
 
@@ -50,32 +96,218 @@ pub fn order(a: Identifier, b: Identifier) -> Ordering {
     return a.namespace.cmp(b.namespace)
 }
 
-impl Pack {
-    /// The data pack in a zip archive, such as the jar bundled in Mojang's server jar, whose
-    /// files are under `data/`. Files whose names aren't identifiers are left out, as vanilla
-    /// leaves them out with a warning.
-    pub fn from_zip(id: own String, known: own KnownPack?, zip: own Zip) -> Pack {
-        var files = List<PackFile>()
-        for i in 0..zip.len() {
-            let name = zip.name(i)
-            if not name.starts_with("data/") or name.ends_with("/") {
-                continue
-            }
-            let rest = name[5..]
-            let slash = rest.find("/") else continue
-            match Identifier.parse("{rest[..slash]}:{rest[slash + 1..]}") {
-                ok(file) => files.push(PackFile { id: file, index: i }),
-                err(_) => {},
-            }
-        }
-        files.sort()
-        return Pack { id: id, known: known, zip: zip, files: files }
+// What a pack's layers hold, as they're read.
+struct Gathered {
+    files: List<PackFile>
+    paths: List<String>
+    namespaces: JavaHashSet<String>
+    invalid: List<Invalid>
+    lines: List<Entry>
+}
+
+impl Gathered {
+    fn new() -> Gathered {
+        return Gathered { files: [], paths: [], namespaces: JavaHashSet<String>(), invalid: [], lines: [] }
     }
 
-    /// A file in the pack's archive by its whole name, such as
-    /// `assets/minecraft/lang/en_us.json`, which needn't be under `data/`.
-    pub fn read_file(self, name: String) -> List<u8> ! String {
-        return try self.zip.read_named(name)
+    // The file at `path` in `namespace`, at `at`, or why it's left out.
+    fn add(mut self, namespace: String, path: String, layer: usize, at: usize) {
+        if valid_path(path) {
+            self.files.push(PackFile { id: Identifier { namespace: namespace.copy(), path: path.copy() }, layer: layer, at: at })
+        } else {
+            self.invalid.push(Invalid { namespace: namespace.copy(), path: path.copy() })
+        }
+    }
+}
+
+impl Pack {
+    /// Vanilla's own pack, as `VanillaPackResources` reads it: the files under
+    /// `data/minecraft/` in `zip`, which is archive `archive` of the resources it goes in. Its
+    /// only namespace is `minecraft`.
+    pub fn builtin(id: own String, known: own KnownPack?, archive: usize, zip: Zip) -> Pack {
+        var g = Gathered.new()
+        for i in 0..zip.len() {
+            let name = zip.name(i)
+            if name.starts_with("data/minecraft/") and not name.ends_with("/") {
+                g.add(String("minecraft"), name[15..], 0, i)
+            }
+        }
+        return finish(id, known, some(archive), false, g, ["minecraft"], none, [])
+    }
+
+    /// A pack in `zip`, which is archive `archive` of the resources it goes in, under each of
+    /// `layers`, such as `` for the archive's top and `overlay/` for an overlay's folder in it,
+    /// the top layer first. A world's zip, whose name `file` is, is read as `FilePackResources`
+    /// reads it, with its warnings: each entry's namespace, from what's after `data/` up to the
+    /// next `/`, warned of if it can't be one. One of vanilla's feature packs, whose `file` is
+    /// `none`, is a folder in Mojang's archive, read as `PathPackResources` reads one, of which
+    /// only the folders in `data/` are namespaces.
+    pub fn in_archive(id: own String, known: own KnownPack?, archive: usize, zip: Zip, layers: List<String>, file: String?, filter: own List<Block>?, filter_lines: own List<Entry>) -> Pack {
+        var g = Gathered.new()
+        for layer in 0..layers.len() {
+            let typed = "{layers[layer]}data/"
+            for i in 0..zip.len() {
+                let name = zip.name(i)
+                if not name.starts_with(typed) {
+                    continue
+                }
+                let rest = name[typed.len()..]
+                let slash = rest.find("/")
+                let namespace = match slash {
+                    some(s) => rest[..s],
+                    none => {
+                        // A file in `data/` itself is a namespace of a zip's, but not of a
+                        // folder's.
+                        if file == none {
+                            continue
+                        }
+                        rest.copy()
+                    },
+                }
+                if namespace.is_empty() {
+                    continue
+                }
+                if not valid_namespace(namespace) {
+                    if let zip_file = file {
+                        g.lines.push(Entry.warn("Non [a-z0-9_.-] character in namespace {namespace} in pack {zip_file}, ignoring"))
+                    }
+                    continue
+                }
+                g.namespaces.insert(namespace.copy())
+                if let s = slash {
+                    if not name.ends_with("/") {
+                        g.add(namespace, rest[s + 1..], layer, i)
+                    }
+                }
+            }
+        }
+        var namespaces = List<String>()
+        for n in g.namespaces {
+            namespaces.push(n.copy())
+        }
+        return finish(id, known, some(archive), file != none, g, namespaces, filter, filter_lines)
+    }
+
+    /// A pack in a folder on the disk, read as `PathPackResources` reads one: under each of
+    /// `roots`, the folder itself and the folders of its overlays in it, the top layer first. A
+    /// namespace is each folder in `data/`, following links, and a file is each regular file
+    /// in one, or in a folder in it, not following links but taking a Windows junction for a
+    /// folder, as `Files.find` finds them (D190).
+    pub fn folder(id: own String, roots: List<String>, filter: own List<Block>?, filter_lines: own List<Entry>) -> Pack {
+        var g = Gathered.new()
+        for layer in 0..roots.len() {
+            let data = resolve(roots[layer], String("data"))
+            for namespace in namespaces_in(data, mut g.lines) {
+                g.namespaces.insert(namespace.copy())
+                var found = List<Found>()
+                walk(resolve(data, namespace), String(), 0, mut found)
+                for f in found {
+                    let at = g.paths.len()
+                    g.add(namespace, f.relative, layer, at)
+                    g.paths.push(f.path.copy())
+                }
+            }
+        }
+        var namespaces = List<String>()
+        for n in g.namespaces {
+            namespaces.push(n.copy())
+        }
+        return finish(id, none, none, false, g, namespaces, filter, filter_lines)
+    }
+}
+
+// The pack, with each identifier's file from its top layer, sorted.
+fn finish(id: own String, known: own KnownPack?, archive: usize?, as_zip: bool, g: own Gathered, namespaces: own List<String>, filter: own List<Block>?, filter_lines: own List<Entry>) -> Pack {
+    var all = g.files
+    all.sort()
+    var files = List<PackFile>()
+    files.reserve(all.len())
+    for f in all {
+        let n = files.len()
+        if n > 0 and files[n - 1].id == f.id {
+            continue
+        }
+        files.push(f.copy())
+    }
+    return Pack {
+        id: id,
+        known: known,
+        archive: archive,
+        as_zip: as_zip,
+        files: files,
+        paths: g.paths,
+        namespaces: namespaces,
+        invalid: g.invalid,
+        filter: filter,
+        namespace_lines: g.lines,
+        filter_lines: filter_lines,
+    }
+}
+
+// The namespaces in the folder `data`, as `PathPackResources.getNamespaces` reads them: each
+// folder in it, following links, that can be one, in the order Java lists them, with vanilla's
+// warnings in `lines`. Nothing's there, or it's a file, is none.
+fn namespaces_in(data: String, lines: mut List<Entry>) -> List<String> {
+    var out = List<String>()
+    let names = match listed(data) {
+        ok(n) => n,
+        err(FsError.NotFound) => return out,
+        err(e) => {
+            if not is_file(data) {
+                lines.push(Entry.error("Failed to list path {data}\n{exception(e, data)}"))
+            }
+            return out
+        },
+    }
+    for name in names {
+        let path = resolve(data, name)
+        if not is_dir(path) {
+            lines.push(Entry.warn("Non-directory entry {path} found in namespace directory, rejecting"))
+        } else if valid_namespace(name) {
+            out.push(name.copy())
+        } else {
+            lines.push(Entry.warn("Non [a-z0-9_.-] character in namespace {name} in pack directory {data}, ignoring"))
+        }
+    }
+    return out
+}
+
+// A regular file a walk found: its path from where the walk started, joined with `/`, and
+// where it is.
+struct Found {
+    relative: String
+    path: String
+}
+
+// The regular files in the folder `dir` and the folders in it, in the order Java lists each
+// folder and goes into each as it comes to it, not following links but taking a junction for a
+// folder. A folder that can't be listed is passed over.
+fn walk(dir: String, relative: String, depth: usize, found: mut List<Found>) {
+    if depth > DEEPEST {
+        return
+    }
+    let names = match listed(dir) {
+        ok(n) => n,
+        err(_) => return,
+    }
+    for name in names {
+        let path = resolve(dir, name)
+        let below = if relative.is_empty() { name.copy() } else { "{relative}/{name}" }
+        match kind(path) {
+            ok(some(Kind.File)) => found.push(Found { relative: below, path: path }),
+            ok(some(Kind.Dir)) => walk(path, below, depth + 1, mut found),
+            ok(some(Kind.Link)) => {
+                match read_link(path) {
+                    ok(some(link)) => {
+                        if link.junction {
+                            walk(path, below, depth + 1, mut found)
+                        }
+                    },
+                    _ => {},
+                }
+            },
+            _ => {},
+        }
     }
 }
 
@@ -93,14 +325,54 @@ pub struct Stack {
     pub resources: List<Resource>
 }
 
-/// The packs, earliest first, so a later one's file stands in for an earlier one's.
+/// The packs, earliest first, so a later one's file stands in for an earlier one's, and the
+/// archives their files are in.
 pub struct Resources {
+    archives: List<Zip>
     packs: List<Pack>
+    // The namespaces, in the order of vanilla's `HashMap` of a manager for each.
+    namespaces: List<String>
 }
 
 impl Resources {
-    pub fn new(packs: own List<Pack>) -> Resources {
-        return Resources { packs: packs }
+    /// The packs, in `archives` or folders, as `MultiPackResourceManager` opens them, with what
+    /// it logs in `logs`: each pack's namespaces read, then for each pack its filter and its
+    /// namespaces again.
+    pub fn new(archives: own List<Zip>, packs: own List<Pack>, logs: mut List<Entry>) -> Resources {
+        var union = List<String>()
+        for p in packs {
+            for e in p.namespace_lines {
+                logs.push(e.copy())
+            }
+            for n in p.namespaces {
+                if not union.contains(n) {
+                    union.push(n.copy())
+                }
+            }
+        }
+        var managers = JavaHashSet<String>()
+        for p in packs {
+            for e in p.filter_lines {
+                logs.push(e.copy())
+            }
+            for e in p.namespace_lines {
+                logs.push(e.copy())
+            }
+            for n in union {
+                var takes = p.namespaces.contains(n)
+                if let f = p.filter {
+                    takes = takes or blocks_namespace(f, n)
+                }
+                if takes {
+                    managers.insert(n.copy())
+                }
+            }
+        }
+        var namespaces = List<String>()
+        for n in managers {
+            namespaces.push(n.copy())
+        }
+        return Resources { archives: archives, packs: packs, namespaces: namespaces }
     }
 
     /// The ID of the pack at `i`.
@@ -132,9 +404,10 @@ impl Resources {
 
     /// The files under `directory` in each namespace, in it or a folder in it, whose paths end
     /// with `suffix`, from the last pack that has each, in vanilla's order: its `listResources`.
-    pub fn list(self, directory: String, suffix: String) -> List<Resource> {
+    /// What vanilla logs listing them goes in `logs`.
+    pub fn list(self, directory: String, suffix: String, logs: mut List<Entry>) -> List<Resource> {
         var out = List<Resource>()
-        for s in self.stacks(directory, suffix) {
+        for s in self.stacks(directory, suffix, mut logs) {
             let last = s.resources.len() - 1
             out.push(s.resources[last].copy())
         }
@@ -142,17 +415,36 @@ impl Resources {
     }
 
     /// The files `list` gives, each with every pack's file of that identifier: vanilla's
-    /// `listResourceStacks`.
-    pub fn stacks(self, directory: String, suffix: String) -> List<Stack> {
-        var found = List<Resource>()
+    /// `listResourceStacks`. A pack's file is left out if a pack above it has a filter that
+    /// takes both its namespace and its path, and `.mcmeta` files, which are other files'
+    /// metadata, aren't listed.
+    pub fn stacks(self, directory: String, suffix: String, logs: mut List<Entry>) -> List<Stack> {
         let prefix = "{directory}/"
+        // Each namespace's manager lists its packs' files in turn, each layer from the top.
+        for n in self.namespaces {
+            for p in self.packs {
+                if not p.namespaces.contains(n) {
+                    continue
+                }
+                for bad in p.invalid {
+                    if bad.namespace == n and bad.path.starts_with(prefix) {
+                        if p.as_zip {
+                            logs.push(Entry.warn("Invalid path in datapack: {n}:{bad.path}, ignoring"))
+                        } else {
+                            logs.push(Entry.error("Invalid path in pack: {n}:{bad.path}, ignoring"))
+                        }
+                    }
+                }
+            }
+        }
+        var found = List<Resource>()
         for p in 0..self.packs.len() {
             // The files are in path order, so those under the directory are together.
             var i = first_at_least(self.packs[p].files, prefix)
             let n = self.packs[p].files.len()
             while i < n and self.packs[p].files[i].id.path.starts_with(prefix) {
-                if self.packs[p].files[i].id.path.ends_with(suffix) {
-                    found.push(Resource { id: self.packs[p].files[i].id.copy(), pack: p, file: self.packs[p].files[i].index })
+                if self.packs[p].files[i].id.path.ends_with(suffix) and not self.packs[p].files[i].id.path.ends_with(".mcmeta") and not self.hidden(p, self.packs[p].files[i].id) {
+                    found.push(Resource { id: self.packs[p].files[i].id.copy(), pack: p, file: self.packs[p].files[i].at })
                 }
                 i += 1
             }
@@ -170,9 +462,28 @@ impl Resources {
         return out
     }
 
+    // Whether a pack above `pack` has a filter that takes `id`.
+    fn hidden(self, pack: usize, id: Identifier) -> bool {
+        for q in pack + 1..self.packs.len() {
+            if let f = self.packs[q].filter {
+                if blocks_namespace(f, id.namespace) and blocks_path(f, id.path) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     /// What the file holds, or why it can't be read.
     pub fn read(self, r: Resource) -> List<u8> ! String {
-        return try self.packs[r.pack].zip.read(r.file)
+        if let a = self.packs[r.pack].archive {
+            return try self.archives[a].read(r.file)
+        }
+        let path = self.packs[r.pack].paths[r.file].copy()
+        return match read_path(path) {
+            ok(b) => b,
+            err(e) => fail exception(e, path),
+        }
     }
 }
 
