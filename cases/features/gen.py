@@ -388,7 +388,7 @@ def main():
     providers(g, cases)
     unread(g, cases)
     end_spikes(g, cases)
-    write_file(HERE / "generated.json", "features", f"cases/features/gen.py, seed {SEED}", cases, probe_version=3)
+    write_file(HERE / "generated.json", "features", f"cases/features/gen.py, seed {SEED}", cases, probe_version=4)
 
 
 if __name__ == "__main__":

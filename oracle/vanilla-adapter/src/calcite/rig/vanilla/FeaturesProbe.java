@@ -63,6 +63,7 @@ import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.ChunkGenerator;
+import net.minecraft.world.level.chunk.ChunkGeneratorStructureState;
 import net.minecraft.world.level.chunk.PalettedContainerFactory;
 import net.minecraft.world.level.chunk.ProtoChunk;
 import net.minecraft.world.level.chunk.UpgradeData;
@@ -70,6 +71,7 @@ import net.minecraft.world.level.chunk.status.ChunkPyramid;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.dimension.BuiltinDimensionTypes;
 import net.minecraft.world.level.dimension.DimensionType;
+import net.minecraft.world.level.levelgen.Beardifier;
 import net.minecraft.world.level.levelgen.Heightmap;
 import net.minecraft.world.level.levelgen.NoiseBasedChunkGenerator;
 import net.minecraft.world.level.levelgen.NoiseChunk;
@@ -108,6 +110,13 @@ import net.minecraft.world.ticks.SavedTick;
  * {@code structure_starts}, as a server holds them. Its level is a stand-in for a
  * {@code ServerLevel}, made without its constructor, that notes the point-of-interest changes
  * the region tells it of. Structures don't generate: the probe's structure manager says so.
+ *
+ * <p>A `structured` op decorates with structures. The chunks out to 9 around get their starts, as
+ * the `structures` probe's `bearded` op makes them, and each of the 3×3 its references and its
+ * terrain filled with their beardifier. The region's chunks are given those starts, and the 3×3
+ * their references, and the structure manager says structures generate. Entities are written
+ * only as their type, position and rotation, since the rest of what an entity saves is random
+ * or set as it's spawned.
  */
 final class FeaturesProbe implements Probe {
     private static final long MAX_CHUNKS = 64;
@@ -131,7 +140,7 @@ final class FeaturesProbe implements Probe {
 
     @Override
     public int version() {
-        return 3;
+        return 4;
     }
 
     /** The level, as far as the region and features ask it. */
@@ -361,6 +370,11 @@ final class FeaturesProbe implements Probe {
                     throw new CaseError(what + " must have 3 elements");
                 }
                 steps.add(new long[] {0, Args.asInt(op.get(1), what + "[1]"), Args.asInt(op.get(2), what + "[2]")});
+            } else if (kind.equals("structured")) {
+                if (op.size() != 3) {
+                    throw new CaseError(what + " must have 3 elements");
+                }
+                steps.add(new long[] {2, Args.asInt(op.get(1), what + "[1]"), Args.asInt(op.get(2), what + "[2]")});
             } else if (kind.equals("place")) {
                 if (op.size() != 7) {
                     throw new CaseError(what + " must have 7 elements");
@@ -431,15 +445,45 @@ final class FeaturesProbe implements Probe {
                     return fake;
                 }
             }, true, fake.type.hasSkyLight());
+            ChunkGeneratorStructureState structureState = null;
             for (long[] op : steps) {
                 fake.poi = new ArrayList<>();
                 int cx = (int) op[1];
                 int cz = (int) op[2];
-                Map<Long, ProtoChunk> chunks = terrain(generator, settings.value(), state, source, seed, heights, containers, cx, cz);
-                WorldGenRegion region = region(fake, chunks, generator, source, state, seed, heights, containers, cx, cz);
+                Map<Long, ProtoChunk> starts = null;
+                Map<Long, Beardifier> beards = new HashMap<>();
+                if (op[0] == 2) {
+                    if (structureState == null) {
+                        structureState = generator.createState(access.lookupOrThrow(Registries.STRUCTURE_SET), state, seed);
+                    }
+                    ResourceKey<net.minecraft.world.level.Level> dimension = id.getPath().equals("nether")
+                            ? net.minecraft.world.level.Level.NETHER
+                            : id.getPath().equals("end") ? net.minecraft.world.level.Level.END : net.minecraft.world.level.Level.OVERWORLD;
+                    starts = StructuresProbe.startsAround(access, generator, structureState, templates, dimension, heights, containers, new ChunkPos(cx, cz), 9);
+                    StructureManager startsManager = StructuresProbe.manager(starts);
+                    for (int dz = -1; dz <= 1; dz++) {
+                        for (int dx = -1; dx <= 1; dx++) {
+                            ProtoChunk withStarts = starts.get(ChunkPos.pack(cx + dx, cz + dz));
+                            StructuresProbe.references(access, generator, startsManager, withStarts);
+                            beards.put(withStarts.getPos().pack(), Beardifier.forStructuresInChunk(startsManager, withStarts.getPos()));
+                        }
+                    }
+                }
+                Map<Long, ProtoChunk> chunks = terrain(generator, settings.value(), state, source, seed, heights, containers, cx, cz, beards);
+                WorldGenRegion region = region(fake, chunks, generator, source, state, seed, heights, containers, cx, cz, starts);
                 ProtoChunk center = chunks.get(ChunkPos.pack(cx, cz));
                 if (op[0] == 0) {
                     StructureManager structures = new StructureManager(region, new WorldOptions(seed, false, false), null);
+                    generator.applyBiomeDecoration(region, center, structures);
+                } else if (op[0] == 2) {
+                    for (int dz = -1; dz <= 1; dz++) {
+                        for (int dx = -1; dx <= 1; dx++) {
+                            long key = ChunkPos.pack(cx + dx, cz + dz);
+                            chunks.get(key).setAllStarts(starts.get(key).getAllStarts());
+                            chunks.get(key).setAllReferences(starts.get(key).getAllReferences());
+                        }
+                    }
+                    StructureManager structures = new StructureManager(region, new WorldOptions(seed, true, false), null);
                     generator.applyBiomeDecoration(region, center, structures);
                 } else {
                     WorldgenRandom random = new WorldgenRandom(new XoroshiroRandomSource(0L));
@@ -448,7 +492,7 @@ final class FeaturesProbe implements Probe {
                 }
                 for (int dz = -1; dz <= 1; dz++) {
                     for (int dx = -1; dx <= 1; dx++) {
-                        write(chunks.get(ChunkPos.pack(cx + dx, cz + dz)), access, out);
+                        write(chunks.get(ChunkPos.pack(cx + dx, cz + dz)), access, out, op[0] == 2);
                     }
                 }
                 out.writeInt(fake.poi.size());
@@ -497,7 +541,8 @@ final class FeaturesProbe implements Probe {
             LevelHeightAccessor heights,
             PalettedContainerFactory containers,
             int cx,
-            int cz) {
+            int cz,
+            Map<Long, Beardifier> beards) {
         Map<Long, ProtoChunk> chunks = new HashMap<>();
         for (int dz = -2; dz <= 2; dz++) {
             for (int dx = -2; dx <= 2; dx++) {
@@ -538,7 +583,7 @@ final class FeaturesProbe implements Probe {
                 }, BiomeManager.obfuscateSeed(seed));
                 NoiseSettings noise = settings.noiseSettings().clampToHeightAccessor(chunk.getHeightAccessorForGeneration());
                 if (noise.height() > 0) {
-                    try (NoiseChunk noiseChunk = TerrainProbe.noiseChunk(generator, settings, state, chunk, noise)) {
+                    try (NoiseChunk noiseChunk = TerrainProbe.noiseChunk(generator, settings, state, chunk, noise, beards.get(ChunkPos.pack(x, z)))) {
                         TerrainProbe.doFill(generator, noiseChunk, chunk);
                         WorldGenerationContext context = new WorldGenerationContext(generator, chunk.getHeightAccessorForGeneration());
                         state.surfaceSystem().buildSurface(state, biomes, context, chunk, noiseChunk, rule, possibleBiomes);
@@ -566,7 +611,8 @@ final class FeaturesProbe implements Probe {
             LevelHeightAccessor heights,
             PalettedContainerFactory containers,
             int cx,
-            int cz) throws Exception {
+            int cz,
+            Map<Long, ProtoChunk> starts) throws Exception {
         WorldGenRegion region = (WorldGenRegion) allocate(WorldGenRegion.class);
         ProtoChunk center = chunks.get(ChunkPos.pack(cx, cz));
         StaticCache2D<ChunkAccess> cache = StaticCache2D.create(cx, cz, 8, (x, z) -> {
@@ -575,6 +621,9 @@ final class FeaturesProbe implements Probe {
             }
             ProtoChunk empty = new ProtoChunk(new ChunkPos(x, z), UpgradeData.EMPTY, heights, containers, null);
             empty.setPersistedStatus(ChunkStatus.STRUCTURE_STARTS);
+            if (starts != null) {
+                empty.setAllStarts(starts.get(ChunkPos.pack(x, z)).getAllStarts());
+            }
             return empty;
         });
         set(region, "cache", cache);
@@ -631,7 +680,7 @@ final class FeaturesProbe implements Probe {
      * entities, each with its UUID zeroed: an entity's UUID comes from a random seeded by the
      * clock, so no two runs give the same.
      */
-    private static void write(ProtoChunk chunk, RegistryAccess access, DataOutputStream out) throws IOException {
+    private static void write(ProtoChunk chunk, RegistryAccess access, DataOutputStream out, boolean structured) throws IOException {
         TerrainProbe.write(chunk, out);
         for (Heightmap.Types type : FINAL) {
             for (int z = 0; z < 16; z++) {
@@ -670,6 +719,16 @@ final class FeaturesProbe implements Probe {
             CompoundTag masked = entity.copy();
             if (masked.contains("UUID")) {
                 masked.putIntArray("UUID", new int[4]);
+            }
+            if (structured) {
+                // Only the type, position and rotation.
+                CompoundTag kept = new CompoundTag();
+                for (String key : List.of("id", "Pos", "Rotation")) {
+                    if (entity.contains(key)) {
+                        kept.put(key, entity.get(key).copy());
+                    }
+                }
+                masked = kept;
             }
             NbtIo.writeAnyTag(masked, out);
         }

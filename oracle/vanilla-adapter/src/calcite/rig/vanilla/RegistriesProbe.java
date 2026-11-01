@@ -19,6 +19,8 @@ import net.minecraft.core.LayeredRegistryAccess;
 import net.minecraft.core.Registry;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.RegistrySynchronization;
+import net.minecraft.core.component.DataComponentInitializers;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.Tag;
@@ -87,6 +89,9 @@ final class RegistriesProbe implements Probe {
         staticTags.forEach(Registry.PendingTags::apply);
         knownPacks = resources.listPacks().flatMap(p -> p.location().knownPackInfo().stream()).toList();
         layers = initial.replaceFrom(RegistryLayer.WORLD, world);
+        // Items' default components, which `ReloadableServerResources` binds as a server starts:
+        // an item stack can't be made without them, and structures make some as they place.
+        BuiltInRegistries.DATA_COMPONENT_INITIALIZERS.build(layers.compositeAccess()).forEach(DataComponentInitializers.PendingComponents::apply);
     }
 
     /** The server's known packs, which it offers in `select_known_packs`. */

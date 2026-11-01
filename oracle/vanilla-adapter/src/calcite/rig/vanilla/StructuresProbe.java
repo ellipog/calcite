@@ -286,40 +286,11 @@ final class StructuresProbe implements Probe {
             PalettedContainerFactory containers,
             ChunkPos target,
             DataOutputStream out) throws Exception {
-        Map<Long, ProtoChunk> chunks = new HashMap<>();
-        for (int x = target.x() - 8; x <= target.x() + 8; x++) {
-            for (int z = target.z() - 8; z <= target.z() + 8; z++) {
-                ProtoChunk chunk = new ProtoChunk(new ChunkPos(x, z), UpgradeData.EMPTY, heights, containers, null);
-                StructureManager manager = (StructureManager) FeaturesProbe.allocate(StructureManager.class);
-                generator.createStructures(access, structures, manager, chunk, templates, dimension);
-                chunks.put(ChunkPos.pack(x, z), chunk);
-            }
-        }
+        Map<Long, ProtoChunk> chunks = startsAround(access, generator, structures, templates, dimension, heights, containers, target, 8);
         ProtoChunk chunk = chunks.get(ChunkPos.pack(target.x(), target.z()));
-        // A level of those chunks alone, which is all `createReferences` and the structure manager read.
-        WorldGenLevel level = (WorldGenLevel) Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(), new Class<?>[] {WorldGenLevel.class}, (proxy, method, arguments) -> {
-            if (method.getName().equals("getChunk") && arguments != null && arguments.length >= 2 && arguments[0] instanceof Integer x && arguments[1] instanceof Integer z) {
-                ChunkAccess found = chunks.get(ChunkPos.pack(x, z));
-                if (found == null) {
-                    throw new IllegalStateException("no chunk " + x + ", " + z);
-                }
-                return found;
-            }
-            throw new UnsupportedOperationException(method.getName());
-        });
-        StructureManager manager = (StructureManager) FeaturesProbe.allocate(StructureManager.class);
-        Field managerLevel = StructureManager.class.getDeclaredField("level");
-        managerLevel.setAccessible(true);
-        managerLevel.set(manager, level);
-        generator.createReferences(level, manager, chunk);
+        StructureManager manager = manager(chunks);
+        Map<Structure, LongSet> ordered = references(access, generator, manager, chunk);
         var registry = access.lookupOrThrow(Registries.STRUCTURE);
-        Map<Structure, LongSet> ordered = new LinkedHashMap<>();
-        chunk.getAllReferences().entrySet().stream()
-                .sorted(Comparator.comparingInt(e -> registry.getId(e.getKey())))
-                .forEach(e -> ordered.put(e.getKey(), e.getValue()));
-        Field references = ChunkAccess.class.getDeclaredField("structureReferences");
-        references.setAccessible(true);
-        references.set(chunk, ordered);
         out.writeInt(ordered.size());
         for (Map.Entry<Structure, LongSet> e : ordered.entrySet()) {
             out.writeUTF(registry.getKey(e.getKey()).toString());
@@ -336,6 +307,68 @@ final class StructuresProbe implements Probe {
             }
         }
         TerrainProbe.write(chunk, out);
+    }
+
+    /** New chunks out to {@code radius} from {@code target}, each with the starts {@code createStructures} makes in it. */
+    static Map<Long, ProtoChunk> startsAround(
+            RegistryAccess.Frozen access,
+            NoiseBasedChunkGenerator generator,
+            ChunkGeneratorStructureState structures,
+            FeaturesProbe.Templates templates,
+            ResourceKey<Level> dimension,
+            LevelHeightAccessor heights,
+            PalettedContainerFactory containers,
+            ChunkPos target,
+            int radius) throws Exception {
+        Map<Long, ProtoChunk> chunks = new HashMap<>();
+        for (int x = target.x() - radius; x <= target.x() + radius; x++) {
+            for (int z = target.z() - radius; z <= target.z() + radius; z++) {
+                ProtoChunk chunk = new ProtoChunk(new ChunkPos(x, z), UpgradeData.EMPTY, heights, containers, null);
+                StructureManager manager = (StructureManager) FeaturesProbe.allocate(StructureManager.class);
+                generator.createStructures(access, structures, manager, chunk, templates, dimension);
+                chunks.put(ChunkPos.pack(x, z), chunk);
+            }
+        }
+        return chunks;
+    }
+
+    /** A structure manager over a level of those chunks alone, which is all `createReferences` and the manager read. */
+    static StructureManager manager(Map<Long, ProtoChunk> chunks) throws Exception {
+        WorldGenLevel level = (WorldGenLevel) Proxy.newProxyInstance(WorldGenLevel.class.getClassLoader(), new Class<?>[] {WorldGenLevel.class}, (proxy, method, arguments) -> {
+            if (method.getName().equals("getChunk") && arguments != null && arguments.length >= 2 && arguments[0] instanceof Integer x && arguments[1] instanceof Integer z) {
+                ChunkAccess found = chunks.get(ChunkPos.pack(x, z));
+                if (found == null) {
+                    throw new IllegalStateException("no chunk " + x + ", " + z);
+                }
+                return found;
+            }
+            throw new UnsupportedOperationException(method.getName());
+        });
+        StructureManager manager = (StructureManager) FeaturesProbe.allocate(StructureManager.class);
+        Field managerLevel = StructureManager.class.getDeclaredField("level");
+        managerLevel.setAccessible(true);
+        managerLevel.set(manager, level);
+        return manager;
+    }
+
+    /**
+     * {@code createReferences} for the chunk, its references then put in the structure registry's
+     * order, as the chunk then keeps them.
+     */
+    static Map<Structure, LongSet> references(RegistryAccess.Frozen access, NoiseBasedChunkGenerator generator, StructureManager manager, ChunkAccess chunk)
+            throws Exception {
+        Field levelField = StructureManager.class.getDeclaredField("level");
+        levelField.setAccessible(true);
+        generator.createReferences((WorldGenLevel) levelField.get(manager), manager, chunk);
+        var registry = access.lookupOrThrow(Registries.STRUCTURE);
+        Map<Structure, LongSet> ordered = new LinkedHashMap<>();
+        chunk.getAllReferences().entrySet().stream()
+                .sorted(Comparator.comparingInt(e -> registry.getId(e.getKey())))
+                .forEach(e -> ordered.put(e.getKey(), e.getValue()));
+        Field references = ChunkAccess.class.getDeclaredField("structureReferences");
+        references.setAccessible(true);
+        references.set(chunk, ordered);
+        return ordered;
     }
 
     /** The chunk's starts as a chunk's {@code structures.starts} compound saves them. */
