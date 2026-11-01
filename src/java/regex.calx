@@ -212,6 +212,10 @@ pub struct Pattern {
     groups: i32
     locals: i32
     memos: u32
+    // Java's `hasSupplementary`: whether the pattern has a character beyond the BMP, or a class or
+    // single character whose predicate isn't one of Java's `BmpCharPredicate`s, which `find`
+    // starts only between code points for.
+    supplementary: bool
 }
 
 impl Pattern {
@@ -223,8 +227,10 @@ impl Pattern {
             f = f | UNICODE_CASE
         }
         var cps = List<u32>()
+        var supplementary = false
         for r in text.runes() {
             cps.push(u32(r))
+            supplementary = supplementary or u32(r) >= 0x10000
         }
         let temp = if (f & LITERAL) != 0 { cps } else { unquote(cps) }
         let plen = i32.wrap(temp.len())
@@ -239,6 +245,7 @@ impl Pattern {
                 groups: 1,
                 locals: 0,
                 memos: 0,
+                supplementary: supplementary,
             },
             temp: temp,
             plen: plen,
@@ -273,18 +280,46 @@ impl Pattern {
     /// Whether the whole of the UTF-16 units `input` matches, for text a `String` can't hold,
     /// such as a lone surrogate in a Windows file name.
     pub fn matches_units(self, input: own List<u16>) -> bool {
+        var s = self.state(input, true)
+        return self.m(self.root, 0, mut s)
+    }
+
+    /// Whether some part of `input` matches, as Java's `pattern.matcher(input).find()` and
+    /// `Pattern.asPredicate` answer: a match is tried from each UTF-16 unit in turn, or each code
+    /// point for a pattern with a character beyond the BMP in it, as Java's `Start` and `StartS`
+    /// try them, the end needn't be the input's, and the loops' memory of where they failed is
+    /// kept from one start to the next, as `Matcher.search` keeps it.
+    pub fn find(self, input: String) -> bool {
+        var units = List<u16>()
+        for c in input.chars() {
+            units.push(u16(c))
+        }
+        var s = self.state(units, false)
+        var start: i32 = 0
+        while start <= s.len {
+            if self.m(self.root, start, mut s) {
+                return true
+            }
+            let both = self.supplementary and is_high(s.unit(start)) and is_low(s.unit(start + 1))
+            start += if both { 2 } else { 1 }
+        }
+        return false
+    }
+
+    // A match's state over `input`, the whole of which must match if `whole`.
+    fn state(self, input: own List<u16>, whole: bool) -> State {
         let len = i32.wrap(input.len())
         let g = if self.groups > 10 { self.groups } else { 10 }
-        var s = State {
+        return State {
             text: input,
             len: len,
+            whole: whole,
             groups: [-1; usize.wrap(g * 2)],
             locals: [-1; usize.wrap(self.locals)],
             failed: [false; usize(self.memos) * usize.wrap(len + 1)],
             last: 0,
             behind_to: 0,
         }
-        return self.m(self.root, 0, mut s)
     }
 
     // Whether code point `c` is one the predicate takes.
@@ -324,7 +359,7 @@ impl Pattern {
                     return true
                 },
                 Last => {
-                    if i != s.len {
+                    if s.whole and i != s.len {
                         return false
                     }
                     s.last = i
@@ -1057,11 +1092,13 @@ impl Info {
     }
 }
 
-// A match in progress: the input, the groups' bounds, the nodes' locals, the positions where a
-// memoized loop failed, where the last chain stopped, and where a lookbehind started.
+// A match in progress: the input, whether all of it must match, the groups' bounds, the nodes'
+// locals, the positions where a memoized loop failed, where the last chain stopped, and where a
+// lookbehind started.
 struct State {
     text: List<u16>
     len: i32
+    whole: bool
     groups: List<i32>
     locals: List<i32>
     failed: List<bool>
@@ -1199,6 +1236,22 @@ impl Parser {
             fail self.error("Unexpected internal error")
         }
         self.pat.root = r
+        // A pattern that starts with four or more literal code points, matched case by case, is
+        // searched for as Java's `BnM` searches, which `BnMS` does a code point at a time if one
+        // of them is beyond the BMP or a surrogate.
+        match self.pat.nodes[usize(r)] {
+            Slice { start, len, fold } => {
+                if fold == 0 and len >= 4 {
+                    for k in start..start + len {
+                        let c = self.pat.items[usize(k)]
+                        if c >= 0x10000 or (c >= 0xD800 and c <= 0xDFFF) {
+                            self.pat.supplementary = true
+                        }
+                    }
+                }
+            },
+            _ => {},
+        }
         if not self.has_backref {
             for k in 0usize..self.closures.len() {
                 let lp = usize(self.closures[k])
@@ -1418,7 +1471,7 @@ impl Parser {
                 continue
             } else if c == LBRACKET {
                 let p = try self.clazz(true)
-                node = self.add(Node.Char { pred: p })
+                node = self.char_node(p)
             } else if c == BACKSLASH {
                 let e = self.next_raw()
                 if e == 0x70 or e == 0x50 {
@@ -1519,7 +1572,7 @@ impl Parser {
         }
         if buf.len() == 1 {
             let p = self.single(buf[0])
-            return self.add(Node.Char { pred: p })
+            return self.char_node(p)
         }
         return self.slice(buf)
     }
@@ -2245,7 +2298,37 @@ impl Parser {
         }
         self.pred = id
         if not inclass {
-            self.root = self.add(Node.Char { pred: id })
+            self.root = self.char_node(id)
+        }
+    }
+
+    // A node for one code point predicate `p` takes, as Java's `newCharProperty` makes it, which
+    // has `find` start only between code points if `p` isn't a BMP predicate.
+    fn char_node(mut self, p: u32) -> u32 {
+        if not self.bmp(p) {
+            self.pat.supplementary = true
+        }
+        return self.add(Node.Char { pred: p })
+    }
+
+    // Whether Java's predicate for `p` is a `BmpCharPredicate`: its bits, a BMP character that
+    // isn't a surrogate, the same either case for ASCII, a range below the surrogates or between
+    // them and the supplementary characters, the ASCII classes and the horizontal and vertical
+    // spaces, or a union or intersection of those; never one negated.
+    fn bmp(self, p: u32) -> bool {
+        return match self.pat.preds[usize(p)] {
+            Single(x) => x < 0xD800 or (x > 0xDFFF and x < 0x10000),
+            SingleI(_, _) => true,
+            Bits(_) => true,
+            Range(a, b) => b < 0xD800 or (a > 0xDFFF and b < 0x10000),
+            Digit => true,
+            Space => true,
+            Word => true,
+            HSpace => true,
+            VSpace => true,
+            Or(a, b) => self.bmp(a) and self.bmp(b),
+            And(a, b) => self.bmp(a) and self.bmp(b),
+            _ => false,
         }
     }
 
