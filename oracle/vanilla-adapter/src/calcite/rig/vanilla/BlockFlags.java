@@ -83,7 +83,7 @@ final class BlockFlags {
 
     private BlockFlags() {}
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args) throws IOException, ReflectiveOperationException {
         if (args.length != 1) {
             throw new IllegalArgumentException("usage: BlockFlags OUTPUT.json");
         }
@@ -124,6 +124,13 @@ final class BlockFlags {
         StringBuilder survive = new StringBuilder();
         StringBuilder placeOn = new StringBuilder();
         StringBuilder shape = new StringBuilder();
+        // `FireBlock.canBurn`: the blocks fire's ignite odds are above 0 for.
+        StringBuilder flammable = new StringBuilder();
+        java.lang.reflect.Field igniteField = net.minecraft.world.level.block.FireBlock.class.getDeclaredField("igniteOdds");
+        igniteField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        it.unimi.dsi.fastutil.objects.Object2IntMap<Block> ignite =
+                (it.unimi.dsi.fastutil.objects.Object2IntMap<Block>) igniteField.get(net.minecraft.world.level.block.Blocks.FIRE);
         Map<String, String> parents = new java.util.TreeMap<>();
         for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
             Class<?> type = BuiltInRegistries.BLOCK.byId(id).getClass();
@@ -142,6 +149,9 @@ final class BlockFlags {
             String u = declaring(type, "updateShape", BlockState.class, net.minecraft.world.level.LevelReader.class,
                     net.minecraft.world.level.ScheduledTickAccess.class, BlockPos.class, Direction.class, BlockPos.class,
                     BlockState.class, net.minecraft.util.RandomSource.class);
+            if (ignite.getInt(BuiltInRegistries.BLOCK.byId(id)) > 0) {
+                flammable.append(flammable.isEmpty() ? "" : ", ").append(id);
+            }
             shape.append(id == 0 ? "\"" : ", \"").append(u).append("\"");
         }
         StringBuilder parentJson = new StringBuilder();
@@ -156,6 +166,7 @@ final class BlockFlags {
         json.append("  \"survive_classes\": [").append(survive).append("],\n");
         json.append("  \"place_on_classes\": [").append(placeOn).append("],\n");
         json.append("  \"shape_classes\": [").append(shape).append("],\n");
+        json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
         json.append("  \"class_parents\": {").append(parentJson).append("},\n");
         json.append("  \"poi\": [").append(poi).append("]");
         json.append(",\n  \"collision\": [").append(collision).append("],\n");

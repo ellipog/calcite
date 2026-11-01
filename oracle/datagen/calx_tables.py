@@ -440,6 +440,9 @@ def block_facts_module(index, flags):
     lines += number_list(
         "shape_classes", "classes", [where[c] if c else none for c in flags["shape_classes"]],
         [f"/// The class whose `updateShape` each block runs, by its index in `class_names`, in block ID order."])
+    lines += number_list(
+        "flammable_blocks", "blocks", flags["flammable_blocks"],
+        ["/// The blocks fire can burn, by ID: those `FireBlock`'s ignite odds are above 0 for."])
     pairs = [str(v) for pair in flags["poi"] for v in pair]
     lines += [
         "/// The states that are points of interest, each followed by its type's ID in the",
