@@ -1,0 +1,452 @@
+/// Sculk patches: `SculkPatchFeature` and the world generation `SculkSpreader` it drives, whose
+/// charge cursors creep over sculk and veins, turn what they cross to sculk, spread veins, and
+/// raise sensors and shriekers, as the blocks' `SculkBehaviour`s do it.
+module worldgen.sculk
+
+import json.tree.{Member}
+import random.source.{RandomSource}
+import worldgen.codec.{int_range_field}
+import worldgen.facts.{DOWN, EAST, EMPTY_FLUID, FULL, Facts, NORTH, SOUTH, UP, WATER_FLUID, WEST, opposite, step_x, step_y, step_z}
+import worldgen.interval.{Thrown}
+import worldgen.multiface.{all_shuffled, shuffle, spread_all}
+import worldgen.region.{Region}
+import worldgen.survive.{attaches_state, direction_property}
+
+/// `SculkSpreader.createWorldGenSpreader`'s numbers.
+const GROWTH_SPAWN_COST: i32 = 50
+const CHARGE_DECAY_RATE: i32 = 5
+const ADDITIONAL_DECAY_RATE: i32 = 10
+/// `SculkSpreader.MAX_CURSORS` and `MAX_CHARGE`.
+const MAX_CURSORS: usize = 32
+const MAX_CHARGE: i32 = 1000
+
+/// A `sculk_patch`, as read.
+pub struct SculkPatch {
+    charges: i32
+    amount: i32
+    attempts: i32
+    growth: i32
+    spread: i32
+}
+
+pub fn read_sculk_patch(m: List<Member>) -> SculkPatch ! String {
+    return SculkPatch {
+        charges: try int_range_field(m, "charge_count", 1, 32),
+        amount: try int_range_field(m, "amount_per_charge", 1, 500),
+        attempts: try int_range_field(m, "spread_attempts", 1, 64),
+        growth: try int_range_field(m, "growth_rounds", 0, 8),
+        spread: try int_range_field(m, "spread_rounds", 0, 8),
+    }
+}
+
+// `SculkSpreader.ChargeCursor`. The facings are a mask of directions, -1 for none known.
+struct Cursor {
+    x: i32
+    y: i32
+    z: i32
+    charge: i32
+    update_delay: i32
+    decay_delay: i32
+    facings: i32
+}
+
+// Which `SculkBehaviour` a block has.
+const DEFAULT: i32 = 0
+const SCULK: i32 = 1
+const VEIN: i32 = 2
+
+fn behaviour(f: Facts, state: u32) -> i32 {
+    if f.is(state, f.ids.sculk) {
+        return SCULK
+    }
+    if f.is(state, f.ids.sculk_vein) {
+        return VEIN
+    }
+    return DEFAULT
+}
+
+/// `SculkPatchFeature.place`.
+pub fn place_sculk_patch<T: RandomSource>(f: Facts, r: mut Region, rand: mut T, p: SculkPatch, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if not try can_spread_from(f, r, x, y, z) {
+        return false
+    }
+    let total = p.spread + p.growth
+    for round in 0..total {
+        var cursors = List<Cursor>()
+        for _ in 0..p.charges {
+            // `addCursors`: the charge in cursors of at most 1000, while there's room.
+            var charge = p.amount
+            while charge > 0 {
+                let current = charge.min(MAX_CHARGE)
+                if cursors.len() < MAX_CURSORS {
+                    cursors.push(Cursor { x: x, y: y, z: z, charge: current, update_delay: 0, decay_delay: 1, facings: -1 })
+                }
+                charge -= current
+            }
+        }
+        let spread_veins = round < p.spread
+        for _ in 0..p.attempts {
+            // `updateCursors`: each cursor near enough updated, those left with charge kept.
+            var kept = List<Cursor>()
+            for c in cursors {
+                var cursor = c
+                let far = (cursor.x - x).abs().max((cursor.y - y).abs()).max((cursor.z - z).abs()) > 1024
+                if not far {
+                    try update(f, mut r, mut rand, mut cursor, x, y, z, spread_veins)
+                    if cursor.charge > 0 {
+                        kept.push(cursor)
+                    }
+                }
+            }
+            cursors = kept
+        }
+    }
+    return true
+}
+
+// `SculkPatchFeature.canSpreadFrom`.
+fn can_spread_from(f: Facts, r: Region, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let start = try r.state(f, x, y, z)
+    if behaviour(f, start) != DEFAULT {
+        return true
+    }
+    if not f.is_air(start) and (not f.is(start, f.ids.water) or not f.is_source(start)) {
+        return false
+    }
+    for d in 0..6 {
+        if f.collision_full_block(try r.state(f, x + step_x(d), y + step_y(d), z + step_z(d))) {
+            return true
+        }
+    }
+    return false
+}
+
+// `ChargeCursor.update`, in world generation.
+fn update<T: RandomSource>(f: Facts, r: mut Region, rand: mut T, c: mut Cursor, ox: i32, oy: i32, oz: i32, spread_veins: bool) ! Thrown {
+    if c.charge <= 0 {
+        return
+    }
+    if c.update_delay > 0 {
+        c.update_delay -= 1
+        return
+    }
+    var state = try r.state(f, c.x, c.y, c.z)
+    var kind = behaviour(f, state)
+    if spread_veins and try attempt_spread_vein(f, mut r, kind, state, c.x, c.y, c.z, c.facings) {
+        // `canChangeBlockStateOnSpread`: all but sculk.
+        if kind != SCULK {
+            state = try r.state(f, c.x, c.y, c.z)
+            kind = behaviour(f, state)
+        }
+    }
+    c.charge = try use_charge(f, mut r, mut rand, kind, c, ox, oy, oz, spread_veins)
+    if c.charge <= 0 {
+        try on_discharged(f, mut r, kind, state, c.x, c.y, c.z)
+        return
+    }
+    let found = try movement_pos(f, r, mut rand, c.x, c.y, c.z, ox, oz)
+    if let (tx, ty, tz) = found {
+        try on_discharged(f, mut r, kind, state, c.x, c.y, c.z)
+        c.x = tx
+        c.y = ty
+        c.z = tz
+        state = try r.state(f, tx, ty, tz)
+    } else {
+        try on_discharged(f, mut r, kind, state, c.x, c.y, c.z)
+        c.charge = 0
+        return
+    }
+    if behaviour(f, state) != DEFAULT {
+        c.facings = available_faces(f, state)
+    }
+    // `updateDecayDelay`: counting down for the default, else 1.
+    c.decay_delay = if kind == DEFAULT { (c.decay_delay - 1).max(0) } else { 1 }
+    c.update_delay = 1
+}
+
+// `MultifaceBlock.availableFaces`: the faces a multiface state has, none for another block.
+fn available_faces(f: Facts, state: u32) -> i32 {
+    if not f.is_a(f.block(state), "MultifaceBlock") {
+        return 0
+    }
+    var mask = 0
+    for d in 0..6 {
+        if f.get_bool(state, direction_property(d)) {
+            mask |= 1 << d
+        }
+    }
+    return mask
+}
+
+// `SculkBehaviour.attemptSpreadVein`.
+fn attempt_spread_vein(f: Facts, r: mut Region, kind: i32, state: u32, x: i32, y: i32, z: i32, facings: i32) -> bool ! Thrown {
+    let vein = f.ids.sculk_vein
+    if kind == DEFAULT {
+        if facings < 0 {
+            let here = try r.state(f, x, y, z)
+            return try spread_all(f, mut r, vein, here, x, y, z, true, true) > 0
+        }
+        if facings != 0 {
+            if not f.is_air(state) and f.fluid(state) != WATER_FLUID {
+                return false
+            }
+            return try regrow(f, mut r, state, x, y, z, facings)
+        }
+    }
+    return try spread_all(f, mut r, vein, state, x, y, z, false, true) > 0
+}
+
+// `SculkVeinBlock.regrow`: a vein with those of the faces it can cling to, if any.
+fn regrow(f: Facts, r: mut Region, existing: u32, x: i32, y: i32, z: i32, faces: i32) -> bool ! Thrown {
+    var s = f.default_state(f.ids.sculk_vein)
+    var any = false
+    for d in 0..6 {
+        if faces & (1 << d) != 0 {
+            if attaches_state(f, try r.state(f, x + step_x(d), y + step_y(d), z + step_z(d)), d) {
+                s = try f.with_bool(s, direction_property(d), true)
+                any = true
+            }
+        }
+    }
+    if not any {
+        return false
+    }
+    if f.fluid(existing) != EMPTY_FLUID {
+        s = try f.with_bool(s, "waterlogged", true)
+    }
+    _ = r.set_block(f, x, y, z, s, 3)
+    return true
+}
+
+// `SculkBehaviour.attemptUseCharge`.
+fn use_charge<T: RandomSource>(f: Facts, r: mut Region, rand: mut T, kind: i32, c: Cursor, ox: i32, oy: i32, oz: i32, spread_veins: bool) -> i32 ! Thrown {
+    let charge = c.charge
+    if kind == DEFAULT {
+        return if c.decay_delay > 0 { charge } else { 0 }
+    }
+    if kind == VEIN {
+        if spread_veins and try place_sculk(f, mut r, mut rand, c.x, c.y, c.z) {
+            return charge - 1
+        }
+        if rand.next_int_below(CHARGE_DECAY_RATE) == 0 {
+            return i32.saturate((f32.nearest(charge) * 0.5f32).floor())
+        }
+        return charge
+    }
+    // `SculkBlock.attemptUseCharge`.
+    if charge == 0 or rand.next_int_below(CHARGE_DECAY_RATE) != 0 {
+        return charge
+    }
+    let dx = c.x - ox
+    let dy = c.y - oy
+    let dz = c.z - oz
+    // `closerThan(origin, 1)`: the origin itself.
+    let close = f64(dx * dx + dy * dy + dz * dz) < 1.0
+    if not close and try can_place_growth(f, r, c.x, c.y, c.z) {
+        if rand.next_int_below(GROWTH_SPAWN_COST) < charge {
+            let growth = try growth_state(f, r, mut rand, c.x, c.y + 1, c.z)
+            _ = r.set_block(f, c.x, c.y + 1, c.z, growth, 3)
+        }
+        return (charge - GROWTH_SPAWN_COST).max(0)
+    }
+    if rand.next_int_below(ADDITIONAL_DECAY_RATE) != 0 {
+        return charge
+    }
+    if close {
+        return charge - 1
+    }
+    // `getDecayPenalty`, with a no-growth radius of 1.
+    let outer = f32.nearest(f64(dx * dx + dy * dy + dz * dz).sqrt()) - 1.0f32
+    let factor = (outer * outer / 529.0f32).min(1.0f32)
+    return charge - i32.saturate(f32.nearest(charge) * factor * 0.5f32).max(1)
+}
+
+// `SculkBlock.getRandomGrowthState`.
+fn growth_state<T: RandomSource>(f: Facts, r: Region, rand: mut T, x: i32, y: i32, z: i32) -> u32 ! Thrown {
+    var s = 0u32
+    if rand.next_int_below(11) == 0 {
+        s = try f.with_bool(f.default_state(try f.named_block("sculk_shrieker")), "can_summon", true)
+    } else {
+        s = f.default_state(try f.named_block("sculk_sensor"))
+    }
+    if f.has(s, "waterlogged") and f.fluid(try r.state(f, x, y, z)) != EMPTY_FLUID {
+        s = try f.with_bool(s, "waterlogged", true)
+    }
+    return s
+}
+
+// `SculkBlock.canPlaceGrowth`: air or source water above, and at most two inhibitors near.
+fn can_place_growth(f: Facts, r: Region, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let above = try r.state(f, x, y + 1, z)
+    if not f.is_air(above) and not (f.is(above, f.ids.water) and f.fluid(above) == WATER_FLUID) {
+        return false
+    }
+    let inhibitors = f.tag("minecraft:sculk_growth_inhibitors")
+    var count = 0
+    for bz in z - 4..z + 5 {
+        for by in y..y + 3 {
+            for bx in x - 4..x + 5 {
+                if f.in_set(try r.state(f, bx, by, bz), inhibitors) {
+                    count += 1
+                    if count > 2 {
+                        return false
+                    }
+                }
+            }
+        }
+    }
+    return true
+}
+
+// `SculkVeinBlock.attemptPlaceSculk`: through the vein's faces in shuffled order, the first
+// block behind one that sculk replaces turned to sculk, veins spread from it, and the veins
+// beside it discharged.
+fn place_sculk<T: RandomSource>(f: Facts, r: mut Region, rand: mut T, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let state = try r.state(f, x, y, z)
+    let replaceable = f.tag("minecraft:sculk_replaceable_world_gen")
+    for support in all_shuffled(mut rand) {
+        if f.get_bool(state, direction_property(support)) {
+            let sx = x + step_x(support)
+            let sy = y + step_y(support)
+            let sz = z + step_z(support)
+            if f.in_set(try r.state(f, sx, sy, sz), replaceable) {
+                let sculk = f.default_state(f.ids.sculk)
+                _ = r.set_block(f, sx, sy, sz, sculk, 3)
+                _ = try spread_all(f, mut r, f.ids.sculk_vein, sculk, sx, sy, sz, false, true)
+                let skip = opposite(support)
+                for d in 0..6 {
+                    if d != skip {
+                        let vx = sx + step_x(d)
+                        let vy = sy + step_y(d)
+                        let vz = sz + step_z(d)
+                        let possible = try r.state(f, vx, vy, vz)
+                        if f.is(possible, f.ids.sculk_vein) {
+                            try on_discharged(f, mut r, VEIN, possible, vx, vy, vz)
+                        }
+                    }
+                }
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// `SculkBehaviour.onDischarged`: a vein loses the faces on sculk, and goes if none are left.
+fn on_discharged(f: Facts, r: mut Region, kind: i32, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+    if kind != VEIN or not f.is(state, f.ids.sculk_vein) {
+        return
+    }
+    var s = state
+    for d in 0..6 {
+        let name = direction_property(d)
+        if f.get_bool(s, name) and f.is(try r.state(f, x + step_x(d), y + step_y(d), z + step_z(d)), f.ids.sculk) {
+            s = try f.with_bool(s, name, false)
+        }
+    }
+    var any = false
+    for d in 0..6 {
+        if f.get_bool(s, direction_property(d)) {
+            any = true
+        }
+    }
+    if not any {
+        s = if f.fluid(try r.state(f, x, y, z)) == EMPTY_FLUID { f.ids.air_state } else { f.ids.water_state }
+    }
+    _ = r.set_block(f, x, y, z, s, 3)
+}
+
+// `ChargeCursor.NON_CORNER_NEIGHBOURS`: the offsets within one, x fastest, then y, then z, but
+// the corners and the center.
+fn non_corner() -> List<i32> {
+    var out = List<i32>()
+    for dz in -1..2 {
+        for dy in -1..2 {
+            for dx in -1..2 {
+                if (dx == 0 or dy == 0 or dz == 0) and not (dx == 0 and dy == 0 and dz == 0) {
+                    out.push(dx)
+                    out.push(dy)
+                    out.push(dz)
+                }
+            }
+        }
+    }
+    return out
+}
+
+// `getValidMovementPos`: the neighbours in shuffled order; the last sculk or vein the cursor can
+// reach unobstructed, or the first vein with sculk-replaceable blocks behind it.
+fn movement_pos<T: RandomSource>(f: Facts, r: Region, rand: mut T, x: i32, y: i32, z: i32, ox: i32, oz: i32) -> (i32, i32, i32)? ! Thrown {
+    let offsets = non_corner()
+    var order = List<i32>()
+    for i in 0..18 {
+        order.push(i)
+    }
+    shuffle(mut order, mut rand)
+    var px = x
+    var py = y
+    var pz = z
+    for i in order {
+        let k = usize.wrap(i * 3)
+        let nx = x + offsets[k]
+        let ny = y + offsets[k + 1]
+        let nz = z + offsets[k + 2]
+        // `canMoveToPos`: within 12 of the origin across.
+        let ddx = ox - nx
+        let ddz = oz - nz
+        if ddx * ddx + ddz * ddz <= 144 {
+            let there = try r.state(f, nx, ny, nz)
+            if behaviour(f, there) != DEFAULT and try unobstructed(f, r, x, y, z, nx, ny, nz) {
+                px = nx
+                py = ny
+                pz = nz
+                if try substrate_access(f, r, there, nx, ny, nz) {
+                    break
+                }
+            }
+        }
+    }
+    if px == x and py == y and pz == z {
+        return none
+    }
+    return some((px, py, pz))
+}
+
+// `isMovementUnobstructed`.
+fn unobstructed(f: Facts, r: Region, x: i32, y: i32, z: i32, tx: i32, ty: i32, tz: i32) -> bool ! Thrown {
+    let dx = tx - x
+    let dy = ty - y
+    let dz = tz - z
+    if dx.abs() + dy.abs() + dz.abs() == 1 {
+        return true
+    }
+    let dir_x = if dx < 0 { WEST } else { EAST }
+    let dir_y = if dy < 0 { DOWN } else { UP }
+    let dir_z = if dz < 0 { NORTH } else { SOUTH }
+    if dx == 0 {
+        return try open_toward(f, r, x, y, z, dir_y) or try open_toward(f, r, x, y, z, dir_z)
+    }
+    if dy == 0 {
+        return try open_toward(f, r, x, y, z, dir_x) or try open_toward(f, r, x, y, z, dir_z)
+    }
+    return try open_toward(f, r, x, y, z, dir_x) or try open_toward(f, r, x, y, z, dir_y)
+}
+
+// `isUnobstructed`.
+fn open_toward(f: Facts, r: Region, x: i32, y: i32, z: i32, d: i32) -> bool ! Thrown {
+    return not f.sturdy(try r.state(f, x + step_x(d), y + step_y(d), z + step_z(d)), opposite(d), FULL)
+}
+
+// `SculkVeinBlock.hasSubstrateAccess`.
+fn substrate_access(f: Facts, r: Region, state: u32, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if not f.is(state, f.ids.sculk_vein) {
+        return false
+    }
+    let replaceable = f.tag("minecraft:sculk_replaceable")
+    for d in 0..6 {
+        if f.get_bool(state, direction_property(d)) and f.in_set(try r.state(f, x + step_x(d), y + step_y(d), z + step_z(d)), replaceable) {
+            return true
+        }
+    }
+    return false
+}
