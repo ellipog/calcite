@@ -31,6 +31,11 @@
 /// sent: with no block changing, that's only at the edge of what's lit, and it comes with block
 /// changes (D184).
 ///
+/// A chunk sent with the engine's light is encoded once for every player who's to be sent it
+/// (CAL-70). Its packet is kept while another player is still to be sent it, and they're sent
+/// the same bytes, until its body, a body around it, or its light changes, when it's encoded
+/// again. The last of them takes it, so a chunk only one player wants is never kept (D195).
+///
 /// A view wider than vanilla's 32 has chunks the tickets don't reach: those more than 33 from
 /// the player on an axis. Each player's are loaded as their sender comes to them, at most 64 at
 /// once, and let go once they're sent, with their light as it was saved. A region's file is asked
@@ -220,6 +225,8 @@ pub struct Level {
     lines: List<Entry> = List<Entry>()
     // The player whose sender asks next, for their far chunks.
     serving: i32 = 0
+    // The packets kept for chunks another player is still to be sent, by packed position.
+    packets: OpenHashMap<i64, List<u8>> = OpenHashMap<i64, List<u8>>()
 }
 
 impl Level {
@@ -244,7 +251,9 @@ impl Level {
     pub fn open(mut self, jobs: own ChunkJobs?, context: own ChunkContext) {
         self.opened = true
         self.jobs = jobs
-        self.light = some(Light.new(context.min_section * 16, context.sections * 16, context.sky_light))
+        var light = Light.new(context.min_section * 16, context.sections * 16, context.sky_light)
+        light.note_changes()
+        self.light = some(light)
         self.min_section = context.min_section
         self.sections = context.sections
         self.context = some(context)
@@ -396,6 +405,7 @@ impl Level {
             }
         }
         self.light = some(light)
+        self.drop_lit()
     }
 
     /// Runs the distance manager until it settles: its updates, which load the chunks the
@@ -433,21 +443,40 @@ impl Level {
     /// as it was saved, or flat, with its light as the engine has it. A flat chunk whose
     /// neighbours are flat is the flat world's body. A far chunk read for a player has its light
     /// as it was saved, and goes once it's sent. Block entities aren't sent yet.
-    pub fn packet(mut self, pos: ChunkPos, flat: FlatWorld) -> List<u8> {
+    ///
+    /// A holder's chunk sent with the engine's light is kept if `keep`, as another player is still
+    /// to be sent it, and is what's sent until it changes; one kept is taken if not `keep`.
+    pub fn packet(mut self, pos: ChunkPos, flat: FlatWorld, keep: bool) -> List<u8> {
         let k = pos.pack()
+        self.drop_lit()
+        if self.packets.contains(k) {
+            if keep {
+                return self.packets[k].copy()
+            }
+            if let p = self.packets.remove(k) {
+                return p
+            }
+        }
         if self.columns.slots.contains(k) {
+            var made: List<u8>? = none
             if let light = self.light {
                 match self.columns.slots[k] {
-                    Body.Saved(s) => return chunk_packet(pos, s.chunk, light.light_data(pos.x, pos.z)),
+                    Body.Saved(s) => made = some(chunk_packet(pos, s.chunk, light.light_data(pos.x, pos.z))),
                     Body.Flat => {
                         if not self.flat_around(pos) {
                             if let f = self.columns.flat {
-                                return chunk_packet(pos, f.chunk, light.light_data(pos.x, pos.z))
+                                made = some(chunk_packet(pos, f.chunk, light.light_data(pos.x, pos.z)))
                             }
                         }
                     },
                     Body.Loading => {},
                 }
+            }
+            if let p = made {
+                if keep {
+                    self.packets.insert(k, p.copy())
+                }
+                return p
             }
             return flat.chunk_packet(pos.x, pos.z)
         }
@@ -463,6 +492,11 @@ impl Level {
             }
         }
         return flat.chunk_packet(pos.x, pos.z)
+    }
+
+    /// How many chunks' packets are kept for players still to be sent them.
+    pub fn kept(self) -> usize {
+        return self.packets.len()
     }
 
     /// The light of the chunk at `pos` as the engine has it, once it's lit: what it's sent with,
@@ -561,6 +595,7 @@ impl Level {
                 self.pump()
             } else {
                 _ = self.columns.slots.remove(k)
+                self.stale(k)
             }
             return true
         }
@@ -585,6 +620,7 @@ impl Level {
         let level = self.dm.chunk_level(k, false)
         let reach = if self.opened { LIGHT_BORDER } else { FULL }
         if level <= reach and not self.columns.slots.contains(k) {
+            self.stale(k)
             if self.opened {
                 self.columns.slots.insert(k, Body.Loading)
                 self.reading.chunks.insert(k)
@@ -611,6 +647,7 @@ impl Level {
             return
         }
         if let _ = self.columns.slots.remove(k) {
+            self.stale(k)
             if self.opened {
                 self.forget_light(k)
             }
@@ -621,6 +658,7 @@ impl Level {
     // one's light goes to the engine, as `SerializableChunkData.read` queues it, a section at a
     // time from the lowest, the chunk's kept from the first section with any.
     fn accept(mut self, k: i64, loaded: own Loaded) {
+        self.stale(k)
         match loaded {
             Loaded.Generate => self.columns.slots.insert(k, Body.Flat),
             Loaded.Saved(s) => {
@@ -735,6 +773,33 @@ impl Level {
         }
         self.light = some(light)
         return not ready.is_empty()
+    }
+
+    // The chunk at `k` came, went or changed: the packets kept for it and those around it go, as a
+    // flat chunk is sent as the flat world's body only while those around it are flat too.
+    fn stale(mut self, k: i64) {
+        if self.packets.len() == 0 {
+            return
+        }
+        let pos = unpacked(k)
+        for x in pos.x - 1..pos.x + 2 {
+            for z in pos.z - 1..pos.z + 2 {
+                _ = self.packets.remove(ChunkPos { x: x, z: z }.pack())
+            }
+        }
+    }
+
+    // The packets kept for chunks whose light may have changed go.
+    fn drop_lit(mut self) {
+        var light = self.light.take() else return
+        let changed = light.take_changed()
+        self.light = some(light)
+        if self.packets.len() == 0 {
+            return
+        }
+        for c in changed {
+            _ = self.packets.remove(c.pack())
+        }
     }
 
     // Tells `light` of the chunk at `k`'s sections with blocks, as `initializeLight` does first.

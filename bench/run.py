@@ -54,7 +54,7 @@ def build(calx):
 def prepare(world):
     world.mkdir(parents=True, exist_ok=True)
     (world / "server.properties").write_text(
-        f"online-mode=false\nserver-ip=127.0.0.1\nserver-port={PORT}\nmax-players=1000\n"
+        f"online-mode=false\nwhite-list=false\nserver-ip=127.0.0.1\nserver-port={PORT}\nmax-players=1000\n"
         f"view-distance={VIEW}\nsimulation-distance={VIEW}\nmotd=Calcite bot benchmark\n", encoding="utf-8")
     (world / "calcite.properties").write_text("console-dashboard=off\nrecord-inputs=false\n", encoding="utf-8")
 
