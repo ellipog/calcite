@@ -99,6 +99,10 @@ final class BlockFlags {
         StringBuilder light = new StringBuilder();
         StringBuilder collision = new StringBuilder();
         StringBuilder facts = new StringBuilder();
+        // The states whose shape is a full block where their collision shape isn't, or the other
+        // way round: what `Block.isShapeFullBlock(getShape)` says, as an exception to
+        // `isCollisionShapeFullBlock`.
+        StringBuilder outline = new StringBuilder();
         json.append("{\n  \"game_version\": \"").append(SharedConstants.getCurrentVersion().name()).append("\",\n");
         json.append("  \"states\": ").append(count).append(",\n  \"flags\": [");
         for (int id = 0; id < count; id++) {
@@ -114,6 +118,10 @@ final class BlockFlags {
             light.append("]");
             collision.append(id == 0 ? "" : ", ").append(collisions.id(collisionShape(state)));
             facts.append(id == 0 ? "" : ", ").append(facts(state));
+            boolean shapeFull = Block.isShapeFullBlock(state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO));
+            if (shapeFull != state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)) {
+                outline.append(outline.isEmpty() ? "" : ", ").append(id);
+            }
         }
         StringBuilder poi = new StringBuilder();
         for (int id = 0; id < count; id++) {
@@ -222,6 +230,7 @@ final class BlockFlags {
         json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");
         json.append("  \"liquid_containers\": [").append(containers).append("],\n");
         json.append("  \"dynamic_shape_blocks\": [").append(dynamic).append("],\n");
+        json.append("  \"outline_differs\": [").append(outline).append("],\n");
         json.append("  \"class_parents\": {").append(parentJson).append("},\n");
         json.append("  \"poi\": [").append(poi).append("],\n");
         json.append("  \"block_entities\": [").append(blockEntities).append("],\n");

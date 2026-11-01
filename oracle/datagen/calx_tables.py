@@ -473,6 +473,11 @@ def block_facts_module(index, flags):
     lines += number_list(
         "dynamic_shape_blocks", "blocks", flags["dynamic_shape_blocks"],
         ["/// The blocks whose shape can change where they stand, by ID: `Block.hasDynamicShape`."])
+    lines += number_list(
+        "outline_differs", "states", flags["outline_differs"],
+        ["/// The states whose shape is a full block when their collision shape isn't, or the",
+         "/// other way round, by ID: `Block.isShapeFullBlock(getShape)` against",
+         "/// `isCollisionShapeFullBlock`."])
     pairs = [str(v) for pair in flags["poi"] for v in pair]
     lines += [
         "/// The states that are points of interest, each followed by its type's ID in the",
