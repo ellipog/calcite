@@ -51,6 +51,7 @@ public final class PacketCheck {
         + " registry's tags a HashMap the server grows from 16 buckets and the decoder sizes for its count, so vanilla neither"
         + " fixes the order nor encodes back the one it read";
     private static final Map<String, String> UNORDERED = Map.of(
+        "play/login", "its dimensions are read into a HashSet of ResourceKey, which hashes by identity, so vanilla encodes them back in an order that changes from run to run",
         "play/set_time", "its clocks are a HashMap keyed by Holder.Reference, which hashes by identity, so vanilla's order changes from run to run",
         "configuration/update_tags", TAGS,
         "play/update_tags", TAGS);
