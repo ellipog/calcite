@@ -17,7 +17,8 @@ import protocol.play.{LightData}
 import nbt.tag.{Tag}
 import server.chunk_jobs.{ChunkContext, Loaded, SavedChunk, saved_bytes}
 import server.chunks.{Next}
-import server.level.{ChunkPacket, LIGHT_PER_TICK, Level, MOST_FAR_LOADS, SPAWN_RADIUS}
+import server.level.{ChunkPacket, Level, MOST_FAR_LOADS, SPAWN_RADIUS}
+import server.light_service.{LIGHT_STEP, LightAsk, LightBody, LightService}
 import server.log.{Entry}
 import storage.chunk.{ChunkData, ChunkFormat}
 import storage.region.{Compression, External, Stored}
@@ -83,8 +84,8 @@ fn at(x: i32, z: i32) -> ChunkPos {
 }
 
 // Hands back each read asked for within `radius` of `center`, generated, until none is asked
-// for, as the IO thread would, and how many it handed back. Chunks past a tick's worth of light
-// are lit as the next tick would.
+// for, as the IO thread would, and how many it handed back. A test's light steps as the level
+// settles, so what can be lit is.
 fn hand_back(level: mut Level, center: ChunkPos, radius: i32) -> i64 {
     var n: i64 = 0
     loop {
@@ -98,10 +99,7 @@ fn hand_back(level: mut Level, center: ChunkPos, radius: i32) -> i64 {
             }
         }
         if not any {
-            if not level.light_deferred() {
-                return n
-            }
-            level.light_ready()
+            return n
         }
     }
 }
@@ -319,7 +317,11 @@ fn prepared() {
             check_int(i64.wrap(s.saved_light().sky.len()), 1, "sky light layers")
             check(s.lighted, "a full chunk with its light on isn't lit")
             // Stone fills the section from y 0 to 15, so the sky comes down to 16.
-            check_int(i64(s.sources.lowest_source_y(3, 3)), 16, "the sky's lowest source")
+            if let sources = s.sources {
+                check_int(i64(sources.lowest_source_y(3, 3)), 16, "the sky's lowest source")
+            } else {
+                panic("a full chunk has no sky sources")
+            }
         },
         Loaded.Generate => panic("a full chunk was generated"),
     }
@@ -382,9 +384,11 @@ fn saved_lit() {
             for i in 0..back.block.len() {
                 bytes_are(back.block[i].data, given.block[i].data, "block layer {i} read back")
             }
+            let read = s.sources.copy() else panic("a chunk read back has no sky sources")
+            let first = made.sources.copy() else panic("the terrain has no sky sources")
             for x in 0..16 {
                 for z in 0..16 {
-                    check_int(i64(s.sources.lowest_source_y(x, z)), i64(made.sources.lowest_source_y(x, z)), "a column's lowest sky source read back")
+                    check_int(i64(read.lowest_source_y(x, z)), i64(first.lowest_source_y(x, z)), "a column's lowest sky source read back")
                 }
             }
         },
@@ -462,7 +466,7 @@ fn terrain(pos: ChunkPos, states: LightStates, draws: mut Draws) -> Loaded {
         sky.push(none)
         block.push(none)
     }
-    return Loaded.Saved(SavedChunk { chunk: Shared(chunk), sources: sources, sky: sky, block: block, lighted: false })
+    return Loaded.Saved(SavedChunk { chunk: Shared(chunk), sources: some(sources), sky: sky, block: block, lighted: false })
 }
 
 fn bytes_are(got: List<u8>, want: List<u8>, what: String) {
@@ -506,7 +510,7 @@ fn differ(a: List<u8>, b: List<u8>) -> bool {
 }
 
 // A level whose spawn's chunks are read: the 3×3 in the middle flat, the rest random terrain,
-// lit as it comes, a tick's worth at a time.
+// lit as it comes.
 fn spawned(states: LightStates) -> Level {
     var level = Level.new(10, 10)
     level.ground(flat_chunk())
@@ -521,11 +525,6 @@ fn spawned(states: LightStates) -> Level {
             let loaded = if x >= -1 and x <= 1 and z >= -1 and z <= 1 { Loaded.Generate } else { terrain(pos, states, mut draws) }
             check(level.read_chunk(pos, [], loaded, []), "a spawn chunk wasn't asked for")
         }
-    }
-    // The terrain's light is more than a tick's worth, which the next ticks do.
-    check(level.light_deferred(), "the terrain's light was done in a tick")
-    while level.light_deferred() {
-        level.light_ready()
     }
     check(level.full_around(spawn, SPAWN_RADIUS), "the spawn isn't full once it's read")
     return level
@@ -652,56 +651,60 @@ fn kept() {
     println("ok kept")
 }
 
-// How many chunks within `radius` of `center` are full.
-fn full_count(level: Level, center: ChunkPos, radius: i32) -> i64 {
-    var n: i64 = 0
-    for x in center.x - radius..center.x + radius + 1 {
-        for z in center.z - radius..center.z + radius + 1 {
-            if level.full(at(x, z)) {
-                n += 1
-            }
-        }
-    }
-    return n
-}
-
-// A player's view brings more chunks ready to light than a tick's worth: those past it wait,
-// and the next tick lights at most `LIGHT_PER_TICK`'s worth more, until they're all lit. A flat
-// chunk's light is 256 queue entries, one for each column's sky.
-fn deferred() {
+// A player's view brings hundreds of chunks to light, which light takes a step at a time, and
+// every one is lit once they're all read (D264).
+fn steps() {
     var level = Level.new(10, 10)
     level.ground(flat_chunk())
     level.open(none, context(), none)
     let spawn = at(0, 0)
     level.load_spawn(spawn)
     _ = hand_back(mut level, spawn, SPAWN_RADIUS + 1)
-    check(not level.light_deferred(), "the spawn's chunks wait for light")
+    check(level.full_around(spawn, SPAWN_RADIUS), "the spawn's chunks wait for light")
     level.add_player(spawn, 1)
     level.pump()
-    // Every read asked for is handed back, with no tick between.
-    loop {
-        var any = false
-        for x in -14..15 {
-            for z in -14..15 {
-                if level.read_chunk(at(x, z), [], Loaded.Generate, []) {
-                    any = true
-                }
+    _ = hand_back(mut level, spawn, 14)
+    check(sendable_around(level, spawn, 11), "a chunk 11 out can't be sent once they're all lit")
+    println("ok steps")
+}
+
+// Light lights at most `LIGHT_STEP` chunks a step, in the order they came to be ready, and the
+// rest in the steps after, with no more asks; a chunk is lit once its holder's full and the 3×3
+// around it is initialized; and a step that has nothing to do says so (D264).
+fn light_steps() {
+    let c = context()
+    var service = LightService.new(c.min_section, c.sections, true, flat_chunk())
+    var asks = Deque<LightAsk>()
+    let side: i32 = 30
+    for x in 0..side {
+        for z in 0..side {
+            let k = at(x, z).pack()
+            asks.push_last(LightAsk.Came { k: k, body: LightBody.Flat, sky: [], block: [], lighted: false })
+            // The edge isn't full, so the chunks inside it can be lit.
+            if x > 0 and x < side - 1 and z > 0 and z < side - 1 {
+                asks.push_last(LightAsk.Full { k: k, full: true })
             }
         }
-        if not any {
-            break
-        }
     }
-    check(level.light_deferred(), "no chunk waits for light past a tick's worth")
-    let before = full_count(level, spawn, 13)
-    level.light_ready()
-    let after = full_count(level, spawn, 13)
-    check(after > before, "the next tick lit nothing")
-    check(after - before <= (LIGHT_PER_TICK + 255) / 256, "the next tick lit more than a tick's worth")
-    _ = hand_back(mut level, spawn, 14)
-    check(not level.light_deferred(), "chunks wait for light once they're all read")
-    check(sendable_around(level, spawn, 11), "a chunk 11 out can't be sent once they're all lit")
-    println("ok deferred")
+    let inside = i64((side - 2) * (side - 2))
+    let n = asks.len()
+    let first = service.step(mut asks, n) else panic("a step with asks did nothing")
+    check_int(i64.wrap(first.covered), i64.wrap(n), "the asks the first step covered")
+    check_int(i64.wrap(first.initialized.len()), i64(side * side), "chunks the first step initialized")
+    check_int(i64.wrap(first.lit.len()), i64.wrap(LIGHT_STEP), "chunks the first step lit")
+    var count = i64.wrap(first.lit.len())
+    var taken = 1
+    while service.pending() {
+        let d = service.step(mut asks, 0) else panic("a step with chunks to light did nothing")
+        check(i64.wrap(d.covered) == i64.wrap(n), "a step with no asks covered more")
+        check(d.lit.len() <= LIGHT_STEP, "a step lit more than LIGHT_STEP")
+        count += i64.wrap(d.lit.len())
+        taken += 1
+    }
+    check_int(count, inside, "chunks lit")
+    check_int(i64(taken), (inside + i64.wrap(LIGHT_STEP) - 1) / i64.wrap(LIGHT_STEP), "steps")
+    check(service.step(mut asks, 0) == none, "a step with nothing to do did something")
+    println("ok light_steps")
 }
 
 // A spawn ticket runs out 20 ticks after its own chunk is ready to save, whether the chunks
@@ -795,7 +798,8 @@ fn main() {
     reads()
     withdrawn()
     let_go()
-    deferred()
+    steps()
+    light_steps()
     far()
     prepared()
     saved_lit()

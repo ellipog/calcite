@@ -19,21 +19,19 @@
 /// until it settles, so a replay has the same chunks at the same points (D178).
 ///
 /// A world whose folder is open lights its chunks as vanilla's `ThreadedLevelLightEngine` does,
-/// with `world.light`'s engines (CAL-76). Its holders load their chunks from level 34, the
-/// `initialize_light` status's, so each full chunk has the chunks around it to be lit with. A
-/// chunk is initialized once it's there, as `initializeLight` does it: its sections with blocks
-/// told, a run, then its light turned on, lit or not as it was saved. One whose holder is full is
-/// lit once the 3×3 around it is initialized, as `lightChunk` does it: its light spread from its
-/// blocks and sky, unless it was saved lit, and a run. Only then is it full. Each pass takes the
-/// chunks that are ready in the order they came to be, each with a run of its own, until the
-/// tick's `LIGHT_PER_TICK` of light work is done, counted in the queue entries the runs went
-/// through; the rest wait for the next tick, which the network ends with `tick_end` once its
-/// players' part is done too (D197). A saved chunk's light
-/// goes to the engine as it comes, and a chunk that unloads takes its light with it. A chunk is
-/// sent with the engine's light, but a flat one whose neighbours are flat too is sent from the
-/// flat world's body, since its light is the same. Light that changes once a chunk is sent isn't
-/// sent: with no block changing, that's only at the edge of what's lit, and it comes with block
-/// changes (D184).
+/// with `world.light`'s engines (CAL-76), on a thread of their own, `server.light_service`'s
+/// (D264). Its holders load their chunks from level 34, the `initialize_light` status's, so each
+/// full chunk has the chunks around it to be lit with. Light is told each chunk that comes, with
+/// the light it was saved with, and each that goes, and which holders are full; it initializes
+/// each chunk as it comes, and lights each whose holder is full once the 3×3 around it is
+/// initialized. Only then is it full. What light did comes back a step at a time, which the
+/// network records and hands to `lit`, so a replay runs light's steps on this thread, over the
+/// same asks, and has the same chunks lit at the same points (D178). A chunk is sent with the
+/// light light gives for it: the level wants a full chunk's light, and keeps it, as it changes,
+/// until the chunk's sent to every player who wants it, and asks for it again if it's wanted
+/// again. A flat chunk whose neighbours are flat too is sent from the flat world's body, since
+/// its light is the same. Light that changes once a chunk is sent isn't sent: with no block
+/// changing, that's only at the edge of what's lit, and it comes with block changes (D184).
 ///
 /// A chunk sent with the engine's light is encoded once for every player who's to be sent it
 /// (CAL-70). Its packet is kept while another player is still to be sent it, and they're sent
@@ -56,19 +54,19 @@ import protocol.wire.{Writer, write_packet}
 import pack.vanilla.{data_path, vanilla_data}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done, Loaded, SavedChunk, gen_thread, generated, prepare}
 import server.chunks.{Chunks, Next}
+import server.light_service.{LIGHT_ASKS, LightAsk, LightBody, LightDone, LightService, LightThread}
 import server.log.{Entry}
 import storage.regions.{ChunkRead, region_of}
 import world.chunk.{Chunk}
 import world.collision.{CollisionBlocks, CollisionStates}
 import world.distance.{DistanceManager, Ticking}
 import world.flat.{FlatChunk, FlatWorld}
-import world.light.{Layer, Light, LightChunks, SectionStates, NO_CHUNK, light_sources, section_bytes, section_states}
+import world.light.{SkySources}
 import world.pos.{BlockPos, ChunkPos}
 import world.spawn.{respawn_pos}
 import world.tickets.{Holders, Ticket, TicketStorage, TicketType}
 import worldgen.generator.{GenSetup}
 import worldgen.scheduler.{Generator}
-import std.memory.{trim}
 
 /// How far around the spawn chunk a joining player's spawn ticket loads full chunks,
 /// `PrepareSpawnTask.PREPARE_CHUNK_RADIUS`.
@@ -89,155 +87,33 @@ const TICKING: i32 = 32
 // of `initialize_light`.
 const LIGHT_BORDER: i32 = 34
 
-/// The most light work done from one tick's end to the next's, the reads handed back between them
-/// and the tick together, in the queue entries the light runs go through. A chunk whose light
-/// wasn't saved takes up to about 0.2 ms to light, and a player's view can bring hundreds at once,
-/// so they're lit a tick's worth at a time, in the order they came to be ready, as vanilla's light
-/// thread takes its tasks a batch at a time (D197). It's counted, not timed, so a replay lights
-/// the same, and one saved lit costs nothing.
-pub const LIGHT_PER_TICK: i64 = 50000
-
-// How many ticks light goes without a run before it lets go of what it kept of sections'
-// blocks, 5 s (D254).
-const LIGHT_QUIET_TICKS: u32 = 100
-
 // A chunk the world has, or is reading.
 enum Body {
     // Being read.
     Loading
     // Generated flat: every flat chunk is the flat world's.
     Flat
-    // As it was saved. A holder's gives its light to the engine as it comes; a far chunk keeps
-    // its own.
+    // As it was saved. A holder's gives its light and its sky's sources to light as it comes; a
+    // far chunk keeps its own.
     Saved(SavedChunk)
 }
 
-// The chunks light sees, as vanilla's `getChunkForLighting` gives them: each holder's chunk, by
-// its packed position, once it's there, and the flat chunk each flat one is.
+// Each holder's chunk, by its packed position, once it's there, and the flat chunk each flat one
+// is.
 struct Columns {
     slots: OpenHashMap<i64, Body> = OpenHashMap<i64, Body>()
     flat: FlatChunk? = none
-    // The columns whose bodies came or went since light was last told, for it to let go of what
-    // it kept of their blocks: a body goes in and out only through `put` and `take` (D254).
-    changed: List<i64> = List<i64>()
 }
 
 impl Columns {
-    // Puts in the body of the column at `k`, noting it for light.
+    // Puts in the body of the column at `k`.
     fn put(mut self, k: i64, given: own Body) {
         self.slots.insert(k, given)
-        self.changed.push(k)
     }
 
-    // Takes out the body of the column at `k`, if it has one, noting it for light.
+    // Takes out the body of the column at `k`, if it has one.
     fn take(mut self, k: i64) -> Body? {
-        let taken = self.slots.remove(k) else return none
-        self.changed.push(k)
-        return some(taken)
-    }
-}
-
-impl LightChunks for Columns {
-    fn light_state(self, x: i32, y: i32, z: i32) -> u32? {
-        let k = ChunkPos { x: x >> 4, z: z >> 4 }.pack()
-        if not self.slots.contains(k) {
-            return none
-        }
-        match self.slots[k] {
-            Body.Saved(s) => return some(s.chunk.value.block(x & 15, y, z & 15)),
-            Body.Flat => {
-                if let f = self.flat {
-                    return some(f.chunk.block(x & 15, y, z & 15))
-                }
-            },
-            Body.Loading => {},
-        }
-        return none
-    }
-
-    fn light_section(self, chunk_x: i32, section_y: i32, chunk_z: i32) -> SectionStates? {
-        let k = ChunkPos { x: chunk_x, z: chunk_z }.pack()
-        if not self.slots.contains(k) {
-            return none
-        }
-        match self.slots[k] {
-            Body.Saved(s) => return some(section_states(s.chunk.value, section_y)),
-            Body.Flat => {
-                if let f = self.flat {
-                    return some(section_states(f.chunk, section_y))
-                }
-            },
-            Body.Loading => {},
-        }
-        return none
-    }
-
-    fn light_bytes(self, chunk_x: i32, section_y: i32, chunk_z: i32, table: List<u8>, out: mut List<u8>) -> i32 {
-        let k = ChunkPos { x: chunk_x, z: chunk_z }.pack()
-        if not self.slots.contains(k) {
-            return NO_CHUNK
-        }
-        match self.slots[k] {
-            Body.Saved(s) => {
-                return section_bytes(s.chunk.value, section_y, table, mut out)
-            },
-            Body.Flat => {
-                if let f = self.flat {
-                    return section_bytes(f.chunk, section_y, table, mut out)
-                }
-            },
-            Body.Loading => {},
-        }
-        return NO_CHUNK
-    }
-
-    fn lowest_sky_source(self, x: i32, z: i32) -> i32? {
-        let k = ChunkPos { x: x >> 4, z: z >> 4 }.pack()
-        if not self.slots.contains(k) {
-            return none
-        }
-        match self.slots[k] {
-            Body.Saved(s) => return some(s.sources.lowest_source_y(x & 15, z & 15)),
-            Body.Flat => {
-                if let f = self.flat {
-                    return some(f.sources.lowest_source_y(x & 15, z & 15))
-                }
-            },
-            Body.Loading => {},
-        }
-        return none
-    }
-
-    fn highest_sky_source(self, chunk_x: i32, chunk_z: i32) -> i32? {
-        let k = ChunkPos { x: chunk_x, z: chunk_z }.pack()
-        if not self.slots.contains(k) {
-            return none
-        }
-        match self.slots[k] {
-            Body.Saved(s) => return some(s.sources.highest_lowest_source_y()),
-            Body.Flat => {
-                if let f = self.flat {
-                    return some(f.sources.highest_lowest_source_y())
-                }
-            },
-            Body.Loading => {},
-        }
-        return none
-    }
-
-    fn light_sources_in(self, chunk_x: i32, chunk_z: i32) -> List<i64> {
-        let k = ChunkPos { x: chunk_x, z: chunk_z }.pack()
-        if not self.slots.contains(k) {
-            return []
-        }
-        if let f = self.flat {
-            match self.slots[k] {
-                Body.Saved(s) => return light_sources(s.chunk.value, f.states, chunk_x, chunk_z),
-                Body.Flat => return light_sources(f.chunk, f.states, chunk_x, chunk_z),
-                Body.Loading => {},
-            }
-        }
-        return []
+        return self.slots.remove(k)
     }
 }
 
@@ -353,24 +229,39 @@ pub struct Level {
     // generator that makes them on this thread.
     gen: GenSetup? = none
     generator: Generator? = none
-    // The light, once chunks are read, and the dimension's sections, from its lowest.
-    light: Light? = none
+    // The dimension's sections, from its lowest.
     min_section: i32 = 0
     sections: i32 = 0
-    // The chunks whose bodies came, to be initialized, in the order they came; those initialized;
-    // those of them lit, which are full; and those initialized that may be ready to light.
-    arrived: LinkedSet<i64> = LinkedSet<i64>()
+    // Light, once chunks are read (D264): the queue to its thread and the steps back, or, in a
+    // replay or a test, light itself, run here. The asks not yet handed over, or, run here, not
+    // yet taken; whether light here steps as the level settles, as a test's does, rather than as
+    // the recording's did; how many asks there have been, and how many light's taken by the last
+    // step taken in. `lighting` is whether there's light.
+    lighting: bool = false
+    light_to: Sender<Deque<LightAsk>>? = none
+    light_back: Receiver<LightDone>? = none
+    light_here: LightService? = none
+    light_asks: Deque<LightAsk> = Deque<LightAsk>()
+    light_eager: bool = false
+    light_sent: u64 = 0
+    light_covered: u64 = 0
+    // For each chunk light's been told came and not that it went, which ask told it: a step that
+    // hadn't taken that ask is about the chunk before, which went.
+    came_at: OpenHashMap<i64, u64> = OpenHashMap<i64, u64>()
+    // The chunks light's initialized, and those it's lit, which are full.
     initialized: OpenHashSet<i64> = OpenHashSet<i64>()
     lit: OpenHashSet<i64> = OpenHashSet<i64>()
-    to_light: LinkedSet<i64> = LinkedSet<i64>()
-    // How much more light work may be done before the tick ends, and how many chunks ready to
-    // be lit wait for the next.
-    light_left: i64 = LIGHT_PER_TICK
-    light_later: usize = 0
-    // Whether light has run since the last tick, and the ticks since it last did: after
-    // `LIGHT_QUIET_TICKS` it lets go of what it kept of sections' blocks (D254).
-    light_ran: bool = false
-    light_quiet: u32 = 0
+    // The holders light's been told are full.
+    told_full: OpenHashSet<i64> = OpenHashSet<i64>()
+    // The chunks whose light is wanted, for their packets, each with the ask that wanted it, from
+    // which light gives it; and the light given, as it was last.
+    watching: OpenHashMap<i64, u64> = OpenHashMap<i64, u64>()
+    light_data: OpenHashMap<i64, LightData> = OpenHashMap<i64, LightData>()
+    // The chunks that went to be saved once light gives the light they had, in the order they
+    // went, how many each has waiting, and the reads of them that wait for those saves.
+    saving: Deque<(i64, Shared<Chunk>)> = Deque<(i64, Shared<Chunk>)>()
+    saves_waiting: OpenHashMap<i64, u32> = OpenHashMap<i64, u32>()
+    parked: List<i64> = List<i64>()
     // The holders whose chunks are to tick their entities once the 5×5 around them is loaded,
     // each with its place in the order they came to wait, and the next place to give; and those
     // that may have come to be ready, or to wait no more, since `ready_waiting` last looked: only
@@ -410,18 +301,41 @@ impl Level {
     }
 
     /// Reads chunks from now on, made with `context`: through `jobs`, the IO thread and chunk
-    /// workers, or, replaying, from the log, which has what the recording read. Each is lit.
+    /// workers, or, replaying, from the log, which has what the recording read. Each is lit, on
+    /// light's thread with `jobs`, and without them here, a step each time the level settles, as
+    /// a test has it, until `replay_light` has the steps the recording's light took instead.
     /// Those that aren't saved are generated as `gen` says, or flat, the ground, if it's `none`.
     pub fn open(mut self, jobs: own ChunkJobs?, context: own ChunkContext, gen: own GenSetup?) {
         self.opened = true
-        self.jobs = jobs
-        self.gen = gen
-        var light = Light.new(context.min_section * 16, context.sections * 16, context.sky_light)
-        light.note_changes()
-        self.light = some(light)
         self.min_section = context.min_section
         self.sections = context.sections
+        var flat: FlatChunk? = none
+        if let f = self.columns.flat {
+            flat = some(f.copy())
+        }
+        if let f = flat {
+            let service = LightService.new(context.min_section, context.sections, context.sky_light, f)
+            self.lighting = true
+            if let j = jobs {
+                let asks = Receiver<Deque<LightAsk>>()
+                let back = Receiver<LightDone>()
+                self.light_to = some(asks.sender())
+                _ = unsafe { Thread.spawn(LightThread { service: service, asks: asks, back: back.sender(), waker: j.poll_waker() }) }
+                self.light_back = some(back)
+            } else {
+                self.light_here = some(service)
+                self.light_eager = true
+            }
+        }
+        self.jobs = jobs
+        self.gen = gen
         self.context = some(context)
+    }
+
+    /// Has light, run here, take the steps the recording's light took, each as `replay_light`
+    /// hands it over, rather than a step each time the level settles.
+    pub fn light_as_recorded(mut self) {
+        self.light_eager = false
     }
 
     /// Whether chunks are read from the world's folder.
@@ -586,8 +500,8 @@ impl Level {
 
     /// The world's part of a tick, as `ServerChunkCache.tick` runs it: the tickets run down, the
     /// distance manager settles, and the holders that dropped unload, with their chunks and their
-    /// light, which a run takes away. Vanilla unloads as many as it has time for, and Calcite all
-    /// of them.
+    /// light, which light's next step takes away. Vanilla unloads as many as it has time for, and
+    /// Calcite all of them.
     pub fn tick(mut self) {
         self.dm.purge_stale(self.reading)
         self.pump()
@@ -597,69 +511,14 @@ impl Level {
         for k in self.dm.take_unloaded() {
             self.unloaded(k)
         }
-        var light = self.light.take() else {
-            self.columns.changed.clear()
-            return
-        }
-        self.tell_changed(mut light)
-        if light.has_work() {
-            self.light_ran = true
-            if let f = self.columns.flat {
-                _ = light.run(f.states, self.columns)
-            }
-        }
-        if self.light_ran {
-            self.light_ran = false
-            self.light_quiet = 0
-        } else if self.light_quiet < LIGHT_QUIET_TICKS {
-            self.light_quiet += 1
-            if self.light_quiet == LIGHT_QUIET_TICKS {
-                light.let_go_of_bytes()
-                trim()
-            }
-        }
-        self.light = some(light)
-        self.drop_lit()
-    }
-
-    /// The server's tick is over, the players' part of it too: the next tick's worth of chunks
-    /// may be lit.
-    pub fn tick_end(mut self) {
-        self.light_left = LIGHT_PER_TICK
-    }
-
-    /// Lets the next tick's worth of chunks be lit, as a tick's end does, and runs the distance
-    /// manager until it settles.
-    pub fn light_ready(mut self) {
-        self.tick_end()
-        self.pump()
-    }
-
-    /// Whether chunks ready to be lit wait for the next tick, this one's `LIGHT_PER_TICK` done.
-    pub fn light_deferred(self) -> bool {
-        return self.light_later > 0
-    }
-
-    /// Lights the chunks waiting with up to `entries` queue entries of light work more, the time
-    /// the server's loop has until its next tick, and gives how many the runs went through
-    /// (D227). What's left of them isn't kept: chunks that come later wait for the next tick, or
-    /// the loop's next turn.
-    pub fn light_slice(mut self, entries: u64) -> u64 {
-        let given = i64.wrap(entries)
-        self.light_left = given
-        self.pump()
-        let used = given - self.light_left
-        if self.light_left > 0 {
-            self.light_left = 0
-        }
-        return u64.wrap(used)
+        self.flush_light()
     }
 
     /// Runs the distance manager until it settles: its updates, which load the chunks the
     /// holders' levels call for; the dispatcher's jobs and the main thread's tasks, until
-    /// neither has any; then the chunks that can be are lit; then each holder waiting for its
-    /// chunk to tick its entities, whose 5×5 is full, is let go; as long as any of those does
-    /// something.
+    /// neither has any; then, with light run here as a test has it, light's steps; then each
+    /// holder waiting for its chunk to tick its entities, whose 5×5 is full, is let go; as long
+    /// as any of those does something. What light's to be told goes to its thread then.
     pub fn pump(mut self) {
         loop {
             var any = self.dm.run_all_updates()
@@ -669,16 +528,53 @@ impl Level {
             if self.drain() {
                 any = true
             }
-            if self.light_up() {
+            if self.light_eager and self.step_here() {
                 any = true
             }
             if self.ready_waiting() {
                 any = true
             }
             if not any {
+                self.flush_light()
                 return
             }
         }
+    }
+
+    /// The next step light's thread has done, which the network records, then hands to
+    /// `light_done`, or `none` if it's done none since this was last asked.
+    pub fn take_light(mut self) -> LightDone? {
+        var back = self.light_back.take() else return none
+        let d = back.next()
+        self.light_back = some(back)
+        return d
+    }
+
+    /// Takes in a step of light: the chunks it initialized and lit, those whose light changed,
+    /// the light wanted for packets and the light the chunks that went are saved with. A chunk
+    /// lit since it was saved, or whose light changed once it was lit, is to be saved again
+    /// (D258). Then the distance manager settles.
+    pub fn light_done(mut self, done: own LightDone) {
+        self.take_in(done)
+        self.pump()
+    }
+
+    /// Has light, run here, take the step the recording's took, which had taken `covered` asks
+    /// by its end, and takes it in, as `light_done`. `false` if light hasn't been told that many,
+    /// or had by the last step, or the step does nothing, which only a replay that's gone another
+    /// way hands over.
+    pub fn replay_light(mut self, covered: u64) -> bool {
+        var s = self.light_here.take() else return false
+        let had = s.covered()
+        if covered < had or covered - had > u64(self.light_asks.len()) {
+            self.light_here = some(s)
+            return false
+        }
+        let d = s.step(mut self.light_asks, usize.wrap(covered - had))
+        self.light_here = some(s)
+        let done = d else return false
+        self.light_done(done)
+        return true
     }
 
     /// Sets the player whose sender asks next, whose far chunks are read for them.
@@ -687,33 +583,34 @@ impl Level {
     }
 
     /// The chunk at `pos` as it's sent, `ClientboundLevelChunkWithLightPacket`'s ID and fields:
-    /// as it was saved, or flat, with its light as the engine has it. A flat chunk whose
-    /// neighbours are flat is the flat world's body. A far chunk read for a player has its light
-    /// as it was saved, and goes once it's sent. Block entities aren't sent yet.
+    /// as it was saved, or flat, with the light light gave for it. A flat chunk whose neighbours
+    /// are flat is the flat world's body. A far chunk read for a player has its light as it was
+    /// saved, and goes once it's sent. Block entities aren't sent yet.
     ///
-    /// A holder's chunk sent with the engine's light is kept if `keep`, as another player is still
-    /// to be sent it, and is what's sent until it changes; one kept is taken if not `keep`. Once
-    /// it's compressed, what's sent is its frame's body.
+    /// A holder's chunk sent with light's light is kept if `keep`, as another player is still to
+    /// be sent it, and is what's sent until it changes; one kept is taken if not `keep`, and its
+    /// light isn't wanted any more. Once it's compressed, what's sent is its frame's body.
     pub fn packet(mut self, pos: ChunkPos, flat: FlatWorld, keep: bool) -> ChunkPacket {
         let k = pos.pack()
-        self.drop_lit()
         if self.packets.contains(k) {
             if keep {
                 return self.packets[k].copied(k)
             }
             if let p = self.packets.remove(k) {
+                self.release(k)
                 return p.taken()
             }
         }
         if self.columns.slots.contains(k) {
             var made: List<u8>? = none
-            if let light = self.light {
+            if self.opened {
+                let light = self.light_for(k, keep)
                 match self.columns.slots[k] {
-                    Body.Saved(s) => made = some(chunk_packet(pos, s.chunk.value, light.light_data(pos.x, pos.z))),
+                    Body.Saved(s) => made = some(chunk_packet(pos, s.chunk.value, light)),
                     Body.Flat => {
                         if not self.flat_around(pos) {
                             if let f = self.columns.flat {
-                                made = some(chunk_packet(pos, f.chunk, light.light_data(pos.x, pos.z)))
+                                made = some(chunk_packet(pos, f.chunk, light))
                             }
                         }
                     },
@@ -726,6 +623,7 @@ impl Level {
                     self.packets.insert(k, Kept { packet: some(p.copy()), body: none, threshold: -1, version: self.versions })
                     return ChunkPacket.Shared { packet: p, key: k, version: self.versions }
                 }
+                self.release(k)
                 return ChunkPacket.Plain(p)
             }
             return ChunkPacket.Plain(flat.chunk_packet(pos.x, pos.z))
@@ -774,21 +672,20 @@ impl Level {
         return n
     }
 
-    /// The light of the chunk at `pos` as the engine has it, once it's lit: what it's sent with,
-    /// unless it's a flat chunk among flat ones.
+    /// The light of the chunk at `pos` as light last gave it, once it's lit and while its light
+    /// is wanted: what it's sent with, unless it's a flat chunk among flat ones.
     pub fn light_of(self, pos: ChunkPos) -> LightData? {
-        if not self.lit.contains(pos.pack()) {
+        let k = pos.pack()
+        if not self.lit.contains(k) or not self.light_data.contains(k) {
             return none
         }
-        if let light = self.light {
-            return some(light.light_data(pos.x, pos.z))
-        }
-        return none
+        return some(self.light_data[k].copy())
     }
 
-    /// Hands what's to be read to the IO thread. Replaying, there's none: what the recording
-    /// read comes from the log.
+    /// Hands what's to be read to the IO thread, and what light's to be told to its thread.
+    /// Replaying, there's no IO thread: what the recording read comes from the log.
     pub fn dispatch(mut self) {
+        self.flush_light()
         if self.asks.is_empty() {
             return
         }
@@ -806,8 +703,9 @@ impl Level {
     }
 
     /// Has the IO thread write the chunks it's been handed and close the region files, as the
-    /// server stops, once each chunk whose light isn't saved is, as `saveAllChunks` saves them.
-    /// Those go from the level as they're handed over, not copied, as nothing ticks after.
+    /// server stops, once each chunk whose light isn't saved is, with the light light has for it,
+    /// as `saveAllChunks` saves them: this waits for light to give it. Those go from the level as
+    /// they're handed over, not copied, as nothing ticks after.
     pub fn close_chunks(mut self) {
         var keys = List<i64>()
         for k in self.unsaved {
@@ -815,10 +713,14 @@ impl Level {
         }
         for k in keys {
             if let gone = self.columns.take(k) {
-                self.save_gone(k, gone)
+                _ = self.came_at.remove(k)
+                if let chunk = self.to_save(k, gone) {
+                    self.save_lit(k, chunk, false)
+                }
             }
         }
         self.unsaved.clear()
+        self.finish_light()
         var far = List<i64>()
         for (k, _) in self.far {
             far.push(k)
@@ -1042,8 +944,9 @@ impl Level {
     }
 
     // The chunk at `k`'s holder's level changed: a full chunk with no chunk yet is loaded, or one
-    // at 34 if chunks are read, to light those beside it with; one that's become full may be
-    // lit; and one whose entities are to tick waits for the chunks around it.
+    // at 34 if chunks are read, to light those beside it with; light's told if it came to be full
+    // or stopped being, as one that's full may be lit; and one whose entities are to tick waits
+    // for the chunks around it.
     fn changed(mut self, k: i64) {
         let level = self.dm.chunk_level(k, false)
         let reach = if self.opened { LIGHT_BORDER } else { FULL }
@@ -1058,8 +961,8 @@ impl Level {
                 self.came_loaded(k)
             }
         }
-        if level <= FULL and self.initialized.contains(k) and not self.lit.contains(k) {
-            self.to_light.insert(k)
+        if self.opened {
+            self.tell_full(k, level <= FULL)
         }
         if self.opened and level <= FULL and not self.lit.contains(k) {
             self.reading.unlit.insert(k)
@@ -1103,12 +1006,16 @@ impl Level {
         _ = self.waiting.remove(k)
     }
 
-    // The holder at `k` unloaded: its chunk goes, with its light, unless it's still being read,
-    // when it goes as it comes back, with no holder to have it, and the generator's told nothing
-    // wants it, unless a far read does, so it doesn't make it if it hasn't begun to (D243).
+    // The holder at `k` unloaded: light's told it isn't full, and its chunk goes, with its light,
+    // unless it's still being read, when it goes as it comes back, with no holder to have it, and
+    // the generator's told nothing wants it, unless a far read does, so it doesn't make it if it
+    // hasn't begun to (D243).
     fn unloaded(mut self, k: i64) {
         self.stop_waiting(k)
         self.reading.unlit.remove(k)
+        if self.opened {
+            self.tell_full(k, false)
+        }
         if self.reading.chunks.contains(k) {
             if self.opened and not self.far.contains(k) and not self.dropping.contains(k) {
                 self.dropping.insert(k)
@@ -1119,57 +1026,73 @@ impl Level {
         if let gone = self.columns.take(k) {
             self.stale(k)
             if self.opened {
-                self.save_gone(k, gone)
-                self.forget_light(k)
+                let save = self.to_save(k, gone)
+                self.forget_light(k, save)
             }
         }
     }
 
-    // The chunk at `k` unloads as `gone`: if it isn't saved as it is, made by the generator since,
-    // or lit, or its light changed, it's saved, with its light if it's lit, as vanilla saves an
-    // unsaved chunk as it unloads (D258).
-    fn save_gone(mut self, k: i64, gone: own Body) {
+    // The chunk at `k` unloads, or the server stops, as `gone`: if it isn't saved as it is, made by
+    // the generator since, or lit, or its light changed, and it's held whole, it's to be saved,
+    // with its light if it's lit, as vanilla saves an unsaved chunk (D258).
+    fn to_save(mut self, k: i64, gone: own Body) -> Shared<Chunk>? {
         if not self.unsaved.contains(k) {
-            return
+            return none
         }
         self.unsaved.remove(k)
         if self.gen == none {
-            return
+            return none
         }
         match gone {
             Body.Saved(s) => {
                 let SavedChunk { chunk: chunk, whole: whole, .. } = s
-                if not whole {
-                    return
+                if whole {
+                    return some(chunk)
                 }
-                let pos = unpacked(k)
-                var data: LightData? = none
-                if self.lit.contains(k) {
-                    if let light = self.light {
-                        data = some(light.light_data(pos.x, pos.z))
-                    }
-                }
-                var jobs = self.jobs.take() else return
-                jobs.save_chunk(pos, chunk, data)
-                self.jobs = some(jobs)
             },
             _ => {},
         }
+        return none
     }
 
-    // Takes the chunks whose light a run changed, or that were queued or taken back: the packets
-    // kept for them go, and each lit and held whole is to be saved again (D258).
-    fn note_light(mut self, light: mut Light) {
-        let changed = light.take_changed()
-        for c in changed {
-            let k = c.pack()
-            if self.packets.len() > 0 {
-                _ = self.packets.remove(k)
-            }
-            if self.lit.contains(k) and self.whole(k) {
-                self.unsaved.insert(k)
+    // Saves the chunk at `k` with the light light has for it, if it's lit, once light gives it,
+    // as it `went` or as the server stops. A read of it waits for the save.
+    fn save_lit(mut self, k: i64, chunk: own Shared<Chunk>, went: bool) {
+        if not self.lighting {
+            self.save_now(k, chunk, none)
+            return
+        }
+        self.send_light(if went { LightAsk.Went { k: k, save: true } } else { LightAsk.Save(k) })
+        self.saving.push_last((k, chunk))
+        self.saves_waiting.insert(k, (self.saves_waiting.get(k) ?? 0) + 1)
+    }
+
+    // Hands the chunk at `k` to the savers with `light`, and the reads of it that waited for its
+    // saves to the IO thread once it has none left waiting.
+    fn save_now(mut self, k: i64, chunk: own Shared<Chunk>, light: own LightData?) {
+        if let held = self.jobs.take() {
+            var jobs = held
+            jobs.save_chunk(unpacked(k), chunk, light)
+            self.jobs = some(jobs)
+        }
+        let left = self.saves_waiting.get(k) ?? 0
+        if left > 1 {
+            self.saves_waiting.insert(k, left - 1)
+            return
+        }
+        _ = self.saves_waiting.remove(k)
+        if self.parked.is_empty() {
+            return
+        }
+        var still = List<i64>()
+        for p in self.parked {
+            if p == k {
+                self.asks.push(Ask.Chunk(unpacked(k)))
+            } else {
+                still.push(p)
             }
         }
+        self.parked = still
     }
 
     // Whether the chunk at `k` is held whole, so it can be saved from what's held (D258).
@@ -1183,160 +1106,243 @@ impl Level {
         }
     }
 
-    // Takes in the chunk at `k` its read came to, for its holder, to be initialized: a saved
-    // one's light goes to the engine, as `SerializableChunkData.read` queues it, a section at a
-    // time from the lowest, the chunk's kept from the first section with any.
+    // Takes in the chunk at `k` its read came to, for its holder, and tells light it came, with
+    // the light it was saved with and its sky's sources, which go to light, to be initialized.
     fn accept(mut self, k: i64, loaded: own Loaded) {
         self.stale(k)
         match loaded {
-            Loaded.Generate => self.columns.put(k, Body.Flat),
+            Loaded.Generate => {
+                self.columns.put(k, Body.Flat)
+                self.came(k, LightBody.Flat, [], [], false)
+            },
             Loaded.Saved(s) => {
                 var saved = s
                 // What the generator made isn't on the disk until it's let go of (D258).
                 if saved.fresh and saved.whole {
                     self.unsaved.insert(k)
                 }
-                var light = self.light.take() else {
+                if not self.lighting {
                     self.columns.put(k, Body.Saved(saved))
                     return
                 }
-                let pos = unpacked(k)
-                var kept = false
-                for i in 0..saved.sky.len() {
-                    if saved.block[i] == none and saved.sky[i] == none {
-                        continue
-                    }
-                    if not kept {
-                        light.retain_data(pos.x, pos.z, true)
-                        kept = true
-                    }
-                    let y = self.min_section - 1 + i32.wrap(i)
-                    if let b = saved.block[i].take() {
-                        light.queue_section_data(false, pos.x, y, pos.z, some(Layer.of(b)))
-                    }
-                    if let l = saved.sky[i].take() {
-                        light.queue_section_data(true, pos.x, y, pos.z, some(Layer.of(l)))
-                    }
-                }
-                // The engine has the layers now, so the lists, each a `none` a section, go.
+                let sky = saved.sky
                 saved.sky = []
+                let block = saved.block
                 saved.block = []
-                self.light = some(light)
+                let sources = saved.sources.take() ?? SkySources.new(self.min_section * 16)
+                let shape = LightBody.Saved(saved.chunk.copy(), sources)
+                let lighted = saved.lighted
                 self.columns.put(k, Body.Saved(saved))
+                self.came(k, shape, sky, block, lighted)
             },
         }
-        self.arrived.insert(k)
     }
 
-    // The chunk at `k` went: its light goes too, as `updateChunkStatus` lets it go, for the next
-    // run to take away.
-    fn forget_light(mut self, k: i64) {
-        self.arrived.remove(k)
+    // Tells light the chunk at `k` came, as `shape`, with the light it was saved with.
+    fn came(mut self, k: i64, shape: own LightBody, sky: own List<List<u8>?>, block: own List<List<u8>?>, lighted: bool) {
+        if not self.lighting {
+            return
+        }
+        self.send_light(LightAsk.Came { k: k, body: shape, sky: sky, block: block, lighted: lighted })
+        self.came_at.insert(k, self.light_sent)
+    }
+
+    // The chunk at `k` went: light's told, and lets its light go, as `updateChunkStatus` lets it
+    // go, giving the light it had first if it's to be saved, as `save` is.
+    fn forget_light(mut self, k: i64, save: own Shared<Chunk>?) {
         self.initialized.remove(k)
         self.lit.remove(k)
-        self.to_light.remove(k)
-        var light = self.light.take() else return
-        let pos = unpacked(k)
-        light.retain_data(pos.x, pos.z, false)
-        light.set_light_enabled(self.columns, pos.x, pos.z, false)
-        for y in self.min_section - 1..self.min_section + self.sections + 1 {
-            light.queue_section_data(false, pos.x, y, pos.z, none)
-            light.queue_section_data(true, pos.x, y, pos.z, none)
+        _ = self.came_at.remove(k)
+        _ = self.watching.remove(k)
+        _ = self.light_data.remove(k)
+        if let chunk = save {
+            self.save_lit(k, chunk, true)
+        } else if self.lighting {
+            self.send_light(LightAsk.Went { k: k, save: false })
         }
-        var ys = List<i32>()
-        for y in self.min_section..self.min_section + self.sections {
-            ys.push(y)
-        }
-        light.update_column_status(pos.x, pos.z, ys, true)
-        self.light = some(light)
     }
 
-    // Lights what can be, as vanilla's light thread runs what it has. Each chunk whose body came
-    // is initialized, as `initializeLight` does it: its sections with blocks told, a run, then its
-    // light turned on, lit or not as it was saved, and kept no more. Then each initialized one
-    // whose holder is full and whose 3×3 is initialized is lit, as `lightChunk` does it: its light
-    // spread from its blocks and sky, unless it was saved lit, and a run, while the tick has light
-    // work left. Whether any was lit.
-    fn light_up(mut self) -> bool {
-        if self.arrived.is_empty() and self.to_light.is_empty() {
-            self.light_later = 0
+    // Tells light `ask`, once it's handed over.
+    fn send_light(mut self, ask: own LightAsk) {
+        self.light_asks.push_last(ask)
+        self.light_sent += 1
+    }
+
+    // Hands what light's to be told to its thread, if it has one.
+    fn flush_light(mut self) {
+        if self.light_asks.is_empty() {
+            return
+        }
+        var to = self.light_to.take() else return
+        var asks = Deque<LightAsk>()
+        while let a = self.light_asks.pop_first() {
+            asks.push_last(a)
+        }
+        to.send(asks)
+        self.light_to = some(to)
+    }
+
+    // Tells light the holder at `k` came to be full, and wants its light from then on, for its
+    // packets, or that it stopped being, and doesn't.
+    fn tell_full(mut self, k: i64, full: bool) {
+        if not self.lighting or full == self.told_full.contains(k) {
+            return
+        }
+        if full {
+            self.told_full.insert(k)
+            self.send_light(LightAsk.Full { k: k, full: true })
+            if not self.watching.contains(k) {
+                self.watch(k)
+            }
+        } else {
+            self.told_full.remove(k)
+            self.send_light(LightAsk.Full { k: k, full: false })
+            self.release(k)
+        }
+    }
+
+    // Wants the chunk at `k`'s light from light, as it is and as it changes.
+    fn watch(mut self, k: i64) {
+        self.send_light(LightAsk.Watch(k))
+        self.watching.insert(k, self.light_sent)
+    }
+
+    // Doesn't want the chunk at `k`'s light any more, if it did, and lets go of what light gave.
+    fn release(mut self, k: i64) {
+        if self.watching.remove(k) == none {
+            return
+        }
+        _ = self.light_data.remove(k)
+        self.send_light(LightAsk.Release(k))
+    }
+
+    // Whether the chunk at `pos`, ready to send, waits for its light, which is wanted if it isn't
+    // already. A flat chunk among flat ones is sent as the flat world's.
+    fn light_wanted(mut self, pos: ChunkPos) -> bool {
+        let k = pos.pack()
+        if not self.lighting or self.light_data.contains(k) or self.flat_around(pos) {
             return false
         }
-        var light = self.light.take() else {
-            self.columns.changed.clear()
-            return false
+        if not self.watching.contains(k) {
+            self.watch(k)
         }
-        self.tell_changed(mut light)
-        if not self.arrived.is_empty() {
-            var keys = List<i64>()
-            for k in self.arrived {
-                keys.push(k)
+        return true
+    }
+
+    // The light to send the chunk at `k` with: light's last, taken if it's not `keep`. The
+    // network sends a chunk only once its light's here (`light_wanted`); a test's level, whose
+    // light steps as it settles, is given it at once.
+    fn light_for(mut self, k: i64, keep: bool) -> LightData {
+        if self.light_eager and not self.light_data.contains(k) {
+            if not self.watching.contains(k) {
+                self.watch(k)
             }
-            self.arrived.clear()
-            for k in keys {
-                self.tell_sections(mut light, k)
+            _ = self.step_here()
+        }
+        if self.light_data.contains(k) {
+            if keep {
+                return self.light_data[k].copy()
             }
-            self.light_ran = true
-            if let f = self.columns.flat {
-                _ = light.run(f.states, self.columns)
+            if let l = self.light_data.remove(k) {
+                return l
             }
-            // What the run changed is taken now, so a chunk lit as it was saved isn't saved again
-            // for its own light coming in (D258).
-            self.note_light(mut light)
-            for k in keys {
-                let pos = unpacked(k)
-                light.set_light_enabled(self.columns, pos.x, pos.z, self.lighted(k))
-                light.retain_data(pos.x, pos.z, false)
+        }
+        return LightData { sky_mask: [], block_mask: [], empty_sky_mask: [], empty_block_mask: [], sky: [], block: [] }
+    }
+
+    // Whether a step of light that had taken `covered` asks is about the chunk at `k` the level
+    // has, not one before it that went: whether the step had taken the ask that told light it
+    // came.
+    fn current(self, k: i64, covered: u64) -> bool {
+        let at = self.came_at.get(k) else return false
+        return at <= covered
+    }
+
+    // Takes in a step of light, as `light_done` does, without settling.
+    fn take_in(mut self, done: own LightDone) {
+        let d = done
+        let covered = d.covered
+        self.light_covered = covered
+        for k in d.initialized {
+            if self.current(k, covered) {
                 self.initialized.insert(k)
-                for x in pos.x - 1..pos.x + 2 {
-                    for z in pos.z - 1..pos.z + 2 {
-                        let n = ChunkPos { x: x, z: z }.pack()
-                        if self.initialized.contains(n) and not self.lit.contains(n) {
-                            self.to_light.insert(n)
-                        }
-                    }
+            }
+        }
+        if self.packets.len() > 0 {
+            for k in d.changed {
+                if self.current(k, covered) {
+                    _ = self.packets.remove(k)
                 }
             }
         }
-        var ready = List<i64>()
-        for k in self.to_light {
-            if self.dm.chunk_level(k, false) <= FULL and self.initialized_around(unpacked(k)) {
-                ready.push(k)
+        for k in d.unsaved {
+            if self.current(k, covered) and self.whole(k) {
+                self.unsaved.insert(k)
             }
         }
-        self.to_light.clear()
-        // Each is lit in turn, with a run of its own to count its work by, until this tick's is
-        // done; the rest wait for the next.
-        var any = false
-        var later: usize = 0
-        for k in ready {
-            if self.light_left <= 0 {
-                self.to_light.insert(k)
-                later += 1
+        for k in d.lit {
+            if not self.current(k, covered) {
                 continue
             }
-            if not self.lighted(k) {
-                var work: i64 = 0
-                self.light_ran = true
-                if let f = self.columns.flat {
-                    let pos = unpacked(k)
-                    light.propagate_light_sources(f.states, self.columns, pos.x, pos.z)
-                    work = i64(light.run(f.states, self.columns))
-                }
-                self.light_left -= work
-                // Lit now and not as it was saved, as `setLightCorrect` marks it unsaved (D258).
-                if self.whole(k) {
-                    self.unsaved.insert(k)
-                }
+            // Lit now and not as it was saved, as `setLightCorrect` marks it unsaved (D258).
+            if not self.lighted(k) and self.whole(k) {
+                self.unsaved.insert(k)
             }
             self.lit.insert(k)
             self.came_loaded(k)
             self.reading.unlit.remove(k)
-            any = true
         }
-        self.light_later = later
-        self.light = some(light)
-        return any
+        var data = d.data
+        while let entry = data.pop() {
+            let (k, light) = entry
+            let from = self.watching.get(k) ?? (covered + 1)
+            if self.current(k, covered) and from <= covered {
+                self.light_data.insert(k, light)
+            }
+        }
+        var saves = d.saves
+        for i in 0..saves.len() {
+            let light = saves[i].take()
+            let gone = self.saving.pop_first() else break
+            let (k, chunk) = gone
+            self.save_now(k, chunk, light)
+        }
+    }
+
+    // Runs light here, a step at a time, over the asks it's been told, until it has nothing left
+    // to do, taking each step in. Whether it did anything.
+    fn step_here(mut self) -> bool {
+        var any = false
+        loop {
+            var s = self.light_here.take() else return any
+            if self.light_asks.is_empty() and not s.pending() {
+                self.light_here = some(s)
+                return any
+            }
+            let n = self.light_asks.len().min(LIGHT_ASKS)
+            let d = s.step(mut self.light_asks, n)
+            self.light_here = some(s)
+            if let done = d {
+                self.take_in(done)
+                any = true
+            }
+        }
+    }
+
+    // Waits for light to have taken every ask it's been told, taking each step in, as the server
+    // stops: on its thread, or here.
+    fn finish_light(mut self) {
+        self.flush_light()
+        if let held = self.light_back.take() {
+            var back = held
+            while self.light_covered < self.light_sent {
+                let d = back.wait() else break
+                self.take_in(d)
+            }
+            self.light_back = some(back)
+            return
+        }
+        _ = self.step_here()
     }
 
     // The chunk at `k` came, went or changed: the packets kept for it and those around it go, as a
@@ -1353,56 +1359,15 @@ impl Level {
         }
     }
 
-    // The packets kept for chunks whose light may have changed go, and those lit and held whole
-    // are to be saved again.
-    fn drop_lit(mut self) {
-        var light = self.light.take() else return
-        self.note_light(mut light)
-        self.light = some(light)
-    }
-
-    // Tells `light` of the columns whose bodies came or went since it was last told, before it
-    // runs, so it reads their blocks again (D254).
-    fn tell_changed(mut self, light: mut Light) {
-        for k in self.columns.changed {
-            let pos = unpacked(k)
-            light.forget_bytes(pos.x, pos.z)
-        }
-        self.columns.changed.clear()
-    }
-
-    // Tells `light` of the chunk at `k`'s sections with blocks, as `initializeLight` does first.
-    fn tell_sections(self, light: mut Light, k: i64) {
-        let pos = unpacked(k)
-        match self.columns.slots[k] {
-            Body.Saved(s) => tell(mut light, s.chunk.value, pos, self.min_section),
-            Body.Flat => {
-                if let f = self.columns.flat {
-                    tell(mut light, f.chunk, pos, self.min_section)
-                }
-            },
-            Body.Loading => {},
-        }
-    }
-
     // Whether the chunk at `k` was saved lit, so its light isn't spread again.
     fn lighted(self, k: i64) -> bool {
+        if not self.columns.slots.contains(k) {
+            return false
+        }
         return match self.columns.slots[k] {
             Body.Saved(s) => s.lighted,
             _ => false,
         }
-    }
-
-    // Whether every chunk in the 3×3 around `pos` is initialized.
-    fn initialized_around(self, pos: ChunkPos) -> bool {
-        for x in pos.x - 1..pos.x + 2 {
-            for z in pos.z - 1..pos.z + 2 {
-                if not self.initialized.contains(ChunkPos { x: x, z: z }.pack()) {
-                    return false
-                }
-            }
-        }
-        return true
     }
 
     // Whether every chunk in the 3×3 around `pos` is flat, so its light is the flat world's.
@@ -1506,9 +1471,13 @@ impl Level {
         return false
     }
 
-    // Asks for a read of the chunk at `k`.
+    // Asks for a read of the chunk at `k`, once it's saved if it's waiting to be.
     fn ask(mut self, k: i64) {
         self.asked.insert(k, (self.asked.get(k) ?? 0) + 1)
+        if self.saves_waiting.contains(k) {
+            self.parked.push(k)
+            return
+        }
         self.asks.push(Ask.Chunk(unpacked(k)))
     }
 
@@ -1544,18 +1513,19 @@ impl CollisionBlocks for Level {
 }
 
 impl Chunks for Level {
-    // A chunk the tickets reach goes once it ticks. One further goes at once if a holder has it,
-    // initialized if chunks are read, if nothing's read, or if its region's file hasn't it, so
-    // it's flat; otherwise it's read for the player, if they've fewer than 64 being read, and goes
+    // A chunk the tickets reach goes once it ticks and light's given its light, which is wanted
+    // if it isn't (D264). One further goes at once if a holder has it, initialized, with its
+    // light, if chunks are read, if nothing's read, or if its region's file hasn't it, so it's
+    // flat; otherwise it's read for the player, if they've fewer than 64 being read, and goes
     // once it's read. The sender stops at one whose region's file is still to say, or past the
     // most reads.
     fn next(mut self, pos: ChunkPos, near: bool) -> Next {
         if near {
-            return if self.sendable(pos) { Next.Send } else { Next.Skip }
+            return if self.sendable(pos) and not self.light_wanted(pos) { Next.Send } else { Next.Skip }
         }
         let k = pos.pack()
         if self.columns.slots.contains(k) {
-            let there = if self.opened { self.initialized.contains(k) } else { true }
+            let there = if self.opened { self.initialized.contains(k) and not self.light_wanted(pos) } else { true }
             return if there { Next.Send } else { Next.Skip }
         }
         if not self.opened {
@@ -1607,20 +1577,6 @@ fn chunk_packet(pos: ChunkPos, chunk: Chunk, light: own LightData) -> List<u8> {
     var w = Writer.new()
     write_packet(ClientboundLevelChunkWithLight { x: pos.x, z: pos.z, chunk: chunk.chunk_data(), light: light }, State.Play, mut w)
     return w.into_bytes()
-}
-
-// Tells `light` of the sections of `chunk`, at `pos`, that have blocks, lowest first, at once
-// (D262).
-fn tell(light: mut Light, chunk: Chunk, pos: ChunkPos, min_section: i32) {
-    var ys = List<i32>()
-    for i in 0..chunk.section_count() {
-        if not chunk.section_only_air(i) {
-            ys.push(min_section + i32.wrap(i))
-        }
-    }
-    if not ys.is_empty() {
-        light.update_column_status(pos.x, pos.z, ys, false)
-    }
 }
 
 // The chunk a packed position is.

@@ -1,0 +1,550 @@
+/// Light on a thread of its own, as vanilla's `ThreadedLevelLightEngine` lights on its own, so
+/// the server's tick never waits for it (CAL-98, D264).
+///
+/// The level tells light what happens to its chunks, in order, as `LightAsk`s: a chunk came, with
+/// the light it was saved with, or went; a holder came to be full or stopped being; and which
+/// chunks' light it wants for their packets. Light takes them a step at a time, as vanilla's
+/// light thread takes its tasks a batch at a time (`runUpdate`): the asks first, then each chunk
+/// that came is initialized, as `initializeLight` does it (its sections with blocks told, a run,
+/// then its light turned on, lit or not as it was saved), then each initialized chunk whose holder
+/// is full and whose 3×3 is initialized is lit, as `lightChunk` does it (its light spread from its
+/// blocks and sky, unless it was saved lit, then a run), at most `LIGHT_STEP` of them a step, in the
+/// order they came to be ready. Each step that does anything hands back a `LightDone`: how many
+/// asks it had taken by then, what it initialized and lit, whose light changed, the light of the
+/// chunks the level wants, and the light of the chunks that went to be saved.
+///
+/// What a step does is a function of what light was told before it and the asks it takes, so a
+/// replay runs the same steps on its own thread, each over the asks the recording's covered, and
+/// lights the same (D178).
+module server.light_service
+
+import protocol.play.{LightData}
+import std.memory.{trim}
+import std.net.{Waker}
+import std.thread.{Task}
+import world.chunk.{Chunk}
+import world.flat.{FlatChunk}
+import world.light.{Layer, Light, LightChunks, SectionStates, SkySources, NO_CHUNK, light_sources, section_bytes, section_states}
+import world.pos.{ChunkPos}
+
+/// The most asks a step takes.
+pub const LIGHT_ASKS: usize = 4096
+/// The most chunks a step lights, as vanilla's light thread runs at most 1,000 tasks a batch, two
+/// for each chunk it lights.
+pub const LIGHT_STEP: usize = 500
+// How long light's thread goes without work before it lets go of what it kept of sections'
+// blocks, and gives the system back free memory, 5 s (D254).
+const QUIET_NANOS: u64 = 5000000000
+
+/// A chunk as light reads it.
+pub enum LightBody {
+    /// As it was saved or made, with its sky's sources.
+    Saved(Shared<Chunk>, SkySources)
+    /// Flat: the flat world's chunk.
+    Flat
+}
+
+/// What the level tells light, in the order it happens.
+pub enum LightAsk {
+    /// The chunk at `k` came, for its holder: what it is, and the light it was saved with, a
+    /// layer a section from the one below the world, the sky's and the blocks', `none` where
+    /// none was, and whether it was saved lit.
+    Came { k: i64, body: LightBody, sky: List<List<u8>?>, block: List<List<u8>?>, lighted: bool }
+    /// The chunk at `k` went, as its holder unloaded, with its light; `save` if the light it had
+    /// is wanted, to save it with.
+    Went { k: i64, save: bool }
+    /// The light the chunk at `k` has, wanted to save it with, as the server stops.
+    Save(i64)
+    /// The holder at `k` came to be full, or stopped being.
+    Full { k: i64, full: bool }
+    /// The level wants the chunk at `k`'s light, for its packets, once it's initialized and each
+    /// time it changes, until it's released or goes.
+    Watch(i64)
+    Release(i64)
+}
+
+/// What a step of light did, for the level to take in, in the order the steps were.
+pub struct LightDone {
+    /// How many asks light had taken by the step's end, counted from the first.
+    pub covered: u64
+    /// The chunks it initialized, and those it lit, in that order.
+    pub initialized: List<i64> = List<i64>()
+    pub lit: List<i64> = List<i64>()
+    /// The initialized chunks whose light, as a packet sends it, changed, and those of them that
+    /// were lit then, as `setLightCorrect`'s chunk is marked unsaved as its light changes (D258).
+    /// A chunk may come more than once.
+    pub changed: List<i64> = List<i64>()
+    pub unsaved: List<i64> = List<i64>()
+    /// The light of the chunks watched that were initialized, lit or changed, or asked for.
+    pub data: List<(i64, LightData)> = List<(i64, LightData)>()
+    /// For each chunk whose light was asked for to save it with, in the order they were asked,
+    /// its light if it was lit.
+    pub saves: List<LightData?> = List<LightData?>()
+}
+
+// The chunks light sees, as vanilla's `getChunkForLighting` gives them: each that came and
+// hasn't gone, and the flat chunk each flat one is.
+struct LightColumns {
+    slots: OpenHashMap<i64, LightBody> = OpenHashMap<i64, LightBody>()
+    flat: FlatChunk
+}
+
+impl LightChunks for LightColumns {
+    fn light_state(self, x: i32, y: i32, z: i32) -> u32? {
+        let k = ChunkPos { x: x >> 4, z: z >> 4 }.pack()
+        if not self.slots.contains(k) {
+            return none
+        }
+        return match self.slots[k] {
+            LightBody.Saved(c, _) => some(c.value.block(x & 15, y, z & 15)),
+            LightBody.Flat => some(self.flat.chunk.block(x & 15, y, z & 15)),
+        }
+    }
+
+    fn light_section(self, chunk_x: i32, section_y: i32, chunk_z: i32) -> SectionStates? {
+        let k = ChunkPos { x: chunk_x, z: chunk_z }.pack()
+        if not self.slots.contains(k) {
+            return none
+        }
+        return match self.slots[k] {
+            LightBody.Saved(c, _) => some(section_states(c.value, section_y)),
+            LightBody.Flat => some(section_states(self.flat.chunk, section_y)),
+        }
+    }
+
+    fn light_bytes(self, chunk_x: i32, section_y: i32, chunk_z: i32, table: List<u8>, out: mut List<u8>) -> i32 {
+        let k = ChunkPos { x: chunk_x, z: chunk_z }.pack()
+        if not self.slots.contains(k) {
+            return NO_CHUNK
+        }
+        return match self.slots[k] {
+            LightBody.Saved(c, _) => section_bytes(c.value, section_y, table, mut out),
+            LightBody.Flat => section_bytes(self.flat.chunk, section_y, table, mut out),
+        }
+    }
+
+    fn lowest_sky_source(self, x: i32, z: i32) -> i32? {
+        let k = ChunkPos { x: x >> 4, z: z >> 4 }.pack()
+        if not self.slots.contains(k) {
+            return none
+        }
+        return match self.slots[k] {
+            LightBody.Saved(_, s) => some(s.lowest_source_y(x & 15, z & 15)),
+            LightBody.Flat => some(self.flat.sources.lowest_source_y(x & 15, z & 15)),
+        }
+    }
+
+    fn highest_sky_source(self, chunk_x: i32, chunk_z: i32) -> i32? {
+        let k = ChunkPos { x: chunk_x, z: chunk_z }.pack()
+        if not self.slots.contains(k) {
+            return none
+        }
+        return match self.slots[k] {
+            LightBody.Saved(_, s) => some(s.highest_lowest_source_y()),
+            LightBody.Flat => some(self.flat.sources.highest_lowest_source_y()),
+        }
+    }
+
+    fn light_sources_in(self, chunk_x: i32, chunk_z: i32) -> List<i64> {
+        let k = ChunkPos { x: chunk_x, z: chunk_z }.pack()
+        if not self.slots.contains(k) {
+            return []
+        }
+        return match self.slots[k] {
+            LightBody.Saved(c, _) => light_sources(c.value, self.flat.states, chunk_x, chunk_z),
+            LightBody.Flat => light_sources(self.flat.chunk, self.flat.states, chunk_x, chunk_z),
+        }
+    }
+}
+
+/// Light's engine, what it sees of the chunks, and where each chunk is in being lit. Its thread
+/// runs it, and a replay or a test runs it on the level's.
+pub struct LightService {
+    light: Light
+    columns: LightColumns
+    min_section: i32
+    sections: i32
+    // The columns whose chunks came or went since light was last told, for it to let go of what
+    // it kept of their blocks (D254).
+    moved: List<i64> = List<i64>()
+    // The chunks that came, to be initialized, in the order they came; those initialized; those
+    // saved lit; and those lit.
+    arrived: LinkedSet<i64> = LinkedSet<i64>()
+    initialized: OpenHashSet<i64> = OpenHashSet<i64>()
+    lighted: OpenHashSet<i64> = OpenHashSet<i64>()
+    lit: OpenHashSet<i64> = OpenHashSet<i64>()
+    // The holders that are full, and the chunks initialized that may be ready to light, in the
+    // order they came to be.
+    full: OpenHashSet<i64> = OpenHashSet<i64>()
+    to_light: LinkedSet<i64> = LinkedSet<i64>()
+    // The chunks whose light the level wants, and those of them whose light goes with this step.
+    watched: OpenHashSet<i64> = OpenHashSet<i64>()
+    sending: OpenHashSet<i64> = OpenHashSet<i64>()
+    // How many asks it's taken.
+    taken: u64 = 0
+}
+
+impl LightService {
+    /// Light for a dimension of `sections` sections from `min_section`, with the sky's if `sky`,
+    /// whose flat chunks are `flat`'s.
+    pub fn new(min_section: i32, sections: i32, sky: bool, flat: own FlatChunk) -> LightService {
+        var light = Light.new(min_section * 16, sections * 16, sky)
+        light.note_changes()
+        return LightService { light: light, columns: LightColumns { flat: flat }, min_section: min_section, sections: sections }
+    }
+
+    /// How many asks it's taken.
+    pub fn covered(self) -> u64 {
+        return self.taken
+    }
+
+    /// Whether a step would do something with no more asks: chunks ready to light wait, past the
+    /// last step's `LIGHT_STEP`.
+    pub fn pending(self) -> bool {
+        return not self.to_light.is_empty()
+    }
+
+    /// Lets go of what light kept of sections' blocks, as it's gone quiet (D254).
+    pub fn quiet(mut self) {
+        self.light.let_go_of_bytes()
+    }
+
+    /// One step: the first `n` of `asks` taken, in order, then what can be initialized and lit
+    /// is. What it did, or `none` if it took nothing and did nothing.
+    pub fn step(mut self, asks: mut Deque<LightAsk>, n: usize) -> LightDone? {
+        var done = LightDone { covered: 0 }
+        var worked = false
+        for _ in 0..n {
+            let a = asks.pop_first() else break
+            self.take(a, mut done)
+            self.taken += 1
+            worked = true
+        }
+        // What came or went, light reads again (D254).
+        for k in self.moved {
+            let pos = unpacked(k)
+            self.light.forget_bytes(pos.x, pos.z)
+        }
+        self.moved.clear()
+        if not self.arrived.is_empty() {
+            self.initialize(mut done)
+            worked = true
+        }
+        if self.light_ready(mut done) {
+            worked = true
+        }
+        if self.light.has_work() {
+            _ = self.light.run(self.columns.flat.states, self.columns)
+            self.note(mut done)
+            worked = true
+        }
+        for k in self.sending {
+            if self.watched.contains(k) and self.initialized.contains(k) {
+                let pos = unpacked(k)
+                done.data.push((k, self.light.light_data(pos.x, pos.z)))
+            }
+        }
+        self.sending.clear()
+        if not worked {
+            return none
+        }
+        done.covered = self.taken
+        return some(done)
+    }
+
+    // Takes an ask in.
+    fn take(mut self, ask: own LightAsk, done: mut LightDone) {
+        match ask {
+            LightAsk.Came { k, body, sky, block, lighted } => self.came(k, body, sky, block, lighted),
+            LightAsk.Went { k, save } => {
+                if save {
+                    done.saves.push(self.saved_light(k))
+                }
+                self.went(k)
+            },
+            LightAsk.Save(k) => done.saves.push(self.saved_light(k)),
+            LightAsk.Full { k, full } => {
+                if full {
+                    self.full.insert(k)
+                    if self.initialized.contains(k) and not self.lit.contains(k) {
+                        self.to_light.insert(k)
+                    }
+                } else {
+                    self.full.remove(k)
+                }
+            },
+            LightAsk.Watch(k) => {
+                self.watched.insert(k)
+                self.sending.insert(k)
+            },
+            LightAsk.Release(k) => {
+                self.watched.remove(k)
+                self.sending.remove(k)
+            },
+        }
+    }
+
+    // The light of the chunk at `k`, if it's lit, to save it with.
+    fn saved_light(self, k: i64) -> LightData? {
+        if not self.lit.contains(k) {
+            return none
+        }
+        let pos = unpacked(k)
+        return some(self.light.light_data(pos.x, pos.z))
+    }
+
+    // The chunk at `k` came: its saved light goes to the engine, as `SerializableChunkData.read`
+    // queues it, a section at a time from the lowest, the chunk's kept from the first section
+    // with any; it's to be initialized.
+    fn came(mut self, k: i64, body: own LightBody, sky: own List<List<u8>?>, block: own List<List<u8>?>, lighted: bool) {
+        let pos = unpacked(k)
+        var skies = sky
+        var blocks = block
+        var kept = false
+        for i in 0..skies.len() {
+            if blocks[i] == none and skies[i] == none {
+                continue
+            }
+            if not kept {
+                self.light.retain_data(pos.x, pos.z, true)
+                kept = true
+            }
+            let y = self.min_section - 1 + i32.wrap(i)
+            if let b = blocks[i].take() {
+                self.light.queue_section_data(false, pos.x, y, pos.z, some(Layer.of(b)))
+            }
+            if let l = skies[i].take() {
+                self.light.queue_section_data(true, pos.x, y, pos.z, some(Layer.of(l)))
+            }
+        }
+        if lighted {
+            self.lighted.insert(k)
+        }
+        self.columns.slots.insert(k, body)
+        self.moved.push(k)
+        self.arrived.insert(k)
+    }
+
+    // The chunk at `k` went: its light goes too, as `updateChunkStatus` lets it go, for the next
+    // run to take away.
+    fn went(mut self, k: i64) {
+        if self.columns.slots.remove(k) != none {
+            self.moved.push(k)
+        }
+        self.arrived.remove(k)
+        self.initialized.remove(k)
+        self.lighted.remove(k)
+        self.lit.remove(k)
+        self.to_light.remove(k)
+        self.watched.remove(k)
+        self.sending.remove(k)
+        let pos = unpacked(k)
+        self.light.retain_data(pos.x, pos.z, false)
+        self.light.set_light_enabled(self.columns, pos.x, pos.z, false)
+        for y in self.min_section - 1..self.min_section + self.sections + 1 {
+            self.light.queue_section_data(false, pos.x, y, pos.z, none)
+            self.light.queue_section_data(true, pos.x, y, pos.z, none)
+        }
+        var ys = List<i32>()
+        for y in self.min_section..self.min_section + self.sections {
+            ys.push(y)
+        }
+        self.light.update_column_status(pos.x, pos.z, ys, true)
+    }
+
+    // Initializes each chunk that came, as `initializeLight` does: its sections with blocks told,
+    // a run, then its light turned on, lit or not as it was saved, and kept no more. Each chunk
+    // initialized around one may be ready to light now.
+    fn initialize(mut self, done: mut LightDone) {
+        var keys = List<i64>()
+        for k in self.arrived {
+            keys.push(k)
+        }
+        self.arrived.clear()
+        for k in keys {
+            self.tell_sections(k)
+        }
+        _ = self.light.run(self.columns.flat.states, self.columns)
+        // What the run changed is taken now, so a chunk lit as it was saved isn't saved again for
+        // its own light coming in (D258).
+        self.note(mut done)
+        for k in keys {
+            let pos = unpacked(k)
+            self.light.set_light_enabled(self.columns, pos.x, pos.z, self.lighted.contains(k))
+            self.light.retain_data(pos.x, pos.z, false)
+            self.initialized.insert(k)
+            done.initialized.push(k)
+            if self.watched.contains(k) {
+                self.sending.insert(k)
+            }
+            for x in pos.x - 1..pos.x + 2 {
+                for z in pos.z - 1..pos.z + 2 {
+                    let n = ChunkPos { x: x, z: z }.pack()
+                    if self.initialized.contains(n) and not self.lit.contains(n) {
+                        self.to_light.insert(n)
+                    }
+                }
+            }
+        }
+    }
+
+    // Lights the chunks ready to be, as `lightChunk` does, up to `LIGHT_STEP` of them in the order
+    // they came to be ready: whose holder is full, and the 3×3 around which is initialized. Each
+    // has its light spread from its blocks and sky, unless it was saved lit, then they're run
+    // together, as vanilla's light thread runs a batch's tasks. Those not ready wait for a chunk
+    // around them to be initialized, or their holder to be full. Whether any was lit.
+    fn light_ready(mut self, done: mut LightDone) -> bool {
+        if self.to_light.is_empty() {
+            return false
+        }
+        var ready = List<i64>()
+        for k in self.to_light {
+            if self.full.contains(k) and self.initialized_around(unpacked(k)) {
+                ready.push(k)
+            }
+        }
+        self.to_light.clear()
+        var now = List<i64>()
+        for k in ready {
+            if now.len() < LIGHT_STEP {
+                now.push(k)
+            } else {
+                self.to_light.insert(k)
+            }
+        }
+        if now.is_empty() {
+            return false
+        }
+        for k in now {
+            if not self.lighted.contains(k) {
+                let pos = unpacked(k)
+                self.light.propagate_light_sources(self.columns.flat.states, self.columns, pos.x, pos.z)
+            }
+        }
+        _ = self.light.run(self.columns.flat.states, self.columns)
+        for k in now {
+            self.lit.insert(k)
+            done.lit.push(k)
+            if self.watched.contains(k) {
+                self.sending.insert(k)
+            }
+        }
+        self.note(mut done)
+        return true
+    }
+
+    // Takes the chunks whose light a run changed, or that were queued or taken back.
+    fn note(mut self, done: mut LightDone) {
+        for c in self.light.take_changed() {
+            let k = c.pack()
+            if not self.initialized.contains(k) {
+                continue
+            }
+            done.changed.push(k)
+            if self.lit.contains(k) {
+                done.unsaved.push(k)
+            }
+            if self.watched.contains(k) {
+                self.sending.insert(k)
+            }
+        }
+    }
+
+    // Tells light of the chunk at `k`'s sections with blocks, as `initializeLight` does first,
+    // all at once (D262).
+    fn tell_sections(mut self, k: i64) {
+        if not self.columns.slots.contains(k) {
+            return
+        }
+        let pos = unpacked(k)
+        var ys = List<i32>()
+        match self.columns.slots[k] {
+            LightBody.Saved(c, _) => filled_sections(c.value, self.min_section, mut ys),
+            LightBody.Flat => filled_sections(self.columns.flat.chunk, self.min_section, mut ys),
+        }
+        if not ys.is_empty() {
+            self.light.update_column_status(pos.x, pos.z, ys, false)
+        }
+    }
+
+    // Whether every chunk in the 3×3 around `pos` is initialized.
+    fn initialized_around(self, pos: ChunkPos) -> bool {
+        for x in pos.x - 1..pos.x + 2 {
+            for z in pos.z - 1..pos.z + 2 {
+                if not self.initialized.contains(ChunkPos { x: x, z: z }.pack()) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+}
+
+// The sections of `chunk` that have blocks, lowest first, from `min_section`.
+fn filled_sections(chunk: Chunk, min_section: i32, ys: mut List<i32>) {
+    for i in 0..chunk.section_count() {
+        if not chunk.section_only_air(i) {
+            ys.push(min_section + i32.wrap(i))
+        }
+    }
+}
+
+/// Light's thread: it takes the level's asks as they come, a step at a time, and hands back what
+/// each step did, waking the server's poll. With nothing to do for 5 s, it lets go of what it kept
+/// of sections' blocks and gives the system back free memory (D254). It ends once the level's
+/// gone.
+pub struct LightThread {
+    pub service: LightService
+    pub asks: Receiver<Deque<LightAsk>>
+    pub back: Sender<LightDone>
+    pub waker: Waker
+}
+
+impl Task for LightThread {
+    fn run(own self) {
+        var s = self.service
+        var asks = self.asks
+        var back = self.back
+        let waker = self.waker
+        var taken = Deque<LightAsk>()
+        var quiet = false
+        loop {
+            while taken.len() < LIGHT_ASKS {
+                var got = asks.next() else break
+                while let a = got.pop_first() {
+                    taken.push_last(a)
+                }
+            }
+            if taken.is_empty() and not s.pending() {
+                var next: Deque<LightAsk>? = none
+                if not quiet {
+                    next = unsafe { asks.wait_for(QUIET_NANOS) }
+                    if next == none {
+                        s.quiet()
+                        trim()
+                        quiet = true
+                    }
+                }
+                if next == none {
+                    next = asks.wait()
+                }
+                var got = next else return
+                while let a = got.pop_first() {
+                    taken.push_last(a)
+                }
+                quiet = false
+                continue
+            }
+            let n = taken.len().min(LIGHT_ASKS)
+            if let d = s.step(mut taken, n) {
+                back.send(d)
+                waker.wake()
+            }
+        }
+    }
+}
+
+// The chunk a packed position is.
+fn unpacked(k: i64) -> ChunkPos {
+    return ChunkPos { x: i32.wrap(k), z: i32.wrap(k >> 32) }
+}
