@@ -27,15 +27,16 @@ and the others keep to one entry that logs in each folder.
 """
 
 import base64
-import io
 import json
+import struct
 import sys
-import zipfile
+import zlib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "rig" / "runner"))
 from cases import write_file  # noqa: E402
+from deflate import deflate as deflated  # noqa: E402
 
 VANILLA = "minecraft:vanilla"
 REBALANCE = "minecraft:trade_rebalance"
@@ -63,20 +64,37 @@ def rebalance_meta():
 WRITTEN = (2026, 11, 1, 3, 19, 0)
 
 
+def dos_time(t):
+    year, month, day, hour, minute, second = t
+    return hour << 11 | minute << 5 | second // 2, (year - 1980) << 9 | month << 5 | day
+
+
 def zipped(files, deflate=True):
-    """A zip of the files, each a name and its text or bytes, as Java's zip tools would read it."""
-    out = io.BytesIO()
-    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED if deflate else zipfile.ZIP_STORED) as z:
-        for name, data in files:
-            if name.endswith("/"):
-                z.writestr(zipfile.ZipInfo(name), b"")
-            else:
-                # As `writestr` makes it for a name, but at a fixed time.
-                info = zipfile.ZipInfo(name, date_time=WRITTEN)
-                info.compress_type = z.compression
-                info.external_attr = 0o600 << 16
-                z.writestr(info, data.encode() if isinstance(data, str) else data)
-    return out.getvalue()
+    """A zip of the files, each a name and its text or bytes, as Java's zip tools would read it,
+    laid out as Python's zipfile lays one out on Windows. Written here, not by zipfile, so that
+    it's the same on every machine: zipfile marks each entry with the system it ran on, and
+    deflates with whichever zlib Python has, where rig/runner/deflate.py doesn't."""
+    out = bytearray()
+    central = bytearray()
+    for name, data in files:
+        data = data.encode() if isinstance(data, str) else bytes(data)
+        folder = name.endswith("/")
+        # Folders as `writestr(ZipInfo(name), b"")` makes them: stored, at 1980's start.
+        method = 8 if deflate and not folder else 0
+        when = dos_time((1980, 1, 1, 0, 0, 0) if folder else WRITTEN)
+        attributes = 0o600 << 16
+        stored = deflated(data) if method == 8 else data
+        encoded = name.encode("ascii", "strict") if name.isascii() else name.encode("utf-8")
+        flags = 0 if name.isascii() else 0x800
+        crc = zlib.crc32(data)
+        common = struct.pack("<HHHHHIIIHH", 20, flags, method, when[0], when[1], crc, len(stored), len(data), len(encoded), 0)
+        offset = len(out)
+        out += struct.pack("<I", 0x04034B50) + common + encoded + stored
+        central += struct.pack("<IH", 0x02014B50, 20) + common + struct.pack("<HHHII", 0, 0, 0, attributes, offset) + encoded
+    start = len(out)
+    out += central
+    out += struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(files), len(files), len(central), start, 0)
+    return bytes(out)
 
 
 class Case:

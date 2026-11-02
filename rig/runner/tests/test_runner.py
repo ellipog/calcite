@@ -1,4 +1,5 @@
-"""Tests for the rig's runner. Standard library only; no vanilla jar needed.
+"""Tests for the rig's runner. Standard library only; no vanilla jar needed, though the case
+generators that read it are skipped without it.
 
     py -I -m unittest discover -s rig/runner/tests -v
 """
@@ -112,19 +113,25 @@ class CaseFiles(unittest.TestCase):
             self.assertEqual(len(ids), len(set(ids)), probe)
 
     def test_generated_files_are_current(self):
-        """Each gen.py must reproduce its committed file exactly."""
+        """Each gen.py must reproduce its committed file exactly, on every machine. Those that
+        read vanilla's ids from the pinned jar are skipped where it hasn't been fetched."""
+        jar = ROOT / "oracle" / "jars" / "server-26.3.jar"
         for gen in sorted((ROOT / "cases").glob("*/gen.py")):
-            before = {p: p.read_bytes() for p in (ROOT / "cases").rglob("*.json")}
-            try:
-                subprocess.run([sys.executable, "-I", str(gen)], check=True, capture_output=True)
-                after = {p: p.read_bytes() for p in (ROOT / "cases").rglob("*.json")}
-            finally:
-                for p in set((ROOT / "cases").rglob("*.json")) - set(before):
-                    p.unlink()
-                for p, data in before.items():
-                    p.write_bytes(data)
-            changed = sorted(str(p.relative_to(ROOT)) for p in after if before.get(p) != after[p])
-            self.assertEqual(changed, [], f"{gen.relative_to(ROOT)} doesn't match its committed output; rerun it")
+            with self.subTest(gen=str(gen.relative_to(ROOT))):
+                if not jar.is_file() and jar.name in gen.read_text(encoding="utf-8"):
+                    self.skipTest(f"no {jar.relative_to(ROOT)}; oracle/fetch.py fetches it")
+                before = {p: p.read_bytes() for p in (ROOT / "cases").rglob("*.json")}
+                try:
+                    run = subprocess.run([sys.executable, "-I", str(gen)], capture_output=True, text=True)
+                    after = {p: p.read_bytes() for p in (ROOT / "cases").rglob("*.json")}
+                finally:
+                    for p in set((ROOT / "cases").rglob("*.json")) - set(before):
+                        p.unlink()
+                    for p, data in before.items():
+                        p.write_bytes(data)
+                self.assertEqual(run.returncode, 0, run.stderr[-2000:])
+                changed = sorted(str(p.relative_to(ROOT)) for p in after if before.get(p) != after[p])
+                self.assertEqual(changed, [], f"{gen.relative_to(ROOT)} doesn't match its committed output; rerun it")
 
     def test_unordered_flag(self):
         with tempfile.TemporaryDirectory() as d:

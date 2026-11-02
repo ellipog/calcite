@@ -15,7 +15,8 @@ sys.path.insert(0, str(DATAGEN))
 
 import calx_tables  # noqa: E402
 
-INDEX = {"game_version": "1.0", "protocol_version": 5, "world_version": 4600}
+INDEX = {"game_version": "1.0", "protocol_version": 5, "world_version": 4600,
+         "pack_version": {"data_major": 94, "data_minor": 1}}
 
 
 def packets(**states):
@@ -33,6 +34,7 @@ class IdsModule(unittest.TestCase):
         }))
         self.assertIn("pub const PROTOCOL_VERSION: i32 = 5\n", text)
         self.assertIn("pub const DATA_VERSION: i32 = 4600\n", text)
+        self.assertIn("pub const DATA_PACK_MAJOR: i32 = 94\npub const DATA_PACK_MINOR: i32 = 1\n", text)
         self.assertIn('    return "1.0"\n', text)
         self.assertIn(
             "        State.Login => {\n"

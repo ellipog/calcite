@@ -110,7 +110,7 @@ Runs one case on an adapter and compares it with vanilla's golden: the output fi
 
 ## Case files
 
-Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.md#case-files). Hand-written files cover edge cases. Generated ones (`generated.json`, `limits.json`) come from the `gen.py` beside them, which is deterministic: run it again and the file comes out the same, zip files included, whose times are fixed.
+Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.md#case-files). Hand-written files cover edge cases. Generated ones (`generated.json`, `limits.json`) come from the `gen.py` beside them, which is deterministic: run it again, on any machine and any Python the runner supports, and the file comes out the same. The runner's tests rerun every generator and compare (D249). So nothing a generator writes may depend on the machine: zip files have fixed times and are laid out by the generator, not `zipfile`, which marks each entry with the system it ran on, and every deflate, zlib or gzip stream comes from [`deflate.py`](runner/deflate.py), not Python's `zlib`, which compresses with whichever zlib Python was built with (zlib-ng on Windows from 3.14, classic zlib elsewhere, with different bytes). The generators that name vanilla's data read its ids from the pinned jar, so they need `oracle/fetch.py` run first; the tests skip them without it.
 
 A case whose blobs vanilla doesn't write in the same order every run says `"unordered": true`, and the runner ([`unordered.py`](runner/unordered.py)) sorts each compound in them by key before hashing (D192).
 

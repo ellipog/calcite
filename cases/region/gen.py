@@ -9,7 +9,8 @@ fixed rule, so rerunning it gives the same file.
 
 A chunk's bytes come from the case, compressed already: its compression's byte, then the stream,
 which both adapters write as they are, so the files compare byte for byte. The streams are made
-here. zlib and gzip come from Python's zlib, the library Java's Deflater wraps. lz4 is framed as
+here. zlib and gzip are compressed by rig/runner/deflate.py, which writes the same bytes on every
+machine, as Python's zlib doesn't: it compresses with the zlib it's built with. lz4 is framed as
 lz4-java's LZ4BlockOutputStream frames it, in blocks compressed by a greedy LZ4 compressor here, or
 stored. Chunks of a megabyte are stored zlib blocks around the runner's generated noise, so the
 case file holds only their framing.
@@ -24,6 +25,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "rig" / "runner"))
 from cases import splitmix64, write_file  # noqa: E402
+from deflate import gzip_stream, zlib_stream  # noqa: E402
 
 SEED = 20261029
 GZIP, DEFLATE, STORED, LZ4, CUSTOM = 1, 2, 3, 4, 127
@@ -91,9 +93,7 @@ def zlib_noise_chunk(noise, length):
 
 def gzip(data, level=6):
     """gzip as Java's GZIPOutputStream writes it: no name, no time, OS 255."""
-    c = zlib.compressobj(level, zlib.DEFLATED, -15)
-    raw = c.compress(data) + c.flush()
-    return b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff" + raw + struct.pack("<II", zlib.crc32(data), len(data))
+    return gzip_stream(data, level)
 
 
 # XXH32, as lz4-java's checksums use it.
@@ -221,7 +221,7 @@ def layout(noise):
     blobs = [
         stored_chunk(noise, 3000)[1],
         stored_chunk(noise, 10000)[1],
-        b64(bytes([DEFLATE]) + zlib.compress(text(20000), 6)),
+        b64(bytes([DEFLATE]) + zlib_stream(text(20000), 6)),
         stored_chunk(noise, 14000)[1],
         stored_chunk(noise, 5000)[1],
         stored_chunk(noise, 100)[1],
@@ -253,7 +253,7 @@ def external(noise):
     # With their 4 bytes of length, 255 sectors exactly, and a byte more.
     exactly = zlib_noise_chunk(noise, 255 * SECTOR - 4)[1]
     edge = zlib_noise_chunk(noise, 255 * SECTOR - 3)[1]
-    blobs = [big, b64(bytes([DEFLATE]) + zlib.compress(text(3000), 6)), bigger, exactly, edge]
+    blobs = [big, b64(bytes([DEFLATE]) + zlib_stream(text(3000), 6)), bigger, exactly, edge]
     ops = [
         ["open"],
         ["write", 3, 4, 0], ["read", 3, 4], ["close"],
@@ -276,12 +276,12 @@ def compressions(noise):
         bytes([GZIP]) + gzip(small, 1),
         bytes([GZIP]) + gzip(b""),
         bytes([GZIP]) + two_members,
-        bytes([DEFLATE]) + zlib.compress(small, 1),
-        bytes([DEFLATE]) + zlib.compress(small, 6),
-        bytes([DEFLATE]) + zlib.compress(words, 9),
-        bytes([DEFLATE]) + zlib.compress(b"", 6),
+        bytes([DEFLATE]) + zlib_stream(small, 1),
+        bytes([DEFLATE]) + zlib_stream(small, 6),
+        bytes([DEFLATE]) + zlib_stream(words, 9),
+        bytes([DEFLATE]) + zlib_stream(b"", 6),
         # What follows a zlib stream's end isn't read.
-        bytes([DEFLATE]) + zlib.compress(small, 6) + b"after the end",
+        bytes([DEFLATE]) + zlib_stream(small, 6) + b"after the end",
         bytes([STORED]),
         bytes([STORED]) + small,
         bytes([LZ4]) + lz4(small),
@@ -307,7 +307,7 @@ def broken(noise):
     """Streams vanilla's readers refuse, chunks of custom and unknown compressions, and chunks
     that say their bytes are in a file of their own."""
     small = text(5000, 2)
-    z = zlib.compress(small, 6)
+    z = zlib_stream(small, 6)
     g = gzip(small)
     l4 = lz4(small)
     bad_adler = bytearray(z)
@@ -385,7 +385,7 @@ def damaged(noise):
     """Headers whose places can't be right, which vanilla drops as it opens them, and chunks whose
     own headers are wrong, which it logs as it reads them."""
     small = text(3000, 5)
-    z = bytes([DEFLATE]) + zlib.compress(small, 6)
+    z = bytes([DEFLATE]) + zlib_stream(small, 6)
     # 0 and 1 overlap the header, 2 has no sectors and 3 is past the end, so all four are dropped.
     # 4 is a good chunk. 5 is allocated, with no stream. 6 says it's longer than its sector, and 7
     # that its length is negative. 8 is in a sector nothing was written to. 10 is at 7 and 8, and

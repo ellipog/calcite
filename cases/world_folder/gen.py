@@ -6,7 +6,8 @@ LevelStorageSource, PlayerDataStorage and SavedDataStorage do each.
     py -I cases/world_folder/gen.py
 
 The level.dat files are made here: NBT written as NbtIo writes a file's root, gzipped as Java's
-GZIPOutputStream gzips it, then broken in the ways a file can be: cut off, with a wrong checksum or
+GZIPOutputStream frames it, by rig/runner/deflate.py, which compresses the same on every machine
+as Python's zlib doesn't, then broken in the ways a file can be: cut off, with a wrong checksum or
 length, more than one gzip member, a header with its optional fields, things after the stream, a
 root that isn't a compound, more NBT than the quota, and folders where files should be.
 """
@@ -20,6 +21,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parents[1] / "rig" / "runner"))
 from cases import write_file  # noqa: E402
+from deflate import GZIP_HEADER, deflate, gzip_stream  # noqa: E402
 
 END, BYTE, SHORT, INT, LONG, FLOAT, DOUBLE, BYTES, STRING, LIST, COMPOUND, INTS, LONGS = range(13)
 
@@ -71,11 +73,9 @@ def level(**fields):
     return root(COMPOUND, {"Data": (COMPOUND, fields)})
 
 
-def gzip(data, header=b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"):
+def gzip(data, header=GZIP_HEADER):
     """gzip as Java's GZIPOutputStream writes it: no name, no time, OS 255."""
-    c = zlib.compressobj(6, zlib.DEFLATED, -15)
-    raw = c.compress(data) + c.flush()
-    return header + raw + struct.pack("<II", zlib.crc32(data), len(data))
+    return gzip_stream(data, 6, header)
 
 
 GOOD = {
@@ -129,8 +129,7 @@ def broken():
     """level.dat files that can't be read, with level.dat_old to fall back on, and some that can
     be although they look broken."""
     data = good("broken")
-    raw = zlib.compressobj(6, zlib.DEFLATED, -15)
-    deflated = raw.compress(data) + raw.flush()
+    deflated = deflate(data)
     head = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\xff"
     trailer = struct.pack("<II", zlib.crc32(data), len(data))
     half = len(data) // 2
