@@ -142,8 +142,11 @@ py -I cases/surface/gen.py       # cases/surface/generated.json
 py -I cases/carvers/gen.py       # cases/carvers/generated.json
 py -I cases/features/gen.py      # cases/features/generated.json
 py -I cases/features/structured.py  # cases/features/structured.json
+py -I cases/features/grid.py     # cases/features/grid.json
 py -I cases/structures/gen.py    # cases/structures/generated.json
 ```
+
+The seed grid, `cases/features/grid.json`, is what Phase 5's gate runs the worldgen suites on in all three dimensions (`G5.1`, D267): ten seeds, the six every worldgen case file draws on, the generation bench's and three drawn, each with the Overworld, the Nether and the End as the `normal` preset makes them. In each, the 3×3 chunks about the origin and the 3×3 about a chunk up to 1,875 out are made by every stage with `structured`, in one shared world, and decorated in the order the server decorates them, by their colors' ranks (D214), so every stage is checked as the server chains them.
 
 ### Blobs in case files
 
@@ -173,7 +176,7 @@ The generators use SplitMix64 from the given seed. A range value is `min + (max 
 
 - calx is found from the `CALX` environment variable, then `PATH`, then `../calx/build/compiler/<platform>/` beside this repository. calx finds clang itself.
 - `CALCITE_DEBUG=1` builds the adapter in debug mode, where it checks that it frees everything it allocates and exits with status 102 if not.
-- It implements `ping`, `rng`, `collections`, `registries`, `palette`, `chunk`, `region`, `chunk_nbt`, `level_data`, `world_folder`, `allow_list`, `entities_poi`, `tickets`, `levels`, `distance`, `light`, `spawn`, `packs`, `noise`, `density`, `biomes`, `terrain`, `surface`, `carvers`, `math`, `strictmath` and `mth`, which pass 100% on Windows and Linux; `nbt` for binary input, whose 32 cases pass, while its SNBT cases wait for the SNBT parser; `features`, which matches every case whose features and structure pieces it places and reports the rest as unimplemented (CAL-84, CAL-85); and `structures`, whose placement and ring cases all pass, with the starts of the structure types Calcite has, and the rest reported as unimplemented (CAL-85). Every other probe reports `unimplemented` until Calcite has the code behind it.
+- It implements `ping`, `rng`, `collections`, `registries`, `palette`, `chunk`, `region`, `chunk_nbt`, `level_data`, `world_folder`, `allow_list`, `entities_poi`, `tickets`, `levels`, `distance`, `light`, `spawn`, `packs`, `noise`, `density`, `biomes`, `terrain`, `surface`, `carvers`, `math`, `strictmath` and `mth`, which pass 100% on Windows and Linux; `nbt` for binary input, whose 32 cases pass, while its SNBT cases wait for the SNBT parser; `features`, whose 557 cases pass, the seed grid's 60 among them (CAL-84, CAL-85, D267); and `structures`, whose 89 cases pass (CAL-85). Either reports a case that reaches a feature, a piece or a structure type it doesn't have as unimplemented. Every other probe reports `unimplemented` until Calcite has the code behind it.
 - It runs from the repository's root. `registries`, `chunk`, `chunk_nbt` and `packs` read the vanilla data pack from the pinned jar in `oracle/jars/`, which [`fetch.py`](../oracle/fetch.py) gets.
 
 The adapter's parts are in [`src/`](../src/README.md): the frames in `rig.frame`, their JSON in `json.tree`, and one module per probe.
