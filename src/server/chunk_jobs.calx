@@ -70,6 +70,10 @@ const MOST_WORKERS: usize = 8
 // The most chunks the IO thread holds to write together.
 const WRITE_BATCH: usize = 64
 
+// How long the generator's thread waits with nothing coming in before it lets go of what its
+// scheduler keeps, in nanoseconds (D228).
+const SETTLE_NANOS: u64 = 5000000000
+
 // How long a generator worker that's handed nothing keeps its copy of the generator's worker, in
 // nanoseconds: then it lets go of it, with what it cached, and copies it again for its next job
 // (D226).
@@ -565,8 +569,6 @@ enum GenIn {
     Written(List<i64>, List<Entry>)
     Origin(i32, i32, String?)
     Spawn
-    // A while has gone by, as the server's ticks count it.
-    Quiet
 }
 
 // A chunk to generate, with what the IO thread logged and read, and what the worker logged.
@@ -727,8 +729,6 @@ struct GenState {
     began: Instant
     hot: Map<i64, u32> = Map<i64, u32>()
     wants: usize = 0
-    // How many chunks have been asked for since the server last said a while had gone by.
-    asked_lately: usize = 0
     // The service that loads the structure templates for every worker.
     to_templates: Sender<TemplateAsk>? = none
     collisions: CollisionStates? = none
@@ -793,7 +793,14 @@ impl Task for GenThread {
                 progressed = true
             }
             if not progressed {
-                let m = inbox.wait() else return
+                // Nothing for a while: everything asked for has been handed back, and nothing
+                // more is, so what the scheduler keeps goes (D228).
+                var next = unsafe { inbox.wait_for(SETTLE_NANOS) }
+                if next == none {
+                    settle(mut s)
+                    next = inbox.wait()
+                }
+                let m = next else return
                 out.take_in(mut s, m)
             }
         }
@@ -808,7 +815,6 @@ impl GenOut {
                 let key = chunk_key(w.pos.x, w.pos.z)
                 let x = w.pos.x
                 let z = w.pos.z
-                s.asked_lately += 1
                 if s.finished.contains(key) {
                     let saved = s.finished[key].copy()
                     self.hand_back(mut s, w, Loaded.Saved(saved))
@@ -864,25 +870,6 @@ impl GenOut {
                     s.lines.push(Entry.warn(p.copy()).on(gen_thread()))
                 }
                 s.spawn = some(SpawnFind { x: x, z: z, offsets: spiral(), at: 0, asked: false })
-            },
-            GenIn.Quiet => {
-                // Nothing asked for since the last time, and nothing waiting: what the scheduler
-                // keeps of the chunks around those it made goes, and is made again, the same, if
-                // it's needed (D220).
-                if s.asked_lately == 0 and s.asked.is_empty() and s.spawn == none and not s.spawn_wanted {
-                    if let g = s.sched.take() {
-                        if g.holds_any() {
-                            s.sched = some(renewed(mut s, g))
-                            forget(mut s)
-                        } else {
-                            s.sched = some(g)
-                        }
-                    }
-                    // What the busy while freed goes back to the system: now what's free, and at
-                    // the next quiet what the workers let go of since (CLX-114).
-                    trim()
-                }
-                s.asked_lately = 0
             },
             GenIn.Spawn => {
                 s.spawn_wanted = true
@@ -1111,6 +1098,26 @@ fn renewed(s: mut GenState, old: own Scheduler) -> Scheduler {
     return fresh
 }
 
+// The generator's thread has had nothing come in for a while, so nothing is waiting to be made:
+// what the scheduler keeps of the chunks around those it made goes, and is made again, the same,
+// if it's needed, and the templates' service lets go of what it loaded (D220, D228). What the
+// busy while freed goes back to the system: what's free now, and the next time what's been freed
+// since, as the workers let go of their copies (CLX-114, D226).
+fn settle(s: mut GenState) {
+    if not s.asked.is_empty() or s.spawn != none or s.spawn_wanted {
+        return
+    }
+    if let g = s.sched.take() {
+        if g.holds_any() {
+            s.sched = some(renewed(mut s, g))
+            forget(mut s)
+        } else {
+            s.sched = some(g)
+        }
+    }
+    trim()
+}
+
 // Has the templates' service let go of the templates it loaded. The workers have let go of their
 // copies of the generator's worker by now, each a while after its last job, so once those that
 // still hold some are let go too, they're freed (D226).
@@ -1314,20 +1321,6 @@ impl ChunkJobs {
         }
         self.to_asks.send(Ask.Close)
         self.closing_away += 1
-    }
-
-    /// Tells the generator's thread, if it's started, that a while has gone by: if it's been asked
-    /// for nothing since it was last told, it lets go of what it keeps of the chunks around those
-    /// it made, which it makes again, the same, if they're needed (D220).
-    pub fn quiet(mut self) {
-        if self.gen != none {
-            return
-        }
-        if let held = self.to_gen.take() {
-            var g = held
-            g.send(GenIn.Quiet)
-            self.to_gen = some(g)
-        }
     }
 
     /// Whether the IO thread is still closing the region files.
