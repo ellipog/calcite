@@ -12,7 +12,7 @@ module storage.region
 
 import resources.identifier.{Identifier}
 import server.log.{Entry}
-import std.fs.{FsError, is_file, metadata, read, read_part, remove_file, rename, rename_synced, write, write_parts}
+import std.fs.{File, FsError, is_file, metadata, open, read, read_part, remove_file, rename, rename_synced, write, write_parts}
 import std.lz4.{Error as Lz4Error, compress_into as lz4_compress, decompress_into as lz4_decompress}
 import std.text.mutf8.{decode as utf_decode}
 import std.zlib.{Error as ZipError, Format, compress_into as zlib_compress, decompress_into as zlib_decompress}
@@ -189,10 +189,16 @@ pub fn unpack(pos: ChunkPos, stored: Stored, lines: mut List<Entry>) -> List<u8>
     return try uncompress(pos, id, stored.sectors, 5, 5 + usize.wrap(stream), mut lines)
 }
 
-/// One region file: its header, and which of its sectors are taken.
+/// One region file: its header, and which of its sectors are taken, and the file, kept open from
+/// when it's opened until it's closed, as vanilla keeps its `FileChannel`. On Windows, a file
+/// written and closed is scanned again by the antivirus, which took a few milliseconds a write;
+/// a server that saved each chunk it made spent nearly all its saving thread's time there.
 pub struct RegionFile {
     path: String
     folder: String
+    file: File? = none
+    // Whether it's been written since it was opened, so closing it syncs it.
+    written: bool = false
     // Each chunk's place, its first sector shifted left by 8 and its sector count, or 0 for
     // none, by `x + z * 32` in the region.
     offsets: List<i32>
@@ -212,19 +218,32 @@ impl RegionFile {
     pub fn open(path: String, folder: String, lines: mut List<Entry>) -> RegionFile ! FsError {
         var region = RegionFile { path: path.copy(), folder: folder.copy(), offsets: [0; 1024], timestamps: [0; 1024], used: [], size: 0 }
         region.take(0, 2)
-        if not is_file(path) {
-            let empty: List<u8> = []
-            try write(path, empty)
+        let existed = is_file(path)
+        region.file = some(try open(path))
+        if not existed {
             return region
         }
-        let header = try read_part(path, 0, HEADER)
+        // Nothing closes a file let go of, so one that fails here is closed first.
+        let header = match region.read_at(0, HEADER) {
+            ok(h) => h,
+            err(e) => {
+                region.let_go()
+                fail e
+            },
+        }
         if header.is_empty() {
             return region
         }
         if header.len() != HEADER {
             lines.push(Entry.warn("Region file {path} has truncated header: {header.len()}"))
         }
-        region.size = try file_size(path)
+        region.size = match region.file_size() {
+            ok(n) => n,
+            err(e) => {
+                region.let_go()
+                fail e
+            },
+        }
         for i in 0..1024usize {
             region.offsets[i] = int_at(header, i * 4)
             region.timestamps[i] = int_at(header, 4096 + i * 4)
@@ -280,7 +299,7 @@ impl RegionFile {
             return none
         }
         let length = i64(count_of(offset)) * SECTOR
-        let sectors = match read_part(self.path, u64.wrap(i64(sector_of(offset)) * SECTOR), usize.wrap(length)) {
+        let sectors = match self.read_at(u64.wrap(i64(sector_of(offset)) * SECTOR), usize.wrap(length)) {
             ok(bytes) => bytes,
             err(e) => fail io(e),
         }
@@ -359,7 +378,7 @@ impl RegionFile {
             }
         }
         self.pad(mut parts)
-        try write_parts(self.path, parts, sync)
+        try self.write_at(parts, sync)
         try self.write_header(sync)
         for external in gone {
             try remove_if_there(external)
@@ -384,14 +403,74 @@ impl RegionFile {
         self.free(sector_of(old), count_of(old))
     }
 
-    /// Pads the file to whole sectors, as vanilla does when it closes one. Each write pads it, so
-    /// this only changes a file that was short of a sector when it was opened.
+    /// Pads the file to whole sectors, syncs it and closes it, as vanilla does when it closes one.
+    /// Each write pads it, so padding only changes a file that was short of a sector when it was
+    /// opened, and a file that wasn't written isn't synced. It's closed even if that fails.
     pub fn close(mut self) ! FsError {
         var parts: List<(u64, List<u8>)> = []
         self.pad(mut parts)
+        var failed: FsError? = none
         if not parts.is_empty() {
-            try write_parts(self.path, parts, true)
+            self.written = true
+            match self.write_at(parts, false) {
+                ok => {},
+                err(e) => failed = some(e),
+            }
         }
+        if let file = self.file.take() {
+            if self.written and failed == none {
+                match file.sync() {
+                    ok => {},
+                    err(e) => failed = some(e),
+                }
+            }
+            match file.close() {
+                ok => {},
+                err(e) => {
+                    if failed == none {
+                        failed = some(e)
+                    }
+                },
+            }
+        }
+        if let e = failed {
+            fail e
+        }
+    }
+
+    // Closes the file without a word, for a region file that failed to open.
+    fn let_go(mut self) {
+        if let file = self.file.take() {
+            match file.close() {
+                ok => {},
+                err(_) => {},
+            }
+        }
+    }
+
+    // The `n` bytes from byte `from`, through the file kept open.
+    fn read_at(self, from: u64, n: usize) -> List<u8> ! FsError {
+        if let file = self.file {
+            return try file.read_part(from, n)
+        }
+        return try read_part(self.path, from, n)
+    }
+
+    // Writes `parts` through the file kept open.
+    fn write_at(mut self, parts: List<(u64, List<u8>)>, sync: bool) ! FsError {
+        self.written = true
+        if let file = self.file {
+            try file.write_parts(parts, sync)
+            return
+        }
+        try write_parts(self.path, parts, sync)
+    }
+
+    fn file_size(self) -> i64 ! FsError {
+        if let file = self.file {
+            return i64.wrap(try file.size())
+        }
+        return try file_size(self.path)
     }
 
     /// The file's sectors that are taken, from the first, the header's two included.
@@ -407,7 +486,7 @@ impl RegionFile {
         return out
     }
 
-    fn write_header(self, sync: bool) ! FsError {
+    fn write_header(mut self, sync: bool) ! FsError {
         var header = List<u8>()
         header.reserve(HEADER)
         for v in self.offsets {
@@ -417,7 +496,7 @@ impl RegionFile {
             put_int(mut header, v)
         }
         let parts: List<(u64, List<u8>)> = [(0, header)]
-        try write_parts(self.path, parts, sync)
+        try self.write_at(parts, sync)
     }
 
     fn external_path(self, pos: ChunkPos) -> String {
