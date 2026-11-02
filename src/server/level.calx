@@ -68,6 +68,7 @@ import world.spawn.{respawn_pos}
 import world.tickets.{Holders, Ticket, TicketStorage, TicketType}
 import worldgen.generator.{GenSetup}
 import worldgen.scheduler.{Generator}
+import std.memory.{trim}
 
 /// How far around the spawn chunk a joining player's spawn ticket loads full chunks,
 /// `PrepareSpawnTask.PREPARE_CHUNK_RADIUS`.
@@ -96,6 +97,10 @@ const LIGHT_BORDER: i32 = 34
 /// the same, and one saved lit costs nothing.
 pub const LIGHT_PER_TICK: i64 = 50000
 
+// How many ticks light goes without a run before it lets go of what it kept of sections'
+// blocks, 5 s (D254).
+const LIGHT_QUIET_TICKS: u32 = 100
+
 // A chunk the world has, or is reading.
 enum Body {
     // Being read.
@@ -112,6 +117,24 @@ enum Body {
 struct Columns {
     slots: OpenHashMap<i64, Body> = OpenHashMap<i64, Body>()
     flat: FlatChunk? = none
+    // The columns whose bodies came or went since light was last told, for it to let go of what
+    // it kept of their blocks: a body goes in and out only through `put` and `take` (D254).
+    changed: List<i64> = List<i64>()
+}
+
+impl Columns {
+    // Puts in the body of the column at `k`, noting it for light.
+    fn put(mut self, k: i64, given: own Body) {
+        self.slots.insert(k, given)
+        self.changed.push(k)
+    }
+
+    // Takes out the body of the column at `k`, if it has one, noting it for light.
+    fn take(mut self, k: i64) -> Body? {
+        let taken = self.slots.remove(k) else return none
+        self.changed.push(k)
+        return some(taken)
+    }
 }
 
 impl LightChunks for Columns {
@@ -344,6 +367,10 @@ pub struct Level {
     // be lit wait for the next.
     light_left: i64 = LIGHT_PER_TICK
     light_later: usize = 0
+    // Whether light has run since the last tick, and the ticks since it last did: after
+    // `LIGHT_QUIET_TICKS` it lets go of what it kept of sections' blocks (D254).
+    light_ran: bool = false
+    light_quiet: u32 = 0
     // The holders whose chunks are to tick their entities once the 5×5 around them is loaded,
     // each with its place in the order they came to wait, and the next place to give; and those
     // that may have come to be ready, or to wait no more, since `ready_waiting` last looked: only
@@ -566,10 +593,25 @@ impl Level {
         for k in self.dm.take_unloaded() {
             self.unloaded(k)
         }
-        var light = self.light.take() else return
+        var light = self.light.take() else {
+            self.columns.changed.clear()
+            return
+        }
+        self.tell_changed(mut light)
         if light.has_work() {
+            self.light_ran = true
             if let f = self.columns.flat {
                 _ = light.run(f.states, self.columns)
+            }
+        }
+        if self.light_ran {
+            self.light_ran = false
+            self.light_quiet = 0
+        } else if self.light_quiet < LIGHT_QUIET_TICKS {
+            self.light_quiet += 1
+            if self.light_quiet == LIGHT_QUIET_TICKS {
+                light.let_go_of_bytes()
+                trim()
             }
         }
         self.light = some(light)
@@ -884,7 +926,7 @@ impl Level {
                 self.accept(k, loaded)
                 self.pump()
             } else {
-                _ = self.columns.slots.remove(k)
+                _ = self.columns.take(k)
                 self.stale(k)
             }
             return true
@@ -930,7 +972,7 @@ impl Level {
                 self.ask(k)
             } else {
                 self.reading.chunks.remove(k)
-                _ = self.columns.slots.remove(k)
+                _ = self.columns.take(k)
                 self.stale(k)
             }
             return true
@@ -956,11 +998,11 @@ impl Level {
         if level <= reach and not self.columns.slots.contains(k) {
             self.stale(k)
             if self.opened {
-                self.columns.slots.insert(k, Body.Loading)
+                self.columns.put(k, Body.Loading)
                 self.reading.chunks.insert(k)
                 self.ask(k)
             } else {
-                self.columns.slots.insert(k, Body.Flat)
+                self.columns.put(k, Body.Flat)
                 self.came_loaded(k)
             }
         }
@@ -1022,7 +1064,7 @@ impl Level {
             }
             return
         }
-        if let _ = self.columns.slots.remove(k) {
+        if let _ = self.columns.take(k) {
             self.stale(k)
             if self.opened {
                 self.forget_light(k)
@@ -1036,11 +1078,11 @@ impl Level {
     fn accept(mut self, k: i64, loaded: own Loaded) {
         self.stale(k)
         match loaded {
-            Loaded.Generate => self.columns.slots.insert(k, Body.Flat),
+            Loaded.Generate => self.columns.put(k, Body.Flat),
             Loaded.Saved(s) => {
                 var saved = s
                 var light = self.light.take() else {
-                    self.columns.slots.insert(k, Body.Saved(saved))
+                    self.columns.put(k, Body.Saved(saved))
                     return
                 }
                 let pos = unpacked(k)
@@ -1065,7 +1107,7 @@ impl Level {
                 saved.sky = []
                 saved.block = []
                 self.light = some(light)
-                self.columns.slots.insert(k, Body.Saved(saved))
+                self.columns.put(k, Body.Saved(saved))
             },
         }
         self.arrived.insert(k)
@@ -1103,7 +1145,11 @@ impl Level {
             self.light_later = 0
             return false
         }
-        var light = self.light.take() else return false
+        var light = self.light.take() else {
+            self.columns.changed.clear()
+            return false
+        }
+        self.tell_changed(mut light)
         if not self.arrived.is_empty() {
             var keys = List<i64>()
             for k in self.arrived {
@@ -1113,6 +1159,7 @@ impl Level {
             for k in keys {
                 self.tell_sections(mut light, k)
             }
+            self.light_ran = true
             if let f = self.columns.flat {
                 _ = light.run(f.states, self.columns)
             }
@@ -1150,6 +1197,7 @@ impl Level {
             }
             if not self.lighted(k) {
                 var work: i64 = 0
+                self.light_ran = true
                 if let f = self.columns.flat {
                     let pos = unpacked(k)
                     light.propagate_light_sources(f.states, self.columns, pos.x, pos.z)
@@ -1192,6 +1240,16 @@ impl Level {
         for c in changed {
             _ = self.packets.remove(c.pack())
         }
+    }
+
+    // Tells `light` of the columns whose bodies came or went since it was last told, before it
+    // runs, so it reads their blocks again (D254).
+    fn tell_changed(mut self, light: mut Light) {
+        for k in self.columns.changed {
+            let pos = unpacked(k)
+            light.forget_bytes(pos.x, pos.z)
+        }
+        self.columns.changed.clear()
     }
 
     // Tells `light` of the chunk at `k`'s sections with blocks, as `initializeLight` does first.
