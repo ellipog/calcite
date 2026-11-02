@@ -390,8 +390,7 @@ def main():
         sys.exit("the server didn't start:\n" + "\n".join(server.lines[-20:]))
     print(f"server: {done.split(': ', 1)[1]}")
     for line in args.command:
-        server.p.stdin.write(f"{line}
-")
+        server.p.stdin.write(f"{line}\n")
         server.p.stdin.flush()
         print(f"console: {line}")
     client = Process(command, game, OUT / "client.log")
