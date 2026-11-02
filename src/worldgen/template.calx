@@ -7,6 +7,7 @@ module worldgen.template
 
 import json.tree.{Json, Member, as_string}
 import nbt.tag.{Accounter, Tag}
+import std.thread.{Task}
 import std.zip.{Zip}
 import protocol.ids.{DATA_VERSION}
 import random.legacy.{LegacyRandom}
@@ -69,48 +70,126 @@ pub struct Template {
     pub version: i32
 }
 
-/// The templates loaded, each once, by ID.
+/// The templates loaded, each once, by ID. Each is shared, so a copy of them, as each worker of
+/// the generator has, is the same templates, not more.
 pub struct Templates {
-    pub list: List<Template>
+    pub list: List<Shared<Template>>
     ids: Map<String, usize>
+    /// The service that loads each template once for every worker that asks it, or none to load
+    /// them here.
+    pub service: Sender<TemplateAsk>? = none
 }
 
 impl Templates {
     pub fn new() -> Templates {
-        return Templates { list: List<Template>(), ids: Map<String, usize>() }
+        return Templates { list: List<Shared<Template>>(), ids: Map<String, usize>() }
     }
 
     /// `StructureTemplateManager.getOrCreate`: the template `id`, loaded from
-    /// `data/<namespace>/structure/<path>.nbt`, or an empty one if there's none.
+    /// `data/<namespace>/structure/<path>.nbt`, or an empty one if there's none. With a service,
+    /// it's asked for the template, which it loads once for all who ask.
     pub fn get_or_create(mut self, zip: Zip, facts: Facts, id: String) -> usize ! String {
         if let i = self.ids.get(id) {
             return i
         }
-        let colon = id.find(":") else fail "`{id}` isn't an identifier"
-        let path = "data/{id[..colon]}/structure/{id[colon + 1..]}.nbt"
-        var template = Template { size_x: 0, size_y: 0, size_z: 0, palettes: List<List<BlockInfo>>(), entities: List<EntityInfo>(), version: DATA_VERSION }
-        if let at = zip.find(path) {
-            let bytes = try zip.read(at)
-            var accounter = Accounter.unlimited()
-            let root = try read_gzipped(bytes, mut accounter)
-            template = load(facts, root)
+        var template: Shared<Template>? = none
+        if let link = self.service.take() {
+            var to = link
+            var back = Receiver<TemplateAnswer>()
+            to.send(TemplateAsk.Load(id.copy(), back.sender()))
+            self.service = some(to)
+            match back.wait() {
+                some(TemplateAnswer.Loaded(t)) => template = some(t),
+                some(TemplateAnswer.Failed(e)) => fail e,
+                none => fail "the structure templates' service is gone",
+            }
         }
-        self.list.push(template)
+        if template == none {
+            template = some(Shared(try read_template(zip, facts, id)))
+        }
+        let loaded = template else fail "no template {id}"
+        self.list.push(loaded)
         let i = self.list.len() - 1
         self.ids.insert(id.copy(), i)
         return i
     }
 }
 
-// `StructureTemplate.load`.
-fn load(facts: Facts, root: JavaHashMap<String, Tag>) -> Template {
+/// What the templates' service is asked: a template, with where its answer goes; or to let go
+/// of those it loaded, as the generator does of what it cached once it's been quiet a while.
+pub enum TemplateAsk {
+    Load(String, Sender<TemplateAnswer>)
+    Forget
+}
+
+/// The service's answer: the template, or why it couldn't be loaded.
+pub enum TemplateAnswer {
+    Loaded(Shared<Template>)
+    Failed(String)
+}
+
+/// The templates' service: on a thread of its own, it loads each template a worker asks for
+/// once, and hands every worker that asks the same one. 31 workers each loading every template
+/// themselves took a sixth of their time, and 31 times the memory.
+pub struct TemplateService {
+    pub zip: Shared<Zip>
+    pub facts: Facts
+    pub asks: Receiver<TemplateAsk>
+}
+
+impl Task for TemplateService {
+    fn run(own self) {
+        let TemplateService { zip: zip, facts: facts, asks: taken } = self
+        var asks = taken
+        var loaded = Map<String, Shared<Template>>()
+        while let ask = asks.wait() {
+            match ask {
+                TemplateAsk.Load(id, back) => {
+                    var to = back
+                    if loaded.contains(id) {
+                        to.send(TemplateAnswer.Loaded(loaded[id].copy()))
+                    } else {
+                        match read_template(zip.value, facts, id) {
+                            ok(t) => {
+                                let s = Shared(t)
+                                loaded.insert(id.copy(), s.copy())
+                                to.send(TemplateAnswer.Loaded(s))
+                            },
+                            err(e) => to.send(TemplateAnswer.Failed(e)),
+                        }
+                    }
+                },
+                TemplateAsk.Forget => loaded = Map<String, Shared<Template>>(),
+            }
+        }
+    }
+}
+
+// The template `id` from `data/<namespace>/structure/<path>.nbt`, or an empty one if there's
+// none.
+fn read_template(zip: Zip, facts: Facts, id: String) -> Template ! String {
+    let colon = id.find(":") else fail "`{id}` isn't an identifier"
+    let path = "data/{id[..colon]}/structure/{id[colon + 1..]}.nbt"
+    let at = zip.find(path) else {
+        return Template { size_x: 0, size_y: 0, size_z: 0, palettes: List<List<BlockInfo>>(), entities: List<EntityInfo>(), version: DATA_VERSION }
+    }
+    let bytes = try zip.read(at)
+    var accounter = Accounter.unlimited()
+    let root = try read_gzipped(bytes, mut accounter)
+    return load(facts, root)
+}
+
+// `StructureTemplate.load`. The lists are taken out of the root, which isn't wanted after, rather
+// than copied.
+fn load(facts: Facts, given: own JavaHashMap<String, Tag>) -> Template {
+    var root = given
     // `NbtUtils.getDataVersion`, 500 if it isn't there.
     var version = 500
     if root.contains("DataVersion") {
         version = root["DataVersion"].number_int() ?? 500
     }
-    let size = list_or_empty(root, "size")
-    let blocks = list_or_empty(root, "blocks")
+    let size = take_list(mut root, "size")
+    let blocks = take_list(mut root, "blocks")
     var palettes = List<List<BlockInfo>>()
     var listed = false
     if root.contains("palettes") {
@@ -118,21 +197,20 @@ fn load(facts: Facts, root: JavaHashMap<String, Tag>) -> Template {
             Tag.List(each) => {
                 listed = true
                 for p in each {
-                    let entries = match p {
-                        Tag.List(items) => items.copy(),
-                        _ => List<Tag>(),
+                    match p {
+                        Tag.List(items) => palettes.push(load_palette(facts, items, blocks)),
+                        _ => palettes.push(load_palette(facts, List<Tag>(), blocks)),
                     }
-                    palettes.push(load_palette(facts, entries, blocks))
                 }
             },
             _ => {},
         }
     }
     if not listed {
-        palettes.push(load_palette(facts, list_or_empty(root, "palette"), blocks))
+        palettes.push(load_palette(facts, take_list(mut root, "palette"), blocks))
     }
     var entities = List<EntityInfo>()
-    for e in list_or_empty(root, "entities") {
+    for e in take_list(mut root, "entities") {
         match e {
             Tag.Compound(m) => {
                 let pos = list_or_empty(m, "pos")
@@ -258,6 +336,14 @@ fn read_block_state(facts: Facts, tag: Tag) -> u32 {
             }
         },
         _ => return facts.ids.air_state,
+    }
+}
+
+// `getListOrEmpty`, taking the list out of the map.
+fn take_list(m: mut JavaHashMap<String, Tag>, key: str) -> List<Tag> {
+    return match m.remove(key) {
+        some(Tag.List(items)) => items,
+        _ => List<Tag>(),
     }
 }
 
@@ -1470,15 +1556,15 @@ pub fn place_template_feature<T: RandomSource>(e: Env, r: mut Region, ts: Templa
     }
     let rotation = f.entries[ei].rotations[usize.wrap(rand.next_int_below(i32.wrap(count)))]
     let ti = f.entries[ei].template
-    let half_x = ts.list[ti].size_x / 2
-    let half_z = ts.list[ti].size_z / 2
+    let half_x = ts.list[ti].value.size_x / 2
+    let half_z = ts.list[ti].value.size_z / 2
     // `getRotatedOffset` along `x`, then `z`.
     let dx = rotate_direction(rotation, WEST)
     let dz = rotate_direction(rotation, NORTH)
     let px = x + step_x(dx) * half_x + step_x(dz) * half_z
     let pz = z + step_z(dx) * half_x + step_z(dz) * half_z
     let s = Settings { rotation: rotation, has_random: true, processors: f.processors.copy() }
-    return try place_in_world(e, mut r, ts.list[ti], px, y, pz, px, y, pz, s, mut rand, 3)
+    return try place_in_world(e, mut r, ts.list[ti].value, px, y, pz, px, y, pz, s, mut rand, 3)
 }
 
 // The pick of `WeightedList.getRandom`.
@@ -1505,7 +1591,7 @@ pub fn place_fossil<T: RandomSource>(e: Env, r: mut Region, ts: Templates, rand:
     let cz = (z >> 4) * 16
     let bounds = Bounds { min_x: cx - 16, min_y: r.min_y, min_z: cz - 16, max_x: cx + 15 + 16, max_y: r.min_y + r.height - 1, max_z: cz + 15 + 16 }
     var s = Settings { rotation: rotation, bounds: some(bounds), has_random: true }
-    let (sx, _, sz) = ts.list[base].size(rotation)
+    let (sx, _, sz) = ts.list[base].value.size(rotation)
     let lx = x - sx / 2
     let lz = z - sz / 2
     var lowest = y
@@ -1515,9 +1601,9 @@ pub fn place_fossil<T: RandomSource>(e: Env, r: mut Region, ts: Templates, rand:
         }
     }
     let target_y = (lowest - 15 - rand.next_int_below(10)).max(r.min_y + 10)
-    let (tx, ty, tz) = ts.list[base].zero_position(lx, target_y, lz, MIRROR_NONE, rotation)
+    let (tx, ty, tz) = ts.list[base].value.zero_position(lx, target_y, lz, MIRROR_NONE, rotation)
     // `countEmptyCorners`.
-    let b = ts.list[base].bounding_box(s, tx, ty, tz)
+    let b = ts.list[base].value.bounding_box(s, tx, ty, tz)
     var empty = 0
     for cy in [b.max_y, b.min_y] {
         for (kx, kz) in [(b.max_x, b.max_z), (b.min_x, b.max_z), (b.max_x, b.min_z), (b.min_x, b.min_z)] {
@@ -1531,8 +1617,8 @@ pub fn place_fossil<T: RandomSource>(e: Env, r: mut Region, ts: Templates, rand:
         return false
     }
     s.processors = fossil.fossil_processors.copy()
-    _ = try place_in_world(e, mut r, ts.list[base], tx, ty, tz, tx, ty, tz, s, mut rand, 260)
+    _ = try place_in_world(e, mut r, ts.list[base].value, tx, ty, tz, tx, ty, tz, s, mut rand, 260)
     s.processors = fossil.overlay_processors.copy()
-    _ = try place_in_world(e, mut r, ts.list[overlay], tx, ty, tz, tx, ty, tz, s, mut rand, 260)
+    _ = try place_in_world(e, mut r, ts.list[overlay].value, tx, ty, tz, tx, ty, tz, s, mut rand, 260)
     return true
 }
