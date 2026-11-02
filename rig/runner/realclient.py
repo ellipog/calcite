@@ -1,6 +1,6 @@
 """A real client's join: Mojang's own 26.3 client joins Calcite, walks, jumps and chats.
 
-    py -I rig/runner/realclient.py [--online NAME] [--server PATH] [--world PATH] [--view N] [--message TEXT] [--dimension ID] [--watch [--mbit N] [--ms N]] [--keep-open SECONDS]
+    py -I rig/runner/realclient.py [--online NAME] [--server PATH] [--world PATH] [--view N] [--message TEXT] [--dimension ID] [--watch [--mbit N] [--ms N] [--dump FILE]] [--set KEY=VALUE]... [--keep-open SECONDS]
 
 The protocol suites and the tests play the client's side with Calcite's own code, so this is
 the one check where the other end is the game itself. Calcite runs from its release build,
@@ -16,7 +16,11 @@ what's measured is what a player who sees as far as the client lets them gets.
 
 With --world PATH, the server's world is a copy of the world folder at PATH, such as one vanilla
 saved in the rig's scratch folders, so the client is sent the chunks it saved, read from its
-region files. Without it, the world is new, and every chunk flat.
+region files. Without it, the world is new, and the server generates its chunks as they're asked
+for.
+
+--set KEY=VALUE gives the server a calcite.properties setting, such as chunk-send-multiplier=2,
+and can be given any number of times.
 
 Without --online, the server is offline and the client is player RealClient, with no account.
 With --online NAME, the server is in online mode, and the client plays as the Modrinth App's
@@ -40,8 +44,9 @@ With --watch, the client joins through chunkwatch.py's relay, which reads the fr
 times the chunks: for the join, and for each dimension it goes to, how many it was sent, their
 bytes, and when the client had them all, by its `chunk_batch_received` after the last (CAL-99).
 --mbit N caps what the server sends at N megabits a second, and --ms N makes each way N
-milliseconds late, as a home link would. The relay reads frames only in offline mode; online,
-they're encrypted, and it only passes them on.
+milliseconds late, as a home link would. --dump FILE writes each chunk packet the client was
+sent to FILE, as it was before it was compressed. The relay reads frames only in offline mode;
+online, they're encrypted, and it only passes them on.
 
 It passes if the server logged the join and the message, with --dimension that it moved the
 player and the screenshot was taken, the client logged the message as it came back, nobody was disconnected before the client was stopped, and the client logged no error
@@ -289,7 +294,7 @@ class Process:
         return None
 
 
-def prepare(server_dir, game, online, world, view):
+def prepare(server_dir, game, online, world, view, settings=()):
     for folder in (server_dir, game / "screenshots"):
         if folder.exists():
             shutil.rmtree(folder)
@@ -297,7 +302,8 @@ def prepare(server_dir, game, online, world, view):
     (server_dir / "server.properties").write_text(
         f"online-mode={str(online).lower()}\nserver-ip=127.0.0.1\nserver-port={PORT}\ngamemode=creative\n"
         f"white-list=false\nview-distance={view}\nmotd=Calcite and a real client\n", encoding="utf-8")
-    (server_dir / "calcite.properties").write_text("console-dashboard=off\n", encoding="utf-8")
+    (server_dir / "calcite.properties").write_text("console-dashboard=off\n" + "".join(f"{s}\n" for s in settings),
+                                                    encoding="utf-8")
     if world:
         shutil.copytree(world, server_dir / "world", ignore=shutil.ignore_patterns("session.lock"))
     game.mkdir(parents=True, exist_ok=True)
@@ -342,6 +348,9 @@ def main():
     parser.add_argument("--watch", action="store_true", help="join through chunkwatch.py's relay and report the chunks it timed")
     parser.add_argument("--mbit", type=float, help="with --watch, the most the server sends, in megabits a second")
     parser.add_argument("--ms", type=float, default=0, help="with --watch, milliseconds each way is late")
+    parser.add_argument("--dump", help="with --watch, a file each chunk packet's written to, as it was before it was compressed")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                        help="a calcite.properties setting for the server, such as chunk-send-multiplier=2")
     parser.add_argument("--keep-open", type=float, default=0, help="seconds to leave the client in the game at the end")
     args = parser.parse_args()
     dimension = args.dimension if not args.dimension or ":" in args.dimension else f"minecraft:{args.dimension}"
@@ -359,7 +368,7 @@ def main():
     relay = None
     if args.watch:
         from chunkwatch import Relay
-        relay = Relay(PORT + 1, ("127.0.0.1", PORT), args.mbit, args.ms)
+        relay = Relay(PORT + 1, ("127.0.0.1", PORT), args.mbit, args.ms, args.dump)
         link = f"{args.mbit} Mbit/s" if args.mbit else "no cap"
         print(f"watch: the client joins through a relay on {PORT + 1}, {link}, {args.ms:g} ms each way")
     command = client_command(spec, java_home, game, player, PORT + 1 if relay else PORT)
@@ -367,7 +376,7 @@ def main():
         sys.exit(f"no level.dat in {args.world}")
     if not 2 <= args.view <= 32:
         sys.exit("the view distance is from 2 to 32")
-    prepare(server_dir, game, bool(args.online), args.world, args.view)
+    prepare(server_dir, game, bool(args.online), args.world, args.view, args.set)
 
     server = Process([str(server_exe)], server_dir, OUT / "server.log")
     done = server.wait_for("Done (", 60)
@@ -434,8 +443,9 @@ def main():
         for connection in report:
             for p in connection:
                 print(f"watch: {p['phase']}: {p['chunks']} chunks, {p['chunk_kib']} KiB, {p['bytes_a_chunk']} B a chunk, "
-                      f"{p['batches']} batches, last sent at {p['last_chunk_s']} s, the client had all at {p['client_had_all_s']} s, "
-                      f"asked {p['asked_a_tick']} a tick, {p['forgotten']} forgotten")
+                      f"{p['batches']} batches, last sent at {p['last_chunk_s']} s, the client had half at {p['client_had_half_s']} s, "
+                      f"90% at {p['client_had_90_s']} s, 95% at {p['client_had_95_s']} s, all at {p['client_had_all_s']} s, "
+                      f"asked {p['asked_a_tick']} a tick, {p['forgotten']} forgotten, waited for the link {p['link_wait_ms']} ms")
         print(f"watch: {(OUT / 'watch.json').relative_to(CALCITE)}")
     sys.exit(0 if all(line for _, line in checks) else 1)
 

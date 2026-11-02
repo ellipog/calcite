@@ -1,7 +1,7 @@
 """Watches chunks reach a real client (CAL-99): a relay between the client and a server that reads
 the frames each way, as an offline server sends them, and times what comes.
 
-    py -I rig/runner/chunkwatch.py --listen PORT --server HOST:PORT [--mbit N] [--ms N] [--out FILE]
+    py -I rig/runner/chunkwatch.py --listen PORT --server HOST:PORT [--mbit N] [--ms N] [--out FILE] [--dump FILE]
 
 realclient.py runs it in its own process with --watch. The client connects to the relay, the
 relay to the server, and every byte goes through as it came. On the way it reads each frame: the
@@ -16,15 +16,25 @@ From the frames it times, for the join and for each respawn packet after it, eac
   it sends once it has the batch, with the chunks a tick it asks for; it answers each batch once,
   in order, so the nth answer is the nth batch's;
 - when the last chunk of the phase was sent, and when the client answered the batch it was in:
-  the client had every chunk then.
+  the client had every chunk then; and when it had half of them, 90% and 95%, which leave out
+  the last few that took longer to make;
+- with --mbit, how long what the server sent waited for the link behind what it sent before,
+  which anything it sent then, such as another player's move, waited too.
 
 With --mbit, what the server sends goes to the client at that many megabits a second at most,
 and with --ms, each way N milliseconds late, as a home link would, so the times are those of a
-player at the other end of one. Times are from the relay's clock, as it hands the bytes on.
+player at the other end of one. The bytes go in pieces of 4 KB, one after another at the rate,
+each late by the latency however many are on the way, so a batch takes the client as long to
+come as it would on such a link. Times are from the relay's clock, as it hands the bytes on.
+
+With --dump, each `level_chunk_with_light` the client's sent is written to the file as it was
+before it was compressed, its packet ID and all, after its length as 4 bytes little-endian, so
+compressors can be compared on the chunks a real client was sent.
 """
 
 import argparse
 import json
+import queue
 import re
 import socket
 import struct
@@ -72,8 +82,9 @@ def varint(data, at):
 class Watch:
     """What one connection's frames come to, each way, as phases."""
 
-    def __init__(self, ids):
+    def __init__(self, ids, dump=None):
         self.ids = ids
+        self.dump = dump
         self.lock = threading.Lock()
         self.state = {"serverbound": "Handshake", "clientbound": "Handshake"}
         self.threshold = -1
@@ -84,11 +95,13 @@ class Watch:
         # the order they came, so the answer to the nth batch is the nth.
         self.batches = []
         self.answers = []
+        # With --mbit, each piece the server sent: when, and how long it waited for the link.
+        self.queued = []
 
     def phase(self, kind, t):
         self.phases.append({"kind": kind, "at": t, "chunks": 0, "chunk_bytes": 0, "bytes": 0,
                             "batches": [], "answers": [], "last_chunk": None, "last_batch": None,
-                            "forgotten": 0})
+                            "first_batch": len(self.batches), "forgotten": 0})
 
     def frame(self, way, frame, size, t):
         """A whole frame, without its length, `size` bytes on the wire with it, handed on at `t`."""
@@ -105,6 +118,8 @@ class Watch:
         state = self.state[way]
         if self.phases and way == "clientbound":
             self.phases[-1]["bytes"] += size
+            if self.dump and name == "level_chunk_with_light":
+                self.dump.write(body)
         if state == "Handshake" and name == "intention":
             # The protocol version, the address, the port, then where it's going.
             _, at = varint(body, at)
@@ -156,11 +171,25 @@ class Watch:
 
     def report(self):
         out = []
-        for p in self.phases:
+        for i, p in enumerate(self.phases):
+            end = self.phases[i + 1]["at"] if i + 1 < len(self.phases) else float("inf")
+            waits = sorted(q for t, q in self.queued if p["at"] <= t < end)
             last = p["last_chunk"]
             b = p["last_batch"]
             had = self.answers[b] if b is not None and b < len(self.answers) else None
             rates = [r for _, r in p["answers"]]
+            # When the client had each share of the phase's chunks: the answer to the batch that
+            # took it that far.
+            shares = {}
+            for share in (50, 90, 95):
+                got = 0
+                for j, (_, n) in enumerate(p["batches"]):
+                    got += n
+                    if got * 100 >= share * p["chunks"]:
+                        g = p["first_batch"] + j
+                        if g < len(self.answers):
+                            shares[share] = round(self.answers[g] - p["at"], 3)
+                        break
             out.append({
                 "phase": p["kind"],
                 "chunks": p["chunks"],
@@ -170,15 +199,30 @@ class Watch:
                 "batches": len(p["batches"]),
                 "last_chunk_s": round(last - p["at"], 3) if last is not None else None,
                 "client_had_all_s": round(had - p["at"], 3) if had is not None else None,
+                "client_had_half_s": shares.get(50),
+                "client_had_90_s": shares.get(90),
+                "client_had_95_s": shares.get(95),
+                # How long what the server sent waited for the link, in milliseconds: the median,
+                # the 95th percentile and the most.
+                "link_wait_ms": [round(waits[len(waits) // 2] * 1000, 1), round(waits[len(waits) * 95 // 100] * 1000, 1),
+                                 round(waits[-1] * 1000, 1)] if waits else None,
                 "asked_a_tick": [round(min(rates), 1), round(max(rates), 1)] if rates else None,
                 "forgotten": p["forgotten"],
+                # Each batch's time and chunks, and each answer's time and the chunks a tick it
+                # asked for, from the phase's start.
+                "batch_times": [[round(t - p["at"], 3), n] for t, n in p["batches"]],
+                "answer_times": [[round(t - p["at"], 3), round(r, 1)] for t, r in p["answers"]],
             })
         return out
 
 
 class Way(threading.Thread):
-    """One way of a connection: reads from `src`, holds each read until it's due, by the link's
-    latency and rate, then reads its frames and hands it on to `dst`."""
+    """One way of a connection, as a link carries it: what's read from `src` is cut into pieces of
+    at most PIECE bytes, each sent at the link's rate once the one before it is, then late by its
+    latency. Another thread hands each on to `dst` once it's due, so reading never waits on the
+    latency, and reads its frames as it does."""
+
+    PIECE = 4096
 
     def __init__(self, src, dst, watch, way, mbit, ms):
         super().__init__(daemon=True)
@@ -187,17 +231,39 @@ class Way(threading.Thread):
         self.delay = ms / 1000
         self.buffer = b""
         self.free_at = 0.0
+        self.due = queue.Queue()
 
     def run(self):
+        threading.Thread(target=self.hand_on, daemon=True).start()
         try:
             while True:
                 data = self.src.recv(65536)
                 if not data:
                     break
-                due = time.monotonic() + self.delay
-                if self.rate:
-                    self.free_at = max(self.free_at, due) + len(data) / self.rate
-                    due = self.free_at
+                now = time.monotonic()
+                if not self.rate and not self.delay:
+                    self.due.put((now, data))
+                    continue
+                for at in range(0, len(data), self.PIECE):
+                    piece = data[at:at + self.PIECE]
+                    sent = now
+                    if self.rate:
+                        start = max(self.free_at, now)
+                        self.watch.queued.append((now, start - now))
+                        self.free_at = start + len(piece) / self.rate
+                        sent = self.free_at
+                    self.due.put((sent + self.delay, piece))
+        except OSError:
+            pass
+        self.due.put(None)
+
+    def hand_on(self):
+        try:
+            while True:
+                item = self.due.get()
+                if item is None:
+                    break
+                due, data = item
                 wait = due - time.monotonic()
                 if wait > 0:
                     time.sleep(wait)
@@ -228,11 +294,30 @@ class Way(threading.Thread):
                     self.watch.encrypted = True
 
 
+class Dump:
+    """A file of chunk packets, each after its length, from every connection."""
+
+    def __init__(self, path):
+        self.file = open(path, "wb")
+        self.lock = threading.Lock()
+        self.count = 0
+
+    def write(self, body):
+        with self.lock:
+            self.file.write(struct.pack("<I", len(body)) + body)
+            self.count += 1
+
+    def close(self):
+        with self.lock:
+            self.file.close()
+
+
 class Relay:
     """Listens on `port` and relays each connection to `server`, watching each."""
 
-    def __init__(self, port, server, mbit=None, ms=0):
+    def __init__(self, port, server, mbit=None, ms=0, dump=None):
         self.ids = packet_ids()
+        self.dump = Dump(dump) if dump else None
         self.server = server
         self.mbit, self.ms = mbit, ms
         self.watches = []
@@ -248,7 +333,7 @@ class Relay:
             upstream = socket.create_connection(self.server)
             for s in (client, upstream):
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            watch = Watch(self.ids)
+            watch = Watch(self.ids, self.dump)
             self.watches.append(watch)
             Way(client, upstream, watch, "serverbound", None, self.ms).start()
             Way(upstream, client, watch, "clientbound", self.mbit, self.ms).start()
@@ -259,6 +344,8 @@ class Relay:
 
     def close(self):
         self.listener.close()
+        if self.dump:
+            self.dump.close()
 
 
 def main():
@@ -268,9 +355,10 @@ def main():
     parser.add_argument("--mbit", type=float, help="the most the server's side sends, in megabits a second")
     parser.add_argument("--ms", type=float, default=0, help="milliseconds each way is late")
     parser.add_argument("--out", help="a file the report's written to as JSON, as it's stopped")
+    parser.add_argument("--dump", help="a file each chunk packet's written to, as it was before it was compressed")
     args = parser.parse_args()
     host, port = args.server.rsplit(":", 1)
-    relay = Relay(args.listen, (host, int(port)), args.mbit, args.ms)
+    relay = Relay(args.listen, (host, int(port)), args.mbit, args.ms, args.dump)
     print(f"relaying 127.0.0.1:{args.listen} to {args.server}; Ctrl+C to stop and report")
     try:
         while True:
@@ -278,6 +366,7 @@ def main():
     except KeyboardInterrupt:
         pass
     report = relay.report()
+    relay.close()
     print(json.dumps(report, indent=1))
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=1), encoding="utf-8")
