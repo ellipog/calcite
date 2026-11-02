@@ -21,7 +21,7 @@ The rig runs the same inputs through vanilla and through Calcite and compares th
 | Protocol suites | [`runner/sessions.py`](runner/sessions.py) | The protocol bot against vanilla and Calcite, packet by packet (`P4.8`) |
 | Light timing | [`runner/light_timing.py`](runner/light_timing.py) | Calcite's light engines timed against vanilla's through the `light` probe ([D182](../docs/decisions.md)) |
 | The round trip | [`runner/roundtrip.py`](runner/roundtrip.py) | A world vanilla made, loaded and saved by Calcite, then read by vanilla (`G5.2`) |
-| A real client | [`runner/realclient.py`](runner/realclient.py) | Mojang's 26.3 client joins Calcite, walks and chats (`G4.1`) |
+| A real client | [`runner/realclient.py`](runner/realclient.py) | Mojang's 26.3 client joins Calcite, walks and chats (`G4.1`), goes to another dimension, and times the chunks it's sent through [`runner/chunkwatch.py`](runner/chunkwatch.py) |
 
 The runner needs only Python 3.10 or newer, with no packages. Run it from anywhere. Paths are relative to the repo.
 
@@ -253,9 +253,17 @@ py -I rig/runner/realclient.py
 py -I rig/runner/realclient.py --message "anyone here" --keep-open 30
 py -I rig/runner/realclient.py --online Ellipog     # online, with signed chat, as your own account
 py -I rig/runner/realclient.py --world build/rig/roundtrip/again/world     # a world vanilla saved
+py -I rig/runner/realclient.py --dimension the_nether     # then to the Nether
+py -I rig/runner/realclient.py --watch --mbit 50 --ms 20     # the chunks timed, on a home link
 ```
 
 Everything else here plays the client's side with Calcite's own code. [`realclient.py`](runner/realclient.py) runs the game itself instead: Mojang's 26.3 client, from the files of a launcher that has run 26.3 once (the official launcher, the Modrinth App or Prism Launcher), each checked against the SHA-1 in 26.3's version file, with JDK 25 ([D162](../docs/decisions.md)). It starts Calcite's release build, `build/server/calcite.exe`, in a fresh folder under `build/rig/realclient/`, and the client in a game folder beside it, with its sound off and the first-run screens skipped, joining with `--quickPlayMultiplayer`. On Windows, [`realclient_keys.ps1`](runner/realclient_keys.ps1) then plays it a little: the debug screen on, a screenshot, a walk of about 11 blocks and a jump, a screenshot, a chat message and a last screenshot. It sends a key only while the client's window is in front and stops if it isn't, so nothing is typed into another window; it does take the focus for about 10 seconds. It passes if Calcite logs the join and the message, the client gets the message back, nobody is disconnected before the client is stopped, and the client logs no error but the ones on its download threads, which Mojang's services and Realms give a client with no account. The screenshots show the coordinates before and after the walk. It needs a desktop and a launcher's files, so it isn't in CI.
+
+The client's render distance and the server's view distance are both 32, as far as the client lets a player see, so what's measured is what such a player gets; `--view N` sets another.
+
+With `--dimension ID`, such as `the_nether`, Calcite's console then runs `calcite dimension ID` for the player once they've chatted, which takes them where a portal would, onto the nearest place they can stand once it's loaded, with the respawn packet vanilla sends a player whose level changes ([D268](../docs/decisions.md)), and a last screenshot is taken there 8 seconds later with the debug screen on, which names the dimension. It passes if Calcite logs the move and the screenshot's taken.
+
+With `--watch`, the client joins through [`chunkwatch.py`](runner/chunkwatch.py), a relay that passes every byte on as it came and reads the frames each way on the way, the handshake, login, configuration and play, with the compression the server turns on, so it watches Calcite or vanilla alike. For the join and for each dimension the player goes to, it reports the chunks the client was sent, their bytes, the batches, when the last was sent, and when the client had them all, by the `chunk_batch_received` it answered the last batch with, in `build/rig/realclient/watch.json`. `--mbit N` caps what the server sends at `N` megabits a second, and `--ms N` makes each way `N` milliseconds late, so the times are those of a player at the other end of a home link. It reads frames only in offline mode: online, they're encrypted, and it only passes them on. It's how chunk sending is measured ([CAL-99](https://acta.aaenz.no/aaen-studios/calcite#CAL-99)): with the real client, which paces itself as players' do, not the test bot.
 
 With `--world PATH`, the server's world is a copy of the world folder at `PATH`, such as the one the round trip has vanilla save, so the client is sent the chunks it saved, read from its region files, and not the flat world alone.
 

@@ -1,6 +1,6 @@
 """A real client's join: Mojang's own 26.3 client joins Calcite, walks, jumps and chats.
 
-    py -I rig/runner/realclient.py [--online NAME] [--server PATH] [--world PATH] [--message TEXT] [--keep-open SECONDS]
+    py -I rig/runner/realclient.py [--online NAME] [--server PATH] [--world PATH] [--view N] [--message TEXT] [--dimension ID] [--watch [--mbit N] [--ms N]] [--keep-open SECONDS]
 
 The protocol suites and the tests play the client's side with Calcite's own code, so this is
 the one check where the other end is the game itself. Calcite runs from its release build,
@@ -10,6 +10,9 @@ App or Prism Launcher, each checked against the SHA-1 in 26.3's version file, wi
 game folder of its own beside the server's, with its sound off and the first-run screens
 skipped. It joins with --quickPlayMultiplayer. Nothing of Mojang's is copied: the client runs
 from the launcher's files.
+
+The client's render distance and the server's view distance are both 32, or --view N, so
+what's measured is what a player who sees as far as the client lets them gets.
 
 With --world PATH, the server's world is a copy of the world folder at PATH, such as one vanilla
 saved in the rig's scratch folders, so the client is sent the chunks it saved, read from its
@@ -28,8 +31,20 @@ Enter, and F2. It sends a key only while the client's window is in front, and st
 so nothing is typed anywhere else. The three screenshots, in the game folder's screenshots/,
 show the coordinates before and after the walk, and the message in the client's chat.
 
-It passes if the server logged the join and the message, the client logged the message as it
-came back, nobody was disconnected before the client was stopped, and the client logged no error
+With --dimension ID, such as the_nether, the server's console then runs `calcite dimension ID`
+for the player, which takes them to that dimension where they are, as vanilla's respawn packet
+takes a player to another (CAL-69), and, once its chunks have had 8 seconds to come, the keys
+take a last screenshot with the debug screen on, which names the dimension.
+
+With --watch, the client joins through chunkwatch.py's relay, which reads the frames each way and
+times the chunks: for the join, and for each dimension it goes to, how many it was sent, their
+bytes, and when the client had them all, by its `chunk_batch_received` after the last (CAL-99).
+--mbit N caps what the server sends at N megabits a second, and --ms N makes each way N
+milliseconds late, as a home link would. The relay reads frames only in offline mode; online,
+they're encrypted, and it only passes them on.
+
+It passes if the server logged the join and the message, with --dimension that it moved the
+player and the screenshot was taken, the client logged the message as it came back, nobody was disconnected before the client was stopped, and the client logged no error
 but the ones on its download threads, which, with no account, Mojang's services and Realms
 always give (rig/README.md, "A real client").
 """
@@ -55,6 +70,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CALCITE = HERE.parents[1]
 sys.path.insert(0, str(CALCITE / "oracle"))
+sys.path.insert(0, str(HERE))
 from jdk import find_java_home, java  # noqa: E402
 
 VERSION = "26.3"
@@ -223,7 +239,7 @@ def online_player(name):
     return Player(profile["name"], profile["id"], answer["access_token"])
 
 
-def client_command(spec, java_home, game, player):
+def client_command(spec, java_home, game, player, port):
     natives = OUT / "natives"
     jar_label, jar = client_jar(spec)
     asset_root, index = assets(spec)
@@ -240,7 +256,7 @@ def client_command(spec, java_home, game, player):
             "--assetsDir", str(asset_root), "--assetIndex", index,
             "--uuid", player.uuid, "--accessToken", player.token, "--clientId", "0", "--xuid", "0",
             "--versionType", "release", "--width", "854", "--height", "480",
-            "--quickPlayMultiplayer", f"127.0.0.1:{PORT}"]
+            "--quickPlayMultiplayer", f"127.0.0.1:{port}"]
     return [str(java(java_home))] + jvm + [spec["mainClass"]] + args
 
 
@@ -273,31 +289,31 @@ class Process:
         return None
 
 
-def prepare(server_dir, game, online, world):
+def prepare(server_dir, game, online, world, view):
     for folder in (server_dir, game / "screenshots"):
         if folder.exists():
             shutil.rmtree(folder)
     server_dir.mkdir(parents=True)
     (server_dir / "server.properties").write_text(
         f"online-mode={str(online).lower()}\nserver-ip=127.0.0.1\nserver-port={PORT}\ngamemode=creative\n"
-        "white-list=false\nview-distance=8\nmotd=Calcite and a real client\n", encoding="utf-8")
+        f"white-list=false\nview-distance={view}\nmotd=Calcite and a real client\n", encoding="utf-8")
     (server_dir / "calcite.properties").write_text("console-dashboard=off\n", encoding="utf-8")
     if world:
         shutil.copytree(world, server_dir / "world", ignore=shutil.ignore_patterns("session.lock"))
     game.mkdir(parents=True, exist_ok=True)
     (game / "options.txt").write_text(
         "onboardAccessibility:false\njoinedFirstServer:true\nskipMultiplayerWarning:true\n"
-        "pauseOnLostFocus:false\ntutorialStep:none\nrenderDistance:8\nnarrator:0\n"
+        f"pauseOnLostFocus:false\ntutorialStep:none\nrenderDistance:{view}\nnarrator:0\n"
         "soundCategory_master:0.0\n", encoding="utf-8")
 
 
-def send_keys(client, message):
+def send_keys(client, message, shot=False):
     if os.name != "nt":
         print("keys: sent only on Windows, so the client just joins")
         return False
-    keys = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                           str(HERE / "realclient_keys.ps1"), "-ProcessId", str(client.p.pid), "-Message", message],
-                          capture_output=True, text=True, timeout=120)
+    argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+            str(HERE / "realclient_keys.ps1"), "-ProcessId", str(client.p.pid), "-Message", message]
+    keys = subprocess.run(argv + (["-Shot"] if shot else []), capture_output=True, text=True, timeout=120)
     said = (keys.stdout.strip() or keys.stderr.strip())
     print(f"keys: {said}")
     return keys.returncode == 0
@@ -319,10 +335,16 @@ def main():
     parser.add_argument("--online", metavar="NAME", help="play as the Modrinth App's account NAME, in online mode")
     parser.add_argument("--server", default=str(CALCITE / "build" / "server" / f"calcite{EXE}"))
     parser.add_argument("--world", help="a world folder to copy in as the server's world")
+    parser.add_argument("--view", type=int, default=32, help="the client's render distance and the server's view distance, 2 to 32")
     parser.add_argument("--message", default="hello from a real client",
                         help="what the client says: small letters and spaces")
+    parser.add_argument("--dimension", metavar="ID", help="a dimension to take the client to after it chats, such as the_nether")
+    parser.add_argument("--watch", action="store_true", help="join through chunkwatch.py's relay and report the chunks it timed")
+    parser.add_argument("--mbit", type=float, help="with --watch, the most the server sends, in megabits a second")
+    parser.add_argument("--ms", type=float, default=0, help="with --watch, milliseconds each way is late")
     parser.add_argument("--keep-open", type=float, default=0, help="seconds to leave the client in the game at the end")
     args = parser.parse_args()
+    dimension = args.dimension if not args.dimension or ":" in args.dimension else f"minecraft:{args.dimension}"
     if not args.message.strip() or not all(c in "abcdefghijklmnopqrstuvwxyz " for c in args.message):
         sys.exit("the message can only have small letters and spaces")
     server_exe = Path(args.server)
@@ -334,10 +356,18 @@ def main():
     server_dir, game = OUT / "server", OUT / "game"
     player = online_player(args.online) if args.online else offline_player()
     print(f"player: {player.name}, {'online, with a renewed session' if args.online else 'offline'}")
-    command = client_command(spec, java_home, game, player)
+    relay = None
+    if args.watch:
+        from chunkwatch import Relay
+        relay = Relay(PORT + 1, ("127.0.0.1", PORT), args.mbit, args.ms)
+        link = f"{args.mbit} Mbit/s" if args.mbit else "no cap"
+        print(f"watch: the client joins through a relay on {PORT + 1}, {link}, {args.ms:g} ms each way")
+    command = client_command(spec, java_home, game, player, PORT + 1 if relay else PORT)
     if args.world and not (Path(args.world) / "level.dat").is_file():
         sys.exit(f"no level.dat in {args.world}")
-    prepare(server_dir, game, bool(args.online), args.world)
+    if not 2 <= args.view <= 32:
+        sys.exit("the view distance is from 2 to 32")
+    prepare(server_dir, game, bool(args.online), args.world, args.view)
 
     server = Process([str(server_exe)], server_dir, OUT / "server.log")
     done = server.wait_for("Done (", 60)
@@ -346,6 +376,7 @@ def main():
     print(f"server: {done.split(': ', 1)[1]}")
     client = Process(command, game, OUT / "client.log")
     keyed = False
+    moved = shot = None
     try:
         joined = server.wait_for(f"{player.name} joined the game", 180)
         if joined:
@@ -354,6 +385,12 @@ def main():
             if keyed:
                 server.wait_for(f"<{player.name}> {args.message}", 10)
                 client.wait_for(f"[CHAT] <{player.name}> {args.message}", 5)
+            if dimension:
+                server.p.stdin.write(f"calcite dimension {dimension} {player.name}\n")
+                server.p.stdin.flush()
+                moved = server.wait_for(f"Moved {player.name} to {dimension}", 10)
+                time.sleep(8)
+                shot = keyed and send_keys(client, args.message, shot=True) and "sent"
             time.sleep(args.keep_open)
         gone_early = server.find("lost connection") or client.find("Disconnected") or client.p.poll() is not None
     finally:
@@ -374,6 +411,10 @@ def main():
                 ("the server took it as signed", said and "[Not Secure]" not in said and said),
                 ("the client took it as signed", back and "[Not Secure]" not in back and back),
             ]
+    if dimension:
+        checks.append((f"the server moved the player to {dimension}", moved))
+        if os.name == "nt":
+            checks.append(("the keys took a screenshot there", shot))
     checks.append(("nobody was disconnected before the client was stopped", not gone_early and "-"))
     # With no account, the client's calls to Mojang's services and Realms fail on these threads.
     errors = [line for line in client.lines if "/ERROR]" in line and "[Download-" not in line]
@@ -386,6 +427,16 @@ def main():
     shots = sorted((game / "screenshots").glob("*.png")) if (game / "screenshots").is_dir() else []
     print(f"screenshots: {', '.join(str(p.relative_to(CALCITE)) for p in shots) or 'none'}")
     print(f"logs: {(OUT / 'server.log').relative_to(CALCITE)}, {(OUT / 'client.log').relative_to(CALCITE)}")
+    if relay:
+        report = relay.report()
+        relay.close()
+        (OUT / "watch.json").write_text(json.dumps(report, indent=1), encoding="utf-8")
+        for connection in report:
+            for p in connection:
+                print(f"watch: {p['phase']}: {p['chunks']} chunks, {p['chunk_kib']} KiB, {p['bytes_a_chunk']} B a chunk, "
+                      f"{p['batches']} batches, last sent at {p['last_chunk_s']} s, the client had all at {p['client_had_all_s']} s, "
+                      f"asked {p['asked_a_tick']} a tick, {p['forgotten']} forgotten")
+        print(f"watch: {(OUT / 'watch.json').relative_to(CALCITE)}")
     sys.exit(0 if all(line for _, line in checks) else 1)
 
 

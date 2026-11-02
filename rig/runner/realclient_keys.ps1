@@ -1,7 +1,8 @@
 # Plays a real client a little, for realclient.py: F3, a screenshot, a walk and a jump, another
-# screenshot, a chat message, and a last screenshot. Keys go only to the client's own window:
-# before each, that window must be in front, or this stops without sending another.
-param([int]$ProcessId, [string]$Message)
+# screenshot, a chat message, and a last screenshot. With -Shot, only a screenshot with the debug
+# screen on. Keys go only to the client's own window: before each, that window must be in front,
+# or this stops without sending another.
+param([int]$ProcessId, [string]$Message, [switch]$Shot)
 
 Add-Type @"
 using System;
@@ -34,6 +35,16 @@ function Key([byte]$vk, [byte]$scan, [int]$holdMs) {
 }
 
 $scans = @{ 'a'=0x1E; 'b'=0x30; 'c'=0x2E; 'd'=0x20; 'e'=0x12; 'f'=0x21; 'g'=0x22; 'h'=0x23; 'i'=0x17; 'j'=0x24; 'k'=0x25; 'l'=0x26; 'm'=0x32; 'n'=0x31; 'o'=0x18; 'p'=0x19; 'q'=0x10; 'r'=0x13; 's'=0x1F; 't'=0x14; 'u'=0x16; 'v'=0x2F; 'w'=0x11; 'x'=0x2D; 'y'=0x15; 'z'=0x2C; ' '=0x39 }
+
+if ($Shot) {
+    Start-Sleep -Milliseconds 300
+    Key 0x72 0x3D 80      # F3: the debug screen, which names the dimension
+    Start-Sleep -Milliseconds 800
+    Key 0x71 0x3C 80      # F2: a screenshot
+    Key 0x72 0x3D 80      # F3 off
+    Write-Output "sent"
+    exit 0
+}
 
 Start-Sleep -Milliseconds 1500
 Key 0x72 0x3D 80          # F3: the debug screen, with the player's coordinates

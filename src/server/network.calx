@@ -22,7 +22,7 @@ import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{DATA_VERSION, PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
-import protocol.play.{Abilities, BookRecipes, BookTab, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundInitializeBorder, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, ClockUpdate, GlobalPos, INITIALIZE_CHAT, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
+import protocol.play.{Abilities, BookRecipes, BookTab, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundInitializeBorder, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, ClockUpdate, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
@@ -34,7 +34,7 @@ import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
 import server.commands.{Failure, GAMEMASTERS, OWNERS, Parsed, Targets, failure_context, parse, tree}
 import server.configuration.{Configuration}
-import server.level.{ChunkPacket, Level, SPAWN_RADIUS}
+import server.level.{ChunkPacket, Level, PORTAL_RADIUS, SPAWN_RADIUS, VERSION_SHIFT}
 import server.link.{FileRead, Input, Link, Report}
 import server.log.{Entry, Look}
 import server.sending.{Outbox, Sending}
@@ -52,7 +52,17 @@ import world.flat.{MIN_Y, SECTIONS, SURFACE_Y}
 import world.item.{ItemStack}
 import world.modes.{GameType, PreviousGameType}
 import world.pos.{BlockPos, ChunkPos}
-import world.spawn.{Candidate, DEFAULT_RESPAWN_RADIUS, SpawnSearch, border_distance, candidate_count, fits, fixup_height, search_radius}
+import world.spawn.{BORDER_HALF, Candidate, DEFAULT_RESPAWN_RADIUS, SpawnSearch, border_distance, candidate_count, fits, fixup_height, search_radius}
+
+// A player on their way to another dimension: their entity, the dimension, by its place in the
+// world's, where in it they're going, and the source who sent them, if it's not they (CAL-69).
+struct Travel {
+    entity_id: i32
+    to: usize
+    x: f64
+    z: f64
+    told: Source?
+}
 
 /// How long a connection may send nothing before it's closed, as vanilla's
 /// `ReadTimeoutHandler(30)`.
@@ -242,6 +252,9 @@ struct Prepare {
     ready: bool = false
     // The player's data as it was read, if they have any.
     data: JavaHashMap<String, Tag>? = none
+    // The dimension the place is in, by its place in the world's: where they were saved, or the
+    // Overworld (CAL-69).
+    dim: usize = 0
 }
 
 impl Prepare {
@@ -316,6 +329,12 @@ struct Player {
     // the players as vanilla's player list does.
     level: i32 = 0
     joined: u64 = 0
+    // The dimension they're in, by its place in the world's (CAL-69).
+    dim: usize = 0
+    // The hotbar slot they hold, and the inventory menu's state, which goes up each time its
+    // slots are sent, as `AbstractContainerMenu.incrementStateId` counts it.
+    selected: i32 = 0
+    menu_state: i32 = 0
 }
 
 // A command, or a game mode picked with F3 and F4, from the player in a slot, which runs once
@@ -374,10 +393,12 @@ pub struct Network {
     session: Uuid?
     // What configuration sends every player.
     configuration: Configuration
-    // The world players join and its chunks, the last entity ID given out, and the server's
-    // ticks.
+    // The world players join and each of its dimensions' chunks, in the world's order, and the
+    // players on their way to another, waiting for where they're going to load (CAL-69), the
+    // last entity ID given out, and the server's ticks.
     world: World
-    level: Level
+    levels: List<Level>
+    travels: List<Travel> = List<Travel>()
     // Every player's chunks nearest first, for the widest view yet.
     spiral: Spiral
     entity_ids: i32
@@ -439,11 +460,17 @@ impl Network {
     pub fn new(link: own Link, status: own StatusInfo, settings: own LoginSettings, lang: own Language, services: own Services, keys: own Receiver<RsaKey>, configuration: own Configuration, world: own World) -> Network {
         // The tickets reach the view distance, as `setServerViewDistance` has them. Vanilla
         // keeps it from 2 to 32, and Calcite doesn't yet (CAL-58); past 32 is the same as 32.
-        var level = Level.new(world.settings.chunk_radius(), world.settings.simulation_distance)
-        if let flat = world.flat.take_chunk() {
-            level.ground(flat)
+        var given = world
+        var levels = List<Level>()
+        for d in 0..given.dims.len() {
+            var level = Level.new(given.settings.chunk_radius(), given.settings.simulation_distance)
+            level.set_dimension(d)
+            if let flat = given.dims[d].ground.take_chunk() {
+                level.ground(flat)
+            }
+            levels.push(level)
         }
-        var network = Network { link: link, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: world, level: level, spiral: Spiral(), entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>(), sending: Sending.new(), to_flush: List<Conn>(), last_logins: Map<String, u64>(), access: Access.empty(false), halted: false, respawn: Spawn { dimension: overworld(), pos: BlockPos { x: 0, y: SURFACE_Y, z: 0 }, yaw: 0.0f32, pitch: 0.0f32 } }
+        var network = Network { link: link, connections: List<Connection?>(), status: status, settings: settings, lang: lang, services: services, status_json: String(), status_due: 0, key: none, public_key: List<u8>(), coming: keys, checks: List<Check>(), authenticators: 0, session: none, configuration: configuration, world: given, levels: levels, spiral: Spiral(), entity_ids: 0, ticks: 0, clock: Timestamp { unix_ms: 0 }, logs: List<Entry>(), sending: Sending.new(), to_flush: List<Conn>(), last_logins: Map<String, u64>(), access: Access.empty(false), halted: false, respawn: Spawn { dimension: overworld(), pos: BlockPos { x: 0, y: SURFACE_Y, z: 0 }, yaw: 0.0f32, pitch: 0.0f32 } }
         network.rebuild_status()
         return network
     }
@@ -497,18 +524,22 @@ impl Network {
     /// How many saves are handed to the saver whose lines the server hasn't taken: the server
     /// isn't to end until there are none.
     pub fn saves_away(self) -> usize {
-        var n = self.level.chunks_closing()
+        var n: usize = 0
+        for level in self.levels {
+            n += level.chunks_closing()
+        }
         if let s = self.saving {
             n += s.away()
         }
         return n
     }
 
-    /// Reads the overworld's chunks from the region files in `regions` from now on, as the
-    /// world's folder is open, on an IO thread and chunk workers that start with the first
-    /// chunk, and generates those that aren't saved, unless the world is flat. Replaying, there's
-    /// no folder, and `regions` is `none`: the chunks the recording read come from its log, if it
-    /// read any, and those it generated are generated again. Until this, every chunk is flat, and
+    /// Reads each dimension's chunks from the region files in its folder in `regions`, in the
+    /// world's order, from now on, as the world's folder is open, each on an IO thread and chunk
+    /// workers of its own that start with its first chunk, and generates those that aren't
+    /// saved, unless it's a flat world's Overworld. Replaying, there's no folder, and `regions`
+    /// is empty: the chunks the recording read come from its log, if it read any, and those it
+    /// generated are generated again. Until this, every chunk is flat, and
     /// they all are if the world was made without its registries, as a test's, or there's
     /// nothing to wake the server's poll with as they're read.
     ///
@@ -516,32 +547,43 @@ impl Network {
     /// chooses it when `level.dat` isn't `initialized`: a world that generates has its generator
     /// find it, as `setInitialSpawn` does, and players new to it wait for that, and a flat one's
     /// is its 0, 0.
-    pub fn open_world(mut self, regions: String?) {
-        var context: ChunkContext? = none
-        if let c = self.world.context {
-            context = some(c.copy())
-        }
-        var jobs: ChunkJobs? = none
+    pub fn open_world(mut self, regions: List<String>) {
+        var all_jobs = List<ChunkJobs?>()
         var reads = false
-        if let folder = regions {
-            if let made = context {
-                match self.link.waker() {
-                    ok(waker) => {
-                        jobs = some(ChunkJobs.new(folder.copy(), made.copy(), self.world.gen.copy(), waker, self.world.settings.chunk_workers))
-                        reads = true
-                    },
-                    err(_) => self.logs.push(Entry.error("Can't read the world's chunks, so they're generated: there's nothing to wake the server's poll with")),
+        for d in 0..self.world.dims.len() {
+            var jobs: ChunkJobs? = none
+            var context: ChunkContext? = none
+            if let c = self.world.dims[d].context {
+                context = some(c.copy())
+            }
+            if d < regions.len() {
+                if let made = context {
+                    match self.link.waker() {
+                        ok(waker) => {
+                            jobs = some(ChunkJobs.new(regions[d].copy(), made.copy(), self.world.dims[d].gen.copy(), waker, self.world.settings.chunk_workers))
+                            reads = true
+                        },
+                        err(_) => self.logs.push(Entry.error("Can't read the world's chunks, so they're generated: there's nothing to wake the server's poll with")),
+                    }
                 }
             }
+            all_jobs.push(jobs)
         }
         if not self.link.world(reads) {
             return
         }
-        let made = context else return
-        self.level.open(jobs, made, self.world.gen.copy())
-        // Replaying, light runs here, a step each time the recording's light took one (D264).
-        if not reads {
-            self.level.light_as_recorded()
+        for d in 0..self.world.dims.len() {
+            var context: ChunkContext? = none
+            if let c = self.world.dims[d].context {
+                context = some(c.copy())
+            }
+            let made = context else return
+            let jobs = all_jobs[d].take()
+            self.levels[d].open(jobs, made, self.world.dims[d].gen.copy())
+            // Replaying, light runs here, a step each time the recording's light took one (D264).
+            if not reads {
+                self.levels[d].light_as_recorded()
+            }
         }
         var chosen = true
         if let d = self.level_data {
@@ -550,9 +592,9 @@ impl Network {
         if chosen {
             return
         }
-        if self.level.generates() {
+        if self.levels[0].generates() {
             self.spawn_pending = true
-            self.level.ask_spawn()
+            self.levels[0].ask_spawn()
         } else {
             let pos = self.respawn.pos
             self.found_spawn(pos)
@@ -636,12 +678,13 @@ impl Network {
             Input.Clock(t) => self.set_clock(t),
             Input.Command(line) => self.command(line),
             Input.Halt => self.halt(),
-            Input.Region(region, lines, presence) => {
-                if not self.level.read_region(region, lines, presence) {
-                    self.link.diverged("the IO thread said which chunks region {region.x}, {region.z} has, which the server didn't ask")
+            Input.Region(d, region, lines, presence) => {
+                if d >= self.levels.len() or not self.levels[d].read_region(region, lines, presence) {
+                    self.link.diverged("the IO thread said which chunks region {region.x}, {region.z} of dimension {d} has, which the server didn't ask")
+                    return true
                 }
                 self.level_lines()
-                self.level.dispatch()
+                self.levels[d].dispatch()
             },
             Input.Saved(lines) => {
                 for e in lines {
@@ -654,29 +697,35 @@ impl Network {
                 }
                 self.found_spawn(pos)
             },
-            Input.Light(covered) => {
-                if not self.level.replay_light(covered) {
-                    self.link.diverged("light took a step over {covered} asks, which the server hadn't asked")
+            Input.Light(d, covered) => {
+                if d >= self.levels.len() or not self.levels[d].replay_light(covered) {
+                    self.link.diverged("light took a step over {covered} asks of dimension {d}, which the server hadn't asked")
+                    return true
                 }
                 self.level_lines()
-                self.level.dispatch()
+                self.levels[d].dispatch()
             },
-            Input.Chunk(pos, io, bytes) => {
+            Input.Chunk(d, pos, io, bytes) => {
+                if d >= self.levels.len() {
+                    self.link.diverged("the IO thread read chunk {pos.x}, {pos.z} of dimension {d}, which the server hasn't")
+                    return true
+                }
                 // What the workers made of what the IO thread read is made again here, from it.
                 var made = List<Entry>()
-                let loaded = self.level.make(pos, bytes, mut made)
-                if not self.level.read_chunk(pos, io, loaded, made) {
-                    self.link.diverged("the IO thread read chunk {pos.x}, {pos.z}, which the server didn't ask for")
+                let loaded = self.levels[d].make(pos, bytes, mut made)
+                if not self.levels[d].read_chunk(pos, io, loaded, made) {
+                    self.link.diverged("the IO thread read chunk {pos.x}, {pos.z} of dimension {d}, which the server didn't ask for")
                 }
                 self.level_lines()
-                self.level.dispatch()
+                self.levels[d].dispatch()
             },
-            Input.Withdrawn(pos, io, made) => {
-                if not self.level.withdrawn(pos, io, made) {
-                    self.link.diverged("the generator handed back chunk {pos.x}, {pos.z} unmade, which the server didn't ask for")
+            Input.Withdrawn(d, pos, io, made) => {
+                if d >= self.levels.len() or not self.levels[d].withdrawn(pos, io, made) {
+                    self.link.diverged("the generator handed back chunk {pos.x}, {pos.z} of dimension {d} unmade, which the server didn't ask for")
+                    return true
                 }
                 self.level_lines()
-                self.level.dispatch()
+                self.levels[d].dispatch()
             },
         }
         return true
@@ -773,8 +822,11 @@ impl Network {
             self.connections[i] = some(con)
         }
         self.logs.push(Entry.info(String("Saving worlds")).calcite(Look.Words(String("Saving the world"))))
-        self.logs.push(Entry.info("Saving chunks for level 'ServerLevel[{self.level_name}]'/minecraft:overworld").calcite(Look.Quiet))
-        self.level.close_chunks()
+        for d in 0..self.levels.len() {
+            let id = self.world.dims[d].id.to_string()
+            self.logs.push(Entry.info("Saving chunks for level 'ServerLevel[{self.level_name}]'/{id}").calcite(Look.Quiet))
+            self.levels[d].close_chunks()
+        }
         self.save_level()
         self.flush()
     }
@@ -803,7 +855,8 @@ impl Network {
     fn save_player(mut self, con: Connection) {
         let p = con.profile else return
         var saving = self.saving.take() else return
-        saving.save(Save.Player(p.id, p.name.copy(), Tag.Compound(player_tag(con.player, p.id))))
+        let dimension = self.world.dims[con.player.dim].id.to_string()
+        saving.save(Save.Player(p.id, p.name.copy(), Tag.Compound(player_tag(con.player, p.id, dimension))))
         self.saving = some(saving)
     }
 
@@ -940,9 +993,11 @@ impl Network {
             self.forget_logins(now)
         }
         self.world.game_time += 1
-        self.level.tick()
+        for d in 0..self.levels.len() {
+            self.levels[d].tick()
+        }
         self.level_lines()
-        self.level.dispatch()
+        self.dispatch_all()
         for i in 0..self.connections.len() {
             var con = self.connections[i].take() else continue
             if not con.closing {
@@ -956,6 +1011,7 @@ impl Network {
             }
             self.connections[i] = some(con)
         }
+        self.travel()
         for i in 0..self.connections.len() {
             if not self.playing(i) {
                 continue
@@ -965,7 +1021,7 @@ impl Network {
             self.connections[i] = some(con)
         }
         // The far chunks the players' senders came to are read.
-        self.level.dispatch()
+        self.dispatch_all()
         if self.open() == 0 {
             self.session = none
         }
@@ -975,7 +1031,7 @@ impl Network {
         if self.autosave_in <= 0 and not self.halted {
             self.autosave()
         }
-        self.level.dispatch()
+        self.dispatch_all()
         self.flush()
     }
 
@@ -1624,13 +1680,14 @@ impl Network {
             }
             if con.prepare.found {
                 let chunk = con.prepare.chunk()
+                let d = con.prepare.dim
                 if not con.prepare.ticketed {
                     con.prepare.ticketed = true
-                    self.level.load_spawn(chunk)
+                    self.levels[d].load_spawn(chunk)
                     self.level_lines()
-                    self.level.dispatch()
+                    self.levels[d].dispatch()
                 }
-                if self.level.around_done(chunk, SPAWN_RADIUS) {
+                if self.levels[d].around_done(chunk, SPAWN_RADIUS) {
                     con.prepare.ready = true
                     con.task = none
                     self.next_task(mut con)
@@ -1638,7 +1695,8 @@ impl Network {
             }
         }
         if con.prepare.ready {
-            self.level.keep_spawn(con.prepare.chunk())
+            let d = con.prepare.dim
+            self.levels[d].keep_spawn(con.prepare.chunk())
         }
     }
 
@@ -1646,14 +1704,17 @@ impl Network {
     // they were saved, or, for one new to the world, a place found around the world's spawn,
     // facing as it does. In adventure mode that's the spawn, moved up or down to where they fit
     // in what's loaded; otherwise a search starts, which the configuration ticks go on with as
-    // each candidate's chunk loads. Calcite has only the overworld, so a player saved in another
-    // dimension joins the overworld at the same place (CAL-69).
+    // each candidate's chunk loads. A player saved in a dimension the world has joins it; one
+    // saved in another joins the Overworld at the same place, as vanilla puts them (CAL-69).
     fn start_spawn(mut self, con: mut Connection) {
         con.prepare = Prepare()
         var saved = SavedPosition { dimension: none, pos: none, rotation: none }
         if let data = self.player_data(con) {
             saved = saved_position(data)
             con.prepare.data = some(data)
+        }
+        if let id = saved.dimension {
+            con.prepare.dim = self.world.dimension_of(id) ?? 0
         }
         var y_rot = self.respawn.yaw
         var x_rot = self.respawn.pitch
@@ -1679,8 +1740,9 @@ impl Network {
         if self.world.settings.game_type == GameType.Adventure {
             var y = origin.y
             if let states = self.collisions {
-                y = fixup_height(states, self.level, origin.x, origin.y, origin.z, MIN_Y, MIN_Y + SECTIONS * 16 - 1)
+                y = fixup_height(states, self.levels[0], origin.x, origin.y, origin.z, MIN_Y, MIN_Y + SECTIONS * 16 - 1)
             }
+            con.prepare.dim = 0
             con.prepare.place(f64(origin.x) + 0.5, f64(y), f64(origin.z) + 0.5)
             return
         }
@@ -1693,6 +1755,7 @@ impl Network {
         }
         var random = LegacyRandom.new(seed)
         var search = SpawnSearch.new(origin, radius, random.next_int_below(candidate_count(radius)))
+        con.prepare.dim = 0
         let first = search.next()
         con.prepare.search = some(search)
         self.next_candidate(mut con, first)
@@ -1700,10 +1763,10 @@ impl Network {
 
     // Loads the chunk of the search's next candidate, `candidate`, to check it once it's full.
     fn next_candidate(mut self, con: mut Connection, candidate: Candidate) {
-        self.level.search_spawn(ChunkPos { x: candidate.x >> 4, z: candidate.z >> 4 })
+        self.levels[0].search_spawn(ChunkPos { x: candidate.x >> 4, z: candidate.z >> 4 })
         con.prepare.candidate = some(candidate)
         self.level_lines()
-        self.level.dispatch()
+        self.levels[0].dispatch()
     }
 
     // Goes on with the spawn search while its candidate's chunk is full, as vanilla checks each
@@ -1713,16 +1776,16 @@ impl Network {
     fn search_spawn(mut self, con: mut Connection) {
         loop {
             let candidate = con.prepare.candidate else return
-            if not self.level.full(ChunkPos { x: candidate.x >> 4, z: candidate.z >> 4 }) {
+            if not self.levels[0].full(ChunkPos { x: candidate.x >> 4, z: candidate.z >> 4 }) {
                 return
             }
             var place: BlockPos? = none
             if let states = self.collisions {
                 if candidate.last {
                     let origin = self.respawn.pos
-                    place = some(BlockPos { x: origin.x, y: fixup_height(states, self.level, origin.x, origin.y, origin.z, MIN_Y, MIN_Y + SECTIONS * 16 - 1), z: origin.z })
-                } else if let pos = self.level.respawn_pos(states, candidate.x, candidate.z) {
-                    if fits(states, self.level, pos.x, pos.y, pos.z) {
+                    place = some(BlockPos { x: origin.x, y: fixup_height(states, self.levels[0], origin.x, origin.y, origin.z, MIN_Y, MIN_Y + SECTIONS * 16 - 1), z: origin.z })
+                } else if let pos = self.levels[0].respawn_pos(states, candidate.x, candidate.z) {
+                    if fits(states, self.levels[0], pos.x, pos.y, pos.z) {
                         place = some(pos)
                     }
                 }
@@ -1926,10 +1989,12 @@ impl Network {
         var kept = Abilities()
         var saved_mode: GameType? = none
         var previous: GameType? = none
+        var selected = 0
         if let d = saved_data {
             kept = saved_abilities(d)
             saved_mode = saved_game_type(d, "playerGameType")
             previous = saved_game_type(d, "previousPlayerGameType")
+            selected = saved_slot(d)
         }
         var mode = saved_mode ?? self.world.settings.game_type
         if self.world.settings.force_game_mode {
@@ -1937,17 +2002,22 @@ impl Network {
         }
         kept.update(mode)
         self.joins += 1
-        con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam, data: saved_data, mode: mode, previous_mode: previous, abilities: kept, level: self.access.level(profile.id), joined: self.joins, sender: ChunkSender.with_rate(self.world.settings.chunk_send_cap, self.world.settings.chunk_send_multiplier) }
+        con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam, data: saved_data, mode: mode, previous_mode: previous, abilities: kept, level: self.access.level(profile.id), joined: self.joins, sender: ChunkSender.with_rate(self.world.settings.chunk_send_cap, self.world.settings.chunk_send_multiplier), dim: con.prepare.dim, selected: selected }
         self.logs.push(Entry.info("{profile.name}[{con.address}] logged in with entity id {id} at ({con.player.x}, {con.player.y}, {con.player.z})").calcite(Look.Join(joined_words(profile.name, con.address))))
-        let spawn = SpawnInfo { dimension_type: self.world.settings.dimension_type, dimension: overworld(), seed: self.world.settings.hashed_seed, game_type: mode, previous_game_type: PreviousGameType { mode: previous }, is_debug: false, is_flat: true, last_death_location: none, portal_cooldown: 0, sea_level: -63 }
+        let spawn = self.spawn_info(con.player.dim, mode, previous)
         let secure = self.enforces_secure_chat()
-        let login = ClientboundLogin { player_id: id, hardcore: self.world.settings.hardcore, levels: [overworld()], max_players: self.world.settings.max_players, chunk_radius: self.world.settings.chunk_radius(), simulation_distance: self.world.settings.simulation_distance, reduced_debug_info: false, show_death_screen: true, do_limited_crafting: false, spawn: spawn, online_mode: self.settings.online_mode, enforces_secure_chat: secure }
+        var levels = List<Identifier>()
+        for dim in self.world.dims {
+            levels.push(dim.id.copy())
+        }
+        let login = ClientboundLogin { player_id: id, hardcore: self.world.settings.hardcore, levels: levels, max_players: self.world.settings.max_players, chunk_radius: self.world.settings.chunk_radius(), simulation_distance: self.world.settings.simulation_distance, reduced_debug_info: false, show_death_screen: true, do_limited_crafting: false, spawn: spawn, online_mode: self.settings.online_mode, enforces_secure_chat: secure }
         self.send(mut con, login, State.Play)
         let difficulty = self.world.settings.difficulty
         self.send(mut con, ClientboundChangeDifficulty { difficulty: difficulty, locked: false }, State.Play)
         let abilities = con.player.abilities
         self.send(mut con, ClientboundPlayerAbilities { abilities: abilities }, State.Play)
-        self.send(mut con, ClientboundSetHeldSlot { slot: 0 }, State.Play)
+        let slot = con.player.selected
+        self.send(mut con, ClientboundSetHeldSlot { slot: slot }, State.Play)
         // Calcite has no recipes until Phase 6, so the player gets none. Then their permission
         // level, as `sendPlayerPermissionLevel` sends it, an entity event from 24 up, and the
         // commands it lets them use.
@@ -1982,6 +2052,15 @@ impl Network {
             self.broadcast(packet.copy())
             self.send_bytes(mut con, packet)
         }
+        self.level_info(mut con)
+        self.enter_level(mut con)
+        self.send(mut con, ClientboundPostEffects { effects: [] }, State.Play)
+        self.send_inventory(mut con)
+    }
+
+    // What `sendLevelInfo` sends a player of the level they're in, and the tick rate, as
+    // `updateJoiningPlayer` sends it.
+    fn level_info(mut self, con: mut Connection) {
         self.send(mut con, ClientboundInitializeBorder.default(), State.Play)
         var clocks = List<ClockUpdate>()
         for c in self.world.settings.clocks {
@@ -1994,22 +2073,81 @@ impl Network {
         self.send(mut con, ClientboundGameEvent { event: LEVEL_CHUNKS_LOAD_START, param: 0.0 }, State.Play)
         self.send(mut con, ClientboundTickingState { tick_rate: 20.0, frozen: false }, State.Play)
         self.send(mut con, ClientboundTickingStep { steps: 0 }, State.Play)
-        // The player's tickets go in their section, then their view, as `updatePlayerStatus`
-        // adds them, and the chunks they come to load.
+    }
+
+    // Puts the player in their dimension's level, as `ChunkMap.addEntity` and
+    // `updatePlayerStatus` add them: their tickets go in their section, then their view, and the
+    // chunks they come to load.
+    fn enter_level(mut self, con: mut Connection) {
         let chunk = ChunkPos.containing(con.player.x, con.player.z)
         con.player.section_x = chunk.x
         con.player.section_y = section(con.player.y)
         con.player.section_z = chunk.z
-        self.level.add_player(chunk, id)
+        self.levels[con.player.dim].add_player(chunk, con.player.entity_id)
         self.track(mut con, true)
         self.settle()
-        self.send(mut con, ClientboundPostEffects { effects: [] }, State.Play)
-        // The inventory menu's 46 slots, all empty, with its first state.
+    }
+
+    // The inventory menu's 46 slots, all empty, as `sendAllDataToRemote` sends them, its state
+    // up one.
+    fn send_inventory(mut self, con: mut Connection) {
+        con.player.menu_state = (con.player.menu_state + 1) & 32767
         var slots = List<ItemStack>()
         for _ in 0..46 {
             slots.push(ItemStack.empty())
         }
-        self.send(mut con, ClientboundContainerSetContent { container_id: 0, state_id: 1, items: slots, carried: ItemStack.empty() }, State.Play)
+        let state = con.player.menu_state
+        self.send(mut con, ClientboundContainerSetContent { container_id: 0, state_id: state, items: slots, carried: ItemStack.empty() }, State.Play)
+    }
+
+    // Takes the player to `x`, `y`, `z` in the dimension at `to`, as `ServerPlayer.teleport` takes
+    // a player whose level changes: the client's told of the dimension, its difficulty and their
+    // permission level, they leave the old level, which drops the chunks of their view, they're
+    // put at the place, and enter the new level, which sends its chunks, then their abilities,
+    // the level's info, their inventory and the slot they hold. In the same dimension, they're
+    // only put at the place (CAL-69).
+    fn change_dimension(mut self, con: mut Connection, to: usize, x: f64, y: f64, z: f64, y_rot: f32, x_rot: f32) {
+        let from = con.player.dim
+        if from == to {
+            self.teleport(mut con, x, y, z, y_rot, x_rot)
+            self.track(mut con, false)
+            return
+        }
+        let spawn = self.spawn_info(to, con.player.mode, con.player.previous_mode)
+        self.send(mut con, ClientboundRespawn { spawn: spawn, data_to_keep: KEEP_ALL_DATA }, State.Play)
+        let difficulty = self.world.settings.difficulty
+        self.send(mut con, ClientboundChangeDifficulty { difficulty: difficulty, locked: false }, State.Play)
+        let (level, id) = (con.player.level, con.player.entity_id)
+        self.send(mut con, ClientboundEntityEvent { entity_id: id, event: i8.wrap(24 + level) }, State.Play)
+        self.send(mut con, tree(level), State.Play)
+        // Out of the old level, as `removePlayerImmediately` takes them: the chunks of their view
+        // are dropped, as `applyChunkTrackingView` drops them for an empty view, then their
+        // tickets go, and the far chunks read for them.
+        self.drop_view(mut con)
+        self.levels[from].remove_player(ChunkPos { x: con.player.section_x, z: con.player.section_z }, con.player.entity_id)
+        self.levels[from].forget_player(con.player.entity_id)
+        con.player.dim = to
+        self.teleport(mut con, x, y, z, y_rot, x_rot)
+        self.enter_level(mut con)
+        let abilities = con.player.abilities
+        self.send(mut con, ClientboundPlayerAbilities { abilities: abilities }, State.Play)
+        self.level_info(mut con)
+        self.send_inventory(mut con)
+        let slot = con.player.selected
+        self.send(mut con, ClientboundSetHeldSlot { slot: slot }, State.Play)
+    }
+
+    // Drops every chunk of the player's view, as `applyChunkTrackingView` drops them for an empty
+    // one: those the client has are forgotten, column by column.
+    fn drop_view(mut self, con: mut Connection) {
+        let center = ChunkPos { x: con.player.center_x, z: con.player.center_z }
+        let view = con.player.view
+        for x in center.x - view - 1..center.x + view + 2 {
+            let (lo, hi) = column(center, view, x)
+            for z in lo..hi + 1 {
+                self.forget(mut con, ChunkPos { x: x, z: z })
+            }
+        }
     }
 
     // Puts the player at a place, which the client is to accept before it moves on its own, as
@@ -2110,10 +2248,11 @@ impl Network {
     fn forget(mut self, con: mut Connection, c: ChunkPos) {
         let near = con.player.sender.near(c)
         let sent = con.player.sender.drop_chunk(c)
+        let d = con.player.dim
         if not near {
-            self.level.forget_far(c, con.player.entity_id)
+            self.levels[d].forget_far(c, con.player.entity_id)
         }
-        if sent or (near and not self.level.sendable(c)) {
+        if sent or (near and not self.levels[d].sendable(c)) {
             self.send(mut con, ClientboundForgetLevelChunk { pos: c }, State.Play)
         }
     }
@@ -2130,15 +2269,16 @@ impl Network {
     // Sends the player the chunks due this tick that are ready, as a batch, as `sendNextChunks`.
     // A chunk another player is still to be sent is kept, so it's encoded once for them all.
     fn send_chunks(mut self, con: mut Connection) {
-        self.level.serve(con.player.entity_id)
-        let batch = con.player.sender.next_batch(mut self.spiral, mut self.level)
+        let d = con.player.dim
+        self.levels[d].serve(con.player.entity_id)
+        let batch = con.player.sender.next_batch(mut self.spiral, mut self.levels[d])
         if batch.is_empty() {
             return
         }
         self.send(mut con, ClientboundChunkBatchStart {}, State.Play)
         for c in batch {
-            let keep = self.wanted(c)
-            match self.level.packet(c, self.world.flat, keep) {
+            let keep = self.wanted(d, c)
+            match self.levels[d].packet(c, self.world.dims[d].ground, keep) {
                 ChunkPacket.Plain(p) => self.send_bytes(mut con, p),
                 ChunkPacket.Shared { packet, key, version } => {
                     self.link.sent(con.conn, packet)
@@ -2157,10 +2297,10 @@ impl Network {
 
     // Whether a player other than the one being sent chunks, who's taken out of the connections,
     // is still to be sent the chunk at `pos`.
-    fn wanted(self, pos: ChunkPos) -> bool {
+    fn wanted(self, d: usize, pos: ChunkPos) -> bool {
         for i in 0..self.connections.len() {
             if let other = self.connections[i] {
-                if not other.closing and other.phase == Phase.Play and other.player.sender.waiting(pos) {
+                if not other.closing and other.phase == Phase.Play and other.player.dim == d and other.player.sender.waiting(pos) {
                     return true
                 }
             }
@@ -2222,6 +2362,15 @@ impl Network {
             PlayIn.ResourcePack(_) => return true,
             PlayIn.CustomClickAction(_) => return true,
             PlayIn.PlayerLoaded(_) => return true,
+            // `handleSetCarriedItem`: a hotbar slot, held; another is warned of.
+            PlayIn.SetCarriedItem(c) => {
+                if c.slot >= 0 and c.slot < 9 {
+                    con.player.selected = i32(c.slot)
+                } else {
+                    self.logs.push(Entry.warn("{player_name(con)} tried to set an invalid carried item"))
+                }
+                return true
+            },
             // `handlePlayerAbilities`: flying, where they may fly.
             PlayIn.PlayerAbilities(a) => {
                 con.player.abilities.flying = a.flags & 2 != 0 and con.player.abilities.may_fly
@@ -2347,6 +2496,12 @@ impl Network {
                 }
             },
             ok(Parsed.FlySpeed(speed)) => self.fly_speed(source, speed),
+            ok(Parsed.Dimension(id, targets)) => {
+                match self.dimension_command(source, id, targets) {
+                    ok => {},
+                    err(f) => self.command_failed(source, f),
+                }
+            },
             err(f) => self.command_failed(source, f),
         }
     }
@@ -2417,7 +2572,7 @@ impl Network {
         con.player.previous_mode = some(con.player.mode)
         con.player.mode = mode
         con.player.abilities.update(mode)
-        if con.player.abilities.flying and mode != GameType.Spectator and self.near_ground(con.player.x, con.player.y, con.player.z) {
+        if con.player.abilities.flying and mode != GameType.Spectator and self.near_ground(con.player.dim, con.player.x, con.player.y, con.player.z) {
             con.player.abilities.flying = false
         }
         let abilities = con.player.abilities
@@ -2437,10 +2592,17 @@ impl Network {
         return true
     }
 
-    // `isInRangeOfGround`, for a player at `x`, `y`, `z`: their box meets no block, and one is
-    // under it, less than a block down. Liquids count as blocks here, where vanilla's colliders
-    // pass through them (D239).
-    fn near_ground(mut self, x: f64, y: f64, z: f64) -> bool {
+    // What the login and respawn packets say of the dimension at `dim`, `createCommonSpawnInfo`'s,
+    // for a player in `mode`, who was in `previous` before.
+    fn spawn_info(self, dim: usize, mode: GameType, previous: GameType?) -> SpawnInfo {
+        let d = self.world.dims[dim].id.copy()
+        return SpawnInfo { dimension_type: self.world.dims[dim].type_id, dimension: d, seed: self.world.settings.hashed_seed, game_type: mode, previous_game_type: PreviousGameType { mode: previous }, is_debug: false, is_flat: self.world.dims[dim].flat, last_death_location: none, portal_cooldown: 0, sea_level: self.world.dims[dim].sea_level }
+    }
+
+    // `isInRangeOfGround`, for a player at `x`, `y`, `z` of dimension `dim`: their box meets no
+    // block, and one is under it, less than a block down. Liquids count as blocks here, where
+    // vanilla's colliders pass through them (D239).
+    fn near_ground(mut self, dim: usize, x: f64, y: f64, z: f64) -> bool {
         if self.collisions == none {
             self.collisions = some(CollisionStates.new())
         }
@@ -2448,7 +2610,7 @@ impl Network {
         let half = f64(0.6f32 / 2.0f32)
         let body = Aabb { min_x: x - half, min_y: y, min_z: z - half, max_x: x + half, max_y: y + f64(1.8f32), max_z: z + half }
         let below = Aabb { min_x: x - half, min_y: y - 1.0, min_z: z - half, max_x: x + half, max_y: y, max_z: z + half }
-        return states.no_collision(self.level, body) and not states.no_collision(self.level, below)
+        return states.no_collision(self.levels[dim], body) and not states.no_collision(self.levels[dim], below)
     }
 
     // The players `targets` names, as `EntitySelector.findPlayers` finds them, in the order they
@@ -2563,6 +2725,143 @@ impl Network {
             self.system_message(mut con, Component.literal("Your flying speed is {times} times vanilla's"))
         }
         self.connections[slot] = some(con)
+    }
+
+    // `calcite dimension`: each player named, or the one who ran it, sent on their way to the
+    // dimension `id` names, as a portal would take them, to the place `destination` gives, and
+    // moved there once it's loaded (`travel`). Where the world hasn't the dimension, it's
+    // `DimensionArgument`'s failure (CAL-69).
+    fn dimension_command(mut self, source: Source, id: Identifier, targets: own Targets?) ! Failure {
+        let to = self.world.dimension_of(id) else fail Failure.alone(Component.translatable("argument.dimension.invalid", [Component.literal(id.to_string())]))
+        var who = List<usize>()
+        if let t = targets {
+            who = self.players_named(source, t)
+            if who.is_empty() {
+                fail Failure.alone(Component.translatable("argument.entity.notfound.player", []))
+            }
+        } else {
+            match source {
+                Source.Player(s) => who.push(s),
+                Source.Console => fail Failure.alone(Component.translatable("permissions.requires.player", [])),
+            }
+        }
+        for slot in who {
+            var at: (usize, f64, f64, i32)? = none
+            if let con = self.connections[slot] {
+                at = some((con.player.dim, con.player.x, con.player.z, con.player.entity_id))
+            }
+            let (from, px, pz, entity_id) = at else continue
+            let me = match source {
+                Source.Player(s) => s == slot,
+                Source.Console => false,
+            }
+            let (x, z) = self.destination(from, to, px, pz)
+            let chunk = ChunkPos.containing(x, z)
+            var i: usize = 0
+            while i < self.travels.len() {
+                if self.travels[i].entity_id == entity_id {
+                    _ = self.travels.remove(i)
+                } else {
+                    i += 1
+                }
+            }
+            self.levels[to].load_portal(chunk)
+            self.level_lines()
+            self.levels[to].dispatch()
+            self.travels.push(Travel { entity_id: entity_id, to: to, x: x, z: z, told: if me { none } else { some(source) } })
+        }
+    }
+
+    // Where a player at `x`, `z` in the dimension at `from` goes in the one at `to`, as a portal
+    // takes them: to the End's arrival point, 100, 0, as `ServerLevel.END_SPAWN_POINT`; out of the
+    // End, to the world's spawn; otherwise the same place, its coordinates times `from`'s scale
+    // over `to`'s, as `DimensionType.getTeleportationScale` scales them, within the border.
+    fn destination(self, from: usize, to: usize, x: f64, z: f64) -> (f64, f64) {
+        if self.world.dims[to].id.path == "the_end" and self.world.dims[to].id.namespace == "minecraft" {
+            return (100.5, 0.5)
+        }
+        if self.world.dims[from].id.path == "the_end" and self.world.dims[from].id.namespace == "minecraft" {
+            return (f64(self.respawn.pos.x) + 0.5, f64(self.respawn.pos.z) + 0.5)
+        }
+        let scale = self.world.dims[from].scale / self.world.dims[to].scale
+        let edge = BORDER_HALF
+        return ((x * scale).max(-edge).min(edge), (z * scale).max(-edge).min(edge))
+    }
+
+    // Moves each player on their way to another dimension whose destination's loaded, as a portal
+    // moves them once its ticket's chunks are: to the nearest place they can stand within
+    // `PORTAL_RADIUS` chunks, looked for column by column in squares going out from where they
+    // were going, from the top of what portals reach in a dimension with a ceiling, or the top of
+    // its blocks; where there's none, to that place at the height they were at, within the
+    // dimension. They're told, and the console or player who sent them is too (CAL-69).
+    fn travel(mut self) {
+        var i: usize = 0
+        while i < self.travels.len() {
+            let to = self.travels[i].to
+            let chunk = ChunkPos.containing(self.travels[i].x, self.travels[i].z)
+            let entity_id = self.travels[i].entity_id
+            let slot = self.slot_of(entity_id) else {
+                _ = self.travels.remove(i)
+                continue
+            }
+            if not self.levels[to].around_done(chunk, PORTAL_RADIUS) {
+                i += 1
+                continue
+            }
+            let t = self.travels.remove(i)
+            var con = self.connections[slot].take() else continue
+            let (x, y, z) = self.standing_place(to, t.x, con.player.y, t.z)
+            let y_rot = con.player.y_rot
+            let x_rot = con.player.x_rot
+            self.change_dimension(mut con, to, x, y, z, y_rot, x_rot)
+            let name = self.world.dims[to].id.to_string()
+            self.system_message(mut con, Component.literal("Moved to {name}"))
+            let moved = player_name(con)
+            self.connections[slot] = some(con)
+            if let source = t.told {
+                self.success(source, Component.literal("Moved {moved} to {name}"), false)
+            }
+        }
+    }
+
+    // The connection of the player in play whose entity is `entity_id`.
+    fn slot_of(self, entity_id: i32) -> usize? {
+        for i in 0..self.connections.len() {
+            if let c = self.connections[i] {
+                if not c.closing and c.phase == Phase.Play and c.player.entity_id == entity_id {
+                    return some(i)
+                }
+            }
+        }
+        return none
+    }
+
+    // Where a player going to `x`, `z` in the dimension at `to`, from the height `y`, stands, as
+    // `travel` finds it.
+    fn standing_place(mut self, to: usize, x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+        if self.collisions == none {
+            self.collisions = some(CollisionStates.new())
+        }
+        let bx = i32.saturate(x.floor())
+        let bz = i32.saturate(z.floor())
+        let min_y = self.world.dims[to].min_y
+        let ceiling = self.world.dims[to].ceiling
+        let top = min_y + (if ceiling { self.world.dims[to].logical_height } else { self.world.dims[to].height }) - 1
+        if let states = self.collisions {
+            for r in 0..PORTAL_RADIUS * 16 + 1 {
+                for dx in -r..r + 1 {
+                    for dz in -r..r + 1 {
+                        if dx.abs() != r and dz.abs() != r {
+                            continue
+                        }
+                        if let at = self.levels[to].standing_y(states, bx + dx, bz + dz, top, ceiling) {
+                            return (f64(bx + dx) + 0.5, f64(at), f64(bz + dz) + 0.5)
+                        }
+                    }
+                }
+            }
+        }
+        return (x, y.max(f64(min_y)).min(f64(top)), z)
     }
 
     // `sendSuccess`: the message to its source, a player only as `sendCommandFeedback`, true
@@ -2919,7 +3218,7 @@ impl Network {
         let chunk = ChunkPos.containing(con.player.x, con.player.z)
         let height = section(con.player.y)
         if chunk.x != con.player.section_x or height != con.player.section_y or chunk.z != con.player.section_z {
-            self.level.move_player(ChunkPos { x: con.player.section_x, z: con.player.section_z }, chunk, con.player.entity_id)
+            self.levels[con.player.dim].move_player(ChunkPos { x: con.player.section_x, z: con.player.section_z }, chunk, con.player.entity_id)
             con.player.section_x = chunk.x
             con.player.section_y = height
             con.player.section_z = chunk.z
@@ -2933,38 +3232,56 @@ impl Network {
     // Runs the world's distance manager until it settles, takes what it logged, and hands what
     // it's to read to the IO thread.
     fn settle(mut self) {
-        self.level.pump()
+        for d in 0..self.levels.len() {
+            self.levels[d].pump()
+        }
         self.level_lines()
-        self.level.dispatch()
+        self.dispatch_all()
     }
 
-    // Takes what the world logged.
+    // Takes what each dimension logged.
     fn level_lines(mut self) {
-        for e in self.level.take_lines() {
-            self.logs.push(e.copy())
+        for d in 0..self.levels.len() {
+            for e in self.levels[d].take_lines() {
+                self.logs.push(e.copy())
+            }
+        }
+    }
+
+    // Hands each dimension's IO thread what it's to read, and its light what it's to be told.
+    fn dispatch_all(mut self) {
+        for d in 0..self.levels.len() {
+            self.levels[d].dispatch()
         }
     }
 
     // Takes in what the IO thread and chunk workers have done, recording what the IO thread
     // read, as the server's loop hands it over, then what it comes to (D178).
     fn chunks_read(mut self) {
-        var done = self.level.take_done()
+        for dim in 0..self.levels.len() {
+            self.dimension_read(dim)
+        }
+    }
+
+    // Takes in what the dimension's IO thread and chunk workers have done, as `chunks_read`.
+    fn dimension_read(mut self, dim: usize) {
+        var done = self.levels[dim].take_done()
         if done.is_empty() {
             return
         }
         while let d = done.pop_first() {
             match d {
                 Done.Region(region, lines, presence) => {
-                    self.link.region_read(region, lines, presence)
-                    _ = self.level.read_region(region, lines, presence)
+                    self.link.region_read(dim, region, lines, presence)
+                    _ = self.levels[dim].read_region(region, lines, presence)
                 },
                 Done.Chunk(pos, io, bytes, made, loaded) => {
-                    self.link.chunk_read(pos, io, bytes)
-                    _ = self.level.read_chunk(pos, io, loaded, made)
+                    self.link.chunk_read(dim, pos, io, bytes)
+                    _ = self.levels[dim].read_chunk(pos, io, loaded, made)
                 },
                 Done.Withdrawn(pos, io, made) => {
-                    self.link.chunk_withdrawn(pos, io, made)
-                    _ = self.level.withdrawn(pos, io, made)
+                    self.link.chunk_withdrawn(dim, pos, io, made)
+                    _ = self.levels[dim].withdrawn(pos, io, made)
                 },
                 Done.Spawn(pos, lines) => {
                     // What finding it logged isn't recorded: a replay doesn't search again.
@@ -2983,21 +3300,23 @@ impl Network {
             }
             self.level_lines()
         }
-        self.level.dispatch()
+        self.levels[dim].dispatch()
     }
 
-    // Takes in each step light's thread has done, recording it, as the server's loop hands it over
-    // (D264).
+    // Takes in each step each dimension's light thread has done, recording it, as the server's
+    // loop hands it over (D264).
     fn light_done(mut self) {
-        var any = false
-        while let d = self.level.take_light() {
-            self.link.light(d.covered)
-            self.level.light_done(d)
-            self.level_lines()
-            any = true
-        }
-        if any {
-            self.level.dispatch()
+        for dim in 0..self.levels.len() {
+            var any = false
+            while let d = self.levels[dim].take_light() {
+                self.link.light(dim, d.covered)
+                self.levels[dim].light_done(d)
+                self.level_lines()
+                any = true
+            }
+            if any {
+                self.levels[dim].dispatch()
+            }
         }
     }
 
@@ -3114,8 +3433,9 @@ impl Network {
         let p = profile else return
         // Their tickets go, and the far chunks read for them, as `updatePlayerStatus` takes
         // them out.
-        self.level.remove_player(ChunkPos { x: con.player.section_x, z: con.player.section_z }, con.player.entity_id)
-        self.level.forget_player(con.player.entity_id)
+        let d = con.player.dim
+        self.levels[d].remove_player(ChunkPos { x: con.player.section_x, z: con.player.section_z }, con.player.entity_id)
+        self.levels[d].forget_player(con.player.entity_id)
         self.settle()
         let message = Component.translatable("multiplayer.player.left", [display_name(p)]).colored("yellow")
         self.broadcast_system(message, Look.Quiet)
@@ -3194,7 +3514,11 @@ impl Network {
         let whole = self.link.checks_sent()
         var got = self.sending.take_compressed()
         while let c = got.pop() {
-            self.level.compressed(c.key, c.version, c.body, c.threshold, whole)
+            // Each dimension gives its packets versions of their own (`Level.set_dimension`).
+            let d = usize.wrap(c.version >> VERSION_SHIFT)
+            if d < self.levels.len() {
+                self.levels[d].compressed(c.key, c.version, c.body, c.threshold, whole)
+            }
         }
     }
 
@@ -3206,16 +3530,16 @@ impl Network {
     }
 }
 
-// The overworld, Calcite's one dimension so far.
+// The Overworld, where the world's spawn is.
 fn overworld() -> Identifier {
     return Identifier { namespace: "minecraft", path: "overworld" }
 }
 
 // The player's data as Calcite saves it: as it was read as they joined, with where they are
-// now, their `Pos`, `Rotation` and `Dimension`, their game modes and their abilities (D239), or
-// for a player new to the world, those with their `UUID` and 26.3's `DataVersion`. Data older
-// than 26.3's keeps its version, since the rest of it is as old (D189).
-fn player_tag(player: Player, id: Uuid) -> JavaHashMap<String, Tag> {
+// now, their `Pos`, `Rotation` and `Dimension`, which is `dimension`, their game modes and their
+// abilities (D239), or for a player new to the world, those with their `UUID` and 26.3's
+// `DataVersion`. Data older than 26.3's keeps its version, since the rest of it is as old (D189).
+fn player_tag(player: Player, id: Uuid, dimension: own String) -> JavaHashMap<String, Tag> {
     var data = JavaHashMap<String, Tag>()
     if let kept = player.data {
         data = kept.copy()
@@ -3225,7 +3549,8 @@ fn player_tag(player: Player, id: Uuid) -> JavaHashMap<String, Tag> {
     }
     data.insert(String("Pos"), Tag.List([Tag.double(player.x), Tag.double(player.y), Tag.double(player.z)]))
     data.insert(String("Rotation"), Tag.List([Tag.float(player.y_rot), Tag.float(player.x_rot)]))
-    data.insert(String("Dimension"), Tag.Str(String("minecraft:overworld")))
+    data.insert(String("Dimension"), Tag.Str(dimension))
+    data.insert(String("SelectedItemSlot"), Tag.Int(player.selected))
     // `storeGameTypes`, and `Abilities.Packed.CODEC`, every field written.
     data.insert(String("playerGameType"), Tag.Int(player.mode.id()))
     if let previous = player.previous_mode {
@@ -3244,6 +3569,17 @@ fn player_tag(player: Player, id: Uuid) -> JavaHashMap<String, Tag> {
     abilities.insert(String("walkSpeed"), Tag.float(a.walking_speed))
     data.insert(String("abilities"), Tag.Compound(abilities))
     return data
+}
+
+// The hotbar slot in the player's data, as `readAdditionalSaveData` reads `SelectedItemSlot`, a
+// number: 0 where it's missing or isn't one, and where it's not a hotbar slot, whose data vanilla
+// fails to load.
+fn saved_slot(data: JavaHashMap<String, Tag>) -> i32 {
+    if not data.contains("SelectedItemSlot") {
+        return 0
+    }
+    let slot = data["SelectedItemSlot"].number_int() ?? 0
+    return if slot >= 0 and slot < 9 { slot } else { 0 }
 }
 
 fn flag_tag(v: bool) -> Tag {
