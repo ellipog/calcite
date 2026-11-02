@@ -13,8 +13,8 @@
 ///
 /// A world that generates its chunks hands each the workers find nothing to use of to the
 /// generator's thread, which schedules `worldgen.generator`'s jobs with `worldgen.scheduler`,
-/// and its workers, one fewer than the processors, each with a `Worker` of its own, which do
-/// them: each chunk's starts and biomes, its terrain, its decoration and its finishing as the
+/// and its workers, one fewer than the processors, each with a `Worker` of its own while it has
+/// jobs (D226), which do them: each chunk's starts and biomes, its terrain, its decoration and its finishing as the
 /// server's chunk, unlit, with its sky's sources (CAL-88). It keeps two jobs a worker out, the
 /// most urgent first, and hands each chunk back as it's finished. The worker that finished it
 /// encodes it as its region file holds it, and the IO thread writes it there, so it's read from
@@ -69,6 +69,11 @@ const MOST_WORKERS: usize = 8
 
 // The most chunks the IO thread holds to write together.
 const WRITE_BATCH: usize = 64
+
+// How long a generator worker that's handed nothing keeps its copy of the generator's worker, in
+// nanoseconds: then it lets go of it, with what it cached, and copies it again for its next job
+// (D226).
+const KEEP_COPY_NANOS: u64 = 5000000000
 
 // How the generator's thread tells which kept terrain is far: a chunk wanted marks the cells of
 // 16 × 16 chunks within `REACH` of it, as far as the jobs it needs reach through their ranks
@@ -577,14 +582,11 @@ struct GenWork {
 enum GenTask {
     Job(u32, Job)
     Origin
-    // The worker every worker was copied from, for the time the generator's gone quiet: one that
-    // hasn't copied it that time does, and lets go of what it cached.
-    Forget(u32, Shared<Worker>)
 }
 
 // A generator worker: with its own copy of the generator's `Worker`, it does each job it's handed
-// and hands back what it made, a chunk finished as the server's, with its sky's sources worked out here, and encoded
-// for its region file.
+// and hands back what it made, a chunk finished as the server's, with its sky's sources worked out
+// here, and encoded for its region file.
 struct GenWorker {
     worker: Shared<Worker>
     context: ChunkContext
@@ -597,18 +599,26 @@ impl Task for GenWorker {
         let GenWorker { worker: worker, context: context, tasks: taken, out: sender } = self
         var tasks = taken
         var out = sender
-        // Each thread copies the worker for itself, so they're all copied at once.
-        var w = worker.value.copy()
-        var forgot: u32 = 0
+        // The thread copies the worker for itself when it's first handed something, and lets go
+        // of the copy, with the templates, pools, features and noise it cached, once it's been
+        // handed nothing for a while; the next job copies it again. What a chunk comes to doesn't
+        // depend on which worker makes it, or what it made before (D226).
+        var held: Worker? = none
         let light = LightStates.new()
-        while let task = tasks.wait() {
+        loop {
+            var next: GenTask? = none
+            if held == none {
+                next = tasks.wait()
+            } else {
+                next = unsafe { tasks.wait_for(KEEP_COPY_NANOS) }
+                if next == none {
+                    held = none
+                    next = tasks.wait()
+                }
+            }
+            let task = next else return
+            var w = held.take() ?? worker.value.copy()
             match task {
-                GenTask.Forget(time, fresh) => {
-                    if time > forgot {
-                        forgot = time
-                        w = fresh.value.copy()
-                    }
-                },
                 GenTask.Origin => {
                     match w.origin() {
                         ok(o) => {
@@ -640,6 +650,7 @@ impl Task for GenWorker {
                     }
                 },
             }
+            held = some(w)
         }
     }
 }
@@ -716,12 +727,8 @@ struct GenState {
     began: Instant
     hot: Map<i64, u32> = Map<i64, u32>()
     wants: usize = 0
-    // How many chunks have been asked for since the server last said a while had gone by; the
-    // worker every worker was copied from, as it was made, and how many times they've been
-    // handed copies of it to forget what they cached.
+    // How many chunks have been asked for since the server last said a while had gone by.
     asked_lately: usize = 0
-    pristine: Shared<Worker>? = none
-    forgets: u32 = 0
     // The service that loads the structure templates for every worker.
     to_templates: Sender<TemplateAsk>? = none
     collisions: CollisionStates? = none
@@ -759,17 +766,16 @@ impl Task for GenThread {
                         var made = first
                         s.to_templates = some(made.serve_templates())
                         s.sched = some(Scheduler.new(made.structures(), made.ring_searches()))
-                        // Each thread copies the one worker as it starts, so the copies are made
-                        // at once; one after another, the last worker started half a second
-                        // later. The queue's sender is made first: a worker that waits on a
-                        // queue with none would end at once.
+                        // Each thread copies the one worker for itself, when it's first handed
+                        // something, so the copies are made at once; one after another, the last
+                        // worker started half a second later. The queue's sender is made first: a
+                        // worker that waits on a queue with none would end at once.
                         let shared = Shared(made)
                         let tasks = Receiver<GenTask>()
                         s.to_tasks = some(tasks.sender())
                         for _ in 0..s.workers {
                             _ = unsafe { Thread.spawn(GenWorker { worker: shared.copy(), context: context.copy(), tasks: tasks.share(), out: to_inbox.share() }) }
                         }
-                        s.pristine = some(shared)
                     },
                     err(e) => s.lines.push(Entry.error("Can't generate the world, so its chunks are flat: {e}").on(gen_thread())),
                 }
@@ -1105,27 +1111,15 @@ fn renewed(s: mut GenState, old: own Scheduler) -> Scheduler {
     return fresh
 }
 
-// Hands each worker a fresh copy of the worker they were copied from, so they let go of the
-// templates, pools, features and noise they cached: what a chunk comes to doesn't depend on which
-// worker makes it, or what it made before. Each takes one at most; one that takes none forgets the
-// next time. The templates' service lets go of those it loaded too, so once every worker has,
-// they're freed.
+// Has the templates' service let go of the templates it loaded. The workers have let go of their
+// copies of the generator's worker by now, each a while after its last job, so once those that
+// still hold some are let go too, they're freed (D226).
 fn forget(s: mut GenState) {
-    let p = s.pristine.take() else return
-    if let t = s.to_tasks.take() {
-        var tasks = t
-        s.forgets += 1
-        for _ in 0..s.workers {
-            tasks.send(GenTask.Forget(s.forgets, p.copy()))
-        }
-        s.to_tasks = some(tasks)
-    }
     if let t = s.to_templates.take() {
         var templates = t
         templates.send(TemplateAsk.Forget)
         s.to_templates = some(templates)
     }
-    s.pristine = some(p)
 }
 
 // Whether the chunk at `x`, `z` was finished by the scheduler and isn't kept: it was handed back
