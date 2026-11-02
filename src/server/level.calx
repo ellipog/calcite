@@ -378,6 +378,10 @@ pub struct Level {
     waiting: Map<i64, u64> = Map<i64, u64>()
     next_place: u64 = 0
     recheck: Set<i64> = Set<i64>()
+    // The chunks held whole whose light isn't saved as the engine has it: lit since they were
+    // saved, or changed by a run since they were lit. Each is saved as it unloads, and as the
+    // server stops, as vanilla saves a chunk it's marked unsaved (D258).
+    unsaved: OpenHashSet<i64> = OpenHashSet<i64>()
     lines: List<Entry> = List<Entry>()
     // The player whose sender asks next, for their far chunks.
     serving: i32 = 0
@@ -802,8 +806,26 @@ impl Level {
     }
 
     /// Has the IO thread write the chunks it's been handed and close the region files, as the
-    /// server stops.
+    /// server stops, once each chunk whose light isn't saved is, as `saveAllChunks` saves them.
+    /// Those go from the level as they're handed over, not copied, as nothing ticks after.
     pub fn close_chunks(mut self) {
+        var keys = List<i64>()
+        for k in self.unsaved {
+            keys.push(k)
+        }
+        for k in keys {
+            if let gone = self.columns.take(k) {
+                self.save_gone(k, gone)
+            }
+        }
+        self.unsaved.clear()
+        var far = List<i64>()
+        for (k, _) in self.far {
+            far.push(k)
+        }
+        for k in far {
+            self.free_far(k)
+        }
         var jobs = self.jobs.take() else return
         jobs.close()
         self.jobs = some(jobs)
@@ -928,6 +950,7 @@ impl Level {
             } else {
                 _ = self.columns.take(k)
                 self.stale(k)
+                self.let_go(k, loaded)
             }
             return true
         }
@@ -940,9 +963,38 @@ impl Level {
                 let owner = self.far[k].owner
                 self.far[k].body = body(loaded)
                 self.far_loads.insert(owner, (self.far_loads.get(owner) ?? 1) - 1)
+                return true
             }
         }
+        self.let_go(k, loaded)
         return true
+    }
+
+    // The chunk at `k`, read, goes with nothing to take it: if the generator made it, it isn't on
+    // the disk, so it's saved, unlit, to be read, not made again, when it's next asked for (D258).
+    fn let_go(mut self, k: i64, loaded: own Loaded) {
+        match loaded {
+            Loaded.Saved(s) => self.let_go_body(k, Body.Saved(s)),
+            Loaded.Generate => {},
+        }
+    }
+
+    // As `let_go`, for a body held.
+    fn let_go_body(mut self, k: i64, gone: own Body) {
+        if self.gen == none {
+            return
+        }
+        match gone {
+            Body.Saved(s) => {
+                if s.fresh and s.whole {
+                    let SavedChunk { chunk: chunk, .. } = s
+                    var jobs = self.jobs.take() else return
+                    jobs.save_chunk(unpacked(k), chunk, none)
+                    self.jobs = some(jobs)
+                }
+            },
+            _ => {},
+        }
     }
 
     /// Takes in that the generator didn't make the chunk at `pos`, as it was told nothing wanted
@@ -1064,11 +1116,70 @@ impl Level {
             }
             return
         }
-        if let _ = self.columns.take(k) {
+        if let gone = self.columns.take(k) {
             self.stale(k)
             if self.opened {
+                self.save_gone(k, gone)
                 self.forget_light(k)
             }
+        }
+    }
+
+    // The chunk at `k` unloads as `gone`: if it isn't saved as it is, made by the generator since,
+    // or lit, or its light changed, it's saved, with its light if it's lit, as vanilla saves an
+    // unsaved chunk as it unloads (D258).
+    fn save_gone(mut self, k: i64, gone: own Body) {
+        if not self.unsaved.contains(k) {
+            return
+        }
+        self.unsaved.remove(k)
+        if self.gen == none {
+            return
+        }
+        match gone {
+            Body.Saved(s) => {
+                let SavedChunk { chunk: chunk, whole: whole, .. } = s
+                if not whole {
+                    return
+                }
+                let pos = unpacked(k)
+                var data: LightData? = none
+                if self.lit.contains(k) {
+                    if let light = self.light {
+                        data = some(light.light_data(pos.x, pos.z))
+                    }
+                }
+                var jobs = self.jobs.take() else return
+                jobs.save_chunk(pos, chunk, data)
+                self.jobs = some(jobs)
+            },
+            _ => {},
+        }
+    }
+
+    // Takes the chunks whose light a run changed, or that were queued or taken back: the packets
+    // kept for them go, and each lit and held whole is to be saved again (D258).
+    fn note_light(mut self, light: mut Light) {
+        let changed = light.take_changed()
+        for c in changed {
+            let k = c.pack()
+            if self.packets.len() > 0 {
+                _ = self.packets.remove(k)
+            }
+            if self.lit.contains(k) and self.whole(k) {
+                self.unsaved.insert(k)
+            }
+        }
+    }
+
+    // Whether the chunk at `k` is held whole, so it can be saved from what's held (D258).
+    fn whole(self, k: i64) -> bool {
+        if not self.columns.slots.contains(k) {
+            return false
+        }
+        return match self.columns.slots[k] {
+            Body.Saved(s) => s.whole,
+            _ => false,
         }
     }
 
@@ -1081,6 +1192,10 @@ impl Level {
             Loaded.Generate => self.columns.put(k, Body.Flat),
             Loaded.Saved(s) => {
                 var saved = s
+                // What the generator made isn't on the disk until it's let go of (D258).
+                if saved.fresh and saved.whole {
+                    self.unsaved.insert(k)
+                }
                 var light = self.light.take() else {
                     self.columns.put(k, Body.Saved(saved))
                     return
@@ -1163,6 +1278,9 @@ impl Level {
             if let f = self.columns.flat {
                 _ = light.run(f.states, self.columns)
             }
+            // What the run changed is taken now, so a chunk lit as it was saved isn't saved again
+            // for its own light coming in (D258).
+            self.note_light(mut light)
             for k in keys {
                 let pos = unpacked(k)
                 light.set_light_enabled(self.columns, pos.x, pos.z, self.lighted(k))
@@ -1204,6 +1322,10 @@ impl Level {
                     work = i64(light.run(f.states, self.columns))
                 }
                 self.light_left -= work
+                // Lit now and not as it was saved, as `setLightCorrect` marks it unsaved (D258).
+                if self.whole(k) {
+                    self.unsaved.insert(k)
+                }
             }
             self.lit.insert(k)
             self.came_loaded(k)
@@ -1229,17 +1351,12 @@ impl Level {
         }
     }
 
-    // The packets kept for chunks whose light may have changed go.
+    // The packets kept for chunks whose light may have changed go, and those lit and held whole
+    // are to be saved again.
     fn drop_lit(mut self) {
         var light = self.light.take() else return
-        let changed = light.take_changed()
+        self.note_light(mut light)
         self.light = some(light)
-        if self.packets.len() == 0 {
-            return
-        }
-        for c in changed {
-            _ = self.packets.remove(c.pack())
-        }
     }
 
     // Tells `light` of the columns whose bodies came or went since it was last told, before it
@@ -1396,9 +1513,10 @@ impl Level {
     // Lets the far chunk at `k` go, and its read if it's still being read.
     fn free_far(mut self, k: i64) {
         let f = self.far.remove(k) else return
-        match f.body {
-            Body.Loading => self.far_loads.insert(f.owner, (self.far_loads.get(f.owner) ?? 1) - 1),
-            _ => {},
+        let Far { owner: owner, body: gone } = f
+        match gone {
+            Body.Loading => self.far_loads.insert(owner, (self.far_loads.get(owner) ?? 1) - 1),
+            _ => self.let_go_body(k, gone),
         }
     }
 }

@@ -5,7 +5,8 @@
 /// what the file holds of a chunk, as it's asked. What it reads goes to the chunk workers, which
 /// check it, inflate it and read its NBT into a chunk, with its sky sources and its light as it
 /// was saved, and back to the tick thread with what each logged, waking the poll. The workers
-/// start as chunks need them, up to as many as the generator has, and at most 8.
+/// start as chunks need them, up to as many as the generator has, and at most 8. As many savers
+/// encode the chunks the server saves, and the IO thread writes them (D258).
 ///
 /// What the IO thread reads is the server's input, as the network's bytes are: the link records
 /// it, and a replay hands it over in the same order. What the workers make of it depends only on
@@ -16,9 +17,9 @@
 /// and its workers, `chunk-workers` of them or one fewer than the processors (D251), each with a `Worker` of its own while it has
 /// jobs (D226), which do them: each chunk's starts and biomes, its terrain, its decoration and its finishing as the
 /// server's chunk, unlit, with its sky's sources (CAL-88). It keeps two jobs a worker out, the
-/// most urgent first, and hands each chunk back as it's finished. The worker that finished it
-/// encodes it as its region file holds it, and the IO thread writes it there, so it's read from
-/// there when it's asked for again; it's kept until it's written. A chunk is a pure function of
+/// most urgent first, and hands each chunk back as it's finished, not yet saved: the server saves
+/// it, lit once it's lit, as it lets go of it, and the generator saves one nothing wants, keeping
+/// it until it's written (D258). A chunk is a pure function of
 /// where it is, so what comes back depends on nothing but the read, and a replay generates it
 /// again. So when the terrain kept for chunks far from any wanted lately is too much, the
 /// scheduler is let go and a new one starts, which makes again from nothing what it needs, and
@@ -36,7 +37,7 @@ import std.pool.{workers}
 import std.thread.{Task}
 import std.memory.{trim}
 import std.time.{Instant, Timestamp}
-import storage.chunk.{ChunkData, ChunkFormat}
+import storage.chunk.{ChunkData, ChunkFormat, written_whole}
 import storage.region.{Compression, ReadError, Stored, unpack}
 import storage.regions.{ChunkRead, RegionStorage, encode_tag, read_root}
 import world.chunk.{BlockStates, Chunk, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, OCEAN_FLOOR_WG, Section, WORLD_SURFACE, WORLD_SURFACE_WG}
@@ -128,6 +129,12 @@ pub struct SavedChunk {
     /// Whether it was saved lit, its status `minecraft:light` or later with its light on, as
     /// vanilla's `isLighted` says, so its light isn't spread again.
     pub lighted: bool
+    /// Whether this is all there is of it, as the generator made it or Calcite saved it whole,
+    /// so it can be saved again from it, with its light (D258).
+    pub whole: bool = false
+    /// Whether it isn't on the disk: the generator made it and nothing has saved it, so what lets
+    /// go of it saves it (D258).
+    pub fresh: bool = false
 }
 
 impl SavedChunk {
@@ -166,7 +173,7 @@ pub fn generated(chunk: own Chunk, light: LightStates, sections: i32) -> SavedCh
     // No light was saved for it, so its lists of saved light are empty, not a `none` for each
     // section: two lists of 26 took 1.8 KB a chunk.
     _ = sections
-    return SavedChunk { chunk: chunk, sources: sources, sky: [], block: [], lighted: false }
+    return SavedChunk { chunk: chunk, sources: sources, sky: [], block: [], lighted: false, whole: true, fresh: true }
 }
 
 /// What a chunk read from its region file comes to, as vanilla's `ChunkMap.scheduleChunkLoad`
@@ -227,6 +234,7 @@ fn prepare_stored(pos: ChunkPos, stored: Stored, context: ChunkContext, light: L
     }
     var parsing = List<Entry>()
     var broken = false
+    let tags_whole = written_whole(fields)
     let parsed: ChunkData? = match ChunkData.parse(context.format, context.min_section, context.sections, fields, mut parsing) {
         ok(d) => d,
         err(_) => {
@@ -313,7 +321,8 @@ fn prepare_stored(pos: ChunkPos, stored: Stored, context: ChunkContext, light: L
     var sources = SkySources.new(context.min_section * 16)
     sources.fill_from(chunk, light)
     let lighted = context.format.has_light(data.status) and data.light_correct
-    return Loaded.Saved(SavedChunk { chunk: chunk, sources: sources, sky: sky, block: block, lighted: lighted })
+    let whole = data.whole(context.format, tags_whole) and parsing.is_empty()
+    return Loaded.Saved(SavedChunk { chunk: chunk, sources: sources, sky: sky, block: block, lighted: lighted, whole: whole })
 }
 
 // The light a chunk's saved layers send, as vanilla's light packet sends each layer its engine
@@ -397,100 +406,198 @@ fn on(from: List<Entry>, thread: String, to: mut List<Entry>) {
 // --- The threads ---
 
 // What the IO thread is asked: which chunks a region's file has, a chunk read, a chunk, encoded,
-// written, or everything written and the files closed.
+// written, a chunk the server holds whole saved, with its light once it's lit, and its bytes back
+// from the saver that encoded them, none if they couldn't be (D258), or everything written and the
+// files closed.
 enum Ask {
     Region(ChunkPos)
     Chunk(ChunkPos)
     Write(ChunkPos, List<u8>)
+    Save(ChunkPos, Chunk, LightData?)
+    Saved(ChunkPos, List<u8>?)
     Close
 }
 
-// A chunk the IO thread read, on its way to a worker.
-struct Work {
-    pos: ChunkPos
-    lines: List<Entry>
-    read: ChunkRead
+// What a chunk worker is handed: a chunk the IO thread read, with what it logged, or a chunk to
+// encode with its light, to go back to the IO thread to write (D258).
+enum Work {
+    Read(ChunkPos, List<Entry>, ChunkRead)
+    Save(ChunkPos, Chunk, LightData?)
 }
 
 // The IO thread: it owns the region files, and reads and writes what it's asked, in the order
 // it's asked. The chunks to write wait until nothing else is asked, or there are
 // `WRITE_BATCH`, and go out together, a region's at once, before anything's read; the
-// generator's thread is told which are on the disk. Once it's closed, it writes nothing more.
+// generator's thread is told which are on the disk. A chunk to save with its light goes to a
+// worker to encode, and a read of it waits until its bytes are back and written, so it reads
+// what was saved; closing waits for every one (D258). Once it's closed, it writes nothing more.
 struct IoThread {
     storage: RegionStorage
     asks: Receiver<Ask>
     work: Sender<Work>
+    saves: Sender<Work>
     done: Sender<Done>
     gen: Sender<GenIn>
     waker: Waker
 }
 
+// What the IO thread keeps as it goes.
+struct IoState {
+    storage: RegionStorage
+    work: Sender<Work>
+    saves: Sender<Work>
+    done: Sender<Done>
+    gen: Sender<GenIn>
+    waker: Waker
+    writes: List<(ChunkPos, List<u8>?)> = List<(ChunkPos, List<u8>?)>()
+    // The chunks among `writes`, so a read of one writes them first and a read of another doesn't
+    // wait for them (D258).
+    pending: Set<i64> = Set<i64>()
+    // The chunks being encoded to save, with how many saves of each are, and the reads that wait
+    // for them, in the order they were asked.
+    encoding: Map<i64, u32> = Map<i64, u32>()
+    held: List<ChunkPos> = List<ChunkPos>()
+    close_asked: bool = false
+    closed: bool = false
+}
+
 impl Task for IoThread {
     fn run(own self) {
-        var storage = self.storage
         var asks = self.asks
-        var work = self.work
-        var done = self.done
-        var gen = self.gen
-        var writes = List<(ChunkPos, List<u8>?)>()
-        var closed = false
+        var s = IoState { storage: self.storage, work: self.work, saves: self.saves, done: self.done, gen: self.gen, waker: self.waker }
         loop {
             var got = asks.next()
             if got == none {
-                if not writes.is_empty() {
-                    write_out(mut storage, mut writes, mut gen)
+                if not s.writes.is_empty() {
+                    s.write_out()
                     continue
                 }
                 got = asks.wait()
             }
             let ask = got else return
             match ask {
-                Ask.Write(pos, bytes) => {
-                    if not closed {
-                        writes.push((pos, some(bytes)))
-                        if writes.len() >= WRITE_BATCH {
-                            write_out(mut storage, mut writes, mut gen)
-                        }
+                Ask.Write(pos, bytes) => s.write(pos, some(bytes)),
+                Ask.Save(pos, chunk, light) => {
+                    if not s.closed {
+                        let key = chunk_key(pos.x, pos.z)
+                        s.encoding.insert(key, (s.encoding.get(key) ?? 0) + 1)
+                        s.saves.send(Work.Save(pos, chunk, light))
+                    }
+                },
+                Ask.Saved(pos, bytes) => {
+                    if let b = bytes {
+                        s.write(pos, some(b))
+                    }
+                    let key = chunk_key(pos.x, pos.z)
+                    let left = (s.encoding.get(key) ?? 1) - 1
+                    if left == 0 {
+                        _ = s.encoding.remove(key)
+                        s.read_held(key)
+                    } else {
+                        s.encoding.insert(key, left)
+                    }
+                    if s.close_asked and s.encoding.is_empty() {
+                        s.close()
                     }
                 },
                 Ask.Close => {
-                    if not writes.is_empty() {
-                        write_out(mut storage, mut writes, mut gen)
+                    if s.encoding.is_empty() {
+                        s.close()
+                    } else {
+                        s.close_asked = true
                     }
-                    var logged = List<Entry>()
-                    match storage.close() {
-                        ok => {},
-                        err(e) => logged.push(Entry.error("Failed to close the region files: {e}")),
-                    }
-                    var lines = List<Entry>()
-                    on(logged, io_thread(), mut lines)
-                    closed = true
-                    done.send(Done.Closed(lines))
-                    self.waker.wake()
                 },
                 Ask.Region(region) => {
-                    if not writes.is_empty() {
-                        write_out(mut storage, mut writes, mut gen)
+                    if not s.writes.is_empty() {
+                        s.write_out()
                     }
                     var logged = List<Entry>()
-                    let presence = storage.presence(region, mut logged)
+                    let presence = s.storage.presence(region, mut logged)
                     var lines = List<Entry>()
                     on(logged, io_thread(), mut lines)
-                    done.send(Done.Region(region, lines, presence))
-                    self.waker.wake()
+                    s.done.send(Done.Region(region, lines, presence))
+                    s.waker.wake()
                 },
                 Ask.Chunk(pos) => {
-                    if not writes.is_empty() {
-                        write_out(mut storage, mut writes, mut gen)
+                    if s.encoding.contains(chunk_key(pos.x, pos.z)) {
+                        s.held.push(pos)
+                    } else {
+                        s.read(pos)
                     }
-                    var logged = List<Entry>()
-                    let read = storage.read_chunk(pos, mut logged)
-                    var lines = List<Entry>()
-                    on(logged, io_thread(), mut lines)
-                    work.send(Work { pos: pos, lines: lines, read: read })
                 },
             }
         }
+    }
+}
+
+impl IoState {
+    // Holds `bytes` to write at `pos`, unless the files are closed, writing what's held once
+    // there are `WRITE_BATCH`.
+    fn write(mut self, pos: ChunkPos, bytes: own List<u8>?) {
+        if self.closed {
+            return
+        }
+        self.pending.insert(chunk_key(pos.x, pos.z))
+        self.writes.push((pos, bytes))
+        if self.writes.len() >= WRITE_BATCH {
+            self.write_out()
+        }
+    }
+
+    fn write_out(mut self) {
+        write_out(mut self.storage, mut self.writes, mut self.gen)
+        self.pending.clear()
+    }
+
+    // Reads the chunk at `pos` for a worker to make, once what's held to write is, if the chunk is
+    // among it: a read of another doesn't wait for the writes (D258).
+    fn read(mut self, pos: ChunkPos) {
+        if self.pending.contains(chunk_key(pos.x, pos.z)) {
+            self.write_out()
+        }
+        var logged = List<Entry>()
+        let read = self.storage.read_chunk(pos, mut logged)
+        var lines = List<Entry>()
+        on(logged, io_thread(), mut lines)
+        self.work.send(Work.Read(pos, lines, read))
+    }
+
+    // Reads each read held for the chunk at `key`, which is saved now.
+    fn read_held(mut self, key: i64) {
+        if self.held.is_empty() {
+            return
+        }
+        var left = List<ChunkPos>()
+        var now = List<ChunkPos>()
+        for pos in self.held {
+            if chunk_key(pos.x, pos.z) == key {
+                now.push(pos)
+            } else {
+                left.push(pos)
+            }
+        }
+        self.held = left
+        for pos in now {
+            self.read(pos)
+        }
+    }
+
+    // Writes what's held, closes the files and says so.
+    fn close(mut self) {
+        if not self.writes.is_empty() {
+            self.write_out()
+        }
+        var logged = List<Entry>()
+        match self.storage.close() {
+            ok => {},
+            err(e) => logged.push(Entry.error("Failed to close the region files: {e}")),
+        }
+        var lines = List<Entry>()
+        on(logged, io_thread(), mut lines)
+        self.closed = true
+        self.close_asked = false
+        self.done.send(Done.Closed(lines))
+        self.waker.wake()
     }
 }
 
@@ -520,12 +627,14 @@ fn write_out(storage: mut RegionStorage, writes: mut List<(ChunkPos, List<u8>?)>
 
 // A chunk worker: it makes each chunk the IO thread read, sends it back, and wakes the poll; one
 // with nothing to use goes to the generator, if the world generates. It works out the block
-// states' light properties with the first chunk it's handed.
+// states' light properties with the first chunk it's handed. A chunk to save it encodes with its
+// light and hands back to the IO thread (D258).
 struct ChunkWorker {
     context: ChunkContext
     work: Receiver<Work>
     done: Sender<Done>
     generate: Sender<GenIn>?
+    to_io: Sender<Ask>
     waker: Waker
 }
 
@@ -534,30 +643,71 @@ impl Task for ChunkWorker {
         var work = self.work
         var done = self.done
         var generate = self.generate
+        var to_io = self.to_io
         var states: LightStates? = none
         while let w = work.wait() {
-            var lines = List<Entry>()
-            let made = states.take() ?? LightStates.new()
-            let loaded = prepare(w.pos, w.read, self.context, made, mut lines)
-            states = some(made)
-            var handed = false
-            match loaded {
-                Loaded.Generate => {
-                    if let held = generate.take() {
-                        var g = held
-                        g.send(GenIn.Make(GenWork { pos: w.pos, io: w.lines.copy(), read: w.read.copy(), made: lines.copy() }))
-                        generate = some(g)
-                        handed = true
+            match w {
+                Work.Save(pos, chunk, light) => to_io.send(Ask.Saved(pos, saved_bytes(self.context, pos, chunk, light))),
+                Work.Read(pos, io, read) => {
+                    var lines = List<Entry>()
+                    let made = states.take() ?? LightStates.new()
+                    let loaded = prepare(pos, read, self.context, made, mut lines)
+                    states = some(made)
+                    var handed = false
+                    match loaded {
+                        Loaded.Generate => {
+                            if let held = generate.take() {
+                                var g = held
+                                g.send(GenIn.Make(GenWork { pos: pos, io: io.copy(), read: read.copy(), made: lines.copy() }))
+                                generate = some(g)
+                                handed = true
+                            }
+                        },
+                        _ => {},
+                    }
+                    if not handed {
+                        done.send(Done.Chunk(pos, io, read, lines, loaded))
+                        self.waker.wake()
                     }
                 },
-                _ => {},
-            }
-            if not handed {
-                done.send(Done.Chunk(w.pos, w.lines, w.read, lines, loaded))
-                self.waker.wake()
             }
         }
     }
+}
+
+/// The chunk at `pos`, which the server holds whole, as its region file holds it: lit, with
+/// `light`, the engine's, as a packet has it, or as the generator finished it if it's `none`.
+/// None if it can't be encoded (D258).
+pub fn saved_bytes(context: ChunkContext, pos: ChunkPos, chunk: Chunk, light: own LightData?) -> List<u8>? {
+    if let l = light {
+        let count = usize.wrap(context.sections) + 2
+        return encoded(context, ChunkData.lit(context.format, pos, chunk, per_section(l.sky_mask, l.sky, count), per_section(l.block_mask, l.block, count)))
+    }
+    return encoded(context, ChunkData.generated(context.format, pos, chunk))
+}
+
+// `data` as its region file holds it, or none if it can't be encoded.
+fn encoded(context: ChunkContext, data: own ChunkData) -> List<u8>? {
+    return match data.write(context.format) {
+        ok(root) => some(encode_tag(root, context.compression)),
+        err(_) => none,
+    }
+}
+
+// The layers a packet's mask says are there, in their places among `count`, `none` in the rest.
+fn per_section(bits: List<u8>, given: List<LightLayer>, count: usize) -> List<List<u8>?> {
+    var out = List<List<u8>?>()
+    var next: usize = 0
+    for i in 0..count {
+        let byte = i / 8
+        if byte < bits.len() and ((u32(bits[byte]) >> u32.wrap(i % 8)) & 1) != 0 and next < given.len() {
+            out.push(some(given[next].data.copy()))
+            next += 1
+        } else {
+            out.push(none)
+        }
+    }
+    return out
 }
 
 // What the generator's thread is handed: a chunk to generate, with what reading it logged; what a
@@ -569,7 +719,7 @@ enum GenIn {
     Make(GenWork)
     Drop(ChunkPos)
     Made(u32, Made)
-    Finished(u32, i32, i32, SavedChunk, List<u8>?)
+    Finished(u32, i32, i32, SavedChunk)
     Written(List<i64>, List<Entry>)
     Origin(i32, i32, String?)
     Spawn
@@ -642,13 +792,7 @@ impl Task for GenWorker {
                     }
                     if finished {
                         match made {
-                            Made.Finished(x, z, chunk) => {
-                                let bytes: List<u8>? = match ChunkData.generated(context.format, ChunkPos { x: x, z: z }, chunk).write(context.format) {
-                                    ok(root) => some(encode_tag(root, context.compression)),
-                                    err(_) => none,
-                                }
-                                out.send(GenIn.Finished(epoch, x, z, generated(chunk, light, context.sections), bytes))
-                            },
+                            Made.Finished(x, z, chunk) => out.send(GenIn.Finished(epoch, x, z, generated(chunk, light, context.sections))),
                             _ => {},
                         }
                     } else {
@@ -863,7 +1007,7 @@ impl GenOut {
                     s.sched = some(sched)
                 }
             },
-            GenIn.Finished(epoch, x, z, saved, bytes) => self.finished(mut s, epoch, x, z, saved, bytes),
+            GenIn.Finished(epoch, x, z, saved) => self.finished(mut s, epoch, x, z, saved),
             GenIn.Written(keys, lines) => {
                 for e in lines {
                     s.lines.push(e.copy())
@@ -1011,10 +1155,12 @@ impl GenOut {
     }
 
     // Hands back the chunk a worker finished, for the scheduler of `epoch`, to each that asked for
-    // it, checks it for the spawn if it's the chunk the spawn's search is trying, and keeps it
-    // while the IO thread writes `bytes`, or for good if there are none. One nothing asked for or
-    // tries was made again after it was handed back, by a scheduler that started again, and goes.
-    fn finished(mut self, s: mut GenState, epoch: u32, x: i32, z: i32, saved: own SavedChunk, bytes: own List<u8>?) {
+    // it, to save as it lets go of it, and checks it for the spawn if it's the chunk the spawn's
+    // search is trying, keeping it until the spawn's found, as the search may try it again (D258).
+    // One nothing asked for or tries is saved here, as the scheduler has it finished and a read
+    // would look for it, and kept until it's written; one made again after it was handed back, by
+    // a scheduler that started again, goes.
+    fn finished(mut self, s: mut GenState, epoch: u32, x: i32, z: i32, saved: own SavedChunk) {
         if epoch != s.epoch {
             s.stale -= 1
         } else if let g = s.sched.take() {
@@ -1027,25 +1173,32 @@ impl GenOut {
         let spawn_here = spawn_tries(s, x, z)
         if works.is_empty() and not spawn_here {
             if epoch == s.epoch {
-                // Let go while it was being finished (D243): it's written all the same, as the
-                // scheduler has it finished, and a read would look for it.
+                // Let go while it was being finished (D243).
+                s.to_io.send(Ask.Save(ChunkPos { x: x, z: z }, saved.chunk.copy(), none))
                 s.finished.insert(key, saved)
-                if let b = bytes {
-                    s.to_io.send(Ask.Write(ChunkPos { x: x, z: z }, b))
-                }
             }
             return
         }
-        while not works.is_empty() {
+        if spawn_here or s.spawn_wanted or s.spawn != none {
+            while not works.is_empty() {
+                let w = works.remove(0)
+                self.hand_back(mut s, w, Loaded.Saved(saved.copy()))
+            }
+            if spawn_here {
+                self.check_spawn(mut s, saved.chunk)
+            }
+            if s.spawn_wanted or s.spawn != none {
+                s.finished.insert(key, saved)
+                s.held.push(key)
+            }
+            return
+        }
+        while works.len() > 1 {
             let w = works.remove(0)
             self.hand_back(mut s, w, Loaded.Saved(saved.copy()))
         }
-        if spawn_here {
-            self.check_spawn(mut s, saved.chunk)
-        }
-        s.finished.insert(key, saved)
-        if let b = bytes {
-            s.to_io.send(Ask.Write(ChunkPos { x: x, z: z }, b))
+        if let w = works.pop() {
+            self.hand_back(mut s, w, Loaded.Saved(saved))
         }
     }
 
@@ -1259,6 +1412,10 @@ pub struct ChunkJobs {
     to_asks: Sender<Ask>
     work: Receiver<Work>
     to_work: Sender<Work>
+    // The savers' queue, and how many have started (D258).
+    saves: Receiver<Work>
+    to_saves: Sender<Work>
+    savers: usize = 0
     done: Receiver<Done>
     to_done: Sender<Done>
     started: usize
@@ -1288,6 +1445,8 @@ impl ChunkJobs {
         let to_asks = asks.sender()
         let work = Receiver<Work>()
         let to_work = work.sender()
+        let saves = Receiver<Work>()
+        let to_saves = saves.sender()
         let done = Receiver<Done>()
         let to_done = done.sender()
         let processors = unsafe { workers() }
@@ -1304,6 +1463,8 @@ impl ChunkJobs {
             to_asks: to_asks,
             work: work,
             to_work: to_work,
+            saves: saves,
+            to_saves: to_saves,
             done: done,
             to_done: to_done,
             started: 0,
@@ -1337,15 +1498,30 @@ impl ChunkJobs {
     pub fn ask_chunk(mut self, pos: ChunkPos) {
         self.start()
         if self.chunks_away >= self.started and self.started < self.most {
-            var generate: Sender<GenIn>? = none
-            if let g = self.to_gen {
-                generate = some(g.share())
-            }
-            _ = unsafe { Thread.spawn(ChunkWorker { context: self.context.copy(), work: self.work.share(), done: self.to_done.share(), generate: generate, waker: self.waker }) }
-            self.started += 1
+            self.add_worker()
         }
         self.to_asks.send(Ask.Chunk(pos))
         self.chunks_away += 1
+    }
+
+    /// Saves the chunk at `pos`, which the server holds whole, with `light`, the engine's, once
+    /// it's lit, or unlit if it's `none`: a saver encodes it and the IO thread writes it, and a
+    /// read of it asked for after this reads it (D258). The savers are threads of their own, as
+    /// many as there can be chunk workers, so the reads that feed the generator never wait
+    /// behind a tick's worth of saves.
+    pub fn save_chunk(mut self, pos: ChunkPos, chunk: own Chunk, light: own LightData?) {
+        self.start()
+        self.to_asks.send(Ask.Save(pos, chunk, light))
+    }
+
+    // Starts another chunk worker.
+    fn add_worker(mut self) {
+        var generate: Sender<GenIn>? = none
+        if let g = self.to_gen {
+            generate = some(g.share())
+        }
+        _ = unsafe { Thread.spawn(ChunkWorker { context: self.context.copy(), work: self.work.share(), done: self.to_done.share(), generate: generate, to_io: self.to_asks.share(), waker: self.waker }) }
+        self.started += 1
     }
 
     /// Tells the generator nothing wants the chunk at `pos` any more, if the world generates: it
@@ -1403,7 +1579,12 @@ impl ChunkJobs {
     // Starts the IO thread, if it hasn't, and the generator's, with its workers.
     fn start(mut self) {
         let storage = self.storage.take() else return
-        _ = unsafe { Thread.spawn(IoThread { storage: storage, asks: self.asks.share(), work: self.to_work.share(), done: self.to_done.share(), gen: self.gen_inbox.sender(), waker: self.waker }) }
+        _ = unsafe { Thread.spawn(IoThread { storage: storage, asks: self.asks.share(), work: self.to_work.share(), saves: self.to_saves.share(), done: self.to_done.share(), gen: self.gen_inbox.sender(), waker: self.waker }) }
+        // The savers start with it, so what the generator saves has them too (D258).
+        while self.savers < self.most {
+            _ = unsafe { Thread.spawn(ChunkWorker { context: self.context.copy(), work: self.saves.share(), done: self.to_done.share(), generate: none, to_io: self.to_asks.share(), waker: self.waker }) }
+            self.savers += 1
+        }
         let setup = self.gen.take() else return
         let to_gen = self.to_gen else return
         _ = unsafe { Thread.spawn(GenThread { setup: setup, context: self.context.copy(), inbox: self.gen_inbox.share(), to_inbox: to_gen.share(), to_io: self.to_asks.share(), done: self.to_done.share(), waker: self.waker, workers: self.gen_workers }) }
