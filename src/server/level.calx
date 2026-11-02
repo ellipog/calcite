@@ -90,6 +90,10 @@ const LIGHT_BORDER: i32 = 34
 /// the same, and one saved lit costs nothing.
 pub const LIGHT_PER_TICK: i64 = 50000
 
+// How many ticks go by between telling the generator a while has: 30 seconds, after which one
+// asked for nothing lets go of what it keeps (D220).
+const QUIET_TICKS: u32 = 600
+
 // A chunk the world has, or is reading.
 enum Body {
     // Being read.
@@ -243,15 +247,19 @@ enum Ask {
     Chunk(ChunkPos)
 }
 
-// The chunks being read for their holders, which aren't ready to save until they're read, as
-// `isReadyForSaving` says, so their tickets that don't run out unloaded don't run down.
+// The chunks being read for their holders, and those full but not yet lit, which aren't ready
+// to save until they're read and lit, as `isReadyForSaving` says while a generation task still
+// holds the holder, so their tickets that don't run out unloaded don't run down. Without the
+// second, a spawn search's ticket ran out while its chunk waited for light, and the chunk was
+// let go before it was full, so the search never went on (CAL-89).
 struct Reading {
     chunks: OpenHashSet<i64> = OpenHashSet<i64>()
+    unlit: OpenHashSet<i64> = OpenHashSet<i64>()
 }
 
 impl Holders for Reading {
     fn ready_for_saving(self, chunk: i64) -> bool {
-        return not self.chunks.contains(chunk)
+        return not self.chunks.contains(chunk) and not self.unlit.contains(chunk)
     }
 }
 
@@ -259,6 +267,8 @@ impl Holders for Reading {
 pub struct Level {
     /// The tickets and players, and the chunks' holders.
     pub dm: DistanceManager
+    // Ticks until the generator's next told a while has gone by.
+    quiet_in: u32 = QUIET_TICKS
     // Each holder's chunk, and those of them still being read.
     columns: Columns = Columns()
     reading: Reading = Reading()
@@ -465,6 +475,22 @@ impl Level {
         return true
     }
 
+    /// Whether the future `getChunkRangeFuture` gives for the chunks within `radius` of
+    /// `center` is done: each is full, or was let go before it was, as one whose level rose past
+    /// `FULL` fails its future. A spawn ticket runs out 20 ticks after its own chunk is ready to
+    /// save, whether those around it are full yet or not, and the player joins then anyway.
+    pub fn around_done(self, center: ChunkPos, radius: i32) -> bool {
+        for x in center.x - radius..center.x + radius + 1 {
+            for z in center.z - radius..center.z + radius + 1 {
+                let k = ChunkPos { x: x, z: z }.pack()
+                if self.dm.chunk_level(k, false) <= FULL and not self.loaded(k) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
     /// Whether the chunk at `pos` is ready to send: it ticks, as `getChunkToSend` has it.
     pub fn sendable(self, pos: ChunkPos) -> bool {
         if self.dm.chunk_level(pos.pack(), false) > TICKING {
@@ -478,6 +504,15 @@ impl Level {
     /// light, which a run takes away. Vanilla unloads as many as it has time for, and Calcite all
     /// of them.
     pub fn tick(mut self) {
+        self.quiet_in -= 1
+        if self.quiet_in == 0 {
+            self.quiet_in = QUIET_TICKS
+            if let j = self.jobs.take() {
+                var jobs = j
+                jobs.quiet()
+                self.jobs = some(jobs)
+            }
+        }
         self.dm.purge_stale(self.reading)
         self.pump()
         _ = self.dm.drop_unloaded()
@@ -663,6 +698,22 @@ impl Level {
         self.jobs = some(jobs)
     }
 
+    /// Has the IO thread write the chunks it's been handed and close the region files, as the
+    /// server stops.
+    pub fn close_chunks(mut self) {
+        var jobs = self.jobs.take() else return
+        jobs.close()
+        self.jobs = some(jobs)
+    }
+
+    /// Whether the IO thread is still closing the region files.
+    pub fn chunks_closing(self) -> usize {
+        if let jobs = self.jobs {
+            return jobs.closing()
+        }
+        return 0
+    }
+
     /// What the IO thread and workers have done since this was last asked, in the order it came.
     pub fn take_done(mut self) -> Deque<Done> {
         var jobs = self.jobs.take() else return Deque<Done>()
@@ -809,6 +860,11 @@ impl Level {
         if level <= FULL and self.initialized.contains(k) and not self.lit.contains(k) {
             self.to_light.insert(k)
         }
+        if self.opened and level <= FULL and not self.lit.contains(k) {
+            self.reading.unlit.insert(k)
+        } else {
+            self.reading.unlit.remove(k)
+        }
         if let h = self.dm.holder(k) {
             if h.ticking == Ticking.Waiting {
                 self.waiting.insert(k)
@@ -820,6 +876,7 @@ impl Level {
     // when it goes as it comes back, with no holder to have it.
     fn unloaded(mut self, k: i64) {
         self.waiting.remove(k)
+        self.reading.unlit.remove(k)
         if self.reading.chunks.contains(k) {
             return
         }
@@ -956,6 +1013,7 @@ impl Level {
                 self.light_left -= work
             }
             self.lit.insert(k)
+            self.reading.unlit.remove(k)
             any = true
         }
         self.light_later = later

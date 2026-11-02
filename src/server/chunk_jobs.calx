@@ -16,9 +16,13 @@
 /// and its workers, one fewer than the processors, each with a `Worker` of its own, which do
 /// them: each chunk's starts and biomes, its terrain, its decoration and its finishing as the
 /// server's chunk, unlit, with its sky's sources (CAL-88). It keeps two jobs a worker out, the
-/// most urgent first, and hands each chunk back as it's finished, keeping it to hand back again.
-/// A chunk is a pure function of where it is, so what comes back depends on nothing but the read,
-/// and a replay generates it again. The generator's thread also finds a new world's spawn, as
+/// most urgent first, and hands each chunk back as it's finished. The worker that finished it
+/// encodes it as its region file holds it, and the IO thread writes it there, so it's read from
+/// there when it's asked for again; it's kept until it's written. A chunk is a pure function of
+/// where it is, so what comes back depends on nothing but the read, and a replay generates it
+/// again. So when the terrain kept for chunks far from any wanted lately is too much, the
+/// scheduler is let go and a new one starts, which makes again from nothing what it needs, and
+/// memory doesn't grow with the chunks made (D220). The generator's thread also finds a new world's spawn, as
 /// `setInitialSpawn` does: from the chunk `getOrigin` picks, which a worker finds, the first
 /// column a player can stand on in the first chunk of the 11×11 around it that has one.
 module server.chunk_jobs
@@ -30,18 +34,18 @@ import pack.vanilla.{data_path, vanilla_data}
 import std.net.{Waker}
 import std.pool.{workers}
 import std.thread.{Task}
+import std.time.{Instant, Timestamp}
 import storage.chunk.{ChunkData, ChunkFormat}
-import storage.region.{ReadError, Stored, unpack}
-import storage.regions.{ChunkRead, RegionStorage, read_root}
+import storage.region.{Compression, ReadError, Stored, unpack}
+import storage.regions.{ChunkRead, RegionStorage, encode_tag, read_root}
 import world.chunk.{BlockStates, Chunk, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, OCEAN_FLOOR_WG, Section, WORLD_SURFACE, WORLD_SURFACE_WG}
 import world.collision.{CollisionStates}
 import world.light.{LightStates, SkySources}
 import world.pos.{BlockPos, ChunkPos}
 import world.spawn.{respawn_pos}
-import std.zip.{Zip}
 import worldgen.generator.{GenSetup, Job, Made, Worker}
 import worldgen.references.{chunk_key}
-import worldgen.scheduler.{Scheduler, scheduler_for}
+import worldgen.scheduler.{Scheduler}
 
 /// The thread vanilla's region files log on, `Util.ioPool`'s first.
 pub fn io_thread() -> String {
@@ -61,14 +65,33 @@ pub fn gen_thread() -> String {
 // The most chunk workers, whatever the processors.
 const MOST_WORKERS: usize = 8
 
+// The most chunks the IO thread holds to write together.
+const WRITE_BATCH: usize = 64
+
+// How the generator's thread tells which kept terrain is far: a chunk wanted marks the cells of
+// 16 × 16 chunks within `REACH` of it, as far as the jobs it needs reach through their ranks
+// (D214), while it's one of the last `RECENT` chunks wanted and was wanted in the last
+// `RECENT_NANOS`. Every `CHECK_EVERY` wanted, if more than `MOST_FAR` chunks' terrain is kept
+// outside the marked cells, the scheduler starts again.
+const CELL_SHIFT: i32 = 4
+const REACH: i32 = 18
+const RECENT: usize = 1024
+const RECENT_NANOS: u64 = 30000000000
+// The most chunks kept as read again, a few at most.
+const MOST_REREAD: usize = 4096
+const CHECK_EVERY: usize = 256
+const MOST_FAR: usize = 1024
+
 /// What a chunk is made from: the registries its NBT names things from, the block states'
-/// table, and the dimension's sections, from its lowest up, with whether it has sky light.
+/// table, and the dimension's sections, from its lowest up, with whether it has sky light; and
+/// how it's compressed in its region file, as `region-file-compression` says.
 pub struct ChunkContext {
     pub format: ChunkFormat
     pub table: BlockStates
     pub min_section: i32
     pub sections: i32
     pub sky_light: bool
+    pub compression: Compression = Compression.Deflate
 }
 
 /// What a chunk read from its region file comes to.
@@ -112,6 +135,9 @@ pub enum Done {
     Chunk(ChunkPos, List<Entry>, ChunkRead, List<Entry>, Loaded)
     /// Where the generator found a new world's spawn, and what it logged finding it.
     Spawn(BlockPos, List<Entry>)
+    /// The IO thread has written every chunk it was handed and closed the region files, as the
+    /// server stops, and what it logged doing it.
+    Closed(List<Entry>)
 }
 
 /// A chunk the generator finished, as the server takes it: its sky's sources worked out from its
@@ -356,10 +382,13 @@ fn on(from: List<Entry>, thread: String, to: mut List<Entry>) {
 
 // --- The threads ---
 
-// What the IO thread is asked.
+// What the IO thread is asked: which chunks a region's file has, a chunk read, a chunk, encoded,
+// written, or everything written and the files closed.
 enum Ask {
     Region(ChunkPos)
     Chunk(ChunkPos)
+    Write(ChunkPos, List<u8>)
+    Close
 }
 
 // A chunk the IO thread read, on its way to a worker.
@@ -369,12 +398,16 @@ struct Work {
     read: ChunkRead
 }
 
-// The IO thread: it owns the region files, and reads what it's asked, in the order it's asked.
+// The IO thread: it owns the region files, and reads and writes what it's asked, in the order
+// it's asked. The chunks to write wait until nothing else is asked, or there are
+// `WRITE_BATCH`, and go out together, a region's at once, before anything's read; the
+// generator's thread is told which are on the disk. Once it's closed, it writes nothing more.
 struct IoThread {
     storage: RegionStorage
     asks: Receiver<Ask>
     work: Sender<Work>
     done: Sender<Done>
+    gen: Sender<GenIn>
     waker: Waker
 }
 
@@ -384,9 +417,47 @@ impl Task for IoThread {
         var asks = self.asks
         var work = self.work
         var done = self.done
-        while let ask = asks.wait() {
+        var gen = self.gen
+        var writes = List<(ChunkPos, List<u8>?)>()
+        var closed = false
+        loop {
+            var got = asks.next()
+            if got == none {
+                if not writes.is_empty() {
+                    write_out(mut storage, mut writes, mut gen)
+                    continue
+                }
+                got = asks.wait()
+            }
+            let ask = got else return
             match ask {
+                Ask.Write(pos, bytes) => {
+                    if not closed {
+                        writes.push((pos, some(bytes)))
+                        if writes.len() >= WRITE_BATCH {
+                            write_out(mut storage, mut writes, mut gen)
+                        }
+                    }
+                },
+                Ask.Close => {
+                    if not writes.is_empty() {
+                        write_out(mut storage, mut writes, mut gen)
+                    }
+                    var logged = List<Entry>()
+                    match storage.close() {
+                        ok => {},
+                        err(e) => logged.push(Entry.error("Failed to close the region files: {e}")),
+                    }
+                    var lines = List<Entry>()
+                    on(logged, io_thread(), mut lines)
+                    closed = true
+                    done.send(Done.Closed(lines))
+                    self.waker.wake()
+                },
                 Ask.Region(region) => {
+                    if not writes.is_empty() {
+                        write_out(mut storage, mut writes, mut gen)
+                    }
                     var logged = List<Entry>()
                     let presence = storage.presence(region, mut logged)
                     var lines = List<Entry>()
@@ -395,6 +466,9 @@ impl Task for IoThread {
                     self.waker.wake()
                 },
                 Ask.Chunk(pos) => {
+                    if not writes.is_empty() {
+                        write_out(mut storage, mut writes, mut gen)
+                    }
                     var logged = List<Entry>()
                     let read = storage.read_chunk(pos, mut logged)
                     var lines = List<Entry>()
@@ -404,6 +478,30 @@ impl Task for IoThread {
             }
         }
     }
+}
+
+// Writes the chunks waiting, then tells the generator's thread which are on the disk: none if
+// the write failed, when each logs vanilla's `IOWorker` line, and they're kept to hand back.
+fn write_out(storage: mut RegionStorage, writes: mut List<(ChunkPos, List<u8>?)>, gen: mut Sender<GenIn>) {
+    var logged = List<Entry>()
+    var keys = List<i64>()
+    let now = i32.wrap(unsafe { Timestamp.now() }.unix_ms / 1000)
+    match storage.write(writes, now, mut logged) {
+        ok => {
+            for w in writes {
+                keys.push(chunk_key(w.0.x, w.0.z))
+            }
+        },
+        err(e) => {
+            for w in writes {
+                logged.push(Entry.error("Failed to store chunk {at(w.0)}: {e}"))
+            }
+        },
+    }
+    writes.clear()
+    var lines = List<Entry>()
+    on(logged, io_thread(), mut lines)
+    gen.send(GenIn.Written(keys, lines))
 }
 
 // A chunk worker: it makes each chunk the IO thread read, sends it back, and wakes the poll; one
@@ -449,15 +547,19 @@ impl Task for ChunkWorker {
 }
 
 // What the generator's thread is handed: a chunk to generate, with what reading it logged; what a
-// job made, or a chunk a worker finished as the server's; the chunk a worker found the spawn is
-// looked for from; a worker that couldn't be made; or a new world's spawn to find.
+// job of a scheduler's epoch made, or a chunk a worker finished as the server's, with its bytes
+// for its region file, none if it couldn't be encoded; the chunks the IO thread wrote, with what
+// it logged; the chunk a worker found the spawn is looked for from; or a new world's spawn to
+// find.
 enum GenIn {
     Make(GenWork)
-    Made(Made)
-    Finished(i32, i32, SavedChunk)
+    Made(u32, Made)
+    Finished(u32, i32, i32, SavedChunk, List<u8>?)
+    Written(List<i64>, List<Entry>)
     Origin(i32, i32, String?)
-    Broken(String)
     Spawn
+    // A while has gone by, as the server's ticks count it.
+    Quiet
 }
 
 // A chunk to generate, with what the IO thread logged and read, and what the worker logged.
@@ -468,38 +570,42 @@ struct GenWork {
     made: List<Entry>
 }
 
-// What a generator worker is handed: a job, or the search for the chunk the spawn is looked for
-// from.
+// What a generator worker is handed: a job, with its scheduler's epoch, or the search for the
+// chunk the spawn is looked for from.
 enum GenTask {
-    Job(Job)
+    Job(u32, Job)
     Origin
+    // A fresh copy of the worker every worker was copied from, for the time the generator's gone
+    // quiet: one that hasn't taken a copy that time takes it, and lets go of what it cached.
+    Forget(u32, Worker)
 }
 
-// A generator worker: it makes its `Worker`, then does each job it's handed and hands back what
-// it made, a chunk finished as the server's, with its sky's sources worked out here.
+// A generator worker: with its own copy of the generator's `Worker`, it does each job it's handed
+// and hands back what it made, a chunk finished as the server's, with its sky's sources worked out here, and encoded
+// for its region file.
 struct GenWorker {
-    zip: Zip
-    setup: GenSetup
-    sections: i32
+    worker: Worker
+    context: ChunkContext
     tasks: Receiver<GenTask>
     out: Sender<GenIn>
 }
 
 impl Task for GenWorker {
     fn run(own self) {
-        let GenWorker { zip: zip, setup: setup, sections: sections, tasks: taken, out: sender } = self
+        let GenWorker { worker: worker, context: context, tasks: taken, out: sender } = self
         var tasks = taken
         var out = sender
-        var w = match Worker.new(zip, setup) {
-            ok(w) => w,
-            err(e) => {
-                out.send(GenIn.Broken(e))
-                return
-            },
-        }
+        var w = worker
+        var forgot: u32 = 0
         let light = LightStates.new()
         while let task = tasks.wait() {
             match task {
+                GenTask.Forget(time, fresh) => {
+                    if time > forgot {
+                        forgot = time
+                        w = fresh
+                    }
+                },
                 GenTask.Origin => {
                     match w.origin() {
                         ok(o) => {
@@ -509,7 +615,7 @@ impl Task for GenWorker {
                         err(t) => out.send(GenIn.Origin(0, 0, some("Couldn't find the spawn's chunk: {t.exception}: {t.message}"))),
                     }
                 },
-                GenTask.Job(job) => {
+                GenTask.Job(epoch, job) => {
                     let made = w.run(job)
                     let finished = match made {
                         Made.Finished(_, _, _) => true,
@@ -517,11 +623,17 @@ impl Task for GenWorker {
                     }
                     if finished {
                         match made {
-                            Made.Finished(x, z, chunk) => out.send(GenIn.Finished(x, z, generated(chunk, light, sections))),
+                            Made.Finished(x, z, chunk) => {
+                                let bytes: List<u8>? = match ChunkData.generated(context.format, ChunkPos { x: x, z: z }, chunk).write(context.format) {
+                                    ok(root) => some(encode_tag(root, context.compression)),
+                                    err(_) => none,
+                                }
+                                out.send(GenIn.Finished(epoch, x, z, generated(chunk, light, context.sections), bytes))
+                            },
                             _ => {},
                         }
                     } else {
-                        out.send(GenIn.Made(made))
+                        out.send(GenIn.Made(epoch, made))
                     }
                 },
             }
@@ -562,12 +674,14 @@ fn spiral() -> List<(i32, i32)> {
     return out
 }
 
-// The generator's thread: its workers, made from the setup, each on a thread of its own.
+// The generator's thread: its workers, made from the setup, each on a thread of its own, and
+// the queue to the IO thread, which writes what they finish.
 struct GenThread {
     setup: GenSetup
-    sections: i32
+    context: ChunkContext
     inbox: Receiver<GenIn>
     to_inbox: Sender<GenIn>
+    to_io: Sender<Ask>
     done: Sender<Done>
     waker: Waker
     workers: usize
@@ -581,15 +695,41 @@ struct GenOut {
 
 // What the generator's thread keeps as it goes.
 struct GenState {
-    // The jobs' scheduler and the queue to the workers, none where nothing generates.
+    // The jobs' scheduler and the queue to the workers, none where nothing generates, and the
+    // queue to the IO thread.
     sched: Scheduler?
     to_tasks: Sender<GenTask>?
+    to_io: Sender<Ask>
     workers: usize
+    // The scheduler's epoch, which each job it hands out carries, and how many jobs of earlier
+    // ones are still out: what they make is let go, but for a finished chunk, which is what it
+    // is whichever scheduler made it.
+    epoch: u32 = 0
+    stale: usize = 0
+    // The chunks wanted lately, oldest first, each with when, in nanoseconds from when the
+    // thread began; the cells about them each marks, by `chunk_key` of the cell, with how many
+    // of them mark it; and how many have been wanted since the far terrain was last counted.
+    recent: Deque<(i64, u64)> = Deque<(i64, u64)>()
+    began: Instant
+    hot: Map<i64, u32> = Map<i64, u32>()
+    wants: usize = 0
+    // How many chunks have been asked for since the server last said a while had gone by; the
+    // worker every worker was copied from, as it was made, and how many times they've been
+    // handed copies of it to forget what they cached.
+    asked_lately: usize = 0
+    pristine: Worker? = none
+    forgets: u32 = 0
     collisions: CollisionStates? = none
     // The chunks asked for and not handed back, by `chunk_key`, and each finished, as it was
-    // handed back, to hand back again if it's asked for again.
+    // handed back, until it's written, to hand back again if it's asked for again. Those
+    // written while the spawn is looked for are kept until it's found, as the search may try
+    // them.
     asked: Map<i64, List<GenWork>> = Map<i64, List<GenWork>>()
     finished: Map<i64, SavedChunk> = Map<i64, SavedChunk>()
+    held: List<i64> = List<i64>()
+    // The chunks asked for after they were written and let go, by a read from before they were
+    // written, which are read again.
+    reread: Map<i64, bool> = Map<i64, bool>()
     // Whether a new world's spawn is to be found, and its search, once its origin's found.
     spawn_wanted: bool = false
     spawn: SpawnFind? = none
@@ -599,20 +739,38 @@ struct GenState {
 
 impl Task for GenThread {
     fn run(own self) {
-        let GenThread { setup: setup, sections: sections, inbox: taken, to_inbox: to_inbox, done: done, waker: waker, workers: count } = self
+        let GenThread { setup: setup, context: context, inbox: taken, to_inbox: to_inbox, to_io: to_io, done: done, waker: waker, workers: count } = self
         var inbox = taken
         var out = GenOut { done: done, waker: waker }
-        var s = GenState { sched: none, to_tasks: none, workers: count.max(1) }
+        var s = GenState { sched: none, to_tasks: none, to_io: to_io, workers: count.max(1), began: unsafe { Instant.now() } }
         match vanilla_data(data_path(), mut s.lines) {
             ok(zip) => {
-                match scheduler_for(zip, setup) {
-                    ok(sched) => {
-                        let tasks = Receiver<GenTask>()
-                        for _ in 0..s.workers {
-                            _ = unsafe { Thread.spawn(GenWorker { zip: zip.copy(), setup: setup.copy(), sections: sections, tasks: tasks.share(), out: to_inbox.share() }) }
+                // One worker is made, and each thread gets a copy: reading vanilla's data on
+                // every thread at once took 40 MB each while it was read, which the allocator
+                // kept (D220).
+                match Worker.new(zip, setup) {
+                    ok(made) => {
+                        s.sched = some(Scheduler.new(made.structures(), made.ring_searches()))
+                        // The copies are made at once, on every core: one after another, the
+                        // last worker started half a second later.
+                        var copies = List<Worker?>()
+                        for _ in 1..s.workers {
+                            copies.push(none)
                         }
+                        parallel for k in 0usize..copies.len() {
+                            copies[k] = some(made.copy())
+                        }
+                        // The queue's sender is made first: a worker that waits on a queue with
+                        // none would end at once.
+                        let tasks = Receiver<GenTask>()
                         s.to_tasks = some(tasks.sender())
-                        s.sched = some(sched)
+                        s.pristine = some(made.copy())
+                        _ = unsafe { Thread.spawn(GenWorker { worker: made, context: context.copy(), tasks: tasks.share(), out: to_inbox.share() }) }
+                        for k in 0..copies.len() {
+                            if let w = copies[k].take() {
+                                _ = unsafe { Thread.spawn(GenWorker { worker: w, context: context.copy(), tasks: tasks.share(), out: to_inbox.share() }) }
+                            }
+                        }
                     },
                     err(e) => s.lines.push(Entry.error("Can't generate the world, so its chunks are flat: {e}").on(gen_thread())),
                 }
@@ -643,41 +801,80 @@ impl GenOut {
         match m {
             GenIn.Make(w) => {
                 let key = chunk_key(w.pos.x, w.pos.z)
+                let x = w.pos.x
+                let z = w.pos.z
+                s.asked_lately += 1
                 if s.finished.contains(key) {
                     let saved = s.finished[key].copy()
                     self.hand_back(mut s, w, Loaded.Saved(saved))
                 } else if s.asked.contains(key) {
                     s.asked[key].push(w)
+                } else if written(s, x, z) and not s.reread.contains(key) {
+                    // Read before it was written: read again, and it's there.
+                    if s.reread.len() >= MOST_REREAD {
+                        s.reread = Map<i64, bool>()
+                    }
+                    s.reread.insert(key, true)
+                    s.to_io.send(Ask.Chunk(w.pos))
                 } else {
-                    let x = w.pos.x
-                    let z = w.pos.z
                     s.asked.insert(key, [w])
-                    if let g = s.sched.take() {
+                    if s.reread.contains(key) {
+                        // Not there when it was read again: it's made again from nothing.
+                        _ = s.reread.remove(key)
+                        if let g = s.sched.take() {
+                            s.sched = some(renewed(mut s, g))
+                        }
+                    } else if let g = s.sched.take() {
                         var sched = g
                         sched.want(x, z)
                         s.sched = some(sched)
                     }
+                    wanted(mut s, x, z)
                 }
             },
-            GenIn.Made(made) => {
-                if let g = s.sched.take() {
+            GenIn.Made(epoch, made) => {
+                if epoch != s.epoch {
+                    s.stale -= 1
+                } else if let g = s.sched.take() {
                     var sched = g
                     sched.take(made)
                     s.sched = some(sched)
                 }
             },
-            GenIn.Finished(x, z, saved) => self.finished(mut s, x, z, saved),
+            GenIn.Finished(epoch, x, z, saved, bytes) => self.finished(mut s, epoch, x, z, saved, bytes),
+            GenIn.Written(keys, lines) => {
+                for e in lines {
+                    s.lines.push(e.copy())
+                }
+                for k in keys {
+                    if s.spawn_wanted or s.spawn != none {
+                        s.held.push(k)
+                    } else {
+                        _ = s.finished.remove(k)
+                    }
+                }
+            },
             GenIn.Origin(x, z, problem) => {
                 if let p = problem {
                     s.lines.push(Entry.warn(p.copy()).on(gen_thread()))
                 }
                 s.spawn = some(SpawnFind { x: x, z: z, offsets: spiral(), at: 0, asked: false })
             },
-            GenIn.Broken(e) => {
-                if let _ = s.sched.take() {
-                    s.lines.push(Entry.error("Can't generate the world, so its chunks are flat: {e}").on(gen_thread()))
-                    s.to_tasks = none
+            GenIn.Quiet => {
+                // Nothing asked for since the last time, and nothing waiting: what the scheduler
+                // keeps of the chunks around those it made goes, and is made again, the same, if
+                // it's needed (D220).
+                if s.asked_lately == 0 and s.asked.is_empty() and s.spawn == none and not s.spawn_wanted {
+                    if let g = s.sched.take() {
+                        if g.holds_any() {
+                            s.sched = some(renewed(mut s, g))
+                            forget(mut s)
+                        } else {
+                            s.sched = some(g)
+                        }
+                    }
                 }
+                s.asked_lately = 0
             },
             GenIn.Spawn => {
                 s.spawn_wanted = true
@@ -722,14 +919,21 @@ impl GenOut {
             return any
         }
         var progressed = false
+        if s.wants >= CHECK_EVERY {
+            s.wants = 0
+            if sched.kept_outside(s.hot, CELL_SHIFT) > MOST_FAR {
+                sched = renewed(mut s, sched)
+                progressed = true
+            }
+        }
         if self.spawn_next(mut s, mut sched) {
             progressed = true
         }
         if let t = s.to_tasks.take() {
             var tasks = t
-            while sched.running() < s.workers * 2 {
+            while sched.running() + s.stale < s.workers * 2 {
                 let job = sched.next() else break
-                tasks.send(GenTask.Job(job))
+                tasks.send(GenTask.Job(s.epoch, job))
                 progressed = true
             }
             s.to_tasks = some(tasks)
@@ -760,9 +964,12 @@ impl GenOut {
                 s.spawn = some(find)
                 self.check_spawn(mut s, saved.chunk)
             } else {
-                sched.want(find.x + ox, find.z + oz)
+                let wx = find.x + ox
+                let wz = find.z + oz
+                sched.want(wx, wz)
                 find.asked = true
                 s.spawn = some(find)
+                wanted(mut s, wx, wz)
                 return any
             }
         }
@@ -797,29 +1004,39 @@ impl GenOut {
         }
     }
 
-    // Hands back the chunk a worker finished to each that asked for it, keeps it, and checks it
-    // for the spawn if it's the chunk the spawn's search is trying.
-    fn finished(mut self, s: mut GenState, x: i32, z: i32, saved: own SavedChunk) {
-        if let g = s.sched.take() {
+    // Hands back the chunk a worker finished, for the scheduler of `epoch`, to each that asked for
+    // it, checks it for the spawn if it's the chunk the spawn's search is trying, and keeps it
+    // while the IO thread writes `bytes`, or for good if there are none. One nothing asked for or
+    // tries was made again after it was handed back, by a scheduler that started again, and goes.
+    fn finished(mut self, s: mut GenState, epoch: u32, x: i32, z: i32, saved: own SavedChunk, bytes: own List<u8>?) {
+        if epoch != s.epoch {
+            s.stale -= 1
+        } else if let g = s.sched.take() {
             var sched = g
             sched.finished_at(x, z)
             s.sched = some(sched)
         }
         let key = chunk_key(x, z)
         var works = s.asked.remove(key) ?? List<GenWork>()
-        while not works.is_empty() {
-            let w = works.remove(0)
-            self.hand_back(mut s, w, Loaded.Saved(saved.copy()))
-        }
         var spawn_here = false
         if let find = s.spawn {
             let (ox, oz) = find.offsets[find.at]
             spawn_here = find.asked and find.x + ox == x and find.z + oz == z
         }
+        if works.is_empty() and not spawn_here {
+            return
+        }
+        while not works.is_empty() {
+            let w = works.remove(0)
+            self.hand_back(mut s, w, Loaded.Saved(saved.copy()))
+        }
         if spawn_here {
             self.check_spawn(mut s, saved.chunk)
         }
         s.finished.insert(key, saved)
+        if let b = bytes {
+            s.to_io.send(Ask.Write(ChunkPos { x: x, z: z }, b))
+        }
     }
 
     // Hands back the chunk `w` asked for, with what was logged since the last.
@@ -833,11 +1050,116 @@ impl GenOut {
         self.waker.wake()
     }
 
-    // Hands back where the spawn is, with what was logged since the last.
+    // Hands back where the spawn is, with what was logged since the last, and lets go of the
+    // chunks written while it was looked for.
     fn spawn_found(mut self, s: mut GenState, pos: BlockPos) {
         self.done.send(Done.Spawn(pos, s.lines.copy()))
         s.lines.clear()
         self.waker.wake()
+        for k in s.held {
+            _ = s.finished.remove(k)
+        }
+        s.held.clear()
+    }
+}
+
+// A scheduler started again from `old`, with nothing made but the strongholds' rings it
+// found, of the next epoch, wanting each chunk asked for and not handed back, nearest the
+// chunk wanted last first, and the chunk the spawn's search is trying. What the old one has
+// out is let go as it comes back.
+fn renewed(s: mut GenState, old: own Scheduler) -> Scheduler {
+    for p in old.problems {
+        s.lines.push(Entry.warn(p.copy()).on(gen_thread()))
+    }
+    s.stale += old.running()
+    s.epoch += 1
+    var fresh = old.renewed()
+    var keys = List<i64>()
+    for (k, _) in s.asked {
+        keys.push(k)
+    }
+    var last: i64 = 0
+    if let r = s.recent.last() {
+        last = r.0
+    }
+    let lx = i32.wrap(last)
+    let lz = i32.wrap(last >> 32)
+    var order = List<i64>()
+    for i in 0..keys.len() {
+        let away = (i32.wrap(keys[i]) - lx).abs().max((i32.wrap(keys[i] >> 32) - lz).abs())
+        order.push((i64(away) << 32) | i64.wrap(i))
+    }
+    order.sort()
+    for o in order {
+        let k = keys[usize.wrap(o & 0xFFFFFFFF)]
+        fresh.want(i32.wrap(k), i32.wrap(k >> 32))
+    }
+    if let find = s.spawn {
+        if find.asked {
+            let (ox, oz) = find.offsets[find.at]
+            fresh.want(find.x + ox, find.z + oz)
+        }
+    }
+    return fresh
+}
+
+// Hands each worker a fresh copy of the worker they were copied from, so they let go of the
+// templates, pools, features and noise they cached: what a chunk comes to doesn't depend on which
+// worker makes it, or what it made before. Each takes one at most; one that takes none forgets the
+// next time.
+fn forget(s: mut GenState) {
+    let p = s.pristine.take() else return
+    if let t = s.to_tasks.take() {
+        var tasks = t
+        s.forgets += 1
+        for _ in 0..s.workers {
+            tasks.send(GenTask.Forget(s.forgets, p.copy()))
+        }
+        s.to_tasks = some(tasks)
+    }
+    s.pristine = some(p)
+}
+
+// Whether the chunk at `x`, `z` was finished by the scheduler and isn't kept: it was handed back
+// and written.
+fn written(s: GenState, x: i32, z: i32) -> bool {
+    if let sched = s.sched {
+        return sched.is_finished(x, z)
+    }
+    return false
+}
+
+// Notes that the chunk at `x`, `z` is wanted: it marks the cells within `REACH` of it, and those
+// wanted before the last `RECENT`, or longer ago than `RECENT_NANOS`, stop marking them.
+fn wanted(s: mut GenState, x: i32, z: i32) {
+    let now = unsafe { Instant.now() }.nanos_since(s.began)
+    s.recent.push_last((chunk_key(x, z), now))
+    mark(mut s.hot, x, z, true)
+    while let r = s.recent.first() {
+        let (k, when) = r
+        if s.recent.len() <= RECENT and when + RECENT_NANOS >= now {
+            break
+        }
+        _ = s.recent.pop_first()
+        mark(mut s.hot, i32.wrap(k), i32.wrap(k >> 32), false)
+    }
+    s.wants += 1
+}
+
+// Marks the cells within `REACH` of the chunk at `x`, `z` once more, or once fewer.
+fn mark(hot: mut Map<i64, u32>, x: i32, z: i32, more: bool) {
+    for cz in (z - REACH) >> CELL_SHIFT..((z + REACH) >> CELL_SHIFT) + 1 {
+        for cx in (x - REACH) >> CELL_SHIFT..((x + REACH) >> CELL_SHIFT) + 1 {
+            let c = chunk_key(cx, cz)
+            let n = hot.get(c) ?? 0
+            if more {
+                hot.insert(c, n + 1)
+            } else if n <= 1 {
+                _ = hot.remove(c)
+            } else {
+                hot.insert(c, n - 1)
+            }
+        }
     }
 }
 
@@ -877,6 +1199,8 @@ pub struct ChunkJobs {
     chunks_away: usize
     regions_away: usize
     spawn_away: usize
+    // Whether the IO thread is closing the region files.
+    closing_away: usize = 0
 }
 
 impl ChunkJobs {
@@ -962,6 +1286,7 @@ impl ChunkJobs {
                 Done.Region(_, _, _) => self.regions_away -= 1,
                 Done.Chunk(_, _, _, _, _) => self.chunks_away -= 1,
                 Done.Spawn(_, _) => self.spawn_away -= 1,
+                Done.Closed(_) => self.closing_away -= 1,
             }
             back.push_last(d)
         }
@@ -978,15 +1303,45 @@ impl ChunkJobs {
         return self.started
     }
 
+    /// Has the IO thread, if it's started, write every chunk it's been handed and close the
+    /// region files, as the server stops; `closing` counts it until it has. What the generator
+    /// hands it after isn't written: it's made again when it's next asked for.
+    pub fn close(mut self) {
+        if self.storage != none {
+            return
+        }
+        self.to_asks.send(Ask.Close)
+        self.closing_away += 1
+    }
+
+    /// Tells the generator's thread, if it's started, that a while has gone by: if it's been asked
+    /// for nothing since it was last told, it lets go of what it keeps of the chunks around those
+    /// it made, which it makes again, the same, if they're needed (D220).
+    pub fn quiet(mut self) {
+        if self.gen != none {
+            return
+        }
+        if let held = self.to_gen.take() {
+            var g = held
+            g.send(GenIn.Quiet)
+            self.to_gen = some(g)
+        }
+    }
+
+    /// Whether the IO thread is still closing the region files.
+    pub fn closing(self) -> usize {
+        return self.closing_away
+    }
+
     // Starts the IO thread, if it hasn't, and the generator's, with its workers, one fewer than
     // the processors.
     fn start(mut self) {
         let storage = self.storage.take() else return
-        _ = unsafe { Thread.spawn(IoThread { storage: storage, asks: self.asks.share(), work: self.to_work.share(), done: self.to_done.share(), waker: self.waker }) }
+        _ = unsafe { Thread.spawn(IoThread { storage: storage, asks: self.asks.share(), work: self.to_work.share(), done: self.to_done.share(), gen: self.gen_inbox.sender(), waker: self.waker }) }
         let setup = self.gen.take() else return
         let to_gen = self.to_gen else return
         let processors = unsafe { workers() }
         let gen_workers = if processors > 2 { processors - 1 } else { 1 }
-        _ = unsafe { Thread.spawn(GenThread { setup: setup, sections: self.context.sections, inbox: self.gen_inbox.share(), to_inbox: to_gen.share(), done: self.to_done.share(), waker: self.waker, workers: gen_workers }) }
+        _ = unsafe { Thread.spawn(GenThread { setup: setup, context: self.context.copy(), inbox: self.gen_inbox.share(), to_inbox: to_gen.share(), to_io: self.to_asks.share(), done: self.to_done.share(), waker: self.waker, workers: gen_workers }) }
     }
 }
