@@ -90,6 +90,8 @@ const RECENT: usize = 1024
 const RECENT_NANOS: u64 = 30000000000
 // The most chunks kept as read again, a few at most.
 const MOST_REREAD: usize = 4096
+// The most chunks kept as let go before they came to the generator's thread (D243).
+const MOST_DROPPED: usize = 4096
 const CHECK_EVERY: usize = 256
 const MOST_FAR: usize = 1024
 
@@ -147,6 +149,9 @@ pub enum Done {
     Chunk(ChunkPos, List<Entry>, ChunkRead, List<Entry>, Loaded)
     /// Where the generator found a new world's spawn, and what it logged finding it.
     Spawn(BlockPos, List<Entry>)
+    /// The chunk, which the generator was told nothing wants before it made it, so it didn't
+    /// (D243), with what the IO thread logged reading it and the workers logged making it.
+    Withdrawn(ChunkPos, List<Entry>, List<Entry>)
     /// The IO thread has written every chunk it was handed and closed the region files, as the
     /// server stops, and what it logged doing it.
     Closed(List<Entry>)
@@ -559,9 +564,10 @@ impl Task for ChunkWorker {
 // job of a scheduler's epoch made, or a chunk a worker finished as the server's, with its bytes
 // for its region file, none if it couldn't be encoded; the chunks the IO thread wrote, with what
 // it logged; the chunk a worker found the spawn is looked for from; or a new world's spawn to
-// find.
+// find; or a chunk nothing wants any more (D243).
 enum GenIn {
     Make(GenWork)
+    Drop(ChunkPos)
     Made(u32, Made)
     Finished(u32, i32, i32, SavedChunk, List<u8>?)
     Written(List<i64>, List<Entry>)
@@ -740,6 +746,9 @@ struct GenState {
     // The chunks asked for after they were written and let go, by a read from before they were
     // written, which are read again.
     reread: Map<i64, bool> = Map<i64, bool>()
+    // The chunks let go before they came to be made, which are handed back unmade when they come
+    // (D243).
+    dropped: Map<i64, bool> = Map<i64, bool>()
     // Whether a new world's spawn is to be found, and its search, once its origin's found.
     spawn_wanted: bool = false
     spawn: SpawnFind? = none
@@ -813,9 +822,12 @@ impl GenOut {
                 let key = chunk_key(w.pos.x, w.pos.z)
                 let x = w.pos.x
                 let z = w.pos.z
+                let was_dropped = s.dropped.remove(key) != none
                 if s.finished.contains(key) {
                     let saved = s.finished[key].copy()
                     self.hand_back(mut s, w, Loaded.Saved(saved))
+                } else if was_dropped and not spawn_tries(s, x, z) {
+                    self.withdraw(w)
                 } else if s.asked.contains(key) {
                     s.asked[key].push(w)
                 } else if written(s, x, z) and not s.reread.contains(key) {
@@ -841,6 +853,7 @@ impl GenOut {
                     wanted(mut s, x, z)
                 }
             },
+            GenIn.Drop(pos) => self.drop(mut s, pos),
             GenIn.Made(epoch, made) => {
                 if epoch != s.epoch {
                     s.stale -= 1
@@ -1011,12 +1024,16 @@ impl GenOut {
         }
         let key = chunk_key(x, z)
         var works = s.asked.remove(key) ?? List<GenWork>()
-        var spawn_here = false
-        if let find = s.spawn {
-            let (ox, oz) = find.offsets[find.at]
-            spawn_here = find.asked and find.x + ox == x and find.z + oz == z
-        }
+        let spawn_here = spawn_tries(s, x, z)
         if works.is_empty() and not spawn_here {
+            if epoch == s.epoch {
+                // Let go while it was being finished (D243): it's written all the same, as the
+                // scheduler has it finished, and a read would look for it.
+                s.finished.insert(key, saved)
+                if let b = bytes {
+                    s.to_io.send(Ask.Write(ChunkPos { x: x, z: z }, b))
+                }
+            }
             return
         }
         while not works.is_empty() {
@@ -1030,6 +1047,41 @@ impl GenOut {
         if let b = bytes {
             s.to_io.send(Ask.Write(ChunkPos { x: x, z: z }, b))
         }
+    }
+
+    // Nothing wants the chunk at `pos` any more (D243). Asked for and not made, it's handed back
+    // unmade, and the scheduler drops the jobs only it needed, unless the spawn's search is trying
+    // it. Not yet come, it's handed back unmade when it comes. Finished, it goes back as it is.
+    fn drop(mut self, s: mut GenState, pos: ChunkPos) {
+        let key = chunk_key(pos.x, pos.z)
+        if s.finished.contains(key) {
+            return
+        }
+        var works = s.asked.remove(key) else {
+            if s.dropped.len() >= MOST_DROPPED {
+                s.dropped = Map<i64, bool>()
+            }
+            s.dropped.insert(key, true)
+            return
+        }
+        while not works.is_empty() {
+            self.withdraw(works.remove(0))
+        }
+        if spawn_tries(s, pos.x, pos.z) {
+            return
+        }
+        if let g = s.sched.take() {
+            var sched = g
+            sched.unwant(pos.x, pos.z)
+            s.sched = some(sched)
+        }
+    }
+
+    // Hands back the chunk `w` asked for unmade, as nothing wants it (D243). What the generator
+    // logged waits for the next chunk handed back.
+    fn withdraw(mut self, w: own GenWork) {
+        self.done.send(Done.Withdrawn(w.pos, w.io, w.made))
+        self.waker.wake()
     }
 
     // Hands back the chunk `w` asked for, with what was logged since the last.
@@ -1125,6 +1177,15 @@ fn forget(s: mut GenState) {
         templates.send(TemplateAsk.Forget)
         s.to_templates = some(templates)
     }
+}
+
+// Whether the spawn's search is trying the chunk at `x`, `z`.
+fn spawn_tries(s: GenState, x: i32, z: i32) -> bool {
+    if let find = s.spawn {
+        let (ox, oz) = find.offsets[find.at]
+        return find.asked and find.x + ox == x and find.z + oz == z
+    }
+    return false
 }
 
 // Whether the chunk at `x`, `z` was finished by the scheduler and isn't kept: it was handed back
@@ -1285,6 +1346,16 @@ impl ChunkJobs {
         self.chunks_away += 1
     }
 
+    /// Tells the generator nothing wants the chunk at `pos` any more, if the world generates: it
+    /// comes back as `Done.Withdrawn` if it wasn't made (D243).
+    pub fn drop_chunk(mut self, pos: ChunkPos) {
+        if let held = self.to_gen.take() {
+            var g = held
+            g.send(GenIn.Drop(pos))
+            self.to_gen = some(g)
+        }
+    }
+
     /// What's come back since this was last asked, in the order it came.
     pub fn take_done(mut self) -> Deque<Done> {
         var back = Deque<Done>()
@@ -1292,6 +1363,7 @@ impl ChunkJobs {
             match d {
                 Done.Region(_, _, _) => self.regions_away -= 1,
                 Done.Chunk(_, _, _, _, _) => self.chunks_away -= 1,
+                Done.Withdrawn(_, _, _) => self.chunks_away -= 1,
                 Done.Spawn(_, _) => self.spawn_away -= 1,
                 Done.Closed(_) => self.closing_away -= 1,
             }
