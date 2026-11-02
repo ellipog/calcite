@@ -398,6 +398,17 @@ final class FeaturesProbe implements Probe {
             throw new CaseError("at most " + MAX_CHUNKS + " ops");
         }
         boolean places = false;
+        // Shared: the ops' chunks are one world's, each op's decoration writing into the chunks the
+        // ops before it left, in the order they're given.
+        boolean shared = false;
+        if (input.has("shared")) {
+            JsonElement value = input.get("shared");
+            if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean()) {
+                throw new CaseError("`shared` must be a boolean");
+            }
+            shared = value.getAsBoolean();
+        }
+        Map<Long, ProtoChunk> world = shared ? new HashMap<>() : null;
         for (int i = 0; i < opList.size(); i++) {
             String what = "`ops`[" + i + "]";
             if (!opList.get(i).isJsonArray() || opList.get(i).getAsJsonArray().isEmpty()) {
@@ -510,7 +521,7 @@ final class FeaturesProbe implements Probe {
                         }
                     }
                 }
-                Map<Long, ProtoChunk> chunks = terrain(generator, settings.value(), state, source, seed, heights, containers, cx, cz, beards);
+                Map<Long, ProtoChunk> chunks = terrain(generator, settings.value(), state, source, seed, heights, containers, cx, cz, beards, world);
                 WorldGenRegion region = region(fake, chunks, generator, source, state, seed, heights, containers, cx, cz, starts);
                 ProtoChunk center = chunks.get(ChunkPos.pack(cx, cz));
                 if (op[0] == 0) {
@@ -573,7 +584,8 @@ final class FeaturesProbe implements Probe {
 
     /**
      * The 5×5 chunks around {@code cx}, {@code cz} with their biomes, and the 3×3 with their
-     * terrain, marked done with {@code terrain}.
+     * terrain, marked done with {@code terrain}. With a {@code world}, a chunk it has is taken as
+     * it is, and each of the 3×3 is kept in it.
      */
     private static Map<Long, ProtoChunk> terrain(
             NoiseBasedChunkGenerator generator,
@@ -585,11 +597,16 @@ final class FeaturesProbe implements Probe {
             PalettedContainerFactory containers,
             int cx,
             int cz,
-            Map<Long, Beardifier> beards) {
+            Map<Long, Beardifier> beards,
+            Map<Long, ProtoChunk> world) {
         Map<Long, ProtoChunk> chunks = new HashMap<>();
         for (int dz = -2; dz <= 2; dz++) {
             for (int dx = -2; dx <= 2; dx++) {
                 ChunkPos pos = new ChunkPos(cx + dx, cz + dz);
+                if (world != null && world.containsKey(pos.pack())) {
+                    chunks.put(pos.pack(), world.get(pos.pack()));
+                    continue;
+                }
                 ProtoChunk chunk = new ProtoChunk(pos, UpgradeData.EMPTY, heights, containers, null);
                 Climate.Sampler climate = state.createClimateSampler(SamplerContext.builder().enableCaches().build());
                 chunk.fillBiomesFromNoise(source.createResolverForChunk(
@@ -610,6 +627,9 @@ final class FeaturesProbe implements Probe {
                 int x = cx + dx;
                 int z = cz + dz;
                 ProtoChunk chunk = chunks.get(ChunkPos.pack(x, z));
+                if (world != null && world.containsKey(ChunkPos.pack(x, z))) {
+                    continue;
+                }
                 Set<Holder<Biome>> possibleBiomes = new ObjectOpenHashSet<>();
                 for (int nz = -1; nz <= 1; nz++) {
                     for (int nx = -1; nx <= 1; nx++) {
@@ -637,7 +657,11 @@ final class FeaturesProbe implements Probe {
         }
         for (int dz = -1; dz <= 1; dz++) {
             for (int dx = -1; dx <= 1; dx++) {
-                chunks.get(ChunkPos.pack(cx + dx, cz + dz)).setPersistedStatus(ChunkStatus.TERRAIN);
+                ProtoChunk chunk = chunks.get(ChunkPos.pack(cx + dx, cz + dz));
+                chunk.setPersistedStatus(ChunkStatus.TERRAIN);
+                if (world != null) {
+                    world.put(chunk.getPos().pack(), chunk);
+                }
             }
         }
         return chunks;

@@ -721,13 +721,15 @@ The chunk is written as in `surface`. After a source and a rule, carvers that do
 
 Chunks decorated as 26.3's `ChunkGenerator.applyBiomeDecoration` decorates them, or one placed feature placed, in a `WorldGenRegion` for the `features` step. The registries are vanilla's own, as `density`'s are, so a feature, placed feature, block state provider, biome or tag named by ID is vanilla's.
 
-Input `{"seed": s, "settings": id, "level": [min_y, height], "source": v, "ops": [...]}`, with `"feature": f` or without, and no blobs. `s`, `id`, `level` and `v` are as in `surface`. `f` is read by `PlacedFeature.CODEC` with the registries' ops: a placed feature by ID or written out. The generator is a `NoiseBasedChunkGenerator` of `v` and the settings. Each case runs on a thread of its own, as `surface`'s do. The ops, in order, at most 64:
+Input `{"seed": s, "settings": id, "level": [min_y, height], "source": v, "ops": [...]}`, with `"feature": f` or without, `"shared": b` or without, and no blobs. `s`, `id`, `level` and `v` are as in `surface`. `f` is read by `PlacedFeature.CODEC` with the registries' ops: a placed feature by ID or written out. The generator is a `NoiseBasedChunkGenerator` of `v` and the settings. Each case runs on a thread of its own, as `surface`'s do. The ops, in order, at most 64:
 
 | Op | Does |
 | --- | --- |
 | `["decorate", cx, cz]` | `applyBiomeDecoration` of the chunk at `cx`, `cz`, with a structure manager whose world options don't generate structures |
 | `["structured", cx, cz]` | `applyBiomeDecoration` of the chunk at `cx`, `cz` with structures, as below |
 | `["place", cx, cz, x, y, z, seed]` | `f.place` in the region around chunk `cx`, `cz`, at block `x`, `y`, `z`, with a `WorldgenRandom` over a `XoroshiroRandomSource` given `setSeed(seed)`, `seed` a `long` as a decimal string. It has no top feature, so a biome filter in it throws, as one in a feature placed by another does |
+
+With `"shared": true`, the ops' chunks are one world's: a chunk an op made is kept, with whatever its decoration and later ones wrote in it, and an op whose 3×3 or 5×5 reaches it takes it as it is rather than making it again. So the ops decorate in the order given, each into what the ones before it left, as a server's decorations of neighbouring chunks do. Its starts, references and beardifiers are made again for each op, the same.
 
 For each op, the region is made as the server makes it for the `features` step, without running its constructor, which wants the server's chunk holders:
 

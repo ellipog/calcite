@@ -3,7 +3,8 @@
 - every .calx file in this folder. Each panics on a wrong result and prints `ok` at its end.
 - every ```calx block in src/README.md, whose `// out: ...` comments give the lines it prints,
   so the docs' examples can't go stale (D41).
-- the server, src/calcite.calx, which runs until it's stopped, so it's only built.
+- the server, src/calcite.calx, which runs until it's stopped, and the rig's adapter,
+  src/rig/adapter.calx, which the rig runs, so they're only built.
 - vanilla's own codecs on every packet the network tests' clients were sent, if the vanilla
   adapter is built (oracle/vanilla-adapter/check_packets.py, D145). Without it, that's skipped.
 
@@ -82,6 +83,10 @@ def main():
             r = subprocess.run([calx, "build", *mode, "src/calcite.calx", "-o", str(out)], cwd=CALCITE,
                                capture_output=True, text=True, encoding="utf-8")
             report("src/calcite.calx builds", mode, r.returncode == 0, r)
+        out = Path(tmp) / f"calcite-adapter{'.exe' if sys.platform == 'win32' else ''}"
+        r = subprocess.run([calx, "build", "--release", "src/rig/adapter.calx", "-o", str(out)], cwd=CALCITE,
+                           capture_output=True, text=True, encoding="utf-8")
+        report("src/rig/adapter.calx builds", ["--release"], r.returncode == 0, r)
 
     check = subprocess.run([sys.executable, "-I", str(CALCITE / "oracle" / "vanilla-adapter" / "check_packets.py")],
                            cwd=CALCITE, capture_output=True, text=True, encoding="utf-8")

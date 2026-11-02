@@ -16,6 +16,9 @@ chunk seldom holding much of them: each in a world of one biome with a seed of i
 picked by asking the `structures` probe where those worlds' starts are and which chunks their
 pieces reach, among them a stronghold's portal room and library, an End city's ship and a
 fortress's blaze spawner.
+
+Chunks of the full Overworld of one seed where a structure's edge meets coral and kelp follow, each
+alone, then in a shared world after the eight around it.
 """
 
 import sys
@@ -45,6 +48,10 @@ FILLED = [
         ("stalks", 21, 8), ("busy", 91, 21), ("bridges", 205, 6),
     ]),
 ]
+# Chunks of the full Overworld where a structure's edge updates the shapes of what grew beside it:
+# coral, coral wall fans and kelp by shipwrecks and ocean ruins, which a pregeneration of seed
+# 20261101 out to 60 chunks found (CAL-90).
+SHAPED = ("20261101", [(-31, -35), (-29, -35), (-33, -31), (-29, -14), (-62, -69), (-51, -32), (-50, -33)])
 
 
 def main():
@@ -75,6 +82,21 @@ def main():
             c = structures.Case(f"structured-{sid}-{name}", seed, structures.world_of(biome), structures.fixed(biome))
             c.op("structured", x, z)
             cases.append(c.build())
+    seed, chunks = SHAPED
+    for x, z in chunks:
+        c = structures.Case(f"structured-overworld-shapes-{x}-{z}", seed, "overworld", structures.preset("overworld"))
+        c.op("structured", x, z)
+        cases.append(c.build())
+        # In one world: the eight around it decorated first, so what grew in them is there when
+        # its structures' edges meet it, as on a server.
+        c = structures.Case(f"structured-overworld-shapes-{x}-{z}-shared", seed, "overworld", structures.preset("overworld"))
+        c.input["shared"] = True
+        for dz in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx or dz:
+                    c.op("structured", x + dx, z + dz)
+        c.op("structured", x, z)
+        cases.append(c.build())
     write_file(HERE / "structured.json", "features", f"cases/features/structured.py, seed {SEED}", cases, probe_version=4)
 
 
