@@ -1,0 +1,868 @@
+/// Pregenerating chunks before players come to them, as the Chunky mod does, built in (CAL-71,
+/// D275).
+///
+/// A task is every chunk of an area, a shape around a center, walked in a pattern. It holds a
+/// window of them at once in the dimension's level, each until it's full, which is lit, then lets
+/// it go, so the level saves it lit as it unloads and memory stays flat. A chunk that was saved
+/// full is read, not made again. How far a task's come is saved beside the world, so it carries
+/// on after a pause, a restart or a crash; it's what the walk passed with every chunk before it
+/// done, so a chunk that was in the window is held again.
+///
+/// A chunk is in an area if its middle is in the shape. A task depends on nothing but its
+/// selection and what the level says is full, so a replay walks it the same.
+module server.pregen
+
+import java.uuid.{Uuid}
+import nbt.tag.{Tag}
+import resources.identifier.{Identifier}
+import std.math.{cos, sin}
+import world.pos.{ChunkPos}
+
+/// An area's shape, as Chunky names them. Each is around the center: a square, circle or diamond
+/// `radius` from it on each side, a rectangle or ellipse `radius` along `x` and `radius_z` along
+/// `z`, and a triangle, pentagon, hexagon or star with its points `radius` from it, the first to
+/// the north.
+pub enum Shape {
+    Square
+    Rectangle
+    Circle
+    Ellipse
+    Diamond
+    Triangle
+    Pentagon
+    Hexagon
+    Star
+}
+
+impl Shape {
+    /// Every shape, in the order the command lists them.
+    pub fn all() -> List<Shape> {
+        return [Shape.Square, Shape.Rectangle, Shape.Circle, Shape.Ellipse, Shape.Diamond, Shape.Triangle, Shape.Pentagon, Shape.Hexagon, Shape.Star]
+    }
+
+    /// Its name, such as `square`.
+    pub fn name(self) -> str {
+        return match self {
+            Square => "square",
+            Rectangle => "rectangle",
+            Circle => "circle",
+            Ellipse => "ellipse",
+            Diamond => "diamond",
+            Triangle => "triangle",
+            Pentagon => "pentagon",
+            Hexagon => "hexagon",
+            Star => "star",
+        }
+    }
+
+    /// The shape `name` names, or `none`.
+    pub fn named(name: String) -> Shape? {
+        for s in Shape.all() {
+            if String(s.name()) == name {
+                return some(s)
+            }
+        }
+        return none
+    }
+
+    /// Whether it has a radius along `z` of its own: a rectangle's or an ellipse's.
+    pub fn two_radii(self) -> bool {
+        return match self {
+            Rectangle => true,
+            Ellipse => true,
+            _ => false,
+        }
+    }
+}
+
+/// The order a task walks its area's chunks in, as Chunky names them: `region`, a region file's
+/// 32 × 32 chunks at a time, row by row, which writes each region file in one go; `concentric`,
+/// square rings out from the center; `spiral`, one spiral out from it; and `loop`, row by row
+/// across the area.
+pub enum Pattern {
+    Region
+    Concentric
+    Spiral
+    Loop
+}
+
+impl Pattern {
+    /// Every pattern, in the order the command lists them.
+    pub fn all() -> List<Pattern> {
+        return [Pattern.Region, Pattern.Concentric, Pattern.Spiral, Pattern.Loop]
+    }
+
+    /// Its name, such as `region`.
+    pub fn name(self) -> str {
+        return match self {
+            Region => "region",
+            Concentric => "concentric",
+            Spiral => "spiral",
+            Loop => "loop",
+        }
+    }
+
+    /// The pattern `name` names, or `none`.
+    pub fn named(name: String) -> Pattern? {
+        for p in Pattern.all() {
+            if String(p.name()) == name {
+                return some(p)
+            }
+        }
+        return none
+    }
+}
+
+/// What a task is to pregenerate: its shape, its center and radii in blocks, and the pattern it
+/// walks them in. Chunky's defaults: a square 500 blocks around 0, 0, region by region.
+pub struct Selection {
+    pub shape: Shape = Shape.Square
+    pub pattern: Pattern = Pattern.Region
+    pub center_x: f64 = 0.0
+    pub center_z: f64 = 0.0
+    pub radius: f64 = 500.0
+    pub radius_z: f64 = 500.0
+}
+
+impl Selection {
+    /// What it is, as `pregen selection` says: `a square around 0, 0, radius 500, region by
+    /// region`, or for a rectangle or an ellipse, `radius 500 by 100`.
+    pub fn described(self) -> String {
+        let radii = if self.shape.two_radii() { "{blocks(self.radius)} by {blocks(self.radius_z)}" } else { blocks(self.radius) }
+        let walk = match self.pattern {
+            Region => "region by region",
+            Concentric => "in rings out from the center",
+            Spiral => "in a spiral out from the center",
+            Loop => "row by row",
+        }
+        return "a {self.shape.name()} around {blocks(self.center_x)}, {blocks(self.center_z)}, radius {radii}, {walk}"
+    }
+
+    /// The radius along `z`: its own for a rectangle or an ellipse, `radius` for the rest.
+    pub fn along_z(self) -> f64 {
+        return if self.shape.two_radii() { self.radius_z } else { self.radius }
+    }
+
+    /// The area it covers, made ready to ask of chunk after chunk.
+    pub fn area(self) -> Area {
+        let rx = self.radius.max(0.0)
+        let rz = self.along_z().max(0.0)
+        var points = List<(f64, f64)>()
+        let sides = match self.shape {
+            Triangle => 3,
+            Pentagon => 5,
+            Hexagon => 6,
+            _ => 0,
+        }
+        let turn = 6.283185307179586
+        for k in 0..sides {
+            let a = turn * f64(k) / f64(sides)
+            points.push((rx * sin(a), -rx * cos(a)))
+        }
+        if self.shape == Shape.Star {
+            // A pentagram's inner points are (3 - √5) / 2 of the way out.
+            let inner = rx * 0.3819660112501051
+            for k in 0..10 {
+                let a = turn * f64(k) / 10.0
+                let r = if k % 2 == 0 { rx } else { inner }
+                points.push((r * sin(a), -r * cos(a)))
+            }
+        }
+        // The chunks whose middles, 16 × c + 8, are within the radii of the center.
+        let min_x = i32.saturate(((self.center_x - rx - 8.0) / 16.0).ceil())
+        let max_x = i32.saturate(((self.center_x + rx - 8.0) / 16.0).floor())
+        let min_z = i32.saturate(((self.center_z - rz - 8.0) / 16.0).ceil())
+        let max_z = i32.saturate(((self.center_z + rz - 8.0) / 16.0).floor())
+        return Area { shape: self.shape, center_x: self.center_x, center_z: self.center_z, rx: rx, rz: rz, points: points, min_x: min_x, max_x: max_x, min_z: min_z, max_z: max_z }
+    }
+}
+
+/// A selection's area: its shape, and the chunks it can hold, whose middles are within its
+/// radii of its center.
+pub struct Area {
+    shape: Shape
+    center_x: f64
+    center_z: f64
+    rx: f64
+    rz: f64
+    // A polygon's points, from the center, for the triangle, the pentagon, the hexagon and the
+    // star.
+    points: List<(f64, f64)>
+    pub min_x: i32
+    pub max_x: i32
+    pub min_z: i32
+    pub max_z: i32
+}
+
+impl Area {
+    /// Whether the chunk at `pos` is in the area: its middle is in the shape.
+    pub fn contains(self, pos: ChunkPos) -> bool {
+        if pos.x < self.min_x or pos.x > self.max_x or pos.z < self.min_z or pos.z > self.max_z {
+            return false
+        }
+        let x = self.middle_x(pos.x)
+        let z = f64(pos.z) * 16.0 + 8.0 - self.center_z
+        return match self.shape {
+            Square => x.abs() <= self.rx and z.abs() <= self.rx,
+            Rectangle => x.abs() <= self.rx and z.abs() <= self.rz,
+            Circle => x * x + z * z <= self.rx * self.rx,
+            Ellipse => self.rx > 0.0 and self.rz > 0.0 and (x / self.rx) * (x / self.rx) + (z / self.rz) * (z / self.rz) <= 1.0,
+            Diamond => x.abs() + z.abs() <= self.rx,
+            _ => in_polygon(self.points, x, z),
+        }
+    }
+
+    /// Whether it holds no chunk at all.
+    pub fn is_empty(self) -> bool {
+        return self.max_x < self.min_x or self.max_z < self.min_z
+    }
+
+    /// How many chunks it holds, a row at a time: a polygon's are those between each pair of the
+    /// places its edges cross the row's middle, as `contains` finds them, and another shape's are
+    /// a run, found from where the shape's edge is and checked at each end.
+    pub fn count(self) -> u64 {
+        var n: u64 = 0
+        if self.is_empty() {
+            return 0
+        }
+        for z in self.min_z..self.max_z + 1 {
+            n += self.row_count(z)
+        }
+        return n
+    }
+
+    // The chunks of the row `z` it holds.
+    fn row_count(self, z: i32) -> u64 {
+        let dz = f64(z) * 16.0 + 8.0 - self.center_z
+        if not self.points.is_empty() {
+            var crossings = List<f64>()
+            let n = self.points.len()
+            var j = n - 1
+            for i in 0..n {
+                let (xi, zi) = self.points[i]
+                let (xj, zj) = self.points[j]
+                if (zi > dz) != (zj > dz) {
+                    crossings.push((xj - xi) * (dz - zi) / (zj - zi) + xi)
+                }
+                j = i
+            }
+            // At most a few, put in order where they go.
+            for i in 1..crossings.len() {
+                var k = i
+                while k > 0 and crossings[k - 1] > crossings[k] {
+                    let c = crossings[k]
+                    crossings[k] = crossings[k - 1]
+                    crossings[k - 1] = c
+                    k -= 1
+                }
+            }
+            var out: u64 = 0
+            var k: usize = 0
+            while k + 1 < crossings.len() {
+                out += self.between(crossings[k], crossings[k + 1])
+                k += 2
+            }
+            return out
+        }
+        // How far the shape reaches either way from the center along the row.
+        let half = match self.shape {
+            Circle => (self.rx * self.rx - dz * dz).max(0.0).sqrt(),
+            Ellipse => if self.rz > 0.0 { self.rx * (1.0 - (dz / self.rz) * (dz / self.rz)).max(0.0).sqrt() } else { 0.0 },
+            Diamond => (self.rx - dz.abs()).max(0.0),
+            _ => self.rx,
+        }
+        var lo = i32.saturate(((self.center_x - half - 8.0) / 16.0).ceil()).max(self.min_x)
+        var hi = i32.saturate(((self.center_x + half - 8.0) / 16.0).floor()).min(self.max_x)
+        while lo > self.min_x and self.contains(ChunkPos { x: lo - 1, z: z }) {
+            lo -= 1
+        }
+        while lo <= hi and not self.contains(ChunkPos { x: lo, z: z }) {
+            lo += 1
+        }
+        while hi < self.max_x and self.contains(ChunkPos { x: hi + 1, z: z }) {
+            hi += 1
+        }
+        while hi >= lo and not self.contains(ChunkPos { x: hi, z: z }) {
+            hi -= 1
+        }
+        return if hi < lo { 0 } else { u64(u32.wrap(hi - lo + 1)) }
+    }
+
+    // How many chunks of a row, in the bounds, have middles from `a` to before `b` along `x` from
+    // the center, worked out as `contains` works out a middle.
+    fn between(self, a: f64, b: f64) -> u64 {
+        var lo = i32.saturate(((a + self.center_x - 8.0) / 16.0).ceil()).max(self.min_x)
+        while lo > self.min_x and self.middle_x(lo - 1) >= a {
+            lo -= 1
+        }
+        while lo <= self.max_x and self.middle_x(lo) < a {
+            lo += 1
+        }
+        var hi = i32.saturate(((b + self.center_x - 8.0) / 16.0).floor()).min(self.max_x)
+        while hi < self.max_x and self.middle_x(hi + 1) < b {
+            hi += 1
+        }
+        while hi >= self.min_x and self.middle_x(hi) >= b {
+            hi -= 1
+        }
+        return if hi < lo { 0 } else { u64(u32.wrap(hi - lo + 1)) }
+    }
+
+    // Where the middle of the chunks at `x` is, along `x` from the center.
+    fn middle_x(self, x: i32) -> f64 {
+        return f64(x) * 16.0 + 8.0 - self.center_x
+    }
+
+    /// The chunk its center is in.
+    pub fn center(self) -> ChunkPos {
+        return ChunkPos { x: i32.saturate((self.center_x / 16.0).floor()), z: i32.saturate((self.center_z / 16.0).floor()) }
+    }
+}
+
+// Whether `x`, `z` is inside the polygon of `points`, by how many of its edges a ray to the east
+// crosses.
+fn in_polygon(points: List<(f64, f64)>, x: f64, z: f64) -> bool {
+    var inside = false
+    let n = points.len()
+    var j = n - 1
+    for i in 0..n {
+        let (xi, zi) = points[i]
+        let (xj, zj) = points[j]
+        if (zi > z) != (zj > z) and x < (xj - xi) * (z - zi) / (zj - zi) + xi {
+            inside = not inside
+        }
+        j = i
+    }
+    return inside
+}
+
+/// An area's chunks in a pattern's order, each once.
+pub struct Walk {
+    pattern: Pattern
+    area: Area
+    center: ChunkPos
+    // The ring out from the center a ring's or the spiral's walk has to reach to cover the area.
+    reach: i32
+    x: i32
+    z: i32
+    // The region `region` is in.
+    rx: i32
+    rz: i32
+    // A ring's number and the step along it.
+    ring: i32
+    along: i32
+    // The spiral's way, east, south, west and north, its leg's length, the steps along it, and
+    // how many it's taken of the (2 × reach + 1)² it takes.
+    way: i32
+    leg: i32
+    leg_step: i32
+    legs_at_length: i32
+    taken: u64
+    ended: bool
+}
+
+impl Walk {
+    /// The walk of `area` in `pattern`'s order, from its start.
+    pub fn new(pattern: Pattern, area: own Area) -> Walk {
+        let c = area.center()
+        let reach = (c.x - area.min_x).max(area.max_x - c.x).max(c.z - area.min_z).max(area.max_z - c.z).max(0)
+        let ended = area.is_empty()
+        return Walk { pattern: pattern, center: c, reach: reach, x: area.min_x, z: area.min_z, rx: area.min_x >> 5, rz: area.min_z >> 5, ring: 0, along: 0, way: 0, leg: 1, leg_step: 0, legs_at_length: 0, taken: 0, ended: ended, area: area }
+    }
+
+    /// The next chunk of the area, or `none` once they've all been given.
+    pub fn next(mut self) -> ChunkPos? {
+        while not self.ended {
+            let p = self.next_place() else return none
+            if self.area.contains(p) {
+                return some(p)
+            }
+        }
+        return none
+    }
+
+    // The next place the pattern goes, in the area's bounds or not, or `none` at its end.
+    fn next_place(mut self) -> ChunkPos? {
+        return match self.pattern {
+            Loop => self.next_row(),
+            Region => self.next_region(),
+            Concentric => self.next_ring(),
+            Spiral => self.next_spiral(),
+        }
+    }
+
+    fn next_row(mut self) -> ChunkPos? {
+        if self.z > self.area.max_z {
+            self.ended = true
+            return none
+        }
+        let p = ChunkPos { x: self.x, z: self.z }
+        self.x += 1
+        if self.x > self.area.max_x {
+            self.x = self.area.min_x
+            self.z += 1
+        }
+        return some(p)
+    }
+
+    // Regions by `z`, then `x`, and in each, its chunks in the bounds row by row.
+    fn next_region(mut self) -> ChunkPos? {
+        loop {
+            if self.rz > self.area.max_z >> 5 {
+                self.ended = true
+                return none
+            }
+            let lo_x = (self.rx << 5).max(self.area.min_x)
+            let hi_x = ((self.rx << 5) + 31).min(self.area.max_x)
+            let lo_z = (self.rz << 5).max(self.area.min_z)
+            let hi_z = ((self.rz << 5) + 31).min(self.area.max_z)
+            if self.x < lo_x {
+                self.x = lo_x
+            }
+            if self.z < lo_z {
+                self.z = lo_z
+            }
+            if self.z <= hi_z and self.x <= hi_x {
+                let p = ChunkPos { x: self.x, z: self.z }
+                self.x += 1
+                if self.x > hi_x {
+                    self.x = lo_x
+                    self.z += 1
+                }
+                return some(p)
+            }
+            // The next region along `x`, or the first of the next row of them.
+            self.rx += 1
+            if self.rx > self.area.max_x >> 5 {
+                self.rx = self.area.min_x >> 5
+                self.rz += 1
+            }
+            self.x = self.rx << 5
+            self.z = self.rz << 5
+        }
+    }
+
+    // Ring 0 is the center; ring r its 8r chunks r out, from its north-west corner east along
+    // the north side, south along the east, west along the south and north along the west.
+    fn next_ring(mut self) -> ChunkPos? {
+        loop {
+            if self.ring > self.reach {
+                self.ended = true
+                return none
+            }
+            let r = self.ring
+            if r == 0 {
+                self.ring = 1
+                self.along = 0
+                return some(self.center)
+            }
+            let i = self.along
+            let side = i / (2 * r)
+            let s = i % (2 * r)
+            let (dx, dz) = if side == 0 { (s - r, -r) } else if side == 1 { (r, s - r) } else if side == 2 { (r - s, r) } else { (-r, r - s) }
+            self.along += 1
+            if self.along == 8 * r {
+                self.ring += 1
+                self.along = 0
+            }
+            let p = ChunkPos { x: self.center.x + dx, z: self.center.z + dz }
+            if p.x >= self.area.min_x and p.x <= self.area.max_x and p.z >= self.area.min_z and p.z <= self.area.max_z {
+                return some(p)
+            }
+        }
+    }
+
+    // East 1, south 1, west 2, north 2, east 3 and on, until it's covered the square `reach`
+    // around the center, (2 × reach + 1)² places.
+    fn next_spiral(mut self) -> ChunkPos? {
+        let side = u64(u32.wrap(2 * self.reach + 1))
+        loop {
+            if self.taken >= side * side {
+                self.ended = true
+                return none
+            }
+            if self.taken == 0 {
+                self.x = self.center.x
+                self.z = self.center.z
+            } else {
+                if self.way == 0 {
+                    self.x += 1
+                } else if self.way == 1 {
+                    self.z += 1
+                } else if self.way == 2 {
+                    self.x -= 1
+                } else {
+                    self.z -= 1
+                }
+                self.leg_step += 1
+                if self.leg_step == self.leg {
+                    self.leg_step = 0
+                    self.way = (self.way + 1) % 4
+                    self.legs_at_length += 1
+                    if self.legs_at_length == 2 {
+                        self.legs_at_length = 0
+                        self.leg += 1
+                    }
+                }
+            }
+            self.taken += 1
+            if self.x >= self.area.min_x and self.x <= self.area.max_x and self.z >= self.area.min_z and self.z <= self.area.max_z {
+                return some(ChunkPos { x: self.x, z: self.z })
+            }
+        }
+    }
+}
+
+/// Where a task holds its chunks: a dimension's level.
+pub interface Holds {
+    /// Holds the chunk at `pos` until it's let go: it's read, or made, then lit, until it's full.
+    fn hold(mut self, pos: ChunkPos)
+    /// Whether the chunk at `pos` is done: full, which is lit.
+    fn done(self, pos: ChunkPos) -> bool
+    /// Stops holding the chunk at `pos`, so it unloads, saved, once it's ready to.
+    fn unhold(mut self, pos: ChunkPos)
+}
+
+// A chunk a task holds, and whether it's full.
+struct Held {
+    pos: ChunkPos
+    done: bool
+}
+
+/// The most chunks a task holds at once, and the most it starts holding a tick (D275).
+pub const MOST_HELD: usize = 1024
+pub const MOST_STARTED_A_TICK: usize = 128
+
+// How far back the rate's measured, in nanoseconds.
+const RATE_SPAN: u64 = 10000000000
+
+/// A task pregenerating a selection's area.
+pub struct Task {
+    pub selection: Selection
+    area: Area
+    walk: Walk
+    /// The chunks in the area.
+    pub total: u64
+    /// The chunks of the walk before the first still held, which are all done.
+    pub passed: u64
+    /// The chunks done, `passed` and those held that are full.
+    pub done: u64
+    window: Deque<Held>
+    /// Whether it's paused: it starts no chunk, and those it holds finish.
+    pub paused: bool
+    /// The time it's run, in nanoseconds, not counting while it's paused.
+    pub spent: u64
+    // When it last stepped, if it was running then.
+    last: u64?
+    // The chunks done a second apart, for the rate: when, and how many.
+    marks: Deque<(u64, u64)>
+    /// The last chunk it started.
+    pub at: ChunkPos? = none
+}
+
+impl Task {
+    /// A task for `selection`, from its start.
+    pub fn new(selection: Selection) -> Task {
+        return Task.resumed(selection, 0, 0, false)
+    }
+
+    /// A task for `selection` that's `passed` chunks along its walk and has run `spent`
+    /// nanoseconds, as it was saved.
+    pub fn resumed(selection: Selection, passed: u64, spent: u64, paused: bool) -> Task {
+        let area = selection.area()
+        let total = area.count()
+        var walk = Walk.new(selection.pattern, area.copy())
+        let along = passed.min(total)
+        for _ in 0u64..along {
+            _ = walk.next()
+        }
+        return Task { selection: selection, area: area, walk: walk, total: total, passed: along, done: along, window: Deque<Held>(), paused: paused, spent: spent, last: none, marks: Deque<(u64, u64)>() }
+    }
+
+    /// Whether every chunk is done: the walk's given them all, and none is still held.
+    pub fn finished(self) -> bool {
+        return self.walk.ended and self.window.is_empty()
+    }
+
+    /// Pauses it, or has it carry on, measuring its rate afresh.
+    pub fn set_paused(mut self, paused: bool) {
+        if self.paused and not paused {
+            self.marks.clear()
+        }
+        self.paused = paused
+    }
+
+    /// How many chunks it holds.
+    pub fn held(self) -> usize {
+        return self.window.len()
+    }
+
+    /// A step at `now`, in nanoseconds: each chunk it holds that's full is let go and done, and
+    /// unless it's paused, it starts holding the next chunks of the walk, up to `MOST_HELD` at
+    /// once and `MOST_STARTED_A_TICK` a step.
+    pub fn step<H: Holds>(mut self, level: mut H, now: u64) {
+        if let then = self.last {
+            if now > then {
+                self.spent += now - then
+            }
+        }
+        self.last = if self.paused { none } else { some(now) }
+        for i in 0..self.window.len() {
+            if not self.window[i].done and level.done(self.window[i].pos) {
+                level.unhold(self.window[i].pos)
+                self.window[i].done = true
+                self.done += 1
+            }
+        }
+        while not self.window.is_empty() and self.window[0].done {
+            _ = self.window.pop_first()
+            self.passed += 1
+        }
+        if not self.paused {
+            var started: usize = 0
+            while self.window.len() < MOST_HELD and started < MOST_STARTED_A_TICK {
+                let p = self.walk.next() else break
+                level.hold(p)
+                self.window.push_last(Held { pos: p, done: false })
+                self.at = some(p)
+                started += 1
+            }
+        }
+        if self.marks.is_empty() or now >= self.marks[self.marks.len() - 1].0 + 1000000000 {
+            self.marks.push_last((now, self.done))
+            while self.marks.len() > 1 and now - self.marks[0].0 > RATE_SPAN {
+                _ = self.marks.pop_first()
+            }
+        }
+    }
+
+    /// Lets go of every chunk it holds, as it's cancelled.
+    pub fn let_go_all<H: Holds>(mut self, level: mut H) {
+        while let h = self.window.pop_first() {
+            if not h.done {
+                level.unhold(h.pos)
+            }
+        }
+    }
+
+    /// Chunks done a second over the last 10 seconds, or `none` before a second's gone.
+    pub fn rate(self) -> f64? {
+        if self.marks.len() < 2 {
+            return none
+        }
+        let (t0, d0) = self.marks[0]
+        let (t1, d1) = self.marks[self.marks.len() - 1]
+        if t1 <= t0 {
+            return none
+        }
+        return some(f64.nearest(d1 - d0) * 1000000000.0 / f64.nearest(t1 - t0))
+    }
+
+    /// The share done, from 0 to 100.
+    pub fn percent(self) -> f64 {
+        return if self.total == 0 { 100.0 } else { f64.nearest(self.done) * 100.0 / f64.nearest(self.total) }
+    }
+
+    /// What's done, as a line: `12345 of 160000 chunks (7.72%), 1234 a second, 1 m 40 s spent,
+    /// 2 m 00 s left, at 12, -34`, without the rate and the time left while it's paused.
+    pub fn progress(self) -> String {
+        var out = "{self.done} of {self.total} chunks ({two_places(self.percent())}%)"
+        let rate: f64? = if self.paused { none } else { self.rate() }
+        if let r = rate {
+            out.push_str(", {i64.saturate((r + 0.5).floor())} a second")
+        }
+        out.push_str(", {duration(self.spent / 1000000000)} spent")
+        if let r = rate {
+            if r > 0.0 {
+                let left = f64.nearest(self.total - self.done.min(self.total)) / r
+                out.push_str(", {duration(u64.wrap(i64.saturate(left.ceil()).max(0)))} left")
+            }
+        }
+        if let p = self.at {
+            out.push_str(", at {p.x}, {p.z}")
+        }
+        return out
+    }
+
+    /// The task as `data/calcite/pregen.dat` keeps it, with the dimension `id` it's in.
+    pub fn saved(self, id: String) -> Tag {
+        var t = JavaHashMap<String, Tag>()
+        t.insert("dimension", Tag.Str(id.copy()))
+        t.insert("shape", Tag.Str(String(self.selection.shape.name())))
+        t.insert("pattern", Tag.Str(String(self.selection.pattern.name())))
+        t.insert("center_x", Tag.Double(self.selection.center_x))
+        t.insert("center_z", Tag.Double(self.selection.center_z))
+        t.insert("radius", Tag.Double(self.selection.radius))
+        t.insert("radius_z", Tag.Double(self.selection.radius_z))
+        t.insert("passed", Tag.Long(i64.wrap(self.passed)))
+        t.insert("spent", Tag.Long(i64.wrap(self.spent / 1000000)))
+        t.insert("paused", Tag.Byte(if self.paused { 1 } else { 0 }))
+        return Tag.Compound(t)
+    }
+}
+
+/// A task running in one of the world's dimensions, and who's told how it goes.
+pub struct Run {
+    /// The dimension, by its place among the world's, and its name.
+    pub dim: usize
+    pub id: String
+    pub task: Task
+    /// The player who started it, who's told in chat each time another tenth of it is done, or
+    /// `none` where the console started it or it carried on as the server started.
+    pub starter: Uuid?
+    /// When the console was last told how it goes, on the server's clock, and the tenths done
+    /// the starter was last told of.
+    pub logged_at: u64 = 0
+    pub told_tenths: u64 = 0
+}
+
+impl Run {
+    /// How it goes, as the console's told: `Pregen minecraft:overworld: 12345 of 160000 chunks
+    /// (7.72%), ...`.
+    pub fn line(self) -> String {
+        return "Pregen {self.id}: {self.task.progress()}"
+    }
+
+    /// What it came to, once it's done: `Pregen minecraft:overworld done: 3844 chunks in 12 s, 320
+    /// a second`.
+    pub fn done_line(self) -> String {
+        let seconds = self.task.spent / 1000000000
+        var out = "Pregen {self.id} done: {self.task.done} chunks in {duration(seconds)}"
+        if self.task.spent > 0 {
+            let rate = f64.nearest(self.task.done) * 1000000000.0 / f64.nearest(self.task.spent)
+            out.push_str(", {i64.saturate((rate + 0.5).floor())} a second")
+        }
+        return out
+    }
+
+    /// The tenths of it done, from 0 to 10.
+    pub fn tenths(self) -> u64 {
+        if self.task.total == 0 {
+            return 10
+        }
+        return self.task.done.min(self.task.total) * 10 / self.task.total
+    }
+}
+
+/// What a source has chosen for the next task it starts: the selection, and the dimension, by its
+/// place among the world's, or `none` for the one the source is in.
+pub struct Choice {
+    pub selection: Selection
+    pub dim: usize?
+}
+
+impl Choice {
+    /// Chunky's: its default selection, in the source's dimension.
+    pub fn new() -> Choice {
+        return Choice { selection: Selection {}, dim: none }
+    }
+}
+
+/// The saved data the tasks are kept in, in the world's `data`: `data/calcite/pregen.dat`.
+pub fn saved_id() -> Identifier {
+    return Identifier { namespace: "calcite", path: "pregen" }
+}
+
+/// What `data/calcite/pregen.dat` keeps of `runs`: `tasks`, each as `Task.saved` keeps it, with
+/// the name of the dimension it's in.
+pub fn saved_data(runs: List<Run>) -> Tag {
+    var tasks = List<Tag>()
+    for r in runs {
+        tasks.push(r.task.saved(r.id))
+    }
+    var data = JavaHashMap<String, Tag>()
+    data.insert("tasks", Tag.List(tasks))
+    return Tag.Compound(data)
+}
+
+/// The tasks `data/calcite/pregen.dat`'s `data` keeps, each with the name of the dimension it's
+/// in, but those that can't be read.
+pub fn saved_tasks(data: JavaHashMap<String, Tag>) -> List<(String, Task)> {
+    var out = List<(String, Task)>()
+    if not data.contains("tasks") {
+        return out
+    }
+    match data["tasks"] {
+        Tag.List(items) => {
+            for item in items {
+                if let found = saved_task(item) {
+                    out.push(found)
+                }
+            }
+        },
+        _ => {},
+    }
+    return out
+}
+
+/// A task `Task.saved` kept, and the dimension it's in, or `none` where it's not one.
+pub fn saved_task(tag: Tag) -> (String, Task)? {
+    return match tag {
+        Tag.Compound(fields) => task_of(fields),
+        _ => none,
+    }
+}
+
+fn task_of(fields: JavaHashMap<String, Tag>) -> (String, Task)? {
+    let id = text(fields, "dimension") else return none
+    let shape = Shape.named(text(fields, "shape") ?? String()) else return none
+    let pattern = Pattern.named(text(fields, "pattern") ?? String()) else return none
+    let selection = Selection {
+        shape: shape,
+        pattern: pattern,
+        center_x: number(fields, "center_x") ?? 0.0,
+        center_z: number(fields, "center_z") ?? 0.0,
+        radius: number(fields, "radius") ?? 500.0,
+        radius_z: number(fields, "radius_z") ?? 500.0,
+    }
+    let passed = if fields.contains("passed") { fields["passed"].number_long() ?? 0 } else { 0 }
+    let spent = if fields.contains("spent") { fields["spent"].number_long() ?? 0 } else { 0 }
+    let paused = if fields.contains("paused") { (fields["paused"].number_int() ?? 0) != 0 } else { false }
+    return some((id, Task.resumed(selection, u64.wrap(passed.max(0)), u64.wrap(spent.max(0)) * 1000000, paused)))
+}
+
+fn text(fields: JavaHashMap<String, Tag>, key: str) -> String? {
+    if not fields.contains(key) {
+        return none
+    }
+    return match fields[key] {
+        Tag.Str(s) => some(s.copy()),
+        _ => none,
+    }
+}
+
+fn number(fields: JavaHashMap<String, Tag>, key: str) -> f64? {
+    if not fields.contains(key) {
+        return none
+    }
+    return fields[key].number_double()
+}
+
+/// `seconds` as a time to read: `45 s`, `3 m 05 s` or `2 h 07 m`.
+pub fn duration(seconds: u64) -> String {
+    if seconds < 60 {
+        return "{seconds} s"
+    }
+    if seconds < 3600 {
+        return "{seconds / 60} m {two_digits(seconds % 60)} s"
+    }
+    return "{seconds / 3600} h {two_digits(seconds / 60 % 60)} m"
+}
+
+/// A length in blocks as it's shown: whole, as `500`, where it is, else as it is, `13.5`.
+pub fn blocks(v: f64) -> String {
+    if v == v.floor() and v.abs() < 1.0e15 {
+        return "{i64.saturate(v)}"
+    }
+    return "{v}"
+}
+
+fn two_digits(n: u64) -> String {
+    return if n < 10 { "0{n}" } else { "{n}" }
+}
+
+// `v` with two decimal places, such as `7.72`.
+fn two_places(v: f64) -> String {
+    let hundredths = i64.saturate((v * 100.0 + 0.5).floor())
+    return "{hundredths / 100}.{two_digits(u64.wrap(hundredths.abs() % 100))}"
+}

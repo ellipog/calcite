@@ -32,11 +32,12 @@ import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
-import server.commands.{Failure, GAMEMASTERS, OWNERS, Parsed, Targets, failure_context, parse, tree}
+import server.commands.{Failure, GAMEMASTERS, OWNERS, Parsed, PregenCommand, Targets, failure_context, parse, tree}
 import server.configuration.{Configuration}
 import server.level.{ChunkPacket, Level, PORTAL_RADIUS, SPAWN_RADIUS, VERSION_SHIFT}
 import server.link.{FileRead, Input, Link, Report}
 import server.log.{Entry, Look}
+import server.pregen.{Choice, Run, Shape, Task as PregenTask, blocks, saved_data as pregen_data, saved_id as pregen_saved_id}
 import server.sending.{Outbox, Sending}
 import server.status.{ServerStatus}
 import server.play.{World, display_name}
@@ -438,7 +439,28 @@ pub struct Network {
     level_name: String = "world"
     saving: Saving? = none
     autosave_in: i32 = AUTOSAVE_TICKS
+    // Pregenerating (CAL-71, D275): the tasks running, a dimension's at most, in the order they
+    // started; what each source has chosen for the next it starts, by `source_key`; how often the
+    // console's told how they go, in nanoseconds, and whether it's told at all; when they were
+    // last saved, on the caller's clock; and whether there's been one since the server started,
+    // so a world that never has one isn't given their file.
+    pregens: List<Run> = List<Run>()
+    choices: Map<String, Choice> = Map<String, Choice>()
+    pregen_every: u64 = PREGEN_LOG_EVERY
+    pregen_silent: bool = false
+    pregen_saved_at: u64 = 0
+    pregen_touched: bool = false
+    // The caller's clock at the last tick.
+    now: u64 = 0
 }
+
+/// How often the console's told how pregenerating goes, until `pregen quiet` says otherwise:
+/// every 5 seconds.
+pub const PREGEN_LOG_EVERY: u64 = 5000000000
+
+// How often the pregen tasks are saved while they run, besides when one starts, pauses, carries
+// on, is cancelled or is done, and with each save of the world: every 30 seconds.
+const PREGEN_SAVE_EVERY: u64 = 30000000000
 
 /// The ticks from one autosave to the next, as `computeNextAutosaveInterval` makes them at 20
 /// ticks a second: 300 seconds' worth, and at least 100.
@@ -505,6 +527,65 @@ impl Network {
             data.modded = true
             self.level_data = some(data)
         }
+    }
+
+    /// Carries on with the pregen tasks `data/calcite/pregen.dat` kept, each with the name of
+    /// the dimension it's in, as they were: running, or paused. One in a dimension the world
+    /// hasn't, or in one that already has one, is dropped, with a warning.
+    pub fn set_pregen(mut self, tasks: own List<(String, PregenTask)>) {
+        var all = tasks
+        while not all.is_empty() {
+            let (id, task) = all.remove(0)
+            var dim: usize? = none
+            match Identifier.parse(id) {
+                ok(name) => dim = self.world.dimension_of(name),
+                err(_) => {},
+            }
+            let d = dim else {
+                self.logs.push(Entry.warn("Pregen in {id} is dropped: the world has no such dimension"))
+                continue
+            }
+            if self.pregen_in(d) != none {
+                self.logs.push(Entry.warn("Pregen in {id} is dropped: there's another there"))
+                continue
+            }
+            var run = Run { dim: d, id: id, task: task, starter: none }
+            run.told_tenths = run.tenths()
+            let state = if run.task.paused { "is paused" } else { "carries on" }
+            self.logs.push(Entry.info("Pregen in {run.id} {state}: {run.task.progress()}"))
+            self.pregens.push(run)
+            self.pregen_touched = true
+        }
+    }
+
+    // The place among the tasks of the one in the dimension at `dim`.
+    fn pregen_in(self, dim: usize) -> usize? {
+        for i in 0..self.pregens.len() {
+            if self.pregens[i].dim == dim {
+                return some(i)
+            }
+        }
+        return none
+    }
+
+    /// How the pregen tasks go, for the dashboard: the share of their chunks done, in tenths of a
+    /// percent, and how many they do a second, or `none` where there are none.
+    pub fn pregen_shown(self) -> (u64, u64)? {
+        if self.pregens.is_empty() {
+            return none
+        }
+        var done: u64 = 0
+        var total: u64 = 0
+        var rate = 0.0
+        for r in self.pregens {
+            done += r.task.done.min(r.task.total)
+            total += r.task.total
+            if not r.task.paused {
+                rate += r.task.rate() ?? 0.0
+            }
+        }
+        let share: u64 = if total == 0 { 1000 } else { done * 1000 / total }
+        return some((share, u64.wrap(i64.saturate((rate + 0.5).floor()).max(0))))
     }
 
     /// Sets the world gen settings' `data`, which the first save writes.
@@ -821,6 +902,9 @@ impl Network {
             self.close(mut con)
             self.connections[i] = some(con)
         }
+        if self.pregen_touched {
+            self.save_pregen()
+        }
         self.logs.push(Entry.info(String("Saving worlds")).calcite(Look.Words(String("Saving the world"))))
         for d in 0..self.levels.len() {
             let id = self.world.dims[d].id.to_string()
@@ -836,6 +920,77 @@ impl Network {
         self.autosave_in = AUTOSAVE_TICKS
         self.save_players()
         self.save_level()
+        if self.pregen_touched {
+            self.save_pregen()
+        }
+    }
+
+    // Saves the pregen tasks, as they are, to `data/calcite/pregen.dat`.
+    fn save_pregen(mut self) {
+        self.pregen_saved_at = self.now
+        var saving = self.saving.take() else return
+        saving.save(Save.Data(pregen_saved_id(), pregen_data(self.pregens)))
+        self.saving = some(saving)
+    }
+
+    // Steps each pregen task, then settles the level it holds its chunks in, so what it started
+    // is asked for this tick. The console's told how each goes every `pregen_every`, unless
+    // they're silent, and the player who started one each time another tenth of it is done.
+    // One that's done says so, and goes.
+    fn pregen_tick(mut self, now: u64) {
+        if self.pregens.is_empty() {
+            return
+        }
+        var i: usize = 0
+        while i < self.pregens.len() {
+            let d = self.pregens[i].dim
+            var run = self.pregens.remove(i)
+            run.task.step(mut self.levels[d], now)
+            self.levels[d].pump()
+            if run.task.finished() {
+                let line = run.done_line()
+                self.logs.push(Entry.info(line.copy()))
+                if let who = run.starter {
+                    self.tell_player(who, Component.literal(line))
+                }
+                self.save_pregen()
+                continue
+            }
+            if not self.pregen_silent and not run.task.paused {
+                if now >= run.logged_at + self.pregen_every {
+                    run.logged_at = now
+                    self.logs.push(Entry.info(run.line()))
+                }
+                let tenths = run.tenths()
+                if tenths > run.told_tenths {
+                    run.told_tenths = tenths
+                    if let who = run.starter {
+                        self.tell_player(who, Component.literal(run.line()).colored("gray"))
+                    }
+                }
+            }
+            self.pregens.insert(i, run)
+            i += 1
+        }
+        if not self.pregens.is_empty() and now >= self.pregen_saved_at + PREGEN_SAVE_EVERY {
+            self.save_pregen()
+        }
+    }
+
+    // A system message to the player in play whose UUID is `id`, if they're on.
+    fn tell_player(mut self, id: Uuid, message: own Component) {
+        for slot in 0..self.connections.len() {
+            var found = false
+            if let c = self.connections[slot] {
+                if let p = c.profile {
+                    found = p.id == id and not c.closing and c.phase == Phase.Play
+                }
+            }
+            if found {
+                self.tell_slot(slot, message)
+                return
+            }
+        }
     }
 
     // Saves each player in the world, as `PlayerList.saveAll` does.
@@ -996,6 +1151,8 @@ impl Network {
         for d in 0..self.levels.len() {
             self.levels[d].tick()
         }
+        self.now = now
+        self.pregen_tick(now)
         self.level_lines()
         self.dispatch_all()
         for i in 0..self.connections.len() {
@@ -2504,6 +2661,12 @@ impl Network {
                 }
             },
             ok(Parsed.FlySpeed(speed)) => self.fly_speed(source, speed),
+            ok(Parsed.Pregen(c)) => {
+                match self.pregen_command(source, c) {
+                    ok => {},
+                    err(f) => self.command_failed(source, f),
+                }
+            },
             ok(Parsed.Dimension(id, targets)) => {
                 match self.dimension_command(source, id, targets) {
                     ok => {},
@@ -2733,6 +2896,199 @@ impl Network {
             self.system_message(mut con, Component.literal("Your flying speed is {times} times vanilla's"))
         }
         self.connections[slot] = some(con)
+    }
+
+    // What a source is known by among the pregen choices: the console, or a player's UUID.
+    fn source_key(self, source: Source) -> String {
+        match source {
+            Source.Console => return String("console"),
+            Source.Player(slot) => {
+                if let c = self.connections[slot] {
+                    if let p = c.profile {
+                        return p.id.to_string()
+                    }
+                }
+                return "slot {slot}"
+            },
+        }
+    }
+
+    // The dimension the source is in, by its place among the world's: the overworld's for the
+    // console.
+    fn dim_of(self, source: Source) -> usize {
+        return match source {
+            Source.Console => 0,
+            Source.Player(slot) => match self.connections[slot] {
+                some(c) => c.player.dim,
+                none => 0,
+            },
+        }
+    }
+
+    // `pregen`, as Chunky's commands: starting, pausing, carrying on with and cancelling the
+    // tasks, a dimension's each, saying how they go, and choosing what the source's next one
+    // pregenerates, which each source has its own of, Chunky's default until it changes it
+    // (CAL-71, D275). What starts or stops a task is told the operators too.
+    fn pregen_command(mut self, source: Source, c: own PregenCommand) ! Failure {
+        let key = self.source_key(source)
+        var choice = self.choices.get(key) ?? Choice.new()
+        match c {
+            PregenCommand.Start => {
+                let dim = choice.dim ?? self.dim_of(source)
+                let id = self.world.dims[dim].id.to_string()
+                if self.pregen_in(dim) != none {
+                    fail Failure.alone(Component.literal("Pregen is already running in {id}: cancel it first"))
+                }
+                let task = PregenTask.new(choice.selection)
+                if task.total == 0 {
+                    fail Failure.alone(Component.literal("The selection holds no chunks: a chunk's in it where its middle is"))
+                }
+                let total = task.total
+                var starter: Uuid? = none
+                match source {
+                    Source.Player(slot) => {
+                        if let con = self.connections[slot] {
+                            if let p = con.profile {
+                                starter = some(p.id)
+                            }
+                        }
+                    },
+                    Source.Console => {},
+                }
+                self.pregens.push(Run { dim: dim, id: id.copy(), task: task, starter: starter, logged_at: self.now })
+                self.pregen_touched = true
+                self.save_pregen()
+                self.success(source, Component.literal("Pregenerating {total} chunks in {id}: {choice.selection.described()}"), true)
+            },
+            PregenCommand.Pause => {
+                var names = List<String>()
+                for i in 0..self.pregens.len() {
+                    if not self.pregens[i].task.paused {
+                        self.pregens[i].task.set_paused(true)
+                        names.push(self.pregens[i].id.copy())
+                    }
+                }
+                if names.is_empty() {
+                    fail Failure.alone(Component.literal("No pregen is running"))
+                }
+                self.save_pregen()
+                self.success(source, Component.literal("Paused pregen in {listed(names)}"), true)
+            },
+            PregenCommand.Continue => {
+                var names = List<String>()
+                for i in 0..self.pregens.len() {
+                    if self.pregens[i].task.paused {
+                        self.pregens[i].task.set_paused(false)
+                        self.pregens[i].logged_at = self.now
+                        names.push(self.pregens[i].id.copy())
+                    }
+                }
+                if names.is_empty() {
+                    fail Failure.alone(Component.literal("No pregen is paused"))
+                }
+                self.save_pregen()
+                self.success(source, Component.literal("Carrying on with pregen in {listed(names)}"), true)
+            },
+            PregenCommand.Cancel => {
+                if self.pregens.is_empty() {
+                    fail Failure.alone(Component.literal("No pregen is running"))
+                }
+                var names = List<String>()
+                while let r = self.pregens.pop() {
+                    var run = r
+                    run.task.let_go_all(mut self.levels[run.dim])
+                    self.levels[run.dim].pump()
+                    names.insert(0, run.id.copy())
+                }
+                self.save_pregen()
+                self.success(source, Component.literal("Cancelled pregen in {listed(names)}"), true)
+            },
+            PregenCommand.Progress => {
+                if self.pregens.is_empty() {
+                    fail Failure.alone(Component.literal("No pregen is running"))
+                }
+                var lines = List<String>()
+                for r in self.pregens {
+                    lines.push(if r.task.paused { "{r.line()}, paused" } else { r.line() })
+                }
+                for line in lines {
+                    self.success(source, Component.literal(line), false)
+                }
+            },
+            PregenCommand.Selection => {
+                let dim = choice.dim ?? self.dim_of(source)
+                let id = self.world.dims[dim].id.to_string()
+                let count = choice.selection.area().count()
+                self.success(source, Component.literal("Pregen selection: {id}, {choice.selection.described()}, {count} chunks"), false)
+            },
+            PregenCommand.Dimension(id) => {
+                let dim = self.world.dimension_of(id) else fail Failure.alone(Component.translatable("argument.dimension.invalid", [Component.literal(id.to_string())]))
+                choice.dim = some(dim)
+                self.success(source, Component.literal("Pregen dimension set to {id.to_string()}"), false)
+            },
+            PregenCommand.Center(at) => {
+                var x = 0.0
+                var z = 0.0
+                if let (gx, gz) = at {
+                    x = gx
+                    z = gz
+                } else {
+                    match source {
+                        Source.Player(slot) => {
+                            if let con = self.connections[slot] {
+                                x = con.player.x
+                                z = con.player.z
+                            }
+                        },
+                        Source.Console => fail Failure.alone(Component.translatable("permissions.requires.player", [])),
+                    }
+                }
+                choice.selection.center_x = x
+                choice.selection.center_z = z
+                self.success(source, Component.literal("Pregen center set to {blocks(x)}, {blocks(z)}"), false)
+            },
+            PregenCommand.Spawn => {
+                if self.spawn_pending {
+                    fail Failure.alone(Component.literal("The world's spawn isn't chosen yet: try again in a moment"))
+                }
+                choice.selection.center_x = f64(self.respawn.pos.x)
+                choice.selection.center_z = f64(self.respawn.pos.z)
+                let line = "Pregen center set to the world's spawn, {self.respawn.pos.x}, {self.respawn.pos.z}"
+                self.success(source, Component.literal(line), false)
+            },
+            PregenCommand.WorldBorder => {
+                choice.selection.shape = Shape.Square
+                choice.selection.center_x = 0.0
+                choice.selection.center_z = 0.0
+                choice.selection.radius = BORDER_HALF
+                choice.selection.radius_z = BORDER_HALF
+                self.success(source, Component.literal("Pregen selection set to the world border: {choice.selection.described()}"), false)
+            },
+            PregenCommand.Radius(r, along_z) => {
+                choice.selection.radius = r
+                choice.selection.radius_z = along_z ?? r
+                let shown = if let rz = along_z { "{blocks(r)} by {blocks(rz)}" } else { blocks(r) }
+                self.success(source, Component.literal("Pregen radius set to {shown}"), false)
+            },
+            PregenCommand.Shape(s) => {
+                choice.selection.shape = s
+                self.success(source, Component.literal("Pregen shape set to {s.name()}"), false)
+            },
+            PregenCommand.Pattern(p) => {
+                choice.selection.pattern = p
+                self.success(source, Component.literal("Pregen pattern set to {p.name()}"), false)
+            },
+            PregenCommand.Quiet(seconds) => {
+                self.pregen_every = u64(u32.wrap(seconds)) * 1000000000
+                self.success(source, Component.literal("Pregen progress is logged every {seconds} seconds"), false)
+            },
+            PregenCommand.Silent => {
+                self.pregen_silent = not self.pregen_silent
+                let line = String(if self.pregen_silent { "Pregen progress is no longer logged" } else { "Pregen progress is logged again" })
+                self.success(source, Component.literal(line), false)
+            },
+        }
+        self.choices.insert(key, choice)
     }
 
     // `calcite dimension`: each player named, or the one who ran it, sent on their way to the
@@ -3855,4 +4211,16 @@ fn joined_words(name: String, address: String) -> String {
         return "{name} joined from {address[1..]}"
     }
     return "{name} joined"
+}
+
+// `names` as a list to read: `a`, `a and b`, `a, b and c`.
+fn listed(names: List<String>) -> String {
+    var out = String()
+    for i in 0..names.len() {
+        if i > 0 {
+            out.push_str(if i + 1 == names.len() { " and " } else { ", " })
+        }
+        out.push_str(names[i])
+    }
+    return out
 }

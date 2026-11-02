@@ -1,6 +1,6 @@
 """A real client's join: Mojang's own 26.3 client joins Calcite, walks, jumps and chats.
 
-    py -I rig/runner/realclient.py [--online NAME] [--server PATH] [--world PATH] [--view N] [--message TEXT] [--dimension ID] [--watch [--mbit N] [--ms N] [--dump FILE]] [--set KEY=VALUE]... [--keep-open SECONDS]
+    py -I rig/runner/realclient.py [--online NAME] [--server PATH] [--world PATH] [--view N] [--message TEXT] [--dimension ID] [--watch [--mbit N] [--ms N] [--dump FILE]] [--set KEY=VALUE]... [--command TEXT]... [--keep-open SECONDS]
 
 The protocol suites and the tests play the client's side with Calcite's own code, so this is
 the one check where the other end is the game itself. Calcite runs from its release build,
@@ -21,6 +21,10 @@ for.
 
 --set KEY=VALUE gives the server a calcite.properties setting, such as chunk-send-multiplier=2,
 and can be given any number of times.
+
+--command TEXT is typed into the server's console once it's ready, before the client starts, such
+as `pregen start` to have the client join while the server pregenerates (CAL-71). It can be given
+any number of times, and they're typed in order.
 
 Without --online, the server is offline and the client is player RealClient, with no account.
 With --online NAME, the server is in online mode, and the client plays as the Modrinth App's
@@ -351,6 +355,8 @@ def main():
     parser.add_argument("--dump", help="with --watch, a file each chunk packet's written to, as it was before it was compressed")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                         help="a calcite.properties setting for the server, such as chunk-send-multiplier=2")
+    parser.add_argument("--command", action="append", default=[], metavar="TEXT",
+                        help="a console command typed once the server's ready, before the client starts")
     parser.add_argument("--keep-open", type=float, default=0, help="seconds to leave the client in the game at the end")
     args = parser.parse_args()
     dimension = args.dimension if not args.dimension or ":" in args.dimension else f"minecraft:{args.dimension}"
@@ -383,6 +389,11 @@ def main():
     if not done:
         sys.exit("the server didn't start:\n" + "\n".join(server.lines[-20:]))
     print(f"server: {done.split(': ', 1)[1]}")
+    for line in args.command:
+        server.p.stdin.write(f"{line}
+")
+        server.p.stdin.flush()
+        print(f"console: {line}")
     client = Process(command, game, OUT / "client.log")
     keyed = False
     moved = shot = None

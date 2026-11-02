@@ -246,8 +246,8 @@ Make the world real: storage that vanilla can read, Folia-style regions on a loc
 - **P5.10** The Overworld first, then the Nether and the End.
 - **P5.11** Cache chunk packets: encode each chunk once and send the same bytes to every player who needs it.
 - **P5.12** Pregenerate chunks, built in, as the Chunky mod does: `/pregen` with Chunky's subcommands generates every chunk in an area, a center and radius or the world border, in any of the usual shapes, region by region or in rings or a spiral.
-  - Progress, rate, time spent and time left go to the console dashboard, chat and a boss bar.
-  - Chunks generate as jobs within a tick budget, so ticks stay on time, and are saved and unloaded as they finish. Generated chunks are skipped.
+  - Progress, rate, time spent and time left go mostly to the console and its dashboard, and now and then to chat for whoever started it, with no boss bar (Elliot, 2026-11-02).
+  - A window of chunks is held at once, each until it's full and lit, then let go, so it's saved and unloaded, and memory stays flat (D275). Chunks saved full are read, not generated again.
   - A task's state is saved beside the world, so it resumes after a pause, a restart or a crash.
   - A pregenerated chunk is the chunk a player walking there would have generated (D29).
   - Phase 8 times it against Chunky on Paper and Folia.

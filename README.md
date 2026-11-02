@@ -16,6 +16,7 @@ Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calc
 
 - [Build plan](docs/PLAN.md): phases, tasks and gates
 - [Decision log](docs/decisions.md): everything that's settled, and why
+- [Pregenerating chunks](docs/pregen.md): `/pregen`, Chunky built in
 - [Host API sketch](plugins/api/HOST_API.md): the plugin contract
 - [Source](src/README.md): Calcite's Calx modules and their tests
 - [Oracle rig](rig/README.md): how Calcite is checked against vanilla, bit for bit
