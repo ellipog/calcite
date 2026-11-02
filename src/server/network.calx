@@ -10,7 +10,7 @@ import auth.profile.{GameProfile, is_valid_name}
 import auth.services.{JoinCheck, KeySet, Services}
 import auth.session.{Joined, server_hash}
 import auth.velocity.{channel, request, read}
-import chat.component.{ClickEvent, Component}
+import chat.component.{Component}
 import chat.language.{Language}
 import java.uuid.{Uuid}
 import nbt.tag.{Tag}
@@ -22,7 +22,7 @@ import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{DATA_VERSION, PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
-import protocol.play.{Abilities, BookRecipes, BookTab, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundCommands, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundInitializeBorder, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, ClockUpdate, CommandNode, GlobalPos, INITIALIZE_CHAT, LEVEL_CHUNKS_LOAD_START, NodeKind, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes}
+import protocol.play.{Abilities, BookRecipes, BookTab, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundInitializeBorder, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, ClockUpdate, GlobalPos, INITIALIZE_CHAT, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
@@ -32,6 +32,7 @@ import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
+import server.commands.{Failure, GAMEMASTERS, OWNERS, Parsed, Targets, failure_context, parse, tree}
 import server.configuration.{Configuration}
 import server.level.{ChunkPacket, Level, SPAWN_RADIUS}
 import server.link.{FileRead, Input, Link, Report}
@@ -46,7 +47,7 @@ import std.time.{Timestamp}
 import storage.level.{LevelData, Spawn}
 import storage.players.{PlayerFiles, SavedPosition, saved_position}
 import storage.world_gen.{world_gen_id}
-import world.collision.{CollisionStates}
+import world.collision.{Aabb, CollisionStates}
 import world.flat.{MIN_Y, SECTIONS, SURFACE_Y}
 import world.item.{ItemStack}
 import world.modes.{GameType, PreviousGameType}
@@ -306,7 +307,35 @@ struct Player {
     // Their data as it was read as they joined, which their saves keep what Calcite doesn't know
     // of in, or `none` for a player new to the world.
     data: JavaHashMap<String, Tag>? = none
+    // Their game mode and the one before it, as `ServerPlayerGameMode` keeps them, and what they
+    // may do, as their `Abilities` (D239).
+    mode: GameType = GameType.Survival
+    previous_mode: GameType? = none
+    abilities: Abilities = Abilities()
+    // Their permission level, from ops.json as they joined, and when they joined, which orders
+    // the players as vanilla's player list does.
+    level: i32 = 0
+    joined: u64 = 0
 }
+
+// A command, or a game mode picked with F3 and F4, from the player in a slot, which runs once
+// their connection is back in its slot (D239).
+enum Queued {
+    Command(usize, String)
+    Mode(usize, GameType)
+}
+
+// Who runs a command: the console, or the player in a slot.
+enum Source {
+    Console
+    Player(usize)
+}
+
+// `ClientboundGameEventPacket.CHANGE_GAME_MODE`.
+const CHANGE_GAME_MODE: u8 = 3
+
+// Vanilla's flying speed, which `calcite flyspeed` multiplies.
+const FLYING_SPEED: f32 = 0.05f32
 
 // A login's check with the session server. It goes on if the player leaves, as vanilla's
 // authenticator thread does, and logs what it comes to either way.
@@ -382,6 +411,9 @@ pub struct Network {
     // ticks until the next autosave, as `ticksUntilAutosave`.
     level_data: LevelData? = none
     world_gen: Tag? = none
+    // The commands waiting for their players' connections, and how many players have joined.
+    queued: Deque<Queued> = Deque<Queued>()
+    joins: u64 = 0
     level_name: String = "world"
     saving: Saving? = none
     autosave_in: i32 = AUTOSAVE_TICKS
@@ -634,38 +666,14 @@ impl Network {
     }
 
     /// Runs a line typed into the console as a command from the console, which may run any, as
-    /// vanilla's `Commands.performPrefixedCommand` runs it: without a leading `/`, parsed as
-    /// brigadier parses it against the command tree. Calcite's tree has only `stop` so far, which
-    /// says so, then stops the server. Anything else gets brigadier's error, as
-    /// `Commands.finishParsing` sends it, which the console logs (P6.6 brings the rest).
+    /// vanilla's `Commands.performPrefixedCommand` runs it: without a leading `/`, read as
+    /// brigadier reads it against the commands Calcite has (`server.commands`), and what it says
+    /// logged (P6.6 brings the rest of vanilla's).
     pub fn command(mut self, line: String) {
         self.link.command(line)
         let input = if line.starts_with("/") { line[1..] } else { line.copy() }
-        let word = input[..input.find(" ") ?? input.len()]
-        if word == "stop" {
-            if input.len() == 4 {
-                let stopping = Component.translatable("commands.stop.stopping", []).get_string(self.lang)
-                self.logs.push(Entry.info(stopping).calcite(Look.Quiet))
-                self.stop()
-                return
-            }
-            // `stop` takes nothing after it. Brigadier reads past the space after it only where
-            // something follows the space, and the error's context starts there.
-            self.syntax_error("command.unknown.argument", input, Look.Words(String("stop takes nothing after it")))
-            return
-        }
-        let look = if input.is_empty() { Look.Quiet } else { Look.Words("There's no command {word} yet: so far Calcite has only stop") }
-        self.syntax_error("command.unknown.command", input, look)
-    }
-
-    // Brigadier's error for `input`: its message, then the input with `<--[HERE]`, which is where
-    // the input that couldn't be read starts and the part that could, which here is at most
-    // `stop `, under the 10 characters vanilla shows of it.
-    fn syntax_error(mut self, key: str, input: String, look: own Look) {
-        let message = Component.translatable(String(key), []).get_string(self.lang)
-        self.logs.push(Entry.info(message).calcite(look))
-        let here = Component.translatable("command.context.here", []).get_string(self.lang)
-        self.logs.push(Entry.info("{input}{here}").calcite(Look.Quiet))
+        self.run_command(Source.Console, input)
+        self.flush()
     }
 
     /// Stops the server at the console's request, as vanilla's shutdown hook halts it at Ctrl+C:
@@ -778,7 +786,7 @@ impl Network {
     fn save_player(mut self, con: Connection) {
         let p = con.profile else return
         var saving = self.saving.take() else return
-        saving.save(Save.Player(p.id, p.name.copy(), Tag.Compound(player_tag(con.player, p.id, self.world.settings.game_type))))
+        saving.save(Save.Player(p.id, p.name.copy(), Tag.Compound(player_tag(con.player, p.id))))
         self.saving = some(saving)
     }
 
@@ -1058,6 +1066,7 @@ impl Network {
             self.close(mut con)
         }
         self.connections[slot] = some(con)
+        self.run_queued()
     }
 
     // Reads what arrived on the connection and answers it. False when it's to close.
@@ -1910,22 +1919,41 @@ impl Network {
             }
         }
         let saved_data = con.prepare.data.take()
-        con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam, data: saved_data }
+        // Their game modes and abilities, as `loadGameTypes` reads them and
+        // `calculateGameModeForNewPlayer` picks the mode: the default where `force-gamemode` is on
+        // or they have none (D239).
+        var kept = Abilities()
+        var saved_mode: GameType? = none
+        var previous: GameType? = none
+        if let d = saved_data {
+            kept = saved_abilities(d)
+            saved_mode = saved_game_type(d, "playerGameType")
+            previous = saved_game_type(d, "previousPlayerGameType")
+        }
+        var mode = saved_mode ?? self.world.settings.game_type
+        if self.world.settings.force_game_mode {
+            mode = self.world.settings.game_type
+        }
+        kept.update(mode)
+        self.joins += 1
+        con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam, data: saved_data, mode: mode, previous_mode: previous, abilities: kept, level: self.access.level(profile.id), joined: self.joins }
         self.logs.push(Entry.info("{profile.name}[{con.address}] logged in with entity id {id} at ({con.player.x}, {con.player.y}, {con.player.z})").calcite(Look.Join(joined_words(profile.name, con.address))))
-        let mode = self.world.settings.game_type
-        let spawn = SpawnInfo { dimension_type: self.world.settings.dimension_type, dimension: overworld(), seed: self.world.settings.hashed_seed, game_type: mode, previous_game_type: PreviousGameType { mode: none }, is_debug: false, is_flat: true, last_death_location: none, portal_cooldown: 0, sea_level: -63 }
+        let spawn = SpawnInfo { dimension_type: self.world.settings.dimension_type, dimension: overworld(), seed: self.world.settings.hashed_seed, game_type: mode, previous_game_type: PreviousGameType { mode: previous }, is_debug: false, is_flat: true, last_death_location: none, portal_cooldown: 0, sea_level: -63 }
         let secure = self.enforces_secure_chat()
         let login = ClientboundLogin { player_id: id, hardcore: self.world.settings.hardcore, levels: [overworld()], max_players: self.world.settings.max_players, chunk_radius: self.world.settings.chunk_radius(), simulation_distance: self.world.settings.simulation_distance, reduced_debug_info: false, show_death_screen: true, do_limited_crafting: false, spawn: spawn, online_mode: self.settings.online_mode, enforces_secure_chat: secure }
         self.send(mut con, login, State.Play)
         let difficulty = self.world.settings.difficulty
         self.send(mut con, ClientboundChangeDifficulty { difficulty: difficulty, locked: false }, State.Play)
-        self.send(mut con, ClientboundPlayerAbilities { abilities: Abilities.of(mode) }, State.Play)
+        let abilities = con.player.abilities
+        self.send(mut con, ClientboundPlayerAbilities { abilities: abilities }, State.Play)
         self.send(mut con, ClientboundSetHeldSlot { slot: 0 }, State.Play)
-        // Calcite has no recipes, commands or operators until Phase 6, so the player gets none,
-        // and the permission level of a player who isn't an operator.
+        // Calcite has no recipes until Phase 6, so the player gets none. Then their permission
+        // level, as `sendPlayerPermissionLevel` sends it, an entity event from 24 up, and the
+        // commands it lets them use.
         self.send(mut con, ClientboundUpdateRecipes { item_sets: [], stonecutter: StonecutterRecipes {} }, State.Play)
-        self.send(mut con, ClientboundEntityEvent { entity_id: id, event: 24 }, State.Play)
-        self.send(mut con, ClientboundCommands { nodes: [CommandNode { kind: NodeKind.Root, children: [] }], root: 0 }, State.Play)
+        let level = con.player.level
+        self.send(mut con, ClientboundEntityEvent { entity_id: id, event: i8.wrap(24 + level) }, State.Play)
+        self.send(mut con, tree(level), State.Play)
         self.send(mut con, ClientboundRecipeBookSettings { crafting: closed_tab(), furnace: closed_tab(), blast_furnace: closed_tab(), smoker: closed_tab() }, State.Play)
         self.send(mut con, ClientboundRecipeBookAdd { recipes: BookRecipes {}, replace: true }, State.Play)
         self.broadcast_system(Component.translatable("multiplayer.player.joined", [display_name(profile)]).colored("yellow"), Look.Quiet)
@@ -1941,14 +1969,14 @@ impl Network {
         for c in self.connections {
             if let other = c {
                 if not other.closing and other.phase == Phase.Play {
-                    if let e = entry(other, mode, self.clock.unix_ms) {
+                    if let e = entry(other, other.player.mode, self.clock.unix_ms) {
                         others.push(e)
                     }
                 }
             }
         }
         self.send(mut con, ClientboundPlayerInfoUpdate { info: PlayerInfo.initializing(others) }, State.Play)
-        if let e = entry(con, mode, self.clock.unix_ms) {
+        if let e = entry(con, con.player.mode, self.clock.unix_ms) {
             let packet = encode_play(ClientboundPlayerInfoUpdate { info: PlayerInfo.initializing([e]) })
             self.broadcast(packet.copy())
             self.send_bytes(mut con, packet)
@@ -2193,6 +2221,22 @@ impl Network {
             PlayIn.ResourcePack(_) => return true,
             PlayIn.CustomClickAction(_) => return true,
             PlayIn.PlayerLoaded(_) => return true,
+            // `handlePlayerAbilities`: flying, where they may fly.
+            PlayIn.PlayerAbilities(a) => {
+                con.player.abilities.flying = a.flags & 2 != 0 and con.player.abilities.may_fly
+                return true
+            },
+            // `handleChangeGameMode`: a player who may use `gamemode` has it run for them.
+            PlayIn.ChangeGameMode(c) => {
+                let mode = GameType.by_id(c.mode)
+                if con.player.level < GAMEMASTERS {
+                    let short = Component.translatable("selectWorld.gameMode.{mode.name()}", []).get_string(self.lang)
+                    self.logs.push(Entry.warn("Player {player_name(con)} tried to change game mode to {short} without required permissions"))
+                } else {
+                    self.queued.push_last(Queued.Mode(con.conn.slot(), mode))
+                }
+                return true
+            },
             PlayIn.KeepAlive(k) => return self.answer_keep_alive(mut con, k, now),
             PlayIn.MovePlayerPos(m) => return self.moved(mut con, true, m.x, m.y, m.z, false, 0.0, 0.0),
             PlayIn.MovePlayerPosRot(m) => return self.moved(mut con, true, m.x, m.y, m.z, true, m.y_rot, m.x_rot),
@@ -2263,14 +2307,356 @@ impl Network {
         self.system_message(mut con, problem.colored("red"))
     }
 
-    // A command, as `handleChatCommand`, once its characters are checked. Calcite has no
-    // commands yet, so each is unknown, as vanilla's dispatcher finds a command it doesn't have.
+    // A command, as `handleChatCommand`, once its characters are checked: run once the
+    // player's connection is back in its slot, then counted toward their command spam.
     fn chat_command(mut self, con: mut Connection, command: String) -> bool {
         if let stays = self.refuse_chat(mut con, command, true) {
             return stays
         }
-        self.unknown_command(mut con, command)
+        self.queued.push_last(Queued.Command(con.conn.slot(), command.copy()))
         return self.spam(mut con, true)
+    }
+
+    // Runs what was queued while the players' connections were out of their slots.
+    fn run_queued(mut self) {
+        while let q = self.queued.pop_first() {
+            match q {
+                Queued.Command(slot, input) => self.run_command(Source.Player(slot), input),
+                Queued.Mode(slot, mode) => {
+                    if self.change_mode(slot, mode) {
+                        self.log_mode_change(Source.Player(slot), slot, mode)
+                    }
+                },
+            }
+        }
+    }
+
+    // Runs `input` from `source`, as `Commands.performCommand`: read against the commands the
+    // source's permission level lets it use, then run, or its failure told to the source.
+    fn run_command(mut self, source: Source, input: String) {
+        match parse(input, self.level_of(source)) {
+            ok(Parsed.Stop) => {
+                self.success(source, Component.translatable("commands.stop.stopping", []), true)
+                self.stop()
+            },
+            ok(Parsed.GameMode(mode, targets)) => {
+                match self.game_mode_command(source, mode, targets) {
+                    ok => {},
+                    err(f) => self.command_failed(source, f),
+                }
+            },
+            ok(Parsed.FlySpeed(speed)) => self.fly_speed(source, speed),
+            err(f) => self.command_failed(source, f),
+        }
+    }
+
+    // The source's permission level: the console's is the owners'.
+    fn level_of(self, source: Source) -> i32 {
+        return match source {
+            Source.Console => OWNERS,
+            Source.Player(slot) => match self.connections[slot] {
+                some(c) => c.player.level,
+                none => 0,
+            },
+        }
+    }
+
+    // `gamemode`, as `GameModeCommand.setMode`: each player named, or the one running it, put in
+    // `mode`, and told of it where they weren't in it already.
+    fn game_mode_command(mut self, source: Source, mode: GameType, targets: own Targets?) ! Failure {
+        var who = List<usize>()
+        if let t = targets {
+            who = self.players_named(source, t)
+            if who.is_empty() {
+                fail Failure.alone(Component.translatable("argument.entity.notfound.player", []))
+            }
+        } else {
+            match source {
+                Source.Player(slot) => who.push(slot),
+                Source.Console => fail Failure.alone(Component.translatable("permissions.requires.player", [])),
+            }
+        }
+        for slot in who {
+            if self.change_mode(slot, mode) {
+                self.log_mode_change(source, slot, mode)
+            }
+        }
+    }
+
+    // `logGamemodeChange`: the player who changed their own mode is told so; another is told
+    // their mode changed, and the source what it did, each told to the operators too.
+    fn log_mode_change(mut self, source: Source, target: usize, mode: GameType) {
+        let name = Component.translatable("gameMode.{mode.name()}", [])
+        let by_target = match source {
+            Source.Player(slot) => slot == target,
+            Source.Console => false,
+        }
+        if by_target {
+            self.success(source, Component.translatable("commands.gamemode.success.self", [name]), true)
+            return
+        }
+        self.tell_slot(target, Component.translatable("gameMode.changed", [name.copy()]))
+        let player = self.name_of(target)
+        self.success(source, Component.translatable("commands.gamemode.success.other", [player, name]), true)
+    }
+
+    // `ServerPlayer.setGameMode`: nothing where the player's in `mode` already. Else the mode
+    // and the abilities it gives, as `changeGameModeForPlayer` sets them, a flying player near
+    // the ground landing but in spectator; then their abilities sent, every player's tab list
+    // told, the mode's game event, and the abilities again.
+    fn change_mode(mut self, slot: usize, mode: GameType) -> bool {
+        if slot >= self.connections.len() {
+            return false
+        }
+        var con = self.connections[slot].take() else return false
+        if con.phase != Phase.Play or con.player.mode == mode {
+            self.connections[slot] = some(con)
+            return false
+        }
+        con.player.previous_mode = some(con.player.mode)
+        con.player.mode = mode
+        con.player.abilities.update(mode)
+        if con.player.abilities.flying and mode != GameType.Spectator and self.near_ground(con.player.x, con.player.y, con.player.z) {
+            con.player.abilities.flying = false
+        }
+        let abilities = con.player.abilities
+        self.send(mut con, ClientboundPlayerAbilities { abilities: abilities }, State.Play)
+        var who: Uuid? = none
+        if let p = con.profile {
+            who = some(p.id)
+        }
+        if let id = who {
+            let update = encode_play(ClientboundPlayerInfoUpdate { info: PlayerInfo { actions: UPDATE_GAME_MODE, entries: [PlayerEntry { id: id, game_type: mode }] } })
+            self.broadcast(update.copy())
+            self.send_bytes(mut con, update)
+        }
+        self.send(mut con, ClientboundGameEvent { event: CHANGE_GAME_MODE, param: f32.nearest(mode.id()) }, State.Play)
+        self.send(mut con, ClientboundPlayerAbilities { abilities: abilities }, State.Play)
+        self.connections[slot] = some(con)
+        return true
+    }
+
+    // `isInRangeOfGround`, for a player at `x`, `y`, `z`: their box meets no block, and one is
+    // under it, less than a block down. Liquids count as blocks here, where vanilla's colliders
+    // pass through them (D239).
+    fn near_ground(mut self, x: f64, y: f64, z: f64) -> bool {
+        if self.collisions == none {
+            self.collisions = some(CollisionStates.new())
+        }
+        let states = self.collisions else return false
+        let half = f64(0.6f32 / 2.0f32)
+        let body = Aabb { min_x: x - half, min_y: y, min_z: z - half, max_x: x + half, max_y: y + f64(1.8f32), max_z: z + half }
+        let below = Aabb { min_x: x - half, min_y: y - 1.0, min_z: z - half, max_x: x + half, max_y: y, max_z: z + half }
+        return states.no_collision(self.level, body) and not states.no_collision(self.level, below)
+    }
+
+    // The players `targets` names, as `EntitySelector.findPlayers` finds them, in the order they
+    // joined: the one a name names, without regard to case; the source; every one; the nearest
+    // to the source, the console being at the world's spawn; or one at random.
+    fn players_named(mut self, source: Source, targets: Targets) -> List<usize> {
+        let me: usize? = match source {
+            Source.Player(slot) => some(slot),
+            Source.Console => none,
+        }
+        let players = self.by_joining()
+        var out = List<usize>()
+        match targets {
+            Targets.Name(name) => {
+                let wanted = name.to_lower_root()
+                for slot in players {
+                    if let c = self.connections[slot] {
+                        if let p = c.profile {
+                            if p.name.to_lower_root() == wanted {
+                                out.push(slot)
+                                return out
+                            }
+                        }
+                    }
+                }
+            },
+            Targets.Me => {
+                if let slot = me {
+                    if players.contains(slot) {
+                        out.push(slot)
+                    }
+                }
+            },
+            Targets.All => out = players,
+            Targets.Nearest => {
+                var at = (f64(self.respawn.pos.x), f64(self.respawn.pos.y), f64(self.respawn.pos.z))
+                if let slot = me {
+                    if let c = self.connections[slot] {
+                        at = (c.player.x, c.player.y, c.player.z)
+                    }
+                }
+                let (ax, ay, az) = at
+                var best: usize? = none
+                var nearest = 0.0
+                for slot in players {
+                    if let c = self.connections[slot] {
+                        let dx = c.player.x - ax
+                        let dy = c.player.y - ay
+                        let dz = c.player.z - az
+                        let d = dx * dx + dy * dy + dz * dz
+                        if best == none or d < nearest {
+                            best = some(slot)
+                            nearest = d
+                        }
+                    }
+                }
+                if let slot = best {
+                    out.push(slot)
+                }
+            },
+            Targets.Random => {
+                if not players.is_empty() {
+                    let bytes = self.link.random(4)
+                    var n: u32 = 0
+                    for b in bytes {
+                        n = (n << 8) | u32(b)
+                    }
+                    out.push(players[usize(n % u32.wrap(players.len()))])
+                }
+            },
+        }
+        return out
+    }
+
+    // The slots of the players in the world, in the order they joined, as vanilla's list holds
+    // them.
+    fn by_joining(self) -> List<usize> {
+        var order = List<(u64, usize)>()
+        for slot in 0..self.connections.len() {
+            if self.playing(slot) {
+                if let c = self.connections[slot] {
+                    order.push((c.player.joined, slot))
+                }
+            }
+        }
+        order.sort()
+        var out = List<usize>()
+        for (_, slot) in order {
+            out.push(slot)
+        }
+        return out
+    }
+
+    // `calcite flyspeed`: the player's flying speed set to `speed` times vanilla's, and sent, or
+    // told them (D239).
+    fn fly_speed(mut self, source: Source, speed: f32?) {
+        let slot = match source {
+            Source.Player(s) => s,
+            Source.Console => {
+                self.command_failed(source, Failure.alone(Component.translatable("permissions.requires.player", [])))
+                return
+            },
+        }
+        var con = self.connections[slot].take() else return
+        if let s = speed {
+            con.player.abilities.flying_speed = FLYING_SPEED * s
+            let abilities = con.player.abilities
+            self.send(mut con, ClientboundPlayerAbilities { abilities: abilities }, State.Play)
+            self.system_message(mut con, Component.literal("Set own flying speed to {s} times vanilla's"))
+        } else {
+            let times = con.player.abilities.flying_speed / FLYING_SPEED
+            self.system_message(mut con, Component.literal("Your flying speed is {times} times vanilla's"))
+        }
+        self.connections[slot] = some(con)
+    }
+
+    // `sendSuccess`: the message to its source, a player only as `sendCommandFeedback`, true
+    // until Calcite reads the game rules, lets them have it, and the console logging it; then,
+    // where `broadcast`, to the operators.
+    fn success(mut self, source: Source, message: own Component, broadcast: bool) {
+        match source {
+            Source.Console => self.logs.push(Entry.info(message.get_string(self.lang))),
+            Source.Player(slot) => self.tell_slot(slot, message.copy()),
+        }
+        if broadcast {
+            self.inform_admins(source, message)
+        }
+    }
+
+    // `broadcastToAdmins`, as `shouldInformAdmins` lets it: in gray italics, `[Source: message]`,
+    // to each operator but the source, and logged where a player ran it. The console's go to
+    // the operators where `broadcast-console-to-ops` says so.
+    fn inform_admins(mut self, source: Source, message: own Component) {
+        var by = Component.literal("Server")
+        var from: usize? = none
+        match source {
+            Source.Player(slot) => {
+                by = self.name_of(slot)
+                from = some(slot)
+            },
+            Source.Console => {
+                if not self.world.settings.broadcast_console_to_ops {
+                    return
+                }
+            },
+        }
+        var line = Component.translatable("chat.type.admin", [by, message]).colored("gray")
+        line.style.italic = some(true)
+        for slot in self.by_joining() {
+            if from == some(slot) {
+                continue
+            }
+            var op = false
+            if let c = self.connections[slot] {
+                if let p = c.profile {
+                    op = self.access.is_op(p.id)
+                }
+            }
+            if op {
+                self.tell_slot(slot, line.copy())
+            }
+        }
+        if from != none {
+            self.logs.push(Entry.info(line.get_string(self.lang)))
+        }
+    }
+
+    // A command's failure, as `Commands.performCommand` sends it: its message, then where in the
+    // input, each in red; the console logs their text.
+    fn command_failed(mut self, source: Source, f: own Failure) {
+        let where_ = failure_context(f)
+        match source {
+            Source.Console => {
+                self.logs.push(Entry.info(f.message.get_string(self.lang)))
+                if let c = where_ {
+                    self.logs.push(Entry.info(c.get_string(self.lang)).calcite(Look.Quiet))
+                }
+            },
+            Source.Player(slot) => {
+                var con = self.connections[slot].take() else return
+                self.failure(mut con, f.message.copy())
+                if let c = where_ {
+                    self.failure(mut con, c)
+                }
+                self.connections[slot] = some(con)
+            },
+        }
+    }
+
+    // A system message to the player in `slot`.
+    fn tell_slot(mut self, slot: usize, message: own Component) {
+        if slot >= self.connections.len() {
+            return
+        }
+        var con = self.connections[slot].take() else return
+        if con.phase == Phase.Play {
+            self.system_message(mut con, message)
+        }
+        self.connections[slot] = some(con)
+    }
+
+    // The display name of the player in `slot`, as `getDisplayName` gives it.
+    fn name_of(self, slot: usize) -> Component {
+        if let c = self.connections[slot] {
+            if let p = c.profile {
+                return display_name(p)
+            }
+        }
+        return Component.empty()
     }
 
     // A command with signed arguments, as `handleSignedChatCommand`: what it says the player
@@ -2291,7 +2677,7 @@ impl Network {
             return stays
         }
         if c.argument_signatures.is_empty() {
-            self.unknown_command(mut con, c.command)
+            self.queued.push_last(Queued.Command(con.conn.slot(), c.command.copy()))
         } else {
             con.player.chain.set_broken()
             var names = String()
@@ -2467,25 +2853,6 @@ impl Network {
             self.disconnect(mut con, Component.translatable("multiplayer.disconnect.too_many_pending_chats", []))
             self.close(mut con)
         }
-    }
-
-    // What vanilla's `Commands.finishParsing` tells the player of a command it has no node for:
-    // that it's unknown, then the command from where it went wrong, which is its start, with a
-    // click that puts it back in the chat box. What comes before the start is nothing, which
-    // vanilla's `append("")` doesn't add.
-    fn unknown_command(mut self, con: mut Connection, command: String) {
-        self.failure(mut con, Component.translatable("command.unknown.command", []))
-        var context = Component.empty().colored("gray")
-        context.style.click_event = some(ClickEvent.SuggestCommand("/{command}"))
-        if not command.is_empty() {
-            var rest = Component.literal(command).colored("red")
-            rest.style.underlined = some(true)
-            context.extra.push(rest)
-        }
-        var here = Component.translatable("command.context.here", []).colored("red")
-        here.style.italic = some(true)
-        context.extra.push(here)
-        self.failure(mut con, context)
     }
 
     // A command's failure, as `CommandSourceStack.sendFailure` sends it: in red, as a system
@@ -2825,22 +3192,93 @@ fn overworld() -> Identifier {
 }
 
 // The player's data as Calcite saves it: as it was read as they joined, with where they are
-// now, their `Pos`, `Rotation` and `Dimension`, or for a player new to the world, those with
-// their `UUID`, the game mode they play in and 26.3's `DataVersion`. Data older than 26.3's keeps
-// its version, since the rest of it is as old (D189).
-fn player_tag(player: Player, id: Uuid, mode: GameType) -> JavaHashMap<String, Tag> {
+// now, their `Pos`, `Rotation` and `Dimension`, their game modes and their abilities (D239), or
+// for a player new to the world, those with their `UUID` and 26.3's `DataVersion`. Data older
+// than 26.3's keeps its version, since the rest of it is as old (D189).
+fn player_tag(player: Player, id: Uuid) -> JavaHashMap<String, Tag> {
     var data = JavaHashMap<String, Tag>()
     if let kept = player.data {
         data = kept.copy()
     } else {
         data.insert(String("DataVersion"), Tag.Int(DATA_VERSION))
         data.insert(String("UUID"), Tag.IntArray(id.ints()))
-        data.insert(String("playerGameType"), Tag.Int(mode.id()))
     }
     data.insert(String("Pos"), Tag.List([Tag.double(player.x), Tag.double(player.y), Tag.double(player.z)]))
     data.insert(String("Rotation"), Tag.List([Tag.float(player.y_rot), Tag.float(player.x_rot)]))
     data.insert(String("Dimension"), Tag.Str(String("minecraft:overworld")))
+    // `storeGameTypes`, and `Abilities.Packed.CODEC`, every field written.
+    data.insert(String("playerGameType"), Tag.Int(player.mode.id()))
+    if let previous = player.previous_mode {
+        data.insert(String("previousPlayerGameType"), Tag.Int(previous.id()))
+    } else {
+        _ = data.remove("previousPlayerGameType")
+    }
+    let a = player.abilities
+    var abilities = JavaHashMap<String, Tag>()
+    abilities.insert(String("invulnerable"), flag_tag(a.invulnerable))
+    abilities.insert(String("flying"), flag_tag(a.flying))
+    abilities.insert(String("mayfly"), flag_tag(a.may_fly))
+    abilities.insert(String("instabuild"), flag_tag(a.instabuild))
+    abilities.insert(String("mayBuild"), flag_tag(a.may_build))
+    abilities.insert(String("flySpeed"), Tag.float(a.flying_speed))
+    abilities.insert(String("walkSpeed"), Tag.float(a.walking_speed))
+    data.insert(String("abilities"), Tag.Compound(abilities))
     return data
+}
+
+fn flag_tag(v: bool) -> Tag {
+    return Tag.Byte(if v { 1 } else { 0 })
+}
+
+// A game mode in the player's data, as `GameType.LEGACY_ID_CODEC` reads it: a number, an ID out
+// of range being survival's, or `none` where it's missing or isn't a number.
+fn saved_game_type(data: JavaHashMap<String, Tag>, key: str) -> GameType? {
+    if not data.contains(key) {
+        return none
+    }
+    let id = data[key].number_int() else return none
+    return some(GameType.by_id(id))
+}
+
+// The player's abilities as `Abilities.Packed.CODEC` reads them from their data: each field's
+// default where it's missing, and all of them where one can't be read, as a codec that fails
+// leaves them.
+fn saved_abilities(data: JavaHashMap<String, Tag>) -> Abilities {
+    var a = Abilities()
+    if not data.contains("abilities") {
+        return a
+    }
+    let fields = match data["abilities"] {
+        Tag.Compound(f) => f.copy(),
+        _ => return a,
+    }
+    for (key, default) in [("invulnerable", false), ("flying", false), ("mayfly", false), ("instabuild", false), ("mayBuild", true)] {
+        var v = default
+        if fields.contains(key) {
+            let b = fields[key].number_bool() else return Abilities()
+            v = b
+        }
+        if key == "invulnerable" {
+            a.invulnerable = v
+        } else if key == "flying" {
+            a.flying = v
+        } else if key == "mayfly" {
+            a.may_fly = v
+        } else if key == "instabuild" {
+            a.instabuild = v
+        } else {
+            a.may_build = v
+        }
+    }
+    if fields.contains("flySpeed") {
+        let speed = fields["flySpeed"].number_float() else return Abilities()
+        a.flying_speed = speed
+    }
+    if fields.contains("walkSpeed") {
+        let speed = fields["walkSpeed"].number_float() else return Abilities()
+        a.walking_speed = speed
+    }
+    return a
 }
 
 fn closed_tab() -> BookTab {
