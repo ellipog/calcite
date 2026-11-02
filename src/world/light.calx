@@ -11,6 +11,7 @@
 module world.light
 
 import protocol.play.{LightData, LightLayer}
+import std.palette.{PalettedContainer}
 import world.block_flags.{CAN_OCCLUDE, LIGHT_DAMPENING_SHIFT, LIGHT_EMISSION_SHIFT, SHAPE_FOR_LIGHT_OCCLUSION, state_flags}
 import world.chunk.{Chunk}
 import world.light_faces.{FACE_BITS, face_occludes, state_faces}
@@ -96,6 +97,73 @@ fn z_of(section: i64) -> i32 {
 fn section_offset(section: i64, dx: i32, dy: i32, dz: i32) -> i64 {
     return section_node(x_of(section) + dx, y_of(section) + dy, z_of(section) + dz)
 }
+
+// The section next to `section` in `direction`.
+fn section_step(section: i64, direction: i32) -> i64 {
+    return match direction {
+        0 => section_offset(section, 0, -1, 0),
+        1 => section_offset(section, 0, 1, 0),
+        2 => section_offset(section, 0, 0, -1),
+        3 => section_offset(section, 0, 0, 1),
+        4 => section_offset(section, -1, 0, 0),
+        _ => section_offset(section, 1, 0, 0),
+    }
+}
+
+// The index in its section of the block next to the one at `index` in `direction`, with
+// `CROSSED` added if it's in the next section (D244).
+fn step_index(index: i32, direction: i32) -> i32 {
+    return match direction {
+        0 => if index < 256 { index + 3840 + CROSSED } else { index - 256 },
+        1 => if index >= 3840 { index - 3840 + CROSSED } else { index + 256 },
+        2 => if index & 240 == 0 { index + 240 + CROSSED } else { index - 16 },
+        3 => if index & 240 == 240 { index - 240 + CROSSED } else { index + 16 },
+        4 => if index & 15 == 0 { index + 15 + CROSSED } else { index - 1 },
+        _ => if index & 15 == 15 { index - 15 + CROSSED } else { index + 1 },
+    }
+}
+
+// The index of the block next to the one at `index` in `direction`, in the next section if it's
+// on that edge of its own: the coordinate the direction moves along wraps (D244).
+fn step_in(index: i32, direction: i32) -> i32 {
+    let shift = 8 - (direction >> 1) * 4
+    let field = 15 << shift
+    let step = if direction & 1 == 0 { -(1 << shift) } else { 1 << shift }
+    return (index & ~field) | ((index + step) & field)
+}
+
+// A bit for each direction whose neighbour of the block at `index` is in the next section.
+fn edges_of(index: i32) -> i32 {
+    let x = index & 15
+    let z = (index >> 4) & 15
+    let y = index >> 8
+    var edges = 0
+    if y == 0 {
+        edges |= 1
+    }
+    if y == 15 {
+        edges |= 2
+    }
+    if z == 0 {
+        edges |= 4
+    }
+    if z == 15 {
+        edges |= 8
+    }
+    if x == 0 {
+        edges |= 16
+    }
+    if x == 15 {
+        edges |= 32
+    }
+    return edges
+}
+
+// What `step_index` adds for a block in the next section.
+const CROSSED: i32 = 4096
+// How many sections' slots `Storage` keeps at hand, a power of 2, and the slot none is.
+const SLOT_CACHE: usize = 1024
+const NO_SLOT: u32 = 4294967295
 
 // The section a block is in, `SectionPos.blockToSection`.
 fn section_of(node: i64) -> i64 {
@@ -217,7 +285,16 @@ pub struct LightStates {
     props: List<u32>
     faces: List<u64>
     occludes: List<u64>
+    // For each state, its dampening in the low four bits and `BYTE_EMPTY` if light sees it as an
+    // empty shape, and the light it gives, for reading a section's at once (D244).
+    bytes: List<u8>
+    glows: List<u8>
 }
+
+// In a state's byte of light properties, that light sees it as an empty shape.
+const BYTE_EMPTY: i32 = 16
+// A byte of light properties not read yet.
+const BYTE_UNREAD: i32 = 256
 
 impl LightStates {
     /// Every state's light properties.
@@ -240,7 +317,15 @@ impl LightStates {
             }
             props.push(p | (u32(faces[i]) << FACES_SHIFT))
         }
-        return LightStates { props: props, faces: palette, occludes: face_occludes() }
+        var bytes = List<u8>()
+        var glows = List<u8>()
+        bytes.reserve(props.len())
+        glows.reserve(props.len())
+        for p in props {
+            bytes.push(u8.wrap((p & 15) | (if p & EMPTY_SHAPE != 0 { 16u32 } else { 0u32 })))
+            glows.push(u8.wrap((p >> EMISSION_SHIFT) & 15))
+        }
+        return LightStates { props: props, faces: palette, occludes: face_occludes(), bytes: bytes, glows: glows }
     }
 
     /// How much light the state takes away, `getLightDampening`.
@@ -248,10 +333,6 @@ impl LightStates {
         return i32.wrap(self.props[usize(state)] & 15)
     }
 
-    // What light loses going into the state, vanilla's `getOpacity`: its dampening, or 1.
-    fn opacity(self, state: u32) -> i32 {
-        return self.dampening(state).max(1)
-    }
 
     /// The light the state gives, `getLightEmission`.
     pub fn emission(self, state: u32) -> i32 {
@@ -288,6 +369,10 @@ impl LightStates {
     // Whether light can't go from `from` to `to` in `direction` for their faces, vanilla's
     // `shapeOccludes`.
     fn shape_occludes(self, from: u32, to: u32, direction: i32) -> bool {
+        // Two empty shapes never occlude, as `faceShapeOccludes` of two empty faces (D244).
+        if self.props[usize(from)] & self.props[usize(to)] & EMPTY_SHAPE != 0 {
+            return false
+        }
         return self.faces_occlude(self.face(from, direction), self.face(to, direction ^ 1))
     }
 
@@ -437,22 +522,70 @@ impl SkySources {
 /// block that does.
 pub fn light_sources(chunk: Chunk, states: LightStates, chunk_x: i32, chunk_z: i32) -> List<i64> {
     var found = List<i64>()
+    var glows = List<u8>()
     for index in 0..chunk.section_count() {
         if not chunk.section_gives_light(index) {
             continue
         }
+        // A section that gives light isn't only air, so its states are `Chunk.block`'s. The light
+        // each block gives is read at once, by index, `y`, then `z`, then `x` (D244).
+        chunk.map_section(index, states.glows, mut glows)
         let bottom = chunk.min_y() + i32.wrap(index) * 16
-        for y in 0..16 {
-            for z in 0..16 {
-                for x in 0..16 {
-                    if states.emission(chunk.block(x, bottom + y, z)) != 0 {
-                        found.push(block_node(chunk_x * 16 + x, bottom + y, chunk_z * 16 + z))
-                    }
-                }
+        for i in 0..4096 {
+            if glows[usize.wrap(i)] != 0 {
+                found.push(block_node(chunk_x * 16 + (i & 15), bottom + (i >> 8), chunk_z * 16 + ((i >> 4) & 15)))
             }
         }
     }
     return found
+}
+
+/// Each block's state in the section at `section_y` of `chunk`, as `section_states` gives them,
+/// looked up in `table`, written over `out` by index (D244).
+pub fn section_bytes(chunk: Chunk, section_y: i32, table: List<u8>, out: mut List<u8>) {
+    let i = section_y - (chunk.min_y() >> 4)
+    if i < 0 or usize.wrap(i) >= chunk.section_count() or chunk.section_only_air(usize.wrap(i)) {
+        fill_bytes(mut out, table[usize(AIR)])
+        return
+    }
+    chunk.map_section(usize.wrap(i), table, mut out)
+}
+
+// `out` as 4096 of `b`.
+fn fill_bytes(out: mut List<u8>, b: u8) {
+    out.clear()
+    out.reserve(4096)
+    for _ in 0..4096 {
+        out.push(b)
+    }
+}
+
+/// A section's block states as light reads them (D244): one state at every block, the section's
+/// own container of them, or each block's state, all by the index `y << 8 | z << 4 | x`.
+pub enum SectionStates {
+    One(u32)
+    Kept(PalettedContainer)
+    Each(List<u32>)
+}
+
+impl SectionStates {
+    fn state(self, index: i32) -> u32 {
+        return match self {
+            SectionStates.One(s) => s,
+            SectionStates.Kept(c) => c.get_at(usize.wrap(index)),
+            SectionStates.Each(all) => all[usize.wrap(index)],
+        }
+    }
+}
+
+/// The states of the section at `section_y` of `chunk`, as `Chunk.block` reads them: air in a
+/// section of only air and outside the chunk's sections, and otherwise the section's own (D244).
+pub fn section_states(chunk: Chunk, section_y: i32) -> SectionStates {
+    let i = section_y - (chunk.min_y() >> 4)
+    if i < 0 or usize.wrap(i) >= chunk.section_count() or chunk.section_only_air(usize.wrap(i)) {
+        return SectionStates.One(AIR)
+    }
+    return SectionStates.Kept(chunk.section_blocks(usize.wrap(i)))
 }
 
 /// The chunks light is worked out in, vanilla's `LightChunkGetter`: a chunk is there when vanilla's
@@ -460,6 +593,42 @@ pub fn light_sources(chunk: Chunk, states: LightStates, chunk_x: i32, chunk_z: i
 pub interface LightChunks {
     /// The state at the block `x`, `y`, `z`, or `none` when its chunk isn't there.
     fn light_state(self, x: i32, y: i32, z: i32) -> u32?
+    /// The states of the section at `section_y` of the chunk at `chunk_x`, `chunk_z`, as
+    /// `light_state` reads them, or `none` when the chunk isn't there: a run asks for each
+    /// section it reads once, and reads its blocks there (D244). By default each block is asked
+    /// for.
+    fn light_section(self, chunk_x: i32, section_y: i32, chunk_z: i32) -> SectionStates? {
+        let x0 = chunk_x * 16
+        let y0 = section_y * 16
+        let z0 = chunk_z * 16
+        if self.light_state(x0, y0, z0) == none {
+            return none
+        }
+        var all = List<u32>()
+        all.reserve(4096)
+        for i in 0..4096 {
+            all.push(self.light_state(x0 + (i & 15), y0 + (i >> 8), z0 + ((i >> 4) & 15)) ?? BEDROCK)
+        }
+        return some(SectionStates.Each(all))
+    }
+    /// Each block's state in the section at `section_y` of the chunk at `chunk_x`, `chunk_z`, as
+    /// `light_section` gives them, looked up in `table`, written over `out` by index, or false
+    /// when the chunk isn't there: a run reads each section's light properties so, once (D244).
+    /// By default from `light_section`.
+    fn light_bytes(self, chunk_x: i32, section_y: i32, chunk_z: i32, table: List<u8>, out: mut List<u8>) -> bool {
+        let states = self.light_section(chunk_x, section_y, chunk_z) else return false
+        match states {
+            SectionStates.One(s) => fill_bytes(mut out, table[usize(s)]),
+            SectionStates.Kept(c) => c.map_into(table, mut out),
+            SectionStates.Each(all) => {
+                out.clear()
+                for s in all {
+                    out.push(table[usize(s)])
+                }
+            },
+        }
+        return true
+    }
     /// The lowest sky source of the column at `x`, `z`, as its chunk's `SkySources` gives it, or
     /// `none` when the chunk isn't there.
     fn lowest_sky_source(self, x: i32, z: i32) -> i32?
@@ -514,6 +683,44 @@ impl Layer {
         let i = usize.wrap(index >> 1)
         let shift = (index & 1) * 4
         self.data[i] = u8.wrap((i32(self.data[i]) & ~(15 << shift)) | ((level & 15) << shift))
+    }
+
+    // A bit for each direction, in vanilla's order, whose neighbour of the block at `index` has
+    // light below `reach`, read as if the section wrapped around: only the bits of neighbours in
+    // the section mean anything (D244).
+    fn darker_around(self, index: i32, reach: i32) -> i32 {
+        if self.data.is_empty() {
+            return if self.fill < reach { 63 } else { 0 }
+        }
+        var darker = 0
+        unsafe {
+            let p = self.data.as_ptr()
+            let down = (index - 256) & 4095
+            let up = (index + 256) & 4095
+            let north = (index - 16) & 4095
+            let south = (index + 16) & 4095
+            let west = (index - 1) & 4095
+            let east = (index + 1) & 4095
+            if (i32(p.add(usize.wrap(down >> 1)).read()) >> ((down & 1) << 2)) & 15 < reach {
+                darker |= 1
+            }
+            if (i32(p.add(usize.wrap(up >> 1)).read()) >> ((up & 1) << 2)) & 15 < reach {
+                darker |= 2
+            }
+            if (i32(p.add(usize.wrap(north >> 1)).read()) >> ((north & 1) << 2)) & 15 < reach {
+                darker |= 4
+            }
+            if (i32(p.add(usize.wrap(south >> 1)).read()) >> ((south & 1) << 2)) & 15 < reach {
+                darker |= 8
+            }
+            if (i32(p.add(usize.wrap(west >> 1)).read()) >> ((west & 1) << 2)) & 15 < reach {
+                darker |= 16
+            }
+            if (i32(p.add(usize.wrap(east >> 1)).read()) >> ((east & 1) << 2)) & 15 < reach {
+                darker |= 32
+            }
+        }
+        return darker
     }
 
     // Sets the light of the 256 blocks at `y`, as `set` on each of them would.
@@ -615,11 +822,51 @@ struct Storage {
     lowest: i32 = i32.MAX
     noting: bool = false
     noted: List<i64> = List<i64>()
+    // Sections' slots as last found, by a hash of the section, `cache_slot` `NO_SLOT` where
+    // there's none, as any long is some section's: a section that's let go of or kept again is
+    // taken out (D244).
+    cache_key: List<i64> = List<i64>()
+    cache_slot: List<u32> = List<u32>()
+    // The section kept in each slot, while it's kept (D244).
+    section_at: List<i64> = List<i64>()
+}
+
+// Where a section's slot is kept at hand.
+fn cache_place(section: i64) -> usize {
+    let h = u64.wrap(section ^ (section >> 20) ^ (section >> 39)).wrapping_mul(0x9E3779B97F4A7C15u64)
+    return usize.wrap(h >> 54) & (SLOT_CACHE - 1)
 }
 
 impl Storage {
     fn storing(self, section: i64) -> bool {
         return self.slots.contains(section)
+    }
+
+    // The section's slot, if light is kept for it, as `slots` gives it, found through the cache.
+    fn find_slot(mut self, section: i64) -> u32? {
+        if self.cache_key.is_empty() {
+            self.cache_key = [0i64; SLOT_CACHE]
+            self.cache_slot = [NO_SLOT; SLOT_CACHE]
+        }
+        let at = cache_place(section)
+        if self.cache_key[at] == section and self.cache_slot[at] != NO_SLOT {
+            return some(self.cache_slot[at])
+        }
+        let slot = self.slots.get(section) else return none
+        self.cache_key[at] = section
+        self.cache_slot[at] = slot
+        return some(slot)
+    }
+
+    // The section's slot is no longer what the cache has, if it has it.
+    fn forget_slot(mut self, section: i64) {
+        if self.cache_key.is_empty() {
+            return
+        }
+        let at = cache_place(section)
+        if self.cache_key[at] == section {
+            self.cache_slot[at] = NO_SLOT
+        }
     }
 
     // The slot of a section light is kept for. Panics if it isn't, as vanilla's
@@ -653,19 +900,23 @@ impl Storage {
             self.layers[usize(slot)] = layer
             return
         }
+        self.forget_slot(section)
         if let slot = self.free.pop() {
             self.layers[usize(slot)] = layer
             self.touched[usize(slot)] = 0
+            self.section_at[usize(slot)] = section
             self.slots.insert(section, slot)
             return
         }
         self.slots.insert(section, u32.wrap(self.layers.len()))
         self.layers.push(layer)
         self.touched.push(0)
+        self.section_at.push(section)
     }
 
     // Takes the section's layer out, if one's kept, and frees its slot.
     fn take(mut self, section: i64) -> Layer? {
+        self.forget_slot(section)
         let slot = self.slots.remove(section) else return none
         self.layers.push(Layer.filled(0))
         let layer = self.layers.swap_remove(usize(slot))
@@ -994,12 +1245,47 @@ impl Storage {
 }
 
 // One kind of light's engine, vanilla's `BlockLightEngine` or `SkyLightEngine`.
+//
+// A run reads blocks only in sections it keeps light for, so it asks the chunks for each such
+// section's states the first time it reads one there, and reads the rest there: `read_at` holds,
+// for each slot, the run it was last asked in, `reads`, and `read_index` where in `read` its
+// states are. Nothing changes a block during a run, and they're let go at its end (D244).
 struct Engine {
     sky: bool
     storage: Storage
     checks: OpenHashSet<i64> = OpenHashSet<i64>(512, 0.5)
     decreases: Deque<i64> = Deque<i64>()
     increases: Deque<i64> = Deque<i64>()
+    reads: u32 = 0
+    read_at: List<u32> = List<u32>()
+    read_index: List<u32> = List<u32>()
+    read: List<SectionStates> = List<SectionStates>()
+    // While light spreads, the increases queued, each as `spread_entry` packs it, from `head` on;
+    // `increase` queues there then (D244).
+    spreading: Deque<i64> = Deque<i64>()
+    spreading_now: bool = false
+    // The light properties of each section read this run, a byte a block, as `LightStates`
+    // has them: for each slot read in the run `bytes_at` says, in `bytes[bytes_of[slot]]`. The
+    // run's first `bytes_used` lists are its; the lists are kept for the next, up to
+    // `BYTES_KEPT` of them (D244).
+    bytes_at: List<u32> = List<u32>()
+    bytes_of: List<u32> = List<u32>()
+    bytes: List<List<u8>> = List<List<u8>>()
+    bytes_used: usize = 0
+}
+
+// How many sections' bytes of light properties an engine keeps between runs, 4 KiB each.
+const BYTES_KEPT: usize = 16
+
+// An entry of the queue light spreads from: the slot of the block's section, the block's index
+// in it, and the entry, `slot << 24 | index << 12 | entry`.
+fn spread_entry(slot: usize, index: i32, entry: i64) -> i64 {
+    return (i64.wrap(slot) << 24) | (i64(index) << 12) | (entry & 4095)
+}
+
+// The block at `index` of `section`.
+fn node_at(section: i64, index: i32) -> i64 {
+    return block_node(x_of(section) * 16 + (index & 15), y_of(section) * 16 + (index >> 8), z_of(section) * 16 + ((index >> 4) & 15))
 }
 
 impl Engine {
@@ -1013,12 +1299,69 @@ impl Engine {
     }
 
     fn increase(mut self, node: i64, entry: i64) {
+        if self.spreading_now {
+            let found = self.storage.find_slot(section_of(node)) else panic("light spreads to a section it isn't kept for")
+            self.spreading.push_last(spread_entry(usize(found), node_index(node), entry))
+            return
+        }
         self.increases.push_last(node)
         self.increases.push_last(entry)
     }
 
     fn has_work(self) -> bool {
         return self.storage.inconsistent or not self.checks.is_empty() or not self.decreases.is_empty() or not self.increases.is_empty()
+    }
+
+    // The state at `index` of the section kept in `slot`, from its states as this run first
+    // asked for them (D244).
+    fn state_in<C: LightChunks>(mut self, chunks: C, slot: usize, section: i64, index: i32) -> u32 {
+        if slot < self.read_at.len() and self.read_at[slot] == self.reads {
+            return self.read[usize(self.read_index[slot])].state(index)
+        }
+        return self.fetch_state(chunks, slot, section, index)
+    }
+
+    // The byte of light properties of the block at `index` of the section in `slot`, as
+    // `state_in`'s state has them (D244).
+    fn byte_in<C: LightChunks>(mut self, states: LightStates, chunks: C, slot: usize, index: i32) -> i32 {
+        if slot >= self.bytes_at.len() or self.bytes_at[slot] != self.reads {
+            self.read_bytes(states, chunks, slot)
+        }
+        return i32(self.bytes[usize(self.bytes_of[slot])][usize.wrap(index)])
+    }
+
+    // Reads the light properties of the section in `slot` for this run, as `state_in` reads its
+    // states: `BEDROCK`'s where its chunk isn't there.
+    fn read_bytes<C: LightChunks>(mut self, states: LightStates, chunks: C, slot: usize) {
+        while self.bytes_at.len() <= slot {
+            self.bytes_at.push(0)
+            self.bytes_of.push(0)
+        }
+        let at = self.bytes_used
+        if at == self.bytes.len() {
+            self.bytes.push(List<u8>())
+        }
+        self.bytes_used += 1
+        self.bytes_at[slot] = self.reads
+        self.bytes_of[slot] = u32.wrap(at)
+        let section = self.storage.section_at[slot]
+        if not chunks.light_bytes(x_of(section), y_of(section), z_of(section), states.bytes, mut self.bytes[at]) {
+            fill_bytes(mut self.bytes[at], states.bytes[usize(BEDROCK)])
+        }
+    }
+
+    // `state_in` for a section this run hasn't read yet: its states are asked for.
+    fn fetch_state<C: LightChunks>(mut self, chunks: C, slot: usize, section: i64, index: i32) -> u32 {
+        while self.read_at.len() <= slot {
+            self.read_at.push(0)
+            self.read_index.push(0)
+        }
+        if self.read_at[slot] != self.reads {
+            self.read_at[slot] = self.reads
+            self.read_index[slot] = u32.wrap(self.read.len())
+            self.read.push(chunks.light_section(x_of(section), y_of(section), z_of(section)) ?? SectionStates.One(BEDROCK))
+        }
+        return self.read[usize(self.read_index[slot])].state(index)
     }
 
     // The light a block gives where its column's light is on, `BlockLightEngine.getEmission`.
@@ -1152,6 +1495,13 @@ impl Engine {
 
     // `runLightUpdates`: the blocks to check, then light taken away, then light spread.
     fn run<C: LightChunks>(mut self, states: LightStates, chunks: C) -> i32 {
+        if self.reads == u32.MAX {
+            for i in 0..self.read_at.len() {
+                self.read_at[i] = 0
+            }
+            self.reads = 0
+        }
+        self.reads += 1
         if not self.checks.is_empty() {
             var nodes = List<i64>()
             for node in self.checks {
@@ -1169,22 +1519,10 @@ impl Engine {
             self.propagate_decrease(states, chunks, node, entry)
             count += 1
         }
-        while let node = self.increases.pop_first() {
-            let entry = self.increases.pop_first() ?? 0
-            let section = section_of(node)
-            let slot = self.storage.slot_of(section)
-            let index = node_index(node)
-            var level = self.storage.layers[slot].get(index)
-            let target = entry_level(entry)
-            if entry & FROM_EMISSION != 0 and level < target {
-                self.storage.set_in(slot, section, index, target)
-                level = target
-            }
-            if level == target {
-                self.propagate_increase(states, chunks, node, entry, level, section, slot)
-            }
-            count += 1
-        }
+        count += self.spread(states, chunks)
+        self.read.clear()
+        self.bytes_used = 0
+        self.bytes.truncate(BYTES_KEPT)
         self.storage.mark_new_inconsistencies()
         self.storage.swap()
         return count
@@ -1196,7 +1534,8 @@ impl Engine {
             if not self.storage.storing(section) {
                 return
             }
-            let state = state_at(chunks, node)
+            let slot = self.storage.slot_of(section)
+            let state = self.state_in(chunks, slot, section, node_index(node))
             let emission = self.emission(states, node, state)
             let old = self.storage.level(node)
             if emission < old {
@@ -1292,46 +1631,111 @@ impl Engine {
 
     // Spreads light from `from`, in the section `from_section`, kept in slot `from_slot`: nothing
     // here keeps or lets go of a section, so the slots found stay right throughout.
-    fn propagate_increase<C: LightChunks>(mut self, states: LightStates, chunks: C, from: i64, entry: i64, from_level: i32, from_section: i64, from_slot: usize) {
-        var from_known = false
-        var from_state: u32 = AIR
-        let empty_below = if self.sky { self.count_empty_sections_below_if_at_border(from) } else { 0 }
-        for direction in 0..6 {
-            if not goes(entry, direction) {
+    //
+    // Light goes on only to a neighbour darker than `from_level - 1`, which most aren't, so those
+    // in the section are read all at once first, and only the rest go on to `spread_to`, in
+    // vanilla's order. Nothing light does to one neighbour changes another's light: its own is
+    // set, and below it, in its column, where `propagate_from_empty_sections` sets light, there's
+    // none of `from`'s neighbours (D244).
+    //
+    // The queue's entries are each block's slot and index with the entry, as `spread_entry` packs
+    // them: slots don't change while light spreads. Light goes on only to a neighbour darker than
+    // the level less 1, which most aren't, so those in the section are read all at once first,
+    // and only the rest go on to `spread_to`, in vanilla's order. Nothing light does to one
+    // neighbour changes another's light: its own is set, and below it, in its column, where
+    // `propagate_from_empty_sections` sets light, there's none of the block's neighbours. Gives
+    // how many entries there were (D244).
+    fn spread<C: LightChunks>(mut self, states: LightStates, chunks: C) -> i32 {
+        while let node = self.increases.pop_first() {
+            let entry = self.increases.pop_first() ?? 0
+            let found = self.storage.find_slot(section_of(node)) else panic("light spread from a section it isn't kept for")
+            self.spreading.push_last(spread_entry(usize(found), node_index(node), entry))
+        }
+        self.spreading_now = true
+        var count = 0
+        while let e = self.spreading.pop_first() {
+            count += 1
+            let slot = usize.wrap(e >> 24)
+            let index = i32.wrap(e >> 12) & 4095
+            let entry = e & 4095
+            let target = i32.wrap(entry & LEVEL_MASK)
+            var level = self.storage.layers[slot].get(index)
+            if entry & FROM_EMISSION != 0 and level < target {
+                let section = self.storage.section_at[slot]
+                self.storage.set_in(slot, section, index, target)
+                level = target
+            }
+            if level != target {
                 continue
             }
-            let to = offset(from, direction)
-            let to_section = section_of(to)
-            var slot = from_slot
-            if to_section != from_section {
-                let found = self.storage.slots.get(to_section) else continue
-                slot = usize(found)
+            let ways = i32.wrap(entry >> 4) & 63
+            let edges = edges_of(index)
+            let inside = ways & ~edges
+            var todo = ways & edges
+            if inside != 0 {
+                todo |= inside & self.storage.layers[slot].darker_around(index, level - 1)
             }
-            let index = node_index(to)
-            let to_level = self.storage.layers[slot].get(index)
-            if from_level - 1 <= to_level {
+            if todo == 0 {
                 continue
             }
-            let to_state = state_at(chunks, to)
-            let new_level = from_level - states.opacity(to_state)
-            if new_level <= to_level {
-                continue
-            }
-            if not from_known {
-                from_state = if entry & FROM_EMPTY_SHAPE != 0 { AIR } else { state_at(chunks, from) }
-                from_known = true
-            }
-            if states.shape_occludes(from_state, to_state, direction) {
-                continue
-            }
-            self.storage.set_in(slot, to_section, index, new_level)
-            if new_level > 1 {
-                self.increase(to, increase_skip_one(new_level, states.empty_shape(to_state), direction ^ 1))
-            }
-            if self.sky {
-                self.propagate_from_empty_sections(to, direction, new_level, true, empty_below)
+            let empty_below = if self.sky and index < 256 { self.count_empty_sections_below_if_at_border(node_at(self.storage.section_at[slot], index)) } else { 0 }
+            let from_empty = entry & FROM_EMPTY_SHAPE != 0
+            var from_byte = if from_empty { BYTE_EMPTY } else { BYTE_UNREAD }
+            for direction in 0..6 {
+                if (todo >> direction) & 1 != 0 {
+                    from_byte = self.spread_to(states, chunks, slot, index, level, from_empty, from_byte, direction, edges, empty_below)
+                }
             }
         }
+        self.spreading_now = false
+        return count
+    }
+
+    // Spreads light at `level` from the block at `index` of the section in `slot` to its
+    // neighbour in `direction`, as `propagateIncrease` does for each: gives the block's state,
+    // `from_state`, which is `UNREAD` until it's needed.
+    fn spread_to<C: LightChunks>(mut self, states: LightStates, chunks: C, slot: usize, index: i32, level: i32, from_empty: bool, from_byte: i32, direction: i32, edges: i32, empty_below: i32) -> i32 {
+        let to_index = step_in(index, direction)
+        var to_slot = slot
+        if (edges >> direction) & 1 != 0 {
+            let next = section_step(self.storage.section_at[slot], direction)
+            let found = self.storage.find_slot(next) else return from_byte
+            to_slot = usize(found)
+        }
+        let to_level = self.storage.layers[to_slot].get(to_index)
+        if level - 1 <= to_level {
+            return from_byte
+        }
+        let to_byte = self.byte_in(states, chunks, to_slot, to_index)
+        let new_level = level - (to_byte & 15).max(1)
+        if new_level <= to_level {
+            return from_byte
+        }
+        var byte = from_byte
+        if byte == BYTE_UNREAD {
+            byte = self.byte_in(states, chunks, slot, index)
+        }
+        let to_section = self.storage.section_at[to_slot]
+        // Two empty shapes never occlude; otherwise their states' faces say, as `shape_occludes`.
+        if byte & to_byte & BYTE_EMPTY == 0 {
+            var from_state = AIR
+            if not from_empty {
+                let section = self.storage.section_at[slot]
+                from_state = self.state_in(chunks, slot, section, index)
+            }
+            let to_state = self.state_in(chunks, to_slot, to_section, to_index)
+            if states.shape_occludes(from_state, to_state, direction) {
+                return byte
+            }
+        }
+        self.storage.set_in(to_slot, to_section, to_index, new_level)
+        if new_level > 1 {
+            self.spreading.push_last(spread_entry(to_slot, to_index, increase_skip_one(new_level, to_byte & BYTE_EMPTY != 0, direction ^ 1)))
+        }
+        if empty_below != 0 {
+            self.propagate_from_empty_sections(node_at(to_section, to_index), direction, new_level, true, empty_below)
+        }
+        return byte
     }
 
     // Takes light away around `from`. Its section may keep no light, unlike an increase's; as
@@ -1340,16 +1744,23 @@ impl Engine {
         let empty_below = if self.sky { self.count_empty_sections_below_if_at_border(from) } else { 0 }
         let old_from = entry_level(entry)
         let from_section = section_of(from)
-        let from_slot = self.storage.slots.get(from_section)
+        let from_slot = self.storage.find_slot(from_section)
+        let from_index = node_index(from)
         for direction in 0..6 {
             if not goes(entry, direction) {
                 continue
             }
+            var index = step_index(from_index, direction)
+            var to_section = from_section
+            var found = from_slot
+            if index >= CROSSED {
+                index -= CROSSED
+                to_section = section_step(from_section, direction)
+                found = self.storage.find_slot(to_section)
+            }
+            let held = found else continue
+            let slot = usize(held)
             let to = offset(from, direction)
-            let to_section = section_of(to)
-            let found = (if to_section == from_section { from_slot } else { self.storage.slots.get(to_section) }) else continue
-            let slot = usize(found)
-            let index = node_index(to)
             let to_level = self.storage.layers[slot].get(index)
             if to_level == 0 {
                 continue
@@ -1364,7 +1775,7 @@ impl Engine {
                 self.propagate_from_empty_sections(to, direction, to_level, false, empty_below)
                 continue
             }
-            let to_state = state_at(chunks, to)
+            let to_state = self.state_in(chunks, slot, to_section, index)
             let to_emission = self.emission(states, to, to_state)
             self.storage.set_in(slot, to_section, index, 0)
             if to_emission < to_level {
