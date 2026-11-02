@@ -14,7 +14,7 @@ import worldgen.beardifier.{Beardifier}
 import worldgen.density.{Functions}
 import worldgen.interval.{Thrown}
 import worldgen.noise.{Volume}
-import worldgen.sampler.{Context, Program, fill, sample, volume, zeros}
+import worldgen.sampler.{Boxes, Context, Program, bounds_over, cells_of, fill, sample, volume, zeros}
 
 /// What `computeSubstance` gives for a block the density makes solid: `null`, the default block.
 const SOLID: u32 = 0xFFFFFFFF
@@ -258,17 +258,70 @@ pub fn fill_noise(functions: mut Functions, s: Shape, states: BlockStates, ctx: 
     // for the chunk; a point's density is the same whatever part it's filled with.
     ctx.whole = some(v)
     let tile = TILE
-    var density: List<f32> = [0.0f32; usize.wrap(tile * height * tile)]
+    let across = 16 / tile
+    // The layers of cells up a tile, each from a multiple of `g` or the bottom of the volume, so
+    // a part of the tile from a layer is filled as the whole tile would be.
+    let g = cells_of(functions.program)
+    let base = low.floor_div(g) * g
+    let layers = (low + height - base + g - 1) / g
+    var cells = Cells { kinds: [UNKNOWN_CELL; usize.wrap(across * across * layers)], base: base, g: g, layers: layers }
+    var density = List<f32>()
+    var rows: List<u8> = [FILLED_Y; usize.wrap(height)]
     var marks = List<u64>()
-    for tz in 0..16 / tile {
-        for tx in 0..16 / tile {
-            let tv = try volume(tile, height, tile, (cx << 4) + tx * tile, low, (cz << 4) + tz * tile, 1, 1, 1)
-            try fill(functions.program, mut ctx, fd, mut density, tv)
+    for tz in 0..across {
+        for tx in 0..across {
+            let tile_index = tz * across + tx
+            if tile_index == 1 {
+                // The first tile kept the corners of the interpolated samplers it filled, which
+                // bound the density over every other tile's cells.
+                prove(mut cells, functions.program, ctx, fd, aquifer, cx, cz, tile, across, low, height)
+            }
+            // Only the layers from the lowest to the highest not proven are filled.
+            var first = -1
+            var last = -1
+            for j in 0..layers {
+                if cells.kinds[usize.wrap(tile_index * layers + j)] == UNKNOWN_CELL {
+                    if first == -1 {
+                        first = j
+                    }
+                    last = j
+                }
+            }
+            var tv = Volume { size_x: tile, size_y: 0, size_z: tile, min_x: (cx << 4) + tx * tile, min_y: low, min_z: (cz << 4) + tz * tile }
+            if first != -1 {
+                let bottom = low.max(base + first * g)
+                let top = (low + height).min(base + (last + 1) * g)
+                tv = try volume(tile, top - bottom, tile, (cx << 4) + tx * tile, bottom, (cz << 4) + tz * tile, 1, 1, 1)
+                let n = usize.wrap(tv.size())
+                density.truncate(n)
+                while density.len() < n {
+                    density.push(0.0f32)
+                }
+                try fill(functions.program, mut ctx, fd, mut density, tv)
+            }
+            // What each height of the tile's columns is, from the bottom, and the highest that
+            // isn't proven air.
+            for j in 0..layers {
+                let kind = cells.kinds[usize.wrap(tile_index * layers + j)]
+                let bottom = low.max(base + j * g)
+                let top = (low + height).min(base + (j + 1) * g)
+                for by in bottom..top {
+                    var k = FILLED_Y
+                    if by < tv.min_y or by >= tv.min_y + tv.size_y {
+                        k = if kind == SOLID_CELL { SOLID_Y } else if s.global(by).at(by) == AIR_STATE { SKY_AIR_Y } else { SKY_FLUID_Y }
+                    }
+                    rows[usize.wrap(by - low)] = k
+                }
+            }
+            var highest = height - 1
+            while highest >= 0 and rows[usize.wrap(highest)] == SKY_AIR_Y {
+                highest -= 1
+            }
             for lz in 0..tile {
                 for lx in 0..tile {
                     let x = tx * tile + lx
                     let z = tz * tile + lz
-                    try fill_column(mut out, mut aquifer, mut marks, functions.program, mut ctx, s, states, density, tv, lx, lz, x, z, cx, cz, low, height, level_min)
+                    try fill_column(mut out, mut aquifer, mut marks, functions.program, mut ctx, s, states, density, tv, rows, highest, lx, lz, x, z, cx, cz, low, height, level_min)
                 }
             }
         }
@@ -286,33 +339,102 @@ pub fn fill_noise(functions: mut Functions, s: Shape, states: BlockStates, ctx: 
 // The blocks across a tile of columns, in blocks: its columns' densities are filled together.
 const TILE: i32 = 4
 
+// What's proven of a layer of a tile's cells: nothing, that the density is above 0 at every
+// block, or that it's at most 0 at every block and only its sign is read there.
+const UNKNOWN_CELL: u8 = 0
+const SOLID_CELL: u8 = 1
+const SKY_CELL: u8 = 2
+
+// What's proven of each tile's layers of cells, `layers` a tile, each `g` blocks from a multiple
+// of `g` from `base`.
+struct Cells {
+    kinds: List<u8>
+    base: i32
+    g: i32
+    layers: i32
+}
+
+// What a height of a tile's columns is: filled, or proven solid, proven to be the global fluid,
+// or proven to be air, which isn't set.
+const FILLED_Y: u8 = 0
+const SOLID_Y: u8 = 1
+const SKY_FLUID_Y: u8 = 2
+const SKY_AIR_Y: u8 = 3
+
+// How far from 0 a bound must be for a layer to be proven.
+const PROOF_MARGIN: f64 = 0.0001
+
+/// The layers of every tile but the first proven, where the final density's bounds over them,
+/// from the corners the first tile kept, are above 0, or at most 0 above every aquifer, where
+/// `substance` reads only the density's sign (D241).
+fn prove(cells: mut Cells, p: Program, ctx: Context, fd: usize, aquifer: Aquifer, cx: i32, cz: i32, tile: i32, across: i32, low: i32, height: i32) {
+    var boxes = Boxes.new(tile, tile)
+    for t in 1..across * across {
+        let x = (cx << 4) + (t % across) * tile
+        let z = (cz << 4) + (t / across) * tile
+        for j in 0..cells.layers {
+            let bottom = low.max(cells.base + j * cells.g)
+            let top = (low + height).min(cells.base + (j + 1) * cells.g)
+            boxes.add(x, bottom, z, top - bottom)
+        }
+    }
+    let bounds = bounds_over(p, ctx, fd, boxes)
+    var k: usize = 0
+    for t in 1..across * across {
+        for j in 0..cells.layers {
+            let at = usize.wrap(t * cells.layers + j)
+            if bounds.low[k] > PROOF_MARGIN {
+                cells.kinds[at] = SOLID_CELL
+            } else if bounds.high[k] < -PROOF_MARGIN and (not aquifer.enabled or boxes.y[k] > aquifer.skip_above) {
+                cells.kinds[at] = SKY_CELL
+            }
+            k += 1
+        }
+    }
+}
+
 // The column at `x`, `z` of the chunk, from the top down, from its densities at `lx`, `lz` of
-// `tv`: a solid block wherever the density is above 0, else what the aquifer says. Each fluid to
+// `tv` and what `rows` says is proven of each height outside it, from `highest`, above which it's
+// air: a solid block wherever the density is above 0, else what the aquifer says. Each fluid to
 // update is noted in `marks` by its column, `z` first, then from the top down.
-fn fill_column(out: mut Filled, aquifer: mut Aquifer, marks: mut List<u64>, p: Program, ctx: mut Context, s: Shape, states: BlockStates, density: List<f32>, tv: Volume, lx: i32, lz: i32, x: i32, z: i32, cx: i32, cz: i32, low: i32, height: i32, level_min: i32) ! Thrown {
+fn fill_column(out: mut Filled, aquifer: mut Aquifer, marks: mut List<u64>, p: Program, ctx: mut Context, s: Shape, states: BlockStates, density: List<f32>, tv: Volume, rows: List<u8>, highest: i32, lx: i32, lz: i32, x: i32, z: i32, cx: i32, cz: i32, low: i32, height: i32, level_min: i32) ! Thrown {
     {
         {
             let column = usize.wrap(x + z * 16)
-            var y = height - 1
-            var at = tv.index(lx, y, lz)
+            // The air above the highest isn't set, and `substance` would only have said so.
+            if highest < height - 1 and aquifer.enabled {
+                aquifer.schedule = false
+            }
+            var y = highest
+            var at = tv.index(lx, tv.size_y - 1, lz)
             while y >= 0 {
                 let by = low + y
-                let d = f64(density[usize.wrap(at)])
-                at -= 1
+                let row = rows[usize.wrap(y)]
                 // `computeSubstance` gives a solid block wherever the density is above 0, and
                 // what it notes for the fluid's update is noted afresh with each block it's asked.
                 var state = s.default_block
-                if not (d > 0.0) {
-                    if aquifer.enabled and by > aquifer.skip_above {
-                        // Above every aquifer it gives the global fluid, as `substance` would.
-                        aquifer.schedule = false
-                        state = s.global(by).at(by)
-                    } else {
-                        state = try aquifer.substance(p, mut ctx, s, (cx << 4) + x, by, (cz << 4) + z, d)
-                        if state == SOLID {
-                            state = s.default_block
+                if row == FILLED_Y {
+                    let d = f64(density[usize.wrap(at)])
+                    at -= 1
+                    if not (d > 0.0) {
+                        if aquifer.enabled and by > aquifer.skip_above {
+                            // Above every aquifer it gives the global fluid, as `substance` would.
+                            aquifer.schedule = false
+                            state = s.global(by).at(by)
+                        } else {
+                            state = try aquifer.substance(p, mut ctx, s, (cx << 4) + x, by, (cz << 4) + z, d)
+                            if state == SOLID {
+                                state = s.default_block
+                            }
                         }
                     }
+                } else if row != SOLID_Y {
+                    // At most 0 where only its sign is read: the global fluid, as `substance`
+                    // gives it, whether the aquifer is on or not.
+                    if aquifer.enabled {
+                        aquifer.schedule = false
+                    }
+                    state = if row == SKY_AIR_Y { AIR_STATE } else { s.global(by).at(by) }
                 }
                 if state != AIR_STATE {
                     out.states[usize.wrap(((by - level_min) << 8) | (z << 4) | x)] = u16.wrap(state)
