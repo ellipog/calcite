@@ -780,6 +780,16 @@ The output is `{"snbt": s}`, `s` the upgraded compound as `CompoundTag.toString`
 
 Calcite answers `unimplemented` for data older than 2700, or with a part that only fixes it doesn't port yet reach (D285).
 
+### `block_entity` (v1)
+
+A block entity loaded from data and saved again, as a structure template's are when it places them: `StructureTemplate.placeInWorld` calls `loadWithComponents` with the template's data, and the chunk saves what `saveAdditional` writes.
+
+Input `{"id": type, "snbt": text}`: `type` is a block entity type's ID, and `text` its data, a compound in SNBT as `TagParser.parseCompoundFully` reads it. The block entity is new, at the origin, in the first block whose default state its type is valid for, and has no level, as one in a chunk that's still generating has none. Its data is read through `TagValueInput` with `ProblemReporter.DISCARDING`, over vanilla's built-in registries.
+
+The output is `{"snbt": s}`, `s` what `saveCustomOnly` writes, as `CompoundTag.toString` writes it, its keys sorted.
+
+Calcite answers `unimplemented` for what it doesn't load yet: an item with components outside a book, a stack of more than one where its stack size decides, a jigsaw with no joint, whose joint is its facing's, and the other parts named in D286.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

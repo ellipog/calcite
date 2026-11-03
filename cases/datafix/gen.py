@@ -72,9 +72,11 @@ def jigsaws(cases):
 
 
 def beds(cases):
+    bed = "[" + block("{id:\"minecraft:bed\"}") + "]"
     for v in (2730, 4884, 4885):
-        case(cases, f"bed-{v}", template(v, "[{Name:\"minecraft:red_bed\",Properties:{facing:\"north\",occupied:\"false\",part:\"head\"}}]", f"[{block('{id:\"minecraft:bed\"}')}]"))
-    case(cases, "bed-short-id-2730", template(2730, "[{Name:\"minecraft:red_bed\"}]", f"[{block('{id:\"bed\"}')}]"))
+        case(cases, f"bed-{v}", template(v, "[{Name:\"minecraft:red_bed\",Properties:{facing:\"north\",occupied:\"false\",part:\"head\"}}]", bed))
+    short = "[" + block("{id:\"bed\"}") + "]"
+    case(cases, "bed-short-id-2730", template(2730, "[{Name:\"minecraft:red_bed\"}]", short))
 
 
 def signs(cases):
