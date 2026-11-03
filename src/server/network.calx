@@ -22,7 +22,7 @@ import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{DATA_VERSION, PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
-import protocol.play.{Abilities, BookRecipes, BookTab, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundInitializeBorder, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, ClockUpdate, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
+import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
@@ -41,7 +41,7 @@ import server.log.{Entry, Look}
 import server.pregen.{Choice, Run, Shape, Task as PregenTask, blocks, saved_data as pregen_data, saved_id as pregen_saved_id}
 import server.sending.{Outbox, Sending}
 import server.status.{ServerStatus}
-import server.play.{World, display_name}
+import server.play.{World, WorldState, display_name}
 import server.saving.{Save, Saving}
 import std.crypto.{RsaKey, RsaPublicKey}
 import std.net.{Conn, Event, NetError, Address, Ip}
@@ -49,7 +49,10 @@ import std.time.{Timestamp}
 import storage.level.{LevelData, Spawn}
 import storage.players.{PlayerFiles, SavedPosition, saved_position}
 import storage.world_gen.{world_gen_id}
+import world.border.{Border, BorderSettings, saved_id as border_id}
+import world.clocks.{saved_id as clocks_id}
 import world.collision.{Aabb, CollisionStates}
+import world.weather.{WeatherLevels, advance as advance_weather, joining as weather_joining, saved_id as weather_id}
 import world.flat.{MIN_Y, SECTIONS, SURFACE_Y}
 import world.item.{ItemStack}
 import world.modes.{GameType, PreviousGameType}
@@ -455,6 +458,13 @@ pub struct Network {
     now: u64 = 0
     // The regions the players are in (CAL-63, D283).
     layout: Layout = Layout()
+    // Pausing when empty (CAL-105): `pause-when-empty-seconds`, 0 for never, as a test's network
+    // has it until it's set, and the ticks there have been no players, as `emptyTicks` counts
+    // them; and the ticks since everyone was last told everyone's latency, as
+    // `sendAllPlayerInfoIn` counts them.
+    pause_when_empty: i32 = 0
+    empty_ticks: i32 = 0
+    player_info_in: i32 = 0
 }
 
 /// How often the console's told how pregenerating goes, until `pregen quiet` says otherwise:
@@ -529,6 +539,30 @@ impl Network {
             }
             data.modded = true
             self.level_data = some(data)
+        }
+    }
+
+    /// Sets what the world saved of its weather, clocks and borders, and what else the tick reads
+    /// (CAL-105), once `set_level` has set the game time: each dimension's border is set up then,
+    /// as `applyInitialSettings` sets it up, each level's random is seeded, and each level that
+    /// can have weather has its rain and thunder as `prepareWeather` sets them.
+    pub fn set_world_state(mut self, state: own WorldState) {
+        let WorldState { weather: weather, clocks: clocks, borders: given_borders, advance_time: advance_time, advance_weather: weather_on, pause_when_empty: pause_when_empty, max_world_size: max_world_size, seeds: given_seeds } = state
+        var borders = given_borders
+        var seeds = given_seeds
+        self.world.weather = weather
+        self.world.clocks = clocks
+        self.world.advance_time = advance_time
+        self.world.advance_weather = weather_on
+        self.pause_when_empty = pause_when_empty
+        for d in 0..self.world.dims.len() {
+            let settings = if borders.is_empty() { BorderSettings.default() } else { borders.remove(0) }
+            self.world.dims[d].border = Border.new(settings, self.world.game_time, max_world_size)
+            let seed = if seeds.is_empty() { 0i64 } else { seeds.remove(0) }
+            self.world.dims[d].random = LegacyRandom.new(seed)
+            if self.world.dims[d].weathered {
+                self.world.dims[d].weather = WeatherLevels.prepared(self.world.weather)
+            }
         }
     }
 
@@ -1036,6 +1070,22 @@ impl Network {
         if let data = self.world_gen.take() {
             saving.save(Save.Data(world_gen_id(), data))
         }
+        // The weather, the clocks and each dimension's border, if they've changed since they
+        // were saved, as `saveAndJoin` saves what's marked (CAL-105).
+        if self.world.weather.dirty {
+            self.world.weather.dirty = false
+            saving.save(Save.Data(weather_id(), self.world.weather.pack()))
+        }
+        if self.world.clocks.dirty {
+            self.world.clocks.dirty = false
+            saving.save(Save.Data(clocks_id(), self.world.clocks.pack()))
+        }
+        for d in 0..self.world.dims.len() {
+            if self.world.dims[d].border.dirty {
+                self.world.dims[d].border.dirty = false
+                saving.save(Save.DimensionData(self.world.dims[d].id.copy(), border_id(), self.world.dims[d].border.pack()))
+            }
+        }
         self.saving = some(saving)
     }
 
@@ -1133,50 +1183,84 @@ impl Network {
         }
     }
 
-    /// One server tick, at `now` nanoseconds on the caller's clock, as vanilla's
-    /// `MinecraftServer.tickChildren` runs the parts this has: every 20 ticks the players are
-    /// told the world's time, which then moves on a tick, and the world's chunks tick; each
-    /// login, configuration and player moves on, as its listener's `tick` moves it, once the
-    /// checks with the session server that are done have been acted on, and every connection
-    /// ticks its second; then each player is sent the chunks that are due. Mojang's services are
-    /// fetched from as they're due.
+    /// One server tick, at `now` nanoseconds on the caller's clock, as vanilla's `tickServer`
+    /// runs it (CAL-105), once the checks with the session server that are done have been acted
+    /// on and Mojang's services fetched from as they're due: a server that's had no players for
+    /// `pause-when-empty-seconds` ticks only its connections, until someone joins; else the tick
+    /// is `tick_children`'s, then the status is rebuilt if it's 5 seconds old, and the autosave
+    /// counts down.
     pub fn tick(mut self, now: u64) {
         self.link.tick(now)
         self.services.tick(now, mut self.logs, mut self.link)
-        // The status is rebuilt every 5 seconds, as `tickServer` rebuilds it.
+        self.authenticate()
+        self.now = now
+        if self.paused() {
+            self.tick_connections(now)
+            self.dispatch_all()
+            self.flush()
+            return
+        }
+        self.ticks += 1
+        self.tick_children(now)
+        // The status is rebuilt every 5 seconds, as `tickServer` rebuilds it after the tick.
         if now >= self.status_due {
             self.status_due = now + STATUS_EXPIRE_NS
             self.rebuild_status()
         }
-        self.authenticate()
-        self.ticks += 1
+        // The autosave, as `tickServer` counts down to it after the tick, which a server that's
+        // stopped and saved has no more of.
+        self.autosave_in -= 1
+        if self.autosave_in <= 0 and not self.halted {
+            self.autosave()
+        }
+        self.dispatch_all()
+        self.flush()
+    }
+
+    // Whether the server's paused this tick, as `tickServer` pauses one that's had no players for
+    // `pause-when-empty-seconds`, saying so and saving once as it does. Pregenerating keeps it
+    // going, as a task needs its ticks, and Chunky keeps vanilla's going.
+    fn paused(mut self) -> bool {
+        // `pauseWhenEmptySeconds() * 20` and `emptyTicks++`, in Java's ints, which wrap.
+        let threshold = self.pause_when_empty.wrapping_mul(20)
+        if threshold <= 0 {
+            return false
+        }
+        if self.players_online() == 0 and self.pregens.is_empty() {
+            self.empty_ticks = self.empty_ticks.wrapping_add(1)
+        } else {
+            self.empty_ticks = 0
+        }
+        if self.empty_ticks < threshold {
+            return false
+        }
+        if self.empty_ticks == threshold {
+            self.logs.push(Entry.info("Server empty for {self.pause_when_empty} seconds, pausing"))
+            self.autosave()
+        }
+        return true
+    }
+
+    // The server's part of a tick, as `tickChildren` runs it: the clocks; every 20 ticks the
+    // players told the game time; each level's tick, in the world's order; the pregen tasks'
+    // steps; the connections; the players' latency every 601 ticks; then each player is sent the
+    // chunks that are due, in the world phase.
+    fn tick_children(mut self, now: u64) {
+        self.world.clocks.tick(self.world.advance_time)
         if self.ticks % 20 == 0 {
             let time = encode_play(ClientboundSetTime { game_time: self.world.game_time, clocks: [] })
             self.broadcast(time)
             self.forget_logins(now)
         }
-        self.world.game_time += 1
         for d in 0..self.levels.len() {
-            self.levels[d].tick()
+            self.tick_level(d)
         }
-        self.now = now
         self.pregen_tick(now)
         self.level_lines()
         self.dispatch_all()
-        for i in 0..self.connections.len() {
-            var con = self.connections[i].take() else continue
-            if not con.closing {
-                match con.phase {
-                    Phase.Login => self.tick_login(mut con),
-                    Phase.Configuration => self.tick_configuration(mut con, now),
-                    Phase.Play => self.tick_play(mut con, now),
-                    _ => {},
-                }
-                self.tick_second(mut con)
-            }
-            self.connections[i] = some(con)
-        }
+        self.tick_connections(now)
         self.travel()
+        self.tick_player_list()
         // The world phase: each region in turn, by ID, and its players by entity ID, once the
         // layout's been worked out from where everyone is now.
         self.lay_out()
@@ -1190,17 +1274,90 @@ impl Network {
         }
         // The far chunks the players' senders came to are read.
         self.dispatch_all()
+    }
+
+    // A level's tick, as `ServerLevel.tick` runs it, of what Calcite has so far (CAL-105): its
+    // border, then its weather, if it can have any; its time, the Overworld's, as `tickTime`
+    // moves the game time on; then its chunks, as its `ServerChunkCache.tick` runs them. Sleep,
+    // block and fluid ticks, raids, block events and entities come with what they tick.
+    fn tick_level(mut self, d: usize) {
+        self.world.dims[d].border.tick()
+        if self.world.dims[d].weathered {
+            let events = advance_weather(mut self.world.weather, mut self.world.dims[d].weather, mut self.world.dims[d].random, self.world.advance_weather)
+            for e in events {
+                let packet = encode_play(ClientboundGameEvent { event: e.event, param: e.param })
+                if e.everyone {
+                    self.broadcast(packet)
+                } else {
+                    self.broadcast_in(d, packet)
+                }
+            }
+        }
+        // Only the Overworld's level ticks the time, as `createLevels` makes only its level with
+        // `tickTime`, and the others' game time is its.
+        if d == 0 {
+            self.world.game_time += 1
+        }
+        self.levels[d].tick()
+    }
+
+    // The connections' part of a tick, as `tickConnection` runs it: each login, configuration
+    // and player moves on, as its listener's `tick` moves it, and every connection ticks its
+    // second. The session ID goes once there are no connections.
+    fn tick_connections(mut self, now: u64) {
+        for i in 0..self.connections.len() {
+            var con = self.connections[i].take() else continue
+            if not con.closing {
+                match con.phase {
+                    Phase.Login => self.tick_login(mut con),
+                    Phase.Configuration => self.tick_configuration(mut con, now),
+                    Phase.Play => self.tick_play(mut con, now),
+                    _ => {},
+                }
+                self.tick_second(mut con)
+            }
+            self.connections[i] = some(con)
+        }
         if self.open() == 0 {
             self.session = none
         }
-        // The autosave, as `tickServer` counts down to it after the tick, which a server that's
-        // stopped and saved has no more of.
-        self.autosave_in -= 1
-        if self.autosave_in <= 0 and not self.halted {
-            self.autosave()
+    }
+
+    // The player list's tick, as `PlayerList.tick` runs it: every 601st tick, everyone in the
+    // world is told everyone's latency, in the order they joined.
+    fn tick_player_list(mut self) {
+        self.player_info_in += 1
+        if self.player_info_in <= 600 {
+            return
         }
-        self.dispatch_all()
-        self.flush()
+        self.player_info_in = 0
+        var entries = List<PlayerEntry>()
+        for slot in self.by_joining() {
+            if let c = self.connections[slot] {
+                if let e = entry(c, c.player.mode, self.clock.unix_ms) {
+                    entries.push(e)
+                }
+            }
+        }
+        if entries.is_empty() {
+            return
+        }
+        self.broadcast(encode_play(ClientboundPlayerInfoUpdate { info: PlayerInfo { actions: UPDATE_LATENCY, entries: entries } }))
+    }
+
+    // A packet to every player in the world in the dimension at `d`, as `broadcastAll` with a
+    // dimension sends it.
+    fn broadcast_in(mut self, d: usize, packet: List<u8>) {
+        for i in 0..self.connections.len() {
+            if not self.playing(i) {
+                continue
+            }
+            var other = self.connections[i].take() else continue
+            if other.player.dim == d {
+                self.send_bytes(mut other, packet.copy())
+            }
+            self.connections[i] = some(other)
+        }
     }
 
     /// Closes each connection that has sent nothing for 30 seconds, as of `now`.
@@ -2244,15 +2401,19 @@ impl Network {
     // What `sendLevelInfo` sends a player of the level they're in, and the tick rate, as
     // `updateJoiningPlayer` sends it.
     fn level_info(mut self, con: mut Connection) {
-        self.send(mut con, ClientboundInitializeBorder.default(), State.Play)
-        var clocks = List<ClockUpdate>()
-        for c in self.world.settings.clocks {
-            clocks.push(ClockUpdate { clock: c, total_ticks: self.world.game_time, partial_tick: 0.0, rate: 1.0 })
-        }
-        let time = ClientboundSetTime { game_time: self.world.game_time, clocks: clocks }
+        let d = con.player.dim
+        let border = self.world.dims[d].border.packet()
+        self.send(mut con, border, State.Play)
+        let time = ClientboundSetTime { game_time: self.world.game_time, clocks: self.world.clocks.updates(self.world.advance_time) }
         self.send(mut con, time, State.Play)
         let respawn = ClientboundSetDefaultSpawnPosition { pos: GlobalPos { dimension: self.respawn.dimension.copy(), pos: self.respawn.pos }, yaw: self.respawn.yaw, pitch: self.respawn.pitch }
         self.send(mut con, respawn, State.Play)
+        // If it's raining there, that it is, and how hard, as `sendLevelInfo` says (CAL-105).
+        if self.world.dims[d].weathered {
+            for e in weather_joining(self.world.dims[d].weather) {
+                self.send(mut con, ClientboundGameEvent { event: e.event, param: e.param }, State.Play)
+            }
+        }
         self.send(mut con, ClientboundGameEvent { event: LEVEL_CHUNKS_LOAD_START, param: 0.0 }, State.Play)
         self.send(mut con, ClientboundTickingState { tick_rate: 20.0, frozen: false }, State.Play)
         self.send(mut con, ClientboundTickingStep { steps: 0 }, State.Play)

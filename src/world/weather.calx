@@ -1,0 +1,286 @@
+/// The world's weather, as vanilla keeps it in its `WeatherData`, saved in
+/// `data/minecraft/weather.dat`, and moves it on each tick of a level that can have it, as
+/// `ServerLevel.advanceWeatherCycle` does (CAL-105).
+///
+/// The weather is the server's: the ticks left of clear weather, of rain and of thunder, and
+/// whether it's raining and thundering. Each time runs down a tick, and once one's run out, the
+/// next is drawn from the level's random. A level that can have weather, one with sky light, no
+/// ceiling and not the End, has its own rain and thunder levels, which go up or down a hundredth
+/// a tick toward what the weather says, and its players are told of each change.
+module world.weather
+
+import nbt.tag.{Tag}
+import random.source.{RandomSource}
+import resources.identifier.{Identifier}
+import server.log.{Entry}
+import storage.saved.{parse_failed}
+
+/// The ticks the next rain or clear spell lasts, drawn from the first to the second, as
+/// `RAIN_DELAY` and `RAIN_DURATION` draw them.
+pub const RAIN_DELAY_MIN: i32 = 12000
+pub const RAIN_DELAY_MAX: i32 = 180000
+pub const RAIN_DURATION_MIN: i32 = 12000
+pub const RAIN_DURATION_MAX: i32 = 24000
+/// And the next thunder or calm, as `THUNDER_DELAY` and `THUNDER_DURATION` draw them.
+pub const THUNDER_DELAY_MIN: i32 = 12000
+pub const THUNDER_DELAY_MAX: i32 = 180000
+pub const THUNDER_DURATION_MIN: i32 = 3600
+pub const THUNDER_DURATION_MAX: i32 = 15600
+
+/// The game events the weather sends, `ClientboundGameEventPacket`'s.
+pub const START_RAINING: u8 = 1
+pub const STOP_RAINING: u8 = 2
+pub const RAIN_LEVEL_CHANGE: u8 = 7
+pub const THUNDER_LEVEL_CHANGE: u8 = 8
+
+/// The server's weather, vanilla's `WeatherData`.
+pub struct Weather {
+    pub clear_weather_time: i32 = 0
+    pub rain_time: i32 = 0
+    pub thunder_time: i32 = 0
+    pub raining: bool = false
+    pub thundering: bool = false
+    /// Whether it's changed since it was saved, as each of vanilla's setters marks it.
+    pub dirty: bool = false
+}
+
+/// A game event the weather sends, and whether to every player or only those in the level that
+/// moved it, as `broadcastAll` sends it with or without the level's dimension.
+pub struct WeatherEvent {
+    pub event: u8
+    pub param: f32
+    pub everyone: bool
+}
+
+/// A level's rain and thunder, vanilla's `rainLevel` and `thunderLevel`, now and a tick ago.
+pub struct WeatherLevels {
+    pub rain: f32 = 0.0f32
+    pub o_rain: f32 = 0.0f32
+    pub thunder: f32 = 0.0f32
+    pub o_thunder: f32 = 0.0f32
+}
+
+/// The saved data type the weather is saved as, `WeatherData.TYPE`.
+pub fn saved_id() -> Identifier {
+    return Identifier { namespace: "minecraft", path: "weather" }
+}
+
+impl Weather {
+    /// The weather the saved data's `root` holds, as `WeatherData.CODEC` reads it, or new
+    /// weather, with vanilla's error, if its `data` isn't a map or a field is missing or isn't
+    /// what it should be.
+    pub fn load(root: JavaHashMap<String, Tag>, lines: mut List<Entry>) -> Weather {
+        if not root.contains("data") {
+            lines.push(parse_failed(saved_id(), String("Not a map: null")))
+            return Weather()
+        }
+        let data = match root["data"] {
+            Tag.Compound(d) => d.copy(),
+            _ => {
+                lines.push(parse_failed(saved_id(), "Not a map: {root["data"].to_snbt()}"))
+                return Weather()
+            },
+        }
+        var errors = List<String>()
+        let clear = int_field(data, "clear_weather_time", mut errors)
+        let rain = int_field(data, "rain_time", mut errors)
+        let thunder = int_field(data, "thunder_time", mut errors)
+        let raining = bool_field(data, "raining", mut errors)
+        let thundering = bool_field(data, "thundering", mut errors)
+        if not errors.is_empty() {
+            // Joined as the record codec joins them, the last field's first.
+            var message = String()
+            var i = errors.len()
+            while i > 0 {
+                i -= 1
+                if not message.is_empty() {
+                    message.push_str("; ")
+                }
+                message.push_str(errors[i])
+            }
+            lines.push(parse_failed(saved_id(), message))
+            return Weather()
+        }
+        return Weather { clear_weather_time: clear, rain_time: rain, thunder_time: thunder, raining: raining, thundering: thundering }
+    }
+
+    /// The weather as `WeatherData.CODEC` writes it, its file's `data`.
+    pub fn pack(self) -> Tag {
+        var fields = JavaHashMap<String, Tag>()
+        fields.insert(String("clear_weather_time"), Tag.Int(self.clear_weather_time))
+        fields.insert(String("rain_time"), Tag.Int(self.rain_time))
+        fields.insert(String("thunder_time"), Tag.Int(self.thunder_time))
+        fields.insert(String("raining"), Tag.Byte(if self.raining { 1 } else { 0 }))
+        fields.insert(String("thundering"), Tag.Byte(if self.thundering { 1 } else { 0 }))
+        return Tag.Compound(fields)
+    }
+
+    /// Clear, with no rain or thunder to come yet, as `resetWeatherCycle` leaves it once everyone
+    /// has slept through the night.
+    pub fn reset(mut self) {
+        self.rain_time = 0
+        self.raining = false
+        self.thunder_time = 0
+        self.thundering = false
+        self.dirty = true
+    }
+}
+
+impl WeatherLevels {
+    /// A level's levels as it's made, as `prepareWeather` sets them: full rain if it's raining,
+    /// and full thunder too if it's thundering, with the levels a tick ago left at 0.
+    pub fn prepared(weather: Weather) -> WeatherLevels {
+        var levels = WeatherLevels()
+        if weather.raining {
+            levels.rain = 1.0f32
+            if weather.thundering {
+                levels.thunder = 1.0f32
+            }
+        }
+        return levels
+    }
+
+    /// The rain level as `getRainLevel(1.0F)` gives it.
+    pub fn rain_level(self) -> f32 {
+        return lerp1(self.o_rain, self.rain)
+    }
+
+    /// The thunder level as `getThunderLevel(1.0F)` gives it, which is under the rain's.
+    pub fn thunder_level(self) -> f32 {
+        return lerp1(self.o_thunder, self.thunder) * self.rain_level()
+    }
+
+    /// Whether it's raining in the level, as `isRaining` says of a level that can have weather.
+    pub fn raining(self) -> bool {
+        return f64(self.rain_level()) > 0.2
+    }
+
+    /// Whether it's thundering in the level, as `isThundering` says of a level that can have
+    /// weather.
+    pub fn thundering(self) -> bool {
+        return f64(self.thunder_level()) > 0.9
+    }
+}
+
+/// A tick of the weather in a level that can have it, as `advanceWeatherCycle` runs it: the
+/// weather's times run down, if `on`, as the `advance_weather` rule says, with the next
+/// drawn from `random`, the level's, as each runs out; then the level's levels move toward it.
+/// Gives the game events the level's players, or everyone, are sent for it, in order.
+pub fn advance<R: RandomSource>(weather: mut Weather, levels: mut WeatherLevels, random: mut R, on: bool) -> List<WeatherEvent> {
+    let was_raining = levels.raining()
+    if on {
+        var clear = weather.clear_weather_time
+        var thunder_time = weather.thunder_time
+        var rain_time = weather.rain_time
+        var thundering = weather.thundering
+        var raining = weather.raining
+        if clear > 0 {
+            clear -= 1
+            thunder_time = if thundering { 0 } else { 1 }
+            rain_time = if raining { 0 } else { 1 }
+            thundering = false
+            raining = false
+        } else {
+            if thunder_time > 0 {
+                thunder_time -= 1
+                if thunder_time == 0 {
+                    thundering = not thundering
+                }
+            } else if thundering {
+                thunder_time = between(mut random, THUNDER_DURATION_MIN, THUNDER_DURATION_MAX)
+            } else {
+                thunder_time = between(mut random, THUNDER_DELAY_MIN, THUNDER_DELAY_MAX)
+            }
+            if rain_time > 0 {
+                rain_time -= 1
+                if rain_time == 0 {
+                    raining = not raining
+                }
+            } else if raining {
+                rain_time = between(mut random, RAIN_DURATION_MIN, RAIN_DURATION_MAX)
+            } else {
+                rain_time = between(mut random, RAIN_DELAY_MIN, RAIN_DELAY_MAX)
+            }
+        }
+        weather.thunder_time = thunder_time
+        weather.rain_time = rain_time
+        weather.clear_weather_time = clear
+        weather.thundering = thundering
+        weather.raining = raining
+        weather.dirty = true
+    }
+    levels.o_thunder = levels.thunder
+    levels.thunder = clamp01(if weather.thundering { levels.thunder + 0.01f32 } else { levels.thunder - 0.01f32 })
+    levels.o_rain = levels.rain
+    levels.rain = clamp01(if weather.raining { levels.rain + 0.01f32 } else { levels.rain - 0.01f32 })
+
+    var events = List<WeatherEvent>()
+    if levels.o_rain != levels.rain {
+        events.push(WeatherEvent { event: RAIN_LEVEL_CHANGE, param: levels.rain, everyone: false })
+    }
+    if levels.o_thunder != levels.thunder {
+        events.push(WeatherEvent { event: THUNDER_LEVEL_CHANGE, param: levels.thunder, everyone: false })
+    }
+    if was_raining != levels.raining() {
+        // These go to every player, wherever they are, as vanilla sends them.
+        events.push(WeatherEvent { event: if was_raining { STOP_RAINING } else { START_RAINING }, param: 0.0f32, everyone: true })
+        events.push(WeatherEvent { event: RAIN_LEVEL_CHANGE, param: levels.rain, everyone: true })
+        events.push(WeatherEvent { event: THUNDER_LEVEL_CHANGE, param: levels.thunder, everyone: true })
+    }
+    return events
+}
+
+/// What a player joining a level that can have weather is told of it, as `sendLevelInfo` tells
+/// them: if it's raining, that it started, and its rain and thunder levels.
+pub fn joining(levels: WeatherLevels) -> List<WeatherEvent> {
+    var events = List<WeatherEvent>()
+    if levels.raining() {
+        events.push(WeatherEvent { event: START_RAINING, param: 0.0f32, everyone: false })
+        events.push(WeatherEvent { event: RAIN_LEVEL_CHANGE, param: levels.rain_level(), everyone: false })
+        events.push(WeatherEvent { event: THUNDER_LEVEL_CHANGE, param: levels.thunder_level(), everyone: false })
+    }
+    return events
+}
+
+// `Mth.randomBetweenInclusive`, as `UniformInt.sample` draws.
+fn between<R: RandomSource>(random: mut R, min: i32, max: i32) -> i32 {
+    return random.next_int_below(max - min + 1) + min
+}
+
+// `Mth.lerp(1.0F, from, to)`, in floats: `from + 1 * (to - from)`, which isn't always `to`.
+fn lerp1(from: f32, to: f32) -> f32 {
+    return from + 1.0f32 * (to - from)
+}
+
+// `Mth.clamp` to 0 and 1.
+fn clamp01(v: f32) -> f32 {
+    return if v < 0.0f32 { 0.0f32 } else if v > 1.0f32 { 1.0f32 } else { v }
+}
+
+// A field of `Codec.INT`, read as `Number.intValue` reads it, or 0 with the codec's error:
+// `NbtOps.getNumberValue`'s, which doesn't say the value.
+fn int_field(data: JavaHashMap<String, Tag>, name: str, errors: mut List<String>) -> i32 {
+    if not data.contains(name) {
+        errors.push("No key {name} in MapLike[{Tag.Compound(data.copy()).to_snbt()}]")
+        return 0
+    }
+    let v = data[name].number_int() else {
+        errors.push(String("Not a number"))
+        return 0
+    }
+    return v
+}
+
+// A field of `Codec.BOOL`, a number other than 0 for true, or false with the codec's error,
+// which is a number's, as `NbtOps.getBooleanValue` reads a number.
+fn bool_field(data: JavaHashMap<String, Tag>, name: str, errors: mut List<String>) -> bool {
+    if not data.contains(name) {
+        errors.push("No key {name} in MapLike[{Tag.Compound(data.copy()).to_snbt()}]")
+        return false
+    }
+    let v = data[name].number_bool() else {
+        errors.push(String("Not a number"))
+        return false
+    }
+    return v
+}
