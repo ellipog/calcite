@@ -1,0 +1,242 @@
+/// Scratch, for CAL-65: a player who joins a running server over TCP, in offline mode with
+/// compression off, accepts its teleport and chunks, answers keep-alives, walks east `WALK`
+/// blocks a second after its first 3 seconds, or with `back` east for half that time and west
+/// again, and says what it was sent. Not a test.
+///
+///     calx run --release src/chunk_bot.calx -- PORT VIEW SECONDS WALK [back]
+module chunk_bot
+
+import java.uuid.{Uuid}
+import pack.resources.{KnownPack}
+import protocol.codec.{Codec}
+import protocol.common.{ChatVisibility, ClientInformation, HumanoidArm, ParticleStatus, ServerboundClientInformation, ServerboundKeepAlive}
+import protocol.configuration.{ServerboundFinishConfiguration, ServerboundSelectKnownPacks}
+import protocol.handshake.{ClientIntent, ClientIntention}
+import protocol.ids.{packet_names}
+import protocol.login.{ServerboundHello, ServerboundLoginAcknowledged}
+import protocol.play.{ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundMovePlayerPos, ON_GROUND}
+import protocol.state.{State, Bound}
+import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
+import std.env.{args, variable}
+import std.net.{Net, Conn, Event}
+import std.time.{Instant}
+import world.pos.{ChunkPos}
+
+fn number(s: String) -> u64 {
+    var n: u64 = 0
+    for i in 0..s.len() {
+        n = n * 10 + u64(s.byte_at(i) - 48)
+    }
+    return n
+}
+
+fn packet<T: Wire + Packet>(p: T, state: State) -> List<u8> {
+    var w = Writer.new()
+    write_packet(p, state, mut w)
+    return w.into_bytes()
+}
+
+struct Bot {
+    conn: Conn
+    codec: Codec
+    state: State
+    view: i32
+    closed: bool = false
+    placed: bool = false
+    x: f64 = 0.0
+    y: f64 = 0.0
+    z: f64 = 0.0
+    held: OpenHashSet<i64> = OpenHashSet<i64>()
+    chunks: u64 = 0
+    again: u64 = 0
+    forgets: u64 = 0
+    unheld_forgets: u64 = 0
+    bytes: u64 = 0
+    sizes: OpenHashMap<usize, u64> = OpenHashMap<usize, u64>()
+    first_chunk: u64 = 0
+    joined: u64 = 0
+    last_chunk: u64 = 0
+    batches: u64 = 0
+    rate: f32 = 64.0
+}
+
+impl Bot {
+    fn send(mut self, net: Net, p: own List<u8>) {
+        net.write(self.conn, self.codec.encode(p)!)
+    }
+
+    // Answers what came.
+    fn handle(mut self, net: Net, now: u64) {
+        loop {
+            let body = match self.codec.next()! {
+                some(b) => b,
+                none => return,
+            }
+            let size = body.len()
+            var r = Reader.new(body)
+            let id = usize.wrap(r.varint()!)
+            let name = packet_names(self.state, Bound.Clientbound)[id].copy()
+            match self.state {
+                State.Login => {
+                    if name == "login_finished" {
+                        self.send(net, packet(ServerboundLoginAcknowledged {}, State.Login))
+                        self.state = State.Configuration
+                        let info = ClientInformation { language: "en_us", view_distance: i8.wrap(self.view), chat_visibility: ChatVisibility.Full, chat_colors: true, model_customisation: 127, main_hand: HumanoidArm.Right, text_filtering_enabled: false, allows_listing: true, particle_status: ParticleStatus.All }
+                        self.send(net, packet(ServerboundClientInformation { information: info }, State.Configuration))
+                        self.send(net, packet(ServerboundSelectKnownPacks { packs: [KnownPack { namespace: "minecraft", id: "core", version: "26.3" }] }, State.Configuration))
+                    } else if name == "login_disconnect" {
+                        println("turned away at login")
+                    }
+                },
+                State.Configuration => {
+                    if name == "finish_configuration" {
+                        self.send(net, packet(ServerboundFinishConfiguration {}, State.Configuration))
+                        self.state = State.Play
+                        self.joined = now
+                    } else if name == "keep_alive" {
+                        self.send(net, packet(ServerboundKeepAlive { challenge: r.i64()! }, State.Configuration))
+                    }
+                },
+                State.Play => {
+                    if name == "keep_alive" {
+                        self.send(net, packet(ServerboundKeepAlive { challenge: r.i64()! }, State.Play))
+                    } else if name == "player_position" {
+                        let teleport = r.varint()!
+                        self.x = r.f64()!
+                        self.y = r.f64()!
+                        self.z = r.f64()!
+                        let accept = packet(ServerboundAcceptTeleportation { teleport_id: teleport, x: self.x, y: self.y, z: self.z, y_rot: 0.0, x_rot: 0.0 }, State.Play)
+                        self.send(net, accept)
+                        self.placed = true
+                    } else if name == "level_chunk_with_light" {
+                        let x = r.i32()!
+                        let z = r.i32()!
+                        let k = ChunkPos { x: x, z: z }.pack()
+                        if self.held.contains(k) {
+                            self.again += 1
+                        }
+                        self.held.insert(k)
+                        self.chunks += 1
+                        self.bytes += u64(size)
+                        self.sizes.insert(size, (self.sizes.get(size) ?? 0) + 1)
+                        if self.first_chunk == 0 {
+                            self.first_chunk = now
+                        }
+                        self.last_chunk = now
+                    } else if name == "forget_level_chunk" {
+                        // ChunkPos as a long: x low, z high.
+                        let k = r.i64()!
+                        let pos = ChunkPos { x: i32.wrap(k), z: i32.wrap(k >> 32) }
+                        if not self.held.contains(pos.pack()) {
+                            self.unheld_forgets += 1
+                        }
+                        self.held.remove(pos.pack())
+                        self.forgets += 1
+                    } else if name == "chunk_batch_finished" {
+                        self.batches += 1
+                        let rate = self.rate
+                        self.send(net, packet(ServerboundChunkBatchReceived { desired_chunks_per_tick: rate }, State.Play))
+                    } else if name == "disconnect" {
+                        println("disconnected in play")
+                    }
+                },
+                _ => {},
+            }
+        }
+    }
+}
+
+fn ms(nanos: u64) -> u64 {
+    return nanos / 1000000
+}
+
+fn main() {
+    let given = args()
+    let port = u16.wrap(number(given[0]))
+    let view = i32.wrap(number(given[1]))
+    let seconds = number(given[2])
+    let walk = number(given[3])
+    let back = given.len() > 4 and given[4] == "back"
+    let net = Net.new()!
+    let start = unsafe { Instant.now() }
+    let conn = net.connect("127.0.0.1", port)!
+    var bot = Bot { conn: conn, codec: Codec.new(), state: State.Login, view: view }
+    // BOT_RATE asks for that many chunks a tick, as a whole number, rather than 64.
+    if let r = variable(String("BOT_RATE")) {
+        var n: i32 = 0
+        for i in 0..r.len() {
+            n = n * 10 + i32(r.byte_at(i) - 48)
+        }
+        bot.rate = f32.nearest(n)
+    }
+    bot.send(net, packet(ClientIntention { protocol_version: 777, host_name: "localhost", port: port, intention: ClientIntent.Login }, State.Handshake))
+    bot.send(net, packet(ServerboundHello { name: "Walker", profile_id: Uuid.new(0, 0) }, State.Login))
+    var next_tick: u64 = 0
+    var ticks: u64 = 0
+    var at_walk_start: u64 = 0
+    var last_count: u64 = 0
+    loop {
+        var events = List<Event>()
+        net.poll(5, mut events)
+        for e in events {
+            match e {
+                Event.Received(c) => {
+                    if c == bot.conn {
+                        _ = bot.codec.read_from(net, c)
+                    }
+                },
+                Event.Closed(c) => {
+                    if c == bot.conn {
+                        bot.closed = true
+                    }
+                },
+                _ => {},
+            }
+        }
+        let now = unsafe { Instant.now() }.nanos_since(start)
+        bot.handle(net, now)
+        if bot.closed {
+            println("closed")
+            return
+        }
+        // A tick of the client's, every 50 ms; after 3 seconds, a step east of WALK / 20 each.
+        if now >= next_tick {
+            next_tick += 50000000
+            if bot.placed and bot.state == State.Play {
+                ticks += 1
+                if ticks % 20 == 0 {
+                    println("  {ticks / 20} s: +{bot.chunks - last_count} chunks, {bot.chunks} in all, at x {bot.x}")
+                    last_count = bot.chunks
+                }
+                if ticks == 60 {
+                    at_walk_start = bot.chunks
+                    println("by 3 s: {bot.chunks} chunks, {bot.held.len()} held, {bot.batches} batches, join at {ms(bot.joined)} ms, first chunk at {ms(bot.first_chunk)} ms, last at {ms(bot.last_chunk)} ms")
+                }
+                if ticks > 60 and walk > 0 {
+                    // With BACK, east for half the walk, then west to where it began.
+                    let half = (seconds * 20 - 60) / 2
+                    if back and ticks > 60 + half {
+                        bot.x -= f64.nearest(walk) / 20.0
+                    } else {
+                        bot.x += f64.nearest(walk) / 20.0
+                    }
+                    let step = packet(ServerboundMovePlayerPos { x: bot.x, y: bot.y, z: bot.z, flags: ON_GROUND }, State.Play)
+                    bot.send(net, step)
+                }
+                bot.send(net, packet(ServerboundClientTickEnd {}, State.Play))
+            }
+        }
+        if now >= seconds * 1000000000 {
+            break
+        }
+    }
+    var shapes = String()
+    var n = 0
+    for (size, count) in bot.sizes {
+        if n < 6 {
+            shapes.push_str(" {size}B×{count}")
+        }
+        n += 1
+    }
+    println("at the end: {bot.chunks} chunks ({bot.chunks - at_walk_start} while walking), {bot.held.len()} held, sent again {bot.again}, {bot.forgets} forgets ({bot.unheld_forgets} of chunks not held), {bot.bytes / 1024} KiB, {n} sizes:{shapes}; at x {bot.x}, last chunk at {ms(bot.last_chunk)} ms")
+}
