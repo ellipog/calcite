@@ -12,7 +12,7 @@
 /// biomes is when the chunk is written.
 module storage.chunk
 
-import nbt.tag.{Tag}
+import nbt.tag.{Accounter, Tag, read_unnamed}
 import protocol.ids.{DATA_VERSION}
 import registry.names.{Names}
 import registry.registries.{Registries}
@@ -146,6 +146,233 @@ impl ChunkRest {
         structures.insert("References", Tag.Compound(JavaHashMap<String, Tag>()))
         return ChunkRest { block_entities: List<Tag>(), block_ticks: List<SavedTick>(), fluid_ticks: List<SavedTick>(), post_processing: post, structures: Tag.Compound(structures) }
     }
+}
+
+/// A chunk's rest as the server keeps it while it holds the chunk: packed in one list of bytes,
+/// where `ChunkRest`'s lists and tags are dozens of small blocks. Each of those lived as long as
+/// its chunk, on a page among the many that generating the chunk took and let go, and held the
+/// page. Packed, and kept with the others in the level's `RestStore`, a still view-32 player's
+/// server holds 45 MiB less (D289). Only the server reads it, and it's never saved as it is:
+/// `unpack` gives the rest back to save.
+///
+/// The ticks and the marks are their numbers, each as a varint, 7 bits a byte with the low ones
+/// first, and a signed one zig-zagged first, as protobuf's are; a section's count of marks is one
+/// more than it has, and 0 where it has none. The block entities and the structures are NBT, as
+/// `write_unnamed` writes a save's root.
+pub struct PackedRest {
+    bytes: List<u8>
+}
+
+impl PackedRest {
+    /// `rest`, packed.
+    pub fn of(rest: ChunkRest) -> PackedRest {
+        var out = List<u8>()
+        put_ticks(mut out, rest.block_ticks)
+        put_ticks(mut out, rest.fluid_ticks)
+        put_var(mut out, u32.wrap(rest.post_processing.len()))
+        for p in rest.post_processing {
+            if let marks = p {
+                put_var(mut out, u32.wrap(marks.len()) + 1)
+                for m in marks {
+                    put_var(mut out, u32(u16.wrap(m)))
+                }
+            } else {
+                put_var(mut out, 0)
+            }
+        }
+        put_var(mut out, u32.wrap(rest.block_entities.len()))
+        for t in rest.block_entities {
+            t.write_unnamed(mut out)
+        }
+        rest.structures.write_unnamed(mut out)
+        // A copy holds as many bytes as there are, where the list grew to as many as twice.
+        return PackedRest { bytes: out.copy() }
+    }
+
+    /// The rest it was packed from.
+    pub fn unpack(self) -> ChunkRest {
+        return unpacked(self.bytes)
+    }
+
+    /// How many bytes it holds.
+    pub fn len(self) -> usize {
+        return self.bytes.len()
+    }
+}
+
+/// The packed rests of the chunks a level holds, all in one list of bytes, each chunk's where its
+/// span says (D289). A rest in a list of its own was a block of its own, made on the worker that
+/// made the chunk, among the many it let go of then: each held a 4 KiB page that was otherwise
+/// free, and a still view-32 player's 5,041 chunks held 25 MiB that way for 5 MiB of rests. One
+/// list is a big block, which comes from the system and goes back to it whole. Once half of what
+/// it holds is rests taken out, those still in it move up to its start, in a list of their own
+/// size.
+pub struct RestStore {
+    bytes: List<u8> = List<u8>()
+    // Each chunk's rest, by its packed position: where it starts in `bytes`, in the high half,
+    // and how long it is.
+    spans: OpenHashMap<i64, u64> = OpenHashMap<i64, u64>()
+    // How many of the bytes are no chunk's.
+    loose: usize = 0
+}
+
+// The least that moves the rests up, so a small store isn't copied over and over.
+const LOOSE_AT_LEAST: usize = 65536
+
+impl RestStore {
+    /// Keeps `rest` for the chunk at `k`, in place of any it had.
+    pub fn put(mut self, k: i64, rest: own PackedRest) {
+        self.forget(k)
+        let start = self.bytes.len()
+        for b in rest.bytes {
+            self.bytes.push(b)
+        }
+        self.spans.insert(k, (u64(start) << 32) | u64(rest.bytes.len()))
+    }
+
+    /// Takes the chunk at `k`'s rest out, if it has one.
+    pub fn take(mut self, k: i64) -> PackedRest? {
+        let span = self.spans.remove(k) else return none
+        let start = usize.wrap(span >> 32)
+        let len = usize.wrap(span & 0xFFFFFFFF)
+        var out = List<u8>()
+        out.reserve(len)
+        for i in start..start + len {
+            out.push(self.bytes[i])
+        }
+        self.loose += len
+        self.tidy()
+        return some(PackedRest { bytes: out })
+    }
+
+    /// How many chunks it has rests for.
+    pub fn len(self) -> usize {
+        return self.spans.len()
+    }
+
+    /// How many bytes it holds, the rests' and those no chunk's.
+    pub fn held(self) -> usize {
+        return self.bytes.len()
+    }
+
+    // Lets go of the chunk at `k`'s rest, if it has one.
+    fn forget(mut self, k: i64) {
+        let span = self.spans.remove(k) else return
+        self.loose += usize.wrap(span & 0xFFFFFFFF)
+        self.tidy()
+    }
+
+    // Once half the bytes are no chunk's, moves the rests up into a list of their size.
+    fn tidy(mut self) {
+        if self.loose < LOOSE_AT_LEAST or self.loose * 2 < self.bytes.len() {
+            return
+        }
+        var out = List<u8>()
+        out.reserve(self.bytes.len() - self.loose)
+        var spans = OpenHashMap<i64, u64>()
+        for (k, span) in self.spans {
+            let start = usize.wrap(span >> 32)
+            let len = usize.wrap(span & 0xFFFFFFFF)
+            spans.insert(k, (u64(out.len()) << 32) | u64(len))
+            for i in start..start + len {
+                out.push(self.bytes[i])
+            }
+        }
+        self.bytes = out
+        self.spans = spans
+        self.loose = 0
+    }
+}
+
+// The rest `b`, a packed rest's bytes, holds.
+fn unpacked(b: List<u8>) -> ChunkRest {
+    var at: usize = 0
+    let block_ticks = ticks_at(b, mut at)
+    let fluid_ticks = ticks_at(b, mut at)
+    let sections = usize(var_at(b, mut at))
+    var post = List<List<i16>?>()
+    for _ in 0..sections {
+        let n = var_at(b, mut at)
+        if n == 0 {
+            post.push(none)
+            continue
+        }
+        var marks = List<i16>()
+        marks.reserve(usize(n - 1))
+        for _ in 0..usize(n - 1) {
+            marks.push(i16.wrap(var_at(b, mut at)))
+        }
+        post.push(some(marks))
+    }
+    var accounter = Accounter.unlimited()
+    let count = usize(var_at(b, mut at))
+    var block_entities = List<Tag>()
+    for _ in 0..count {
+        block_entities.push(read_unnamed(b, mut at, mut accounter)!)
+    }
+    let structures = read_unnamed(b, mut at, mut accounter)!
+    return ChunkRest { block_entities: block_entities, block_ticks: block_ticks, fluid_ticks: fluid_ticks, post_processing: post, structures: structures }
+}
+
+fn put_var(out: mut List<u8>, value: u32) {
+    var v = value
+    while v >= 0x80 {
+        out.push(u8.wrap(v) | 0x80)
+        v = v >> 7
+    }
+    out.push(u8.wrap(v))
+}
+
+fn var_at(b: List<u8>, at: mut usize) -> u32 {
+    var v: u32 = 0
+    var shift: u32 = 0
+    loop {
+        let byte = u32(b[at])
+        at += 1
+        v = v | ((byte & 0x7F) << shift)
+        if byte < 0x80 {
+            return v
+        }
+        shift += 7
+    }
+}
+
+// A signed number zig-zagged, so one near 0 either way takes a byte or two.
+fn put_signed(out: mut List<u8>, v: i32) {
+    put_var(mut out, u32.wrap((v << 1) ^ (v >> 31)))
+}
+
+fn signed_at(b: List<u8>, at: mut usize) -> i32 {
+    let u = var_at(b, mut at)
+    return i32.wrap(u >> 1) ^ -i32.wrap(u & 1)
+}
+
+fn put_ticks(out: mut List<u8>, ticks: List<SavedTick>) {
+    put_var(mut out, u32.wrap(ticks.len()))
+    for t in ticks {
+        put_var(mut out, t.kind)
+        put_signed(mut out, t.x)
+        put_signed(mut out, t.y)
+        put_signed(mut out, t.z)
+        put_signed(mut out, t.delay)
+        put_signed(mut out, t.priority)
+    }
+}
+
+fn ticks_at(b: List<u8>, at: mut usize) -> List<SavedTick> {
+    let n = usize(var_at(b, mut at))
+    var out = List<SavedTick>()
+    out.reserve(n)
+    for _ in 0..n {
+        let kind = var_at(b, mut at)
+        let x = signed_at(b, mut at)
+        let y = signed_at(b, mut at)
+        let z = signed_at(b, mut at)
+        let delay = signed_at(b, mut at)
+        let priority = signed_at(b, mut at)
+        out.push(SavedTick { kind: kind, x: x, y: y, z: z, delay: delay, priority: priority })
+    }
+    return out
 }
 
 /// What the blender needs of a chunk from before the world grew, vanilla's `BlendingData.Packed`.
