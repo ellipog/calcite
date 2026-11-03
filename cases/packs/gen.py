@@ -435,6 +435,83 @@ def enchantment(*paths):
     })
 
 
+def effects_enchantment(effects):
+    """An enchantment with `effects`, each component's list of conditional effects (CAL-79)."""
+    return json.dumps({
+        "anvil_cost": 1,
+        "description": "e",
+        "effects": effects,
+        "max_cost": {"base": 1, "per_level_above_first": 0},
+        "max_level": 1,
+        "min_cost": {"base": 1, "per_level_above_first": 0},
+        "slots": ["any"],
+        "supported_items": "#minecraft:enchantable/weapon",
+        "weight": 1,
+    })
+
+
+def conditional(component, *requirements):
+    """`component`'s list of effects, one for each of `requirements`, with an effect of the kind
+    the component holds."""
+    if component in ("tick", "hit_block", "location_changed", "post_piercing_attack", "post_attack"):
+        effect = {"type": "minecraft:change_item_damage", "amount": 1.0}
+    else:
+        effect = {"type": "minecraft:add", "value": 1.0}
+    if component == "post_attack":
+        return [{"enchanted": "attacker", "affected": "victim", "effect": effect, "requirements": r} for r in requirements]
+    return [{"effect": effect, "requirements": r} for r in requirements]
+
+
+def check(kind, **fields):
+    return {"type": f"minecraft:{kind}", **fields}
+
+
+# A positional environment attribute, which needs `origin`.
+POSITIONAL = {"type": "minecraft:environment_attribute", "attribute": "minecraft:gameplay/turtle_egg_hatch_chance"}
+
+# Conditions an effect's context doesn't have the parameters for, by component, each failing to
+# load as vanilla's `validatedListCodec` fails it.
+BAD_REQUIREMENTS = {
+    "tool-in-damage": {"minecraft:damage": conditional("damage", check("match_tool"))},
+    "origin-in-item": {"minecraft:item_damage": conditional("item_damage", check("location_check"))},
+    "killer-in-tick": {"minecraft:tick": conditional("tick", check("killed_by_player"))},
+    "explosion-in-post-attack": {"minecraft:post_attack": conditional("post_attack", check("survives_explosion"))},
+    "active-in-tick": {"minecraft:tick": conditional("tick", check("enchantment_active_check", active=True))},
+    "attacker-in-tick": {"minecraft:tick": conditional("tick", check("entity_properties", entity="attacker"))},
+    "block-entity-in-hit-block": {"minecraft:hit_block": conditional("hit_block", check("match_block", nbt="{a:1b}"))},
+    "bonus-in-item": {"minecraft:block_experience": conditional("block_experience", check("random_chance_with_enchanted_bonus", unenchanted_chance=0.5, enchanted_chance=0.5, enchantment="minecraft:sharpness"))},
+    "inverted": {"minecraft:item_damage": conditional("item_damage", check("inverted", term=check("survives_explosion")))},
+    "all-of": {"minecraft:tick": conditional("tick", check("all_of", terms=[check("location_check"), check("killed_by_player")]))},
+    "one-term": {"minecraft:tick": conditional("tick", check("any_of", terms=check("match_tool")))},
+    "three-terms": {"minecraft:tick": conditional("tick", check("all_of", terms=[check("match_tool"), check("killed_by_player"), check("survives_explosion")]))},
+    "two-effects": {"minecraft:fishing_luck_bonus": conditional("fishing_luck_bonus", check("match_tool"), check("weather_check"), check("survives_explosion"))},
+    "two-components": {
+        "minecraft:damage": conditional("damage", check("match_tool")),
+        "minecraft:ammo_use": conditional("ammo_use", check("killed_by_player")),
+    },
+    "attribute-value": {"minecraft:item_damage": conditional("item_damage", check("float_value_check", value=POSITIONAL, test={"min": 0.0}))},
+    "attribute-range": {"minecraft:item_damage": conditional("item_damage", check("float_value_check", value=1.0, test={"min": POSITIONAL, "max": {"type": "minecraft:add", "inputs": [1.0, POSITIONAL]}}))},
+    "empty-inputs": {"minecraft:tick": conditional("tick", check("float_value_check", value={"type": "minecraft:max", "inputs": []}, test=1.0))},
+    "score-target": {"minecraft:tick": conditional("tick", check("int_value_check", value={"type": "minecraft:score", "target": "attacker", "score": "s"}, test=1))},
+    "time-range": {"minecraft:item_damage": conditional("item_damage", check("time_check", clock="minecraft:overworld", value={"min": {"type": "minecraft:environment_attribute", "attribute": "minecraft:gameplay/turtle_egg_hatch_chance"}}))},
+    "time-line": {"minecraft:item_damage": conditional("item_damage", check("time_check", clock="minecraft:overworld", value={"min": 1, "max": {"type": "minecraft:score", "target": "attacker", "score": "s"}}))},
+    "conditional-number": {"minecraft:tick": conditional("tick", check("int_value_check", value={"type": "minecraft:conditional", "condition": check("match_tool"), "on_true": 1}, test=1))},
+    "dispatcher": {"minecraft:item_damage": conditional("item_damage", check("float_value_check", value={"type": "minecraft:number_dispatcher", "cases": [{"condition": check("weather_check"), "value": 1.0}, {"condition": check("killed_by_player"), "value": 2.0}], "default": {"type": "minecraft:abs", "input": POSITIONAL}}, test=1.0))},
+    "scores": {"minecraft:item_damage": conditional("item_damage", check("entity_scores", entity="this", scores={"a": {"min": {"type": "minecraft:score", "target": "this", "score": "a"}}}))},
+}
+
+# Conditions their contexts have the parameters for, or that vanilla doesn't check, which load.
+ALLOWED_REQUIREMENTS = {
+    "minecraft:damage": conditional("damage", check("damage_source_properties"), check("entity_properties", entity="attacker"), check("location_check")),
+    "minecraft:item_damage": conditional("item_damage", check("match_tool"), check("weather_check"), check("float_value_check", value={"type": "minecraft:enchantment_level", "amount": 1.0}, test={"min": 1.0})),
+    "minecraft:hit_block": conditional("hit_block", check("match_block"), check("location_check")),
+    "minecraft:location_changed": conditional("location_changed", check("enchantment_active_check", active=True)),
+    # `random_chance` checks nothing of its chance, so a chance that needs `origin` loads anywhere.
+    "minecraft:block_experience": conditional("block_experience", check("random_chance", chance=POSITIONAL)),
+    "minecraft:tick": conditional("tick", check("float_value_check", value={"type": "minecraft:environment_attribute", "attribute": "minecraft:gameplay/sky_light_level"}, test=1.0)),
+}
+
+
 # NBT paths that don't read, by what's wrong with them.
 BAD_PATHS = {
     "double-dot": "a..b",
@@ -552,12 +629,15 @@ def loading():
     }
     for name, path in BAD_PATHS.items():
         broken[f"nbt-path-{name}"] = [("data/w/enchantment/bad.json", enchantment(path))]
+    for name, effects in BAD_REQUIREMENTS.items():
+        broken[f"requirements-{name}"] = [("data/w/enchantment/bad.json", effects_enchantment(effects))]
     for name, files in broken.items():
         cases.append(world(f"load-{name}", files))
     # NBT paths that read, each written back as the text it was read from, which stops at a space.
     cases.append(world("load-nbt-paths", [("data/w/enchantment/paths.json", enchantment(
         "a", "a.b[0]", "a[-1][]", "{x:1b}.y", "a{x:1b}", "a[{x:1b}]", "\"q r\".'s\\'t'", "x-y_z:w+", "a b", "a.", "", " a",
     ))]))
+    cases.append(world("load-requirements-allowed", [("data/w/enchantment/allowed.json", effects_enchantment(ALLOWED_REQUIREMENTS))]))
     # A registry of variants left empty, by a filter that hides vanilla's paintings and their tags.
     hide = {"block": [{"namespace": "minecraft", "path": "(tags/)?painting_variant/.*"}]}
     cases.append(world("load-no-paintings", [], meta(filter=hide)))
