@@ -93,7 +93,7 @@ Vanilla isn't repeatable run to run. Each level's `random` is seeded from `Rando
 
 - seeds each level's random, as the level's made, with `mixStafford13(N ^ name.hashCode())`, the name its dimension's, such as `minecraft:overworld`. Calcite's `level-random-seed=N` seeds its own the same way;
 - sets the entity counter back to 0 as the Overworld's level is made, so the first entity is 1;
-- with `,tape=PATH` as well, writes each value a level's random draws to `PATH`, the RNG tape, a line each: the level, its game time, the bits drawn, the value, and the two frames of the stack that asked for it outside the random classes.
+- with `,tape=PATH` as well, writes each value a level's random draws to `PATH`, the RNG tape, a line each: the level, its game time, the bits drawn, the value, and the two frames of the stack that asked for it outside the random classes. As the JVM ends it adds `# end LEVEL TIME` for each level, its game time then. Calcite's `--rng-tape PATH` writes the same lines, without where each was drawn, and [`tapediff.py`](../../rig/runner/tapediff.py) lines the two up ([D312](../../docs/decisions.md)).
 
 ```
 # seed 1103

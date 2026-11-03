@@ -15,9 +15,10 @@ import java.util.function.LongSupplier;
 /**
  * The RNG tape (P6.1, D311): each value a level's random draws, a line each, with the level, its
  * game time, the bits drawn, the value, and where it was drawn: the first two frames of the
- * stack outside the random classes, the method that asked for it and what called that.
+ * stack outside the random classes, the method that asked for it and what called that. It ends
+ * with a line {@code # end LEVEL TIME} for each level, its game time as the JVM ended (D312).
  *
- * <pre>minecraft:overworld 0 31 1424587364 ServerLevel.advanceWeatherCycle:1012 ServerLevel.tick:420</pre>
+ * <pre>minecraft:overworld 0 31 1530525153 Mth.randomBetweenInclusive:823 UniformInt.sample:27</pre>
  *
  * <p>{@code LegacyRandomSource.next} calls {@link #drew} for every value it returns, so it must be
  * cheap for the randoms that aren't a level's: one comparison for each level. It names no game
@@ -54,9 +55,14 @@ public final class Tape {
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+        // As the JVM ends, each level's game time then, `# end LEVEL TIME`, so a comparison knows
+        // how far each server ran (D312).
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             synchronized (Tape.class) {
                 try {
+                    for (Watched w : watched) {
+                        out.write("# end " + w.name + " " + w.time.getAsLong() + "\n");
+                    }
                     out.close();
                 } catch (IOException ignored) {
                     // The JVM is going; there's nowhere left to say so.

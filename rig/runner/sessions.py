@@ -13,7 +13,9 @@ both servers' packets with vanilla's codecs, and the comparison lines them up a 
 has a difference no file in rig/differences/ explains.
 
 --compare-only reads and compares what the last run recorded, without starting either server.
---tape has the rig's agent write each draw of vanilla's levels' randoms to tape.txt in its folder.
+--tape has the rig's agent write each draw of vanilla's levels' randoms to tape.txt in its folder,
+and Calcite write its own there with --rng-tape, and lines the two up level by level
+(rig/runner/tapediff.py, D312).
 """
 
 import argparse
@@ -37,6 +39,7 @@ sys.path.insert(0, str(HERE))
 from launch import find_calx  # noqa: E402
 import nbt  # noqa: E402
 import sessiondiff  # noqa: E402
+import tapediff  # noqa: E402
 
 PLATFORM = "windows" if os.name == "nt" else "linux"
 EXE = ".exe" if os.name == "nt" else ""
@@ -96,9 +99,8 @@ BOT = "Bot"
 VANILLA_COMMANDS = [("gamerule respawn_radius 0", "respawn_radius")]
 # The data version both servers save, which a game rules file the rig writes is in.
 DATA_VERSION = 5023
-# Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent, which
-# with --tape also writes each of their draws to tape.txt in its folder, and Calcite's by
-# level-random-seed.
+# Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
+# Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.
 LEVEL_RANDOM_SEED = 1103
 
 
@@ -262,7 +264,7 @@ def main():
     ap.add_argument("--scenario", action="append", choices=SCENARIOS, help="only this scenario")
     ap.add_argument("--compare-only", action="store_true", help="compare the last run's sessions")
     ap.add_argument("--show", type=int, default=3, help="differences shown for each packet, 0 for all")
-    ap.add_argument("--tape", action="store_true", help="write vanilla's levels' draws to tape.txt in its folder")
+    ap.add_argument("--tape", action="store_true", help="write both servers' levels' draws to tape.txt, and line them up")
     args = ap.parse_args()
     configs = args.config or list(CONFIGS)
     complete = args.config is None and args.scenario is None
@@ -281,7 +283,11 @@ def main():
                 continue
             print(f"{config}:", flush=True)
             record(config, "vanilla", vanilla_argv(a, args.tape), bot, scenarios[config])
-            record(config, "calcite", [str(server)], bot, scenarios[config])
+            record(config, "calcite", [str(server)] + (["--rng-tape", "tape.txt"] if args.tape else []), bot, scenarios[config])
+            if args.tape:
+                print(f"{config}: the levels' draws, vanilla's against Calcite's (D312):", flush=True)
+                tapediff.compare(tapediff.read(SESSIONS / config / "vanilla" / "tape.txt"),
+                                 tapediff.read(SESSIONS / config / "calcite" / "tape.txt"), args.show)
     files = [SESSIONS / c / side / f"{s}.bin" for c in configs for side in ("vanilla", "calcite") for s in scenarios[c]]
     if not files:
         sys.exit("sessions: no configuration has those scenarios")
