@@ -576,7 +576,7 @@ def main():
     finally:
         stop(server, client)
     print(f"memory: {mib(idle)} MiB before the client joined, {mib(still)} MiB with it still, "
-          f"{STILL_WAIT if relay else 0} s after its chunks stopped coming, {mib(peak)} MiB at the most")
+          f"{3 + STILL_WAIT if relay else 0} s after its last chunk, {mib(peak)} MiB at the most")
 
     # Each check: what it is, and the line that shows it, or None.
     checks = [("the server logged the join", server.find(f"{player.name}[/127.0.0.1:"))]

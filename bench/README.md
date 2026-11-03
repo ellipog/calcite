@@ -1,11 +1,16 @@
 ---
 title: Benchmarks
-description: How Calcite's server is timed with 100 bot players joining, walking and chatting, and generating a world with Terralith and Terratonic beside C2ME's numbers, how to run each, and the results.
+description: How Calcite's server is timed with 100 bot players, generating a world with Terralith and Terratonic beside C2ME's numbers and without them, with Mojang's own client joining and flying at 25 and 100 times vanilla's speed, and with its light engine against vanilla's, how to run each, and the results.
 ---
 
 # Benchmarks
 
-Two benchmarks, each run on the server's release build: [the bots](#bot-benchmark), which time the server with 100 players on it, and [worldgen](#worldgen-benchmark), which times generating a world with Terralith and Terratonic, set up as C2ME's own benchmark is.
+Four, each run on the server's release build:
+
+- [the bots](#bot-benchmark), which time the server with 100 players on it;
+- [worldgen](#worldgen-benchmark), which times generating a world with Terralith and Terratonic, set up as C2ME's own benchmark is, and without them;
+- [a real client](#a-real-client), Mojang's own, joining a new world at view distance 32 and flying over it at 25 and 100 times vanilla's speed, with the server's memory;
+- [light](#light), Calcite's light engine against vanilla's.
 
 ## Bot benchmark
 
@@ -84,7 +89,7 @@ py -I bench/terralith.py --no-packs --record  # vanilla's own worldgen, the same
 
 - **The packs** are the versions made for 26.3, Terralith 2.6.5+26.3 and Terratonic 3.0.31, fetched from Modrinth into `build/bench/packs/` and checked against their SHA-512s. They're Stardust Labs', so they're never committed.
 - **The seed** is C2ME's, 114862964781274189.
-- **One launch on a fresh world**: a warm-up of a 1,536-block radius about the origin, then the measured run, a 3,072-block radius about 1,000,000, 1,000,000, 148,225 chunks, each with the server's own `pregen` command. The release server runs in `build/bench/<platform>/terralith/` with `chunk-workers` set to the thread count.
+- **One launch on a fresh world**: a warm-up of a 1,536-block radius about the origin, then the measured run, a 3,072-block radius about 1,000,000, 1,000,000, each with the server's own `pregen` command. Chunky counts 148,225 chunks there, 385 a side. `pregen` takes a chunk where its middle is ([D275](../docs/decisions.md)), so it counts 147,456, 384 a side; the rates are a second either way. The release server runs in `build/bench/<platform>/terralith/` with `chunk-workers` set to the thread count.
 
 It reports the measured run's chunks a second, overall and steady, the CPU time and peak memory the system gives for the whole launch, any warning the server logged, and how the workers' time split between the generator's stages: the strongholds' rings, the structures' starts, the biomes, the terrain, the features, and finishing a chunk as the server's, with its sky's light sources and its bytes. The stage times come from the server: `--stage-times FILE` keeps the seconds its workers have spent on each kind of job in the file as they go ([D287](../docs/decisions.md)). The steady rate is the chunks a second from the `pregen` progress line at 10% done to the one at 90%: it leaves out the start, while the first starts and biomes fill the generator's pipeline, and the last chunks, which fewer workers share. The whole run is over an hour, most of it at 1 thread.
 
@@ -92,4 +97,88 @@ With `--no-packs`, the same runs have no packs, so they time vanilla's own world
 
 C2ME's numbers are from their machine, a Xeon Platinum 8558P held to 3.2 GHz, on Minecraft 26.2 with Terralith 2.6.4 and Terratonic 3.0.27, so only the curves compare, not the numbers themselves. The script prints its table beside theirs, and `--record` keeps theirs in the results with ours.
 
-Whether what Calcite generates with the packs is vanilla's is checked by the rig's [`terragen.py`](../rig/README.md#worldgen-with-packs), on a sample of chunks.
+Whether what Calcite generates with the packs is vanilla's is checked by the rig's [`terragen.py`](../rig/README.md#worldgen-with-packs), on a sample of chunks: every one of its 264 has what must be vanilla's.
+
+### Results
+
+With Terralith and Terratonic, on the reference machine, an i9-13900K on Windows 11, recorded in [`results/terralith-windows.json`](results/terralith-windows.json) at commit 815d1cc with Calx 154040f. Chunks a second over the measured run:
+
+| Threads | Calcite | Steady | C2ME | Paper | Vanilla | Calcite's peak memory |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 60.4 | 63.0 | 29.1 | 12.8 | 13.2 | 748 MiB |
+| 8 | 331.8 | 344.6 | 228.7 | 93.5 | 38.9 | 1,035 MiB |
+| 16 | 512.3 | 532.4 | 458.9 | 142.2 | 42.0 | 1,128 MiB |
+| 32 | 780.4 | 809.1 | | | | 1,363 MiB |
+
+C2ME's, Paper's and vanilla's are C2ME's, from their machine, which held its cores to 3.2 GHz where this one boosts to 5.8, so the rows don't compare one to one; the curves do. Calcite at 8 threads goes 5.5 times as fast as at 1, and at 16 threads 8.5 times, on 8 performance cores with two threads each and 16 efficiency cores. At every thread count the workers spent 77 to 78% of their time on terrain, 15 to 16% on features, 3% each on starts and biomes, and 2% finishing chunks. No run logged a warning.
+
+Vanilla's own worldgen, the same runs without the packs, recorded in [`results/worldgen-windows.json`](results/worldgen-windows.json) at the same commit:
+
+| Threads | Calcite | Steady | Peak memory |
+| --- | --- | --- | --- |
+| 1 | 153.8 | 154.9 | 555 MiB |
+| 8 | 897.6 | 904.3 | 798 MiB |
+| 16 | 1,418.6 | 1,407.1 | 927 MiB |
+| 32 | 1,848.7 | 1,848.3 | 1,019 MiB |
+
+Here the workers spent 67 to 69% on terrain, 18 to 19% on features, 7% on biomes, 2% on starts and 4 to 5% finishing chunks. The packs' terrain is the dearer part: with them a chunk takes 2.5 times as long on one thread. These go through the whole server, as a player's chunks do: each chunk is lit, saved to its region file, deflated, and kept until it's let go. The generator by itself, with no server around it, made 3,078 to 3,091 chunks a second on 31 workers under WSL, over a 120-chunk radius on another seed ([CAL-88](https://acta.aaenz.no/aaen-studios/calcite#CAL-88)).
+
+## A real client
+
+```sh
+py -I bench/client.py                 # a join and flights at 25 and 100 times vanilla's flying speed, not recorded
+py -I bench/client.py --record        # the same, written to bench/results/client-<platform>.json
+```
+
+The bots pace themselves as the server lets them. A real player's client asks for chunks as fast as it takes them in, renders them, and flies over them, so what a player gets is measured with Mojang's own 26.3 client, through the rig's [`realclient.py`](../rig/README.md#a-real-client) ([D162](../docs/decisions.md)). For each speed, [`client.py`](client.py) starts the release server on a new world, with C2ME's seed, and the client joins at render and view distance 32:
+
+1. Its join is timed through the rig's relay: the chunks it's sent, and when it had 95% of them and all.
+2. Once the chunks have stopped coming for 3 seconds, and 15 more have passed, the server's memory is read as a still player's.
+3. The client types `/calcite flyspeed`, takes off and flies forward for 30 seconds. Four times a second the relay counts how much of the circle of 32 chunks about the player the client has, and how far the nearest chunk it doesn't have is. The server's ticks come from its `--tick-times` file.
+4. It stops, and the chunks have up to a minute to catch up.
+
+Memory is the server's working set on Windows: before the client joined, 15 seconds after the server was ready, then with the player still, and the most it had, which is the flight's peak. It needs a desktop and a launcher that has run 26.3, and takes the client's window to the front while it flies, so it isn't in CI.
+
+### Results
+
+On the reference machine, Windows 11, recorded in [`results/client-windows.json`](results/client-windows.json) at commit 815d1cc with Calx 154040f. The server has 31 generator workers, its default. The view is the 3,209 chunks within 32 of the player's.
+
+| | 25× | 100× |
+| --- | --- | --- |
+| Join: the client had 95% of its 3,725 chunks | 3.11 s | 3.18 s |
+| Join: the client had all of them | 3.19 s | 3.26 s |
+| Flight speed | 268 blocks a second | 1,073 blocks a second |
+| Chunks sent a second while flying | 1,119 | 990 |
+| The view the client had, mean | 97.2% | 8.6% |
+| The view the client had, least | 88.3% | 0.0% |
+| The nearest chunk it didn't have, median | 30.0 chunks away | 0.0 |
+| MSPT while flying, mean | 4.88 ms | 5.04 ms |
+| MSPT while flying, p99 | 14.47 ms | 10.31 ms |
+| MSPT while flying, max | 25.95 ms | 13.89 ms |
+| Memory, idle | 77.0 MiB | 76.7 MiB |
+| Memory, a still view-32 player | 363.8 MiB | 364.7 MiB |
+| Memory, at the most | 1,134 MiB | 1,039 MiB |
+
+At 25 times vanilla's speed the client has nearly all of its view the whole flight, and what it lacks is at the edge: the nearest missing chunk is 30 chunks away at the median, and never nearer than 21. At 100 times it flies 67 chunks a second, so the circle ahead of it needs about 4,360 new chunks a second, more than twice the 1,849 a second the server generated on 32 workers in [the worldgen benchmark](#worldgen-benchmark), and the player outruns its chunks within the first seconds. The generator drops what nothing wants any more as the player goes past it ([D243](../docs/decisions.md)). The client is told to forget each chunk that leaves its view, sent or not, as vanilla tells it: 130,978 at 100×.
+
+The peak is the generator's, while it's making a thousand chunks a second, and it's handed back once the workers go quiet ([D226, D228](../docs/decisions.md)). A still player costs about 287 MiB over idle: the chunks it's sent and the border the server holds about them, with their blocks, light and what else they hold.
+
+## Light
+
+```sh
+py -I rig/runner/light_timing.py      # Calcite's light engine against vanilla's, 15 runs of each workload
+```
+
+[`light_timing.py`](../rig/runner/light_timing.py) runs the rig's `light` probe on vanilla's server and on Calcite, each a few times to warm up and then 15 times, with three workloads: a flat 9×9 chunks, 7×7 chunks of random terrain, and the same with 5,000 random edits relit. Each is run twice, once whole and once with only its chunks and blocks, so the difference is the light. It says whether both engines' light came out the same, which the probe also checks nibble for nibble.
+
+### Results
+
+On the reference machine, Windows 11, at commit 815d1cc with Calx 154040f, the median of 15 runs each; the light is the run with it less the run without:
+
+| Workload | Vanilla | Calcite | Calcite is |
+| --- | --- | --- | --- |
+| Flat, 9×9 chunks | 3.34 ms | 3.33 ms | as fast |
+| Terrain, 7×7 chunks | 241.9 ms | 136.2 ms | 1.78× as fast |
+| Terrain, 7×7 chunks, 5,000 edits relit | 299.4 ms | 185.9 ms | 1.61× as fast |
+
+Both engines' light came out the same in every workload. A flat world's light is the sky's, a level at a time, so there's little to do either way. Both engines take the same steps, the ones each case lists, on the probe's one thread; how the server batches light on a thread of its own ([D264, D265](../docs/decisions.md)) isn't part of what's timed.
