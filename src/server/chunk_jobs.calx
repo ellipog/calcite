@@ -79,6 +79,9 @@ const SETTLE_NANOS: u64 = 5000000000
 // nanoseconds: then it lets go of it, with what it cached, and copies it again for its next job
 // (D226).
 const KEEP_COPY_NANOS: u64 = 5000000000
+/// How many terrain jobs next to each other a worker is handed at once when more is ready than
+/// the workers can take (D298).
+const TERRAIN_BATCH: usize = 4
 
 // How the generator's thread tells which kept terrain is far: a chunk wanted marks the cells of
 // 16 × 16 chunks within `REACH` of it, as far as the jobs it needs reach through their ranks
@@ -740,6 +743,8 @@ enum GenIn {
     Written(List<i64>, List<Entry>)
     Origin(i32, i32, String?)
     Spawn
+    // A worker's done the jobs of a task, having handed back what each made.
+    Free
 }
 
 // A chunk to generate, with what the IO thread logged and read, and what the worker logged.
@@ -750,10 +755,10 @@ struct GenWork {
     made: List<Entry>
 }
 
-// What a generator worker is handed: a job, with its scheduler's epoch, or the search for the
-// chunk the spawn is looked for from.
+// What a generator worker is handed: jobs to do in order, with their scheduler's epoch, or the
+// search for the chunk the spawn is looked for from.
 enum GenTask {
-    Job(u32, Job)
+    Jobs(u32, List<Job>)
     Origin
 }
 
@@ -801,26 +806,31 @@ impl Task for GenWorker {
                         err(t) => out.send(GenIn.Origin(0, 0, some("Couldn't find the spawn's chunk: {t.exception}: {t.message}"))),
                     }
                 },
-                GenTask.Job(epoch, job) => {
-                    // How long it takes is only told, for `--stage-times`: nothing made depends
-                    // on it.
-                    let began = unsafe { Instant.now() }
-                    let made = w.run(job)
-                    let finished = match made {
-                        Made.Finished(_, _, _, _) => true,
-                        _ => false,
-                    }
-                    if finished {
-                        match made {
-                            Made.Finished(x, z, chunk, rest) => {
-                                let saved = generated(chunk, rest, light, context.sections)
-                                out.send(GenIn.Finished(epoch, x, z, saved, unsafe { Instant.now() }.nanos_since(began)))
-                            },
-                            _ => {},
+                GenTask.Jobs(epoch, given) => {
+                    var jobs = given
+                    while not jobs.is_empty() {
+                        let job = jobs.remove(0)
+                        // How long it takes is only told, for `--stage-times`: nothing made
+                        // depends on it.
+                        let began = unsafe { Instant.now() }
+                        let made = w.run(job)
+                        let finished = match made {
+                            Made.Finished(_, _, _, _) => true,
+                            _ => false,
                         }
-                    } else {
-                        out.send(GenIn.Made(epoch, made, unsafe { Instant.now() }.nanos_since(began)))
+                        if finished {
+                            match made {
+                                Made.Finished(x, z, chunk, rest) => {
+                                    let saved = generated(chunk, rest, light, context.sections)
+                                    out.send(GenIn.Finished(epoch, x, z, saved, unsafe { Instant.now() }.nanos_since(began)))
+                                },
+                                _ => {},
+                            }
+                        } else {
+                            out.send(GenIn.Made(epoch, made, unsafe { Instant.now() }.nanos_since(began)))
+                        }
                     }
+                    out.send(GenIn.Free)
                 },
             }
             held = some(w)
@@ -889,11 +899,11 @@ struct GenState {
     to_tasks: Sender<GenTask>?
     to_io: Sender<Ask>
     workers: usize
-    // The scheduler's epoch, which each job it hands out carries, and how many jobs of earlier
-    // ones are still out: what they make is let go, but for a finished chunk, which is what it
-    // is whichever scheduler made it.
+    // The scheduler's epoch, which each job it hands out carries: what jobs of earlier ones
+    // make is let go, but for a finished chunk, which is what it is whichever scheduler made it.
     epoch: u32 = 0
-    stale: usize = 0
+    // How many tasks of jobs are out, of whatever epoch: a batch of terrain jobs is one (D298).
+    tasks_out: usize = 0
     // The chunks wanted lately, oldest first, each with when, in nanoseconds from when the
     // thread began; the cells about them each marks, by `chunk_key` of the cell, with how many
     // of them mark it; and how many have been wanted since the far terrain was last counted.
@@ -1113,12 +1123,12 @@ impl GenOut {
                 let stage = stage_of(made)
                 s.stage_nanos[stage] += nanos
                 s.stages_changed = true
-                if epoch != s.epoch {
-                    s.stale -= 1
-                } else if let g = s.sched.take() {
-                    var sched = g
-                    sched.take(made)
-                    s.sched = some(sched)
+                if epoch == s.epoch {
+                    if let g = s.sched.take() {
+                        var sched = g
+                        sched.take(made)
+                        s.sched = some(sched)
+                    }
                 }
             },
             GenIn.Finished(epoch, x, z, saved, nanos) => {
@@ -1144,6 +1154,7 @@ impl GenOut {
                 }
                 s.spawn = some(SpawnFind { x: x, z: z, offsets: spiral(), at: 0, asked: false })
             },
+            GenIn.Free => s.tasks_out -= 1,
             GenIn.Spawn => {
                 s.spawn_wanted = true
                 if let t = s.to_tasks.take() {
@@ -1156,9 +1167,9 @@ impl GenOut {
     }
 
     // Does what can be done without waiting: the spawn's next chunk asked for, and the most
-    // urgent jobs out while the workers have fewer than two each. Where nothing generates, each
-    // chunk asked for goes back to be flat, and the spawn is its chunk's middle. Whether anything
-    // was done.
+    // urgent jobs out while the workers have fewer than two tasks each. Where nothing generates,
+    // each chunk asked for goes back to be flat, and the spawn is its chunk's middle. Whether
+    // anything was done.
     fn step(mut self, s: mut GenState) -> bool {
         var sched = s.sched.take() else {
             var any = false
@@ -1199,9 +1210,35 @@ impl GenOut {
         }
         if let t = s.to_tasks.take() {
             var tasks = t
-            while sched.running() + s.stale < s.workers * 2 {
+            // When more is ready than the workers can take, a terrain job goes out with up to
+            // `TERRAIN_BATCH` ready next to it, as one task to one worker, so what a chunk's
+            // neighbours ask for again, as the aquifers' surface levels (D297), is that worker's
+            // own (D298). Otherwise jobs go out one a task, so a few urgent ones spread over the
+            // workers.
+            let batch = if sched.ready() > s.workers * 2 { TERRAIN_BATCH } else { 1 }
+            while s.tasks_out < s.workers * 2 {
                 let job = sched.next() else break
-                tasks.send(GenTask.Job(s.epoch, job))
+                var spots = List<(i32, i32)>()
+                if let spot = job.terrain_at() {
+                    spots.push(spot)
+                }
+                var jobs = List<Job>()
+                jobs.push(job)
+                var i: usize = 0
+                while jobs.len() < batch and i < spots.len() {
+                    let (x, z) = spots[i]
+                    match sched.ready_terrain_near(x, z) {
+                        some(more) => {
+                            if let spot = more.terrain_at() {
+                                spots.push(spot)
+                            }
+                            jobs.push(more)
+                        },
+                        none => i += 1,
+                    }
+                }
+                tasks.send(GenTask.Jobs(s.epoch, jobs))
+                s.tasks_out += 1
                 progressed = true
             }
             s.to_tasks = some(tasks)
@@ -1279,12 +1316,12 @@ impl GenOut {
     // would look for it, and kept until it's written; one made again after it was handed back, by
     // a scheduler that started again, goes.
     fn finished(mut self, s: mut GenState, epoch: u32, x: i32, z: i32, saved: own SavedChunk) {
-        if epoch != s.epoch {
-            s.stale -= 1
-        } else if let g = s.sched.take() {
-            var sched = g
-            sched.finished_at(x, z)
-            s.sched = some(sched)
+        if epoch == s.epoch {
+            if let g = s.sched.take() {
+                var sched = g
+                sched.finished_at(x, z)
+                s.sched = some(sched)
+            }
         }
         let key = chunk_key(x, z)
         var works = s.asked.remove(key) ?? List<GenWork>()
@@ -1389,7 +1426,6 @@ fn renewed(s: mut GenState, old: own Scheduler) -> Scheduler {
     for p in old.problems {
         s.lines.push(Entry.warn(p.copy()).on(gen_thread()))
     }
-    s.stale += old.running()
     s.epoch += 1
     var fresh = old.renewed()
     var keys = List<i64>()
