@@ -770,6 +770,16 @@ Calcite answers `unimplemented` for a case that reaches a structure type, a plac
 
 Version 2 added `bearded` and `ring_bearded`.
 
+### `datafix` (v1)
+
+Data saved by an older game, upgraded to 26.3's by vanilla's data fixers, as a structure template is when it loads: `TemplateSource.readStructure` runs `DataFixTypes.STRUCTURE.updateToCurrentVersion` on it.
+
+Input `{"type": "structure", "snbt": text, "version": v}`. The data is `text`, a compound in SNBT as `TagParser.parseCompoundFully` reads it, or, without `snbt`, the one blob, a gzipped NBT file as `NbtIo.readCompressed` reads it. `v`, optional, is the data version it's upgraded from, a decimal integer as a string, cast to an `int`; without it, it's the data's own `DataVersion`, 500 without one, as `NbtUtils.getDataVersion` reads it.
+
+The output is `{"snbt": s}`, `s` the upgraded compound as `CompoundTag.toString` writes it, its keys sorted. Where the fixers throw, as they do for a text whose JSON is a number, the output is `{"loads": false}`: `TemplateSource.load` logs what reading a template throws and has no template.
+
+Calcite answers `unimplemented` for data older than 2700, or with a part that only fixes it doesn't port yet reach (D285).
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

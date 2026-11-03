@@ -67,7 +67,8 @@ public final class Main {
                 new SurfaceProbe(false),
                 new SurfaceProbe(true),
                 new FeaturesProbe(),
-                new StructuresProbe())) {
+                new StructuresProbe(),
+                new DatafixProbe())) {
             probes.put(probe.name(), probe);
         }
 
