@@ -4,7 +4,8 @@ vanilla 26.3 and against Calcite, and the two sessions are compared packet by pa
     py -I rig/runner/sessions.py [--config NAME] [--scenario NAME] [--compare-only] [--show N] [--tape]
 
 For each configuration, a set of server.properties, this starts vanilla in a fresh folder under
-build/rig/sessions/, sets what vanilla draws at random to fixed values from its console, runs
+build/rig/sessions/, sets what vanilla draws at random to fixed values from its console, waits for
+it to pause, empty, so the bot joins at the same game time on both (D315), runs
 src/rig/session.calx once for each scenario, and stops it; then the same for Calcite's release
 build. Vanilla runs from the jar's own classes, which oracle/vanilla-adapter/build.py unpacks,
 with Mojang's EULA accepted in its scratch folder only. The vanilla adapter's SessionDump reads
@@ -49,7 +50,10 @@ ADAPTER = CALCITE / "oracle" / "vanilla-adapter" / "build" / PLATFORM / "adapter
 VIEW = 4
 
 # What both servers are given. Everything else is the default. The flat world has no structures,
-# so vanilla places no village; peaceful spawns no monsters, which vanilla places at random.
+# so vanilla places no village; peaceful spawns no monsters, which vanilla places at random. Each
+# pauses once it's been empty PAUSE seconds, and the bot runs only once it has, so the bot joins
+# both at the same game time and their ticks line up from there (D315).
+PAUSE = 2
 BASE = {
     "online-mode": "false",
     "server-ip": "127.0.0.1",
@@ -59,6 +63,7 @@ BASE = {
     "difficulty": "peaceful",
     "view-distance": str(VIEW),
     "simulation-distance": str(VIEW),
+    "pause-when-empty-seconds": str(PAUSE),
 }
 SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # The world the round trip has vanilla make and save (rig/runner/roundtrip.py), from the seed
@@ -237,7 +242,8 @@ def record(config, side, argv, bot, scenarios):
         for command, answer in VANILLA_COMMANDS + list(CONFIGS[config].commands):
             server.type(command)
             at = server.wait_for(answer, at)
-    print(f"  {side}: up in {time.monotonic() - began:.1f}s on port {port}", flush=True)
+    at = server.wait_for(f"Server empty for {PAUSE} seconds, pausing", at)
+    print(f"  {side}: up in {time.monotonic() - began:.1f}s on port {port}, paused", flush=True)
     try:
         for scenario in scenarios:
             out = folder / f"{scenario}.bin"
