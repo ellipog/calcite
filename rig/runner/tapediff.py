@@ -1,13 +1,15 @@
 """Lines up two RNG tapes, vanilla's from the rig's agent and Calcite's, level by level (D312).
 
-    py -I rig/runner/tapediff.py VANILLA_TAPE CALCITE_TAPE [--show N]
+    py -I rig/runner/tapediff.py VANILLA_TAPE CALCITE_TAPE [--show N] [--since TIME]
 
 A tape is a line for each value a level's random drew: the level, its game time, the bits drawn,
 the value, and on vanilla's, where it was drawn. Each ends with a `# end LEVEL TIME` line for each
 level, the game time it had when the server stopped. For each level, the draws are compared in
 order over the game times both servers ran, and the first that differs is shown with where vanilla
-drew it, with the few after it, since that's where the two servers' ticks part. It exits with 1 if
-any level's draws differ.
+drew it, with the few after it, since that's where the two servers' ticks part. With --since, the
+time both seeded their levels' randoms again (D316), the draws from then on are lined up too, so
+what each drew while the player's chunks loaded doesn't hide the rest. It exits with 1 if any
+level's draws differ.
 """
 
 import argparse
@@ -44,7 +46,25 @@ def shown(draw):
     return f"at {time}, {bits} bits, {value}" + (f", {site}" if site else "")
 
 
-def compare(vanilla, calcite, show):
+def line_up(label, vd, cd, until, show):
+    """Prints how far two lists of draws are the same, and the first that differs, with `show`
+    after it; true if they differ."""
+    same = 0
+    while same < len(vd) and same < len(cd) and vd[same][:3] == cd[same][:3]:
+        same += 1
+    if same == len(vd) == len(cd):
+        print(f"{label}: the same, {same} draws before game time {until}")
+        return False
+    print(f"{label}: {same} draws the same, then they differ (before game time {until}; vanilla {len(vd)}, Calcite {len(cd)})")
+    for i in range(same, same + show):
+        if i >= len(vd) and i >= len(cd):
+            break
+        print(f"  vanilla {shown(vd[i] if i < len(vd) else None)}")
+        print(f"  calcite {shown(cd[i] if i < len(cd) else None)}")
+    return True
+
+
+def compare(vanilla, calcite, show, since=None):
     differ = False
     for name in sorted(set(vanilla) | set(calcite)):
         v, c = vanilla.get(name, Level()), calcite.get(name, Level())
@@ -56,19 +76,12 @@ def compare(vanilla, calcite, show):
         until = min(ends)
         vd = [d for d in v.draws if d[0] < until]
         cd = [d for d in c.draws if d[0] < until]
-        same = 0
-        while same < len(vd) and same < len(cd) and vd[same][:3] == cd[same][:3]:
-            same += 1
-        if same == len(vd) == len(cd):
-            print(f"{name}: the same, {same} draws before game time {until}")
-            continue
-        differ = True
-        print(f"{name}: {same} draws the same, then they differ (before game time {until}; vanilla {len(vd)}, Calcite {len(cd)})")
-        for i in range(same, same + show):
-            if i >= len(vd) and i >= len(cd):
-                break
-            print(f"  vanilla {shown(vd[i] if i < len(vd) else None)}")
-            print(f"  calcite {shown(cd[i] if i < len(cd) else None)}")
+        if line_up(name, vd, cd, until, show):
+            differ = True
+        if since is not None and since < until:
+            if line_up(f"{name} from game time {since}, seeded again", [d for d in vd if d[0] >= since],
+                       [d for d in cd if d[0] >= since], until, show):
+                differ = True
     return differ
 
 
@@ -77,8 +90,9 @@ def main():
     ap.add_argument("vanilla")
     ap.add_argument("calcite")
     ap.add_argument("--show", type=int, default=3, help="the draws shown from the first that differs")
+    ap.add_argument("--since", type=int, help="the game time both seeded their levels' randoms again, from which the draws are lined up too")
     args = ap.parse_args()
-    return 1 if compare(read(args.vanilla), read(args.calcite), args.show) else 0
+    return 1 if compare(read(args.vanilla), read(args.calcite), args.show, args.since) else 0
 
 
 if __name__ == "__main__":

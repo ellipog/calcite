@@ -142,7 +142,8 @@ def main():
         },
         "default_config": "strict-math",
         # The rig's Java agent (D311), for a vanilla server started with
-        # -javaagent:<agent>=seed=N[,tape=PATH]: its levels' randoms seeded, their draws taped.
+        # -javaagent:<agent>=seed=N[,tape=PATH][,reseed=T]: its levels' randoms seeded, their draws
+        # taped, and seeded again at game time T (D316).
         "agent": str(agent),
     }
     (BUILD / "adapter.json").write_text(json.dumps(adapter, indent=2) + "\n", encoding="utf-8")

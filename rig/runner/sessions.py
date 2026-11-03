@@ -16,7 +16,8 @@ has a difference no file in rig/differences/ explains.
 --compare-only reads and compares what the last run recorded, without starting either server.
 --tape has the rig's agent write each draw of vanilla's levels' randoms to tape.txt in its folder,
 and Calcite write its own there with --rng-tape, and lines the two up level by level
-(rig/runner/tapediff.py, D312).
+(rig/runner/tapediff.py, D312). Both seed their levels' randoms again at RESEED, once the player's
+chunks are in, so the tapes line up from there whatever each drew while they loaded (D316).
 """
 
 import argparse
@@ -107,6 +108,12 @@ DATA_VERSION = 5023
 # Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
 # Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.
 LEVEL_RANDOM_SEED = 1103
+# With --tape, the game time at which both seed each level's random again (D316): 3 seconds after
+# the bot joins, at PAUSE seconds, by when vanilla's workers have made the player's chunks. A level
+# is seeded as its tick starts at RESEED or later; the Overworld's tick moves the time on before
+# its chunks draw, so its draws from the new seed are taped from RESEED + 1, and the tapes are
+# lined up from there.
+RESEED = (PAUSE + 3) * 20
 
 
 def offline_uuid(name):
@@ -144,7 +151,7 @@ def vanilla_argv(a, tape=False):
         sys.exit("sessions: the vanilla adapter was built without the agent; run py -I oracle/vanilla-adapter/build.py")
     argv = a["argv"]
     cp = argv[argv.index("-cp") + 1]
-    agent = f"-javaagent:{a['agent']}=seed={LEVEL_RANDOM_SEED}" + (",tape=tape.txt" if tape else "")
+    agent = f"-javaagent:{a['agent']}=seed={LEVEL_RANDOM_SEED}" + (f",tape=tape.txt,reseed={RESEED}" if tape else "")
     return [argv[0], "-Xmx2G", "-Dfile.encoding=UTF-8", agent, "-cp", cp, "net.minecraft.server.Main", "--nogui"]
 
 
@@ -289,11 +296,11 @@ def main():
                 continue
             print(f"{config}:", flush=True)
             record(config, "vanilla", vanilla_argv(a, args.tape), bot, scenarios[config])
-            record(config, "calcite", [str(server)] + (["--rng-tape", "tape.txt"] if args.tape else []), bot, scenarios[config])
+            record(config, "calcite", [str(server)] + (["--rng-tape", "tape.txt", "--rng-reseed", str(RESEED)] if args.tape else []), bot, scenarios[config])
             if args.tape:
                 print(f"{config}: the levels' draws, vanilla's against Calcite's (D312):", flush=True)
                 tapediff.compare(tapediff.read(SESSIONS / config / "vanilla" / "tape.txt"),
-                                 tapediff.read(SESSIONS / config / "calcite" / "tape.txt"), args.show)
+                                 tapediff.read(SESSIONS / config / "calcite" / "tape.txt"), args.show, RESEED + 1)
     files = [SESSIONS / c / side / f"{s}.bin" for c in configs for side in ("vanilla", "calcite") for s in scenarios[c]]
     if not files:
         sys.exit("sessions: no configuration has those scenarios")

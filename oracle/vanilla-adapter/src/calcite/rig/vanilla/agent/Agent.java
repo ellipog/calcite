@@ -3,7 +3,11 @@ package calcite.rig.vanilla.agent;
 import java.lang.classfile.ClassFile;
 import java.lang.classfile.ClassHierarchyResolver;
 import java.lang.classfile.ClassTransform;
+import java.lang.classfile.CodeBuilder;
+import java.lang.classfile.CodeElement;
 import java.lang.classfile.CodeTransform;
+import java.lang.classfile.MethodModel;
+import java.lang.classfile.MethodTransform;
 import java.lang.classfile.instruction.ReturnInstruction;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDescs;
@@ -18,10 +22,13 @@ import java.security.ProtectionDomain;
  * run, and from what Calcite draws with the same seed, and can write every draw a level's random
  * makes to a tape.
  *
- * <p>Started as {@code -javaagent:agent.jar=seed=N[,tape=PATH]}. Each {@code ServerLevel}'s
- * constructor, as it returns, calls {@link Levels#made}, which seeds the level's random with
- * {@code mixStafford13(N ^ name.hashCode())}, with the name the dimension's, such as
- * {@code minecraft:overworld}, and sets the entity counter back to 0 as the Overworld's is made.
+ * <p>Started as {@code -javaagent:agent.jar=seed=N[,tape=PATH][,reseed=T]}. Each
+ * {@code ServerLevel}'s constructor, as it returns, calls {@link Levels#made}, which seeds the
+ * level's random with {@code mixStafford13(N ^ name.hashCode())}, with the name the dimension's,
+ * such as {@code minecraft:overworld}, and sets the entity counter back to 0 as the Overworld's is
+ * made. With {@code reseed=T}, {@code ServerLevel.tick} calls {@link Levels#ticking} as it starts,
+ * which seeds the level's random so again the first time its tick starts at game time T or later
+ * (D316).
  * {@code LegacyRandomSource.next}, which every draw of a level's random comes down to, hands
  * {@link Tape#drew} each value it returns, which writes those of a level's random to the tape.
  *
@@ -38,6 +45,7 @@ public final class Agent {
     public static void premain(String arguments, Instrumentation inst) {
         Long seed = null;
         Path tape = null;
+        long reseed = -1;
         for (String part : (arguments == null ? "" : arguments).split(",")) {
             if (part.isEmpty()) {
                 continue;
@@ -48,6 +56,7 @@ public final class Agent {
             switch (key) {
                 case "seed" -> seed = Long.parseLong(value);
                 case "tape" -> tape = Path.of(value);
+                case "reseed" -> reseed = Long.parseLong(value);
                 default -> throw new IllegalArgumentException("agent: unknown argument " + key);
             }
         }
@@ -55,6 +64,7 @@ public final class Agent {
             throw new IllegalArgumentException("agent: no seed=N given");
         }
         Tape.start(seed, tape);
+        Levels.reseedAt(reseed);
         inst.addTransformer(new Transformer());
     }
 
@@ -79,18 +89,41 @@ public final class Agent {
         }
     }
 
-    // Each of ServerLevel's constructors hands the level to Levels.made before it returns.
+    // Each of ServerLevel's constructors hands the level to Levels.made before it returns, and its
+    // tick hands it to Levels.ticking as it starts.
     private static byte[] level(ClassFile cf, byte[] bytes) {
-        MethodTypeDesc made = MethodTypeDesc.of(ConstantDescs.CD_void, ClassDesc.ofInternalName(LEVEL));
-        CodeTransform hook = (b, e) -> {
+        MethodTypeDesc withLevel = MethodTypeDesc.of(ConstantDescs.CD_void, ClassDesc.ofInternalName(LEVEL));
+        ClassDesc levels = ClassDesc.of("calcite.rig.vanilla.agent.Levels");
+        CodeTransform made = (b, e) -> {
             if (e instanceof ReturnInstruction) {
                 b.aload(0);
-                b.invokestatic(ClassDesc.of("calcite.rig.vanilla.agent.Levels"), "made", made);
+                b.invokestatic(levels, "made", withLevel);
             }
             b.with(e);
         };
-        return cf.transformClass(cf.parse(bytes),
-                ClassTransform.transformingMethodBodies(m -> m.methodName().equalsString("<init>"), hook));
+        CodeTransform ticking = new CodeTransform() {
+            @Override
+            public void atStart(CodeBuilder b) {
+                b.aload(0);
+                b.invokestatic(levels, "ticking", withLevel);
+            }
+
+            @Override
+            public void accept(CodeBuilder b, CodeElement e) {
+                b.with(e);
+            }
+        };
+        ClassTransform both = (cb, ce) -> {
+            if (ce instanceof MethodModel m && m.methodName().equalsString("<init>")) {
+                cb.transformMethod(m, MethodTransform.transformingCode(made));
+            } else if (ce instanceof MethodModel m && m.methodName().equalsString("tick")
+                    && m.methodType().equalsString("(Ljava/util/function/BooleanSupplier;)V")) {
+                cb.transformMethod(m, MethodTransform.transformingCode(ticking));
+            } else {
+                cb.with(ce);
+            }
+        };
+        return cf.transformClass(cf.parse(bytes), both);
     }
 
     // LegacyRandomSource.next(int) hands each value it returns, itself and the bits to Tape.drew.

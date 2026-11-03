@@ -94,7 +94,8 @@ Vanilla isn't repeatable run to run. Each level's `random` is seeded from `Rando
 
 - seeds each level's random, as the level's made, with `mixStafford13(N ^ name.hashCode())`, the name its dimension's, such as `minecraft:overworld`. Calcite's `level-random-seed=N` seeds its own the same way;
 - sets the entity counter back to 0 as the Overworld's level is made, so the first entity is 1;
-- with `,tape=PATH` as well, writes each value a level's random draws to `PATH`, the RNG tape, a line each: the level, its game time, the bits drawn, the value, and the two frames of the stack that asked for it outside the random classes. As the JVM ends it adds `# end LEVEL TIME` for each level, its game time then. Calcite's `--rng-tape PATH` writes the same lines, without where each was drawn, and [`tapediff.py`](../../rig/runner/tapediff.py) lines the two up ([D312](../../docs/decisions.md)).
+- with `,tape=PATH` as well, writes each value a level's random draws to `PATH`, the RNG tape, a line each: the level, its game time, the bits drawn, the value, and the two frames of the stack that asked for it outside the random classes. As the JVM ends it adds `# end LEVEL TIME` for each level, its game time then. Calcite's `--rng-tape PATH` writes the same lines, without where each was drawn, and [`tapediff.py`](../../rig/runner/tapediff.py) lines the two up ([D312](../../docs/decisions.md));
+- with `,reseed=T` as well, seeds each level's random again as it was seeded, the first time the level's tick starts at game time T or later, as Calcite's `--rng-reseed T` does, so the tapes line up again from there whatever each server drew before ([D316](../../docs/decisions.md)).
 
 ```
 # seed 1103
@@ -103,4 +104,4 @@ minecraft:overworld 0 31 353078769 Mth.randomBetweenInclusive:823 UniformInt.sam
 minecraft:overworld 1 31 699777690 PhantomSpawner.tick:41 ServerLevel.tickCustomSpawners:501
 ```
 
-It changes two classes as they load, with the JDK's own `java.lang.classfile`: `ServerLevel`'s constructors call `Levels.made` before they return, and `LegacyRandomSource.next`, which every draw of a level's random comes down to, hands each value it returns to `Tape.drew`. A change that fails stops the server, which would otherwise run unseeded. The rig's runners start every vanilla server with it, at seed 1103.
+It changes two classes as they load, with the JDK's own `java.lang.classfile`: `ServerLevel`'s constructors call `Levels.made` before they return, its `tick` calls `Levels.ticking` as it starts, and `LegacyRandomSource.next`, which every draw of a level's random comes down to, hands each value it returns to `Tape.drew`. A change that fails stops the server, which would otherwise run unseeded. The rig's runners start every vanilla server with it, at seed 1103.
