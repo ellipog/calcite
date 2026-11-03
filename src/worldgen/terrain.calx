@@ -14,7 +14,7 @@ import worldgen.beardifier.{Beardifier}
 import worldgen.density.{Functions}
 import worldgen.interval.{Thrown}
 import worldgen.noise.{Volume}
-import worldgen.sampler.{Boxes, Context, Program, bounds_over, cells_of, fill, sample, volume, zeros}
+import worldgen.sampler.{Boxes, Context, Program, bounds_over, cells_of, fill, reads_beardifier, sample, volume, zeros}
 
 /// What `computeSubstance` gives for a block the density makes solid: `null`, the default block.
 const SOLID: u32 = 0xFFFFFFFF
@@ -27,6 +27,15 @@ const NO_LOCATION: i64 = 0x7FFFFFFFFFFFFFFF
 const MAX_CELLS: i32 = 16777216
 /// `FLOWING_UPDATE_SIMULARITY`: `similarity(10 * 10, 12 * 12)`.
 const FLOWING: f64 = -0.76
+/// The quart columns across the window `SurfaceLevels` keeps, and how many it keeps.
+const LEVEL_SIDE: i32 = 128
+const LEVEL_PLACES: usize = 16384
+/// A key no kept column has, which `SurfaceLevels`' empty places hold: that of the column at `x`
+/// 0 and `z` `i32.MIN`, which is never kept.
+const NO_LEVEL: i64 = i64.MIN
+/// How far from 0 an aquifer's box of quarts must stay, on both axes, for the levels kept from
+/// other chunks to be used: 2^26 quarts, eight times past the world's border.
+const FAR_QUARTS: i32 = 67108864
 
 /// `Aquifer.Config`'s functions, as read.
 struct AquiferFunctions {
@@ -91,6 +100,79 @@ impl Shape {
     fn is_air(self, state: u32) -> bool {
         return state == AIR_STATE or (state == self.default_fluid and self.fluid_air)
     }
+}
+
+/// The preliminary surface levels, `NoiseChunk.preliminarySurfaceLevel`'s, at the quart columns
+/// an aquifer asked for: one chunk's, as vanilla's `NoiseChunk` keeps them, or a worker's, kept
+/// from chunk to chunk (D297). Each chunk's aquifer asks for the columns over 41 blocks about it,
+/// and the 13 about each of its cells, so the chunks near it ask for most of them again, and a
+/// column's level is the same whichever chunk asks, unless the surface reads the chunk's
+/// beardifier; then, and near the ends of `int`, a worker's are forgotten at each chunk. A
+/// column's is at its quart `x` and `z` modulo 128, until one 128 quarts from it takes its place,
+/// so the columns one chunk asks for never take each other's places. It holds 192 KB, from when
+/// it's first asked to keep one.
+pub struct SurfaceLevels {
+    keys: List<i64> = List<i64>()
+    levels: List<i32> = List<i32>()
+    // Whether they're a worker's, kept from chunk to chunk; whether it's been worked out if the
+    // surface reads the beardifier, and whether it does.
+    across: bool = false
+    judged: bool = false
+    bearded: bool = false
+}
+
+impl SurfaceLevels {
+    /// One chunk's levels, none kept yet.
+    pub fn new() -> SurfaceLevels {
+        return SurfaceLevels {}
+    }
+
+    /// A worker's levels, kept from chunk to chunk, none kept yet.
+    pub fn kept() -> SurfaceLevels {
+        return SurfaceLevels { across: true }
+    }
+
+    // The level kept for the column whose block's `chunk_pack` is `key`.
+    fn get(self, key: i64) -> i32? {
+        if self.keys.is_empty() or key == NO_LEVEL {
+            return none
+        }
+        let i = level_place(key)
+        if self.keys[i] != key {
+            return none
+        }
+        return some(self.levels[i])
+    }
+
+    // Keeps `level` for the column whose block's `chunk_pack` is `key`.
+    fn put(mut self, key: i64, level: i32) {
+        if key == NO_LEVEL {
+            return
+        }
+        if self.keys.is_empty() {
+            self.keys = [NO_LEVEL; LEVEL_PLACES]
+            self.levels = [0; LEVEL_PLACES]
+        }
+        let i = level_place(key)
+        self.keys[i] = key
+        self.levels[i] = level
+    }
+
+    // Every level forgotten.
+    fn forget(mut self) {
+        if not self.keys.is_empty() {
+            self.keys = []
+            self.levels = []
+        }
+    }
+}
+
+// Where the column whose block's `chunk_pack` is `key` is kept in `SurfaceLevels`: by its quart
+// `x` and `z`.
+fn level_place(key: i64) -> usize {
+    let qx = i32.wrap(key) >> 2
+    let qz = i32.wrap(key >> 32) >> 2
+    return usize.wrap((qx & (LEVEL_SIDE - 1)) | ((qz & (LEVEL_SIDE - 1)) * LEVEL_SIDE))
 }
 
 /// `Aquifer.FluidStatus`: a fluid, up to below a level.
@@ -222,7 +304,7 @@ pub fn fill_bearded(functions: mut Functions, s: Shape, states: BlockStates, bea
 /// `fill_chunk` through `ctx`, the `NoiseChunk`'s caching samplers, which the chunk's surface
 /// samples through after it (`worldgen.material`).
 pub fn fill_in(functions: mut Functions, s: Shape, states: BlockStates, ctx: mut Context, cx: i32, cz: i32, level_min: i32, level_height: i32) -> Filled ! Thrown {
-    let (f, _) = try fill_noise(mut functions, s, states, mut ctx, cx, cz, level_min, level_height)
+    let (f, _) = try fill_noise(mut functions, s, states, mut ctx, cx, cz, level_min, level_height, SurfaceLevels.new())
     return f
 }
 
@@ -243,15 +325,16 @@ pub fn air_filled(level_min: i32, level_height: i32) -> Filled {
 }
 
 /// `fill_in`, with the `NoiseChunk`'s aquifer after it, which the carvers fill the blocks they
-/// carve through (`worldgen.carver`): a disabled one where the noise doesn't reach the world.
-pub fn fill_noise(functions: mut Functions, s: Shape, states: BlockStates, ctx: mut Context, cx: i32, cz: i32, level_min: i32, level_height: i32) -> (Filled, Aquifer) ! Thrown {
+/// carve through (`worldgen.carver`): a disabled one where the noise doesn't reach the world. The
+/// aquifer asks `levels` for the surface levels, and keeps it, to give back with `give_back`.
+pub fn fill_noise(functions: mut Functions, s: Shape, states: BlockStates, ctx: mut Context, cx: i32, cz: i32, level_min: i32, level_height: i32, levels: own SurfaceLevels) -> (Filled, Aquifer) ! Thrown {
     var out = air_filled(level_min, level_height)
     let (low, height) = clamped(s, level_min, level_height)
     if height <= 0 {
-        return (out, Aquifer.disabled(s))
+        return (out, Aquifer.disabled(s, levels))
     }
     let v = try volume(16, height, 16, cx << 4, low, cz << 4, 1, 1, 1)
-    var aquifer = try Aquifer.new(mut functions, s, mut ctx, v)
+    var aquifer = try Aquifer.new(mut functions, s, mut ctx, v, levels)
     let fd = try functions.sampler(s.final_density)
     // The density is filled a column of cells at a time, small enough for what each step of it
     // works out to stay near at hand, with each interpolated function's corners worked out once
@@ -483,7 +566,7 @@ pub fn base_column(functions: mut Functions, s: Shape, x: i32, z: i32, level_min
     }
     let v = try volume(1, height, 1, x, low, z, 1, 1, 1)
     var ctx = Context.new(true)
-    var aquifer = try Aquifer.new(mut functions, s, mut ctx, v)
+    var aquifer = try Aquifer.new(mut functions, s, mut ctx, v, SurfaceLevels.new())
     let fd = try functions.sampler(s.final_density)
     var density = try zeros(v.size())
     try fill(functions.program, mut ctx, fd, mut density, v)
@@ -535,7 +618,8 @@ pub struct Aquifer {
     min_gz: i32
     size_x: i32
     size_z: i32
-    surface_cache: Map<i64, i32>
+    // The worker's surface levels, `preliminarySurfaceLevelCache` kept across chunks (D297).
+    surfaces: SurfaceLevels
     // The grid cell the twelve near cells were found about, and each one's index and location,
     // in the order `computeSubstance` looks at them.
     near_at: (i32, i32, i32)
@@ -547,7 +631,7 @@ pub struct Aquifer {
 
 impl Aquifer {
     /// `Aquifer.createDisabled`: the global fluid picker's fluid wherever the density isn't solid.
-    fn disabled(s: Shape) -> Aquifer {
+    fn disabled(s: Shape, levels: own SurfaceLevels) -> Aquifer {
         return Aquifer {
             enabled: false,
             samplers: AquiferSamplers { barrier: 0, floodedness: 0, spread: 0, lava: 0, exclusion: 0, surface: 0 },
@@ -563,7 +647,7 @@ impl Aquifer {
             min_gz: 0,
             size_x: 0,
             size_z: 0,
-            surface_cache: Map<i64, i32>(),
+            surfaces: levels,
             near_at: (i32.MIN, i32.MIN, i32.MIN),
             near_index: [0; 12],
             near_x: [0; 12],
@@ -573,8 +657,8 @@ impl Aquifer {
     }
 
     /// `NoiseChunk`'s aquifer for the volume: `Aquifer.Config.create`, or `createDisabled`.
-    fn new(functions: mut Functions, s: Shape, ctx: mut Context, v: Volume) -> Aquifer ! Thrown {
-        var a = Aquifer.disabled(s)
+    fn new(functions: mut Functions, s: Shape, ctx: mut Context, v: Volume, levels: own SurfaceLevels) -> Aquifer ! Thrown {
+        var a = Aquifer.disabled(s, levels)
         let f = s.aquifers else return a
         a.enabled = true
         a.samplers = AquiferSamplers {
@@ -615,23 +699,52 @@ impl Aquifer {
     }
 
     /// `maxSurfaceLevel`: the highest preliminary surface at the quarts of the box, sampled as
-    /// a volume, which also fills the surface cache.
+    /// a volume, which also keeps them. With a worker's levels, far from the ends of `int`, only
+    /// the least box about the quarts it hasn't kept is sampled; the whole box is still made
+    /// first, so what making it throws is thrown as before.
     fn max_surface_level(mut self, p: Program, ctx: mut Context, min_x: i32, min_z: i32, max_x: i32, max_z: i32) -> i32 ! Thrown {
         let min_qx = min_x >> 2
         let max_qx = max_x >> 2
         let min_qz = min_z >> 2
         let max_qz = max_z >> 2
-        let v = try volume(max_qx - min_qx + 1, 1, max_qz - min_qz + 1, min_qx << 2, 0, min_qz << 2, 4, 1, 4)
+        var v = try volume(max_qx - min_qx + 1, 1, max_qz - min_qz + 1, min_qx << 2, 0, min_qz << 2, 4, 1, 4)
+        var max_y = i32.MIN
+        if self.surfaces.across and not self.surfaces.judged {
+            self.surfaces.bearded = reads_beardifier(p, self.samplers.surface)
+            self.surfaces.judged = true
+        }
+        let far = min_qx > -FAR_QUARTS and max_qx < FAR_QUARTS and min_qz > -FAR_QUARTS and max_qz < FAR_QUARTS
+        if self.surfaces.across and not self.surfaces.bearded and far {
+            var low_x = i32.MAX
+            var high_x = i32.MIN
+            var low_z = i32.MAX
+            var high_z = i32.MIN
+            for qz in min_qz..max_qz + 1 {
+                for qx in min_qx..max_qx + 1 {
+                    if let level = self.surfaces.get(chunk_pack(qx << 2, qz << 2)) {
+                        max_y = max_y.max(level)
+                    } else {
+                        low_x = low_x.min(qx)
+                        high_x = high_x.max(qx)
+                        low_z = low_z.min(qz)
+                        high_z = high_z.max(qz)
+                    }
+                }
+            }
+            if low_x > high_x {
+                return max_y
+            }
+            v = try volume(high_x - low_x + 1, 1, high_z - low_z + 1, low_x << 2, 0, low_z << 2, 4, 1, 4)
+        } else {
+            self.surfaces.forget()
+        }
         var buffer = try zeros(v.size())
         try fill(p, mut ctx, self.samplers.surface, mut buffer, v)
-        var max_y = i32.MIN
         for z in 0..v.size_z {
             for x in 0..v.size_x {
                 let level = floor(f64(buffer[usize.wrap(v.index(x, 0, z))]))
-                self.surface_cache.insert(chunk_pack(v.block_x(x), v.block_z(z)), level)
-                if level > max_y {
-                    max_y = level
-                }
+                self.surfaces.put(chunk_pack(v.block_x(x), v.block_z(z)), level)
+                max_y = max_y.max(level)
             }
         }
         return max_y
@@ -642,12 +755,17 @@ impl Aquifer {
         let qx = (x >> 2) << 2
         let qz = (z >> 2) << 2
         let key = chunk_pack(qx, qz)
-        if let level = self.surface_cache.get(key) {
+        if let level = self.surfaces.get(key) {
             return level
         }
         let level = floor(f64(try sample(p, mut ctx, self.samplers.surface, qx, 0, qz)))
-        self.surface_cache.insert(key, level)
+        self.surfaces.put(key, level)
         return level
+    }
+
+    /// The worker's surface levels, given back for its next chunk's aquifer.
+    pub fn give_back(own self) -> SurfaceLevels {
+        return self.surfaces
     }
 
     /// `getIndex`, with the bounds Java's arrays check.
