@@ -58,6 +58,7 @@ import world.flat.{MIN_Y, SECTIONS, SURFACE_Y}
 import world.item.{ItemStack}
 import world.modes.{GameType, PreviousGameType}
 import world.pos.{BlockPos, ChunkPos}
+import world.spawners.{SpawnerPlayer, SpawnerView, Spawners, trader_id}
 import world.spawn.{BORDER_HALF, Candidate, DEFAULT_RESPAWN_RADIUS, SpawnSearch, border_distance, candidate_count, fits, fixup_height, search_radius}
 
 // A player on their way to another dimension: their entity, the dimension, by its place in the
@@ -335,8 +336,10 @@ struct Player {
     // the players as vanilla's player list does.
     level: i32 = 0
     joined: u64 = 0
-    // The dimension they're in, by its place in the world's (CAL-69).
+    // The dimension they're in, by its place in the world's (CAL-69), and when they came into
+    // its level, which orders its players as `ServerLevel.players()` has them (D314).
     dim: usize = 0
+    entered: u64 = 0
     // The hotbar slot they hold, and the inventory menu's state, which goes up each time its
     // slots are sent, as `AbstractContainerMenu.incrementStateId` counts it.
     selected: i32 = 0
@@ -441,6 +444,8 @@ pub struct Network {
     // The commands waiting for their players' connections, and how many players have joined.
     queued: Deque<Queued> = Deque<Queued>()
     joins: u64 = 0
+    // How many times a player has come into a level, which orders each level's players.
+    entries: u64 = 0
     level_name: String = "world"
     saving: Saving? = none
     autosave_in: i32 = AUTOSAVE_TICKS
@@ -548,13 +553,15 @@ impl Network {
     /// as `applyInitialSettings` sets it up, each level's random is seeded, and each level that
     /// can have weather has its rain and thunder as `prepareWeather` sets them.
     pub fn set_world_state(mut self, state: own WorldState) {
-        let WorldState { weather: weather, clocks: clocks, borders: given_borders, advance_time: advance_time, advance_weather: weather_on, pause_when_empty: pause_when_empty, max_world_size: max_world_size, seeds: given_seeds } = state
+        let WorldState { weather: weather, clocks: clocks, borders: given_borders, advance_time: advance_time, advance_weather: weather_on, pause_when_empty: pause_when_empty, max_world_size: max_world_size, seeds: given_seeds, spawn_rules: spawn_rules, trader: trader, trader_seed: trader_seed } = state
         var borders = given_borders
         var seeds = given_seeds
         self.world.weather = weather
         self.world.clocks = clocks
         self.world.advance_time = advance_time
         self.world.advance_weather = weather_on
+        self.world.spawn_rules = spawn_rules
+        self.world.spawners = Spawners.new(trader_seed, trader)
         self.pause_when_empty = pause_when_empty
         for d in 0..self.world.dims.len() {
             let settings = if borders.is_empty() { BorderSettings.default() } else { borders.remove(0) }
@@ -1099,8 +1106,9 @@ impl Network {
         if let data = self.world_gen.take() {
             saving.save(Save.Data(world_gen_id(), data))
         }
-        // The weather, the clocks and each dimension's border, if they've changed since they
-        // were saved, as `saveAndJoin` saves what's marked (CAL-105).
+        // The weather, the clocks, the wandering trader's data (D314) and each dimension's
+        // border, if they've changed since they were saved, as `saveAndJoin` saves what's
+        // marked (CAL-105).
         if self.world.weather.dirty {
             self.world.weather.dirty = false
             saving.save(Save.Data(weather_id(), self.world.weather.pack()))
@@ -1108,6 +1116,10 @@ impl Network {
         if self.world.clocks.dirty {
             self.world.clocks.dirty = false
             saving.save(Save.Data(clocks_id(), self.world.clocks.pack()))
+        }
+        if self.world.spawners.trader.dirty {
+            self.world.spawners.trader.dirty = false
+            saving.save(Save.Data(trader_id(), self.world.spawners.trader.pack()))
         }
         for d in 0..self.world.dims.len() {
             if self.world.dims[d].border.dirty {
@@ -1309,8 +1321,8 @@ impl Network {
     // tick of its environment's attributes; its border, then its weather, if it can have any;
     // its sky's light, as `updateSkyBrightness` sets it (D313); its time, the Overworld's, as
     // `tickTime` moves the game time on; then its chunks, as its `ServerChunkCache.tick` runs
-    // them. Sleep, block and fluid ticks, raids, block events and entities come with what they
-    // tick.
+    // them, with the custom spawners (D314). Sleep, block and fluid ticks, raids, block events
+    // and entities come with what they tick.
     fn tick_level(mut self, d: usize) {
         // What the level's random draws is at the game time as it is, which the Overworld's
         // moves on partway, as vanilla's `getGameTime` gives it.
@@ -1336,7 +1348,43 @@ impl Network {
             self.world.game_time += 1
         }
         self.world.dims[d].random.time = self.world.game_time
-        self.levels[d].tick()
+        // The chunk source's tick: its tickets, then `tickChunks`, then what unloads.
+        self.levels[d].tick_tickets()
+        self.tick_chunks(d)
+        self.levels[d].tick_unload()
+    }
+
+    // `ServerChunkCache.tickChunks`, of what Calcite has so far: the custom spawners, which only
+    // the Overworld's level has, while `spawn_mobs` is on (D314). The spawning chunks' shuffle,
+    // natural spawning and each chunk's own tick come before them, with what they tick.
+    fn tick_chunks(mut self, d: usize) {
+        if d != 0 or not self.world.spawn_rules.mobs {
+            return
+        }
+        let siege = Identifier { namespace: "minecraft", path: "roll_village_siege" }
+        let view = SpawnerView { rules: self.world.spawn_rules, sky_darken: self.world.dims[d].sky_darken, sky_light: self.world.dims[d].sky_light, bright: self.world.dims[d].bright_outside(), siege_roll: self.world.at_marker(d, siege), players: self.level_players(d) }
+        self.world.spawners.tick(view, mut self.world.dims[d].random)
+    }
+
+    // The players in the dimension at `d` as the spawners see them, in the order they came into
+    // its level, as `ServerLevel.players()` has them.
+    fn level_players(self, d: usize) -> List<SpawnerPlayer> {
+        var order = List<(u64, bool)>()
+        for slot in 0..self.connections.len() {
+            if self.playing(slot) {
+                if let c = self.connections[slot] {
+                    if c.player.dim == d {
+                        order.push((c.player.entered, c.player.mode == GameType.Spectator))
+                    }
+                }
+            }
+        }
+        order.sort()
+        var out = List<SpawnerPlayer>()
+        for (_, spectator) in order {
+            out.push(SpawnerPlayer { spectator: spectator })
+        }
+        return out
     }
 
     // The connections' part of a tick, as `tickConnection` runs it: each login, configuration
@@ -2466,6 +2514,8 @@ impl Network {
         con.player.section_y = section(con.player.y)
         con.player.section_z = chunk.z
         self.levels[con.player.dim].add_player(chunk, con.player.entity_id)
+        self.entries += 1
+        con.player.entered = self.entries
         self.track(mut con, true)
         self.settle()
     }
