@@ -142,9 +142,17 @@ def one_run(server, packs, threads, measured):
         seen = len(progress)
         began = time.perf_counter()
         say(f"pregen center {area['x']} {area['z']}", f"pregen radius {area['radius']}", "pregen start")
-        if not finished.wait(4 * 3600):
-            p.kill()
-            sys.exit("terralith: the pregeneration didn't finish:\n" + "\n".join(lines[-20:]))
+        # Waited for a second at a time, so a server that ends before it's done is told of at once,
+        # with what it said last, not after hours.
+        give_up = time.monotonic() + 4 * 3600
+        while not finished.wait(1):
+            if p.poll() is not None:
+                reader.join(5)
+                sys.exit(f"terralith: the server ended with status {p.returncode} before the pregeneration was done:\n"
+                         + "\n".join(lines[-40:]))
+            if time.monotonic() > give_up:
+                p.kill()
+                sys.exit("terralith: the pregeneration didn't finish:\n" + "\n".join(lines[-20:]))
         took = time.perf_counter() - began
         done = next(DONE.search(line) for line in lines[first:] if DONE.search(line))
         # The steady rate: from the first progress line at 10% done or more to the last at 90% or
