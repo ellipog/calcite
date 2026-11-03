@@ -37,7 +37,7 @@ import std.fs.{write}
 import std.thread.{Task}
 import std.memory.{trim}
 import std.time.{Instant, Timestamp}
-import storage.chunk.{ChunkData, ChunkFormat, written_whole}
+import storage.chunk.{ChunkData, ChunkFormat, ChunkRest, written_whole}
 import storage.region.{Compression, ReadError, Stored, unpack}
 import storage.regions.{ChunkRead, RegionStorage, encode_tag, read_root}
 import world.chunk.{BlockStates, Chunk, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, OCEAN_FLOOR_WG, Section, WORLD_SURFACE, WORLD_SURFACE_WG}
@@ -138,6 +138,17 @@ pub struct SavedChunk {
     /// Whether it isn't on the disk: the generator made it and nothing has saved it, so what lets
     /// go of it saves it (D258).
     pub fresh: bool = false
+    /// What a whole one saves beside its sections and light, shared as the chunk is: its block
+    /// entities, ticks, blocks to update and structures, as the generator made them or they were
+    /// read (D288).
+    pub rest: Shared<ChunkRest>? = none
+}
+
+/// A chunk the server holds whole, as it's saved: the chunk, and the rest of what it saves
+/// (D258, D288).
+pub struct Whole {
+    pub chunk: Shared<Chunk>
+    pub rest: Shared<ChunkRest>
 }
 
 impl SavedChunk {
@@ -167,16 +178,16 @@ pub enum Done {
     Closed(List<Entry>)
 }
 
-/// A chunk the generator finished, as the server takes it: its sky's sources worked out from its
-/// blocks with `light`, and no light, which the server's engine works out. `sections` is the
-/// dimension's.
-pub fn generated(chunk: own Chunk, light: LightStates, sections: i32) -> SavedChunk {
+/// A chunk the generator finished, with the rest of what it saves, as the server takes it: its
+/// sky's sources worked out from its blocks with `light`, and no light, which the server's engine
+/// works out. `sections` is the dimension's.
+pub fn generated(chunk: own Chunk, rest: own ChunkRest, light: LightStates, sections: i32) -> SavedChunk {
     var sources = SkySources.new(chunk.min_y())
     sources.fill_from(chunk, light)
     // No light was saved for it, so its lists of saved light are empty, not a `none` for each
     // section: two lists of 26 took 1.8 KB a chunk.
     _ = sections
-    return SavedChunk { chunk: Shared(chunk), sources: some(sources), sky: [], block: [], lighted: false, whole: true, fresh: true }
+    return SavedChunk { chunk: Shared(chunk), sources: some(sources), sky: [], block: [], lighted: false, whole: true, fresh: true, rest: some(Shared(rest)) }
 }
 
 /// What a chunk read from its region file comes to, as vanilla's `ChunkMap.scheduleChunkLoad`
@@ -324,8 +335,10 @@ fn prepare_stored(pos: ChunkPos, stored: Stored, context: ChunkContext, light: L
     var sources = SkySources.new(context.min_section * 16)
     sources.fill_from(chunk, light)
     let lighted = context.format.has_light(data.status) and data.light_correct
-    let whole = data.whole(context.format, tags_whole) and parsing.is_empty()
-    return Loaded.Saved(SavedChunk { chunk: Shared(chunk), sources: some(sources), sky: sky, block: block, lighted: lighted, whole: whole })
+    // One saved at another position isn't whole: its block entities and ticks are where it was.
+    let whole = data.whole(context.format, tags_whole) and parsing.is_empty() and data.pos.x == pos.x and data.pos.z == pos.z
+    let rest: Shared<ChunkRest>? = if whole { some(Shared(data.take_rest(count))) } else { none }
+    return Loaded.Saved(SavedChunk { chunk: Shared(chunk), sources: some(sources), sky: sky, block: block, lighted: lighted, whole: whole, rest: rest })
 }
 
 // The light a chunk's saved layers send, as vanilla's light packet sends each layer its engine
@@ -416,7 +429,7 @@ enum Ask {
     Region(ChunkPos)
     Chunk(ChunkPos)
     Write(ChunkPos, List<u8>)
-    Save(ChunkPos, Shared<Chunk>, LightData?)
+    Save(ChunkPos, Whole, LightData?)
     Saved(ChunkPos, List<u8>?)
     Close
 }
@@ -425,7 +438,7 @@ enum Ask {
 // encode with its light, to go back to the IO thread to write (D258).
 enum Work {
     Read(ChunkPos, List<Entry>, ChunkRead)
-    Save(ChunkPos, Shared<Chunk>, LightData?)
+    Save(ChunkPos, Whole, LightData?)
 }
 
 // The IO thread: it owns the region files, and reads and writes what it's asked, in the order
@@ -480,11 +493,11 @@ impl Task for IoThread {
             let ask = got else return
             match ask {
                 Ask.Write(pos, bytes) => s.write(pos, some(bytes)),
-                Ask.Save(pos, chunk, light) => {
+                Ask.Save(pos, whole, light) => {
                     if not s.closed {
                         let key = chunk_key(pos.x, pos.z)
                         s.encoding.insert(key, (s.encoding.get(key) ?? 0) + 1)
-                        s.saves.send(Work.Save(pos, chunk, light))
+                        s.saves.send(Work.Save(pos, whole, light))
                     }
                 },
                 Ask.Saved(pos, bytes) => {
@@ -650,7 +663,7 @@ impl Task for ChunkWorker {
         var states: LightStates? = none
         while let w = work.wait() {
             match w {
-                Work.Save(pos, chunk, light) => to_io.send(Ask.Saved(pos, saved_bytes(self.context, pos, chunk.value, light))),
+                Work.Save(pos, whole, light) => to_io.send(Ask.Saved(pos, saved_bytes(self.context, pos, whole.chunk.value, whole.rest.value.copy(), light))),
                 Work.Read(pos, io, read) => {
                     var lines = List<Entry>()
                     let made = states.take() ?? LightStates.new()
@@ -678,15 +691,15 @@ impl Task for ChunkWorker {
     }
 }
 
-/// The chunk at `pos`, which the server holds whole, as its region file holds it: lit, with
-/// `light`, the engine's, as a packet has it, or as the generator finished it if it's `none`.
-/// None if it can't be encoded (D258).
-pub fn saved_bytes(context: ChunkContext, pos: ChunkPos, chunk: Chunk, light: own LightData?) -> List<u8>? {
+/// The chunk at `pos`, which the server holds whole, with `rest`, as its region file holds it:
+/// lit, with `light`, the engine's, as a packet has it, or as the generator finished it if it's
+/// `none`. None if it can't be encoded (D258, D288).
+pub fn saved_bytes(context: ChunkContext, pos: ChunkPos, chunk: Chunk, rest: own ChunkRest, light: own LightData?) -> List<u8>? {
     if let l = light {
         let count = usize.wrap(context.sections) + 2
-        return encoded(context, ChunkData.lit(context.format, pos, chunk, per_section(l.sky_mask, l.sky, count), per_section(l.block_mask, l.block, count)))
+        return encoded(context, ChunkData.lit(context.format, pos, chunk, rest, per_section(l.sky_mask, l.sky, count), per_section(l.block_mask, l.block, count)))
     }
-    return encoded(context, ChunkData.generated(context.format, pos, chunk))
+    return encoded(context, ChunkData.generated(context.format, pos, chunk, rest))
 }
 
 // `data` as its region file holds it, or none if it can't be encoded.
@@ -793,13 +806,13 @@ impl Task for GenWorker {
                     let began = unsafe { Instant.now() }
                     let made = w.run(job)
                     let finished = match made {
-                        Made.Finished(_, _, _) => true,
+                        Made.Finished(_, _, _, _) => true,
                         _ => false,
                     }
                     if finished {
                         match made {
-                            Made.Finished(x, z, chunk) => {
-                                let saved = generated(chunk, light, context.sections)
+                            Made.Finished(x, z, chunk, rest) => {
+                                let saved = generated(chunk, rest, light, context.sections)
                                 out.send(GenIn.Finished(epoch, x, z, saved, unsafe { Instant.now() }.nanos_since(began)))
                             },
                             _ => {},
@@ -931,7 +944,7 @@ fn stage_of(made: Made) -> usize {
         Made.Biomes(_, _, _, _) => 2,
         Made.Terrain(_, _, _, _) => 3,
         Made.Decorated(_, _) => 4,
-        Made.Finished(_, _, _) => 5,
+        Made.Finished(_, _, _, _) => 5,
     }
 }
 
@@ -1278,7 +1291,9 @@ impl GenOut {
         if works.is_empty() and not spawn_here {
             if epoch == s.epoch {
                 // Let go while it was being finished (D243).
-                s.to_io.send(Ask.Save(ChunkPos { x: x, z: z }, saved.chunk.copy(), none))
+                if let rest = saved.rest {
+                    s.to_io.send(Ask.Save(ChunkPos { x: x, z: z }, Whole { chunk: saved.chunk.copy(), rest: rest.copy() }, none))
+                }
                 s.finished.insert(key, saved)
             }
             return
@@ -1615,9 +1630,9 @@ impl ChunkJobs {
     /// read of it asked for after this reads it (D258). The savers are threads of their own, as
     /// many as there can be chunk workers, so the reads that feed the generator never wait
     /// behind a tick's worth of saves.
-    pub fn save_chunk(mut self, pos: ChunkPos, chunk: own Shared<Chunk>, light: own LightData?) {
+    pub fn save_chunk(mut self, pos: ChunkPos, whole: own Whole, light: own LightData?) {
         self.start()
-        self.to_asks.send(Ask.Save(pos, chunk, light))
+        self.to_asks.send(Ask.Save(pos, whole, light))
     }
 
     // Starts another chunk worker.

@@ -127,6 +127,17 @@ def cases():
     add("sign-styled", "sign", "{front_text:{messages:[{text:\"A\",color:\"red\"},\"\",\"\",\"\"],color:\"blue\",has_glowing_text:1b},"
         "is_waxed:1b}")
     add("sign-empty", "sign", "{}")
+    # A side through `SignText.DIRECT_CODEC`: lines written as the component codec writes them, the
+    # first four of more, none of fewer, filtered lines only where they differ, a dye's color (D288).
+    add("sign-compound-lines", "sign", "{front_text:{messages:[{text:\"\"},{text:\"Hi\"},\"\",[{text:\"a\"},\"b\"]],color:\"black\",has_glowing_text:0b}}")
+    add("sign-filtered-same", "sign", "{front_text:{messages:[\"a\",\"\",\"\",\"\"],filtered_messages:[{text:\"a\"},\"\",\"\",\"\"],color:\"red\",has_glowing_text:2b}}")
+    add("sign-filtered-other", "sign", "{front_text:{messages:[\"a\",\"\",\"\",\"\"],filtered_messages:[\"#\",\"\",\"\",\"\"],color:\"red\",has_glowing_text:1b}}")
+    add("sign-filtered-bad", "sign", "{front_text:{messages:[\"a\",\"\",\"\",\"\"],filtered_messages:[\"#\"],color:\"red\",has_glowing_text:1b}}")
+    add("sign-bad-color", "sign", "{front_text:{messages:[\"a\",\"\",\"\",\"\"],color:\"rainbow\",has_glowing_text:0b}}")
+    add("sign-three-lines", "sign", "{front_text:{messages:[\"a\",\"b\",\"c\"],color:\"blue\",has_glowing_text:1b}}")
+    add("sign-five-lines", "sign", "{front_text:{messages:[\"a\",\"b\",\"c\",\"d\",\"e\"],color:\"blue\",has_glowing_text:1b}}")
+    add("sign-no-color", "hanging_sign", "{back_text:{messages:[\"\",\"\",\"\",\"x\"]}}")
+    add("sign-bad-line", "sign", "{front_text:{messages:[\"a\",5,\"c\",\"d\"],color:\"blue\",has_glowing_text:1b}}")
     add("hanging-sign-text", "hanging_sign", "{front_text:{messages:[\"\",\"Inn\",\"\",\"\"],color:\"black\",has_glowing_text:0b}}")
     add("banner-patterns", "banner", "{patterns:[{pattern:\"minecraft:stripe_top\",color:\"red\"},{pattern:\"minecraft:border\",color:\"black\"}]}")
     add("banner-empty-patterns", "banner", "{patterns:[]}")
