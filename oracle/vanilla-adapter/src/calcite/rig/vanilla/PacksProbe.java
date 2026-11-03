@@ -435,7 +435,8 @@ final class PacksProbe implements Probe {
         }
 
         String normal(String text) {
-            return text.replace(folder, "").replace(File.separatorChar, '/');
+            // Every backslash, not only Windows' separator, so a line reads the same on each system.
+            return text.replace(folder, "").replace('\\', '/');
         }
 
         void write(DataOutputStream out) throws IOException {
