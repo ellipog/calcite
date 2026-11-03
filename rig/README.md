@@ -21,6 +21,7 @@ The rig runs the same inputs through vanilla and through Calcite and compares th
 | Protocol suites | [`runner/sessions.py`](runner/sessions.py) | The protocol bot against vanilla and Calcite, packet by packet (`P4.8`) |
 | Light timing | [`runner/light_timing.py`](runner/light_timing.py) | Calcite's light engines timed against vanilla's through the `light` probe ([D182](../docs/decisions.md)) |
 | The round trip | [`runner/roundtrip.py`](runner/roundtrip.py) | A world vanilla made, loaded and saved by Calcite, then read by vanilla (`G5.2`) |
+| Worldgen with packs | [`runner/terragen.py`](runner/terragen.py) | Chunks Calcite generates with Terralith and Terratonic against vanilla's, block by block (CAL-92) |
 | A real client | [`runner/realclient.py`](runner/realclient.py) | Mojang's 26.3 client joins Calcite, walks and chats (`G4.1`), goes to another dimension, and times the chunks it's sent through [`runner/chunkwatch.py`](runner/chunkwatch.py) |
 | The lockstep check | [`lockstep.py`](lockstep.py) | A session Calcite records on many threads, replayed on one to the same packets and lines (`G5.3`, [D283](../docs/decisions.md)) |
 
@@ -252,6 +253,17 @@ A world vanilla made and saved must come back from Calcite as it went, and open 
 4. In `back/` and `again/`, vanilla's server opens a copy of Calcite's save and one of its own and answers the same 22 questions from its console about each: what the chests, the sign and the furnace hold, in two dimensions, whether the portal and the bed are there, the score, the storage, the border, the forced chunks in each dimension, the teams, the boss bar and each entity. An answer that isn't the same for both, or a warning or error vanilla logs opening Calcite's save and not its own, is a difference. The answers are kept in `answers.json`.
 
 It exits with 1 if there's a difference. It needs the vanilla adapter built, and runs Calcite's release builds of the bot and `resave`; it never runs in CI. It passes on Windows and Linux: 51 files and about 3400 chunks the same, the same in order too, and vanilla answers all 22 questions about Calcite's save as about its own. This is the storage layer: once the server loads and saves a world itself, the round trip goes through the server.
+
+## Worldgen with packs
+
+```sh
+py -I rig/runner/terragen.py            # both servers generate the sample, then it's compared
+py -I rig/runner/terragen.py --reuse    # compare the last run's worlds again
+py -I rig/runner/terragen.py --areas 2  # only the first two areas
+py -I rig/runner/terragen.py --no-packs # the same without the packs, in build/rig/terragen/plain/
+```
+
+The worldgen probes check Calcite's generator piece by piece on vanilla's own data. [`terragen.py`](runner/terragen.py) checks it whole, on packs that replace most of it: Terralith and Terratonic, the packs of the worldgen benchmark ([`bench/terralith.py`](../bench/terralith.py), which fetches them and checks their SHA-512s), with that benchmark's seed. It runs in `build/rig/terragen/`, with Mojang's EULA accepted in its scratch folder only. Vanilla's server freezes its ticks, so nothing a feature leaves to tick runs, force-loads six areas of 8 by 8 chunks (the spawn's, the benchmark's measured area's and four far from both), waits until each chunk is loaded, saves and stops. Calcite's release build pregenerates a square about each area and stops. Then each chunk vanilla force-loaded is read from both worlds' region files and compared: its status, each section's blocks and biomes, decoded so a palette's order doesn't count, the heightmaps, the block entities and the structures' starts and references. Light, entities and the times a chunk keeps aren't compared. What differs is written to `build/rig/terragen/report.json`, and it exits with 1 if a chunk differs. The packs are Stardust Labs', so nothing it makes is committed, and it never runs in CI.
 
 ## A real client
 

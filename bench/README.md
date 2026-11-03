@@ -1,9 +1,13 @@
 ---
-title: Bot benchmark
-description: How Calcite's server is timed with 100 bot players joining, walking and chatting, how to run it, and the results per commit.
+title: Benchmarks
+description: How Calcite's server is timed with 100 bot players joining, walking and chatting, and generating a world with Terralith and Terratonic beside C2ME's numbers, how to run each, and the results.
 ---
 
-# Bot benchmark
+# Benchmarks
+
+Two benchmarks, each run on the server's release build: [the bots](#bot-benchmark), which time the server with 100 players on it, and [worldgen](#worldgen-benchmark), which times generating a world with Terralith and Terratonic, set up as C2ME's own benchmark is.
+
+## Bot benchmark
 
 D34 tracks performance per commit, from the tick-loop benchmark in Phase 3 to a fixed bot scenario from Phase 4. This is that scenario (P4.10, [D154](../docs/decisions.md)): the real server, its release build, with players on it.
 
@@ -15,7 +19,7 @@ py -I bench/run.py --runs 1 --bots 20 --seconds 20     # a quick look, not recor
 
 On Linux, use `python3` for `py`. The runner builds the server and the bots with calx into `build/bench/<platform>/`, then runs each in `build/bench/<platform>/world/`, a fresh start each time. It needs nothing but Python.
 
-## The scenario
+### The scenario
 
 - **The server** is the release build, in offline mode with the whitelist off, with vanilla's compression threshold of 256, and view and simulation distance 10, so a player has 473 chunks in view. `max-players` is 1000.
 - **100 bots join**, 20 a second, over TCP on 127.0.0.1. Each does what a client must to stay: logs in, finishes configuration, accepts its teleport, acknowledges each chunk batch, answers keep-alives and ends a tick every 50 ms.
@@ -25,7 +29,7 @@ On Linux, use `python3` for `py`. The runner builds the server and the bots with
 
 The bots are [`src/rig/swarm.calx`](../src/rig/swarm.calx), on one thread of their own process. They're made from Calcite's own protocol code; the format is checked elsewhere, by the network tests and vanilla's codecs ([D145](../docs/decisions.md)).
 
-## What's measured
+### What's measured
 
 | Measure | What it is |
 | --- | --- |
@@ -41,7 +45,7 @@ The tick times come from the server itself: `--tick-times FILE` writes each tick
 
 A later run prints each number beside the recorded one, and names any that's more than 5% worse, which D34 says to look into before more work lands. The numbers come from one machine, since CI runners are too noisy to compare.
 
-## Results
+### Results
 
 On the reference machine, an i9-13900K, the medians of 5 runs, recorded in [`results/`](results/) with the commit, the Calx compiler's commit and the machine. Linux is Ubuntu in WSL 2 on the same machine.
 
@@ -65,3 +69,23 @@ Commit 1195b56, Calx f6ad008, after the chunk sender stopped sorting every chunk
 Since then the worst tick while joining has moved with how chunks load. On Windows, in 15-second runs, it went from 2.0 ms to 4.4 when chunks began to be read on threads (d30ab20), since the first bot's come back in one burst, and to 10.6 when the level began to light them (3b8d324). Lighting a tick's worth at a time brought it to 4.8 ms, and on a world vanilla generated, where most chunks need their light spread, to 7.9 ms from 41.0, the medians of 3 30-second runs ([D197](../docs/decisions.md)).
 
 The runs are noisy, from the system and the other threads: one run's mean MSPT is from 0.46 to 0.56 ms on Windows, about ±10%. CPU time on Windows varies more, from 2.3 to 3.6 s in one set of runs, and a worst tick can be one the system held up, such as 18 ms while joining in one run on Linux where the others were 2 to 4. So before looking into a number flagged as more than 5% worse, run it again with `--runs 10`, and look into it if it stays.
+
+## Worldgen benchmark
+
+```sh
+py -I bench/terralith.py                      # 1, 8, 16 and 32 workers, the full run, not recorded
+py -I bench/terralith.py --record             # the same, written to bench/results/terralith-<platform>.json
+py -I bench/terralith.py --threads 8 --radius 512     # a quick look, not recorded
+```
+
+[C2ME](https://modrinth.com/mod/c2me-fabric) publishes how fast it generates a world with [Terralith](https://modrinth.com/datapack/terralith) and [Terratonic](https://modrinth.com/datapack/terratonic), beside Paper's and vanilla's, from 1 to 16 threads. [`terralith.py`](terralith.py) runs the same benchmark on Calcite (CAL-92), set up as theirs is:
+
+- **The packs** are the versions made for 26.3, Terralith 2.6.5+26.3 and Terratonic 3.0.31, fetched from Modrinth into `build/bench/packs/` and checked against their SHA-512s. They're Stardust Labs', so they're never committed.
+- **The seed** is C2ME's, 114862964781274189.
+- **One launch on a fresh world**: a warm-up of a 1,536-block radius about the origin, then the measured run, a 3,072-block radius about 1,000,000, 1,000,000, 148,225 chunks, each with the server's own `pregen` command. The release server runs in `build/bench/<platform>/terralith/` with `chunk-workers` set to the thread count.
+
+It reports the measured run's chunks a second, the CPU time and peak memory the system gives for the whole launch, any warning the server logged, and how the workers' time split between the generator's stages: the strongholds' rings, the structures' starts, the biomes, the terrain, the features, and finishing a chunk as the server's, with its sky's light sources and its bytes. The stage times come from the server: `--stage-times FILE` keeps the seconds its workers have spent on each kind of job in the file as they go ([D287](../docs/decisions.md)). The whole run is over an hour, most of it at 1 thread.
+
+C2ME's numbers are from their machine, a Xeon Platinum 8558P held to 3.2 GHz, on Minecraft 26.2 with Terralith 2.6.4 and Terratonic 3.0.27, so only the curves compare, not the numbers themselves. The script prints its table beside theirs, and `--record` keeps theirs in the results with ours.
+
+Whether what Calcite generates with the packs is vanilla's is checked by the rig's [`terragen.py`](../rig/README.md#worldgen-with-packs), on a sample of chunks.

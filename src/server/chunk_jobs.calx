@@ -33,6 +33,7 @@ import protocol.play.{LightData, LightLayer}
 import server.log.{Entry}
 import std.net.{Waker}
 import std.pool.{workers}
+import std.fs.{write}
 import std.thread.{Task}
 import std.memory.{trim}
 import std.time.{Instant, Timestamp}
@@ -714,14 +715,14 @@ fn per_section(bits: List<u8>, given: List<LightLayer>, count: usize) -> List<Li
 
 // What the generator's thread is handed: a chunk to generate, with what reading it logged; what a
 // job of a scheduler's epoch made, or a chunk a worker finished as the server's, with its bytes
-// for its region file, none if it couldn't be encoded; the chunks the IO thread wrote, with what
+// for its region file, none if it couldn't be encoded, each with the nanoseconds it took; the chunks the IO thread wrote, with what
 // it logged; the chunk a worker found the spawn is looked for from; or a new world's spawn to
 // find; or a chunk nothing wants any more (D243).
 enum GenIn {
     Make(GenWork)
     Drop(ChunkPos)
-    Made(u32, Made)
-    Finished(u32, i32, i32, SavedChunk)
+    Made(u32, Made, u64)
+    Finished(u32, i32, i32, SavedChunk, u64)
     Written(List<i64>, List<Entry>)
     Origin(i32, i32, String?)
     Spawn
@@ -787,6 +788,9 @@ impl Task for GenWorker {
                     }
                 },
                 GenTask.Job(epoch, job) => {
+                    // How long it takes is only told, for `--stage-times`: nothing made depends
+                    // on it.
+                    let began = unsafe { Instant.now() }
                     let made = w.run(job)
                     let finished = match made {
                         Made.Finished(_, _, _) => true,
@@ -794,11 +798,14 @@ impl Task for GenWorker {
                     }
                     if finished {
                         match made {
-                            Made.Finished(x, z, chunk) => out.send(GenIn.Finished(epoch, x, z, generated(chunk, light, context.sections))),
+                            Made.Finished(x, z, chunk) => {
+                                let saved = generated(chunk, light, context.sections)
+                                out.send(GenIn.Finished(epoch, x, z, saved, unsafe { Instant.now() }.nanos_since(began)))
+                            },
                             _ => {},
                         }
                     } else {
-                        out.send(GenIn.Made(epoch, made))
+                        out.send(GenIn.Made(epoch, made, unsafe { Instant.now() }.nanos_since(began)))
                     }
                 },
             }
@@ -851,6 +858,7 @@ struct GenThread {
     done: Sender<Done>
     waker: Waker
     workers: usize
+    stage_file: String?
 }
 
 // Where the generator's thread hands back what it made: the queue back, and what wakes the poll.
@@ -904,6 +912,56 @@ struct GenState {
     // since: the IO thread's notes of what it wrote come whether it has work or not (D260).
     busy_at: u64 = 0
     settled: bool = false
+    // `--stage-times`: the file, the nanoseconds the workers have spent on each kind of job, by
+    // `write_stages`'s order, when they were last written, and whether they've changed since (D287).
+    stage_file: String? = none
+    stage_nanos: List<u64> = List<u64>()
+    stages_written_at: u64 = 0
+    stages_changed: bool = false
+}
+
+// How often the stage times are written while the workers are busy: every second.
+const STAGES_EVERY: u64 = 1000000000
+
+// The stage of what a job made, by its place in `write_stages`'s order.
+fn stage_of(made: Made) -> usize {
+    return match made {
+        Made.Ring(_, _, _, _, _) => 0,
+        Made.Starts(_, _, _, _) => 1,
+        Made.Biomes(_, _, _, _) => 2,
+        Made.Terrain(_, _, _, _) => 3,
+        Made.Decorated(_, _) => 4,
+        Made.Finished(_, _, _) => 5,
+    }
+}
+
+// Writes the stage times to their file, if they've changed: `name=seconds` for each, on one line.
+// The stages are the kinds of the generator's jobs: the strongholds' rings, the structures'
+// starts, the biomes, the terrain, the features, and the chunk finished as the server's, with its
+// sky's sources and its bytes.
+fn write_stages(s: mut GenState) {
+    if s.stage_file == none or not s.stages_changed {
+        return
+    }
+    let names: List<str> = ["rings", "starts", "biomes", "terrain", "features", "finish"]
+    var line = String()
+    for i in 0..names.len() {
+        if i > 0 {
+            line.push_str(" ")
+        }
+        let seconds = f64.nearest(s.stage_nanos[i]) / 1.0e9
+        line.push_str("{names[i]}={seconds}")
+    }
+    line.push_str("\n")
+    // A file that can't be written goes without: it's only told.
+    if let path = s.stage_file {
+        match write(path, line.to_bytes()) {
+            ok => {},
+            err(_) => {},
+        }
+    }
+    s.stages_changed = false
+    s.stages_written_at = unsafe { Instant.now() }.nanos_since(s.began)
 }
 
 impl GenState {
@@ -916,10 +974,10 @@ impl GenState {
 
 impl Task for GenThread {
     fn run(own self) {
-        let GenThread { setup: setup, context: context, inbox: taken, to_inbox: to_inbox, to_io: to_io, done: done, waker: waker, workers: count } = self
+        let GenThread { setup: setup, context: context, inbox: taken, to_inbox: to_inbox, to_io: to_io, done: done, waker: waker, workers: count, stage_file: stage_file } = self
         var inbox = taken
         var out = GenOut { done: done, waker: waker }
-        var s = GenState { sched: none, to_tasks: none, to_io: to_io, workers: count.max(1), began: unsafe { Instant.now() } }
+        var s = GenState { sched: none, to_tasks: none, to_io: to_io, workers: count.max(1), began: unsafe { Instant.now() }, stage_file: stage_file, stage_nanos: [0, 0, 0, 0, 0, 0] }
         match setup_data(setup, mut s.lines) {
             ok(zip) => {
                 // One worker is made, and each thread gets a copy: reading vanilla's data on
@@ -960,6 +1018,9 @@ impl Task for GenThread {
                 s.busy()
                 progressed = true
             }
+            if s.stages_changed and unsafe { Instant.now() }.nanos_since(s.began) >= s.stages_written_at + STAGES_EVERY {
+                write_stages(mut s)
+            }
             if not progressed {
                 // No work for a while: everything asked for has been handed back, and nothing
                 // more is, so what the scheduler keeps goes (D228). What comes meanwhile that
@@ -974,6 +1035,7 @@ impl Task for GenThread {
                     if next == none {
                         settle(mut s)
                         s.settled = true
+                        write_stages(mut s)
                     }
                 }
                 if next == none {
@@ -1033,7 +1095,10 @@ impl GenOut {
                 }
             },
             GenIn.Drop(pos) => self.drop(mut s, pos),
-            GenIn.Made(epoch, made) => {
+            GenIn.Made(epoch, made, nanos) => {
+                let stage = stage_of(made)
+                s.stage_nanos[stage] += nanos
+                s.stages_changed = true
                 if epoch != s.epoch {
                     s.stale -= 1
                 } else if let g = s.sched.take() {
@@ -1042,7 +1107,11 @@ impl GenOut {
                     s.sched = some(sched)
                 }
             },
-            GenIn.Finished(epoch, x, z, saved) => self.finished(mut s, epoch, x, z, saved),
+            GenIn.Finished(epoch, x, z, saved, nanos) => {
+                s.stage_nanos[5] += nanos
+                s.stages_changed = true
+                self.finished(mut s, epoch, x, z, saved)
+            },
             GenIn.Written(keys, lines) => {
                 for e in lines {
                     s.lines.push(e.copy())
@@ -1457,6 +1526,8 @@ pub struct ChunkJobs {
     most: usize
     // The generator's workers: `chunk-workers`, or one fewer than the processors (D251).
     gen_workers: usize
+    // Where the generator writes its stage times, for `--stage-times` (D287).
+    stage_file: String? = none
     // How many chunks are asked for and not back, how many regions, and whether the spawn is.
     chunks_away: usize
     regions_away: usize
@@ -1559,6 +1630,12 @@ impl ChunkJobs {
         self.started += 1
     }
 
+    /// Has the generator write how long its workers spend in each stage to `path`, as they go, for
+    /// `--stage-times` (D287). It takes effect when the generator starts.
+    pub fn set_stage_times(mut self, path: own String) {
+        self.stage_file = some(path)
+    }
+
     /// Tells the generator nothing wants the chunk at `pos` any more, if the world generates: it
     /// comes back as `Done.Withdrawn` if it wasn't made (D243).
     pub fn drop_chunk(mut self, pos: ChunkPos) {
@@ -1628,6 +1705,6 @@ impl ChunkJobs {
         }
         let setup = self.gen.take() else return
         let to_gen = self.to_gen else return
-        _ = unsafe { Thread.spawn(GenThread { setup: setup, context: self.context.copy(), inbox: self.gen_inbox.share(), to_inbox: to_gen.share(), to_io: self.to_asks.share(), done: self.to_done.share(), waker: self.waker, workers: self.gen_workers }) }
+        _ = unsafe { Thread.spawn(GenThread { setup: setup, context: self.context.copy(), inbox: self.gen_inbox.share(), to_inbox: to_gen.share(), to_io: self.to_asks.share(), done: self.to_done.share(), waker: self.waker, workers: self.gen_workers, stage_file: self.stage_file.copy() }) }
     }
 }
