@@ -53,6 +53,8 @@ A task holds up to 1024 chunks at once. It loads each with a ticket of its own, 
 
 Tasks survive restarts and crashes. How far each has come is saved in the world's `data/calcite/pregen.dat`: as it starts, pauses, carries on, is cancelled or finishes, every 30 seconds while it runs, and with each save of the world. When the server starts, each task carries on where it was, paused if it was paused. The chunks it was working on when it stopped are generated again or read.
 
+Players come first. While a player's chunks are loading in the dimension, as they join or travel into new terrain, a task starts no new chunks, and its progress line says `giving way to players`. It carries on once their chunks are in. On our test machine, a real client joining at view distance 32 had 90% of its chunks at 2.8 s with no pregen running and at 3.5 to 3.7 s with one running.
+
 A pregenerated chunk is the same chunk a player walking there would have generated.
 
 On our test machine, with 32 threads, a new world's Overworld pregenerates at about 2,000 chunks a second: a 2000-block radius, 62,500 chunks, takes 31 seconds, with the server using at most 764 MB. It runs as fast as Calcite generates chunks, so it's faster on more cores. `chunk-workers` in calcite.properties sets how many threads generate chunks.
