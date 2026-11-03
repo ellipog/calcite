@@ -238,6 +238,7 @@ Make the world real: storage that vanilla can read, Folia-style regions on a loc
   - Every tick runs the global phase, the region phase and then message exchange (D19, D20).
   - Global state such as world time, weather, entity IDs, scoreboards and the player list lives in the central world actor.
   - Run every test with one thread and with many.
+  - Done in Phase 5 (D283): the layout, which splits and merges as players move, the world phase by region, and the check that a session recorded on many threads replays on one. Regions tick in parallel once they have something to tick, with Phase 6's entities and block ticks (CAL-101).
 - **P5.5** Chunk tickets and load levels as vanilla has them: view distance, simulation distance, entity ticking range, forced chunks, and portal and ender pearl tickets. What's loaded and ticking decides how farms behave, so this gets its own parity suite.
 - **P5.6** Chunk loading and generation run as jobs off the region threads, and their completions go into the input log (D21).
 - **P5.7** Lighting: sky light and block light, checked by the light probe.

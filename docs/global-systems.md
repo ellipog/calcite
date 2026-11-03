@@ -19,7 +19,7 @@ From D50, which replaces the phase order in D20:
 4. **World phase**, all regions in parallel: scheduled ticks, chunks, block events, entities, block entities, connections.
 5. **Barrier**, one thread again: console and RCON commands (where vanilla's `tickConnection` runs them), then handoffs, region split and merge, message routing, fan-out and flush.
 
-Vanilla handles every packet at the start of the tick, then runs functions, then ticks the worlds. Handling packets in their own phase before the global phase keeps that order, so a command a player types sees the same game time as in vanilla. A message is handled the next time its destination runs, so a region's message to the global instance during the packet phase is handled in the same tick.
+Vanilla handles every packet before the tick it came before, then runs functions, then ticks the worlds. It runs each packet's task as it comes while it waits for the next tick, and so does Calcite: the packet phase is the wait between ticks ([D283](decisions.md)). Handling packets in their own phase before the global phase keeps that order, so a command a player types sees the same game time as in vanilla. A message is handled the next time its destination runs, so a region's message to the global instance during the packet phase is handled in the same tick.
 
 ## Homes
 

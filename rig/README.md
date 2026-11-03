@@ -22,6 +22,7 @@ The rig runs the same inputs through vanilla and through Calcite and compares th
 | Light timing | [`runner/light_timing.py`](runner/light_timing.py) | Calcite's light engines timed against vanilla's through the `light` probe ([D182](../docs/decisions.md)) |
 | The round trip | [`runner/roundtrip.py`](runner/roundtrip.py) | A world vanilla made, loaded and saved by Calcite, then read by vanilla (`G5.2`) |
 | A real client | [`runner/realclient.py`](runner/realclient.py) | Mojang's 26.3 client joins Calcite, walks and chats (`G4.1`), goes to another dimension, and times the chunks it's sent through [`runner/chunkwatch.py`](runner/chunkwatch.py) |
+| The lockstep check | [`lockstep.py`](lockstep.py) | A session Calcite records on many threads, replayed on one to the same packets and lines (`G5.3`, [D283](../docs/decisions.md)) |
 
 The runner needs only Python 3.10 or newer, with no packages. Run it from anywhere. Paths are relative to the repo.
 
@@ -297,7 +298,7 @@ The data converter and the jar fetch step have their own tests, which don't need
 py -I -m unittest discover -s oracle/datagen/tests -v
 ```
 
-CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Windows and Linux, with the oldest supported Python (3.10) and the newest. A second job checks out calx beside Calcite, builds it, runs Calcite's Calx tests (`py -I src/test/run.py`), fetches the pinned server jar, which the `registries` probe reads and which it caches, and scores Calcite against the committed hashes with `--strict` (`P1.9`).
+CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Windows and Linux, with the oldest supported Python (3.10) and the newest. A second job checks out calx beside Calcite, builds it, runs Calcite's Calx tests (`py -I src/test/run.py`), fetches the pinned server jar, which the `registries` probe reads and which it caches, and scores Calcite against the committed hashes with `--strict` (`P1.9`). Then it runs the lockstep check, `py -I rig/lockstep.py`: Calcite's release build records a session with 8 chunk workers and 4 bots walking into new terrain, in a new world of a fixed seed, and `--replay` plays the input log back on one thread, which fails if any packet or line differs (`G5.3`).
 
 ## Found so far
 
