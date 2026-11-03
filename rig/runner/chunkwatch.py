@@ -30,10 +30,19 @@ come as it would on such a link. Times are from the relay's clock, as it hands t
 With --dump, each `level_chunk_with_light` the client's sent is written to the file as it was
 before it was compressed, its packet ID and all, after its length as 4 bytes little-endian, so
 compressors can be compared on the chunks a real client was sent.
+
+With --view N, it also follows the player: where the client says it is, from its moves and the
+server's teleports, and which chunks it has, each it was sent until the server has it forget it.
+Four times a second, as the player moves, it counts the chunks of the circle of N chunks about
+the player's that the client has, and how far the nearest it doesn't is. A phase's report then
+says how much of its view the client had while it moved, and how fast it went, so a flight shows
+whether the chunks kept up (CAL-94). realclient.py starts a phase of its own, `flight`, as the
+player starts to fly forward, and `after` as they stop.
 """
 
 import argparse
 import json
+import math
 import queue
 import re
 import socket
@@ -82,9 +91,19 @@ def varint(data, at):
 class Watch:
     """What one connection's frames come to, each way, as phases."""
 
-    def __init__(self, ids, dump=None):
+    def __init__(self, ids, dump=None, view=None):
         self.ids = ids
         self.dump = dump
+        # With a view: the chunks the client has, where it last said it was, and each sample of
+        # how much of the view about it it had: when, where, how many, and how far the nearest
+        # it didn't have was, or None.
+        self.view = view
+        self.have = set()
+        self.samples = []
+        self.sampled = -1.0
+        # Each chunk of the circle of `view` about the player's, by how far it is, nearest first.
+        self.circle = sorted((math.hypot(dx, dz), dx, dz) for dx in range(-(view or 0), (view or 0) + 1)
+                             for dz in range(-(view or 0), (view or 0) + 1) if dx * dx + dz * dz <= (view or 0) ** 2)
         self.lock = threading.Lock()
         self.state = {"serverbound": "Handshake", "clientbound": "Handshake"}
         self.threshold = -1
@@ -146,6 +165,8 @@ class Watch:
             self.phase("join", t)
             return
         if way == "clientbound" and name == "respawn":
+            # Another dimension: the client lets every chunk it had go.
+            self.have.clear()
             self.phase("respawn", t)
             return
         if not self.phases:
@@ -156,6 +177,7 @@ class Watch:
                 p["chunks"] += 1
                 p["chunk_bytes"] += size
                 p["last_chunk"] = t
+                self.have.add(struct.unpack(">ii", rest[:8]))
             elif name == "chunk_batch_finished":
                 n, _ = varint(rest, 0)
                 p["batches"].append((t, n))
@@ -164,10 +186,38 @@ class Watch:
                 self.batches.append(t)
             elif name == "forget_level_chunk":
                 p["forgotten"] += 1
+                # A chunk's position as one long, its x in the low half.
+                packed = struct.unpack(">q", rest[:8])[0]
+                x = packed & 0xFFFFFFFF
+                self.have.discard((x - (1 << 32) if x >= 1 << 31 else x, packed >> 32))
+            elif name == "player_position":
+                # A teleport: its ID, then where to, which the server's are, not relative.
+                _, at = varint(rest, 0)
+                x, _, z = struct.unpack(">ddd", rest[at:at + 24])
+                self.moved(x, z, t)
         elif name == "chunk_batch_received" and len(rest) >= 4:
             rate = struct.unpack(">f", rest[:4])[0]
             p["answers"].append((t, rate))
             self.answers.append(t)
+        elif name in ("move_player_pos", "move_player_pos_rot"):
+            x, _, z = struct.unpack(">ddd", rest[:24])
+            self.moved(x, z, t)
+
+    def moved(self, x, z, t):
+        """The player is at `x`, `z`: four times a second, how much of the view about them the
+        client has."""
+        if not self.view or t - self.sampled < 0.25:
+            return
+        self.sampled = t
+        cx, cz = math.floor(x) >> 4, math.floor(z) >> 4
+        had = 0
+        nearest = None
+        for distance, dx, dz in self.circle:
+            if (cx + dx, cz + dz) in self.have:
+                had += 1
+            elif nearest is None:
+                nearest = distance
+        self.samples.append((t, x, z, had, nearest))
 
     def report(self):
         out = []
@@ -213,7 +263,36 @@ class Watch:
                 "batch_times": [[round(t - p["at"], 3), n] for t, n in p["batches"]],
                 "answer_times": [[round(t - p["at"], 3), round(r, 1)] for t, r in p["answers"]],
             })
+            out[-1].update(self.view_report(p, end))
         return out
+
+    def view_report(self, p, end):
+        """With a view, how much of it the client had in the phase, as the player moved."""
+        samples = [s for s in self.samples if p["at"] <= s[0] < end]
+        if not self.view or len(samples) < 2:
+            return {}
+        size = len(self.circle)
+        shares = [had / size * 100 for _, _, _, had, _ in samples]
+        missing = sorted(n for *_, n in samples if n is not None)
+        blocks = sum(math.hypot(b[1] - a[1], b[2] - a[2]) for a, b in zip(samples, samples[1:]))
+        seconds = samples[-1][0] - samples[0][0]
+        return {
+            "view_chunks": size,
+            "seconds": round(seconds, 1),
+            "blocks_a_second": round(blocks / seconds, 1) if seconds else 0,
+            "chunks_a_second": round(p["chunks"] / seconds, 1) if seconds else 0,
+            # The share of the view the client had, in percent: the mean and the least, and
+            # how many samples had all of it.
+            "had_of_view": [round(sum(shares) / len(shares), 1), round(min(shares), 1)],
+            "whole_view_samples": f"{len(samples) - len(missing)} of {len(samples)}",
+            # How far the nearest chunk missing was, in chunks, where one was: the median and the
+            # least.
+            "nearest_missing": [round(missing[len(missing) // 2], 1), round(missing[0], 1)] if missing else None,
+            # Each sample: when, from the phase's start, the share of the view, and the nearest
+            # missing.
+            "view_samples": [[round(t - p["at"], 2), round(had / size * 100, 1), n and round(n, 1)]
+                             for t, _, _, had, n in samples],
+        }
 
 
 class Way(threading.Thread):
@@ -315,11 +394,12 @@ class Dump:
 class Relay:
     """Listens on `port` and relays each connection to `server`, watching each."""
 
-    def __init__(self, port, server, mbit=None, ms=0, dump=None):
+    def __init__(self, port, server, mbit=None, ms=0, dump=None, view=None):
         self.ids = packet_ids()
         self.dump = Dump(dump) if dump else None
         self.server = server
         self.mbit, self.ms = mbit, ms
+        self.view = view
         self.watches = []
         self.listener = socket.create_server(("127.0.0.1", port))
         threading.Thread(target=self.accept, daemon=True).start()
@@ -333,10 +413,23 @@ class Relay:
             upstream = socket.create_connection(self.server)
             for s in (client, upstream):
                 s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            watch = Watch(self.ids, self.dump)
+            watch = Watch(self.ids, self.dump, self.view)
             self.watches.append(watch)
             Way(client, upstream, watch, "serverbound", None, self.ms).start()
             Way(upstream, client, watch, "clientbound", self.mbit, self.ms).start()
+
+    def mark(self, kind):
+        """Starts a phase named `kind` now on each connection that's playing."""
+        t = time.monotonic()
+        for w in self.watches:
+            with w.lock:
+                if w.phases:
+                    w.phase(kind, t)
+
+    def last_chunk(self):
+        """When the last chunk any connection was sent was handed on, or None."""
+        times = [p["last_chunk"] for w in self.watches for p in w.phases if p["last_chunk"] is not None]
+        return max(times) if times else None
 
     def report(self):
         """Each connection that got to play, its phases."""
@@ -356,9 +449,10 @@ def main():
     parser.add_argument("--ms", type=float, default=0, help="milliseconds each way is late")
     parser.add_argument("--out", help="a file the report's written to as JSON, as it's stopped")
     parser.add_argument("--dump", help="a file each chunk packet's written to, as it was before it was compressed")
+    parser.add_argument("--view", type=int, help="follow the player, and how much of the view of this many chunks about them the client has")
     args = parser.parse_args()
     host, port = args.server.rsplit(":", 1)
-    relay = Relay(args.listen, (host, int(port)), args.mbit, args.ms, args.dump)
+    relay = Relay(args.listen, (host, int(port)), args.mbit, args.ms, args.dump, args.view)
     print(f"relaying 127.0.0.1:{args.listen} to {args.server}; Ctrl+C to stop and report")
     try:
         while True:

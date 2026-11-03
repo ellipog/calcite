@@ -2,7 +2,12 @@
 seed and packs, a warm-up of a 1,536-block radius about the origin, then a measured 3,072-block
 radius about 1,000,000, 1,000,000, 148,225 chunks, all in one launch on a fresh world.
 
-    py -I bench/terralith.py [--threads 1,8,16,32] [--radius 3072] [--record]
+    py -I bench/terralith.py [--threads 1,8,16,32] [--radius 3072] [--no-packs] [--record]
+
+With --no-packs, the same runs have no packs, so they time vanilla's own worldgen, recorded as
+bench/results/worldgen-<platform>.json. Each run also gives a steady rate: the chunks a second
+from the progress line at 10% done to the one at 90%, without the start, as the generator's
+pipeline fills, or the last chunks, which fewer workers share.
 
 The packs are fetched from Modrinth into build/bench/packs/ and checked against their SHA-512s,
 since they're Stardust Labs' and aren't ours to commit. Each thread count runs the release
@@ -62,6 +67,7 @@ C2ME = {
     },
 }
 DONE = re.compile(r"Pregen \S+ done: (\d+) chunks in ")
+PROGRESS = re.compile(r"Pregen \S+: (\d+) of (\d+) chunks")
 # The generator writes its stage times when it's had no work for 5 seconds (`--stage-times`).
 SETTLE = 6.5
 
@@ -116,6 +122,8 @@ def one_run(server, packs, threads, measured):
     folder = BUILD / "terralith"
     prepare(folder, packs, threads)
     lines = []
+    # Each progress line's time and chunks done, as it came.
+    progress = []
     ready = threading.Event()
     finished = threading.Event()
     stages_file = folder / "stage-times.txt"
@@ -127,6 +135,8 @@ def one_run(server, packs, threads, measured):
             lines.append(line.rstrip("\n"))
             if "Done (" in line:
                 ready.set()
+            if m := PROGRESS.search(line):
+                progress.append((time.perf_counter(), int(m.group(1)), int(m.group(2))))
             if DONE.search(line):
                 finished.set()
 
@@ -141,6 +151,7 @@ def one_run(server, packs, threads, measured):
     def pregen(area):
         finished.clear()
         first = len(lines)
+        seen = len(progress)
         began = time.perf_counter()
         say(f"pregen center {area['x']} {area['z']}", f"pregen radius {area['radius']}", "pregen start")
         if not finished.wait(4 * 3600):
@@ -148,10 +159,16 @@ def one_run(server, packs, threads, measured):
             sys.exit("terralith: the pregeneration didn't finish:\n" + "\n".join(lines[-20:]))
         took = time.perf_counter() - began
         done = next(DONE.search(line) for line in lines[first:] if DONE.search(line))
+        # The steady rate: from the first progress line at 10% done or more to the last at 90% or
+        # less, leaving out the start, as the first starts and biomes fill the generator's
+        # pipeline, and the last few chunks, which fewer workers share.
+        lines_here = progress[seen:]
+        middle = [(t, n) for t, n, total in lines_here if total * 0.1 <= n <= total * 0.9]
+        steady = (middle[-1][1] - middle[0][1]) / (middle[-1][0] - middle[0][0]) if len(middle) >= 2 else None
         # The workers' seconds in each stage, once the generator has settled and written them.
         time.sleep(SETTLE)
         return {"chunks": int(done.group(1)), "seconds": took, "chunks_per_second": int(done.group(1)) / took,
-                "stages_total": stage_times(stages_file)}
+                "steady_chunks_per_second": steady, "stages_total": stage_times(stages_file)}
 
     if not ready.wait(300):
         p.kill()
@@ -177,8 +194,10 @@ def one_run(server, packs, threads, measured):
     problems = [line for line in problems if "OFFLINE" not in line and "online-mode" not in line
                 and "no attempt to authenticate" not in line and "hackers" not in line]
     result.update(threads=threads, warmup=warm, cpu_seconds=cpu, peak_memory_mib=peak / 2**20, problems=problems[:50])
+    steady = result["steady_chunks_per_second"]
     print(f"  {threads} threads: {result['chunks']} chunks in {result['seconds']:.1f} s, "
-          f"{result['chunks_per_second']:.1f} a second, peak {result['peak_memory_mib']:.0f} MiB"
+          f"{result['chunks_per_second']:.1f} a second" + (f", {steady:.1f} steady" if steady else "")
+          + f", peak {result['peak_memory_mib']:.0f} MiB"
           + (f", {len(problems)} warnings" if problems else ""), flush=True)
     if stages := result["stage_seconds"]:
         total = sum(stages.values()) or 1.0
@@ -191,34 +210,46 @@ def main():
     parser.add_argument("--threads", default="1,8,16,32", help="the thread counts, comma-separated")
     parser.add_argument("--radius", type=int, default=MEASURED["radius"], help="the measured run's radius in blocks")
     parser.add_argument("--record", action="store_true", help="write bench/results/terralith-<platform>.json")
+    parser.add_argument("--no-packs", action="store_true",
+                        help="vanilla's own worldgen, the same runs without the packs, recorded as worldgen-<platform>.json")
     args = parser.parse_args()
     measured = dict(MEASURED, radius=args.radius)
     if args.record and measured != MEASURED:
         sys.exit(f"terralith: only the measured area {MEASURED} is recorded")
 
-    packs = fetch()
+    packs = [] if args.no_packs else fetch()
     calx = find_calx()
     server = build(calx)
     runs = [one_run(server, packs, int(t), measured) for t in args.threads.split(",")]
 
-    print(f"\nTerralith + Terratonic, seed {SEED}, {measured['radius']}-block radius about "
+    what = "Vanilla's worldgen" if args.no_packs else "Terralith + Terratonic"
+    print(f"\n{what}, seed {SEED}, {measured['radius']}-block radius about "
           f"{measured['x']}, {measured['z']}, chunks a second:")
-    print("| Threads | Calcite | C2ME | Paper | Vanilla |")
-    print("| --- | --- | --- | --- | --- |")
-    for r in runs:
-        t = r["threads"]
-        theirs = [f"{C2ME['chunks_per_second'][k][t - 1]:.1f}" if t <= 16 else "" for k in ("c2me", "paper", "vanilla")]
-        print(f"| {t} | {r['chunks_per_second']:.1f} | " + " | ".join(theirs) + " |")
-    print("\nC2ME's, Paper's and vanilla's are C2ME's published numbers, on their machine.")
+    if args.no_packs:
+        print("| Threads | Calcite | Steady |")
+        print("| --- | --- | --- |")
+        for r in runs:
+            steady = r["steady_chunks_per_second"]
+            print(f"| {r['threads']} | {r['chunks_per_second']:.1f} | {f'{steady:.1f}' if steady else ''} |")
+    else:
+        print("| Threads | Calcite | C2ME | Paper | Vanilla |")
+        print("| --- | --- | --- | --- | --- |")
+        for r in runs:
+            t = r["threads"]
+            theirs = [f"{C2ME['chunks_per_second'][k][t - 1]:.1f}" if t <= 16 else "" for k in ("c2me", "paper", "vanilla")]
+            print(f"| {t} | {r['chunks_per_second']:.1f} | " + " | ".join(theirs) + " |")
+        print("\nC2ME's, Paper's and vanilla's are C2ME's published numbers, on their machine.")
 
     if args.record:
         result = {
             "recorded": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "commit": commit(CALCITE), "calx": {"version": output([calx, "version"]), "commit": commit(Path(calx).parents[3])},
-            "machine": machine(), "packs": [{k: pin[k] for k in ("name", "version", "sha512")} for pin in PINS],
-            "seed": SEED, "warmup": WARMUP, "measured": measured, "runs": runs, "c2me": C2ME,
+            "machine": machine(), "packs": [{k: pin[k] for k in ("name", "version", "sha512")} for pin in PINS if packs],
+            "seed": SEED, "warmup": WARMUP, "measured": measured, "runs": runs,
         }
-        out = HERE / "results" / f"terralith-{PLATFORM}.json"
+        if not args.no_packs:
+            result["c2me"] = C2ME
+        out = HERE / "results" / f"{'worldgen' if args.no_packs else 'terralith'}-{PLATFORM}.json"
         out.parent.mkdir(exist_ok=True)
         out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8", newline="\n")
         print(f"\nterralith: wrote {out}")

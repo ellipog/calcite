@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import statistics
 import subprocess
 import sys
@@ -52,10 +53,17 @@ def build(calx):
 
 
 def prepare(world):
+    """The server's folder, with a new flat level each time: the scenario's world is flat, as it
+    was when it was set (P4.10), so it times the tick loop and the network, not worldgen, which the
+    worldgen benchmark and the real client's flights time. The boot cache beside it stays."""
     world.mkdir(parents=True, exist_ok=True)
+    level = world / "world"
+    if level.exists():
+        shutil.rmtree(level)
     (world / "server.properties").write_text(
         f"online-mode=false\nwhite-list=false\nserver-ip=127.0.0.1\nserver-port={PORT}\nmax-players=1000\n"
-        f"view-distance={VIEW}\nsimulation-distance={VIEW}\nmotd=Calcite bot benchmark\n", encoding="utf-8")
+        f"view-distance={VIEW}\nsimulation-distance={VIEW}\nlevel-type=minecraft:flat\nmotd=Calcite bot benchmark\n",
+        encoding="utf-8")
     (world / "calcite.properties").write_text("console-dashboard=off\nrecord-inputs=false\n", encoding="utf-8")
 
 

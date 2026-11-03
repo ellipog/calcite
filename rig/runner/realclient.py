@@ -1,6 +1,6 @@
-"""A real client's join: Mojang's own 26.3 client joins Calcite, walks, jumps and chats.
+"""A real client's join: Mojang's own 26.3 client joins Calcite, walks, jumps and chats, or flies.
 
-    py -I rig/runner/realclient.py [--online NAME] [--server PATH] [--world PATH] [--view N] [--message TEXT] [--dimension ID] [--watch [--mbit N] [--ms N] [--dump FILE]] [--set KEY=VALUE]... [--command TEXT]... [--keep-open SECONDS]
+    py -I rig/runner/realclient.py [--online NAME] [--server PATH] [--world PATH] [--seed N] [--view N] [--message TEXT] [--dimension ID] [--watch [--mbit N] [--ms N] [--dump FILE]] [--fly SPEED [--fly-seconds N]] [--set KEY=VALUE]... [--command TEXT]... [--keep-open SECONDS]
 
 The protocol suites and the tests play the client's side with Calcite's own code, so this is
 the one check where the other end is the game itself. Calcite runs from its release build,
@@ -52,6 +52,23 @@ milliseconds late, as a home link would. --dump FILE writes each chunk packet th
 sent to FILE, as it was before it was compressed. The relay reads frames only in offline mode;
 online, they're encrypted, and it only passes them on.
 
+With --fly SPEED, the client flies instead of walking and chatting, to see whether the chunks keep
+up with a player who outruns them (CAL-94). It joins through the relay, as with --watch, as an op
+from ops.json, and once its join's chunks have stopped coming for 3 seconds, and the server's
+memory has been read 15 seconds later, the keys type
+`/calcite flyspeed SPEED` in its chat, SPEED times vanilla's flying speed, double-jump to fly,
+climb, and hold W for --fly-seconds, 30 unless given. Then they let go, and the chunks have up to
+60 seconds to catch up. The relay follows the player as the phases `flight` and `after`, and
+reports how fast they went, how many chunks a second they were sent, how much of the circle of
+their view about them the client had, and how far the nearest chunk it didn't was. The server's
+ticks during the flight come from its `--tick-times` file. --seed N gives a new world that seed,
+so flights over it can be compared.
+
+The server's memory, its working set on Windows and resident set on Linux, is sampled as it
+runs, and reported as it was before the client joined (with --fly, 15 seconds after the server
+was ready), as a still player's, 15 seconds after the join's chunks stopped coming (with --watch
+or --fly; without, once the keys are done), and the most it had. With --fly, the flight's numbers are also written to flight.json beside the logs.
+
 It passes if the server logged the join and the message, with --dimension that it moved the
 player and the screenshot was taken, the client logged the message as it came back, nobody was disconnected before the client was stopped, and the client logged no error
 but the ones on its download threads, which, with no account, Mojang's services and Realms
@@ -87,6 +104,9 @@ PORT = 25600
 OUT = CALCITE / "build" / "rig" / "realclient"
 EXE = ".exe" if os.name == "nt" else ""
 OS = {"nt": "windows", "darwin": "osx"}.get(os.name, "linux")
+# How long after the join's chunks stop the server's memory is read, as a still player's: past
+# the 5 seconds after which the server lets go of what making them kept (D226, D228, D254).
+STILL_WAIT = 15
 
 
 def launcher_roots():
@@ -298,14 +318,19 @@ class Process:
         return None
 
 
-def prepare(server_dir, game, online, world, view, settings=()):
+def prepare(server_dir, game, online, world, view, settings=(), seed=None, op=None):
     for folder in (server_dir, game / "screenshots"):
         if folder.exists():
             shutil.rmtree(folder)
     server_dir.mkdir(parents=True)
     (server_dir / "server.properties").write_text(
         f"online-mode={str(online).lower()}\nserver-ip=127.0.0.1\nserver-port={PORT}\ngamemode=creative\n"
-        f"white-list=false\nview-distance={view}\nmotd=Calcite and a real client\n", encoding="utf-8")
+        f"white-list=false\nview-distance={view}\nmotd=Calcite and a real client\n"
+        + (f"level-seed={seed}\n" if seed is not None else ""), encoding="utf-8")
+    if op:
+        # The player as an op, so they may use `calcite flyspeed`.
+        (server_dir / "ops.json").write_text(json.dumps([{"uuid": str(uuid.UUID(op.uuid)), "name": op.name, "level": 4,
+                                                          "bypassesPlayerLimit": False}]), encoding="utf-8")
     (server_dir / "calcite.properties").write_text("console-dashboard=off\n" + "".join(f"{s}\n" for s in settings),
                                                     encoding="utf-8")
     if world:
@@ -327,6 +352,107 @@ def send_keys(client, message, shot=False):
     said = (keys.stdout.strip() or keys.stderr.strip())
     print(f"keys: {said}")
     return keys.returncode == 0
+
+
+def fly(client, relay, speed, seconds):
+    """The keys' flight: the relay's phase `flight` starts as the player starts forward, and
+    `after` as they let go. Whether it flew, and when it started and stopped."""
+    argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(HERE / "realclient_keys.ps1"),
+            "-ProcessId", str(client.p.pid), "-Fly", "-Speed", speed, "-Seconds", str(seconds)]
+    keys = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    said, times = [], {}
+    for line in keys.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        said.append(line)
+        if line in ("flying", "stopped"):
+            relay.mark("flight" if line == "flying" else "after")
+            times[line] = time.monotonic()
+    keys.wait(30)
+    print(f"keys: {'; '.join(said)}")
+    return keys.returncode == 0 and "stopped" in times, times
+
+
+def settle(relay, quiet, timeout):
+    """Waits until no chunk has been sent for `quiet` seconds, for at most `timeout`; whether
+    they stopped."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        last = relay.last_chunk()
+        if last is not None and time.monotonic() - last > quiet:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+class Memory:
+    """The server's memory as it runs, sampled twice a second: its working set on Windows, its
+    resident set on Linux, in bytes."""
+
+    def __init__(self, p):
+        self.p = p
+        self.samples = []
+        threading.Thread(target=self._sample, daemon=True).start()
+
+    def now(self):
+        return self.windows()[0] if os.name == "nt" else self.linux("VmRSS:")
+
+    def peak(self):
+        """The most it had, as the system kept it, while it's still running."""
+        return self.windows()[1] if os.name == "nt" else self.linux("VmHWM:")
+
+    def linux(self, key):
+        try:
+            status = Path(f"/proc/{self.p.pid}/status").read_text()
+        except OSError:
+            return None
+        return next((int(line.split()[1]) * 1024 for line in status.splitlines() if line.startswith(key)), None)
+
+    def windows(self):
+        import ctypes
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t)] + \
+                       [(f"rest{i}", ctypes.c_size_t) for i in range(6)]
+
+        counters = Counters()
+        counters.cb = ctypes.sizeof(Counters)
+        if not ctypes.windll.psapi.GetProcessMemoryInfo(wintypes.HANDLE(int(self.p._handle)), ctypes.byref(counters),
+                                                        counters.cb):
+            return None, None
+        return counters.WorkingSetSize, counters.PeakWorkingSetSize
+
+    def _sample(self):
+        while self.p.poll() is None:
+            m = self.now()
+            if m:
+                self.samples.append((time.monotonic(), m))
+            time.sleep(0.5)
+
+
+def mib(n):
+    return round(n / 2**20, 1) if n else None
+
+
+def ticks_between(path, began, start, end):
+    """The server's tick times between `start` and `end`, from its --tick-times file, whose times
+    are from the server's start, a moment after `began`: the mean, the 99th percentile and the
+    most, in milliseconds."""
+    if not path.is_file():
+        return None
+    busy = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        at, work = line.split()
+        if start <= began + int(at) / 1e9 < end:
+            busy.append(int(work) / 1e6)
+    if not busy:
+        return None
+    busy.sort()
+    return {"ticks": len(busy), "mspt_mean": round(sum(busy) / len(busy), 3),
+            "mspt_p99": round(busy[min(len(busy) - 1, len(busy) * 99 // 100)], 3), "mspt_max": round(busy[-1], 3)}
 
 
 def stop(server, client):
@@ -358,10 +484,23 @@ def main():
     parser.add_argument("--command", action="append", default=[], metavar="TEXT",
                         help="a console command typed once the server's ready, before the client starts")
     parser.add_argument("--keep-open", type=float, default=0, help="seconds to leave the client in the game at the end")
+    parser.add_argument("--fly", metavar="SPEED", help="fly forward at SPEED times vanilla's flying speed instead of walking and chatting")
+    parser.add_argument("--fly-seconds", type=int, default=30, help="with --fly, how long the client flies forward")
+    parser.add_argument("--seed", type=int, help="the new world's seed")
     args = parser.parse_args()
     dimension = args.dimension if not args.dimension or ":" in args.dimension else f"minecraft:{args.dimension}"
     if not args.message.strip() or not all(c in "abcdefghijklmnopqrstuvwxyz " for c in args.message):
         sys.exit("the message can only have small letters and spaces")
+    if args.fly:
+        try:
+            speed = float(args.fly)
+        except ValueError:
+            speed = -1
+        if not 0 < speed <= 1000:
+            sys.exit("--fly takes a speed from above 0 to 1000 times vanilla's")
+        if args.online or os.name != "nt" or dimension:
+            sys.exit("--fly flies with the keys, on Windows, offline, so the relay can follow the player, and without --dimension")
+        args.watch = True
     server_exe = Path(args.server)
     if not server_exe.is_file():
         sys.exit(f"no {server_exe}: build Calcite's release build first (src/README.md)")
@@ -374,7 +513,7 @@ def main():
     relay = None
     if args.watch:
         from chunkwatch import Relay
-        relay = Relay(PORT + 1, ("127.0.0.1", PORT), args.mbit, args.ms, args.dump)
+        relay = Relay(PORT + 1, ("127.0.0.1", PORT), args.mbit, args.ms, args.dump, args.view)
         link = f"{args.mbit} Mbit/s" if args.mbit else "no cap"
         print(f"watch: the client joins through a relay on {PORT + 1}, {link}, {args.ms:g} ms each way")
     command = client_command(spec, java_home, game, player, PORT + 1 if relay else PORT)
@@ -382,9 +521,13 @@ def main():
         sys.exit(f"no level.dat in {args.world}")
     if not 2 <= args.view <= 32:
         sys.exit("the view distance is from 2 to 32")
-    prepare(server_dir, game, bool(args.online), args.world, args.view, args.set)
+    prepare(server_dir, game, bool(args.online), args.world, args.view, args.set, args.seed,
+            player if args.fly else None)
 
-    server = Process([str(server_exe)], server_dir, OUT / "server.log")
+    ticks_path = server_dir / "tick-times.txt"
+    began = time.monotonic()
+    server = Process([str(server_exe), "--tick-times", str(ticks_path)], server_dir, OUT / "server.log")
+    memory = Memory(server.p)
     done = server.wait_for("Done (", 60)
     if not done:
         sys.exit("the server didn't start:\n" + "\n".join(server.lines[-20:]))
@@ -393,12 +536,24 @@ def main():
         server.p.stdin.write(f"{line}\n")
         server.p.stdin.flush()
         print(f"console: {line}")
+    if args.fly:
+        # Idle as a server with nobody on it is: past what finding the spawn kept.
+        time.sleep(STILL_WAIT)
+    idle = memory.now()
     client = Process(command, game, OUT / "client.log")
     keyed = False
     moved = shot = None
+    still = peak = None
+    flew, flight_times = False, {}
     try:
         joined = server.wait_for(f"{player.name} joined the game", 180)
-        if joined:
+        if joined and args.fly:
+            settle(relay, 3, 120)
+            time.sleep(STILL_WAIT)
+            still = memory.now()
+            flew, flight_times = fly(client, relay, args.fly, args.fly_seconds)
+            settle(relay, 3, 60)
+        elif joined:
             time.sleep(4)
             keyed = send_keys(client, args.message)
             if keyed:
@@ -410,14 +565,27 @@ def main():
                 moved = server.wait_for(f"Moved {player.name} to {dimension}", 10)
                 time.sleep(8)
                 shot = keyed and send_keys(client, args.message, shot=True) and "sent"
+            if relay:
+                settle(relay, 3, 60)
+                time.sleep(STILL_WAIT)
+            still = memory.now()
+        if joined:
             time.sleep(args.keep_open)
         gone_early = server.find("lost connection") or client.find("Disconnected") or client.p.poll() is not None
+        peak = memory.peak()
     finally:
         stop(server, client)
+    print(f"memory: {mib(idle)} MiB before the client joined, {mib(still)} MiB with it still, "
+          f"{STILL_WAIT if relay else 0} s after its chunks stopped coming, {mib(peak)} MiB at the most")
 
     # Each check: what it is, and the line that shows it, or None.
     checks = [("the server logged the join", server.find(f"{player.name}[/127.0.0.1:"))]
-    if os.name == "nt":
+    if args.fly:
+        checks += [
+            ("the client was told its flying speed", client.find("Set own flying speed to")),
+            ("the keys flew the client forward and let go", flew and "-"),
+        ]
+    elif os.name == "nt":
         said = server.find(f"<{player.name}> {args.message}")
         back = client.find(f"[CHAT] <{player.name}> {args.message}")
         checks += [
@@ -456,7 +624,28 @@ def main():
                       f"{p['batches']} batches, last sent at {p['last_chunk_s']} s, the client had half at {p['client_had_half_s']} s, "
                       f"90% at {p['client_had_90_s']} s, 95% at {p['client_had_95_s']} s, all at {p['client_had_all_s']} s, "
                       f"asked {p['asked_a_tick']} a tick, {p['forgotten']} forgotten, waited for the link {p['link_wait_ms']} ms")
+                if "had_of_view" in p:
+                    print(f"watch: {p['phase']}: {p['seconds']} s at {p['blocks_a_second']} blocks a second, sent "
+                          f"{p['chunks_a_second']} chunks a second; the client had {p['had_of_view'][0]}% of the "
+                          f"{p['view_chunks']} chunks of its view on average, {p['had_of_view'][1]}% at the least, all of "
+                          f"them in {p['whole_view_samples']} samples; the nearest it didn't was {p['nearest_missing']} chunks "
+                          f"away, the median and the least")
         print(f"watch: {(OUT / 'watch.json').relative_to(CALCITE)}")
+        if args.fly:
+            phases = {p["phase"]: p for connection in report for p in connection}
+            ticks = None
+            if "flying" in flight_times and "stopped" in flight_times:
+                ticks = ticks_between(ticks_path, began, flight_times["flying"], flight_times["stopped"])
+            print(f"flight: the server's ticks while the client flew: {ticks}")
+            keep = ("seconds", "blocks_a_second", "chunks", "chunks_a_second", "had_of_view", "whole_view_samples",
+                    "nearest_missing", "client_had_all_s", "forgotten", "view_samples")
+            flight = {"speed": float(args.fly), "view": args.view, "seed": args.seed, "flight_seconds": args.fly_seconds,
+                      "memory_mib": {"idle": mib(idle), "joined": mib(still), "peak": mib(peak)}, "ticks": ticks,
+                      "join": {k: phases.get("join", {}).get(k) for k in ("chunks", "client_had_95_s", "client_had_all_s")},
+                      "flight": {k: phases.get("flight", {}).get(k) for k in keep},
+                      "after": {k: phases.get("after", {}).get(k) for k in keep}}
+            (OUT / "flight.json").write_text(json.dumps(flight, indent=1), encoding="utf-8")
+            print(f"flight: {(OUT / 'flight.json').relative_to(CALCITE)}")
     sys.exit(0 if all(line for _, line in checks) else 1)
 
 

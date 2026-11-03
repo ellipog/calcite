@@ -22,6 +22,7 @@ On Linux, use `python3` for `py`. The runner builds the server and the bots with
 ### The scenario
 
 - **The server** is the release build, in offline mode with the whitelist off, with vanilla's compression threshold of 256, and view and simulation distance 10, so a player has 473 chunks in view. `max-players` is 1000.
+- **The world is flat**, `level-type=minecraft:flat`, and new for each run, as it was when the scenario was set, before Calcite generated terrain. So this times the tick loop and the network with 100 players, not worldgen; [the worldgen benchmark](#worldgen-benchmark) and [the real client's flights](../rig/README.md#a-real-client) time chunks being made and sent.
 - **100 bots join**, 20 a second, over TCP on 127.0.0.1. Each does what a client must to stay: logs in, finishes configuration, accepts its teleport, acknowledges each chunk batch, answers keep-alives and ends a tick every 50 ms.
 - **Once a bot has every chunk of its view**, it walks at walking speed, 0.21585 blocks a tick, on a heading of its own: its index times the golden angle. So the players spread out, and the server sends each a new row of chunks every few seconds, the whole run.
 - **Each bot chats every 10 seconds**, starting at a second of its own, and every message goes to all 100.
@@ -76,6 +77,7 @@ The runs are noisy, from the system and the other threads: one run's mean MSPT i
 py -I bench/terralith.py                      # 1, 8, 16 and 32 workers, the full run, not recorded
 py -I bench/terralith.py --record             # the same, written to bench/results/terralith-<platform>.json
 py -I bench/terralith.py --threads 8 --radius 512     # a quick look, not recorded
+py -I bench/terralith.py --no-packs --record  # vanilla's own worldgen, the same runs, to bench/results/worldgen-<platform>.json
 ```
 
 [C2ME](https://modrinth.com/mod/c2me-fabric) publishes how fast it generates a world with [Terralith](https://modrinth.com/datapack/terralith) and [Terratonic](https://modrinth.com/datapack/terratonic), beside Paper's and vanilla's, from 1 to 16 threads. [`terralith.py`](terralith.py) runs the same benchmark on Calcite (CAL-92), set up as theirs is:
@@ -84,7 +86,9 @@ py -I bench/terralith.py --threads 8 --radius 512     # a quick look, not record
 - **The seed** is C2ME's, 114862964781274189.
 - **One launch on a fresh world**: a warm-up of a 1,536-block radius about the origin, then the measured run, a 3,072-block radius about 1,000,000, 1,000,000, 148,225 chunks, each with the server's own `pregen` command. The release server runs in `build/bench/<platform>/terralith/` with `chunk-workers` set to the thread count.
 
-It reports the measured run's chunks a second, the CPU time and peak memory the system gives for the whole launch, any warning the server logged, and how the workers' time split between the generator's stages: the strongholds' rings, the structures' starts, the biomes, the terrain, the features, and finishing a chunk as the server's, with its sky's light sources and its bytes. The stage times come from the server: `--stage-times FILE` keeps the seconds its workers have spent on each kind of job in the file as they go ([D287](../docs/decisions.md)). The whole run is over an hour, most of it at 1 thread.
+It reports the measured run's chunks a second, overall and steady, the CPU time and peak memory the system gives for the whole launch, any warning the server logged, and how the workers' time split between the generator's stages: the strongholds' rings, the structures' starts, the biomes, the terrain, the features, and finishing a chunk as the server's, with its sky's light sources and its bytes. The stage times come from the server: `--stage-times FILE` keeps the seconds its workers have spent on each kind of job in the file as they go ([D287](../docs/decisions.md)). The steady rate is the chunks a second from the `pregen` progress line at 10% done to the one at 90%: it leaves out the start, while the first starts and biomes fill the generator's pipeline, and the last chunks, which fewer workers share. The whole run is over an hour, most of it at 1 thread.
+
+With `--no-packs`, the same runs have no packs, so they time vanilla's own worldgen, on the same seed and areas.
 
 C2ME's numbers are from their machine, a Xeon Platinum 8558P held to 3.2 GHz, on Minecraft 26.2 with Terralith 2.6.4 and Terratonic 3.0.27, so only the curves compare, not the numbers themselves. The script prints its table beside theirs, and `--record` keeps theirs in the results with ours.
 
