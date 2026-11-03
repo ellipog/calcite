@@ -78,6 +78,7 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `agent/Levels.java` | What it does as each level's made: its random seeded, the entity counter set back |
 | `agent/Tape.java` | The RNG tape: each draw of a level's random, with where it was drawn |
 | `WorldCheck.java` | Vanilla reading a world it saved and the same world saved by Calcite, with `RegionFile`, `NbtIo` and Gson, and comparing them file by file and chunk by chunk, run by `rig/runner/roundtrip.py` (`G5.2`) |
+| `EnvironmentProbe.java` | `environment`: an `EnvironmentAttributeSystem` built as a level's but for the biomes, from a dimension type or a data pack's map and timelines, with every clock at the record's ticks and the record's rain and thunder, read by `getDimensionValue` |
 | `RegistriesProbe.java` | `registries`: the vanilla data pack's registries and tags, loaded once as `WorldLoader.load` loads them |
 | `NoiseProbe.java` | `noise`: `PerlinNoise`, `SmearedPerlinNoise`, `SimplexNoise`, the stacks `NormalNoise` and `BlendedNoise.createFbm` make, sampled with `get` and `addToVolume` |
 

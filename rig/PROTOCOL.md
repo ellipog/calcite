@@ -790,6 +790,14 @@ The output is `{"snbt": s}`, `s` what `saveCustomOnly` writes, as `CompoundTag.t
 
 Calcite answers `unimplemented` for what it doesn't load yet: an item with components outside a book, a stack of more than one where its stack size decides, a jigsaw with no joint, whose joint is its facing's, and the other parts named in D286.
 
+### `environment` (v1)
+
+The environment attributes' dimension values, as a level's `EnvironmentAttributeSystem` gives them through `getDimensionValue`, at many clocks and weathers.
+
+Input `{"type": id, "weather": w, "read": [attributes]}` or `{"attributes_map": map, "timelines": [timelines], "weather": w, "read": [attributes]}`. The system is built as `addDefaultLayers` builds a level's, but for the biomes' layer: first a constant layer of attributes, then a layer for each timeline in order, then the weather's layers, from `WeatherAttributes.addBuiltinLayers`, if `w` is true. With `type`, vanilla's dimension type of that ID gives its `attributes()` and its `timelines()` in order. Otherwise `map` is a map of attributes as a dimension type's `attributes` are written, read with `EnvironmentAttributeMap.CODEC`, and each of `timelines` a timeline as its file is written, read with `Timeline.DIRECT_CODEC`; either may be left out, for none. `read` names float or boolean attributes by ID.
+
+The one blob is 16-byte records: an `i64`, the ticks every clock has run, then `f32`s for the rain and thunder levels the weather's layers get, as `getRainLevel(1.0F)` and `getThunderLevel(1.0F)` would give them. For each record the system's tick cache is cleared, as `ServerLevel.tick` clears it, then each attribute in `read` is written: a float as `Float.floatToIntBits` gives it, every NaN as one, a boolean as a byte, 1 for true. The output is `{}`.
+
 ## Adding a probe
 
 1. Add its section here, with version 1.

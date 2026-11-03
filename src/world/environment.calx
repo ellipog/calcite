@@ -1,0 +1,847 @@
+/// The environment attributes a level reads of itself, as vanilla's `EnvironmentAttributeSystem`
+/// gives their dimension values (P6.1, D313).
+///
+/// Each attribute starts at its default. Then it's changed by, in this order:
+///
+/// 1. what the dimension's type sets;
+/// 2. each of the type's timelines, in their order, by the keyframes of its track, at the ticks
+///    of the clock the timeline goes by;
+/// 3. the rain and the thunder, where the level can have weather.
+///
+/// That's the order `addDefaultLayers` adds them in. The biomes' layer, between the type's and the
+/// timelines', is left out, as `getDimensionValue` leaves it out: only a place has a biome. A
+/// float that ends outside its attribute's range is clamped to it. What each attribute is stays
+/// the same for the rest of the tick once it's asked for, as `ValueSampler` keeps it, until
+/// `invalidate` starts the next.
+///
+/// Calcite evaluates the float and boolean attributes. The others are colors, angles, sounds and
+/// the like, which the client works out from the same data.
+module world.environment
+
+import math.mth.{SinTable}
+import nbt.tag.{Tag}
+import resources.identifier.{Identifier}
+import std.java.math.{pow, sin}
+import world.clocks.{Clocks}
+
+/// An attribute's kind, of the two Calcite evaluates.
+pub enum Kind {
+    Float
+    Boolean
+}
+
+/// An attribute's value, or what a modifier takes: a float, with the alpha that `alpha_blend`
+/// blends by, or a boolean.
+pub struct Value {
+    pub number: f32 = 0.0f32
+    pub alpha: f32 = 1.0f32
+    pub flag: bool = false
+}
+
+// What a layer does to the value so far: `AttributeModifier`'s operations on floats and
+// booleans.
+enum Op {
+    Override
+    AlphaBlend
+    Add
+    Subtract
+    Multiply
+    Minimum
+    Maximum
+    And
+    Nand
+    Or
+    Nor
+    Xor
+    Xnor
+}
+
+// `CubicBezier.CubicCurve`: `((a t + b) t + c) t`, from a curve's two inner controls.
+struct Curve {
+    a: f32
+    b: f32
+    c: f32
+}
+
+// How a segment of a track eases from one keyframe to the next, `EasingType`.
+enum Ease {
+    Constant
+    Linear
+    InBack
+    InBounce
+    InCirc
+    InCubic
+    InElastic
+    InExpo
+    InQuad
+    InQuart
+    InQuint
+    InSine
+    InOutBack
+    InOutBounce
+    InOutCirc
+    InOutCubic
+    InOutElastic
+    InOutExpo
+    InOutQuad
+    InOutQuart
+    InOutQuint
+    InOutSine
+    OutBack
+    OutBounce
+    OutCirc
+    OutCubic
+    OutElastic
+    OutExpo
+    OutQuad
+    OutQuart
+    OutQuint
+    OutSine
+    Bezier { x: Curve, y: Curve }
+}
+
+// From one keyframe to the next, `KeyframeTrackSampler.Segment`.
+struct Segment {
+    ease: Ease
+    from_ticks: i32
+    from: Value
+    to_ticks: i32
+    to: Value
+}
+
+// A timeline's track of one attribute, `AttributeTrackSampler`: its modifier, the clock it goes
+// by, by its ID in `world_clock`, the timeline's period, and its segments.
+struct Track {
+    op: Op
+    clock: i32?
+    period: i32?
+    segments: List<Segment>
+}
+
+// What the rain or the thunder does to an attribute, from `WeatherAttributes.RAIN` and `THUNDER`.
+struct Change {
+    op: Op
+    argument: Value
+}
+
+// One step of an attribute's value: the dimension type's, a timeline's, or the weather's.
+enum Layer {
+    Constant { op: Op, argument: Value }
+    Timed(Track)
+    Weather { rain: Change?, thunder: Change? }
+}
+
+// One attribute's layers, `EnvironmentAttributeSystem.ValueSampler`, and what it was this tick.
+struct Sampler {
+    kind: Kind
+    base: Value
+    range: bool
+    min: f32
+    max: f32
+    layers: List<Layer>
+    cached: Value? = none
+}
+
+/// A level's environment attributes.
+pub struct Environment {
+    samplers: List<Sampler>
+    // `Mth`'s sine table, for the sine easings, if a track has one.
+    table: SinTable? = none
+}
+
+// Each float and boolean attribute: its name, whether it's a float, its default, and its range,
+// where it has one, as `EnvironmentAttributes` registers them.
+fn catalog() -> List<(String, Kind, f32, bool, f32, f32)> {
+    let inf = f32.INFINITY
+    let f = Kind.Float
+    let b = Kind.Boolean
+    return [
+        ("minecraft:visual/fog_start_distance", f, 0.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:visual/fog_end_distance", f, 1024.0f32, true, 0.0f32, inf),
+        ("minecraft:visual/sky_fog_end_distance", f, 512.0f32, true, 0.0f32, inf),
+        ("minecraft:visual/cloud_fog_end_distance", f, 2048.0f32, true, 0.0f32, inf),
+        ("minecraft:visual/water_fog_start_distance", f, -8.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:visual/water_fog_end_distance", f, 96.0f32, true, 0.0f32, inf),
+        ("minecraft:visual/cloud_height", f, 192.33f32, false, 0.0f32, 0.0f32),
+        ("minecraft:visual/star_brightness", f, 0.0f32, true, 0.0f32, 1.0f32),
+        ("minecraft:visual/sky_light_factor", f, 1.0f32, true, 0.0f32, 1.0f32),
+        ("minecraft:audio/music_volume", f, 1.0f32, true, 0.0f32, 1.0f32),
+        ("minecraft:audio/firefly_bush_sounds", b, 0.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/sky_light_level", f, 15.0f32, true, 0.0f32, 15.0f32),
+        ("minecraft:gameplay/can_start_raid", b, 1.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/water_evaporates", b, 0.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/respawn_anchor_works", b, 0.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/nether_portal_spawns_piglin", b, 0.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/fast_lava", b, 0.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/increased_fire_burnout", b, 0.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/turtle_egg_hatch_chance", f, 0.002f32, true, 0.0f32, 1.0f32),
+        ("minecraft:gameplay/piglins_zombify", b, 1.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/snow_golem_melts", b, 0.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/creaking_active", b, 0.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/surface_slime_spawn_chance", f, 0.0f32, true, 0.0f32, 1.0f32),
+        ("minecraft:gameplay/cat_waking_up_gift_chance", f, 0.0f32, true, 0.0f32, 1.0f32),
+        ("minecraft:gameplay/bees_stay_in_hive", b, 0.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/monsters_burn", b, 0.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/can_pillager_patrol_spawn", b, 1.0f32, false, 0.0f32, 0.0f32),
+        ("minecraft:gameplay/creature_world_gen_spawn_probability", f, 0.1f32, true, 0.0f32, 0.9999999f32),
+    ]
+}
+
+/// The attributes Calcite evaluates, by the places `find` gives.
+pub fn attribute_names() -> List<String> {
+    var out = List<String>()
+    for (name, _kind, _default, _range, _min, _max) in catalog() {
+        out.push(name.copy())
+    }
+    return out
+}
+
+/// The place of the attribute `name` among those Calcite evaluates, if it's one.
+pub fn find(name: String) -> usize? {
+    let all = catalog()
+    for i in 0..all.len() {
+        let (n, _kind, _default, _range, _min, _max) = all[i]
+        if n == name {
+            return some(i)
+        }
+    }
+    return none
+}
+
+/// The kind of the attribute at `at`.
+pub fn kind_at(at: usize) -> Kind {
+    let all = catalog()
+    let (_name, kind, _default, _range, _min, _max) = all[at]
+    return kind
+}
+
+/// `minecraft:gameplay/sky_light_level`'s place, which a level reads every tick.
+pub fn sky_light_level() -> usize {
+    return find(String("minecraft:gameplay/sky_light_level")) ?? 0
+}
+
+// What the rain does to the attribute `name`, and what the thunder does, as `WeatherAttributes`
+// has them. The sky's light blends towards 4, the sky light factor towards 0.24, the stars go
+// out, and bees stay in their hives.
+fn weather_changes(name: String) -> (Change?, Change?) {
+    if name == "minecraft:gameplay/sky_light_level" {
+        return (some(blend(4.0f32, 0.3125f32)), some(blend(4.0f32, 0.52734375f32)))
+    }
+    if name == "minecraft:visual/sky_light_factor" {
+        return (some(blend(0.24f32, 0.3125f32)), some(blend(0.24f32, 0.52734375f32)))
+    }
+    if name == "minecraft:visual/star_brightness" {
+        let zero = Change { op: Op.Override, argument: Value { number: 0.0f32 } }
+        return (some(zero), some(zero))
+    }
+    if name == "minecraft:gameplay/bees_stay_in_hive" {
+        let yes = Change { op: Op.Override, argument: Value { flag: true } }
+        return (some(yes), some(yes))
+    }
+    return (none, none)
+}
+
+fn blend(value: f32, alpha: f32) -> Change {
+    return Change { op: Op.AlphaBlend, argument: Value { number: value, alpha: alpha } }
+}
+
+impl Environment {
+    /// No layers at all: each attribute at its default.
+    pub fn new() -> Environment {
+        return Environment.build(Tag.End, List<Tag>(), List<Identifier>(), false)
+    }
+
+    /// A level's, as `addDefaultLayers` builds it: `attributes`, its dimension type's map of
+    /// attributes as the type's codec reads it, then `timelines`, the timelines its type names,
+    /// in their order, each as the timeline's codec reads it, with their clocks by their place
+    /// in `clocks`, the `world_clock` registry, then the weather's, if `weather`, as
+    /// `canHaveWeather` says.
+    pub fn build(attributes: Tag, timelines: List<Tag>, clocks: List<Identifier>, weather: bool) -> Environment {
+        var samplers = List<Sampler>()
+        var sines = false
+        for (name, kind, default, range, min, max) in catalog() {
+            let base = if kind == Kind.Float { Value { number: default } } else { Value { flag: default != 0.0f32 } }
+            var layers = List<Layer>()
+            let entry = field(attributes, name)
+            if entry != Tag.End {
+                let (op, argument) = entry_of(entry, kind)
+                layers.push(Layer.Constant { op: op, argument: argument })
+            }
+            for t in timelines {
+                let track = field(field(t, String("tracks")), name)
+                if track == Tag.End {
+                    continue
+                }
+                let made = track_of(track, kind, field(t, String("period_ticks")), clock_id(field(t, String("clock")), clocks))
+                for s in made.segments {
+                    if uses_sine(s.ease) {
+                        sines = true
+                    }
+                }
+                layers.push(Layer.Timed(made))
+            }
+            if weather {
+                let (rain, thunder) = weather_changes(name)
+                if rain != none or thunder != none {
+                    layers.push(Layer.Weather { rain: rain, thunder: thunder })
+                }
+            }
+            samplers.push(Sampler { kind: kind, base: base, range: range, min: min, max: max, layers: layers })
+        }
+        return Environment { samplers: samplers, table: if sines { some(SinTable.new()) } else { none } }
+    }
+
+    /// A new tick, as `invalidateTickCache` starts one: each attribute is worked out again when
+    /// it's next asked for.
+    pub fn invalidate(mut self) {
+        for i in 0..self.samplers.len() {
+            self.samplers[i].cached = none
+        }
+    }
+
+    /// The attribute at `at`, as `getDimensionValue` gives it, with the world's `clocks` and the
+    /// level's rain and thunder levels, as `getRainLevel(1.0F)` and `getThunderLevel(1.0F)` give
+    /// them. An attribute with no layers is its default.
+    pub fn value(mut self, at: usize, clocks: Clocks, rain: f32, thunder: f32) -> Value {
+        if let v = self.samplers[at].cached {
+            return v
+        }
+        let kind = self.samplers[at].kind
+        var v = self.samplers[at].base
+        for layer in self.samplers[at].layers {
+            v = match layer {
+                Layer.Constant { op, argument } => apply(kind, op, v, argument),
+                Layer.Timed(track) => apply(kind, track.op, v, sample(track, clocks, kind, self.table)),
+                Layer.Weather { rain: on_rain, thunder: on_thunder } => weathered(kind, v, on_rain, on_thunder, rain, thunder),
+            }
+        }
+        if kind == Kind.Float and self.samplers[at].range {
+            // `AttributeRange.sanitize`: a value in range is left as it is, NaN too, and any
+            // other is `Mth.clamp`ed.
+            let (lo, hi) = (self.samplers[at].min, self.samplers[at].max)
+            if not (v.number >= lo and v.number <= hi) {
+                v = Value { number: clamp(v.number, lo, hi) }
+            }
+        }
+        self.samplers[at].cached = some(v)
+        return v
+    }
+
+    /// The float attribute at `at`, as `value` gives it.
+    pub fn number(mut self, at: usize, clocks: Clocks, rain: f32, thunder: f32) -> f32 {
+        return self.value(at, clocks, rain, thunder).number
+    }
+
+    /// The boolean attribute at `at`, as `value` gives it.
+    pub fn flag(mut self, at: usize, clocks: Clocks, rain: f32, thunder: f32) -> bool {
+        return self.value(at, clocks, rain, thunder).flag
+    }
+}
+
+// `modifier.apply(value, argument)`.
+fn apply(kind: Kind, op: Op, v: Value, a: Value) -> Value {
+    if kind == Kind.Boolean {
+        let (x, y) = (v.flag, a.flag)
+        return Value { flag: match op {
+            Op.And => x and y,
+            Op.Nand => not (x and y),
+            Op.Or => x or y,
+            Op.Nor => not (x or y),
+            Op.Xor => x != y,
+            Op.Xnor => x == y,
+            _ => y,
+        } }
+    }
+    let (x, y) = (v.number, a.number)
+    return Value { number: match op {
+        Op.AlphaBlend => lerp(a.alpha, x, y),
+        Op.Add => x + y,
+        Op.Subtract => x - y,
+        Op.Multiply => x * y,
+        Op.Minimum => java_min(x, y),
+        Op.Maximum => java_max(x, y),
+        _ => y,
+    } }
+}
+
+// The weather's layer, as `WeatherAttributes.addLayer`'s does it: the rain's change by how much
+// it rains without thunder, then the thunder's by how much it thunders, each through the type's
+// `stateChangeLerp`.
+fn weathered(kind: Kind, v: Value, on_rain: Change?, on_thunder: Change?, rain: f32, thunder: f32) -> Value {
+    var out = v
+    let rain_only = rain - thunder
+    if let c = on_rain {
+        if rain_only > 0.0f32 {
+            out = state_lerp(kind, rain_only, out, apply(kind, c.op, out, c.argument))
+        }
+    }
+    if let c = on_thunder {
+        if thunder > 0.0f32 {
+            out = state_lerp(kind, thunder, out, apply(kind, c.op, out, c.argument))
+        }
+    }
+    return out
+}
+
+// `AttributeType.stateChangeLerp`: `Mth.lerp` for a float, `ofStep(0)` for a boolean.
+fn state_lerp(kind: Kind, alpha: f32, from: Value, to: Value) -> Value {
+    if kind == Kind.Float {
+        return Value { number: lerp(alpha, from.number, to.number) }
+    }
+    return if alpha >= 0.0f32 { to } else { from }
+}
+
+// `KeyframeTrackSampler.sample` at the track's clock's ticks.
+fn sample(track: Track, clocks: Clocks, kind: Kind, table: SinTable?) -> Value {
+    var ticks = clocks.total_ticks(track.clock)
+    if let p = track.period {
+        // `Math.floorMod(long, int)`.
+        ticks = ticks.floor_mod(i64(p))
+    }
+    // The first segment the ticks are before the end of, or else the last.
+    var at = track.segments.len() - 1
+    for i in 0..track.segments.len() {
+        if ticks < i64(track.segments[i].to_ticks) {
+            at = i
+            break
+        }
+    }
+    let s = track.segments[at]
+    if ticks <= i64(s.from_ticks) {
+        return s.from
+    }
+    if ticks >= i64(s.to_ticks) {
+        return s.to
+    }
+    // `(float)(ticks - from) / (float)(to - from)`, a `long` and an `int` each rounded to a float.
+    let alpha = f32.nearest(ticks - i64(s.from_ticks)) / f32.nearest(s.to_ticks.wrapping_sub(s.from_ticks))
+    let eased = ease(s.ease, alpha, table)
+    return keyframe_lerp(kind, track.op, eased, s.from, s.to)
+}
+
+// `modifier.argumentKeyframeLerp`: a float's `Mth.lerp`, of the value and the alpha both for
+// `alpha_blend`, and for a boolean the value it's from until the easing reaches 1, as
+// `ofConstant` and the boolean type's `keyframeLerp` both are.
+fn keyframe_lerp(kind: Kind, op: Op, alpha: f32, from: Value, to: Value) -> Value {
+    if kind == Kind.Boolean {
+        return if alpha >= 1.0f32 { to } else { from }
+    }
+    if op == Op.AlphaBlend {
+        return Value { number: lerp(alpha, from.number, to.number), alpha: lerp(alpha, from.alpha, to.alpha) }
+    }
+    return Value { number: lerp(alpha, from.number, to.number) }
+}
+
+// `Mth.lerp`, in floats.
+fn lerp(alpha: f32, from: f32, to: f32) -> f32 {
+    return from + alpha * (to - from)
+}
+
+// `Mth.clamp(float, float, float)`.
+fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
+    return if v < lo { lo } else { java_min(v, hi) }
+}
+
+// `Math.min(float, float)`: NaN if either is, and -0 under 0.
+fn java_min(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        return a
+    }
+    if a == 0.0f32 and b == 0.0f32 and b.to_bits() == 0x80000000u32 {
+        return b
+    }
+    return if a <= b { a } else { b }
+}
+
+// `Math.max(float, float)`: NaN if either is, and 0 over -0.
+fn java_max(a: f32, b: f32) -> f32 {
+    if a.is_nan() {
+        return a
+    }
+    if a == 0.0f32 and b == 0.0f32 and a.to_bits() == 0x80000000u32 {
+        return b
+    }
+    return if a >= b { a } else { b }
+}
+
+// What a map's entry does: its value alone overrides, and `{modifier, argument}` names its
+// operation.
+fn entry_of(entry: Tag, kind: Kind) -> (Op, Value) {
+    match field(entry, String("modifier")) {
+        Tag.Str(name) => return (op_named(name), argument_of(field(entry, String("argument")), kind)),
+        _ => return (Op.Override, argument_of(entry, kind)),
+    }
+}
+
+// A value or an argument as its codec reads it: a float, or `{value, alpha}`, or a boolean.
+fn argument_of(tag: Tag, kind: Kind) -> Value {
+    if kind == Kind.Boolean {
+        return Value { flag: match tag {
+            Tag.Byte(b) => b != 0i8,
+            _ => false,
+        } }
+    }
+    match tag {
+        Tag.Compound(_) => {
+            let alpha = field(tag, String("alpha"))
+            return Value { number: number_of(field(tag, String("value"))), alpha: if alpha == Tag.End { 1.0f32 } else { number_of(alpha) } }
+        },
+        _ => return Value { number: number_of(tag) },
+    }
+}
+
+fn number_of(tag: Tag) -> f32 {
+    return match tag {
+        Tag.Float(v) => v,
+        Tag.Double(v) => f32.nearest(v),
+        Tag.Int(v) => f32.nearest(v),
+        _ => 0.0f32,
+    }
+}
+
+fn op_named(name: String) -> Op {
+    if name == "alpha_blend" {
+        return Op.AlphaBlend
+    }
+    if name == "add" {
+        return Op.Add
+    }
+    if name == "subtract" {
+        return Op.Subtract
+    }
+    if name == "multiply" {
+        return Op.Multiply
+    }
+    if name == "minimum" {
+        return Op.Minimum
+    }
+    if name == "maximum" {
+        return Op.Maximum
+    }
+    if name == "and" {
+        return Op.And
+    }
+    if name == "nand" {
+        return Op.Nand
+    }
+    if name == "or" {
+        return Op.Or
+    }
+    if name == "nor" {
+        return Op.Nor
+    }
+    if name == "xor" {
+        return Op.Xor
+    }
+    if name == "xnor" {
+        return Op.Xnor
+    }
+    return Op.Override
+}
+
+// The ID in `world_clock` of the clock a timeline names.
+fn clock_id(clock: Tag, clocks: List<Identifier>) -> i32? {
+    let Tag.Str(name) = clock else return none
+    for i in 0..clocks.len() {
+        if clocks[i].to_string() == name {
+            return some(i32.wrap(i))
+        }
+    }
+    return none
+}
+
+// `KeyframeTrackSampler.bakeSegments`: one constant segment for a single keyframe; else, with a
+// period, from the last keyframe a period back to the first, each to the next, and from the last
+// to the first a period on; without one, each to the next.
+fn track_of(track: Tag, kind: Kind, period_tag: Tag, clock: i32?) -> Track {
+    let op = match field(track, String("modifier")) {
+        Tag.Str(name) => op_named(name),
+        _ => Op.Override,
+    }
+    let period: i32? = match period_tag {
+        Tag.Int(p) => some(p),
+        _ => none,
+    }
+    let easing = ease_of(field(track, String("ease")))
+    var frames = List<(i32, Value)>()
+    match field(track, String("keyframes")) {
+        Tag.List(list) => {
+            for f in list {
+                let t = match field(f, String("ticks")) {
+                    Tag.Int(v) => v,
+                    _ => 0,
+                }
+                frames.push((t, argument_of(field(f, String("value")), kind)))
+            }
+        },
+        _ => {},
+    }
+    var segments = List<Segment>()
+    if frames.len() == 1 {
+        let (_t, v) = frames[0]
+        segments.push(Segment { ease: Ease.Constant, from_ticks: 0, from: v, to_ticks: 0, to: v })
+        return Track { op: op, clock: clock, period: period, segments: segments }
+    }
+    if frames.is_empty() {
+        return Track { op: op, clock: clock, period: period, segments: segments }
+    }
+    let (first_t, first_v) = frames[0]
+    let (last_t, last_v) = frames[frames.len() - 1]
+    if let p = period {
+        segments.push(Segment { ease: easing, from_ticks: last_t.wrapping_sub(p), from: last_v, to_ticks: first_t, to: first_v })
+    }
+    for i in 0..frames.len() - 1 {
+        let (a_t, a_v) = frames[i]
+        let (b_t, b_v) = frames[i + 1]
+        segments.push(Segment { ease: easing, from_ticks: a_t, from: a_v, to_ticks: b_t, to: b_v })
+    }
+    if let p = period {
+        segments.push(Segment { ease: easing, from_ticks: last_t, from: last_v, to_ticks: first_t.wrapping_add(p), to: first_v })
+    }
+    return Track { op: op, clock: clock, period: period, segments: segments }
+}
+
+// An easing by its name, or a cubic Bézier by its controls `[x1, y1, x2, y2]`.
+fn ease_of(tag: Tag) -> Ease {
+    match tag {
+        Tag.Str(name) => return ease_named(name),
+        Tag.Compound(_) => {
+            match field(tag, String("cubic_bezier")) {
+                Tag.List(c) => {
+                    if c.len() == 4 {
+                        return Ease.Bezier { x: curve(number_of(c[0]), number_of(c[2])), y: curve(number_of(c[1]), number_of(c[3])) }
+                    }
+                },
+                _ => {},
+            }
+        },
+        _ => {},
+    }
+    return Ease.Linear
+}
+
+// `CubicBezier.curveFromControls`.
+fn curve(p1: f32, p2: f32) -> Curve {
+    return Curve { a: 3.0f32 * p1 - 3.0f32 * p2 + 1.0f32, b: -6.0f32 * p1 + 3.0f32 * p2, c: 3.0f32 * p1 }
+}
+
+fn ease_named(name: String) -> Ease {
+    let names: List<String> = [
+        "constant", "linear", "in_back", "in_bounce", "in_circ", "in_cubic", "in_elastic", "in_expo", "in_quad",
+        "in_quart", "in_quint", "in_sine", "in_out_back", "in_out_bounce", "in_out_circ", "in_out_cubic",
+        "in_out_elastic", "in_out_expo", "in_out_quad", "in_out_quart", "in_out_quint", "in_out_sine", "out_back",
+        "out_bounce", "out_circ", "out_cubic", "out_elastic", "out_expo", "out_quad", "out_quart", "out_quint",
+        "out_sine",
+    ]
+    let all: List<Ease> = [
+        Ease.Constant, Ease.Linear, Ease.InBack, Ease.InBounce, Ease.InCirc, Ease.InCubic, Ease.InElastic, Ease.InExpo, Ease.InQuad,
+        Ease.InQuart, Ease.InQuint, Ease.InSine, Ease.InOutBack, Ease.InOutBounce, Ease.InOutCirc, Ease.InOutCubic,
+        Ease.InOutElastic, Ease.InOutExpo, Ease.InOutQuad, Ease.InOutQuart, Ease.InOutQuint, Ease.InOutSine, Ease.OutBack,
+        Ease.OutBounce, Ease.OutCirc, Ease.OutCubic, Ease.OutElastic, Ease.OutExpo, Ease.OutQuad, Ease.OutQuart, Ease.OutQuint,
+        Ease.OutSine,
+    ]
+    for i in 0..names.len() {
+        if names[i] == name {
+            return all[i]
+        }
+    }
+    return Ease.Linear
+}
+
+fn uses_sine(e: Ease) -> bool {
+    return match e {
+        Ease.InSine => true,
+        Ease.OutSine => true,
+        Ease.InOutSine => true,
+        _ => false,
+    }
+}
+
+// `EasingType.apply`, as `Ease` computes each: in floats, but where it calls `Math.pow`,
+// `Math.sin` or `Math.sqrt`, which are in doubles, and the sines through `Mth`'s table.
+fn ease(e: Ease, x: f32, table: SinTable?) -> f32 {
+    return match e {
+        Ease.Constant => 0.0f32,
+        Ease.Linear => x,
+        Ease.InBack => x * x * (2.70158f32 * x - 1.70158f32),
+        Ease.InBounce => 1.0f32 - out_bounce(1.0f32 - x),
+        Ease.InCirc => f32.nearest(-(f64(1.0f32 - x * x)).sqrt()) + 1.0f32,
+        Ease.InCubic => x * x * x,
+        Ease.InElastic => in_elastic(x),
+        Ease.InExpo => if x == 0.0f32 { 0.0f32 } else { f32.nearest(pow(2.0, 10.0 * f64(x) - 10.0)) },
+        Ease.InQuad => x * x,
+        Ease.InQuart => square(square(x)),
+        Ease.InQuint => square(square(x)) * x,
+        Ease.InSine => 1.0f32 - table_cos(table, f64(x * 1.5707964f32)),
+        Ease.InOutBack => in_out_back(x),
+        Ease.InOutBounce => if x < 0.5f32 { (1.0f32 - out_bounce(1.0f32 - 2.0f32 * x)) / 2.0f32 } else { (1.0f32 + out_bounce(2.0f32 * x - 1.0f32)) / 2.0f32 },
+        Ease.InOutCirc => in_out_circ(x),
+        Ease.InOutCubic => if x < 0.5f32 { 4.0f32 * (x * x * x) } else { f32.nearest(1.0 - pow(-2.0 * f64(x) + 2.0, 3.0) / 2.0) },
+        Ease.InOutElastic => in_out_elastic(x),
+        Ease.InOutExpo => in_out_expo(x),
+        Ease.InOutQuad => if x < 0.5f32 { 2.0f32 * square(x) } else { f32.nearest(1.0 - pow(-2.0 * f64(x) + 2.0, 2.0) / 2.0) },
+        Ease.InOutQuart => if x < 0.5f32 { 8.0f32 * square(square(x)) } else { f32.nearest(1.0 - pow(-2.0 * f64(x) + 2.0, 4.0) / 2.0) },
+        Ease.InOutQuint => if f64(x) < 0.5 { 16.0f32 * x * x * x * x * x } else { f32.nearest(1.0 - pow(-2.0 * f64(x) + 2.0, 5.0) / 2.0) },
+        Ease.InOutSine => -(table_cos(table, f64(3.1415927f32 * x)) - 1.0f32) / 2.0f32,
+        Ease.OutBack => 1.0f32 + 2.70158f32 * cube(x - 1.0f32) + 1.70158f32 * square(x - 1.0f32),
+        Ease.OutBounce => out_bounce(x),
+        Ease.OutCirc => f32.nearest(f64(1.0f32 - square(x - 1.0f32)).sqrt()),
+        Ease.OutCubic => 1.0f32 - cube(1.0f32 - x),
+        Ease.OutElastic => out_elastic(x),
+        Ease.OutExpo => if x == 1.0f32 { 1.0f32 } else { 1.0f32 - f32.nearest(pow(2.0, -10.0 * f64(x))) },
+        Ease.OutQuad => 1.0f32 - square(1.0f32 - x),
+        Ease.OutQuart => 1.0f32 - square(square(1.0f32 - x)),
+        Ease.OutQuint => 1.0f32 - f32.nearest(pow(1.0 - f64(x), 5.0)),
+        Ease.OutSine => table_sin(table, f64(x * 1.5707964f32)),
+        Ease.Bezier { x: xc, y: yc } => sample_curve(yc, solve_t(xc, x)),
+    }
+}
+
+// `Mth.square` and `Mth.cube`.
+fn square(x: f32) -> f32 {
+    return x * x
+}
+
+fn cube(x: f32) -> f32 {
+    return x * x * x
+}
+
+fn table_sin(table: SinTable?, angle: f64) -> f32 {
+    let t = table else return 0.0f32
+    return t.sin(angle)
+}
+
+fn table_cos(table: SinTable?, angle: f64) -> f32 {
+    let t = table else return 1.0f32
+    return t.cos(angle)
+}
+
+fn out_bounce(x: f32) -> f32 {
+    if x < 0.36363637f32 {
+        return 7.5625f32 * square(x)
+    }
+    if x < 0.72727275f32 {
+        return 7.5625f32 * square(x - 0.54545456f32) + 0.75f32
+    }
+    if f64(x) < 0.9090909090909091 {
+        return 7.5625f32 * square(x - 0.8181818f32) + 0.9375f32
+    }
+    return 7.5625f32 * square(x - 0.95454544f32) + 0.984375f32
+}
+
+fn in_elastic(x: f32) -> f32 {
+    if x == 0.0f32 {
+        return 0.0f32
+    }
+    if x == 1.0f32 {
+        return 1.0f32
+    }
+    let d = f64(x)
+    return f32.nearest(-pow(2.0, 10.0 * d - 10.0) * sin((d * 10.0 - 10.75) * 2.094395160675049))
+}
+
+fn out_elastic(x: f32) -> f32 {
+    if x == 0.0f32 {
+        return 0.0f32
+    }
+    if x == 1.0f32 {
+        return 1.0f32
+    }
+    let d = f64(x)
+    return f32.nearest(pow(2.0, -10.0 * d) * sin((d * 10.0 - 0.75) * 2.094395160675049) + 1.0)
+}
+
+fn in_out_elastic(x: f32) -> f32 {
+    if x == 0.0f32 {
+        return 0.0f32
+    }
+    if x == 1.0f32 {
+        return 1.0f32
+    }
+    let d = f64(x)
+    let s = sin((20.0 * d - 11.125) * 1.3962634801864624)
+    if x < 0.5f32 {
+        return f32.nearest(-(pow(2.0, 20.0 * d - 10.0) * s) / 2.0)
+    }
+    return f32.nearest(pow(2.0, -20.0 * d + 10.0) * s / 2.0 + 1.0)
+}
+
+fn in_out_expo(x: f32) -> f32 {
+    let d = f64(x)
+    if x < 0.5f32 {
+        return if x == 0.0f32 { 0.0f32 } else { f32.nearest(pow(2.0, 20.0 * d - 10.0) / 2.0) }
+    }
+    return if x == 1.0f32 { 1.0f32 } else { f32.nearest((2.0 - pow(2.0, -20.0 * d + 10.0)) / 2.0) }
+}
+
+fn in_out_circ(x: f32) -> f32 {
+    let d = f64(x)
+    if x < 0.5f32 {
+        return f32.nearest((1.0 - (1.0 - pow(2.0 * d, 2.0)).sqrt()) / 2.0)
+    }
+    return f32.nearest(((1.0 - pow(-2.0 * d + 2.0, 2.0)).sqrt() + 1.0) / 2.0)
+}
+
+fn in_out_back(x: f32) -> f32 {
+    if x < 0.5f32 {
+        return 4.0f32 * x * x * (7.189819f32 * x - 2.5949094f32) / 2.0f32
+    }
+    let t = 2.0f32 * x - 2.0f32
+    return (t * t * (3.5949094f32 * t + 2.5949094f32) + 2.0f32) / 2.0f32
+}
+
+// `CubicCurve.sample` and `sampleGradient`.
+fn sample_curve(c: Curve, t: f32) -> f32 {
+    return ((c.a * t + c.b) * t + c.c) * t
+}
+
+fn curve_gradient(c: Curve, t: f32) -> f32 {
+    return (3.0f32 * c.a * t + 2.0f32 * c.b) * t + c.c
+}
+
+// `CubicBezier.solveT`: the curve's parameter where its x is `x`, by four Newton steps of a
+// quarter at most, then, if those don't come within 1e-5, by halving from where they got to, as
+// `solveTBisect` does.
+fn solve_t(c: Curve, x: f32) -> f32 {
+    var t = x
+    for _ in 0..4 {
+        let off = sample_curve(c, t) - x
+        if off.abs() < 0.00001f32 {
+            return t
+        }
+        let slope = curve_gradient(c, t)
+        if slope < 0.00001f32 {
+            break
+        }
+        t -= clamp(off / slope, -0.25f32, 0.25f32)
+    }
+    var lo = 0.0f32
+    var hi = 1.0f32
+    var mid = t
+    while lo < hi {
+        let off = sample_curve(c, mid) - x
+        if off.abs() < 0.00001f32 {
+            return mid
+        }
+        if off < 0.0f32 {
+            lo = mid
+        } else {
+            hi = mid
+        }
+        mid = (hi + lo) / 2.0f32
+    }
+    return mid
+}
+
+// The field `key` of a compound, or `Tag.End` where there's none.
+fn field(value: Tag, key: String) -> Tag {
+    match value {
+        Tag.Compound(fields) => {
+            if fields.contains(key) {
+                return fields[key].copy()
+            }
+        },
+        _ => {},
+    }
+    return Tag.End
+}

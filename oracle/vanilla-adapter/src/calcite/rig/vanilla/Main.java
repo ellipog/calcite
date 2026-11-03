@@ -69,7 +69,8 @@ public final class Main {
                 new FeaturesProbe(),
                 new StructuresProbe(),
                 new DatafixProbe(),
-                new BlockEntityProbe())) {
+                new BlockEntityProbe(),
+                new EnvironmentProbe())) {
             probes.put(probe.name(), probe);
         }
 
