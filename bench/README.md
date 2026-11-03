@@ -1,6 +1,6 @@
 ---
 title: Benchmarks
-description: How Calcite's server is timed with 100 bot players, generating a world with Terralith and Terratonic beside C2ME's numbers and without them, with Mojang's own client joining and flying at 25 and 100 times vanilla's speed, and with its light engine against vanilla's, how to run each, and the results.
+description: How Calcite's server is timed with 100 bot players, generating a world with Terralith and Terratonic beside vanilla, Paper and C2ME on the same machine, and without them, with Mojang's own client joining and flying at 25 and 100 times vanilla's speed, and with its light engine against vanilla's, how to run each, and the results.
 ---
 
 # Benchmarks
@@ -8,7 +8,7 @@ description: How Calcite's server is timed with 100 bot players, generating a wo
 Four, each run on the server's release build:
 
 - [the bots](#bot-benchmark), which time the server with 100 players on it;
-- [worldgen](#worldgen-benchmark), which times generating a world with Terralith and Terratonic, set up as C2ME's own benchmark is, and without them;
+- [worldgen](#worldgen-benchmark), which times generating a world with Terralith and Terratonic, set up as C2ME's own benchmark is, beside vanilla, Paper and C2ME on the same machine, and without the packs;
 - [a real client](#a-real-client), Mojang's own, joining a new world at view distance 32 and flying over it at 25 and 100 times vanilla's speed, with the server's memory;
 - [light](#light), Calcite's light engine against vanilla's.
 
@@ -57,20 +57,24 @@ On the reference machine, an i9-13900K, the medians of 5 runs, recorded in [`res
 
 | Measure | Windows 11 | Linux |
 | --- | --- | --- |
-| MSPT, mean | 0.455 ms | 0.452 ms |
-| MSPT, p99 | 1.479 ms | 1.133 ms |
-| MSPT, max | 1.967 ms | 1.750 ms |
-| TPS | 20.02 | 20.00 |
-| MSPT while joining, mean | 0.964 ms | 1.314 ms |
-| MSPT while joining, max | 2.224 ms | 3.830 ms |
-| Join to all chunks, median | 1100 ms | 1097 ms |
-| Join to all chunks, max | 1121 ms | 1099 ms |
-| CPU time | 3.25 s | 2.06 s |
-| Peak memory | 47.2 MiB | 44.3 MiB |
-| Chunks sent | 79952 | 79975 |
-| Bytes to the bots | 21.2 MiB | 21.2 MiB |
+| MSPT, mean | 0.400 ms | 0.471 ms |
+| MSPT, p99 | 1.006 ms | 1.085 ms |
+| MSPT, max | 1.312 ms | 1.432 ms |
+| TPS | 20.00 | 20.00 |
+| MSPT while joining, mean | 1.125 ms | 6.259 ms |
+| MSPT while joining, max | 3.744 ms | 47.984 ms |
+| Join to all chunks, median | 548 ms | 552 ms |
+| Join to all chunks, max | 600 ms | 603 ms |
+| CPU time | 2.78 s | 2.71 s |
+| Peak memory | 69.1 MiB | 67.7 MiB |
+| Chunks sent | 80323 | 80384 |
+| Bytes to the bots | 21.4 MiB | 21.4 MiB |
 
-Commit 1195b56, Calx f6ad008, after the chunk sender stopped sorting every chunk waiting each tick ([D155](../docs/decisions.md)); at 08e6657, the first recorded, the mean MSPT was 0.508 ms on Windows and 0.459 ms on Linux. A join takes about 1.1 s because the client's first batch is 9 chunks, then 25 a tick as the bots ask for, so 473 chunks take about 20 ticks; it's the protocol's pace, not the server's.
+Commit 868e0a0, Calx 154040f, at the end of Phase 5 (CAL-94). At 1195b56, recorded at the end of Phase 4, the mean MSPT was 0.455 ms on Windows and 0.452 ms on Linux, and at 08e6657, the first recorded, 0.508 and 0.459. The tick thread no longer compresses packets or compares every pair of players ([D291](../docs/decisions.md), [D292](../docs/decisions.md)).
+
+A join takes about 550 ms, half what it did. The client's first batch is 9 chunks. The bots then ask for 25 a tick, and since [D272](../docs/decisions.md) a client that asks for fewer than 64 is sent 4 times as many, up to 64. So 473 chunks take about 9 ticks, where at 1195b56 they took 20. Sending a join's chunks faster makes its ticks dearer: the mean MSPT while joining went from 0.964 to 1.125 ms on Windows.
+
+On Linux under WSL, the ticks while joining average 6.3 ms, and the worst was 48 ms. They were 8.6 ms before D291 too (D292), and on Windows on the same machine they're 1.1 ms, so this is still to be found ([CAL-108](https://acta.aaenz.no/aaen-studios/calcite#CAL-108)). Peak memory went from 47 to 69 MiB over Phase 5; it was 67 to 69 MiB before D291 as well (D292).
 
 Since then the worst tick while joining has moved with how chunks load. On Windows, in 15-second runs, it went from 2.0 ms to 4.4 when chunks began to be read on threads (d30ab20), since the first bot's come back in one burst, and to 10.6 when the level began to light them (3b8d324). Lighting a tick's worth at a time brought it to 4.8 ms, and on a world vanilla generated, where most chunks need their light spread, to 7.9 ms from 41.0, the medians of 3 30-second runs ([D197](../docs/decisions.md)).
 
@@ -79,49 +83,78 @@ The runs are noisy, from the system and the other threads: one run's mean MSPT i
 ## Worldgen benchmark
 
 ```sh
-py -I bench/terralith.py                      # 1, 8, 16 and 32 workers, the full run, not recorded
+py -I bench/terralith.py                      # Calcite at 1, 8, 16 and 32 workers, not recorded
 py -I bench/terralith.py --record             # the same, written to bench/results/terralith-<platform>.json
 py -I bench/terralith.py --threads 8 --radius 512     # a quick look, not recorded
 py -I bench/terralith.py --no-packs --record  # vanilla's own worldgen, the same runs, to bench/results/worldgen-<platform>.json
+py -I bench/others.py --record                # vanilla, Paper and C2ME, the same runs, to bench/results/others-<platform>.json
+py -I bench/others.py --servers c2me --threads 8 --radius 512     # a quick look at one, not recorded
 ```
 
-[C2ME](https://modrinth.com/mod/c2me-fabric) publishes how fast it generates a world with [Terralith](https://modrinth.com/datapack/terralith) and [Terratonic](https://modrinth.com/datapack/terratonic), beside Paper's and vanilla's, from 1 to 16 threads. [`terralith.py`](terralith.py) runs the same benchmark on Calcite (CAL-92), set up as theirs is:
+[C2ME](https://modrinth.com/mod/c2me-fabric) publishes a benchmark of how fast it generates a world with [Terralith](https://modrinth.com/datapack/terralith) and [Terratonic](https://modrinth.com/datapack/terratonic), beside Paper and vanilla. [`terralith.py`](terralith.py) runs it on Calcite (CAL-92), and [`others.py`](others.py) runs it on vanilla, Paper and C2ME, on the same machine ([D293](../docs/decisions.md)). Both are set up as C2ME's benchmark is, but over smaller areas, so the whole comparison takes about an hour and a half:
 
 - **The packs** are the versions made for 26.3, Terralith 2.6.5+26.3 and Terratonic 3.0.31, fetched from Modrinth into `build/bench/packs/` and checked against their SHA-512s. They're Stardust Labs', so they're never committed.
 - **The seed** is C2ME's, 114862964781274189.
-- **One launch on a fresh world**: a warm-up of a 1,536-block radius about the origin, then the measured run, a 3,072-block radius about 1,000,000, 1,000,000, each with the server's own `pregen` command. Chunky counts 148,225 chunks there, 385 a side. `pregen` takes a chunk where its middle is ([D275](../docs/decisions.md)), so it counts 147,456, 384 a side; the rates are a second either way. The release server runs in `build/bench/<platform>/terralith/` with `chunk-workers` set to the thread count.
+- **One launch on a fresh world**: a warm-up of a 512-block radius about the origin, then the measured run, a 1,024-block radius about 1,000,000, 1,000,000. Chunky counts 16,641 chunks there, 129 a side. Calcite's `pregen` takes a chunk where its middle is ([D275](../docs/decisions.md)), so it counts 16,384, 128 a side; the rates are a second either way. C2ME's own benchmark measures a 3,072-block radius after a 1,536-block warm-up, 148,225 chunks, which takes vanilla hours on one thread.
 
-It reports the measured run's chunks a second, overall and steady, the CPU time and peak memory the system gives for the whole launch, any warning the server logged, and how the workers' time split between the generator's stages: the strongholds' rings, the structures' starts, the biomes, the terrain, the features, and finishing a chunk as the server's, with its sky's light sources and its bytes. The stage times come from the server: `--stage-times FILE` keeps the seconds its workers have spent on each kind of job in the file as they go ([D287](../docs/decisions.md)). The steady rate is the chunks a second from the `pregen` progress line at 10% done to the one at 90%: it leaves out the start, while the first starts and biomes fill the generator's pipeline, and the last chunks, which fewer workers share. The whole run is over an hour, most of it at 1 thread.
+Calcite runs from the release build in `build/bench/<platform>/terralith/`, with `chunk-workers` set to the thread count, and generates with its own `pregen` command. The others each run in their own folder in `build/bench/<platform>/java/` with Chunky 1.5.3 and its `force-load-existing-chunks` on, as C2ME's benchmark has it:
 
-With `--no-packs`, the same runs have no packs, so they time vanilla's own worldgen, on the same seed and areas.
+| Server | What runs | Threads set by |
+| --- | --- | --- |
+| Vanilla | Fabric loader 0.20.1 with Fabric API 0.165.0 | `-Dmax.bg.threads` |
+| Paper | Paper 26.3-238 | `chunk-system.worker-threads`, with `io-threads` at 4 |
+| C2ME | C2ME 0.4.2-alpha.0.115, with Lithium 0.26.3, ScalableLux 0.3.0-alpha.0.6, VMP 0.2.0+beta.7.238 and zfastnoise 1.1.2, as C2ME's benchmark runs it | C2ME's `globalExecutorParallelism` |
 
-C2ME's numbers are from their machine, a Xeon Platinum 8558P held to 3.2 GHz, on Minecraft 26.2 with Terralith 2.6.4 and Terratonic 3.0.27, so only the curves compare, not the numbers themselves. The script prints its table beside theirs, and `--record` keeps theirs in the results with ours.
+Each runs on JDK 25.0.5 (Temurin) with C2ME's JVM flags: a 16 GiB ZGC heap, touched up front, with compact object headers. Large pages are left out, since Windows only gives them to a process with a privilege it doesn't have. The jars are fetched into `build/bench/jars/` and checked against their hashes, and Fabric and Paper fetch Mojang's server themselves.
+
+Vanilla with Chunky puts off unloading chunks while its ticks are behind, and its heap fills. At 8 threads over C2ME's area, its 16 GiB were full 120,000 chunks into the measured run. It then fell from 150 to 200 chunks a second to 21, with its ticks 2.3 s behind. C2ME's benchmark gives vanilla a patched Chunky that forces chunks to unload, and doesn't publish it. So `others.py` types vanilla's own `save-all flush` every 120 seconds instead, which unloads them. On a 1,536-block area at 8 threads:
+
+- without it, vanilla's heap after each major collection grew past 14 GiB in 400 seconds;
+- with it, the heap stayed at 3 to 4.5 GiB;
+- vanilla made 116.6 chunks a second with it, against 127.4 without, a cost of 8%. A flush every 30 seconds cost 14%.
+
+Each reports the measured run's chunks a second, overall and steady, and the CPU time and peak memory the system gives for the whole launch. Calcite also reports any warning the server logged, and how its workers' time split between the generator's stages:
+
+- the strongholds' rings
+- the structures' starts
+- the biomes
+- the terrain
+- the features
+- finishing a chunk as the server's, with its sky's light sources and its bytes
+
+The stage times come from the server: `--stage-times FILE` keeps the seconds its workers have spent on each kind of job in the file as they go ([D287](../docs/decisions.md)). The steady rate counts the chunks a second from the progress line at 10% done to the one at 90%. That leaves out the start, while the first starts and biomes fill the generator's pipeline, and the last chunks, which fewer workers share.
+
+With `--no-packs`, `terralith.py`'s runs have no packs, so they time vanilla's own worldgen, on the same seed and areas.
 
 Whether what Calcite generates with the packs is vanilla's is checked by the rig's [`terragen.py`](../rig/README.md#worldgen-with-packs), on a sample of chunks: every one of its 264 has what must be vanilla's.
 
 ### Results
 
-With Terralith and Terratonic, on the reference machine, an i9-13900K on Windows 11, recorded in [`results/terralith-windows.json`](results/terralith-windows.json) at commit 815d1cc with Calx 154040f. Chunks a second over the measured run:
+With Terralith and Terratonic, on the reference machine, an i9-13900K on Windows 11, in chunks a second over the measured run. Calcite's are recorded in [`results/terralith-windows.json`](results/terralith-windows.json) at commit 868e0a0 with Calx 154040f, and the others' in [`results/others-windows.json`](results/others-windows.json):
 
-| Threads | Calcite | Steady | C2ME | Paper | Vanilla | Calcite's peak memory |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | 60.4 | 63.0 | 29.1 | 12.8 | 13.2 | 748 MiB |
-| 8 | 331.8 | 344.6 | 228.7 | 93.5 | 38.9 | 1,035 MiB |
-| 16 | 512.3 | 532.4 | 458.9 | 142.2 | 42.0 | 1,128 MiB |
-| 32 | 780.4 | 809.1 | | | | 1,363 MiB |
+| Threads | Calcite | C2ME | Paper | Vanilla | Calcite's peak memory |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 60.8 | 48.8 | 52.8 | 37.9 | 832 MiB |
+| 8 | 389.7 | 312.5 | 313.7 | 98.0 | 955 MiB |
+| 16 | 521.8 | 484.4 | 308.5 | 103.9 | 1,037 MiB |
+| 32 | 746.0 | 687.1 | 312.5 | 112.9 | 1,210 MiB |
 
-C2ME's, Paper's and vanilla's are C2ME's, from their machine, which held its cores to 3.2 GHz where this one boosts to 5.8, so the rows don't compare one to one; the curves do. Calcite at 8 threads goes 5.5 times as fast as at 1, and at 16 threads 8.5 times, on 8 performance cores with two threads each and 16 efficiency cores. At every thread count the workers spent 77 to 78% of their time on terrain, 15 to 16% on features, 3% each on starts and biomes, and 2% finishing chunks. No run logged a warning.
+Calcite was the fastest at every thread count. It made 1.25 times C2ME's rate on one thread and on 8, and 1.08 and 1.09 times on 16 and 32. On one thread Paper came second, and Calcite made 1.15 times its rate. Paper used the 16 and 32 worker threads it was given, as its log says, and made no more than with 8. Vanilla made about 100 at every count from 8 up, the threads helping it little.
+
+Over the whole launch, warm-up included, Calcite used the least CPU time: on one thread 370 s, against Paper's 532 s, C2ME's 545 s and vanilla's 685 s, and at 8 threads 434 s, against 565, 684 and 815. The Java servers' peak memory is their 16 GiB heap, which C2ME's flags touch up front, so it isn't compared. The steady rates are in the results: Calcite's are 58.3, 369.0, 525.1 and 781.4.
+
+Calcite's workers spent 68 to 72% of their time on terrain, 19 to 21% on features, 2% on biomes and 1 to 2% finishing chunks. Starts took 3% at 1 thread and 9% at 32, growing faster with the threads than the rest, which [CAL-107](https://acta.aaenz.no/aaen-studios/calcite#CAL-107) looks into. No run logged a warning. At 815d1cc, over C2ME's whole area, Calcite made 60.4, 331.8, 512.3 and 780.4. The smaller area's measured run is 22 s at 32 threads, so its start and end weigh more.
 
 Vanilla's own worldgen, the same runs without the packs, recorded in [`results/worldgen-windows.json`](results/worldgen-windows.json) at the same commit:
 
 | Threads | Calcite | Steady | Peak memory |
 | --- | --- | --- | --- |
-| 1 | 153.8 | 154.9 | 555 MiB |
-| 8 | 897.6 | 904.3 | 798 MiB |
-| 16 | 1,418.6 | 1,407.1 | 927 MiB |
-| 32 | 1,848.7 | 1,848.3 | 1,019 MiB |
+| 1 | 136.3 | 135.6 | 439 MiB |
+| 8 | 832.1 | 858.0 | 652 MiB |
+| 16 | 1,286.4 | 1,328.6 | 707 MiB |
+| 32 | 1,689.8 | | 882 MiB |
 
-Here the workers spent 67 to 69% on terrain, 18 to 19% on features, 7% on biomes, 2% on starts and 4 to 5% finishing chunks. The packs' terrain is the dearer part: with them a chunk takes 2.5 times as long on one thread. These go through the whole server, as a player's chunks do: each chunk is lit, saved to its region file, deflated, and kept until it's let go. The generator by itself, with no server around it, made 3,078 to 3,091 chunks a second on 31 workers under WSL, over a 120-chunk radius on another seed ([CAL-88](https://acta.aaenz.no/aaen-studios/calcite#CAL-88)).
+At 32 threads the measured run takes 9.7 s, too short to have two progress lines between 10% and 90% done, so it has no steady rate. Here the workers spent 65 to 67% on terrain, 19 to 21% on features, 6 to 7% on biomes, 2 to 3% on starts and 4 to 5% finishing chunks. The packs' terrain is the dearer part: with them a chunk takes 2.2 times as long on one thread. These go through the whole server, as a player's chunks do: each chunk is lit, saved to its region file, deflated, and kept until it's let go. The generator by itself, with no server around it, made 3,078 to 3,091 chunks a second on 31 workers under WSL, over a 120-chunk radius on another seed ([CAL-88](https://acta.aaenz.no/aaen-studios/calcite#CAL-88)).
 
 ## A real client
 

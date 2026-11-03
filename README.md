@@ -14,7 +14,7 @@ Phase 5 made the world: chunks, storage, regions and worldgen. On the [benchmark
 
 - **Worldgen matches vanilla.** The Overworld, the Nether and the End pass the worldgen suites on the rig's seed grid. With Terralith and Terratonic, every one of 264 sampled chunks has what must be vanilla's; the blocks that differ are those the order chunks are decorated in decides, which vanilla doesn't fix either.
 - **Worlds round-trip** between vanilla and Calcite, and one region thread and many give identical results from the same input log.
-- **Generation:** 1,849 chunks a second of vanilla's worldgen pregenerated through the whole server on 32 worker threads, and 780 with Terralith and Terratonic. On one thread it's 60.4 with the packs, where C2ME's published benchmark has 29.1 for C2ME, on its own machine held to 3.2 GHz, so only the curves compare.
+- **Generation:** on the [worldgen benchmark](bench/README.md#worldgen-benchmark), with Terralith and Terratonic, set up as C2ME's own benchmark is, Calcite pregenerates 60.8 chunks a second through the whole server on one thread, 389.7 on 8 and 746.0 on 32. On the same machine, C2ME makes 48.8, 312.5 and 687.1, Paper 52.8, 313.7 and 312.5, and vanilla 37.9, 98.0 and 112.9. Without the packs, Calcite makes 1,690 chunks a second of vanilla's own worldgen on 32 threads.
 - **A real client:** Mojang's client joining a new world at view distance 32 has all 3,725 chunks in 3.2 s. Flying at 25 times vanilla's speed, 268 blocks a second, it has 97.2% of its view on average and never less than 88.3%.
 - **Memory:** the server holds 77 MiB idle, 364 MiB with one still view-32 player, and at most 1,134 MiB while that player flies at 25×.
 - **Light** is 1.6 to 1.8 times as fast as vanilla's engine on the rig's terrain workloads, with the same light to the nibble.
@@ -29,7 +29,7 @@ Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calc
 - [Host API sketch](plugins/api/HOST_API.md): the plugin contract
 - [Source](src/README.md): Calcite's Calx modules and their tests
 - [Oracle rig](rig/README.md): how Calcite is checked against vanilla, bit for bit
-- [Benchmarks](bench/README.md): the server timed with 100 players, per commit; generating a world, with Terralith and Terratonic beside C2ME and without; Mojang's own client joining and flying, with the server's memory; and the light engine against vanilla's
+- [Benchmarks](bench/README.md): the server timed with 100 players, per commit; generating a world, with Terralith and Terratonic beside vanilla, Paper and C2ME, and without; Mojang's own client joining and flying, with the server's memory; and the light engine against vanilla's
 - [Data generator and tables](oracle/datagen/README.md): the tables Calcite's codegen reads, generated from the jar
 
 ## License

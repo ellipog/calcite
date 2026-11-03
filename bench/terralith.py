@@ -1,8 +1,10 @@
-"""Runs the worldgen benchmark with Terralith and Terratonic (CAL-92), set up as C2ME's own: the same
-seed and packs, a warm-up of a 1,536-block radius about the origin, then a measured 3,072-block
-radius about 1,000,000, 1,000,000, 148,225 chunks, all in one launch on a fresh world.
+"""Runs the worldgen benchmark with Terralith and Terratonic (CAL-92), set up as C2ME's own but over
+smaller areas: the same seed and packs, a warm-up of a 512-block radius about the origin, then a
+measured 1,024-block radius about 1,000,000, 1,000,000, 16,641 chunks as Chunky counts them, all in
+one launch on a fresh world. C2ME's own runs a 1,536-block warm-up and a 3,072-block measured
+radius, 148,225 chunks, which takes vanilla hours at 1 thread (D293).
 
-    py -I bench/terralith.py [--threads 1,8,16,32] [--radius 3072] [--no-packs] [--record]
+    py -I bench/terralith.py [--threads 1,8,16,32] [--radius 1024] [--no-packs] [--record]
 
 With --no-packs, the same runs have no packs, so they time vanilla's own worldgen, recorded as
 bench/results/worldgen-<platform>.json. Each run also gives a steady rate: the chunks a second
@@ -14,9 +16,10 @@ since they're Stardust Labs' and aren't ours to commit. Each thread count runs t
 server in build/bench/<platform>/terralith/ with `chunk-workers` set to it, pregenerates with its
 `pregen` command and reads the chunks it logs, and the seconds the workers spent in each stage,
 which `--stage-times` writes. The system gives the CPU time and the peak memory. --record writes
-bench/results/terralith-<platform>.json, with the machine, the toolchain, the commit and C2ME's
-published numbers beside ours (D34). C2ME's ran on a Xeon Platinum 8558P held to 3.2 GHz, so only
-the shape of the curves compares, not the numbers themselves.
+bench/results/terralith-<platform>.json, with the machine, the toolchain and the commit (D34). The
+table puts vanilla's, Paper's and C2ME's rates beside Calcite's where others.py has recorded them on
+this platform, in bench/results/others-<platform>.json, or others-worldgen-<platform>.json without
+the packs, so every number in it is from the same machine.
 """
 
 import argparse
@@ -40,8 +43,8 @@ BUILD = CALCITE / "build" / "bench" / PLATFORM
 PACKS = CALCITE / "build" / "bench" / "packs"
 PORT = 25641
 SEED = "114862964781274189"
-WARMUP = {"x": 0, "z": 0, "radius": 1536}
-MEASURED = {"x": 1000000, "z": 1000000, "radius": 3072}
+WARMUP = {"x": 0, "z": 0, "radius": 512}
+MEASURED = {"x": 1000000, "z": 1000000, "radius": 1024}
 # The packs C2ME's benchmark names, at the versions made for 26.3.
 PINS = [
     {"name": "Terralith", "version": "2.6.5+26.3", "file": "Terralith_v2.6.5+26.3.zip",
@@ -51,21 +54,6 @@ PINS = [
      "url": "https://cdn.modrinth.com/data/3L2L6sWL/versions/RUBbKGx8/terratonic-datapack-3.0.31.zip",
      "sha512": "82deeee38afead548bc86cc6eed5d536b164194c442abbc4f0e21092a234430484e57989fdd7750e13c3bcc47b87f7365859b899a210f97b6fe55213e6fd6912"},
 ]
-# C2ME's published numbers (Modrinth, "Benchmarks for 26.2 w/ Terratonic + Terralith", 2026-08-14):
-# chunks a second at 1 to 16 threads, the 3,072-block run.
-C2ME = {
-    "source": "https://modrinth.com/mod/c2me-fabric",
-    "minecraft": "26.2",
-    "packs": ["Terralith 2.6.4", "Terratonic 3.0.27"],
-    "machine": "Intel Xeon Platinum 8558P held to 3.2 GHz, 48 cores, Debian 13, tmpfs",
-    "jvm": "Temurin 26.0.2+10, ZGC, 16 GiB heap",
-    "threads": list(range(1, 17)),
-    "chunks_per_second": {
-        "c2me": [29.06, 57.25, 85.68, 115.08, 144.05, 172.56, 203.05, 228.74, 257.78, 287.26, 316.04, 344.71, 373.36, 404.99, 430.89, 458.90],
-        "paper": [12.82, 25.77, 38.29, 50.55, 61.73, 74.15, 84.65, 93.52, 103.44, 111.95, 118.39, 123.73, 130.59, 134.14, 133.54, 142.25],
-        "vanilla": [13.22, 21.57, 26.98, 30.12, 33.73, 35.53, 37.17, 38.88, 39.82, 39.02, 39.04, 38.72, 40.16, 40.52, 40.60, 41.98],
-    },
-}
 DONE = re.compile(r"Pregen \S+ done: (\d+) chunks in ")
 PROGRESS = re.compile(r"Pregen \S+: (\d+) of (\d+) chunks")
 # The generator writes its stage times when it's had no work for 5 seconds (`--stage-times`).
@@ -225,20 +213,26 @@ def main():
     what = "Vanilla's worldgen" if args.no_packs else "Terralith + Terratonic"
     print(f"\n{what}, seed {SEED}, {measured['radius']}-block radius about "
           f"{measured['x']}, {measured['z']}, chunks a second:")
-    if args.no_packs:
-        print("| Threads | Calcite | Steady |")
-        print("| --- | --- | --- |")
-        for r in runs:
-            steady = r["steady_chunks_per_second"]
-            print(f"| {r['threads']} | {r['chunks_per_second']:.1f} | {f'{steady:.1f}' if steady else ''} |")
-    else:
-        print("| Threads | Calcite | C2ME | Paper | Vanilla |")
-        print("| --- | --- | --- | --- | --- |")
-        for r in runs:
-            t = r["threads"]
-            theirs = [f"{C2ME['chunks_per_second'][k][t - 1]:.1f}" if t <= 16 else "" for k in ("c2me", "paper", "vanilla")]
-            print(f"| {t} | {r['chunks_per_second']:.1f} | " + " | ".join(theirs) + " |")
-        print("\nC2ME's, Paper's and vanilla's are C2ME's published numbers, on their machine.")
+    # The Java servers' rates on this platform, from others.py, for the same area only.
+    others = HERE / "results" / f"{'others-worldgen' if args.no_packs else 'others'}-{PLATFORM}.json"
+    theirs = {}
+    if others.is_file() and measured == MEASURED:
+        recorded = json.loads(others.read_text(encoding="utf-8"))
+        theirs = {name: {r["threads"]: r["chunks_per_second"] for r in server["runs"]}
+                  for name, server in recorded["servers"].items()}
+    names = [n for n in ("c2me", "paper", "vanilla") if n in theirs]
+
+    def row(cells):
+        print("| " + " | ".join(cells) + " |")
+
+    row(["Threads", "Calcite", "Steady"] + [{"c2me": "C2ME", "paper": "Paper", "vanilla": "Vanilla"}[n] for n in names])
+    row(["---"] * (3 + len(names)))
+    for r in runs:
+        t, steady = r["threads"], r["steady_chunks_per_second"]
+        row([str(t), f"{r['chunks_per_second']:.1f}", f"{steady:.1f}" if steady else ""]
+            + [f"{theirs[n][t]:.1f}" if t in theirs[n] else "" for n in names])
+    if names:
+        print(f"\nThe Java servers' are from {others.relative_to(CALCITE).as_posix()}, recorded on this platform by others.py.")
 
     if args.record:
         result = {
@@ -247,8 +241,6 @@ def main():
             "machine": machine(), "packs": [{k: pin[k] for k in ("name", "version", "sha512")} for pin in PINS if packs],
             "seed": SEED, "warmup": WARMUP, "measured": measured, "runs": runs,
         }
-        if not args.no_packs:
-            result["c2me"] = C2ME
         out = HERE / "results" / f"{'worldgen' if args.no_packs else 'terralith'}-{PLATFORM}.json"
         out.parent.mkdir(exist_ok=True)
         out.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8", newline="\n")
