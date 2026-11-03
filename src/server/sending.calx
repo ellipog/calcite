@@ -12,8 +12,9 @@
 /// codec thread with the connection's encoder, as vanilla compresses on its network threads, and
 /// the bytes and the encoder come back on a queue, waking the poll. Only one batch of a
 /// connection is away at a time, so its bytes keep their order, and what it queues meanwhile goes
-/// once the encoder is back. The codec threads start as the bytes waiting need them, up to one
-/// fewer than the processors.
+/// once the encoder is back. A batch of up to `SMALL_BATCH` bytes goes to the one codec thread
+/// for small batches; the others take bigger ones, and start as the bytes waiting need them, up
+/// to one fewer than the processors.
 ///
 /// A chunk's packet that's kept for several players is compressed once, by whichever player's
 /// encoder gets it first: the body comes back for the level to keep, and the others are sent it
@@ -31,9 +32,15 @@ import std.thread.{Task}
 /// byte and compressing more, while handing a batch to a codec thread costs a few microseconds.
 pub const INLINE_BYTES: usize = 1024
 
-/// The bytes of packets each codec thread may have waiting before another starts: about half a
-/// millisecond of compressing. A broadcast of small packets to every player is one thread's work,
-/// and a join's batches of chunks start as many as they need.
+/// The most bytes of packets a batch has that goes to the one codec thread for small batches,
+/// such as a chat message for each player, or a few chunks. The other threads take only bigger
+/// batches, so those a join started sleep once it's done, and don't each wake for a broadcast and
+/// give their memory back 2 seconds later, over and over, as they did with 100 bots.
+pub const SMALL_BATCH: usize = 16384
+
+/// The bytes of packets in bigger batches each of the other codec threads may have waiting before
+/// another starts: about half a millisecond of compressing. A join's batches of chunks start as
+/// many as they need.
 pub const THREAD_BYTES: usize = 65536
 
 /// One thing a connection sends, in order.
@@ -239,17 +246,22 @@ pub struct Sending {
     // one, everything is encoded on the tick thread.
     waker: Waker?
     no_waker: bool
-    // The batches waiting for a codec thread, which each takes from, and those coming back.
+    // The bigger batches waiting for a codec thread, which each of those takes from; the small
+    // ones, for the small batches' thread; and those coming back.
     jobs: Receiver<Batch>
     to_jobs: Sender<Batch>
+    small_jobs: Receiver<Batch>
+    to_small: Sender<Batch>
     done: Receiver<Encoded>
     to_done: Sender<Encoded>
-    // How many codec threads have started, how many may, and how many batches are away, with how
-    // many bytes of packets.
+    // How many codec threads for bigger batches have started, how many may, whether the small
+    // batches' has, how many batches are away, and how many bigger ones, with how many bytes.
     started: usize
     most: usize
+    small_started: bool = false
     batches_away: usize
-    bytes_away: usize = 0
+    big_away: usize = 0
+    big_bytes: usize = 0
     // The shared packets compressed since they were last taken.
     compressed: List<Compressed>
 }
@@ -259,12 +271,14 @@ impl Sending {
     pub fn new() -> Sending {
         let jobs = Receiver<Batch>()
         let to_jobs = jobs.sender()
+        let small_jobs = Receiver<Batch>()
+        let to_small = small_jobs.sender()
         let done = Receiver<Encoded>()
         let to_done = done.sender()
         // The tick thread is busy itself, so the codec threads leave it a processor.
         let processors = unsafe { workers() }
         let most = if processors > 2 { processors - 1 } else { 1 }
-        return Sending { waker: none, no_waker: false, jobs: jobs, to_jobs: to_jobs, done: done, to_done: to_done, started: 0, most: most, batches_away: 0, compressed: List<Compressed>() }
+        return Sending { waker: none, no_waker: false, jobs: jobs, to_jobs: to_jobs, small_jobs: small_jobs, to_small: to_small, done: done, to_done: to_done, started: 0, most: most, batches_away: 0, compressed: List<Compressed>() }
     }
 
     /// Encodes what `out` queued for `conn`, and sends it through `link`: here if it's at most
@@ -285,9 +299,15 @@ impl Sending {
                 let size = out.bytes
                 out.bytes = 0
                 out.largest = 0
-                self.to_jobs.send(Batch { conn: conn, encoder: encoder, steps: steps, size: size })
+                let batch = Batch { conn: conn, encoder: encoder, steps: steps, size: size }
+                if size <= SMALL_BATCH {
+                    self.to_small.send(batch)
+                } else {
+                    self.to_jobs.send(batch)
+                    self.big_away += 1
+                    self.big_bytes += size
+                }
                 self.batches_away += 1
-                self.bytes_away += size
                 return
             }
             var encoder = out.encoder.take()!
@@ -303,9 +323,9 @@ impl Sending {
         }
     }
 
-    /// How many codec threads have started.
+    /// How many codec threads have started, the small batches' among them.
     pub fn threads(self) -> usize {
-        return self.started
+        return self.started + (if self.small_started { 1usize } else { 0 })
     }
 
     /// How many batches are on codec threads, or waiting for one.
@@ -318,7 +338,10 @@ impl Sending {
         var back = List<Encoded>()
         while let e = self.done.next() {
             self.batches_away -= 1
-            self.bytes_away -= e.size
+            if e.size > SMALL_BATCH {
+                self.big_away -= 1
+                self.big_bytes -= e.size
+            }
             var got = e
             while let c = got.compressed.pop() {
                 self.compressed.push(c)
@@ -350,9 +373,9 @@ impl Sending {
         self.dispatch(conn, mut out, mut problems, link)
     }
 
-    // Whether a batch of `size` bytes of packets can go to a codec thread, starting one if there's
-    // none, or if every one started has a batch and they'd have more than `THREAD_BYTES` each
-    // waiting with it.
+    // Whether a batch of `size` bytes of packets can go to a codec thread, starting the small
+    // batches' for a small one if it hasn't, or for a bigger one, another if there's none, or if
+    // every one started has a batch and they'd have more than `THREAD_BYTES` each with it.
     fn can_hand_over(mut self, link: Link, size: usize) -> bool {
         if self.no_waker {
             return false
@@ -366,7 +389,15 @@ impl Sending {
                 },
             }
         }
-        let busy = self.batches_away >= self.started and self.bytes_away + size > self.started * THREAD_BYTES
+        if size <= SMALL_BATCH {
+            if not self.small_started {
+                let waker = self.waker!
+                _ = unsafe { Thread.spawn(CodecThread { jobs: self.small_jobs.share(), done: self.to_done.share(), waker: waker }) }
+                self.small_started = true
+            }
+            return true
+        }
+        let busy = self.big_away >= self.started and self.big_bytes + size > self.started * THREAD_BYTES
         if self.started < self.most and (self.started == 0 or busy) {
             let waker = self.waker!
             _ = unsafe { Thread.spawn(CodecThread { jobs: self.jobs.share(), done: self.to_done.share(), waker: waker }) }
