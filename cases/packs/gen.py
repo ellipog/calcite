@@ -413,6 +413,48 @@ def dimension(**more):
     return json.dumps(data)
 
 
+def enchantment(*paths):
+    """An enchantment with an effect for each of `paths`, whose chance is a number from command
+    storage at that path, as `NbtPathArgument` reads it (CAL-78)."""
+    effects = [{
+        "affected": "attacker",
+        "enchanted": "victim",
+        "effect": {"type": "minecraft:change_item_damage", "amount": 1.0},
+        "requirements": {"type": "minecraft:random_chance", "chance": {"type": "minecraft:storage", "storage": "w:s", "path": p}},
+    } for p in paths]
+    return json.dumps({
+        "anvil_cost": 1,
+        "description": "e",
+        "effects": {"minecraft:post_attack": effects},
+        "max_cost": {"base": 1, "per_level_above_first": 0},
+        "max_level": 1,
+        "min_cost": {"base": 1, "per_level_above_first": 0},
+        "slots": ["any"],
+        "supported_items": "#minecraft:enchantable/weapon",
+        "weight": 1,
+    })
+
+
+# NBT paths that don't read, by what's wrong with them.
+BAD_PATHS = {
+    "double-dot": "a..b",
+    "no-dot": "a]",
+    "after-index": "[0]x",
+    "not-an-index": "[x]",
+    "fraction-index": "[1.5]",
+    "unclosed-index": "[1",
+    "unclosed-pattern-index": "[{a:1}",
+    "empty-name": '""',
+    "unclosed-quote": '"abc',
+    "bad-escape": '"a\\x"',
+    "bad-pattern": "abc{a:1",
+    "pattern-not-first": "a.{b:1}",
+    "two-roots": "{a:1}{b:2}",
+    "ends-in-bracket": "[",
+    "ends-in-bracket-after": "a[",
+}
+
+
 def tag(*values, replace=None):
     data = {"values": list(values)}
     if replace is not None:
@@ -508,8 +550,14 @@ def loading():
             ("data/w/dimension_type/bad.json", dimension(timelines="#w:missing")),
         ],
     }
+    for name, path in BAD_PATHS.items():
+        broken[f"nbt-path-{name}"] = [("data/w/enchantment/bad.json", enchantment(path))]
     for name, files in broken.items():
         cases.append(world(f"load-{name}", files))
+    # NBT paths that read, each written back as the text it was read from, which stops at a space.
+    cases.append(world("load-nbt-paths", [("data/w/enchantment/paths.json", enchantment(
+        "a", "a.b[0]", "a[-1][]", "{x:1b}.y", "a{x:1b}", "a[{x:1b}]", "\"q r\".'s\\'t'", "x-y_z:w+", "a b", "a.", "", " a",
+    ))]))
     # A registry of variants left empty, by a filter that hides vanilla's paintings and their tags.
     hide = {"block": [{"namespace": "minecraft", "path": "(tags/)?painting_variant/.*"}]}
     cases.append(world("load-no-paintings", [], meta(filter=hide)))
