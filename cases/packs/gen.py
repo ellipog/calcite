@@ -539,6 +539,28 @@ def tag(*values, replace=None):
     return json.dumps(data)
 
 
+def cat(*conditions, **more):
+    """A cat variant, with `conditions` as its spawn conditions, unless `more` gives them."""
+    fields = {"asset_id": "w:entity/cat/c", "baby_asset_id": "w:entity/cat/c_baby"}
+    fields["spawn_conditions"] = list(conditions)
+    fields.update(more)
+    return json.dumps({k: v for k, v in fields.items() if v is not None})
+
+
+def void_biome(features=None, carvers=None):
+    """Vanilla's `the_void`, with `features` in its last step and `carvers`."""
+    steps = [[] for _ in range(10)] + [features if features is not None else ["minecraft:void_start_platform"]]
+    return json.dumps({
+        "attributes": {"minecraft:visual/sky_color": "#7ba4ff"},
+        "carvers": carvers if carvers is not None else [],
+        "downfall": 0.5,
+        "effects": {"water_color": "#3f76e4"},
+        "features": steps,
+        "has_precipitation": False,
+        "temperature": 0.5,
+    })
+
+
 def loading():
     """The registries loaded from the picked packs, in a new world with one folder pack, `p`."""
     cases = [new_world(Case("load-vanilla")).load().done()]
@@ -627,6 +649,24 @@ def loading():
             ("data/w/dimension_type/bad.json", dimension(timelines="#w:missing")),
         ],
     }
+    variant = "data/w/cat_variant/bad.json"
+    broken.update({
+        "variant-no-spawn-conditions": [(variant, cat(spawn_conditions=None))],
+        "variant-no-priority": [(variant, cat({"condition": {"type": "minecraft:moon_brightness", "range": 1}}))],
+        "variant-bad-condition-type": [(variant, cat({"priority": 0, "condition": {"type": "minecraft:weather"}}))],
+        "variant-bad-moon": [(variant, cat({"priority": 0, "condition": {"type": "minecraft:moon_brightness", "range": "bright"}}))],
+        "variant-missing-structure": [(variant, cat({"priority": 0, "condition": {"type": "minecraft:structure", "structures": ["w:gone", "minecraft:swamp_hut", "a:gone"]}}))],
+        "variant-missing-structure-tag": [(variant, cat({"priority": 0, "condition": {"type": "minecraft:structure", "structures": "#w:gone"}}))],
+        "variant-missing-biome": [(variant, cat({"priority": 0, "condition": {"type": "minecraft:biome", "biomes": "w:gone"}}))],
+        "biome-missing-feature": [("data/w/worldgen/biome/v.json", void_biome(["w:gone", "minecraft:oak_checked"]))],
+        "biome-missing-carver": [("data/w/worldgen/biome/v.json", void_biome(carvers=["w:gone"]))],
+        "world-tag-missing-entry": [("data/w/tags/worldgen/structure/t.json", tag("w:gone", "minecraft:igloo"))],
+        "world-and-synced-unbound": [
+            ("data/w/worldgen/biome/v.json", void_biome(["w:gone"])),
+            ("data/w/dimension_type/bad.json", dimension(timelines=["w:gone"])),
+            (variant, cat({"priority": 0, "condition": {"type": "minecraft:structure", "structures": "#w:gone"}})),
+        ],
+    })
     for name, path in BAD_PATHS.items():
         broken[f"nbt-path-{name}"] = [("data/w/enchantment/bad.json", enchantment(path))]
     for name, effects in BAD_REQUIREMENTS.items():
@@ -638,6 +678,22 @@ def loading():
         "a", "a.b[0]", "a[-1][]", "{x:1b}.y", "a{x:1b}", "a[{x:1b}]", "\"q r\".'s\\'t'", "x-y_z:w+", "a b", "a.", "", " a",
     ))]))
     cases.append(world("load-requirements-allowed", [("data/w/enchantment/allowed.json", effects_enchantment(ALLOWED_REQUIREMENTS))]))
+    # Spawn conditions of each kind, naming the world registries' entries and tags, vanilla's and
+    # the pack's own, which a client isn't sent; and a biome naming placed features and carvers.
+    cases.append(world("load-world-references", [
+        ("data/w/cat_variant/c.json", cat(
+            {"priority": 0},
+            {"priority": 3, "condition": {"type": "minecraft:structure", "structures": "#w:huts"}},
+            {"priority": 2, "condition": {"type": "minecraft:structure", "structures": ["minecraft:swamp_hut", "minecraft:igloo"]}},
+            {"priority": 1, "condition": {"type": "minecraft:moon_brightness", "range": {"min": 0.25}}},
+            {"priority": 4, "condition": {"type": "minecraft:moon_brightness", "range": 0.5}},
+            {"priority": 5, "condition": {"type": "minecraft:biome", "biomes": ["minecraft:plains", "w:v"]}},
+            {"priority": 6, "condition": {"type": "biome", "biomes": "#minecraft:is_ocean"}},
+        )),
+        ("data/w/tags/worldgen/structure/huts.json", tag("minecraft:swamp_hut", "#minecraft:cats_spawn_in")),
+        ("data/w/worldgen/placed_feature/p.json", json.dumps({"feature": "minecraft:oak", "placement": []})),
+        ("data/w/worldgen/biome/v.json", void_biome(["w:p", "minecraft:oak_checked"], ["minecraft:cave", "minecraft:canyon"])),
+    ]))
     # A registry of variants left empty, by a filter that hides vanilla's paintings and their tags.
     hide = {"block": [{"namespace": "minecraft", "path": "(tags/)?painting_variant/.*"}]}
     cases.append(world("load-no-paintings", [], meta(filter=hide)))
