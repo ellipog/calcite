@@ -1,7 +1,7 @@
 """The protocol suites (P4.8, CAL-42): the rig's protocol bot runs the same scenarios against
 vanilla 26.3 and against Calcite, and the two sessions are compared packet by packet.
 
-    py -I rig/runner/sessions.py [--config NAME] [--scenario NAME] [--compare-only] [--show N]
+    py -I rig/runner/sessions.py [--config NAME] [--scenario NAME] [--compare-only] [--show N] [--tape]
 
 For each configuration, a set of server.properties, this starts vanilla in a fresh folder under
 build/rig/sessions/, sets what vanilla draws at random to fixed values from its console, runs
@@ -13,6 +13,7 @@ both servers' packets with vanilla's codecs, and the comparison lines them up a 
 has a difference no file in rig/differences/ explains.
 
 --compare-only reads and compares what the last run recorded, without starting either server.
+--tape has the rig's agent write each draw of vanilla's levels' randoms to tape.txt in its folder.
 """
 
 import argparse
@@ -95,6 +96,10 @@ BOT = "Bot"
 VANILLA_COMMANDS = [("gamerule respawn_radius 0", "respawn_radius")]
 # The data version both servers save, which a game rules file the rig writes is in.
 DATA_VERSION = 5023
+# Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent, which
+# with --tape also writes each of their draws to tape.txt in its folder, and Calcite's by
+# level-random-seed.
+LEVEL_RANDOM_SEED = 1103
 
 
 def offline_uuid(name):
@@ -125,11 +130,15 @@ def adapter():
     return json.loads(ADAPTER.read_text(encoding="utf-8"))
 
 
-def vanilla_argv(a):
-    """The adapter's java and class path, running vanilla's server with its own logging."""
+def vanilla_argv(a, tape=False):
+    """The adapter's java and class path, running vanilla's server with its own logging, and the
+    rig's agent, which seeds its levels' randoms, and with `tape` writes their draws (D311)."""
+    if "agent" not in a:
+        sys.exit("sessions: the vanilla adapter was built without the agent; run py -I oracle/vanilla-adapter/build.py")
     argv = a["argv"]
     cp = argv[argv.index("-cp") + 1]
-    return [argv[0], "-Xmx2G", "-Dfile.encoding=UTF-8", "-cp", cp, "net.minecraft.server.Main", "--nogui"]
+    agent = f"-javaagent:{a['agent']}=seed={LEVEL_RANDOM_SEED}" + (",tape=tape.txt" if tape else "")
+    return [argv[0], "-Xmx2G", "-Dfile.encoding=UTF-8", agent, "-cp", cp, "net.minecraft.server.Main", "--nogui"]
 
 
 def prepare(folder, config, port, vanilla):
@@ -162,7 +171,8 @@ def prepare(folder, config, port, vanilla):
         # Elliot accepted Mojang's EULA for the rig's own scratch servers (CAL-42).
         (folder / "eula.txt").write_text("eula=true\n", encoding="utf-8")
     else:
-        (folder / "calcite.properties").write_text("console-dashboard=off\nrecord-inputs=false\n", encoding="utf-8")
+        (folder / "calcite.properties").write_text(
+            f"console-dashboard=off\nrecord-inputs=false\nlevel-random-seed={LEVEL_RANDOM_SEED}\n", encoding="utf-8")
 
 
 class Server:
@@ -252,6 +262,7 @@ def main():
     ap.add_argument("--scenario", action="append", choices=SCENARIOS, help="only this scenario")
     ap.add_argument("--compare-only", action="store_true", help="compare the last run's sessions")
     ap.add_argument("--show", type=int, default=3, help="differences shown for each packet, 0 for all")
+    ap.add_argument("--tape", action="store_true", help="write vanilla's levels' draws to tape.txt in its folder")
     args = ap.parse_args()
     configs = args.config or list(CONFIGS)
     complete = args.config is None and args.scenario is None
@@ -269,7 +280,7 @@ def main():
             if not scenarios[config]:
                 continue
             print(f"{config}:", flush=True)
-            record(config, "vanilla", vanilla_argv(a), bot, scenarios[config])
+            record(config, "vanilla", vanilla_argv(a, args.tape), bot, scenarios[config])
             record(config, "calcite", [str(server)], bot, scenarios[config])
     files = [SESSIONS / c / side / f"{s}.bin" for c in configs for side in ("vanilla", "calcite") for s in scenarios[c]]
     if not files:

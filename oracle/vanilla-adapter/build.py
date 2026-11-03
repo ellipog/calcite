@@ -81,6 +81,19 @@ def unpack(version):
     return classpath
 
 
+def write_agent(classes):
+    """The agent's jar, build/<platform>/agent.jar: its manifest, which names the class whose
+    premain starts it, and the classes of calcite.rig.vanilla.agent. The game's classes stay on
+    the class path the server runs with, from which the agent's hooks find them."""
+    jar = BUILD / "agent.jar"
+    manifest = "Manifest-Version: 1.0\r\nPremain-Class: calcite.rig.vanilla.agent.Agent\r\n\r\n"
+    with zipfile.ZipFile(jar, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("META-INF/MANIFEST.MF", manifest)
+        for f in sorted((classes / "calcite" / "rig" / "vanilla" / "agent").glob("*.class")):
+            z.write(f, f.relative_to(classes).as_posix())
+    return jar
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--version", default="26.3")
@@ -106,6 +119,7 @@ def main():
     )
     if javac.returncode != 0:
         sys.exit("build: javac failed")
+    agent = write_agent(classes)
 
     adapter = {
         "adapter": "vanilla",
@@ -127,6 +141,9 @@ def main():
             "intrinsics": [],
         },
         "default_config": "strict-math",
+        # The rig's Java agent (D311), for a vanilla server started with
+        # -javaagent:<agent>=seed=N[,tape=PATH]: its levels' randoms seeded, their draws taped.
+        "agent": str(agent),
     }
     (BUILD / "adapter.json").write_text(json.dumps(adapter, indent=2) + "\n", encoding="utf-8")
     print(f"build: wrote {BUILD / 'adapter.json'}")

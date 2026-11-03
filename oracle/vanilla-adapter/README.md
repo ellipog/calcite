@@ -74,6 +74,9 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `PacketCheck.java` | Vanilla reading Calcite's packets, run by `check_packets.py` |
 | `ChatCheck.java` | Vanilla's client checking the signed chat in `build/packets/chat/`, run by `check_packets.py` |
 | `SessionDump.java` | Vanilla reading the protocol bot's sessions, as trees, run by `rig/runner/sessions.py` |
+| `agent/Agent.java` | The rig's Java agent: its arguments, and the two classes it changes as they load |
+| `agent/Levels.java` | What it does as each level's made: its random seeded, the entity counter set back |
+| `agent/Tape.java` | The RNG tape: each draw of a level's random, with where it was drawn |
 | `WorldCheck.java` | Vanilla reading a world it saved and the same world saved by Calcite, with `RegionFile`, `NbtIo` and Gson, and comparing them file by file and chunk by chunk, run by `rig/runner/roundtrip.py` (`G5.2`) |
 | `RegistriesProbe.java` | `registries`: the vanilla data pack's registries and tags, loaded once as `WorldLoader.load` loads them |
 | `NoiseProbe.java` | `noise`: `PerlinNoise`, `SmearedPerlinNoise`, `SimplexNoise`, the stacks `NormalNoise` and `BlendedNoise.createFbm` make, sampled with `get` and `addToVolume` |
@@ -84,6 +87,19 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 - **Malformed cases throw `CaseError`.** `Args` reads every field and throws `CaseError` for anything missing or mistyped. So any other exception came from the game, and becomes a rejection result instead of an error.
 - **Bits, not text.** Floats go out as raw bits in a blob, never formatted.
 
-## Randomness in later probes
+## The agent
 
-Vanilla isn't repeatable run to run. Each level's `random` is seeded from `RandomSupport.generateUniqueSeed()`, which mixes in `System.nanoTime()`, and the entity ID counter is a static `AtomicInteger`. The Phase 1 probes don't touch either. Probes that run a level (random ticks, spawning, mob AI) will need the Java agent from the plan's layout to pin both, so the self-check can pass.
+Vanilla isn't repeatable run to run. Each level's `random` is seeded from `RandomSupport.generateUniqueSeed()`, which mixes in `System.nanoTime()`, and the entity ID counter is a static `AtomicInteger`, `ServerLevel.ENTITY_COUNTER`. The Phase 1 probes touch neither. For what does, the build also writes `build/<platform>/agent.jar`, the rig's Java agent ([D311](../../docs/decisions.md)), and names it in `adapter.json`'s `agent`. A vanilla server started with `-javaagent:agent.jar=seed=N`:
+
+- seeds each level's random, as the level's made, with `mixStafford13(N ^ name.hashCode())`, the name its dimension's, such as `minecraft:overworld`. Calcite's `level-random-seed=N` seeds its own the same way;
+- sets the entity counter back to 0 as the Overworld's level is made, so the first entity is 1;
+- with `,tape=PATH` as well, writes each value a level's random draws to `PATH`, the RNG tape, a line each: the level, its game time, the bits drawn, the value, and the two frames of the stack that asked for it outside the random classes.
+
+```
+# seed 1103
+minecraft:overworld 0 31 1530525153 Mth.randomBetweenInclusive:823 UniformInt.sample:27
+minecraft:overworld 0 31 353078769 Mth.randomBetweenInclusive:823 UniformInt.sample:27
+minecraft:overworld 1 31 699777690 PhantomSpawner.tick:41 ServerLevel.tickCustomSpawners:501
+```
+
+It changes two classes as they load, with the JDK's own `java.lang.classfile`: `ServerLevel`'s constructors call `Levels.made` before they return, and `LegacyRandomSource.next`, which every draw of a level's random comes down to, hands each value it returns to `Tape.drew`. A change that fails stops the server, which would otherwise run unseeded. The rig's runners start every vanilla server with it, at seed 1103.
