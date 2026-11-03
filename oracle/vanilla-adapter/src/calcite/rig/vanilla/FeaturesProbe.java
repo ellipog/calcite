@@ -409,6 +409,21 @@ final class FeaturesProbe implements Probe {
             shared = value.getAsBoolean();
         }
         Map<Long, ProtoChunk> world = shared ? new HashMap<>() : null;
+        // Final: a shared world's chunks written once, after the last op, rather than each op's
+        // nine after it, so the same chunks decorated in two orders can be compared (CAL-33).
+        boolean finalOnly = false;
+        if (input.has("final")) {
+            JsonElement value = input.get("final");
+            if (!value.isJsonPrimitive() || !value.getAsJsonPrimitive().isBoolean()) {
+                throw new CaseError("`final` must be a boolean");
+            }
+            finalOnly = value.getAsBoolean();
+        }
+        if (finalOnly && !shared) {
+            throw new CaseError("`final` needs `shared`");
+        }
+        boolean anyStructured = false;
+        List<int[]> allPoi = new ArrayList<>();
         for (int i = 0; i < opList.size(); i++) {
             String what = "`ops`[" + i + "]";
             if (!opList.get(i).isJsonArray() || opList.get(i).getAsJsonArray().isEmpty()) {
@@ -426,6 +441,7 @@ final class FeaturesProbe implements Probe {
                     throw new CaseError(what + " must have 3 elements");
                 }
                 steps.add(new long[] {2, Args.asInt(op.get(1), what + "[1]"), Args.asInt(op.get(2), what + "[2]")});
+                anyStructured = true;
             } else if (kind.equals("place")) {
                 if (op.size() != 7) {
                     throw new CaseError(what + " must have 7 elements");
@@ -544,6 +560,10 @@ final class FeaturesProbe implements Probe {
                     random.setSeed(op[6]);
                     feature.value().place(region, generator, random, new BlockPos((int) op[3], (int) op[4], (int) op[5]));
                 }
+                if (finalOnly) {
+                    allPoi.addAll(fake.poi);
+                    continue;
+                }
                 for (int dz = -1; dz <= 1; dz++) {
                     for (int dx = -1; dx <= 1; dx++) {
                         write(chunks.get(ChunkPos.pack(cx + dx, cz + dz)), access, out, op[0] == 2);
@@ -551,6 +571,25 @@ final class FeaturesProbe implements Probe {
                 }
                 out.writeInt(fake.poi.size());
                 for (int[] p : fake.poi) {
+                    for (int v : p) {
+                        out.writeInt(v);
+                    }
+                }
+            }
+            if (finalOnly) {
+                // Each chunk of the world, by `z` and then `x`, each with its position; then every
+                // op's point-of-interest changes, in order of their numbers.
+                List<Long> keys = new ArrayList<>(world.keySet());
+                keys.sort(Comparator.<Long>comparingInt(k -> ChunkPos.getZ(k)).thenComparingInt(k -> ChunkPos.getX(k)));
+                out.writeInt(keys.size());
+                for (long key : keys) {
+                    out.writeInt(ChunkPos.getX(key));
+                    out.writeInt(ChunkPos.getZ(key));
+                    write(world.get(key), access, out, anyStructured);
+                }
+                allPoi.sort((a, b) -> java.util.Arrays.compare(a, b));
+                out.writeInt(allPoi.size());
+                for (int[] p : allPoi) {
                     for (int v : p) {
                         out.writeInt(v);
                     }

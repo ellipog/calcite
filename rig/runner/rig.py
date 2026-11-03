@@ -407,6 +407,43 @@ def _hexdump(data, start, width=16):
     return f"{start:08x}  {chunk.hex(' ')}"
 
 
+# The orders `cases/features/orders.py` decorates each area's chunks in.
+ORDERS = ["colored", "rows", "reverse", "center-out"]
+
+
+def cmd_orders(args):
+    """For each area of cases/features/orders.json, whether vanilla's recorded world is the same
+    in every order its chunks were decorated in, and which orders agree where it isn't (CAL-33)."""
+    store = Store(ROOT, args.version)
+    expected = store.expected("features")
+    groups = {}
+    for case in load_cases(["features"]).get("features", []):
+        if not case.id.startswith("orders-"):
+            continue
+        order = next((o for o in ORDERS if case.id.endswith("-" + o)), None)
+        if order is None:
+            continue
+        area = case.id[len("orders-"):-len(order) - 1]
+        groups.setdefault(area, {})[order] = expected.get(case.id)
+    if not groups:
+        die("no order cases: run cases/features/orders.py, then record them")
+    same = 0
+    for area, by_order in sorted(groups.items()):
+        missing = [o for o in ORDERS if by_order.get(o) is None]
+        if missing:
+            print(f"{area}: not recorded in {', '.join(missing)}")
+            continue
+        alike = {}
+        for o in ORDERS:
+            alike.setdefault(by_order[o], []).append(o)
+        if len(alike) == 1:
+            same += 1
+            print(f"{area}: the same in every order")
+        else:
+            print(f"{area}: differs: {' | '.join(' = '.join(os) for os in alike.values())}")
+    print(f"{same} of {len(groups)} areas the same in every order")
+
+
 def cmd_diff(args):
     store = Store(ROOT, args.version)
     by_probe = load_cases([args.probe])
@@ -472,6 +509,9 @@ def main():
     p.add_argument("--config", help="when scoring vanilla itself, the configuration to run it in")
     p.add_argument("--strict", action="store_true", help="exit with status 1 if any case fails or errors")
     p.set_defaults(fn=cmd_score)
+
+    p = sub.add_parser("orders", help="whether vanilla's decorations came out the same in each order (CAL-33)")
+    p.set_defaults(fn=cmd_orders)
 
     p = sub.add_parser("diff", help="compare one case's result with vanilla's golden")
     p.add_argument("probe")

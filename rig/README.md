@@ -46,6 +46,7 @@ py -I rig/runner/rig.py record --config all      # run vanilla; write goldens an
 py -I rig/runner/rig.py check --variants all     # the self-check
 py -I rig/runner/rig.py score                    # score Calcite
 py -I rig/runner/rig.py diff rng legacy-seed-0   # one case, Calcite's result against vanilla's golden
+py -I rig/runner/rig.py orders                   # whether vanilla's decorations depend on their order
 py -I rig/runner/mathcmp.py                      # Math against StrictMath, 500,000 arguments per range
 ```
 
@@ -80,6 +81,8 @@ Runs vanilla again and compares with its own expected hashes (`P1.3`, `P1.4`). A
 | `c2` | Only C2, compiling early |
 | `serial-1cpu` | Serial GC on one CPU |
 | `parallel-8cpu` | Parallel GC on eight CPUs |
+
+Generation order isn't a variant, since a case's ops say it: the same chunks decorated in different orders are cases of their own, `cases/features/orders.json`, each giving the world its decorations left (`final`). They repeat like any other case, and Calcite has to match each order. `orders` says which came out the same whatever the order (CAL-33).
 
 With `--quarantine`, the cases that didn't repeat are added to `expected/26.3/quarantine.json`, with what varied. Quarantined cases aren't scored. Quarantine a case only after reading why it varies; if Calcite should do something definite instead, add a [difference](differences/README.md) too.
 
@@ -143,6 +146,7 @@ py -I cases/carvers/gen.py       # cases/carvers/generated.json
 py -I cases/features/gen.py      # cases/features/generated.json
 py -I cases/features/structured.py  # cases/features/structured.json
 py -I cases/features/grid.py     # cases/features/grid.json
+py -I cases/features/orders.py   # cases/features/orders.json
 py -I cases/structures/gen.py    # cases/structures/generated.json
 ```
 
