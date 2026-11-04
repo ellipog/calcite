@@ -1,22 +1,30 @@
 /// Random ticks, as `ServerLevel.tickChunk` gives a chunk's blocks theirs, and what a block does
-/// with its tick, as far as Calcite has it (P6.1, D318).
+/// with its tick, by the class that declares its `randomTick`, as vanilla's own says (P6.1, D318,
+/// D338).
 ///
 /// Each chunk whose blocks tick picks `random_tick_speed` places in each of its sections with a
 /// block or fluid that ticks at random, through `BlockRandom`, the level's `getBlockRandomPos`,
-/// and ticks the block there if it ticks at random. What a block does with its tick draws from
-/// the level's random: Calcite has grass's and mycelium's, which spread, drawing 12 times where
-/// the light above them is 9 or more, and budding amethyst's, which picks a side to grow a bud
-/// on one time in five (D320). Each sets the blocks it changes through the level, as vanilla's
-/// `setBlockAndUpdate` (D321): grass and mycelium spread to dirt and die back to it, and buds
-/// grow. The other blocks' ticks, and lava's, come with CAL-106.
+/// and ticks the block there if it ticks at random, then its fluid if that does, which is lava's.
+/// What a block does with its tick draws from the level's random, and it sets the blocks it
+/// changes through the level (D321). Grass and mycelium spread, drawing 12 times where the light
+/// above them is 9 or more, and die back to dirt; budding amethyst grows a bud one time in five
+/// (D320). Lava draws where fire may spread from it, near a player, twice for each tick, its
+/// block's and its fluid's; ice melts and snow goes in block light over 11; a mushroom spreads one
+/// time in 25; sugar cane grows; decaying leaves go; and a nether portal draws nothing in a
+/// peaceful world (D338). What those leave out, the fire lava sets, what snow and leaves drop and
+/// a portal's piglins, and every other class's tick, is reported once and left out.
 module world.random_ticks
 
 import random.source.{RandomSource}
-import world.block_flags.{RANDOMLY_TICKING}
+import world.block_flags.{FLUID_RANDOMLY_TICKING, RANDOMLY_TICKING}
+import world.block_updates.{BlockLevel, remove_block}
 import world.light.{LightStates, UP}
 import world.level_writer.{LevelWriter, UPDATE_ALL}
 import world.natural.{SpawnLevel, raw_brightness}
+import worldgen.access.{BlockAccess}
 import worldgen.facts.{BlockSet, Facts, WATER_FLUID, direction_name, step_x, step_y, step_z}
+import worldgen.interval.{Thrown}
+import worldgen.survive.{Env, can_survive}
 
 /// `Level.randValue`, which `getBlockRandomPos` steps to pick where random ticks and
 /// precipitation land, a linear congruential generator of its own, apart from the level's
@@ -35,12 +43,58 @@ impl BlockRandom {
     }
 }
 
-/// What random ticks read of the blocks, made once: the blocks whose ticks Calcite has and those
-/// they make, the blocks that make grass snowy, `BlockTags.SNOW`, and how light goes between
-/// states, which grass reads.
+/// What a chunk's random ticks read besides its blocks, the same for each chunk of a level in a
+/// tick: how much the sky's darkened, where the players who aren't spectators are, how far from
+/// them fire spreads, the game rule `fire_spread_radius_around_player`, whether the dimension's
+/// water evaporates, and whether the world is peaceful (D338).
+pub struct TickPlace {
+    pub darken: i32 = 0
+    pub players: List<(f64, f64, f64)> = List<(f64, f64, f64)>()
+    pub fire_radius: i32 = 128
+    pub evaporates: bool = false
+    pub peaceful: bool = false
+}
+
+impl TickPlace {
+    /// `ServerLevel.canSpreadFireAround`: the game rule at -1, or a player nearer than it to the
+    /// block's corner, as `ChunkMap.anyPlayerCloseEnoughTo` measures it.
+    pub fn fire_spreads(self, x: i32, y: i32, z: i32) -> bool {
+        if self.fire_radius == -1 {
+            return true
+        }
+        let radius = f64(self.fire_radius)
+        for (px, py, pz) in self.players {
+            let dx = px - f64(x)
+            let dy = py - f64(y)
+            let dz = pz - f64(z)
+            if (dx * dx + dy * dy + dz * dz).sqrt() < radius {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+// What each block's random tick is, by the class that declares its `randomTick`.
+const NOTHING: u8 = 0
+const SPREADING: u8 = 1
+const BUDDING: u8 = 2
+const LIQUID: u8 = 3
+const ICE: u8 = 4
+const SNOW_LAYER: u8 = 5
+const MUSHROOM: u8 = 6
+const SUGAR_CANE: u8 = 7
+const LEAVES: u8 = 8
+const NETHER_PORTAL: u8 = 9
+const OTHER: u8 = 255
+
+/// What random ticks read of the blocks, made once: each block's tick, by the class that
+/// declares it, the blocks the ticks make, the blocks that make grass snowy, `BlockTags.SNOW`,
+/// those lava's fire doesn't spread past, `BlockTags.BLOCKS_LAVA_FIRE_SPREAD`, and how light goes
+/// between states, which grass and ice read.
 pub struct RandomTicks {
     light: LightStates
-    budding: u32
+    kinds: List<u8>
     grass: u32
     mycelium: u32
     snow: u32
@@ -51,13 +105,18 @@ pub struct RandomTicks {
     large_bud: u32
     cluster: u32
     snowy: BlockSet
+    stops_fire: BlockSet
 }
 
 impl RandomTicks {
     pub fn new(facts: Facts) -> RandomTicks ! String {
+        var kinds = List<u8>()
+        for b in 0..facts.block_count {
+            kinds.push(kind_of(facts.random_tick_class(b)))
+        }
         return RandomTicks {
             light: LightStates.new(),
-            budding: try block_id(facts, "minecraft:budding_amethyst"),
+            kinds: kinds,
             grass: try block_id(facts, "minecraft:grass_block"),
             mycelium: try block_id(facts, "minecraft:mycelium"),
             snow: try block_id(facts, "minecraft:snow"),
@@ -68,21 +127,68 @@ impl RandomTicks {
             large_bud: try block_id(facts, "minecraft:large_amethyst_bud"),
             cluster: try block_id(facts, "minecraft:amethyst_cluster"),
             snowy: facts.tag(String("minecraft:snow")),
+            stops_fire: facts.tag(String("minecraft:blocks_lava_fire_spread")),
         }
     }
 
     /// The random tick of the block `state` at `x`, `y`, `z`, `BlockState.randomTick`, if it
-    /// ticks at random, with the sky darkened by `darken`, drawing from the level's random and
-    /// setting the blocks it changes in the level, as one (D323).
-    pub fn tick<L: SpawnLevel + LevelWriter + RandomSource>(self, facts: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32, darken: i32) {
-        if facts.flags(state) & RANDOMLY_TICKING == 0 {
+    /// ticks at random, then of its fluid, `FluidState.randomTick`, if that does, as `tickChunk`
+    /// gives them, with what `place` says of the level, drawing from the level's random and
+    /// setting the blocks they change in the level (D323, D338).
+    pub fn tick<L: SpawnLevel + LevelWriter + RandomSource + BlockAccess + BlockLevel>(self, e: Env, level: mut L, place: TickPlace, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+        let Env { facts: f, .. } = e
+        let flags = f.flags(state)
+        if flags & RANDOMLY_TICKING != 0 {
+            try self.block_tick(e, mut level, place, state, x, y, z)
+        }
+        // The fluid of the state as it was before its block's tick, as vanilla reads it.
+        if flags & FLUID_RANDOMLY_TICKING != 0 {
+            try self.lava_tick(f, mut level, place, x, y, z)
+        }
+    }
+
+    // `BlockState.randomTick`, by the class that declares it.
+    fn block_tick<L: SpawnLevel + LevelWriter + RandomSource + BlockAccess + BlockLevel>(self, e: Env, level: mut L, place: TickPlace, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+        let Env { facts: f, .. } = e
+        let block = f.block(state)
+        let kind = self.kinds[usize(block)]
+        if kind == NOTHING {
             return
         }
-        let block = facts.block(state)
-        if block == self.grass or block == self.mycelium {
-            self.spread(facts, mut level, state, x, y, z, darken)
-        } else if block == self.budding {
-            self.grow_bud(facts, mut level, x, y, z)
+        if kind == SPREADING {
+            self.spread(f, mut level, state, x, y, z, place.darken)
+        } else if kind == BUDDING {
+            self.grow_bud(f, mut level, x, y, z)
+        } else if kind == LIQUID {
+            // `LiquidBlock.randomTick`: its fluid's, which `tickChunk` gives it again after.
+            try self.lava_tick(f, mut level, place, x, y, z)
+        } else if kind == ICE {
+            try self.melt_ice(f, mut level, place, state, x, y, z)
+        } else if kind == SNOW_LAYER {
+            // `SnowLayerBlock.randomTick`: in block light over 11 it drops what it drops and goes.
+            if level.light(false, x, y, z) > 11 {
+                level.unimplemented(String("What a block drops"))
+                _ = try remove_block(f, mut level, x, y, z)
+            }
+        } else if kind == MUSHROOM {
+            try spread_mushroom(e, mut level, state, x, y, z)
+        } else if kind == SUGAR_CANE {
+            try grow_cane(f, mut level, state, x, y, z)
+        } else if kind == LEAVES {
+            // `LeavesBlock.randomTick`: leaves decaying, far from a log and not placed, drop what
+            // they drop and go; only those tick at random.
+            if not f.get_bool(state, "persistent") and f.get_int(state, String("distance")) == some(7) {
+                level.unimplemented(String("What a block drops"))
+                _ = try remove_block(f, mut level, x, y, z)
+            }
+        } else if kind == NETHER_PORTAL {
+            // `NetherPortalBlock.randomTick` draws only where monsters spawn, and spawns a
+            // zombified piglin, which comes with entities.
+            if not place.peaceful {
+                level.unimplemented(String("randomTick of NetherPortalBlock"))
+            }
+        } else {
+            level.unimplemented("randomTick of {f.random_tick_class(block)}")
         }
     }
 
@@ -160,6 +266,190 @@ impl RandomTicks {
         }
         return self.light.dampening_into(state, above, UP) < 15
     }
+
+    // `LavaFluid.randomTick`, where fire may spread around it: up to two blocks up and about it,
+    // drawn, or three beside it, drawn, each in a loaded chunk. Fire would go in the first air
+    // above the lava by something lava sets alight, or above something beside it lava sets
+    // alight; fire isn't in Calcite yet, so that's reported. Rising, it stops at a block that
+    // stops it, `BLOCKS_LAVA_FIRE_SPREAD`.
+    fn lava_tick<L: SpawnLevel + RandomSource + BlockLevel>(self, f: Facts, level: mut L, place: TickPlace, x: i32, y: i32, z: i32) ! Thrown {
+        if not place.fire_spreads(x, y, z) {
+            return
+        }
+        let passes = level.next_int_below(3)
+        if passes > 0 {
+            var tx = x
+            var ty = y
+            var tz = z
+            for _ in 0..passes {
+                tx += level.next_int_below(3) - 1
+                ty += 1
+                tz += level.next_int_below(3) - 1
+                if not level.is_loaded(tx, ty, tz) {
+                    return
+                }
+                let there = level.spawn_state(tx, ty, tz)
+                if f.is_air(there) {
+                    if flammable_beside(f, level, tx, ty, tz) {
+                        level.unimplemented(String("Fire that lava sets"))
+                        return
+                    }
+                } else if f.in_set(there, self.stops_fire) {
+                    return
+                }
+            }
+            return
+        }
+        for _ in 0..3 {
+            let tx = x + level.next_int_below(3) - 1
+            let tz = z + level.next_int_below(3) - 1
+            if not level.is_loaded(tx, y, tz) {
+                return
+            }
+            if f.is_air(level.spawn_state(tx, y + 1, tz)) and flammable(f, level, tx, y, tz) {
+                level.unimplemented(String("Fire that lava sets"))
+            }
+        }
+    }
+
+    // `IceBlock.randomTick`: in block light over 11 less its own dampening, it melts, `melt`: it
+    // goes where water evaporates, and is water elsewhere, which is told its block changed.
+    fn melt_ice<L: SpawnLevel + LevelWriter + BlockAccess + BlockLevel>(self, f: Facts, level: mut L, place: TickPlace, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+        if level.light(false, x, y, z) <= 11 - self.light.dampening(state) {
+            return
+        }
+        if place.evaporates {
+            _ = try remove_block(f, mut level, x, y, z)
+            return
+        }
+        _ = level.set_block(x, y, z, f.ids.water_state, UPDATE_ALL)
+        level.neighbour_changed(x, y, z, f.ids.water)
+    }
+}
+
+// `LavaFluid.hasFlammableNeighbours`: one of the six around, in `Direction`'s order, lava
+// sets alight.
+fn flammable_beside<L: SpawnLevel + BlockLevel>(f: Facts, level: L, x: i32, y: i32, z: i32) -> bool {
+    for d in 0..6 {
+        if flammable(f, level, x + step_x(d), y + step_y(d), z + step_z(d)) {
+            return true
+        }
+    }
+    return false
+}
+
+// `LavaFluid.isFlammable`: not in a chunk that isn't loaded, inside the world's height, else
+// what's there lava sets alight, `ignitedByLava`.
+fn flammable<L: SpawnLevel + BlockLevel>(f: Facts, level: L, x: i32, y: i32, z: i32) -> bool {
+    if level.in_height(y) and not level.is_loaded(x, y, z) {
+        return false
+    }
+    return f.ignited_by_lava(level.spawn_state(x, y, z))
+}
+
+// `MushroomBlock.randomTick`: one time in 25, where at most 4 of it are in the 9 by 3 by 9
+// around it, `canSpread`, it looks five times at a place drawn about where it's got to,
+// moving there each time it's air it can stay in, and grows in the last, set with flags 2.
+fn spread_mushroom<L: SpawnLevel + LevelWriter + RandomSource + BlockAccess>(e: Env, level: mut L, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+    let Env { facts: f, .. } = e
+    if level.next_int_below(25) != 0 {
+        return
+    }
+    let block = f.block(state)
+    var found = 0
+    for ax in x - 4..x + 5 {
+        for ay in y - 1..y + 2 {
+            for az in z - 4..z + 5 {
+                if f.is(level.spawn_state(ax, ay, az), block) {
+                    found += 1
+                }
+            }
+        }
+    }
+    if found > 4 {
+        return
+    }
+    var at_x = x
+    var at_y = y
+    var at_z = z
+    // `pos.offset(nextInt(3) - 1, nextInt(2) - nextInt(2), nextInt(3) - 1)`, drawn in order.
+    var tx = at_x + level.next_int_below(3) - 1
+    var ty = at_y + level.next_int_below(2)
+    ty -= level.next_int_below(2)
+    var tz = at_z + level.next_int_below(3) - 1
+    for _ in 0..4 {
+        if f.is_air(level.spawn_state(tx, ty, tz)) and try can_survive(e, level, state, tx, ty, tz) {
+            at_x = tx
+            at_y = ty
+            at_z = tz
+        }
+        tx = at_x + level.next_int_below(3) - 1
+        ty = at_y + level.next_int_below(2)
+        ty -= level.next_int_below(2)
+        tz = at_z + level.next_int_below(3) - 1
+    }
+    if f.is_air(level.spawn_state(tx, ty, tz)) and try can_survive(e, level, state, tx, ty, tz) {
+        _ = level.set_block(tx, ty, tz, state, 2)
+    }
+}
+
+// `SugarCaneBlock.randomTick`: with air above, and fewer than three of it in its stack down
+// from it, it ages, set with flags 260; at 15 it grows a new cane above, `setBlockAndUpdate`,
+// and goes back to 0.
+fn grow_cane<L: SpawnLevel + LevelWriter>(f: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+    if not f.is_air(level.spawn_state(x, y + 1, z)) {
+        return
+    }
+    let block = f.block(state)
+    var height = 1
+    while f.is(level.spawn_state(x, y - height, z), block) {
+        height += 1
+    }
+    if height >= 3 {
+        return
+    }
+    let age = f.get_int(state, String("age")) ?? 0
+    if age == 15 {
+        _ = level.set_block(x, y + 1, z, f.default_state(block), UPDATE_ALL)
+        _ = level.set_block(x, y, z, try f.with_int(state, String("age"), 0), 260)
+    } else {
+        _ = level.set_block(x, y, z, try f.with_int(state, String("age"), age + 1), 260)
+    }
+}
+
+// A block's random tick, by the name of the class that declares its `randomTick`.
+fn kind_of(name: String) -> u8 {
+    if name == "BlockBehaviour" {
+        return NOTHING
+    }
+    if name == "SpreadingSnowyBlock" {
+        return SPREADING
+    }
+    if name == "BuddingAmethystBlock" {
+        return BUDDING
+    }
+    if name == "LiquidBlock" {
+        return LIQUID
+    }
+    if name == "IceBlock" {
+        return ICE
+    }
+    if name == "SnowLayerBlock" {
+        return SNOW_LAYER
+    }
+    if name == "MushroomBlock" {
+        return MUSHROOM
+    }
+    if name == "SugarCaneBlock" {
+        return SUGAR_CANE
+    }
+    if name == "LeavesBlock" {
+        return LEAVES
+    }
+    if name == "NetherPortalBlock" {
+        return NETHER_PORTAL
+    }
+    return OTHER
 }
 
 // The block named `name`, which the data has.

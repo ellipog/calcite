@@ -207,13 +207,15 @@ final class BlockFlags {
         StringBuilder survive = new StringBuilder();
         StringBuilder placeOn = new StringBuilder();
         StringBuilder shape = new StringBuilder();
-        // What a block does as the blocks around it change, as it's placed, once it's gone and as
-        // its scheduled tick runs: the class whose `neighborChanged`, `onPlace`,
-        // `affectNeighborsAfterRemoval` and `tick` it runs (D325).
+        // What a block does as the blocks around it change, as it's placed, once it's gone, as
+        // its scheduled tick runs and as a random tick comes to it: the class whose
+        // `neighborChanged`, `onPlace`, `affectNeighborsAfterRemoval`, `tick` (D325) and
+        // `randomTick` (D338) it runs.
         StringBuilder neighbour = new StringBuilder();
         StringBuilder place = new StringBuilder();
         StringBuilder removal = new StringBuilder();
         StringBuilder tick = new StringBuilder();
+        StringBuilder randomTick = new StringBuilder();
         // `FireBlock.canBurn`: the blocks fire's ignite odds are above 0 for.
         StringBuilder flammable = new StringBuilder();
         // The blocks that are `LiquidBlockContainer`s, as structure templates fill them: those that
@@ -270,10 +272,13 @@ final class BlockFlags {
                     BlockPos.class, boolean.class);
             String tk = declaring(type, "tick", BlockState.class, net.minecraft.server.level.ServerLevel.class, BlockPos.class,
                     net.minecraft.util.RandomSource.class);
+            String rt = declaring(type, "randomTick", BlockState.class, net.minecraft.server.level.ServerLevel.class, BlockPos.class,
+                    net.minecraft.util.RandomSource.class);
             neighbour.append(id == 0 ? "\"" : ", \"").append(nc).append("\"");
             place.append(id == 0 ? "\"" : ", \"").append(op).append("\"");
             removal.append(id == 0 ? "\"" : ", \"").append(ar).append("\"");
             tick.append(id == 0 ? "\"" : ", \"").append(tk).append("\"");
+            randomTick.append(id == 0 ? "\"" : ", \"").append(rt).append("\"");
             Block block = BuiltInRegistries.BLOCK.byId(id);
             int instrument = block.defaultBlockState().instrument().ordinal();
             for (BlockState each : block.getStateDefinition().getPossibleStates()) {
@@ -319,6 +324,7 @@ final class BlockFlags {
         json.append("  \"place_classes\": [").append(place).append("],\n");
         json.append("  \"removal_classes\": [").append(removal).append("],\n");
         json.append("  \"tick_classes\": [").append(tick).append("],\n");
+        json.append("  \"random_tick_classes\": [").append(randomTick).append("],\n");
         json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
         json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");
         json.append("  \"liquid_containers\": [").append(containers).append("],\n");

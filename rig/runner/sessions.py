@@ -86,6 +86,8 @@ class Config:
     spawn: tuple | None = None
     # Whether the copy keeps the world's entities, each dimension's `entities` folder.
     entities: bool = True
+    # Game rules set in the copy's game_rules.dat, which both servers read, by their names.
+    rules: tuple = ()
 
 
 CONFIGS = {
@@ -97,8 +99,11 @@ CONFIGS = {
     # there, as each server finds it (CAL-75).
     "saved": Config({}, view=3, scenarios=("join",), world=SAVED_WORLD, spawn=(0, 100, 0)),
     # The same world without its entities, so its blocks' random ticks show on the tape past the
-    # mobs, whose brains draw first, and the End's crystals, which come with entities (CAL-106).
-    "terrain": Config({}, view=3, scenarios=("join",), world=SAVED_WORLD, spawn=(0, 100, 0), entities=False),
+    # mobs, whose brains draw first, and the End's crystals, which come with entities (CAL-106);
+    # and without natural spawning, `spawn_mobs` off, whose first mob's `finalizeSpawn` drew
+    # where Calcite has no mob to draw for, so the tape goes on past it (D338).
+    "terrain": Config({}, view=3, scenarios=("join",), world=SAVED_WORLD, spawn=(0, 100, 0), entities=False,
+                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
@@ -182,6 +187,8 @@ def prepare(folder, config, port, vanilla):
     if rules.is_file():
         saved = nbt.read(rules)
         saved["data"]["minecraft:respawn_radius"] = nbt.Int(0)
+        for name, value in c.rules:
+            saved["data"][name] = value
         nbt.write(rules, saved)
     elif not vanilla:
         nbt.write(rules, {"data": {"minecraft:respawn_radius": nbt.Int(0)}, "DataVersion": nbt.Int(DATA_VERSION)})
