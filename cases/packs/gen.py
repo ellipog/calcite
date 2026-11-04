@@ -381,6 +381,86 @@ def links():
     return cases
 
 
+def item_dialog(*items):
+    """A notice whose body shows each item, as `ItemStackTemplate.CODEC` reads it (CAL-77)."""
+    return json.dumps({"type": "minecraft:notice", "title": "T", "body": [{"type": "minecraft:item", "item": i} for i in items]})
+
+
+def with_components(components, item="minecraft:stone"):
+    return {"id": item, "components": components}
+
+
+# Components of each type Calcite reads, in shapes vanilla writes back another way: IDs without
+# their namespace, defaults given, one block predicate alone, numbers that are other numbers.
+ITEM_COMPONENTS = [
+    {
+        "max_stack_size": 64, "max_damage": 100, "damage": 3, "unbreakable": {}, "repair_cost": 2,
+        "use_effects": {"can_sprint": True, "interact_vibrations": True, "speed_multiplier": 0.5},
+        "custom_name": "N", "item_name": {"text": "x", "color": "red"}, "item_model": "w:m",
+        "lore": ["a", {"text": "b", "italic": False}], "rarity": "rare", "minimum_attack_charge": 0.25,
+        "damage_type": "minecraft:arrow",
+    },
+    {
+        "minecraft:enchantments": {"minecraft:sharpness": 3, "unbreaking": 1.0},
+        "stored_enchantments": {"mending": 1},
+        "can_break": {"blocks": "minecraft:stone"},
+        "can_place_on": [{"blocks": "#minecraft:logs"}, {"blocks": ["stone", "dirt"]}],
+        "enchantment_glint_override": True, "intangible_projectile": {}, "glider": {}, "waxed": {},
+    },
+    {
+        "food": {"nutrition": 4, "saturation": 2.5, "can_always_eat": False},
+        "use_remainder": "minecraft:bowl", "use_cooldown": {"seconds": 1.5, "cooldown_group": "w:g"},
+        "damage_resistant": {"types": "#minecraft:is_fire"}, "weapon": {"item_damage_per_attack": 1},
+        "attack_range": {"max_reach": 4, "hitbox_margin": 0.3, "mob_factor": 2},
+        "enchantable": {"value": 10}, "repairable": {"items": ["minecraft:iron_ingot", "gold_ingot"]},
+        "tooltip_style": "w:t", "piercing_weapon": {"dismounts": True, "sound": "minecraft:item.trident.throw"},
+        "villager_food": {"nutrition": 2}, "potion_duration_scale": 0.5, "ominous_bottle_amplifier": 2,
+    },
+    {
+        "dye": "red", "base_color": "blue", "map_id": 5, "charged_projectiles": ["minecraft:arrow"],
+        "bundle_contents": [{"id": "minecraft:stone", "count": 3}, "minecraft:dirt"],
+        "provides_banner_patterns": "#minecraft:pattern_item/flower", "recipes": ["minecraft:stick", "w:r"],
+        "note_block_sound": "minecraft:block.note_block.harp", "pot_decorations": {"front": "minecraft:brick", "back": {"id": "minecraft:brick"}},
+        "block_state": {"facing": "north", "lit": "true"}, "sulfur_cube_content": "minecraft:slime_ball",
+        "lock": {"items": "minecraft:diamond"}, "container_loot": {"loot_table": "minecraft:chests/simple_dungeon", "seed": 5},
+        "break_sound": "minecraft:entity.item.break",
+        "mob_visibility": {"targeting_entity_types": "minecraft:creeper", "visibility": 0.5},
+    },
+    {
+        "villager/variant": "minecraft:desert", "wolf/variant": "minecraft:pale", "wolf/collar": "red",
+        "fox/variant": "snow", "salmon/size": "large", "parrot/variant": "gray", "tropical_fish/pattern": "betty",
+        "mooshroom/variant": "brown", "rabbit/variant": "evil", "horse/variant": "dark_brown", "llama/variant": "gray",
+        "axolotl/variant": "blue", "pig/variant": "minecraft:cold", "cow/variant": "warm", "chicken/variant": "minecraft:temperate",
+        "frog/variant": "minecraft:cold", "cat/variant": "minecraft:black", "painting/variant": "minecraft:kebab",
+        "sheep/color": "lime", "shulker/color": "black", "cushion/color": "white", "provides_pottery_pattern": "minecraft:angler",
+    },
+    {
+        "custom_data": "{a:1b,b:[I;1,2]}", "bucket_entity_data": {"x": 1, "y": [1.5, "s"]},
+        "!minecraft:food": {}, "!damage": {"ignored": 1}, "!minecraft:max_stack_size": {},
+    },
+]
+
+# Patches that don't read, each stopping the registries loading.
+BAD_COMPONENTS = {
+    "unknown": {"w:nope": 1},
+    "transient": {"minecraft:creative_slot_lock": {}},
+    "bad-key": {"Bad Key": 1},
+    "removed-unknown": {"!w:nope": {}},
+    "removed-not-object": {"!minecraft:damage": 1},
+    "stack-size": {"max_stack_size": 100},
+    "negative-damage": {"damage": -1},
+    "rarity": {"rarity": "legendary"},
+    "level": {"enchantments": {"minecraft:sharpness": 0}},
+    "unknown-enchantment": {"enchantments": {"w:gone": 1}},
+    "unit": {"unbreakable": True},
+    "empty-predicate": {"can_break": []},
+    "speed": {"use_effects": {"speed_multiplier": 2}},
+    "reach": {"attack_range": {"max_reach": 65}},
+    "several": {"w:nope": 1, "damage": -1, "rarity": 3},
+    "not-object": [],
+}
+
+
 def painting(width=1, height=1, asset="w:a", **more):
     data = {"width": width, "height": height, "asset_id": asset}
     data.update(more)
@@ -671,8 +751,15 @@ def loading():
         broken[f"nbt-path-{name}"] = [("data/w/enchantment/bad.json", enchantment(path))]
     for name, effects in BAD_REQUIREMENTS.items():
         broken[f"requirements-{name}"] = [("data/w/enchantment/bad.json", effects_enchantment(effects))]
+    for name, components in BAD_COMPONENTS.items():
+        broken[f"components-{name}"] = [("data/w/dialog/bad.json", item_dialog(with_components(components)))]
     for name, files in broken.items():
         cases.append(world(f"load-{name}", files))
+    # Items with components of each type Calcite reads, which a client is sent as the patch
+    # vanilla writes back (CAL-77).
+    cases.append(world("load-item-components", [
+        (f"data/w/dialog/d{i}.json", item_dialog(with_components(components))) for i, components in enumerate(ITEM_COMPONENTS)
+    ]))
     # NBT paths that read, each written back as the text it was read from, which stops at a space.
     cases.append(world("load-nbt-paths", [("data/w/enchantment/paths.json", enchantment(
         "a", "a.b[0]", "a[-1][]", "{x:1b}.y", "a{x:1b}", "a[{x:1b}]", "\"q r\".'s\\'t'", "x-y_z:w+", "a b", "a.", "", " a",
