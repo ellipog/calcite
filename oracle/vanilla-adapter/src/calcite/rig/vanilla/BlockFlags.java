@@ -267,8 +267,16 @@ final class BlockFlags {
         // properties, so every state of a block has the same; that's checked.
         StringBuilder pushReactions = new StringBuilder();
         StringBuilder unbreakable = new StringBuilder();
+        // The sounds a block that a signal opens or presses plays, on and off (CAL-124): a door's,
+        // a trapdoor's and a button's and a pressure plate's from its `BlockSetType`, a fence gate's
+        // from its `WoodType`, each by the sound event's name.
+        StringBuilder toggles = new StringBuilder();
         for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
             Block block = BuiltInRegistries.BLOCK.byId(id);
+            String[] sounds = toggleSounds(block);
+            if (sounds != null) {
+                toggles.append(toggles.isEmpty() ? "" : ", ").append("[").append(id).append(", \"").append(sounds[0]).append("\", \"").append(sounds[1]).append("\"]");
+            }
             BlockState first = block.getStateDefinition().getPossibleStates().get(0);
             int reaction = first.getPistonPushReaction().ordinal();
             boolean fixed = first.getDestroySpeed(EmptyBlockGetter.INSTANCE, BlockPos.ZERO) == -1.0F;
@@ -409,6 +417,7 @@ final class BlockFlags {
         json.append("  \"item_stack_sizes\": [").append(stacks).append("],\n");
         json.append("  \"push_reactions\": [").append(pushReactions).append("],\n");
         json.append("  \"unbreakable_blocks\": [").append(unbreakable).append("],\n");
+        json.append("  \"toggle_sounds\": [").append(toggles).append("],\n");
         json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
         json.append("  \"fire_odds\": [").append(fireOdds).append("],\n");
         json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");
@@ -500,6 +509,49 @@ final class BlockFlags {
     }
 
     /** The state's collision shape as a fluid's wall test asks it, before vanilla offsets it by its position. */
+    // A door's, trapdoor's, fence gate's, button's or pressure plate's sounds as it turns on and off,
+    // or null for another block.
+    private static String[] toggleSounds(Block block) throws ReflectiveOperationException {
+        if (block instanceof net.minecraft.world.level.block.FenceGateBlock) {
+            net.minecraft.world.level.block.state.properties.WoodType wood = (net.minecraft.world.level.block.state.properties.WoodType) fieldOf(block, "type");
+            return new String[] {soundName(wood.fenceGateOpen()), soundName(wood.fenceGateClose())};
+        }
+        if (block instanceof net.minecraft.world.level.block.DoorBlock door) {
+            return new String[] {soundName(door.type().doorOpen()), soundName(door.type().doorClose())};
+        }
+        if (block instanceof net.minecraft.world.level.block.TrapDoorBlock) {
+            var set = (net.minecraft.world.level.block.state.properties.BlockSetType) fieldOf(block, "type");
+            return new String[] {soundName(set.trapdoorOpen()), soundName(set.trapdoorClose())};
+        }
+        if (block instanceof net.minecraft.world.level.block.ButtonBlock) {
+            var set = (net.minecraft.world.level.block.state.properties.BlockSetType) fieldOf(block, "type");
+            return new String[] {soundName(set.buttonClickOn()), soundName(set.buttonClickOff())};
+        }
+        if (block instanceof net.minecraft.world.level.block.BasePressurePlateBlock) {
+            var set = (net.minecraft.world.level.block.state.properties.BlockSetType) fieldOf(block, "type");
+            return new String[] {soundName(set.pressurePlateClickOn()), soundName(set.pressurePlateClickOff())};
+        }
+        return null;
+    }
+
+    private static String soundName(net.minecraft.sounds.SoundEvent sound) {
+        return BuiltInRegistries.SOUND_EVENT.getKey(sound).getPath();
+    }
+
+    // The field `name` of `o`, from its class or the nearest above it that declares it.
+    private static Object fieldOf(Object o, String name) throws ReflectiveOperationException {
+        for (Class<?> c = o.getClass(); c != null; c = c.getSuperclass()) {
+            try {
+                java.lang.reflect.Field f = c.getDeclaredField(name);
+                f.setAccessible(true);
+                return f.get(o);
+            } catch (NoSuchFieldException e) {
+                // Not this class's: its parent's, then.
+            }
+        }
+        throw new NoSuchFieldException(o.getClass().getName() + "." + name);
+    }
+
     private static VoxelShape fluidShape(BlockState state) {
         VoxelShape shape = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
         if (!state.hasOffsetFunction()) {

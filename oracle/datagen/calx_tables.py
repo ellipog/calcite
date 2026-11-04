@@ -505,6 +505,19 @@ def block_facts_module(index, flags):
     lines += number_list(
         "unbreakable_blocks", "blocks", flags["unbreakable_blocks"],
         ["/// The blocks whose destroy speed is -1, which a piston can't move, by ID (CAL-125)."])
+    toggles = flags["toggle_sounds"]
+    lines += number_list(
+        "toggle_sound_blocks", "blocks", [b for b, _, _ in toggles],
+        ["/// The doors, trapdoors, fence gates, buttons and pressure plates, by ID, whose sounds",
+         "/// `toggle_sounds_on` and `toggle_sounds_off` give in their order (CAL-124)."])
+    for fn, at, what in [("toggle_sounds_on", 1, "opening or pressed"), ("toggle_sounds_off", 2, "closing or let go")]:
+        lines += [
+            f"/// The sound each of `toggle_sound_blocks` plays {what}, by the sound event's name (CAL-124).",
+            f"pub fn {fn}() -> List<str> {{",
+            "    return [",
+        ]
+        lines += [f'        "{t[at]}",' for t in toggles]
+        lines += ["    ]", "}", ""]
     lines += number_list(
         "flammable_blocks", "blocks", flags["flammable_blocks"],
         ["/// The blocks fire can burn, by ID: those `FireBlock`'s ignite odds are above 0 for."])

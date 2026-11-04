@@ -130,6 +130,11 @@ CONFIGS = {
     # save: pushing, pulling, slime and blocks they can't move (CAL-125); watched, as `redstone`.
     "pistons": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "pistons" / "world",
                       fixture="pistons", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # The blocks a signal changes by the spawn, each pulsed by an observer clock: doors, trapdoors,
+    # a fence gate, a copper bulb, a hopper, an empty dispenser, dropper and crafter, a note block,
+    # a bell, a big dripleaf, a command block, rails and shelves (CAL-124); watched, as `redstone`.
+    "receivers": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "receivers" / "world",
+                        fixture="receivers", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
