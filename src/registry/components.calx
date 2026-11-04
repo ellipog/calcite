@@ -6,16 +6,17 @@ module registry.components
 
 import chat.component.{Component}
 import json.gson.{int_value}
-import json.tree.{Json}
+import json.tree.{Json, Member, parse}
 import nbt.snbt.{units_of}
 import nbt.tag.{Tag}
 import registry.builtin.{builtin_entries, builtin_names}
 import registry.codec.{Codec, Codecs, Dispatched, Field, FloatRange, HolderCodec, HolderKind, IntRange, Kinds, Many, MapOf, Need, Read, Refs, Then, json_text, same}
-import registry.codecs.{bool_codec, by_name, def, f32_codec, f64_codec, field, i32_codec, i64_codec, id, inline, item_stack_template, non_negative_int, opt, positive_float, positive_int, read_compound_tag, registry_codec, req, rgb_int, sound, string, text, uuid, vec3i}
+import registry.codecs.{bool_codec, by_name, def, f32_codec, f64_codec, field, i32_codec, i64_codec, id, inline, item_stack_template, non_negative_int, not_air, opt, positive_float, positive_int, read_compound_tag, registry_codec, req, rgb_int, sound, string, text, uuid, vec3i}
 import registry.predicates.{block, holder_set, item, snbt_compound}
 import registry.registries.{Registries}
 import resources.identifier.{Identifier}
 import world.blocks.{block_properties, property_names, property_starts}
+import world.item_defaults.{block_named_items, item_patches, shared_components}
 
 /// `DataComponentPatch.CODEC`, made in `c`: an object whose keys are component types, each the
 /// component's value, or with `!` before it, `{}`, the component taken away. Written with each
@@ -64,6 +65,167 @@ fn read_map_key(c: Codecs, value: Json, _r: Registries) -> Read {
         return Read.bad("Unknown registry key in ResourceKey[minecraft:root / minecraft:data_component_type]: {name}")
     }
     return Read.ok(Tag.Str(name))
+}
+
+/// `ItemStack.CODEC`, made in `c`: an item, which can't be air, how many, from 1 to 99 and
+/// always written, and the components the stack changes from its item's. It doesn't check the
+/// count against the item's stack size: `validateStrict` does that, where vanilla asks for it.
+pub fn item_stack(c: mut Codecs) -> usize {
+    let key = String("item stack")
+    if let at = c.find(key) {
+        return at
+    }
+    let items = by_name(mut c, "minecraft:item")
+    let one = c.add(Codec.Then(Then { of: items, then: not_air, with: Tag.End }))
+    let count = int_within(mut c, 1, 99)
+    let patch = component_patch(mut c)
+    let fields: List<Field> = [
+        req("id", one),
+        Field { name: "count", of: count, need: Need.Always(Tag.Int(1)) },
+        def("components", patch, Tag.Compound(JavaHashMap<String, Tag>())),
+    ]
+    let record = c.add(Codec.Record(fields))
+    c.name(String("item stack record"), record)
+    return c.shared(key, Codec.Nested(read_item_stack))
+}
+
+// The stack's record, with its patch as `PatchedDataComponentMap.applyPatch` leaves it, applied
+// to the item's default components as the stack is made: a component the same as the item's own
+// is left out, and so is one taken away that the item hasn't. What's left keeps the order its
+// keys were given in, as the patch's array map keeps it, so a compound written from it has its
+// keys in vanilla's order. Where the item's defaults haven't been read, the patch is as given.
+fn read_item_stack(c: Codecs, value: Json, r: Registries, refs: mut Refs) -> Read {
+    let at = c.find(String("item stack record")) else return Read.bad(String("there's no item stack codec"))
+    var got = c.read(at, value, r, mut refs)
+    let read = got.value.take() else return got
+    got.value = some(against_defaults(c, read, value, r))
+    return got
+}
+
+fn against_defaults(c: Codecs, value: Tag, json: Json, r: Registries) -> Tag {
+    var fields = match value {
+        Tag.Compound(m) => m.copy(),
+        _ => return value.copy(),
+    }
+    if not fields.contains(String("components")) {
+        return value.copy()
+    }
+    let item_id = match fields[String("id")] {
+        Tag.Str(s) => s.copy(),
+        _ => return value.copy(),
+    }
+    if not c.item_defaults.contains(item_id.copy()) {
+        return value.copy()
+    }
+    let defaults = match c.item_defaults[item_id] {
+        Tag.Compound(m) => m.copy(),
+        _ => return value.copy(),
+    }
+    let patch = match fields[String("components")] {
+        Tag.Compound(m) => m.copy(),
+        _ => return value.copy(),
+    }
+    let given = match field_of(json, "components") {
+        some(Json.Object(m)) => m,
+        _ => return value.copy(),
+    }
+    var kept = JavaHashMap<String, Tag>()
+    for m in given {
+        let k = match read_key(c, Json.Str(m.key.copy()), r).value {
+            some(Tag.Str(s)) => s,
+            _ => continue,
+        }
+        if not patch.contains(k.copy()) or kept.contains(k.copy()) {
+            continue
+        }
+        let v = patch[k.copy()].copy()
+        if k.starts_with("!") {
+            if defaults.contains(k[1..].copy()) {
+                kept.insert(k.copy(), v)
+            }
+        } else if not defaults.contains(k.copy()) or not same(defaults[k.copy()], v) {
+            kept.insert(k.copy(), v)
+        }
+    }
+    if kept.is_empty() {
+        _ = fields.remove(String("components"))
+    } else {
+        fields.insert(String("components"), Tag.Compound(kept))
+    }
+    return Tag.Compound(fields)
+}
+
+// The member `name` of `value`, an object, or none.
+fn field_of(value: Json, name: str) -> Json? {
+    match value {
+        Json.Object(members) => {
+            for m in members {
+                if m.key == String(name) {
+                    return some(m.value.copy())
+                }
+            }
+        },
+        _ => {},
+    }
+    return none
+}
+
+/// Each item's default components, by its ID, as the component map, `DataComponentType`'s
+/// `VALUE_MAP_CODEC`, reads them from `world.item_defaults` with `c`, which `component_patch`
+/// has made the map in: a compound of each type's ID and its value. Fails where one doesn't read,
+/// which can only be a broken build.
+pub fn read_item_defaults(c: Codecs, r: Registries) -> Map<String, Tag> ! String {
+    let at = c.find(String("component map")) else fail String("there's no component map codec")
+    let b = r.find_builtin(String("item")) else fail String("there's no item registry")
+    let names = r.builtin[b].entries.copy()
+    let patches = item_patches()
+    if names.len() != patches.len() {
+        fail "the item registry has {names.len()} items, and their defaults {patches.len()}"
+    }
+    let shared = match parse(String(shared_components())) {
+        some(Json.Object(m)) => m,
+        _ => fail String("the shared default components aren't a JSON object"),
+    }
+    let blocks = block_named_items()
+    var next_block: usize = 0
+    var out = Map<String, Tag>()
+    for i in 0..names.len() {
+        let name = names[i].copy()
+        var prefix = "item"
+        if next_block < blocks.len() and usize(blocks[next_block]) == i {
+            prefix = "block"
+            next_block += 1
+        }
+        var members = shared.copy()
+        members.push(Member { key: String("minecraft:item_model"), value: Json.Str(name.to_string()) })
+        let translate: List<Member> = [Member { key: String("translate"), value: Json.Str("{prefix}.minecraft.{name.path}") }]
+        members.push(Member { key: String("minecraft:item_name"), value: Json.Object(translate) })
+        let given = match parse(String(patches[i])) {
+            some(Json.Object(m)) => m,
+            _ => fail "{name.to_string()}'s default components aren't a JSON object",
+        }
+        for m in given {
+            let taken = m.key.starts_with("!")
+            let key = if taken { m.key[1..].copy() } else { m.key.copy() }
+            var kept = List<Member>()
+            for each in members {
+                if each.key != key {
+                    kept.push(Member { key: each.key.copy(), value: each.value.copy() })
+                }
+            }
+            if not taken {
+                kept.push(Member { key: key, value: m.value.copy() })
+            }
+            members = kept
+        }
+        var refs = Refs.new()
+        var got = c.read(at, Json.Object(members), r, mut refs)
+        if let e = got.error.take() {
+            fail "{name.to_string()}'s default components don't read: {e}"
+        }
+        out.insert(name.to_string(), got.value.take() ?? Tag.End)
+    }
+    return out
 }
 
 // `PatchKey.CODEC`: a type's ID, with `!` before it for one taken away, which must be a type that's

@@ -916,4 +916,5 @@ def main():
     write_file(HERE / "generated.json", "packs", "cases/packs/gen.py", cases, probe_version=2)
 
 
-main()
+if __name__ == "__main__":
+    main()

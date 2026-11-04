@@ -1268,6 +1268,97 @@ def entity_facts_module(index, facts):
     return "\n".join(lines)
 
 
+def calx_json(value):
+    """JSON text as a Calx string literal holds it, ASCII only, with its quotes, backslashes and
+    braces escaped."""
+    text = json.dumps(value, separators=(",", ":"), ensure_ascii=True)
+    text = text.replace("\\", "\\\\").replace('"', '\\"').replace("{", "\\{").replace("}", "\\}")
+    return f'"{text}"'
+
+
+def item_defaults_module(items):
+    """The text of src/world/item_defaults.calx: each item's default components, as items.json
+    has them, vanilla's JSON. The components more than half the items have with one value are
+    written once; each item's model is its name, and its name is the translation of
+    `item.minecraft.<name>` or, for those `block_named_items` lists, `block.minecraft.<name>`;
+    the rest of each item's are a patch of those, with `!` before a shared one it hasn't."""
+    if [i["id"] for i in items] != list(range(len(items))):
+        raise ValueError("items.json's item IDs don't run from 0 without gaps")
+    counts = {}
+    for i in items:
+        for k, v in i["components"].items():
+            key = (k, json.dumps(v, sort_keys=True))
+            counts[key] = counts.get(key, 0) + 1
+    shared = {}
+    for (k, v), n in counts.items():
+        if n * 2 > len(items):
+            if k in shared:
+                raise ValueError(f"{k} is shared with two values")
+            shared[k] = json.loads(v)
+    for k in ("minecraft:item_model", "minecraft:item_name"):
+        if k in shared:
+            raise ValueError(f"{k} is shared")
+    block_named = []
+    patches = []
+    for i in items:
+        name = i["name"]
+        if not name.startswith("minecraft:"):
+            raise ValueError(f"{name} isn't vanilla's")
+        short_name = name[len("minecraft:"):]
+        components = i["components"]
+        if components.get("minecraft:item_model") != name:
+            raise ValueError(f"{name}'s model isn't its name")
+        item_name = components.get("minecraft:item_name")
+        if item_name == {"translate": f"block.minecraft.{short_name}"}:
+            block_named.append(i["id"])
+        elif item_name != {"translate": f"item.minecraft.{short_name}"}:
+            raise ValueError(f"{name}'s name isn't its translation")
+        patch = {}
+        for k, v in components.items():
+            if k in ("minecraft:item_model", "minecraft:item_name"):
+                continue
+            if k in shared and json.dumps(v, sort_keys=True) == json.dumps(shared[k], sort_keys=True):
+                continue
+            patch[k] = v
+        for k in shared:
+            if k not in components:
+                patch["!" + k] = {}
+        patches.append(patch)
+    lines = [
+        "/// Each item's default components, as vanilla's item report gives them in JSON (D362): the",
+        "/// ones more than half the items have with one value, once, in `shared_components`, and each",
+        "/// item's others in `item_patches`, as a patch of those, with `!` before a shared one the item",
+        "/// hasn't. An item's model is its name, and its name the translation of `item.minecraft.` and",
+        "/// its name, or of `block.minecraft.` for `block_named_items`. Written by",
+        "/// oracle/datagen/calx_tables.py from items.json (D126): don't edit it.",
+        "module world.item_defaults",
+        "",
+        "/// The components more than half the items have, with their value, as a JSON object.",
+        "pub fn shared_components() -> str {",
+        f"    return {calx_json(shared)}",
+        "}",
+        "",
+        "/// The items named as blocks are, `block.minecraft.<name>`, by ID.",
+        "pub fn block_named_items() -> List<u32> {",
+        "    let items: List<u32> = [",
+    ]
+    ids = [str(n) for n in block_named]
+    lines += ["        " + ", ".join(ids[k:k + 24]) + "," for k in range(0, len(ids), 24)]
+    lines += [
+        "    ]",
+        "    return items",
+        "}",
+        "",
+        "/// Each item's default components besides the shared ones and its model and name, as a patch",
+        "/// of the shared ones in JSON, in item ID order.",
+        "pub fn item_patches() -> List<str> {",
+        "    return [",
+    ]
+    lines += [f"        {calx_json(p)}," for p in patches]
+    lines += ["    ]", "}", ""]
+    return "\n".join(lines)
+
+
 def outputs(tables, version=VERSION):
     index = json.loads((tables / "index.json").read_text(encoding="utf-8"))
     packets = json.loads((tables / "packets.json").read_text(encoding="utf-8"))
@@ -1276,6 +1367,7 @@ def outputs(tables, version=VERSION):
     pins = json.loads((CALCITE / "oracle" / "versions.json").read_text(encoding="utf-8"))
     flags = json.loads((tables.parent / "block_flags.json").read_text(encoding="utf-8"))
     entities = json.loads((tables.parent / "entity_facts.json").read_text(encoding="utf-8"))
+    items = json.loads((tables / "items.json").read_text(encoding="utf-8"))
     return {
         CALCITE / "src" / "protocol" / "ids.calx": ids_module(index, packets),
         CALCITE / "src" / "registry" / "builtin.calx": builtin_module(index, registries),
@@ -1287,6 +1379,7 @@ def outputs(tables, version=VERSION):
         CALCITE / "src" / "world" / "collision_shapes.calx": collision_module(index, flags),
         CALCITE / "src" / "world" / "fluid_faces.calx": fluid_faces_module(index, flags),
         CALCITE / "src" / "world" / "entity_facts.calx": entity_facts_module(index, entities),
+        CALCITE / "src" / "world" / "item_defaults.calx": item_defaults_module(items),
     }
 
 

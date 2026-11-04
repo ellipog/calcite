@@ -820,6 +820,16 @@ Input `{"type": id, "weather": w, "read": [attributes]}` or `{"attributes_map": 
 
 The one blob is 16-byte records: an `i64`, the ticks every clock has run, then `f32`s for the rain and thunder levels the weather's layers get, as `getRainLevel(1.0F)` and `getThunderLevel(1.0F)` would give them. For each record the system's tick cache is cleared, as `ServerLevel.tick` clears it, then each attribute in `read` is written: a float as `Float.floatToIntBits` gives it, every NaN as one, a boolean as a byte, 1 for true. The output is `{}`.
 
+### `items` (v1)
+
+An item stack read as vanilla reads one and written again, with the vanilla data pack's registries, complete, and the items' default components bound, as a server has them once its packs have loaded.
+
+Input `{"from": f, "value": text, "to": t}`. `f` is `json`, for `text` a stack as a data pack writes it, read with `ItemStack.CODEC` through `JsonOps`; `snbt`, for `text` SNBT, read with the codec through `NbtOps`, as a save is; or `wire`, for the one blob, read with `ItemStack.OPTIONAL_STREAM_CODEC`, as the network has it. `t` is `nbt`, for the stack written with `ItemStack.CODEC` through `NbtOps`, as `writeAnyTag` writes it, as the one blob, or `wire`, for it written with the stream codec.
+
+The output is `{"empty": e}`, `e` whether the stack is empty, with the blob, or, where it doesn't read, `{"error": message, "partial": p}`, `p` whether the codec had a partial value. A stream that doesn't read gives `{"error": exception}`, its `toString`, and one with bytes left over says how many in `left`. An empty stack has no NBT, and one the codec can't write gives `{"write_error": message}`.
+
+Calcite answers `unimplemented` for what it doesn't do yet: reading from `snbt` or `wire`, and writing to `wire` (CAL-77).
+
 ## Adding a probe
 
 1. Add its section here, with version 1.
