@@ -22,7 +22,7 @@ import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{DATA_VERSION, PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
-import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
+import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundLevelEvent, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
@@ -57,7 +57,8 @@ import world.collision.{Aabb, CollisionStates}
 import world.tickets.{saved_id as tickets_id}
 import world.weather.{WeatherLevels, advance as advance_weather, joining as weather_joining, saved_id as weather_id}
 import world.flat.{MIN_Y, SECTIONS, SURFACE_Y}
-import worldgen.providers.{IntProvider}
+import worldgen.providers.{GenContext, IntProvider}
+import worldgen.survive.{Env}
 import world.item.{ItemStack}
 import world.modes.{Difficulty, GameType, PreviousGameType}
 import world.pos.{BlockPos, ChunkPos}
@@ -567,7 +568,7 @@ impl Network {
     /// as `applyInitialSettings` sets it up, each level's random is seeded, and each level that
     /// can have weather has its rain and thunder as `prepareWeather` sets them.
     pub fn set_world_state(mut self, state: own WorldState) {
-        let WorldState { weather: weather, clocks: clocks, borders: given_borders, advance_time: advance_time, advance_weather: weather_on, pause_when_empty: pause_when_empty, max_world_size: max_world_size, seeds: given_seeds, spawn_rules: spawn_rules, random_tick_speed: random_tick_speed, trader: trader, trader_seed: trader_seed, tickets: given_tickets } = state
+        let WorldState { weather: weather, clocks: clocks, borders: given_borders, advance_time: advance_time, advance_weather: weather_on, pause_when_empty: pause_when_empty, max_world_size: max_world_size, max_chained: max_chained, seeds: given_seeds, spawn_rules: spawn_rules, random_tick_speed: random_tick_speed, trader: trader, trader_seed: trader_seed, tickets: given_tickets } = state
         var borders = given_borders
         var seeds = given_seeds
         self.world.weather = weather
@@ -588,6 +589,7 @@ impl Network {
                 }
             }
             self.levels[d].game_time = self.world.game_time
+            self.levels[d].max_chained = max_chained
             let seed = if seeds.is_empty() { 0i64 } else { seeds.remove(0) }
             self.levels[d].set_random(TapedRandom.new(seed))
             self.world.dims[d].block_random.value = i32.wrap(seed)
@@ -1451,17 +1453,61 @@ impl Network {
         // Lava's tick delay, as `LavaFluid.isFastLava` reads it from the dimension (D324).
         let fast = self.world.dims[d].environment.flag(fast_lava(), self.world.clocks, self.world.dims[d].weather.rain_level(), self.world.dims[d].weather.thunder_level())
         self.levels[d].lava_delay = if fast { 10 } else { 30 }
+        // What a block set tells the blocks around reads, once natural spawning's block facts
+        // are made (D326).
+        self.give_env(d)
         // The block ticks due, then the fluid ticks, as `ServerLevel.tick` runs them once the
         // time's moved on (D322). What each block's and fluid's tick does comes with it: fluids'
         // with CAL-91, falling blocks' with their entities.
         _ = self.levels[d].take_block_ticks()
         _ = self.levels[d].take_fluid_ticks()
+        self.send_level_events(d)
         // The chunk source's tick: its tickets, then `tickChunks`, with the blocks set as the
         // chunks ticked broadcast after (D321), then what unloads.
         self.levels[d].tick_tickets()
         self.tick_chunks(d)
+        self.send_level_events(d)
         self.broadcast_changes(d)
         self.levels[d].tick_unload()
+    }
+
+    // Gives the level `d` what a block's shape and its survival read, once natural spawning's
+    // block facts are made: those facts, and its dimension's light and height (D326). Its
+    // generator's depth, `getGenDepth`, is the dimension's height here, which only a huge fungus
+    // grown by bone meal reads, and none is yet.
+    fn give_env(mut self, d: usize) {
+        if self.levels[d].has_env() or not self.world.natural_ready() {
+            return
+        }
+        let n = self.world.natural.take() else return
+        let facts = n.facts.copy()
+        self.world.natural = some(n)
+        let ctx = GenContext { min_y: self.world.dims[d].min_y, depth: self.world.dims[d].height, sea: self.world.dims[d].sea_level }
+        self.levels[d].set_env(Env { facts: facts, ctx: ctx, sky_light: self.world.dims[d].sky_light, gen_depth: self.world.dims[d].height })
+    }
+
+    // The level events of the level `d` since they were last sent, each to its players within
+    // 64 blocks, as `PlayerList.broadcast` sends `levelEvent`'s (D326).
+    fn send_level_events(mut self, d: usize) {
+        let events = self.levels[d].take_events()
+        for e in events {
+            let packet = encode_play(ClientboundLevelEvent { kind: e.kind, pos: BlockPos { x: e.x, y: e.y, z: e.z }, data: e.data, global: false })
+            for i in 0..self.connections.len() {
+                if not self.playing(i) {
+                    continue
+                }
+                var other = self.connections[i].take() else continue
+                if other.player.dim == d {
+                    let dx = f64(e.x) - other.player.x
+                    let dy = f64(e.y) - other.player.y
+                    let dz = f64(e.z) - other.player.z
+                    if dx * dx + dy * dy + dz * dz < 4096.0 {
+                        self.send_bytes(mut other, packet.copy())
+                    }
+                }
+                self.connections[i] = some(other)
+            }
+        }
     }
 
     // The blocks set in the level at `d` since the last broadcast, sent to each player in it who

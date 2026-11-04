@@ -66,7 +66,8 @@ import world.chunk.{AIR_STATE, BlockStates, Chunk, MOTION_BLOCKING}
 import world.collision.{CollisionBlocks, CollisionStates}
 import world.distance.{DistanceManager, Ticking}
 import world.flat.{FlatChunk, FlatWorld}
-import world.level_writer.{LevelWriter, UPDATE_CLIENTS}
+import world.block_updates.{BlockLevel, after_removal, on_neighbour_changed, on_place, shape_order, update_or_destroy, update_order}
+import world.level_writer.{LevelWriter, UPDATE_CLIENTS, UPDATE_KNOWN_SHAPE, UPDATE_LIMIT, UPDATE_MOVE_BY_PISTON, UPDATE_NEIGHBORS, UPDATE_SKIP_ON_PLACE, UPDATE_SKIP_SHAPE_UPDATE_ON_WIRE}
 import world.light.{SkySources}
 import world.natural.{SpawnLevel}
 import world.pos.{BlockPos, ChunkPos}
@@ -75,10 +76,12 @@ import world.tickets.{FULL_LEVEL, Holders, Ticket, TicketStorage, TicketType}
 import world.ticks.{ChunkTicks, LevelTicks, ScheduledTick}
 import worldgen.access.{BlockAccess}
 import worldgen.biome_manager.{corner}
-import worldgen.facts.{FLOWING_LAVA, Facts, LAVA_FLUID}
+import worldgen.facts.{FLOWING_LAVA, Facts, LAVA_FLUID, opposite, step_x, step_y, step_z}
 import worldgen.generator.{GenSetup, setup_data}
 import worldgen.interval.{Thrown}
 import worldgen.scheduler.{Generator}
+import worldgen.shapes.{update_shape}
+import worldgen.survive.{Env}
 
 /// How far around the spawn chunk a joining player's spawn ticket loads full chunks,
 /// `PrepareSpawnTask.PREPARE_CHUNK_RADIUS`.
@@ -257,6 +260,29 @@ impl Holders for Reading {
     }
 }
 
+// One update waiting in the level's updater, as `CollectingNeighborUpdater` keeps them (D326).
+enum Update {
+    // `ShapeUpdate`: the block at x, y, z told its neighbour toward `d` is `neighbour` now.
+    Shape { d: i32, neighbour: u32, x: i32, y: i32, z: i32, flags: i32, limit: i32 }
+    // `SimpleNeighborUpdate`: the block at x, y, z told the block `source` beside it changed.
+    Simple { x: i32, y: i32, z: i32, source: u32 }
+    // `FullNeighborUpdate`: the same, with the state it's told as, and whether a piston moved
+    // what changed.
+    Full { state: u32, x: i32, y: i32, z: i32, source: u32, moved: bool }
+    // `MultiNeighborUpdate`: the six around x, y, z told `source` changed, in `UPDATE_ORDER`,
+    // but the one toward `skip`, -1 for none; `next` is the next to be told.
+    Multi { x: i32, y: i32, z: i32, source: u32, skip: i32, next: i32 }
+}
+
+/// An event at a block, `levelEvent`, for the players within 64 blocks of it (D326).
+pub struct LevelEvent {
+    pub kind: i32
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub data: i32
+}
+
 /// The overworld's chunks, and the distance manager that says which load.
 pub struct Level {
     /// The tickets and players, and the chunks' holders.
@@ -367,6 +393,19 @@ pub struct Level {
     /// Lava's tick delay, `LavaFluid.getTickDelay`: 10 where the dimension's lava is fast, as the
     /// network sets it each tick, else 30 (D324).
     pub lava_delay: i32 = 30
+    // What a block's shape and its survival read, the block facts and the dimension's light,
+    // once the network has them; the updates waiting, as `CollectingNeighborUpdater` keeps them,
+    // the stack and those the update running added, with how many have run in this chain and
+    // how many may, `max-chained-neighbor-updates`; what isn't in Calcite yet that's been
+    // reported; and the level events for the network to send (D326).
+    env: Env? = none
+    update_stack: List<Update> = List<Update>()
+    update_added: List<Update> = List<Update>()
+    update_count: i32 = 0
+    /// `max-chained-neighbor-updates`: how many updates a chain may run, or no end if below 0.
+    pub max_chained: i32 = 1000000
+    reported: Set<String> = Set<String>()
+    events: List<LevelEvent> = List<LevelEvent>()
 }
 
 /// The blocks set in a section since they were last broadcast, as `ChunkHolder.broadcastChanges`
@@ -905,6 +944,201 @@ impl Level {
     /// counts them.
     pub fn tick_count(self) -> (usize, usize) {
         return (self.block_ticks.count(), self.fluid_ticks.count())
+    }
+
+    /// Gives the level what a block's shape and its survival read, the block facts and the
+    /// dimension's light, as the network has them once the registries are read. Till then, a
+    /// block set tells nothing around it (D326).
+    pub fn set_env(mut self, env: own Env) {
+        self.env = some(env)
+    }
+
+    /// Whether the level has `set_env`'s.
+    pub fn has_env(self) -> bool {
+        return match self.env {
+            some(_) => true,
+            none => false,
+        }
+    }
+
+    /// The level events since this was last asked, in the order they came, for the network to
+    /// send (D326).
+    pub fn take_events(mut self) -> List<LevelEvent> {
+        let out = self.events.copy()
+        self.events.clear()
+        return out
+    }
+
+    // Says once that `what` isn't in Calcite yet: the level goes on without it.
+    fn report(mut self, what: String) {
+        if self.reported.contains(what) {
+            return
+        }
+        self.reported.insert(what.copy())
+        self.lines.push(Entry.warn("{what} isn't in Calcite yet, so it's left out"))
+    }
+
+    // The state at the block, or `none`, reported, where it can't be read.
+    fn state_or_report(mut self, f: Facts, x: i32, y: i32, z: i32) -> u32? {
+        return match self.state(f, x, y, z) {
+            ok(s) => some(s),
+            err(t) => {
+                self.report(t.message)
+                none
+            },
+        }
+    }
+
+    // `CollectingNeighborUpdater.addAndRun`: the update `u`, from the block at x, y, z, run at
+    // once if none is running, or kept for when the one running is done; past
+    // `max-chained-neighbor-updates` in one chain, dropped, with an error the first time.
+    fn add_and_run(mut self, x: i32, y: i32, z: i32, u: own Update) {
+        let was_running = self.update_count > 0
+        let over = self.max_chained >= 0 and self.update_count >= self.max_chained
+        self.update_count += 1
+        if not over {
+            if was_running {
+                self.update_added.push(u)
+            } else {
+                self.update_stack.push(u)
+            }
+        } else if self.update_count - 1 == self.max_chained {
+            self.lines.push(Entry.error("Too many chained neighbor updates. Skipping the rest. First skipped position: {x}, {y}, {z}"))
+        }
+        if not was_running {
+            self.run_updates()
+        }
+    }
+
+    // `CollectingNeighborUpdater.runUpdates`: the updates added while one runs go on top of the
+    // stack, the first added on top, and the top runs a step at a time until it's done or adds
+    // more.
+    fn run_updates(mut self) {
+        while not self.update_stack.is_empty() or not self.update_added.is_empty() {
+            var i = self.update_added.len()
+            while i > 0 {
+                i -= 1
+                self.update_stack.push(self.update_added[i])
+            }
+            self.update_added.clear()
+            let top = self.update_stack.len() - 1
+            while self.update_added.is_empty() {
+                let u = self.update_stack[top]
+                if not self.run_next(top, u) {
+                    _ = self.update_stack.pop()
+                    break
+                }
+            }
+        }
+        self.update_stack.clear()
+        self.update_added.clear()
+        self.update_count = 0
+    }
+
+    // `runNext` of the update `u`, at `top` of the stack: whether it has more to run.
+    fn run_next(mut self, top: usize, u: Update) -> bool {
+        match u {
+            Update.Shape { d, neighbour, x, y, z, flags, limit } => {
+                self.shape_update(d, x, y, z, neighbour, flags, limit)
+                return false
+            },
+            Update.Simple { x, y, z, source } => {
+                let f = self.facts_now() else return false
+                let state = self.state_or_report(f, x, y, z) else return false
+                self.neighbour_update(state, x, y, z, source, false)
+                return false
+            },
+            Update.Full { state, x, y, z, source, moved } => {
+                self.neighbour_update(state, x, y, z, source, moved)
+                return false
+            },
+            Update.Multi { x, y, z, source, skip, next } => {
+                let d = update_order(next)
+                var after = next + 1
+                if after < 6 and update_order(after) == skip {
+                    after += 1
+                }
+                // Moved on before it runs, which adds only to `update_added`.
+                self.update_stack[top] = Update.Multi { x: x, y: y, z: z, source: source, skip: skip, next: after }
+                let nx = x + step_x(d)
+                let ny = y + step_y(d)
+                let nz = z + step_z(d)
+                if let f = self.facts_now() {
+                    if let state = self.state_or_report(f, nx, ny, nz) {
+                        self.neighbour_update(state, nx, ny, nz, source, false)
+                    }
+                }
+                return after < 6
+            },
+        }
+    }
+
+    // The block facts, once the level has them.
+    fn facts_now(self) -> Facts? {
+        if let e = self.env {
+            return some(e.facts.copy())
+        }
+        return none
+    }
+
+    // `NeighborUpdater.executeShapeUpdate`: the block at x, y, z, but redstone wire with
+    // `UPDATE_SKIP_SHAPE_UPDATE_ON_WIRE`, takes the shape the block toward `d`, `neighbour`, gives
+    // it, or is broken.
+    fn shape_update(mut self, d: i32, x: i32, y: i32, z: i32, neighbour: u32, flags: i32, limit: i32) {
+        let some_env = self.env.copy()
+        let e = some_env else return
+        let f = e.facts.copy()
+        let state = self.state_or_report(f, x, y, z) else return
+        if flags & UPDATE_SKIP_SHAPE_UPDATE_ON_WIRE != 0 and f.block(state) == f.ids.redstone_wire {
+            return
+        }
+        let made = match update_shape(e, mut self, state, x, y, z, d, neighbour) {
+            ok(s) => s,
+            err(t) => {
+                self.report(t.message)
+                return
+            },
+        }
+        match update_or_destroy(e, mut self, state, made, x, y, z, flags, limit) {
+            ok => {},
+            err(t) => self.report(t.message),
+        }
+    }
+
+    // `NeighborUpdater.executeUpdate`: the block `state` at x, y, z told `source` beside it
+    // changed.
+    fn neighbour_update(mut self, state: u32, x: i32, y: i32, z: i32, source: u32, moved: bool) {
+        let some_env = self.env.copy()
+        let e = some_env else return
+        match on_neighbour_changed(e, mut self, state, x, y, z, source, moved) {
+            ok => {},
+            err(t) => self.report(t.message),
+        }
+    }
+
+    // `updateNeighborsAt`: the six around the block at x, y, z told `source` there changed, as
+    // one `MultiNeighborUpdate`.
+    fn update_neighbours_at(mut self, x: i32, y: i32, z: i32, source: u32) {
+        self.add_and_run(x, y, z, Update.Multi { x: x, y: y, z: z, source: source, skip: -1, next: 0 })
+    }
+
+    // `BlockState.updateNeighbourShapes`: each of the six around the block at x, y, z, in
+    // `UPDATE_SHAPE_ORDER`, told its shape is `state`'s, `neighborShapeChanged`.
+    fn update_neighbour_shapes(mut self, state: u32, x: i32, y: i32, z: i32, flags: i32, limit: i32) {
+        var i = 0
+        while i < 6 {
+            let d = shape_order(i)
+            let nx = x + step_x(d)
+            let ny = y + step_y(d)
+            let nz = z + step_z(d)
+            self.add_and_run(nx, ny, nz, Update.Shape { d: opposite(d), neighbour: state, x: nx, y: ny, z: nz, flags: flags, limit: limit })
+            i += 1
+        }
+    }
+
+    // The block at x, y, z as it is, where its chunk's full.
+    fn block_state(self, x: i32, y: i32, z: i32) -> u32? {
+        return self.collision_state(x, y, z)
     }
 
     /// Gives the level the tickets its dimension's `chunk_tickets` saved, all deactivated, as
@@ -2163,14 +2397,27 @@ impl SpawnLevel for Level {
 }
 
 impl LevelWriter for Level {
-    // `Level.setBlock`, as far as Calcite has it (D321): in the world's height and a full chunk,
-    // the block's state set, as `LevelChunk.setBlockState` sets it, with the heightmaps, in the
-    // chunk's own copy; the chunk marked unsaved, and its kept packet dropped, as the next player
-    // to be sent it is sent it as it is now; light told, as `setBlockState` tells it; and with
-    // `UPDATE_CLIENTS`, in a chunk that ticks, the block kept for the broadcast after the chunks
-    // tick, as `sendBlockUpdated` keeps it through `ChunkHolder.blockChanged`. What it tells the
-    // blocks around, and their shapes, come with CAL-106.
     fn set_block(mut self, x: i32, y: i32, z: i32, state: u32, flags: i32) -> bool {
+        return self.set_block_limited(x, y, z, state, flags, UPDATE_LIMIT)
+    }
+}
+
+// The level's blocks, set as vanilla's are (D326).
+impl BlockLevel for Level {
+    // `Level.setBlock` (D321, D326): in the world's height and a full chunk, the block's state
+    // set, as `LevelChunk.setBlockState` sets it, with the heightmaps, in the chunk's own copy;
+    // the chunk marked unsaved, and its kept packet dropped, as the next player to be sent it is
+    // sent it as it is now; and light told, as `setBlockState` tells it. Then, with the block
+    // facts, what `setBlockState` does once it's set: the old block's
+    // `affectNeighborsAfterRemoval`, where the block changed or is a rail and the blocks around
+    // are told or a piston moved it, and, unless that set another block there, the new one's
+    // `onPlace`, unless `UPDATE_SKIP_ON_PLACE`. Then, if the block's still what was set,
+    // `setBlock`'s: with `UPDATE_CLIENTS`, in a chunk that ticks, the block kept for the
+    // broadcast after the chunks tick, as `sendBlockUpdated` keeps it through
+    // `ChunkHolder.blockChanged`; with `UPDATE_NEIGHBORS`, the six around told; and unless
+    // `UPDATE_KNOWN_SHAPE`, with `limit` left, the six around given its shape. A comparator
+    // reading the block, redstone wire's indirect shapes and points of interest come with them.
+    fn set_block_limited(mut self, x: i32, y: i32, z: i32, state: u32, flags: i32, limit: i32) -> bool {
         if y < self.min_section * 16 or y >= (self.min_section + self.sections) * 16 {
             return false
         }
@@ -2197,11 +2444,9 @@ impl LevelWriter for Level {
             self.columns.live.insert(k, c)
         }
         let t = self.table.take() else return false
-        let old = self.columns.live[k].set_block(t, x & 15, y, z & 15, state)
+        let set = self.columns.live[k].set_block(t, x & 15, y, z & 15, state)
         self.table = some(t)
-        if old == none {
-            return false
-        }
+        let old = set else return false
         if self.whole(k) {
             self.unsaved.insert(k)
         }
@@ -2209,7 +2454,76 @@ impl LevelWriter for Level {
         if self.lighting {
             self.send_light(LightAsk.Block { k: k, x: x, y: y, z: z, state: state })
         }
+        let some_env = self.env.copy()
+        let found = some_env else {
+            self.sent_block(pos, x, y, z, flags)
+            return true
+        }
+        let e = found
+        let f = e.facts.copy()
+        let block = f.block(state)
+        let moved = flags & UPDATE_MOVE_BY_PISTON != 0
+        // The block entity of the block replaced, which `removeBlockEntity` takes away, and the
+        // one the block set makes or keeps, aren't in the server's level yet.
+        if f.block(old) != block and f.has_block_entity(old) {
+            self.report(String("A block entity taken away with its block"))
+        }
+        if (f.block(old) != block or f.is_a(block, "BaseRailBlock")) and (flags & UPDATE_NEIGHBORS != 0 or moved) {
+            match after_removal(e, self, old, x, y, z, moved) {
+                ok => {},
+                err(thrown) => self.report(thrown.message),
+            }
+        }
+        let here = self.block_state(x, y, z) ?? state
+        if f.block(here) != block {
+            return false
+        }
+        if flags & UPDATE_SKIP_ON_PLACE == 0 {
+            match on_place(e, mut self, state, x, y, z, old, moved) {
+                ok => {},
+                err(thrown) => self.report(thrown.message),
+            }
+        }
+        if f.has_block_entity(state) {
+            self.report(String("A block entity made or kept with its block"))
+        }
+        let now = self.block_state(x, y, z) ?? state
+        if now != state {
+            return true
+        }
+        self.sent_block(pos, x, y, z, flags)
+        if flags & UPDATE_NEIGHBORS != 0 {
+            self.update_neighbours_at(x, y, z, f.block(old))
+        }
+        if flags & UPDATE_KNOWN_SHAPE == 0 and limit > 0 {
+            if f.block(old) == f.ids.redstone_wire or block == f.ids.redstone_wire {
+                self.report(String("Redstone wire's shapes of the blocks diagonal to it"))
+            }
+            let shape_flags = flags & -34
+            self.update_neighbour_shapes(state, x, y, z, shape_flags, limit - 1)
+        }
+        if f.poi(old) != f.poi(now) {
+            self.report(String("Points of interest changed as blocks are set"))
+        }
+        return true
+    }
+
+    // `ServerLevel.levelEvent`, kept for the network to send.
+    fn level_event(mut self, kind: i32, x: i32, y: i32, z: i32, data: i32) {
+        self.events.push(LevelEvent { kind: kind, x: x, y: y, z: z, data: data })
+    }
+
+    fn unimplemented(mut self, what: String) {
+        self.report(what)
+    }
+}
+
+impl Level {
+    // `sendBlockUpdated`, with `UPDATE_CLIENTS`, in a chunk that ticks: the block kept for the
+    // broadcast after the chunks tick, through `ChunkHolder.blockChanged` (D321).
+    fn sent_block(mut self, pos: ChunkPos, x: i32, y: i32, z: i32, flags: i32) {
         if flags & UPDATE_CLIENTS != 0 and self.sendable(pos) {
+            let k = pos.pack()
             let key = section_key(pos.x, y >> 4, pos.z)
             if not self.changed_blocks.contains(key) {
                 self.changed_blocks.insert(key, OpenHashSet<i16>())
@@ -2217,7 +2531,6 @@ impl LevelWriter for Level {
             self.changed_blocks[key].insert(i16.wrap(((x & 15) << 8) | ((z & 15) << 4) | (y & 15)))
             self.to_broadcast.insert(k)
         }
-        return true
     }
 }
 
@@ -2234,7 +2547,7 @@ impl BlockAccess for Level {
         if x < -30000000 or x >= 30000000 or z < -30000000 or z >= 30000000 {
             return facts.ids.void_air_state
         }
-        let s = self.collision_state(x, y, z) else fail Thrown { exception: "Unimplemented", message: "a block read where its chunk isn't full, at {x}, {y}, {z}" }
+        let s = self.collision_state(x, y, z) else fail Thrown { exception: "Unimplemented", message: "Reading a block where its chunk isn't full" }
         return s
     }
 
@@ -2255,7 +2568,7 @@ impl BlockAccess for Level {
 
     // The level keeps no block entities yet.
     fn block_entity(mut self, facts: Facts, x: i32, y: i32, z: i32) -> String? ! Thrown {
-        fail Thrown { exception: "Unimplemented", message: "a block entity in the server's level, at {x}, {y}, {z}" }
+        fail Thrown { exception: "Unimplemented", message: "Block entities in the server's level" }
     }
 
     // `getRawBrightness(pos, 0)`: the block's light or the sky's, whichever's more, or the
