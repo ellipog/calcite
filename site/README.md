@@ -75,6 +75,10 @@ The footer's ground (`src/components/site/ground.tsx`) is a cut through another 
 
 By "Performance" a band across the window is one tick (`src/components/site/tick-band.tsx`): its 50 ms are the window's width, and what 100 players took of it is marked to scale at its left end, solid to the mean, half-tone to the 99th percentile and a line at the longest, from `DATA.bots.windows`. It's plain CSS.
 
+### The 404 page
+
+An address with no page (`src/app/not-found.tsx`) shows a strip of a finished world across the window with one chunk missing in the middle, the chunk the address would be in (`src/components/site/lost-chunk.tsx`). A hash of the address picks the world's seed and the chunk's coordinates, within the world border, so each wrong address is somewhere else. After a moment the server generates the chunk anyway, a step every 1.25 s, as the home page's strip shows them, while a log under it ticks each step off. Its structure is the page's number: structure starts reserves its box, and features builds "404" in bricks a course at a time (`build()` in `slab.ts`). Its chunk is levelled first and kept clear of trees (`open` in the `Slab` constructor), as the game's terrain adaptation levels the ground around a village, so the number stands on flat grass against little else. The other chunks are drawn under half strength with dotted edges (`focus` in the view), so the eye goes to the hole. "Generate it again" replays the steps, and "go somewhere else" goes to another address that isn't a page, `/nowhere/` and six random letters, so another world. With reduced motion the chunk is drawn generated, with the whole log.
+
 ### The roadmap
 
 `/roadmap` is rebuilt at most once an hour. On a rebuild it also reads Acta's public feed for the board and shows its tasks under "From the board", if any are marked public. With none, that section doesn't appear.

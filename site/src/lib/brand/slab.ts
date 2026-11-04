@@ -52,6 +52,7 @@ const enum K {
 	Coal,
 	Iron,
 	Diamond,
+	Bricks,
 }
 
 // Each block's ink on its front, its top and its right side, in sixteenths of the 4×4 matrix: lit
@@ -71,6 +72,7 @@ const TONE: number[][] = [
 	[4, 1, 8],
 	[4, 1, 8],
 	[9, 5, 12],
+	[15, 4, 13],
 ].map((r) => r.map((v) => v / 16));
 
 const h3 = (x: number, y: number, z: number) => hash(x + Math.imul(z, 4099), Math.imul(y, 131) + z);
@@ -101,8 +103,12 @@ export class Slab {
 	private biome: Uint8Array;
 	private boxes: Box[] = [];
 
-	/** front: a tunnel along the front of every chunk, for the strip, where the cut should show one. */
-	constructor(chunks: number, seed = 149, front = true) {
+	/**
+	 * front: a tunnel along the front of every chunk, for the strip, where the cut should show one.
+	 * open: a chunk levelled and kept clear of trees, in front and in the sky over it, for a structure
+	 * built() in it.
+	 */
+	constructor(chunks: number, seed = 149, front = true, open = -1) {
 		const L = (this.L = chunks * 16), C = (this.C = chunks), N = L * D * H;
 		this.height = new Int8Array(L * D);
 		this.canopy = new Int8Array(L * D).fill(H);
@@ -118,6 +124,19 @@ export class Slab {
 				const h = 10.5 + 13 * (n1.fbm(x / 34, z / 34, 3, 0.5) - 0.5) + 3 * (n2(x / 7, z / 7) - 0.5) + z * 0.1;
 				this.height[z * L + x] = Math.max(4, Math.min(14, Math.round(h)));
 			}
+		// a structure's ground is levelled for it, as the game's terrain adaptation levels a village's:
+		// the open chunk flat at about its own height, over the sea, and the ground beside eased to it
+		if (open >= 0) {
+			const a = open * 16;
+			let sum = 0;
+			for (let z = 0; z < D; z++) for (let x = a; x < a + 16; x++) sum += this.height[z * L + x];
+			const lv = Math.max(SEA + 1, Math.min(H - 8, Math.round(sum / (16 * D))));
+			for (let z = 0; z < D; z++)
+				for (let x = Math.max(0, a - 5); x < Math.min(L, a + 21); x++) {
+					const out = x < a ? a - x : x >= a + 16 ? x - a - 15 : 0, k = 1 - out / 5, i = z * L + x;
+					this.height[i] = Math.round(this.height[i] + (lv - this.height[i]) * k * k * (3 - 2 * k));
+				}
+		}
 		// biomes at every fourth block: river where the ground dips under the sea, forest or plains
 		for (let qz = 0; qz < D / 4; qz++)
 			for (let qx = 0; qx < L / 4; qx++) {
@@ -230,7 +249,7 @@ export class Slab {
 		// the front two take the nearest grass to where they'd go, a little further back if need be
 		const grass = (x: number, z: number) => feat[at(x, this.height[z * L + x], z)] === K.Grass && this.height[z * L + x] + 7 < H;
 		for (let c = 0; c < C; c++)
-			for (let k = 0; k < (front || hash(c, 71) < 0.5 ? 2 : 1); k++) {
+			for (let k = 0; k < (c === open ? 0 : front || hash(c, 71) < 0.5 ? 2 : 1); k++) {
 				// evenly in the strip, so each chunk shows two; anywhere in a cut
 				const x0 = c * 16 + (front ? 3 + k * 8 + Math.floor(hash(c, k + 50) * 3) : 1 + Math.floor(hash(c, k + 70) * 14)), z0 = 2 + Math.floor(hash(c + 9, k) * 2);
 				find: for (let dz = 0; dz < 5; dz++)
@@ -249,7 +268,8 @@ export class Slab {
 				if (hash(x + 11, z + 5) < p) spots.push([x, z]);
 			}
 		for (const [x, z] of spots) {
-			if (x >= L || z >= D) continue;
+			// none in front of the open chunk's structure, or behind it, where it would show over it
+			if (x >= L || z >= D || (open >= 0 && x + (z >> 1) >= open * 16 - 3 && x + (z >> 1) < open * 16 + 19)) continue;
 			const g = this.height[z * L + x], top = g + 4 + (hash(x, z) < 0.5 ? 1 : 0);
 			if (feat[at(x, g, z)] !== K.Grass || top + 1 >= H) continue;
 			const tz = hash(x, z + 1);
@@ -313,6 +333,36 @@ export class Slab {
 	/** The structure's box in chunk c. */
 	box(c: number) {
 		return this.boxes[c];
+	}
+
+	/**
+	 * Builds rows of text into chunk c as its structure, during features: '#' is a block of bricks
+	 * and the first row is the top. It stands a block back from the front, centred, on a plinth
+	 * up out of the ground or the sea, and goes up a course at a time. Its start's box is set to
+	 * fit, so the first step shows where it will be.
+	 */
+	build(c: number, rows: string[]) {
+		const L = this.L, w = rows[0].length, n = rows.length, x0 = c * 16 + ((16 - w) >> 1), z0 = 1, z1 = 2;
+		const feat = this.stage[Step.Features], at = (x: number, y: number, z: number) => (z * H + y) * L + x;
+		let g = SEA, low = H;
+		for (let z = z0; z < z1; z++)
+			for (let x = x0; x < x0 + w; x++) {
+				g = Math.max(g, this.height[z * L + x]);
+				low = Math.min(low, this.height[z * L + x] + 1);
+			}
+		const top = g + n;
+		if (top >= H) return;
+		const put = (x: number, y: number, z: number) => {
+			const i = at(x, y, z);
+			feat[i] = K.Bricks;
+			this.featAt[i] = 0.3 + (0.62 * (y - low)) / (top - low + 1) + (x - x0) * 0.003;
+		};
+		for (let z = z0; z < z1; z++)
+			for (let x = x0; x < x0 + w; x++) {
+				for (let y = this.height[z * L + x] + 1; y <= g; y++) put(x, y, z);
+				for (let r = 0; r < n; r++) if (rows[r][x - x0] === '#') put(x, top - r, z);
+			}
+		this.boxes[c] = { x0, y0: low, z0, x1: x0 + w, y1: top + 1, z1 };
 	}
 
 	/** The biome a column has: 0 plains, 1 forest, 2 river. */
@@ -407,11 +457,13 @@ export interface View {
 	 * in the open and darker underground.
 	 */
 	cut?: { deep: number };
+	/** A chunk to draw at full strength; the rest are drawn quieter, under half, with dotted edges. */
+	focus?: number;
 }
 
 const M4 = bayer(4);
 // the planes and nearness of each cell, kept between drawings of the same size
-const scratch = new Map<number, { key: Int32Array; ord: Int32Array }>();
+const scratch = new Map<number, { key: Int32Array; ord: Int32Array; quiet: Uint8Array }>();
 // each world's blocks as a drawing shows them, worked out once a drawing
 const shown = new WeakMap<Slab, Uint8Array>();
 
@@ -426,11 +478,12 @@ export function drawSlab(w: Slab, v: View, bits: Uint8Array, steps: ArrayLike<nu
 	let sc = scratch.get(N);
 	if (!sc) {
 		if (scratch.size > 2) scratch.clear();
-		scratch.set(N, (sc = { key: new Int32Array(N), ord: new Int32Array(N) }));
+		scratch.set(N, (sc = { key: new Int32Array(N), ord: new Int32Array(N), quiet: new Uint8Array(N) }));
 	}
-	const { key, ord } = sc;
+	const { key, ord, quiet } = sc, focus = v.focus ?? -1;
 	bits.fill(0);
 	key.fill(0);
+	quiet.fill(0);
 	ord.fill(0);
 	const set = (cx: number, cy: number, on: number) => {
 		if (cx >= 0 && cy >= 0 && cx < cols && cy < rows) bits[cy * cols + cx] = on;
@@ -530,9 +583,12 @@ export function drawSlab(w: Slab, v: View, bits: Uint8Array, steps: ArrayLike<nu
 					const sh = lit > 0 ? w.shade(x, y, z, f as 0 | 1 | 2) * lit : 0;
 					// a face looking into air that's under the ground faces into a cave, so it's in the
 					// dark, light or no light; in a cut, a block further back that isn't is fainter
-					const cave = f === 0 ? z > 0 && y < w.height[(z - 1) * L + x] : f === 1 ? y + 1 < w.height[z * L + x] : x + 1 < L && y < w.height[z * L + x + 1];
+					const cave = f === 0 ? z > 0 && y < w.height[(z - 1) * L + x] : f === 1 ? y + 1 < w.height[z * L + x] : x + 1 < L && stepOf(x + 1) >= Step.Noise && y < w.height[z * L + x + 1];
 					const dark = cave ? 0.45 : 0, fade = cut && z > 0 && !cave ? Math.max(0.3, 1 - 0.22 * z) : 1;
 					const n = f === 1 ? d : s, m = f === 2 ? d : s, o = nearness--;
+					// outside the focus, quieter; but a side facing into it, as the cut side of the chunk
+					// beside a hole, is part of it
+					const q = focus >= 0 && x >> 4 !== focus && !(f === 2 && (x + 1) >> 4 === focus) ? 1 : 0, mute = q ? 0.45 : 1;
 					// what the face is part of: its plane (a front's z, a top's y, a side's x), what it's
 					// made of and its chunk, so chunk borders are edges too, as the game's border view
 					// draws them on the ground; an ore is a block to itself
@@ -552,22 +608,24 @@ export function drawSlab(w: Slab, v: View, bits: Uint8Array, steps: ArrayLike<nu
 							if (t < 0) continue;
 							key[j] = kk;
 							ord[j] = o;
-							tone(cx, cy, (t + sh) * fade + dark);
+							quiet[j] = q;
+							tone(cx, cy, ((t + sh) * fade + dark) * mute);
 						}
 				}
 			}
 
 	// the outlines: where two neighbouring cells show different planes or blocks, the nearer is ink
-	const outline = (i: number, j: number) => {
+	// (dotted where it's quiet: j is always the cell before i, so of the other parity)
+	const outline = (i: number, j: number, odd: number) => {
 		if (key[i] === key[j]) return;
 		const near = ord[i] >= ord[j] ? i : j;
-		if (key[near]) bits[near] = 1;
+		if (key[near] && (!quiet[near] || (near === i ? odd : odd ^ 1))) bits[near] = 1;
 	};
 	for (let cy = 1; cy < rows; cy++)
 		for (let cx = 1; cx < cols; cx++) {
-			const i = cy * cols + cx;
-			outline(i, i - 1);
-			outline(i, i - cols);
+			const i = cy * cols + cx, odd = (cx + cy) & 1;
+			outline(i, i - 1, odd);
+			outline(i, i - cols, odd);
 		}
 
 	// and up through the air from each chunk's front corner, dotted, as the border view draws it
@@ -622,6 +680,14 @@ function texel(id: number, f: number, a: number, b: number, s: number, d: number
 			// and level lines down the front, the one-ink sign for water, broken now and then
 			if (f === 0) return a % 3 === 1 && (b + x * 7 + y * 3) % 11 !== 0 ? 1 : 0;
 			break;
+		case K.Bricks: {
+			// courses of bricks half a block high, their joints alternating, in paper mortar
+			if (f === 1) return t;
+			const h = Math.max(2, s >> 1);
+			if (a % h === h - 1) return 0;
+			if (f === 0 && (b + (Math.floor(a / h) & 1 ? s >> 1 : 0)) % s === s - 1) return 0;
+			return t;
+		}
 		case K.Stone:
 			// a fleck here and there
 			if (f !== 1 && g(x, y, z, f, b, a) < 0.07) return 1;

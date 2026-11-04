@@ -1,29 +1,35 @@
 import type { Metadata } from 'next';
-import { Mark } from '@/components/mark';
 import { SiteFooter } from '@/components/site/footer';
 import { SiteHeader } from '@/components/site/header';
+import { LostChunk } from '@/components/site/lost-chunk';
+import { Kicker } from '@/components/site/parts';
 import { ButtonLink } from '@/components/ui/button';
 
 export const metadata: Metadata = { title: 'Not found', robots: { index: false } };
 
-// A page that isn't there: the mark with its view shrunk to nothing, so every square is out of it.
+// A page that isn't there: the chunk where it would be was never generated, so the server
+// generates it, and what it builds there is the number (lost-chunk.tsx).
 export default function NotFound() {
 	return (
 		<>
 			<SiteHeader />
-			<main id="main" className="wrap grid min-h-[70svh] grid-cols-1 content-center items-center gap-12 py-20 md:grid-cols-[auto_minmax(0,1fr)]">
-				<Mark size={192} r={0.06} title="The mark, with no view: nothing generated" />
-				<div>
-					<p className="label mb-4">404 · not found</p>
-					<h1 className="font-display text-[clamp(48px,7vw,96px)] leading-[0.9] font-extrabold tracking-display text-balance">Page not found</h1>
-					<p className="mt-6 max-w-[48ch] text-lg leading-normal">There&apos;s no page at this address. It may have moved, or the link may be wrong.</p>
-					<div className="mt-8 flex flex-wrap gap-2.5">
-						<ButtonLink href="/">Home</ButtonLink>
-						<ButtonLink href="/docs" variant="secondary">
-							The docs
-						</ButtonLink>
+			<main id="main" className="pb-6">
+				<div className="wrap grid grid-cols-1 items-end gap-6 pt-12 md:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)] md:gap-10 md:pt-16">
+					<div>
+						<Kicker>404 · not found</Kicker>
+						<h1 className="font-display text-[clamp(48px,7.4vw,136px)] leading-[0.86] font-extrabold tracking-display text-balance">Nothing was generated here</h1>
+					</div>
+					<div className="pb-1">
+						<p className="max-w-[44ch] text-lg leading-normal">There&apos;s no page at this address. It may have moved, or the link may be wrong. The server is generating the chunk it would be in anyway.</p>
+						<div className="mt-6 flex flex-wrap gap-2.5">
+							<ButtonLink href="/">Home</ButtonLink>
+							<ButtonLink href="/docs" variant="secondary">
+								The docs
+							</ButtonLink>
+						</div>
 					</div>
 				</div>
+				<LostChunk className="mt-8 md:mt-12" />
 			</main>
 			<SiteFooter />
 		</>
