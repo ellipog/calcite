@@ -1,5 +1,6 @@
 """Checks what a chunk does as it starts to tick against vanilla (D329, CAL-91): its
-post-processing, `LevelChunk.postProcessGeneration`, and its first ticks.
+post-processing, `LevelChunk.postProcessGeneration`, and its first ticks; and the chunks a save
+left part-way, as their generation goes on (D333, CAL-113).
 
     py -I rig/runner/ticking.py [--reuse] [--show N]
 
@@ -7,15 +8,16 @@ Both servers load the world the round trip has vanilla make and save (rig/runner
 whose chunks from -6 to 5 are full. Those vanilla ticked, from -5 to 4, it post-processed before it
 saved them. The ring at the edge, -6 and 5, it didn't, so they still have the blocks their
 generation marked, `PostProcessing`: aquifers' water and lava, mushrooms, ice, glow lichen, leaves.
-The rig's bot joins each at the origin with a view of 7, as `sessions.py` records a session, so
-that ring comes to tick and is sent. Each server finishes the ring out from it, which the save has
-waiting for its light, first.
+Out from them, the save has a ring at -7 and 6 with its features, waiting for its light, then one
+at -8 and 7 with only its terrain, then one with only its biomes. The rig's bot joins each server
+at the origin with a view of 10, as `sessions.py` records a session, so the chunks from -8 to 7
+are all sent, each server finishing the part-way rings first: vanilla from where it saved them,
+Calcite from the start.
 
 Each chunk packet's blocks are decoded, so how a palette is written (D271) doesn't count, and the
-blocks of the chunks from -6 to 5 are compared. Past them, the save's chunks have their terrain
-but not their features, which Calcite doesn't carry on from yet (CAL-113). A block that differs
-in a way that waits on something not in Calcite yet is counted under it, by the card it waits on;
-any other fails the check.
+blocks of the chunks from -8 to 7 are compared. A block that differs in a way that waits on
+something not in Calcite yet is counted under it, by the card it waits on; any other fails the
+check.
 
 It runs vanilla from the adapter (oracle/vanilla-adapter/build.py), with Mojang's EULA accepted in
 the rig's scratch folder only (CAL-42), and needs the reports datagen writes to generated/26.3/
@@ -38,10 +40,10 @@ import sessions  # noqa: E402
 CALCITE = HERE.parents[1]
 REPORTS = CALCITE / "generated" / "26.3" / "datagen" / "reports"
 CONFIG = "ticking"
-sessions.CONFIGS[CONFIG] = sessions.Config({}, view=7, scenarios=("join",), world=sessions.SAVED_WORLD,
+sessions.CONFIGS[CONFIG] = sessions.Config({}, view=10, scenarios=("join",), world=sessions.SAVED_WORLD,
                                            spawn=(0, 100, 0), entities=False)
-# The chunks compared: those the save has whole, with their neighbours' features.
-LOW, HIGH = -6, 5
+# The chunks compared: those the save has full, and the two rings it left part-way out from them.
+LOW, HIGH = -8, 7
 # The Overworld's sections, from y -64.
 SECTIONS, MIN_Y = 24, -64
 # `ConnectionProtocol`'s number for play, as the bot records it (src/rig/session.calx).
