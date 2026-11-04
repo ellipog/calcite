@@ -553,6 +553,7 @@ ITEM_COMPONENTS += [
     {"profile": {"properties": {"b": ["1", "2"], "a": ["3"], "c": []}, "model": "wide"}},
     {"profile": {"name": "x", "id": [1, 2, 3, 4], "properties": {}}},
     {"profile": {}},
+    {"lock": {"items": "minecraft:diamond", "components": {"damage": 3, "minecraft:custom_name": "x", "lore": ["a"], "repair_cost": 2}}},
 ]
 
 BAD_COMPONENTS.update({
@@ -577,6 +578,10 @@ BAD_COMPONENTS.update({
     "sign-lines": {"sign_text_front": {"messages": ["a", "b", "c"]}},
     "sign-color": {"sign_text_back": {"messages": ["a", "b", "c", "d"], "color": "pink-ish"}},
     "tooltip-unknown": {"tooltip_display": {"hidden_components": ["w:nope"]}},
+    "exact-transient": {"lock": {"components": {"creative_slot_lock": {}}}},
+    "exact-unknown": {"lock": {"components": {"w:nope": 1}}},
+    "exact-removed": {"lock": {"components": {"!damage": {}}}},
+    "exact-value": {"lock": {"components": {"damage": -1, "max_stack_size": 0}}},
 })
 
 
