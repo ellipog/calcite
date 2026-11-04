@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import { JsonLd, SOFTWARE, STUDIO, WEBSITE } from '@/lib/ld';
 import { meta } from '@/lib/meta';
 import Link from 'next/link';
 import { Flyover } from '@/components/flyover';
@@ -96,6 +97,7 @@ export default function Home() {
 	const hostBuilt = plan.find((p) => p.n === 7)?.state === 'done';
 	return (
 		<>
+			<JsonLd things={[WEBSITE, STUDIO, SOFTWARE]} />
 			{/* ---- hero ---- */}
 			{/* the heading shrinks on short screens too, so a laptop sees most of the world above the fold */}
 			<section className="flex min-h-[calc(100svh-4rem-1px)] flex-col pt-8 md:pt-[min(3.5rem,5svh)]">

@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import { JsonLd, trail } from '@/lib/ld';
 import { meta } from '@/lib/meta';
 import { PAGES } from '@/lib/pages';
 import { MarkdownLine } from '@/components/markdown';
@@ -98,6 +99,7 @@ export default async function Roadmap() {
 	const tasks = live?.tasks ?? [];
 	return (
 		<>
+			<JsonLd things={[trail([[PAGES.roadmap.title, PAGES.roadmap.path]])]} />
 			<PageHead
 				title="Roadmap"
 				lead={

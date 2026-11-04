@@ -16,13 +16,15 @@ export const SUFFIX = ' · calcite Minecraft server';
 /** A public page's metadata: its title and description, cut to what a search result shows, its one
  *  address, and the same for link previews, which don't take them from the page on their own. The
  *  picture is the page's card, from the opengraph-image.tsx beside it. */
-export function meta({ title, description, path }: { title?: string; description: string; path: string }): Metadata {
+export function meta({ title, description, path, modified }: { title?: string; description: string; path: string; modified?: string }): Metadata {
 	const full = title ? title + SUFFIX : SITE.title, about = snippet(description);
+	const og = { siteName: 'calcite', title: full, description: about, url: path, locale: 'en_US' };
 	return {
 		title: title ?? { absolute: SITE.title },
 		description: about,
 		alternates: { canonical: path },
-		openGraph: { type: 'website', siteName: 'calcite', title: full, description: about, url: path, locale: 'en_US' },
+		// a page of the docs is an article, with when it last changed where that's known
+		openGraph: path.startsWith('/docs') ? { ...og, type: 'article', ...(modified ? { modifiedTime: modified } : {}) } : { ...og, type: 'website' },
 		twitter: { card: 'summary_large_image', title: full, description: about },
 	};
 }

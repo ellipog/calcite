@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import { JsonLd, trail } from '@/lib/ld';
 import { meta } from '@/lib/meta';
 import { PAGES } from '@/lib/pages';
 import Link from 'next/link';
@@ -33,6 +34,7 @@ export default function Plugins() {
 	const p7 = phases().phases.find((p) => p.n === 7);
 	return (
 		<>
+			<JsonLd things={[trail([[PAGES.plugins.title, PAGES.plugins.path]])]} />
 			<PageHead
 				title="Plugins"
 				lead={

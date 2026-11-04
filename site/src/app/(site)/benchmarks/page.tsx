@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import { JsonLd, trail } from '@/lib/ld';
 import { meta } from '@/lib/meta';
 import { PAGES } from '@/lib/pages';
 import Link from 'next/link';
@@ -78,6 +79,7 @@ export default function Benchmarks() {
 	const others = phases().phases.find((p) => p.n === 8)?.state !== 'done';
 	return (
 		<>
+			<JsonLd things={[trail([[PAGES.benchmarks.title, PAGES.benchmarks.path]])]} />
 			{/* on a wide screen the sections are listed in a column beside the page, as the docs' pages
 			    are, and the one being read is marked; on a narrower one they're a row of chips under the head */}
 			<div className="wrap xl:grid xl:grid-cols-[200px_minmax(0,1fr)] xl:gap-x-16">

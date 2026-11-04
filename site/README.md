@@ -90,6 +90,8 @@ Each public page's title is its own name and then ` · calcite Minecraft server`
 
 Every page has its own card, the picture a link to it shows: the mark and the name, the section, the page's title and what it's about, over a strip of the world, from `src/lib/og-card.tsx`. Each page's `opengraph-image.tsx` sits beside it, since a page that sets its own preview text no longer inherits a card from above it; the docs' pages share one, `docs/[slug]/opengraph-image.tsx`, built for each page. The home page's card, `src/app/opengraph-image.tsx`, has the name large instead, and `(site)/opengraph-image.tsx` is the same card for the home page.
 
+Each page also says what it is in structured data, a JSON-LD script from `src/lib/ld.tsx`. The home page describes the site, Aaen Studios and Calcite itself, as software for Minecraft: Java Edition under the MIT license. Every other page gives its trail from the home page (`trail()`), and the docs' pages are articles about Calcite (`article()`), with the site and the studio again, as a search engine reads each page alone. A page of the docs is an article in link previews too, and it and the sitemap say when its file last changed in git (`changed()` in `src/lib/repo.ts`). In a shallow clone, as a host may build from, there's no date, since a file untouched since the clone's oldest commit would look as new as that commit.
+
 The repo README's banner is drawn by `scripts/banner.tsx` as the brand guide's README header is: the world from the README's camera coming in from the left, and the mark and the name on paper over it, 1600 by 400.
 
 ## How it's laid out

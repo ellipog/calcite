@@ -2,6 +2,7 @@
 // phases, the deliberate differences, the settings calcite.properties is written with, and the
 // sample plugins. Server components only: it reads files.
 
+import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, posix } from 'node:path';
 
@@ -40,6 +41,24 @@ function doc(slug: string, path: string, group: string): Doc {
 	const rest = body.replace(/^# .+$/m, '').trim(), cut = rest.indexOf('\n\n');
 	const first = (cut < 0 ? rest : rest.slice(0, cut)).replace(/[`*]/g, '').replace(/\[([^\]]+)\]\([^)]+\)/g, '$1').replace(/\s+/g, ' ');
 	return { slug, path, group, title: meta.title ?? h1, description: first, body: `# ${h1}\n\n${cut < 0 ? '' : rest.slice(cut + 2)}` };
+}
+
+// When a file last changed, from git, as an ISO date. Nothing in a shallow clone, where a file
+// untouched since the clone's oldest commit would look as new as that commit, or without git.
+const changes = new Map<string, string | undefined>();
+let shallow: boolean | undefined;
+export function changed(path: string): string | undefined {
+	if (changes.has(path)) return changes.get(path);
+	let at: string | undefined;
+	try {
+		const git = (...args: string[]) => execFileSync('git', args, { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+		shallow ??= git('rev-parse', '--is-shallow-repository') !== 'false';
+		if (!shallow) at = git('log', '-1', '--format=%cI', '--', path) || undefined;
+	} catch {
+		shallow = true;
+	}
+	changes.set(path, at);
+	return at;
 }
 
 export const GUIDE = 'docs/guide/README.md';
