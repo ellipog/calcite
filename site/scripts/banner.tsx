@@ -1,46 +1,63 @@
-// Writes ../assets/logo/calcite-banner.png, the README's header, as the brand guide draws it: the
-// world from the README's camera, coming in from the left, and on paper over it the mark and the
-// name. 1600 × 400, in one ink, every dot of the world a whole 2 × 2 pixels; it has its own paper,
-// so it reads the same on GitHub's light and dark themes. Run from site/: bun run banner
+// Writes ../assets/logo/calcite-banner.png, the README's header, as the home page's first screen:
+// the kicker and the name on the left, the lead on the right, and under them the flight's world, the
+// hero's own first frame (firstFrame in src/lib/brand/hero.ts), its sky dissolving into the paper.
+// 1600 × 704, in one ink, every dot of the world 2 × 2 pixels. It has its own paper, so it reads the
+// same on GitHub's light and dark themes. Run from site/: bun run banner
 
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ImageResponse } from 'next/og';
-import { CAMS, fade, view } from '../src/lib/brand/terrain';
-import { ordered } from '../src/lib/dither/bayer';
-import { cellsFor, markBits } from '../src/lib/dither/mark';
+import { BANNER_SEED, firstFrame } from '../src/lib/brand/hero';
 import { INK, PAPER } from '../src/lib/dither/math';
 import { bitsToPNG } from '../src/lib/png';
+import { SITE } from '../src/lib/site';
 
-const W = 1600, H = 400, cols = W / 2, rows = H / 2;
-const url = (png: Buffer) => `data:image/png;base64,${png.toString('base64')}`;
+const W = 1600, H = 704;
+/** Where the world's band starts, a little under the name. */
+const TOP = 284;
+/** The left edge everything lines up on, as the site's frame does. */
+const SIDE = 64;
+
 const fonts = join(process.cwd(), 'src/app/fonts');
+const url = (png: Buffer) => `data:image/png;base64,${png.toString('base64')}`;
 
-const tone = new Float32Array(cols * rows);
-view(tone, cols, rows, CAMS.readme, { horizon: 0.22 });
-fade(tone, cols, rows, { l: 0.5 });
-const world = url(bitsToPNG(ordered(tone, cols, rows, 8), cols, rows, 2, INK, PAPER));
-// the mark as the site draws it at 80 px: 40 cells, 2 px each
-const MARK = 80, n = cellsFor(MARK), mark = url(bitsToPNG(markBits(n), n, n, MARK / n, INK, null));
+const cols = W / 2, rows = (H - TOP) / 2, px = new Uint32Array(cols * rows);
+firstFrame(px, cols, rows, BANNER_SEED);
+const bits = new Uint8Array(cols * rows);
+for (let i = 0; i < bits.length; i++) bits[i] = px[i] ? 1 : 0;
+const world = url(bitsToPNG(bits, cols, rows, 2, INK, PAPER));
 
-// the guide's proportions, in hundredths of the width: the name 6.4 high, the box 4 in from the
-// left, padded 1.4 round the mark and 2.4 after the name, with 1.8 between them
-const cq = W / 100;
 const img = new ImageResponse(
 	(
-		<div style={{ width: '100%', height: '100%', display: 'flex', background: PAPER, position: 'relative' }}>
+		<div style={{ width: '100%', height: '100%', display: 'flex', background: PAPER, color: INK, position: 'relative' }}>
 			{/* eslint-disable-next-line @next/next/no-img-element */}
-			<img src={world} width={W} height={H} alt="" style={{ position: 'absolute', left: 0, top: 0 }} />
-			<div style={{ position: 'absolute', left: 4 * cq, top: 0, bottom: 0, display: 'flex', alignItems: 'center' }}>
-				<div style={{ display: 'flex', alignItems: 'center', gap: Math.round(1.8 * cq), background: PAPER, padding: `${Math.round(1.4 * cq)}px ${Math.round(2.4 * cq)}px ${Math.round(1.4 * cq)}px ${Math.round(1.4 * cq)}px` }}>
-					{/* eslint-disable-next-line @next/next/no-img-element */}
-					<img src={mark} width={MARK} height={MARK} alt="" />
-					<div style={{ fontFamily: 'Bricolage', fontSize: Math.round(6.4 * cq), lineHeight: 0.86, letterSpacing: '-0.05em', color: INK }}>calcite</div>
+			<img src={world} width={W} height={H - TOP} alt="" style={{ position: 'absolute', left: 0, top: TOP }} />
+			<div style={{ position: 'absolute', left: SIDE, right: SIDE, top: 56, display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between' }}>
+				<div style={{ display: 'flex', flexDirection: 'column' }}>
+					{/* the kicker, its dotted rule after it */}
+					<div style={{ display: 'flex', alignItems: 'center', gap: 20, fontFamily: 'DM Mono', fontSize: 20, letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+						Minecraft: Java Edition {SITE.minecraft}
+						<div style={{ display: 'flex', gap: 6 }}>
+							{Array.from({ length: 9 }, (_, i) => (
+								<div key={i} style={{ width: 2, height: 2, background: INK }} />
+							))}
+						</div>
+					</div>
+					<div style={{ fontFamily: 'Bricolage', fontWeight: 800, fontSize: 236, lineHeight: 0.8, letterSpacing: '-0.045em', marginTop: 22, marginLeft: -8 }}>calcite</div>
 				</div>
+				<div style={{ display: 'flex', width: 640, fontFamily: 'Bricolage', fontWeight: 400, fontSize: 30, lineHeight: 1.45, marginBottom: 2 }}>{SITE.lead}</div>
 			</div>
 		</div>
 	),
-	{ width: W, height: H, fonts: [{ name: 'Bricolage', data: readFileSync(join(fonts, 'BricolageGrotesque-ExtraBold.ttf')), weight: 800, style: 'normal' }] },
+	{
+		width: W,
+		height: H,
+		fonts: [
+			{ name: 'Bricolage', data: readFileSync(join(fonts, 'BricolageGrotesque-ExtraBold.ttf')), weight: 800, style: 'normal' },
+			{ name: 'Bricolage', data: readFileSync(join(fonts, 'BricolageGrotesque-Regular.woff')), weight: 400, style: 'normal' },
+			{ name: 'DM Mono', data: readFileSync(join(fonts, 'DMMono-Regular.ttf')), weight: 400, style: 'normal' },
+		],
+	},
 );
 const out = join(process.cwd(), '../assets/logo/calcite-banner.png');
 writeFileSync(out, Buffer.from(await img.arrayBuffer()));

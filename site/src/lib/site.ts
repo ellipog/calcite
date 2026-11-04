@@ -16,6 +16,8 @@ export const SITE = {
 	studio: 'https://aaenz.no',
 	calxInstall: 'https://calxlang.com/guide/install/',
 	minecraft: '26.3',
+	/** The home page's lead, which the README's banner (scripts/banner.tsx) sets beside the name too. */
+	lead: "A Minecraft server that runs the world on every core of the machine. It's written in Calx, and plugins can be written in Calx or in anything that builds to WASM.",
 } as const;
 
 export const NAV = [

@@ -18,7 +18,9 @@ import { useFrames, useSized, useSteps, still as stillMotion } from '@/lib/dithe
 import { DATA } from '@/lib/data';
 import { markPNG, pngBlob, save, socialCard, wordMask } from '@/lib/brand/files';
 import { ICONS } from '@/lib/brand/icons';
+import { BANNER_SEED, firstFrame } from '@/lib/brand/hero';
 import { CAMS, still } from '@/lib/brand/terrain';
+import { SITE } from '@/lib/site';
 import { cn } from '@/lib/cn';
 import { BarChart, LineChart, type LineCfg } from '@/components/charts';
 import { Cap, Section, Wm } from './_parts';
@@ -268,6 +270,16 @@ function Still({ cam, o, className }: { cam: keyof typeof CAMS; o: Parameters<ty
 	useSized(ref, () => still(ref.current!, CAMS[cam], o));
 	return <canvas ref={ref} className={className} />;
 }
+// The home page's flight, its first frame over a seed's world, drawn once.
+function Flight({ seed, className }: { seed: number; className?: string }) {
+	const ref = useRef<HTMLCanvasElement>(null);
+	useSized(ref, () => {
+		const s = surface(ref.current!, 2);
+		firstFrame(s.u32, s.cols, s.rows, seed);
+		s.flush();
+	});
+	return <canvas ref={ref} className={className} />;
+}
 const Chrome = ({ title }: { title: string }) => (
 	<div className="flex h-8 items-center gap-1.5 overflow-hidden rule-b px-3 font-mono text-[11px] leading-none whitespace-nowrap">
 		<i className="size-2 flex-none border border-ink" />
@@ -370,11 +382,15 @@ export function InUse() {
 				</div>
 				<div>
 					<Sub first>README header</Sub>
-					<div className={cn(frame, 'relative aspect-[4/1] [container-type:inline-size]')}>
-						<Still cam="readme" o={{ fade: { l: 0.5 }, horizon: 0.22 }} className="absolute inset-0 size-full" />
-						<div className="absolute top-1/2 left-[4%] flex -translate-y-1/2 items-center gap-[1.8cqi] bg-paper py-[1.4cqi] pr-[2.4cqi] pl-[1.4cqi]">
-							<Mark size={32} />
-							<b className="font-display text-[6.4cqi] leading-[0.86] font-extrabold tracking-[-0.05em]">calcite</b>
+					{/* the home page's first screen, as scripts/banner.tsx draws it at 1600 × 704: 1cqi is 16 px of it */}
+					<div className={cn(frame, 'relative aspect-[1600/704] [container-type:inline-size]')}>
+						<Flight seed={BANNER_SEED} className="absolute inset-x-0 bottom-0 h-[59.66%] w-full" />
+						<div className="absolute inset-x-[4cqi] top-[3.5cqi] flex items-end justify-between">
+							<div>
+								<p className="font-mono text-[1.25cqi] leading-none tracking-label uppercase">Minecraft: Java Edition {SITE.minecraft}</p>
+								<b className="mt-[1.4cqi] -ml-[0.5cqi] block font-display text-[14.75cqi] leading-[0.8] font-extrabold tracking-display">calcite</b>
+							</div>
+							<p className="w-[40cqi] text-[1.875cqi] leading-[1.45]">{SITE.lead}</p>
 						</div>
 					</div>
 					<Sub>Browser tab</Sub>

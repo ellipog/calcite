@@ -94,7 +94,7 @@ Each page also says what it is in structured data, a JSON-LD script from `src/li
 
 `src/app/manifest.ts` tells a browser or a phone's home screen the site's name, icons and paper.
 
-The repo README's banner is drawn by `scripts/banner.tsx` as the brand guide's README header is: the world from the README's camera coming in from the left, and the mark and the name on paper over it, 1600 by 400.
+The repo README's banner, drawn by `scripts/banner.tsx`, is the home page's first screen, 1600 by 704: the kicker and the name on the left, the lead (`SITE.lead`) on the right, and under them the hero's own flight, its first frame over the world `BANNER_SEED` makes (`firstFrame()` in `src/lib/brand/hero.ts`), which shares the hero's look, so a change to the hero shows in the banner the next time it's drawn. The lead is set in Bricolage's regular weight, from `src/app/fonts/BricolageGrotesque-Regular.woff`, Google Fonts' Latin subset. The brand guide draws the same header live.
 
 ## How it's laid out
 

@@ -33,6 +33,25 @@ function start() {
 	return { x: 1000, y: 3000 };
 }
 
+// How the flight looks: its horizon, how far it sees, the sky's dots and the haze, and how the sky
+// dissolves into the page above and the land into it below.
+const LOOK = { horizon: 0.22, far: VIEW * CHUNK, sky: 0.22, haze: 0.08, fadeTop: 0.32, fadeBottom: 0.2 };
+
+/**
+ * The flight's first frame over a seed's world, as the still frame draws it, into px as ink or 0:
+ * for pictures made ahead of time, such as the README's banner (scripts/banner.tsx).
+ */
+/** The world the README's banner flies over, and the brand guide's picture of it: a valley between woods. */
+export const BANNER_SEED = 31337;
+
+export function firstFrame(px: Uint32Array, cols: number, rows: number, seed: number) {
+	reseed(seed);
+	forget();
+	const cam = start(), ccx = Math.floor(cam.x / CHUNK), ccz = Math.floor(cam.y / CHUNK);
+	for (const [x, z] of ORDER) if (!isLoaded(ccx + x, ccz + z)) generate(ccx + x, ccz + z);
+	frame(px, cols, rows, { x: cam.x, y: cam.y, yaw: 0 }, { ...LOOK, height: (groundAt(cam.x, cam.y) + 24) * B, drift: 0 });
+}
+
 type Canvas = HTMLCanvasElement | OffscreenCanvas;
 type Ctx = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D;
 
@@ -214,7 +233,7 @@ export class Hero {
 		}
 
 		// the sky dissolves into the page above, and the land into it below
-		frame(this.px, this.cols, this.rows, { x: cam.x, y: cam.y, yaw: heading + this.look.yaw }, { height: this.h, horizon: 0.22 + this.look.hor, far: VIEW * CHUNK, sky: 0.22, haze: 0.08, drift: t * 3, fadeTop: 0.32, fadeBottom: 0.2 });
+		frame(this.px, this.cols, this.rows, { x: cam.x, y: cam.y, yaw: heading + this.look.yaw }, { ...LOOK, height: this.h, horizon: LOOK.horizon + this.look.hor, drift: t * 3 });
 		this.cctx!.putImageData(this.img!, 0, 0);
 		this.ctx.imageSmoothingEnabled = false;
 		this.ctx.clearRect(0, 0, this.W, this.H);

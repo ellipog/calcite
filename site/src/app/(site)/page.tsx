@@ -110,7 +110,7 @@ export default function Home() {
 					</div>
 					<div className="pb-1">
 						<p className="max-w-[44ch] text-lg leading-normal md:text-xl">
-							A Minecraft server that runs the world on every core of the machine. It&apos;s written in Calx, and plugins can be written in Calx or in anything that builds to WASM.
+							{SITE.lead}
 						</p>
 						<div className="mt-6 flex flex-wrap gap-2.5">
 							<ButtonLink href="/docs/start">Get started</ButtonLink>
