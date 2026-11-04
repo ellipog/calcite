@@ -160,7 +160,7 @@ export function Voice() {
 			{[
 				['worlds, one dot at a time.', 'for the project'],
 				['the same world, made faster.', 'for worldgen and benchmarks'],
-				['the same light, to the nibble.', 'for the light engine'],
+				['the same light in every block.', 'for the light engine'],
 			].map(([t, s], i) => (
 				<div key={t} className={cn(line, i === 2 && 'rule-b')}>
 					{t}

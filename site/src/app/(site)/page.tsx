@@ -207,7 +207,7 @@ export default function Home() {
 					items={[
 						'Worldgen passes the rig’s suites in the Overworld, the Nether and the End, on a grid of seeds.',
 						'With Terralith and Terratonic, every one of 264 sampled chunks has what must be vanilla’s.',
-						'Light matches vanilla’s to the nibble.',
+						'Light matches vanilla’s exactly: every block gets the same light level, from 0 to 15.',
 						'Logins match vanilla’s packet for packet.',
 						'Worlds move between vanilla and Calcite in both directions.',
 						`The ${diffs} places Calcite differs on purpose are listed, each a vanilla bug fixed or a limit stated.`,

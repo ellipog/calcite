@@ -12,7 +12,7 @@ Calcite means to do what vanilla 26.3 does, to the bit, wherever a player, a far
 An oracle rig runs the same inputs through vanilla's server code and through Calcite's, and compares the results bit for bit: floats as raw bits, so a near miss is a failure. Vanilla's results are recorded once and their hashes committed, and Calcite is scored against them on every change. The rig covers, among the rest:
 
 - **Worldgen.** The Overworld, the Nether and the End pass the worldgen suites on the rig's grid of seeds, block for block. With Terralith and Terratonic, every one of 264 sampled chunks has what must be vanilla's; the blocks that differ are those the order chunks are decorated in decides, which vanilla doesn't fix either.
-- **Light**, nibble for nibble, in every workload.
+- **Light.** Every block gets the same light level, from 0 to 15, as in vanilla, in every workload.
 - **The protocol.** The login and configuration suites match vanilla packet for packet, and Mojang's own 26.3 client joins, walks and chats.
 - **Saves.** A world vanilla made, loaded and saved by Calcite, reads back in vanilla.
 - **Lockstep.** A session recorded on many threads, replayed on one, gives the same packets and lines.

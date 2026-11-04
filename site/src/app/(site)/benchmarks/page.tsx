@@ -308,7 +308,7 @@ export default function Benchmarks() {
 								title="Light"
 								lead={
 									<>
-										<p>The rig runs its light probe on vanilla&apos;s server and on Calcite, 15 times each after a warm-up, on three workloads, and checks that the two engines&apos; light comes out the same, nibble for nibble. It did in every run.</p>
+										<p>The rig runs its light probe on vanilla&apos;s server and on Calcite, 15 times each after a warm-up, on three workloads, and checks that the two engines give every block the same light level, from 0 to 15. They did in every run.</p>
 										<p className="mt-4">A flat world&apos;s light is the sky&apos;s, one level at a time, so there&apos;s little work either way. Terrain is where the difference shows.</p>
 									</>
 								}
