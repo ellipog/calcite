@@ -1,10 +1,12 @@
-// Writes src/styles/tiles.css, the dither tiles every component draws with, and src/app/icon.svg,
-// the favicon. Run from site/: bun run tiles
+// Writes src/styles/tiles.css, the dither tiles every component draws with, and the icons in
+// src/app: icon.svg, favicon.ico (16 and 32 px) and apple-icon.png (180 px, the master at 2 px a
+// cell on paper). Run from site/: bun run tiles
 
 import { writeFileSync } from 'node:fs';
 import { houseTiles } from '../src/lib/dither/tiles';
-import { markSVG } from '../src/lib/dither/mark';
-import { PAPER } from '../src/lib/dither/math';
+import { markBits, markSVG } from '../src/lib/dither/mark';
+import { INK, PAPER } from '../src/lib/dither/math';
+import { bitsToPNG, ico } from '../src/lib/png';
 
 const tiles = houseTiles();
 const lines = [
@@ -35,4 +37,10 @@ for (const [n] of tiles) {
 lines.push('@utility tint-100 {\n\tbackground-color: var(--color-ink);\n}', '');
 writeFileSync('src/styles/tiles.css', lines.join('\n'));
 writeFileSync('src/app/icon.svg', markSVG(16, { paper: PAPER, size: 32 }) + '\n');
-console.log(`${tiles.length} tiles, icon.svg`);
+const m16 = markBits(16);
+writeFileSync('src/app/favicon.ico', ico([16, 32].map((size) => ({ size, png: bitsToPNG(m16, 16, 16, size / 16, INK, PAPER, true) }))));
+// the master, 64 cells at 2 px, in the middle of 90 cells of paper
+const apple = new Uint8Array(90 * 90), m64 = markBits(64);
+for (let y = 0; y < 64; y++) for (let x = 0; x < 64; x++) apple[(y + 13) * 90 + x + 13] = m64[y * 64 + x];
+writeFileSync('src/app/apple-icon.png', bitsToPNG(apple, 90, 90, 2, INK, PAPER));
+console.log(`${tiles.length} tiles, icon.svg, favicon.ico, apple-icon.png`);

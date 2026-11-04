@@ -10,7 +10,7 @@ import { Slider } from '@/components/ui/slider';
 import { Sub } from '@/components/ui/sub';
 import { Tabs } from '@/components/ui/tabs';
 import { Kbd, Panel, Tip, TextLink } from '@/components/ui/text';
-import { DATA } from '@/lib/brand/data';
+import { DATA } from '@/lib/data';
 import { StopDialog, ToastButton, ViewDistance } from './_demos';
 
 export const metadata: Metadata = { title: 'Components' };

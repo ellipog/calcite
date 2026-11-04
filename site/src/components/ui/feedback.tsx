@@ -5,7 +5,7 @@ import { cn } from '@/lib/cn';
 // empty is not started. Always with its word.
 export function Tag({ status = 'planned', children }: { status?: 'done' | 'running' | 'planned'; children: ReactNode }) {
 	return (
-		<span className="inline-flex items-center gap-[7px] rule px-[9px] py-1.5 font-mono text-xs leading-none">
+		<span className="inline-flex items-center gap-[7px] rule px-[9px] py-1.5 font-mono text-xs leading-none whitespace-nowrap">
 			<i className={cn('size-2.5 flex-none border border-ink', status === 'done' && 'bg-ink', status === 'running' && 'animate-march bg-(image:--ring) bg-size-[8px_8px]')} aria-hidden />
 			{children}
 		</span>
@@ -39,29 +39,41 @@ export function Skeleton({ lines = [100, 82, 64] }: { lines?: number[] }) {
 }
 
 // A data table: dotted rules, labels in mono caps, numbers right and tabular; the rule under the
-// row you point at goes solid.
+// row you point at goes solid. A `stack` table becomes a list on a phone: each row a block, its
+// first cell on top, its last below, and any between with their column's label.
 export interface Column {
 	label: string;
 	num?: boolean;
 }
-export function Table({ columns, rows, strong, className }: { columns: Column[]; rows: ReactNode[][]; strong?: number; className?: string }) {
-	const cell = (c: Column) => cn('rule-b py-2.5 pr-2.5 text-left', c.num && 'text-right font-mono tabular-nums');
+export function Table({ columns, rows, strong, stack, className }: { columns: Column[]; rows: ReactNode[][]; strong?: number; stack?: boolean; className?: string }) {
+	const last = columns.length - 1;
+	// a number stays on one line; its column's label may wrap over it
+	const cell = (c: Column, j: number, head = false) =>
+		cn(
+			'rule-b py-2.5 pr-2.5 text-left',
+			c.num && 'text-right font-mono tabular-nums',
+			c.num && !head && 'whitespace-nowrap',
+			stack && 'max-sm:block max-sm:border-0 max-sm:py-0.5 max-sm:pr-0 max-sm:text-left',
+			stack && j === 0 && 'max-sm:pt-3',
+			stack && j === last && 'max-sm:pb-3',
+		);
 	return (
-		<table className={cn('w-full border-collapse text-[15px] [&_tbody_tr:hover>td]:[border-bottom-style:solid]', className)}>
-			<thead>
+		<table className={cn('w-full border-collapse text-[15px] [&_tbody_tr:hover>td]:[border-bottom-style:solid]', stack && 'max-sm:block', className)}>
+			<thead className={cn(stack && 'max-sm:sr-only')}>
 				<tr>
-					{columns.map((c) => (
-						<th key={c.label} className={cn(cell(c), 'label font-normal')}>
+					{columns.map((c, j) => (
+						<th key={c.label || j} className={cn(cell(c, j, true), 'label font-normal')}>
 							{c.label}
 						</th>
 					))}
 				</tr>
 			</thead>
-			<tbody>
+			<tbody className={cn(stack && 'max-sm:block')}>
 				{rows.map((r, i) => (
-					<tr key={i} className={cn(i === strong && 'font-bold')}>
+					<tr key={i} className={cn(i === strong && 'font-bold', stack && 'max-sm:block max-sm:rule-b')}>
 						{r.map((v, j) => (
-							<td key={j} className={cell(columns[j])}>
+							<td key={j} className={cell(columns[j], j)}>
+								{stack && j > 0 && j < last && columns[j].label && <span className="label mr-2 sm:hidden">{columns[j].label}</span>}
 								{v}
 							</td>
 						))}
@@ -86,7 +98,7 @@ export function Accordion({ items }: { items: { q: ReactNode; a: ReactNode }[] }
 		<div className="rule-t">
 			{items.map((it, i) => (
 				<Disclosure key={i} summary={it.q} big>
-					<p>{it.a}</p>
+					{typeof it.a === 'string' ? <p>{it.a}</p> : it.a}
 				</Disclosure>
 			))}
 		</div>

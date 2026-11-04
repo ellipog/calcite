@@ -23,6 +23,7 @@ Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calc
 
 ## Docs
 
+- [Running Calcite](docs/guide/README.md): building and starting a server, its settings, proxies, the console, recording and moving worlds
 - [Build plan](docs/PLAN.md): phases, tasks and gates
 - [Decision log](docs/decisions.md): everything that's settled, and why
 - [Pregenerating chunks](docs/pregen.md): `/pregen`, Chunky built in
@@ -31,6 +32,7 @@ Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calc
 - [Oracle rig](rig/README.md): how Calcite is checked against vanilla, bit for bit
 - [Benchmarks](bench/README.md): the server timed with 100 players, per commit; generating a world, with Terralith and Terratonic beside vanilla, Paper and C2ME, and without; Mojang's own client joining and flying, with the server's memory; and the light engine against vanilla's
 - [Data generator and tables](oracle/datagen/README.md): the tables Calcite's codegen reads, generated from the jar
+- [Website](site/README.md): the public site and the brand guide, built from the files above
 
 ## License
 

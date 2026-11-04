@@ -15,18 +15,18 @@ import { painter, surface, type Surface } from '@/lib/dither/canvas';
 import { markBits, markSVG, MARK } from '@/lib/dither/mark';
 import { PAPER } from '@/lib/dither/math';
 import { useFrames, useSized, useSteps, still as stillMotion } from '@/lib/dither/motion';
-import { DATA } from '@/lib/brand/data';
+import { DATA } from '@/lib/data';
 import { markPNG, pngBlob, save, socialCard, wordMask } from '@/lib/brand/files';
 import { ICONS } from '@/lib/brand/icons';
 import { CAMS, still } from '@/lib/brand/terrain';
 import { cn } from '@/lib/cn';
-import { BarChart, LineChart, type LineCfg } from './_charts';
+import { BarChart, LineChart, type LineCfg } from '@/components/charts';
 import { Cap, Section, Wm } from './_parts';
 
 const fmt = (v: number, d = 1) => v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
 const threads = (n: number) => `${n} thread${n > 1 ? 's' : ''}`;
 // Vanilla's own worldgen through the whole server, now (data.ts) and at 868e0a0 (bench/README.md).
-const BEFORE: Record<number, number> = { 1: 136.3, 8: 832.1, 16: 1286.4, 32: 1689.8 };
+const BEFORE: Record<number, number> = Object.fromEntries(DATA.worldgen.runs.map((r, i) => [r.threads, DATA.worldgen.before.cps[i]]));
 const GEN = DATA.worldgen.runs.map((r) => ({ th: r.threads, now: r.cps, then: BEFORE[r.threads], steady: r.steady, mem: Math.round(r.mem) }));
 const FLY = DATA.flight.runs;
 
@@ -155,7 +155,7 @@ export function Charts() {
 						<span className="text-right font-mono text-[11px] leading-[1.4]">MiB · lower is better</span>
 					</figcaption>
 					<div className="mb-2.5 font-mono text-xs leading-none">
-						<i className="mr-[7px] inline-block h-2.5 w-4 tint-62 align-[-1px]" />
+						<i className="mr-[7px] inline-block h-2.5 w-4 tint-38 align-[-1px]" />
 						now
 					</div>
 					<BarChart max={1000} rows={GEN.map((r) => ({ name: threads(r.th), v: r.mem, label: `${r.mem}`, aria: `${threads(r.th)}: ${r.mem} MiB at most`, tip: `<b>${threads(r.th)}</b><br>${r.mem} MiB at most` }))} />

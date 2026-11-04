@@ -259,17 +259,29 @@ export function LineChart({ cfg, label, className }: { cfg: LineCfg; label: stri
 	);
 }
 
-// One series of bars, square at both ends, its value at the end.
-export function BarChart({ max, rows }: { max: number; rows: { name: string; v: number; label: string; aria: string; tip: string }[] }) {
+export interface Bar {
+	name: string;
+	v: number;
+	label: string;
+	aria: string;
+	tip: string;
+	/** The bar the chart is about: solid. The rest are dots. */
+	strong?: boolean;
+}
+
+// One series of bars, square at both ends, its value at the end. When the values change, the bars
+// step to their new lengths, never ease.
+export function BarChart({ max, rows, nameW = 78, className }: { max: number; rows: Bar[]; nameW?: number; className?: string }) {
 	const [tipNode, setTip] = useTip();
 	return (
-		<div>
+		<div className={className}>
 			{rows.map((r) => (
 				<div
 					key={r.name}
 					tabIndex={0}
 					aria-label={r.aria}
-					className="grid cursor-default grid-cols-[78px_minmax(0,1fr)] items-center gap-2.5 py-[7px] outline-none"
+					style={{ gridTemplateColumns: `${nameW}px minmax(0,1fr)` }}
+					className="grid cursor-default items-center gap-2.5 py-[7px] outline-none"
 					onPointerMove={(e) => setTip({ html: r.tip, x: e.clientX, y: e.clientY })}
 					onPointerLeave={() => setTip(null)}
 					onFocus={(e) => {
@@ -278,10 +290,13 @@ export function BarChart({ max, rows }: { max: number; rows: { name: string; v: 
 					}}
 					onBlur={() => setTip(null)}
 				>
-					<span className="font-mono text-[13px] leading-tight">{r.name}</span>
+					<span className={cn('font-mono text-[13px] leading-tight', r.strong && 'font-medium')}>{r.name}</span>
 					<div className="grid gap-[3px] border-l border-ink py-0.5">
 						<div className="flex min-h-4 items-center gap-2">
-							<i className="h-[22px] flex-none tint-62" style={{ width: `calc(${(r.v / max) * 100}% - ${(r.v / max) * 60}px)` }} />
+							<i
+								className={cn('h-[22px] flex-none transition-[width] duration-300 ease-[steps(6)] motion-reduce:transition-none', r.strong ? 'bg-ink' : 'tint-38')}
+								style={{ width: `calc(${(r.v / max) * 100}% - ${(r.v / max) * 64}px)` }}
+							/>
 							<b className="bg-paper px-[3px] py-0.5 font-mono text-xs leading-none font-normal whitespace-nowrap">{r.label}</b>
 						</div>
 					</div>

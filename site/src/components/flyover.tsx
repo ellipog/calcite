@@ -9,8 +9,9 @@ import { surface, type Surface } from '@/lib/dither/canvas';
 import { quadtree, type Leaf } from '@/lib/dither/mark';
 import { still, useFrames, useSized } from '@/lib/dither/motion';
 import { fade, view } from '@/lib/brand/terrain';
+import { cn } from '@/lib/cn';
 
-export function Hero() {
+export function Flyover({ chips = ['150.6 chunks/s on 1 thread', '2,022 on 32', "vanilla's worldgen"], className }: { chips?: string[]; className?: string }) {
 	const fly = useRef<HTMLDivElement>(null), cv = useRef<HTMLCanvasElement>(null);
 	const st = useRef({ S: null as Surface | null, T: new Float32Array(0), Z: new Uint8Array(0), grow: 0, last: 0, t: 0, aim: null as [number, number] | null, pos: { x: 0, y: 0 }, cam: { x: 256, y: 200 } });
 
@@ -70,7 +71,7 @@ export function Hero() {
 	return (
 		<div
 			ref={fly}
-			className="relative mt-14 h-[clamp(320px,52vh,520px)] rule-t"
+			className={cn('relative h-[clamp(320px,52vh,520px)] rule-t', className ?? 'mt-14')}
 			onPointerMove={(e) => {
 				const S = st.current.S;
 				if (!S) return;
@@ -80,9 +81,9 @@ export function Hero() {
 			onPointerLeave={() => (st.current.aim = null)}
 		>
 			<canvas ref={cv} className="absolute inset-0 size-full cursor-crosshair touch-pan-y" aria-label="A generated world, flown over, seen through a quadtree of the chunks in the player's view" />
-			<span className="pointer-events-none absolute top-4 right-(--gutter) rule bg-paper px-2.5 py-2 font-mono text-xs leading-none">move to look around</span>
+			<span className="pointer-events-none absolute top-4 right-(--gutter) rule bg-paper pointer-coarse:hidden px-2.5 py-2 font-mono text-xs leading-none">move to look around</span>
 			<div className="pointer-events-none absolute bottom-5 left-(--gutter) flex flex-wrap gap-2">
-				{['150.6 chunks/s on 1 thread', '2,022 on 32', "vanilla's worldgen"].map((t) => (
+				{chips.map((t) => (
 					<span key={t} className="rule bg-paper px-2.5 py-2 font-mono text-xs leading-none">
 						{t}
 					</span>

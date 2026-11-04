@@ -98,12 +98,29 @@ export function Dialog({ trigger, title, children, actions }: { trigger: ReactEl
 
 /* ---- code: a half-density bar down the left, solid once copied; comments aren't copied ------ */
 
-export function CodeBlock({ code, copy = true, className }: { code: string; copy?: boolean; className?: string }) {
+const LANGS: Record<string, string> = { sh: 'shell', bash: 'shell', powershell: 'PowerShell', properties: '.properties', toml: '.toml', json: '.json', calx: 'Calx' };
+
+export function CodeBlock({
+	code,
+	copy = true,
+	comment = '#',
+	lang,
+	className,
+}: {
+	code: string;
+	copy?: boolean;
+	/** What a line starts with to be a comment, which is lighter and isn't copied; null for none. */
+	comment?: string | null;
+	/** Shown in the corner, as `sh` or `powershell`, where it helps to know. */
+	lang?: string;
+	className?: string;
+}) {
 	const toast = useToast();
 	const [done, setDone] = useState(0);
 	const lines = code.split('\n');
+	const isComment = (l: string) => comment != null && l.trim().startsWith(comment);
 	const run = async () => {
-		const keep = lines.filter((l) => l.trim() && !l.trim().startsWith('#'));
+		const keep = lines.filter((l) => l.trim() && !isComment(l));
 		try {
 			await navigator.clipboard.writeText(keep.join('\n') + '\n');
 		} catch {
@@ -119,18 +136,24 @@ export function CodeBlock({ code, copy = true, className }: { code: string; copy
 	}, [done]);
 	return (
 		<div className={cn('relative min-w-0', className)}>
-			<pre key={done} className={cn('d-code m-0 overflow-x-auto py-4 pr-[76px] pl-[22px] font-mono text-[13.5px] leading-[1.7] font-medium whitespace-pre', done > 0 && 'done')}>
+			{lang && LANGS[lang] && Math.max(...lines.map((l) => l.length)) <= 56 && <span className="pointer-events-none absolute top-0 right-0 font-mono text-[11px] leading-none select-none max-sm:hidden" style={{ right: copy ? 72 : 10, top: 15 }}>{LANGS[lang]}</span>}
+			{/* on a phone the button gets a strip of its own above the code, so no line starts under it */}
+			<pre key={done} className={cn('d-code m-0 overflow-x-auto py-4 pl-[22px] font-mono text-[13.5px] leading-[1.7] font-medium whitespace-pre', copy ? 'pr-[76px] max-sm:pt-[50px] max-sm:pr-[18px]' : 'pr-[18px]', done > 0 && 'done')}>
 				{lines.map((l, i) => (
-					<span key={i} className={l.trim().startsWith('#') ? 'font-normal' : undefined}>
+					<span key={i} className={isComment(l) ? 'font-normal' : undefined}>
 						{l}
 						{i < lines.length - 1 && '\n'}
 					</span>
 				))}
 			</pre>
 			{copy && (
-				<Button variant="secondary" size="sm" className="absolute top-2.5 right-2.5 bg-paper" onClick={run}>
-					{done ? 'copied' : 'copy'}
-				</Button>
+				// paper under the button hides code scrolled beneath it, and leaves the button's own
+				// ground free to fill on a hover
+				<div className="absolute top-2.5 right-2.5 bg-paper">
+					<Button variant="secondary" size="sm" onClick={run}>
+						{done ? 'copied' : 'copy'}
+					</Button>
+				</div>
 			)}
 		</div>
 	);

@@ -2,7 +2,7 @@ import type { Metadata } from 'next';
 import { InternalBar } from '@/components/internal-bar';
 import { SECTIONS } from './_parts';
 import { Idea, Colour, Type, Voice } from './_static';
-import { Hero } from './_hero';
+import { Flyover } from '@/components/flyover';
 import { Logo } from './_logo';
 import { Dither, Imagery, Icons } from './_pictures';
 import { UI, Charts, Motion, InUse, Files } from './_more';
@@ -21,7 +21,7 @@ export default function Brand() {
 					</div>
 					<p className="max-w-[34ch] pb-3 text-lg leading-normal">Calcite is a Minecraft server written in Calx. Its worldgen matches vanilla&apos;s. Its brand is one cobalt ink on paper, every shade a pattern of dots, and its mark is the view around a player.</p>
 				</div>
-				<Hero />
+				<Flyover />
 			</section>
 			<main>
 				<Idea />
