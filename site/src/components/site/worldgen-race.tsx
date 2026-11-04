@@ -1,7 +1,8 @@
 'use client';
 
 // Calcite beside vanilla, Paper and C2ME generating the same world with Terralith and Terratonic,
-// at the thread count you pick. The bars step to their new lengths.
+// at the thread count you pick. The fastest at that count fills the width, and the bars step to
+// their new lengths.
 
 import { useState } from 'react';
 import { BarChart } from '@/components/charts';
@@ -22,7 +23,6 @@ export function WorldgenRace({ className, defaultThreads = 32 }: { className?: s
 		{ name: 'Paper', v: at(P.paper, t) },
 		{ name: 'Vanilla', v: at(P.vanilla, t) },
 	];
-	const max = Math.max(...P.calcite.map((r) => r.cps)) * 1.04;
 	const lead = rows[0].v / Math.max(...rows.slice(1).map((r) => r.v));
 	return (
 		<div className={cn('grid gap-5', className)}>
@@ -34,7 +34,6 @@ export function WorldgenRace({ className, defaultThreads = 32 }: { className?: s
 			</div>
 			<BarChart
 				nameW={72}
-				max={max}
 				rows={rows.map((r) => ({
 					name: r.name,
 					v: r.v,

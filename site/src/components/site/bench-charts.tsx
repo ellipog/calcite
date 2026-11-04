@@ -61,7 +61,6 @@ export function MemoryBars({ which }: { which: 'worldgen' | 'packs' }) {
 	return (
 		<BarChart
 			nameW={86}
-			max={Math.max(...runs.map((r) => r.mem)) * 1.12}
 			rows={runs.map((r) => ({ name: threads(r.threads), v: r.mem, strong: true, label: `${r.mem.toLocaleString('en-US')} MiB`, aria: `${threads(r.threads)}: ${r.mem} MiB at most`, tip: `<b>${threads(r.threads)}</b><br>${r.mem.toLocaleString('en-US')} MiB at most` }))}
 		/>
 	);
@@ -81,7 +80,6 @@ export function CpuBars({ t }: { t: number }) {
 	return (
 		<BarChart
 			nameW={72}
-			max={Math.max(...rows.map((r) => r.v)) * 1.12}
 			rows={rows.map((r) => ({ ...r, label: `${r.v} s`, aria: `${r.name}, ${threads(t)}: ${r.v} seconds of CPU`, tip: `<b>${r.name}</b> · ${threads(t)}<br>${r.v} s of CPU` }))}
 		/>
 	);
@@ -89,7 +87,7 @@ export function CpuBars({ t }: { t: number }) {
 
 /** Light: vanilla's engine and Calcite's, workload by workload. */
 export function LightBars() {
-	const L = DATA.light.runs, max = Math.max(...L.map((l) => l.vanilla)) * 1.15;
+	const L = DATA.light.runs;
 	return (
 		<div className="grid gap-6">
 			{L.map((l) => (
@@ -99,7 +97,6 @@ export function LightBars() {
 					</p>
 					<BarChart
 						nameW={72}
-						max={max}
 						rows={[
 							{ name: 'Calcite', v: l.calcite, strong: true, label: `${fmt(l.calcite, 2)} ms`, aria: `${l.name}: Calcite ${l.calcite} ms`, tip: `<b>Calcite</b><br>${fmt(l.calcite, 2)} ms` },
 							{ name: 'Vanilla', v: l.vanilla, label: `${fmt(l.vanilla, 2)} ms`, aria: `${l.name}: vanilla ${l.vanilla} ms`, tip: `<b>Vanilla</b><br>${fmt(l.vanilla, 2)} ms` },

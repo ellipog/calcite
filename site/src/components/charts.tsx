@@ -269,10 +269,15 @@ export interface Bar {
 	strong?: boolean;
 }
 
-// One series of bars, square at both ends, its value at the end. When the values change, the bars
-// step to their new lengths, never ease.
-export function BarChart({ max, rows, nameW = 78, className }: { max: number; rows: Bar[]; nameW?: number; className?: string }) {
+// One series of bars, square at both ends, its value at the end. The longest bar fills the track,
+// less room for the longest value after it, so the scale is always the rows shown: when they change,
+// as when a chart switches thread counts, the scale changes with them and the bars step to their
+// new lengths, never ease.
+export function BarChart({ rows, nameW = 78, className }: { rows: Bar[]; nameW?: number; className?: string }) {
 	const [tipNode, setTip] = useTip();
+	const top = Math.max(0, ...rows.map((r) => r.v)) || 1;
+	// the values are in mono, so the longest is that many ch, with its padding and the gap before it
+	const room = `${Math.max(0, ...rows.map((r) => r.label.length))}ch + 15px`;
 	return (
 		<div className={className}>
 			{rows.map((r) => (
@@ -292,10 +297,11 @@ export function BarChart({ max, rows, nameW = 78, className }: { max: number; ro
 				>
 					<span className={cn('font-mono text-[13px] leading-tight', r.strong && 'font-medium')}>{r.name}</span>
 					<div className="grid gap-[3px] border-l border-ink py-0.5">
-						<div className="flex min-h-4 items-center gap-2">
+						{/* in the values' font, so the bar's ch is theirs */}
+						<div className="flex min-h-4 items-center gap-2 font-mono text-xs">
 							<i
 								className={cn('h-[22px] flex-none transition-[width] duration-300 ease-[steps(6)] motion-reduce:transition-none', r.strong ? 'bg-ink' : 'tint-38')}
-								style={{ width: `calc(${(r.v / max) * 100}% - ${(r.v / max) * 64}px)` }}
+								style={{ width: `calc((100% - (${room})) * ${Math.max(0, r.v) / top})` }}
 							/>
 							<b className="bg-paper px-[3px] py-0.5 font-mono text-xs leading-none font-normal whitespace-nowrap">{r.label}</b>
 						</div>

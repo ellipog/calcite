@@ -158,7 +158,7 @@ export function Charts() {
 						<i className="mr-[7px] inline-block h-2.5 w-4 tint-38 align-[-1px]" />
 						now
 					</div>
-					<BarChart max={1000} rows={GEN.map((r) => ({ name: threads(r.th), v: r.mem, label: `${r.mem}`, aria: `${threads(r.th)}: ${r.mem} MiB at most`, tip: `<b>${threads(r.th)}</b><br>${r.mem} MiB at most` }))} />
+					<BarChart rows={GEN.map((r) => ({ name: threads(r.th), v: r.mem, label: `${r.mem}`, aria: `${threads(r.th)}: ${r.mem} MiB at most`, tip: `<b>${threads(r.th)}</b><br>${r.mem} MiB at most` }))} />
 				</figure>
 			</div>
 			<Disclosure summary="Table view" className="mt-7">
@@ -166,7 +166,7 @@ export function Charts() {
 				<Table className="mt-5" columns={[{ label: 'flight' }, { label: 'on average', num: true }, { label: 'at least', num: true }, { label: 'samples', num: true }]} rows={Object.entries(FLY).map(([v, f]) => [`${v}× vanilla's speed`, `${fmt(f.had[0])}%`, `${fmt(f.had[1])}%`, f.samples.length])} />
 			</Disclosure>
 			<Cap>The real-client flights from bench/results/client-windows.json, and vanilla&apos;s worldgen, no packs, through the whole server, from worldgen-windows.json: both on the reference machine, an i9-13900K.</Cap>
-			<Rules className="mt-[22px]" items={['Lines are one dot thick, 2 px, with square ends and corners. Bars are square at both ends.', 'Light gridlines of sparse dots, labels in mono outside the plot, values at the line ends. Where a gridline crosses the dense part of an area it turns to paper dots.', 'The reveal is a front of the 8×8 matrix rising from the baseline in 50 ms steps, once. With reduced motion, the chart is simply there.', 'Hover or focus a chart for its values; arrow keys step through them. Every chart has a table view.', 'Two measures, two charts. Never a second axis.']} />
+			<Rules className="mt-[22px]" items={['Lines are one dot thick, 2 px, with square ends and corners. Bars are square at both ends.', "A bar chart's longest bar fills its width, less room for its value, so a chart that switches what it shows rescales to it.",'Light gridlines of sparse dots, labels in mono outside the plot, values at the line ends. Where a gridline crosses the dense part of an area it turns to paper dots.', 'The reveal is a front of the 8×8 matrix rising from the baseline in 50 ms steps, once. With reduced motion, the chart is simply there.', 'Hover or focus a chart for its values; arrow keys step through them. Every chart has a table view.', 'Two measures, two charts. Never a second axis.']} />
 		</Section>
 	);
 }
