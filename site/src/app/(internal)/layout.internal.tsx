@@ -5,5 +5,6 @@ import type { Metadata } from 'next';
 export const metadata: Metadata = { robots: { index: false, follow: false } };
 
 export default function InternalLayout({ children }: { children: React.ReactNode }) {
-	return children;
+	// the guide and the sheet are laid out in the narrower frame they were drawn in
+	return <div data-frame="narrow">{children}</div>;
 }

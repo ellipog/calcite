@@ -78,7 +78,7 @@ src/app/(site)/        the public pages, with their header and footer
 src/app/(internal)/    the brand guide and the component sheet (*.internal.tsx)
 src/app/               the root layout, icons, the social card, robots.txt and the sitemap
 src/components/ui/     the components, each drawn in the brand's dither
-src/components/site/   pieces of the public pages: the header, the footer, the charts, the docs nav
+src/components/site/   pieces of the public pages: the header, the footer and its wordmark, the charts, the page and docs navs
 src/lib/               the brand's math and tiles, the Markdown parser, what's read from the repo
 scripts/               data.ts and tiles.ts
 ```
@@ -86,6 +86,19 @@ scripts/               data.ts and tiles.ts
 The internal pages' files end in `.internal.tsx`, which `next.config.ts` only counts as a page extension under `next dev` or with `CALCITE_INTERNAL=1`. A production build doesn't see them at all.
 
 The footer's bottom bar credits Aaen Studios, which makes Calcite and Calx, and links to its site, `SITE.studio` in `src/lib/site.ts`. The studio's mark, in `src/components/aaen-mark.tsx`, is traced from `logo-mark.png` on aaenz.no and drawn in the footer's ink. Calx's site has the same credit.
+
+### The frame
+
+The public pages span the window. Their content sits in a frame up to 1920 px wide (`--frame` in `src/app/globals.css`), with `--side` between it and each edge of the window: the gutter on a narrow screen, and whatever is left over on a wider one. The `wrap` utility pads a block by `--side`, so its content is in the frame. Paragraphs keep their own measure, about 60 to 70 characters, however wide the frame gets. The extra width goes to structure:
+
+- Each section of the home page and the plugins page is a `Band` (`src/components/site/parts.tsx`), whose dotted rule runs from one edge of the window to the other. So do the roadmap's phases, with the phase in progress on a solid rule.
+- A wide head is split as the hero is, with the title on the left and the lead on the right: `SectionHead` with `split`, and `PageHead`. Anything beside a table or a chart under such a head uses the same columns (`SPLIT_XL`), so text in the right-hand column starts on the lead's line down the whole page.
+- The `bleed-r`, `bleed-l` and `bleed` utilities take something in the frame out to the window's edge. The home page's stats run their rules across the window (`Stats` with `bleed`), and the relief map by "Vanilla parity" runs off the right of the page, or off both sides of a phone, with no fade on the side the page's edge cuts.
+- Grids get more columns as the width grows: the home page's features go four across, the plugin API's needs go as many across as fill every row, and a roadmap phase's checklist sits beside its gate.
+- On a wide screen the benchmarks page lists its sections in a sticky column on the left (`src/components/site/page-nav.tsx`), marking the one being read. On a narrower one they're a row of chips under the head.
+- The footer sets the name across the whole frame (`src/components/site/wordmark.tsx`), standing on the bottom bar's rule. It's type rather than a picture, so it needs no script: the word is sized in container units to the frame's width, trimmed to its cap height and baseline, and drawn seven times, each copy clipped to a band of the letters' height and filled with a Bayer tile, from solid at the top to a quarter at the foot. The ink's width and the c's side bearing are measured constants, so the letters touch both sides of the frame. If the display face changes, measure them again.
+
+The docs, being for reading, keep the old 1200 px frame, as do the internal pages: an element with `data-frame="narrow"` sets `--frame` and `--side` again for everything in it. The header and footer still span the window there.
 
 ## Deploying
 

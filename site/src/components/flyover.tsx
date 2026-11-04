@@ -135,8 +135,8 @@ export function Flyover({ className, cue = false, cps = 2000 }: { className?: st
 
 	return (
 		<div ref={fly} className={cn('relative min-h-[260px]', className)}>
-			<span className="pointer-events-none absolute top-4 right-(--gutter) z-10 rule bg-paper pointer-coarse:hidden motion-reduce:hidden px-2.5 py-2 font-mono text-xs leading-none">move to look around</span>
-			<div className="pointer-events-none absolute bottom-5 left-(--gutter) z-10 flex flex-wrap gap-2 font-mono text-xs leading-none max-sm:hidden">
+			<span className="pointer-events-none absolute top-4 right-(--side) z-10 rule bg-paper pointer-coarse:hidden motion-reduce:hidden px-2.5 py-2 font-mono text-xs leading-none">move to look around</span>
+			<div className="pointer-events-none absolute bottom-5 left-(--side) z-10 flex flex-wrap gap-2 font-mono text-xs leading-none max-sm:hidden">
 				<span ref={count} className="rule bg-paper px-2.5 py-2 tabular-nums">
 					0 chunks
 				</span>

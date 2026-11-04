@@ -33,50 +33,59 @@ async function board(): Promise<{ stages: Record<string, string>; tasks: Task[] 
 
 const STATE = { done: ['done', 'passed'], now: ['running', 'in progress'], next: ['planned', 'to come'] } as const;
 
+// A phase across the page: its rule runs from one edge of the window to the other, solid for the
+// phase in progress. On a wide screen the number, what it builds and its gate are on the left, and
+// the gate's checklist and the tasks are on the right, on the head's lead line.
 function PhaseRow({ p }: { p: Phase }) {
 	const [status, word] = STATE[p.state];
 	return (
-		<section id={`phase-${p.n}`} className={cn('grid scroll-mt-24 grid-cols-1 gap-x-10 gap-y-4 rule-t py-10 md:grid-cols-[120px_minmax(0,1fr)]', p.state === 'now' && 'border-t-2 border-solid')}>
-			<div className="flex items-start gap-4 md:block">
-				<b className={cn('block font-display text-[64px] leading-[0.8] font-extrabold tracking-display tabular-nums', p.state === 'next' && 'font-bold')}>{String(p.n).padStart(2, '0')}</b>
-				<div className="md:mt-4">
-					<Tag status={status}>{word}</Tag>
+		<section id={`phase-${p.n}`} className={cn('scroll-mt-16 rule-t', p.state === 'now' && 'border-t-2 border-solid')}>
+			<div className="wrap grid grid-cols-1 gap-x-10 gap-y-5 py-10 xl:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)] xl:py-12">
+				<div className="grid grid-cols-1 gap-x-10 gap-y-4 md:grid-cols-[120px_minmax(0,1fr)]">
+					<div className="flex items-start gap-4 md:block">
+						<b className={cn('block font-display text-[64px] leading-[0.8] font-extrabold tracking-display tabular-nums xl:text-[88px]', p.state === 'next' && 'font-bold')}>{String(p.n).padStart(2, '0')}</b>
+						<div className="md:mt-4">
+							<Tag status={status}>{word}</Tag>
+						</div>
+					</div>
+					<div className="min-w-0">
+						<h2 className="font-display text-[clamp(28px,3.4vw,48px)] leading-none font-extrabold tracking-title text-balance">{p.builds}</h2>
+						<p className="mt-4 max-w-[64ch] text-lg leading-normal">
+							<span className="label mr-2 align-[2px]">gate</span>
+							<MarkdownLine text={p.gate} path="docs/PLAN.md" />.
+						</p>
+					</div>
 				</div>
-			</div>
-			<div className="min-w-0">
-				<h2 className="font-display text-[clamp(28px,3.4vw,40px)] leading-none font-extrabold tracking-title">{p.builds}</h2>
-				<p className="mt-4 max-w-[64ch] text-lg leading-normal">
-					<span className="label mr-2 align-[2px]">gate</span>
-					<MarkdownLine text={p.gate} path="docs/PLAN.md" />.
-				</p>
-				{p.gates.length > 0 && (
-					<ul className="mt-5 grid max-w-[70ch] gap-2">
-						{p.gates.map((g) => (
-							<li key={g.id} className="relative pl-8 text-[15px] leading-normal">
-								<span aria-hidden className={cn('absolute top-[0.3em] left-0 grid size-4 place-items-center border border-ink', !g.done && 'border-dotted')}>
-									{g.done && <i className="size-2 bg-ink" />}
-								</span>
-								<span className="mr-2 font-mono text-xs">{g.id}</span>
-								<MarkdownLine text={g.text} path="docs/PLAN.md" />
-								<span className="sr-only">{g.done ? ' (passed)' : ' (not yet)'}</span>
-							</li>
-						))}
-					</ul>
-				)}
-				{p.tasks.length > 0 && (
-					<Disclosure summary={`The ${p.tasks.length} tasks`} className="mt-5">
-						<ul className="grid max-w-[76ch] gap-2.5 pt-2 pb-2">
-							{p.tasks.map((t) => (
-								<li key={t.id} className="grid grid-cols-[52px_minmax(0,1fr)] gap-2 text-[15px] leading-normal">
-									<span className="pt-0.5 font-mono text-xs">{t.id}</span>
-									<span>
-										<MarkdownLine text={t.text} path="docs/PLAN.md" />
+				<div className="min-w-0 md:max-xl:pl-[160px] xl:pt-1">
+					{p.gates.length > 0 && (
+						<ul className="grid max-w-[70ch] gap-2">
+							{p.gates.map((g) => (
+								<li key={g.id} className="relative pl-8 text-[15px] leading-normal">
+									<span aria-hidden className={cn('absolute top-[0.3em] left-0 grid size-4 place-items-center border border-ink', !g.done && 'border-dotted')}>
+										{g.done && <i className="size-2 bg-ink" />}
 									</span>
+									<span className="mr-2 font-mono text-xs">{g.id}</span>
+									<MarkdownLine text={g.text} path="docs/PLAN.md" />
+									<span className="sr-only">{g.done ? ' (passed)' : ' (not yet)'}</span>
 								</li>
 							))}
 						</ul>
-					</Disclosure>
-				)}
+					)}
+					{p.tasks.length > 0 && (
+						<Disclosure summary={`The ${p.tasks.length} tasks`} className="mt-5">
+							<ul className="grid max-w-[76ch] gap-2.5 pt-2 pb-2">
+								{p.tasks.map((t) => (
+									<li key={t.id} className="grid grid-cols-[52px_minmax(0,1fr)] gap-2 text-[15px] leading-normal">
+										<span className="pt-0.5 font-mono text-xs">{t.id}</span>
+										<span>
+											<MarkdownLine text={t.text} path="docs/PLAN.md" />
+										</span>
+									</li>
+								))}
+							</ul>
+						</Disclosure>
+					)}
+				</div>
 			</div>
 		</section>
 	);
@@ -99,11 +108,9 @@ export default async function Roadmap() {
 				<PhaseStrip phases={plan} className="mt-12" />
 			</PageHead>
 
-			<div className="wrap">
-				{plan.map((p) => (
-					<PhaseRow key={p.n} p={p} />
-				))}
-			</div>
+			{plan.map((p) => (
+				<PhaseRow key={p.n} p={p} />
+			))}
 
 			{tasks.length > 0 && (
 				<section className="wrap mt-16 rule-t pt-12">
@@ -128,17 +135,17 @@ export default async function Roadmap() {
 				</section>
 			)}
 
-			<section className="wrap mt-10">
-				<div className="flex flex-wrap gap-x-8 gap-y-3 rule-t pt-8">
-				<a href={`${SITE.blob}docs/PLAN.md`} className="link">
-					The whole plan
-				</a>
-				<a href={`${SITE.blob}docs/decisions.md`} className="link">
-					The decision log
-				</a>
-				<a href={SITE.acta} className="link">
-					The board, on Acta
-				</a>
+			<section className={cn('rule-t', tasks.length > 0 && 'mt-16')}>
+				<div className="wrap flex flex-wrap gap-x-8 gap-y-3 pt-8">
+					<a href={`${SITE.blob}docs/PLAN.md`} className="link">
+						The whole plan
+					</a>
+					<a href={`${SITE.blob}docs/decisions.md`} className="link">
+						The decision log
+					</a>
+					<a href={SITE.acta} className="link">
+						The board, on Acta
+					</a>
 				</div>
 			</section>
 		</>
