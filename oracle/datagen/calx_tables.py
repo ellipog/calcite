@@ -474,6 +474,10 @@ def block_facts_module(index, flags):
         "random_tick_classes", "classes", [where[c] if c else none for c in flags["random_tick_classes"]],
         ["/// The class whose `randomTick` each block runs, by its index in `class_names`, in block ID order (D338)."])
     lines += number_list(
+        "precipitation_classes", "classes", [where[c] if c else none for c in flags["precipitation_classes"]],
+        ["/// The class whose `handlePrecipitation` each block runs, by its index in `class_names`, in block ID order",
+         "/// (D340)."])
+    lines += number_list(
         "flammable_blocks", "blocks", flags["flammable_blocks"],
         ["/// The blocks fire can burn, by ID: those `FireBlock`'s ignite odds are above 0 for."])
     lines += number_list(

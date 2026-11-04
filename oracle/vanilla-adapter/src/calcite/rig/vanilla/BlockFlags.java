@@ -208,14 +208,15 @@ final class BlockFlags {
         StringBuilder placeOn = new StringBuilder();
         StringBuilder shape = new StringBuilder();
         // What a block does as the blocks around it change, as it's placed, once it's gone, as
-        // its scheduled tick runs and as a random tick comes to it: the class whose
-        // `neighborChanged`, `onPlace`, `affectNeighborsAfterRemoval`, `tick` (D325) and
-        // `randomTick` (D338) it runs.
+        // its scheduled tick runs, as a random tick comes to it and as rain or snow falls on it:
+        // the class whose `neighborChanged`, `onPlace`, `affectNeighborsAfterRemoval`, `tick`
+        // (D325), `randomTick` (D338) and `handlePrecipitation` (D340) it runs.
         StringBuilder neighbour = new StringBuilder();
         StringBuilder place = new StringBuilder();
         StringBuilder removal = new StringBuilder();
         StringBuilder tick = new StringBuilder();
         StringBuilder randomTick = new StringBuilder();
+        StringBuilder precipitation = new StringBuilder();
         // `FireBlock.canBurn`: the blocks fire's ignite odds are above 0 for; and each block with
         // either of fire's odds above 0, with its ignite odds and its burn odds (D339).
         StringBuilder flammable = new StringBuilder();
@@ -286,11 +287,14 @@ final class BlockFlags {
                     net.minecraft.util.RandomSource.class);
             String rt = declaring(type, "randomTick", BlockState.class, net.minecraft.server.level.ServerLevel.class, BlockPos.class,
                     net.minecraft.util.RandomSource.class);
+            String hp = declaring(type, "handlePrecipitation", BlockState.class, net.minecraft.world.level.Level.class, BlockPos.class,
+                    net.minecraft.world.level.biome.Biome.Precipitation.class);
             neighbour.append(id == 0 ? "\"" : ", \"").append(nc).append("\"");
             place.append(id == 0 ? "\"" : ", \"").append(op).append("\"");
             removal.append(id == 0 ? "\"" : ", \"").append(ar).append("\"");
             tick.append(id == 0 ? "\"" : ", \"").append(tk).append("\"");
             randomTick.append(id == 0 ? "\"" : ", \"").append(rt).append("\"");
+            precipitation.append(id == 0 ? "\"" : ", \"").append(hp).append("\"");
             Block block = BuiltInRegistries.BLOCK.byId(id);
             int instrument = block.defaultBlockState().instrument().ordinal();
             for (BlockState each : block.getStateDefinition().getPossibleStates()) {
@@ -337,6 +341,7 @@ final class BlockFlags {
         json.append("  \"removal_classes\": [").append(removal).append("],\n");
         json.append("  \"tick_classes\": [").append(tick).append("],\n");
         json.append("  \"random_tick_classes\": [").append(randomTick).append("],\n");
+        json.append("  \"precipitation_classes\": [").append(precipitation).append("],\n");
         json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
         json.append("  \"fire_odds\": [").append(fireOdds).append("],\n");
         json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");
