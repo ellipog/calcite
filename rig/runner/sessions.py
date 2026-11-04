@@ -67,9 +67,15 @@ BASE = {
     "pause-when-empty-seconds": str(PAUSE),
 }
 SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
+# Scenarios only the configurations that name them run: `watch`, where the bot joins and stays put
+# a fixed number of game ticks, for a world that never goes quiet (src/rig/session.calx).
+OTHER_SCENARIOS = ["watch"]
 # The world the round trip has vanilla make and save (rig/runner/roundtrip.py), from the seed
 # `calcite` with real terrain, its chunks full from -6 to 5 around the origin.
 SAVED_WORLD = CALCITE / "build" / "rig" / "roundtrip" / "vanilla" / "world"
+# The fixture worlds vanilla builds from rig/fixtures/'s commands (rig/runner/fixtures.py), each in
+# a folder of its name with its world in it.
+FIXTURES = CALCITE / "build" / "rig" / "fixtures"
 
 
 @dataclass
@@ -88,6 +94,8 @@ class Config:
     entities: bool = True
     # Game rules set in the copy's game_rules.dat, which both servers read, by their names.
     rules: tuple = ()
+    # The fixture `world` is, which is built from its commands if it isn't, or none.
+    fixture: str | None = None
 
 
 CONFIGS = {
@@ -104,6 +112,11 @@ CONFIGS = {
     # where Calcite has no mob to draw for, so the tape goes on past it (D338).
     "terrain": Config({}, view=3, scenarios=("join",), world=SAVED_WORLD, spawn=(0, 100, 0), entities=False,
                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # Redstone that runs by itself, built in vanilla with its ticks waiting in the save, by the
+    # spawn, in the player's chunk (CAL-116), without natural spawning, as `terrain`; its clocks
+    # never stop, so the bot watches it a fixed time.
+    "redstone": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "redstone" / "world", fixture="redstone",
+                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
@@ -288,7 +301,7 @@ def dump(a, files):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--config", action="append", choices=sorted(CONFIGS), help="only this configuration")
-    ap.add_argument("--scenario", action="append", choices=SCENARIOS, help="only this scenario")
+    ap.add_argument("--scenario", action="append", choices=SCENARIOS + OTHER_SCENARIOS, help="only this scenario")
     ap.add_argument("--compare-only", action="store_true", help="compare the last run's sessions")
     ap.add_argument("--show", type=int, default=3, help="differences shown for each packet, 0 for all")
     ap.add_argument("--tape", action="store_true", help="write both servers' levels' draws to tape.txt, and line them up")
@@ -296,12 +309,15 @@ def main():
     configs = args.config or list(CONFIGS)
     complete = args.config is None and args.scenario is None
     for c in list(configs):
+        if CONFIGS[c].fixture is not None and not args.compare_only:
+            import fixtures
+            fixtures.make(CONFIGS[c].fixture)
         world = CONFIGS[c].world
         if world is not None and not (world / "level.dat").is_file():
             print(f"{c}: skipped, since there's no {world.relative_to(CALCITE)}; run py -I rig/runner/roundtrip.py", flush=True)
             configs.remove(c)
             complete = False
-    scenarios = {c: [s for s in (args.scenario or SCENARIOS) if s in CONFIGS[c].scenarios] for c in configs}
+    scenarios = {c: [s for s in (args.scenario or CONFIGS[c].scenarios) if s in CONFIGS[c].scenarios] for c in configs}
     a = adapter()
     if not args.compare_only:
         server, bot = build_calcite(find_calx())

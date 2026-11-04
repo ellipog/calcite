@@ -241,6 +241,7 @@ Calcite is written in [Calx](https://calxlang.com). Module `a.b` is the file `sr
 | `rig.biomes` | The `biomes` probe: `worldgen.biome_source`'s sources, from vanilla's presets, tags and biomes or written out, with the climate of vanilla's noise settings, their lists, climates and biomes at quarts, at targets and over chunks, against vanilla's | |
 | `rig.nbt` | The `nbt` probe: binary NBT read, printed and written back, and SNBT parsed, against vanilla's | |
 | `rig.resave` | The round trip's Calcite half (`G5.2`): a world's folder loaded and saved again, every file through `storage`'s readers and writers, for `rig/runner/roundtrip.py` to give back to vanilla | |
+| `rig.session` | The protocol bot (`P4.8`): one player who runs a scenario against a running server and records every packet it's sent, for `rig/runner/sessions.py` to compare; `watch` stays put and leaves at a game time, for a fixture world whose redstone never lets the server go quiet ([D344](../docs/decisions.md)) | |
 | `rig.swarm` | The bot benchmark's players: bots that join a running server, walk and chat, and say how it went ([D154](../docs/decisions.md)). Its flags try wide views, as with `force-view-distance` | |
 
 ## Random sources
