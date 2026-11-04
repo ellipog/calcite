@@ -126,6 +126,10 @@ CONFIGS = {
     # `redstone`.
     "comparators": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "comparators" / "world",
                           fixture="comparators", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # Pistons by the spawn, driven by observer clocks and by repeaters whose ticks wait in the
+    # save: pushing, pulling, slime and blocks they can't move (CAL-125); watched, as `redstone`.
+    "pistons": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "pistons" / "world",
+                      fixture="pistons", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.

@@ -22,11 +22,12 @@ import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{DATA_VERSION, PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
-import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundLevelEvent, ClientboundLightUpdate, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
+import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundBlockEvent, ClientboundLevelEvent, ClientboundSound, ClientboundLightUpdate, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
 import random.legacy.{LegacyRandom}
+import registry.builtin.{builtin_entries, builtin_names}
 import random.source.{shuffle}
 import random.taped.{TapedRandom}
 import resources.identifier.{Identifier}
@@ -37,7 +38,7 @@ import server.chunks.{ChunkSender, Spiral, chunks_held, column}
 import server.commands.{Failure, GAMEMASTERS, OWNERS, Parsed, PregenCommand, Targets, failure_context, parse, tree}
 import server.configuration.{Configuration}
 import server.layout.{Layout, Placed}
-import server.level.{ChunkPacket, Level, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
+import server.level.{ChunkPacket, Heard, Level, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
 import server.link.{FileRead, Input, Link, Report}
 import server.log.{Entry, Look}
 import server.pregen.{Choice, Run, Shape, Task as PregenTask, blocks, saved_data as pregen_data, saved_id as pregen_saved_id}
@@ -373,6 +374,9 @@ const CHANGE_GAME_MODE: u8 = 3
 // Vanilla's flying speed, which `calcite flyspeed` multiplies.
 const FLYING_SPEED: f32 = 0.05f32
 
+// `SoundSource.BLOCKS`'s ordinal, which a block's sounds are played as (CAL-125).
+const SOUND_BLOCKS: i32 = 4
+
 // A login's check with the session server. It goes on if the player leaves, as vanilla's
 // authenticator thread does, and logs what it comes to either way.
 struct Check {
@@ -485,6 +489,9 @@ pub struct Network {
     reseeded: List<bool> = List<bool>()
     // The chunks each level's saved tickets load, which the first tick waits for (D319).
     preparing: List<List<ChunkPos>> = List<List<ChunkPos>>()
+    // The `sound_event` registry's IDs by name, which a sound's packet sends it by, made as the
+    // first is sent (CAL-125).
+    sound_ids: OpenHashMap<String, i32> = OpenHashMap<String, i32>()
 }
 
 /// How often the console's told how pregenerating goes, until `pregen quiet` says otherwise:
@@ -1417,6 +1424,8 @@ impl Network {
     // them, with the custom spawners (D314). Sleep, block and fluid ticks, raids, block events
     // and entities come with what they tick.
     fn tick_level(mut self, d: usize) {
+        // `handlingTick`, from the tick's start until its block events have run (CAL-125).
+        self.levels[d].handling = true
         if let r = self.reseed {
             let (at, base) = r
             if self.world.game_time >= at and d < self.reseeded.len() and not self.reseeded[d] {
@@ -1478,6 +1487,14 @@ impl Network {
         self.send_level_events(d)
         self.broadcast_changes(d)
         self.levels[d].tick_unload()
+        // The block events, `runBlockEvents`, each sent as it runs with what it did, then the
+        // tick's handled; entities, which come with them, and then the block entities,
+        // `tickBlockEntities` (CAL-125).
+        self.levels[d].run_block_events()
+        self.levels[d].handling = false
+        self.send_level_events(d)
+        self.levels[d].tick_block_entities()
+        self.send_level_events(d)
     }
 
     // Gives the level `d` what a block's shape and its survival read, once natural spawning's
@@ -1502,28 +1519,55 @@ impl Network {
         self.levels[d].set_env(Env { facts: facts, ctx: ctx, sky_light: self.world.dims[d].sky_light, gen_depth: self.world.dims[d].height })
     }
 
-    // The level events of the level `d` since they were last sent, each to its players within
-    // 64 blocks, as `PlayerList.broadcast` sends `levelEvent`'s (D326).
+    // What the players of the level `d` heard since it was last sent, in the order it happened,
+    // each to those near enough, as `PlayerList.broadcast` sends it: a level event within 64
+    // blocks (D326), a block event that ran within 64, and a sound within 16 of where it's
+    // played, `SoundEvent.getRange` of a volume of 1 or less (CAL-125).
     fn send_level_events(mut self, d: usize) {
-        let events = self.levels[d].take_events()
-        for e in events {
-            let packet = encode_play(ClientboundLevelEvent { kind: e.kind, pos: BlockPos { x: e.x, y: e.y, z: e.z }, data: e.data, global: false })
+        let heard = self.levels[d].take_heard()
+        for h in heard {
+            let (packet, x, y, z, range) = match h {
+                Heard.Event(e) => (encode_play(ClientboundLevelEvent { kind: e.kind, pos: BlockPos { x: e.x, y: e.y, z: e.z }, data: e.data, global: false }), f64(e.x), f64(e.y), f64(e.z), 64.0),
+                Heard.Block(e) => (encode_play(ClientboundBlockEvent { pos: BlockPos { x: e.x, y: e.y, z: e.z }, b0: u8.wrap(e.b0), b1: u8.wrap(e.b1), block: i32.wrap(e.block) }), f64(e.x), f64(e.y), f64(e.z), 64.0),
+                Heard.Sound(s) => {
+                    let id = self.sound_id(s.sound)
+                    let range = if s.volume > 1.0f32 { 16.0 * f64(s.volume) } else { 16.0 }
+                    (encode_play(ClientboundSound { sound: id + 1, source: SOUND_BLOCKS, x: i32.saturate(s.x * 8.0), y: i32.saturate(s.y * 8.0), z: i32.saturate(s.z * 8.0), volume: s.volume, pitch: s.pitch, seed: s.seed }), s.x, s.y, s.z, range)
+                },
+            }
             for i in 0..self.connections.len() {
                 if not self.playing(i) {
                     continue
                 }
                 var other = self.connections[i].take() else continue
                 if other.player.dim == d {
-                    let dx = f64(e.x) - other.player.x
-                    let dy = f64(e.y) - other.player.y
-                    let dz = f64(e.z) - other.player.z
-                    if dx * dx + dy * dy + dz * dz < 4096.0 {
+                    let dx = x - other.player.x
+                    let dy = y - other.player.y
+                    let dz = z - other.player.z
+                    if dx * dx + dy * dy + dz * dz < range * range {
                         self.send_bytes(mut other, packet.copy())
                     }
                 }
                 self.connections[i] = some(other)
             }
         }
+    }
+
+    // The `sound_event` registry's ID of the sound `name`, as `block.piston.extend`, the table
+    // made the first time; -1 for one it hasn't.
+    fn sound_id(mut self, name: String) -> i32 {
+        if self.sound_ids.is_empty() {
+            let names = builtin_names()
+            for r in 0..names.len() {
+                if names[r] == "sound_event" {
+                    let entries = builtin_entries(r)
+                    for i in 0..entries.len() {
+                        self.sound_ids.insert(entries[i].copy(), i32.wrap(i))
+                    }
+                }
+            }
+        }
+        return self.sound_ids.get(name) ?? -1
     }
 
     // The blocks set in the level at `d` since the last broadcast, sent to each player in it who
@@ -1741,6 +1785,10 @@ impl Network {
             burnout: burnout,
             burnout_biomes: burnout_biomes,
             max_snow: self.world.max_snow,
+            border_min_x: self.world.dims[d].border.min_x(),
+            border_min_z: self.world.dims[d].border.min_z(),
+            border_max_x: self.world.dims[d].border.max_x(),
+            border_max_z: self.world.dims[d].border.max_z(),
         }
     }
 

@@ -500,6 +500,12 @@ def block_facts_module(index, flags):
         "small_stack_sizes", "sizes", [size for _, size in stacks],
         ["/// Each of `small_stack_items`' default `max_stack_size`, in their order."])
     lines += number_list(
+        "push_reactions", "reactions", flags["push_reactions"],
+        ["/// Each block's `getPistonPushReaction`, by `PushReaction`'s ordinal, in block ID order (CAL-125)."])
+    lines += number_list(
+        "unbreakable_blocks", "blocks", flags["unbreakable_blocks"],
+        ["/// The blocks whose destroy speed is -1, which a piston can't move, by ID (CAL-125)."])
+    lines += number_list(
         "flammable_blocks", "blocks", flags["flammable_blocks"],
         ["/// The blocks fire can burn, by ID: those `FireBlock`'s ignite odds are above 0 for."])
     lines += number_list(

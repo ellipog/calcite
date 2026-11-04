@@ -328,6 +328,21 @@ class Sessions(unittest.TestCase):
         ])
         self.assertEqual(report.counts["play"], {"match": 4, "differ": 3})
 
+    def test_block_events_line_up_by_place(self):
+        def event(x, b0):
+            return self.packet("play", "block_event", {"pos": {"@": "BlockPos", "x": x, "y": 0, "z": 0}, "b0": b0, "b1": 5}, f"e{x}{b0}")
+
+        def sound(x, seed):
+            return self.packet("play", "sound", {"sound": "#minecraft:block.piston.extend", "x": x * 8 + 4, "y": 4, "z": 4, "pitch": 0.7, "seed": seed}, f"s{x}{seed}")
+        # Calcite has lost the first piston's first pair: lined up by kind alone, every pair after
+        # would be the other piston's. The seeds are drawn, so they don't count.
+        vanilla = [{"mark": "step join"}, sound(1, 7), event(1, 0), sound(2, 8), event(2, 0), sound(1, 9), event(1, 1), sound(2, 3), event(2, 1)]
+        calcite = [{"mark": "step join"}, sound(2, 1), event(2, 0), sound(1, 2), event(1, 1), sound(2, 4), event(2, 1)]
+        report, _ = self.compare(vanilla, calcite)
+        found = sorted((f.key, f.what) for f in report.findings)
+        self.assertEqual(found, [("session:join/join/block_event", "only vanilla sends it"), ("session:join/join/sound", "only vanilla sends it")])
+        self.assertEqual(report.counts["play"]["match"], 6)
+
     def test_scenarios_by_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

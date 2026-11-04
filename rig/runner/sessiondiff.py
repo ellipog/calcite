@@ -2,7 +2,9 @@
 vanilla and by Calcite, as the vanilla adapter's SessionDump read it with vanilla's codecs.
 
 A session is cut into the bot's steps, and each step's packets are lined up by kind, as `diff`
-lines up text. Two lined-up packets match when their values are the same tree and, unless
+lines up text, a block event or a sound by where it is too (`PLACED`), so a run of a piston's
+sounds and events, the same kinds over and over, lines up event by event. Two lined-up packets
+match when their values are the same tree and, unless
 vanilla doesn't fix the order (`UNORDERED`), the same bytes. Four things are taken out of the
 line first, since when or in what order they come depends on timing rather than on the server:
 
@@ -45,10 +47,14 @@ CHANGES = {"play/block_update", "play/section_blocks_update", "play/light_update
 # the client reads them into an EnumMap.
 UNORDERED = {"configuration/update_tags", "play/update_tags", "play/set_time", "play/level_chunk_with_light"}
 # Fields vanilla draws afresh each run, which can't match: the session ID the server draws as it
-# starts, which every login gets, and the time on a chat message without a signature, which is
-# the server's clock as it reads the message.
-DRAWN = {"login/login_finished": {"sessionId"}, "play/player_chat": {"timeStamp"}}
+# starts, which every login gets; the time on a chat message without a signature, which is the
+# server's clock as it reads the message; and a sound's seed, which `Level.playSound` draws from
+# `threadSafeRandom`, seeded afresh as the server starts (CAL-125).
+DRAWN = {"login/login_finished": {"sessionId"}, "play/player_chat": {"timeStamp"}, "play/sound": {"seed"}}
 SUITES = {"status": "status", "login": "login", "configuration": "configuration"}
+# Packets lined up by where they are as well as by kind: a block's event and a sound, which
+# pistons and clocks send over and over (CAL-125).
+PLACED = {"play/block_event", "play/sound"}
 
 
 @dataclass
@@ -196,7 +202,7 @@ def compare_step(scenario, va, ca, findings, counts):
         tally["differ"] += 1
 
     a, b = va.entries, ca.entries
-    m = difflib.SequenceMatcher(a=[e.kind for e in a], b=[e.kind for e in b], autojunk=False)
+    m = difflib.SequenceMatcher(a=[line_key(e) for e in a], b=[line_key(e) for e in b], autojunk=False)
     for op, i1, i2, j1, j2 in m.get_opcodes():
         if op == "equal":
             for x, y in zip(a[i1:i2], b[j1:j2]):
@@ -224,6 +230,15 @@ def compare_step(scenario, va, ca, findings, counts):
             found(kind, "differs, with the times taken out", paths(va.clock[kind], ca.clock[kind]))
         else:
             tally["match"] += 1
+
+
+def line_key(entry):
+    """What a packet's lined up by: its kind, and, for one of `PLACED`, where it is."""
+    if entry.kind not in PLACED or not isinstance(entry.value, dict):
+        return entry.kind
+    v = entry.value
+    at = v.get("pos") or {k: v.get(k) for k in ("x", "y", "z")}
+    return f"{entry.kind} {json.dumps(without(at, {'@'}), sort_keys=True)}"
 
 
 def where(entry):

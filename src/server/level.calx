@@ -55,6 +55,7 @@ import protocol.state.{State}
 import protocol.wire.{Writer, write_packet}
 import random.source.{RandomSource}
 import random.taped.{TapedRandom}
+import random.xoroshiro.{mix_stafford13}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done, Loaded, SavedChunk, Whole, gen_thread, generated, prepare}
 import server.chunks.{Chunks, Next}
 import server.light_service.{LIGHT_ASKS, LightAsk, LightBody, LightDone, LightService, LightThread}
@@ -71,7 +72,9 @@ import world.post_process.{post_process}
 import world.precipitation.{Precipitation}
 import world.random_ticks.{RandomTicks, TickPlace}
 import world.block_entity_updates.{block_entity_ids, block_entity_infos, block_entity_map, holds_anything, kind_of, made_block_entity, place_of, saved_block_entities, sends_update_packet, update_tag}
-import world.block_updates.{BlockLevel, after_removal, on_neighbour_changed, on_place, shape_order, tick_block, update_or_destroy, update_order, update_output_signal}
+import world.block_level.{BlockLevel, MovingPiston, update_or_destroy}
+import world.block_updates.{after_removal, on_neighbour_changed, on_place, shape_order, tick_block, update_order, update_output_signal}
+import world.pistons.{tick_moving, trigger_event}
 import world.level_writer.{LevelWriter, UPDATE_CLIENTS, UPDATE_KNOWN_SHAPE, UPDATE_LIMIT, UPDATE_MOVE_BY_PISTON, UPDATE_NEIGHBORS, UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS, UPDATE_SKIP_ON_PLACE, UPDATE_SKIP_SHAPE_UPDATE_ON_WIRE}
 import world.light.{SkySources}
 import world.natural.{SpawnLevel}
@@ -337,6 +340,47 @@ pub struct LevelEvent {
     pub data: i32
 }
 
+/// What a level's players are sent of what happens in it, in the order it happened, as vanilla
+/// sends each at once: a level event (D326); a sound, `playSound`; and a block event that ran,
+/// `ClientboundBlockEventPacket` (CAL-125).
+pub enum Heard {
+    Event(LevelEvent)
+    Sound(LevelSound)
+    Block(BlockEvent)
+}
+
+/// A sound played, `Level.playSound`, for the players near enough to hear it (CAL-125): the
+/// sound event's name, as `block.piston.extend`, where it's played, its volume and pitch, and the
+/// seed the client plays it with.
+pub struct LevelSound {
+    pub sound: String
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    pub volume: f32
+    pub pitch: f32
+    pub seed: i64
+}
+
+/// A block event, `BlockEventData`: the block at `x`, `y`, `z` it's for, and its two numbers, for
+/// the players within 64 blocks once it's run (CAL-125).
+pub struct BlockEvent {
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub block: u32
+    pub b0: i32
+    pub b1: i32
+}
+
+// A block entity's ticker, `RebindableTickingBlockEntityWrapper`: its place, and its number,
+// which `ticker_ids` keeps for the place while it's there; once it isn't, it's dropped as the
+// tickers come to it (CAL-125).
+struct Ticker {
+    pos: BlockPos
+    id: u64
+}
+
 // A redstone torch's toggle, `RedstoneTorchBlock.Toggle`: where, and the game time it toggled at.
 struct Toggle {
     x: i32
@@ -491,7 +535,7 @@ pub struct Level {
     /// `max-chained-neighbor-updates`: how many updates a chain may run, or no end if below 0.
     pub max_chained: i32 = 1000000
     reported: Set<String> = Set<String>()
-    events: List<LevelEvent> = List<LevelEvent>()
+    events: List<Heard> = List<Heard>()
     // The block ticks running this tick, as `LevelTicks.tick` collects them, `toRunThisTick`, with
     // the next to run, and those still to run, `toRunThisTickSet`, which `willTickThisTick` makes
     // as it first asks; and the redstone torches' toggles, oldest first, `RECENT_TOGGLES`'s
@@ -503,6 +547,25 @@ pub struct Level {
     // The `block_entity_type` registry's IDs by name, which a chunk's packet sends its block
     // entities' types by, made as the first chunk's packet is (CAL-115).
     block_entity_ids: OpenHashMap<String, i32> = OpenHashMap<String, i32>()
+    // The block events waiting, `blockEvents`, each once, in the order they came; the moving
+    // pistons' block entities, by their places, packed; the block entities' tickers,
+    // `blockEntityTickers`, in their order, with those added while they tick,
+    // `pendingBlockEntityTickers`, and whether they're ticking; each place's ticker's number, and
+    // the next; the chunks full before the level had its block facts, whose moving pistons tick
+    // once it has them; and the sounds' seeds, from a sequence of their own, as vanilla's
+    // `threadSafeRandom` is seeded as the server starts (CAL-125).
+    block_events: List<BlockEvent> = List<BlockEvent>()
+    motions: Map<i64, MovingPiston> = Map<i64, MovingPiston>()
+    tickers: List<Ticker> = List<Ticker>()
+    pending_tickers: List<Ticker> = List<Ticker>()
+    ticking_entities: bool = false
+    ticker_ids: Map<i64, u64> = Map<i64, u64>()
+    next_ticker: u64 = 1
+    moving_waiting: List<i64> = List<i64>()
+    sound_seeds: i64 = 0
+    /// `handlingTick`: whether the level's tick is between its start and its block events, as the
+    /// network sets it, which a piston pulled back while another moves reads (CAL-125).
+    pub handling: bool = false
 }
 
 /// The blocks set in a section since they were last broadcast, as `ChunkHolder.broadcastChanges`
@@ -1231,6 +1294,13 @@ impl Level {
     /// post-processed until it's given them (D329).
     pub fn set_env(mut self, env: own Env) {
         self.env = some(Shared(env))
+        let moving = self.moving_waiting.copy()
+        self.moving_waiting.clear()
+        for k in moving {
+            if self.full(unpacked(k)) {
+                self.load_moving(k)
+            }
+        }
         // The chunks that came to tick without them, the spawn's at the server's start, are
         // post-processed now, in the order they came to, each that still ticks (D329).
         var waiting = List<i64>()
@@ -1253,12 +1323,213 @@ impl Level {
         }
     }
 
-    /// The level events since this was last asked, in the order they came, for the network to
-    /// send (D326).
+    /// The level events since this was last asked, in the order they came (D326), with what else
+    /// the players heard since let go.
     pub fn take_events(mut self) -> List<LevelEvent> {
+        var out = List<LevelEvent>()
+        for h in self.events {
+            match h {
+                Heard.Event(e) => out.push(e),
+                _ => {},
+            }
+        }
+        self.events.clear()
+        return out
+    }
+
+    /// What the players heard since this was last asked, in the order it happened, for the
+    /// network to send: level events, sounds and block events (CAL-125).
+    pub fn take_heard(mut self) -> List<Heard> {
         let out = self.events.copy()
         self.events.clear()
         return out
+    }
+
+    /// How many moving pistons' block entities the level holds (CAL-125).
+    pub fn moving_piston_count(self) -> usize {
+        return self.motions.len()
+    }
+
+    /// Runs the block events waiting, as `runBlockEvents` does once the chunks have ticked
+    /// (CAL-125): first come first, with those they add after them, each in a chunk whose blocks
+    /// tick run if the block it's for is still there, `doBlockEvent`, and heard by its players if
+    /// it did anything; each in a chunk that doesn't, kept for the next tick.
+    pub fn run_block_events(mut self) {
+        let some_env = self.env.copy()
+        let shared = some_env else return
+        let Env { facts: f, .. } = shared.value
+        var later = List<BlockEvent>()
+        while not self.block_events.is_empty() {
+            let e = self.block_events.remove(0)
+            if not self.dm.in_block_ticking_range(ChunkPos { x: e.x >> 4, z: e.z >> 4 }.pack()) {
+                later.push(e)
+                continue
+            }
+            let state = self.state_or_report(f, e.x, e.y, e.z) else continue
+            if f.block(state) != e.block {
+                continue
+            }
+            let ran = match self.trigger(shared.value, state, e) {
+                ok(r) => r,
+                err(thrown) => {
+                    self.report(thrown.message)
+                    false
+                },
+            }
+            if ran {
+                self.events.push(Heard.Block(e))
+            }
+        }
+        for e in later {
+            self.add_block_event(e)
+        }
+    }
+
+    /// Ticks the block entities, as `tickBlockEntities` does after the entities (CAL-125): those
+    /// added since they last ticked put at the end first, then each in turn, one taken away
+    /// since dropped as it's come to, and one in a chunk whose blocks tick, within the border,
+    /// whose block is still of its type, ticked. Only moving pistons' tick yet.
+    pub fn tick_block_entities(mut self) {
+        let some_env = self.env.copy()
+        let shared = some_env else return
+        let Env { facts: f, .. } = shared.value
+        self.ticking_entities = true
+        let added = self.pending_tickers.copy()
+        self.pending_tickers.clear()
+        for t in added {
+            self.tickers.push(t)
+        }
+        var kept = List<Ticker>()
+        var i: usize = 0
+        while i < self.tickers.len() {
+            let t = self.tickers[i]
+            i += 1
+            let p = t.pos.pack()
+            if (self.ticker_ids.get(p) ?? 0) != t.id {
+                continue
+            }
+            kept.push(t)
+            if not self.ticks_block_entity(t.pos) {
+                continue
+            }
+            let state = self.block_state(t.pos.x, t.pos.y, t.pos.z) ?? f.ids.air_state
+            if f.block(state) != f.ids.moving_piston {
+                continue
+            }
+            let m = self.motions.get(p) else continue
+            match tick_moving(shared.value, mut self, t.pos.x, t.pos.y, t.pos.z, m) {
+                ok(next) => {
+                    if let n = next {
+                        if (self.ticker_ids.get(p) ?? 0) == t.id {
+                            self.set_motion(t.pos, n)
+                        }
+                    }
+                },
+                err(thrown) => self.report(thrown.message),
+            }
+        }
+        self.tickers = kept
+        self.ticking_entities = false
+    }
+
+    // `triggerEvent` of the block event `ev` on `state`: a piston's, as `world.pistons` has it;
+    // the others' come with their blocks.
+    fn trigger(mut self, e: Env, state: u32, ev: BlockEvent) -> bool ! Thrown {
+        let Env { facts: f, .. } = e
+        let block = f.block(state)
+        if block == f.ids.piston or block == f.ids.sticky_piston {
+            return try trigger_event(e, mut self, state, ev.x, ev.y, ev.z, ev.b0, ev.b1)
+        }
+        fail Thrown { exception: "Unimplemented", message: "triggerEvent of {f.class_name(block)}" }
+    }
+
+    // `blockEvents.add`: kept at the end, unless the same one waits already.
+    fn add_block_event(mut self, e: BlockEvent) {
+        for w in self.block_events {
+            if w.x == e.x and w.y == e.y and w.z == e.z and w.block == e.block and w.b0 == e.b0 and w.b1 == e.b1 {
+                return
+            }
+        }
+        self.block_events.push(e)
+    }
+
+    // `BoundTickingBlockEntity.tick`'s `isTicking` and `shouldTickBlocksAt`: whether a block
+    // entity at `pos` ticks, within the border, in a chunk whose blocks tick, with its entities.
+    fn ticks_block_entity(self, pos: BlockPos) -> bool {
+        let chunk = pos.chunk()
+        return self.place.in_border(pos.x, pos.z) and self.dm.in_block_ticking_range(chunk.pack()) and self.sendable(chunk)
+    }
+
+    // `updateBlockEntityTicker` for a block entity new at `pos`: a ticker of its own, at the end,
+    // or, while they tick, after them.
+    fn add_ticker(mut self, pos: BlockPos) {
+        let id = self.next_ticker
+        self.next_ticker += 1
+        self.ticker_ids.insert(pos.pack(), id)
+        let t = Ticker { pos: pos, id: id }
+        if self.ticking_entities {
+            self.pending_tickers.push(t)
+        } else {
+            self.tickers.push(t)
+        }
+    }
+
+    // What the moving piston at `pos` holds now, `m`, kept, and in its block entity as it saves:
+    // its `progress`, `progressO`.
+    fn set_motion(mut self, pos: BlockPos, m: MovingPiston) {
+        self.motions.insert(pos.pack(), m)
+        let k = pos.chunk().pack()
+        self.columns.own_block_entities(k)
+        if not self.columns.block_entities[k].contains(pos) {
+            return
+        }
+        var tags = match self.columns.block_entities[k][pos] {
+            Tag.Compound(t) => t.copy(),
+            _ => return,
+        }
+        tags.insert("progress", Tag.Float(m.progress_o))
+        self.columns.block_entities[k].insert(pos, Tag.Compound(tags))
+        if self.whole(k) {
+            self.unsaved.insert(k)
+        }
+    }
+
+    // The moving pistons the chunk at `k` was saved with, ticking once it's full, as
+    // `registerAllBlockEntitiesAfterLevelLoad` adds their tickers, in its map's order; once the
+    // level has its block facts, which read what they move.
+    fn load_moving(mut self, k: i64) {
+        let some_env = self.env.copy()
+        let shared = some_env else {
+            self.moving_waiting.push(k)
+            return
+        }
+        let Env { facts: f, .. } = shared.value
+        let map = self.columns.block_entities_of(k)
+        for (pos, saved) in map {
+            if (kind_of(saved) ?? String()) != "minecraft:piston" {
+                continue
+            }
+            let m = moving_of(f, saved) else continue
+            self.motions.insert(pos.pack(), m)
+            if not self.ticker_ids.contains(pos.pack()) {
+                self.add_ticker(pos)
+            }
+        }
+    }
+
+    // The chunk at `k` unloaded: its moving pistons go, and their tickers with them, as
+    // `clearAllBlockEntities` takes them away.
+    fn drop_moving(mut self, k: i64) {
+        var gone = List<i64>()
+        for (p, _) in self.motions {
+            if BlockPos.unpack(p).chunk().pack() == k {
+                gone.push(p)
+            }
+        }
+        for p in gone {
+            _ = self.motions.remove(p)
+            _ = self.ticker_ids.remove(p)
+        }
     }
 
     // Says once that `what` isn't in Calcite yet: the level goes on without it.
@@ -1776,6 +2047,9 @@ impl Level {
     // `removeBlockEntity`: the block entity at `pos` in the chunk at `k` taken away, if it has one;
     // with `effects`, what it holds dropped first, `preRemoveSideEffects`, which isn't yet.
     fn remove_block_entity(mut self, k: i64, pos: BlockPos, effects: bool) {
+        // A moving piston's goes with what it moves and its ticker (CAL-125).
+        _ = self.motions.remove(pos.pack())
+        _ = self.ticker_ids.remove(pos.pack())
         self.columns.own_block_entities(k)
         if not self.columns.block_entities[k].contains(pos) {
             return
@@ -1798,6 +2072,10 @@ impl Level {
             }
             // One of another type is taken away, with a warning, as `setBlockState` does.
             _ = self.columns.block_entities[k].remove(pos)
+        }
+        // `MovingPistonBlock.newBlockEntity` makes none: a piston sets its own (CAL-125).
+        if kind == "minecraft:piston" {
+            return
         }
         let made = fresh(kind.copy()) else {
             self.report("A fresh {kind}")
@@ -2211,6 +2489,7 @@ impl Level {
                 }
                 self.block_ticks.add_container(k, ChunkTicks.saved(block))
                 self.fluid_ticks.add_container(k, ChunkTicks.saved(fluid))
+                self.load_moving(k)
             }
             if self.sendable(pos) {
                 self.post_process_lit(k)
@@ -2323,6 +2602,7 @@ impl Level {
     fn unloaded(mut self, k: i64) {
         self.stop_waiting(k)
         let ticks = self.drop_ticks(k)
+        self.drop_moving(k)
         self.reading.unlit.remove(k)
         if self.opened {
             self.tell_full(k, false)
@@ -3044,7 +3324,7 @@ impl BlockLevel for Level {
 
     // `ServerLevel.levelEvent`, kept for the network to send.
     fn level_event(mut self, kind: i32, x: i32, y: i32, z: i32, data: i32) {
-        self.events.push(LevelEvent { kind: kind, x: x, y: y, z: z, data: data })
+        self.events.push(Heard.Event(LevelEvent { kind: kind, x: x, y: y, z: z, data: data }))
     }
 
     fn unimplemented(mut self, what: String) {
@@ -3218,6 +3498,134 @@ impl BlockLevel for Level {
     // at the zoomed biome.
     fn fire_burnout(self, x: i32, y: i32, z: i32) -> bool {
         return self.place.burnout_in(self.noise_biome(x >> 2, y >> 2, z >> 2))
+    }
+
+    fn block_event(mut self, x: i32, y: i32, z: i32, block: u32, b0: i32, b1: i32) {
+        self.add_block_event(BlockEvent { x: x, y: y, z: z, block: block, b0: b0, b1: b1 })
+    }
+
+    // `playSound(null, pos, ...)`: from the block's middle, with a seed of its own, as vanilla
+    // draws one from `threadSafeRandom`, which nothing else reads.
+    fn play_sound(mut self, x: i32, y: i32, z: i32, sound: str, volume: f32, pitch: f32) {
+        self.sound_seeds += -7046029254386353131
+        let seed = mix_stafford13(self.sound_seeds)
+        self.events.push(Heard.Sound(LevelSound { sound: String(sound), x: f64(x) + 0.5, y: f64(y) + 0.5, z: f64(z) + 0.5, volume: volume, pitch: pitch, seed: seed }))
+    }
+
+    fn neighbour_shapes(mut self, state: u32, x: i32, y: i32, z: i32, flags: i32) {
+        self.update_neighbour_shapes(state, x, y, z, flags, UPDATE_LIMIT)
+    }
+
+    fn indirect_shapes(mut self, state: u32, x: i32, y: i32, z: i32, flags: i32) {
+        let some_env = self.env.copy()
+        let shared = some_env else return
+        let Env { facts: f, .. } = shared.value
+        self.update_indirect_shapes(f, state, x, y, z, flags, UPDATE_LIMIT)
+    }
+
+    fn moving_piston(self, x: i32, y: i32, z: i32) -> MovingPiston? {
+        return self.motions.get(BlockPos { x: x, y: y, z: z }.pack())
+    }
+
+    // `LevelChunk.setBlockEntity`, where the block there is a moving piston: in the chunk's map,
+    // as it saves, ticking, by its place's ticker where it has one, as `updateBlockEntityTicker`
+    // rebinds it, else by a new one.
+    fn put_moving_piston(mut self, x: i32, y: i32, z: i32, m: MovingPiston) {
+        let some_env = self.env.copy()
+        let shared = some_env else return
+        let Env { facts: f, .. } = shared.value
+        let state = self.block_state(x, y, z) else return
+        if f.block(state) != f.ids.moving_piston {
+            return
+        }
+        let pos = BlockPos { x: x, y: y, z: z }
+        let k = pos.chunk().pack()
+        self.columns.own_block_entities(k)
+        self.columns.block_entities[k].insert(pos, moving_tag(f, pos, m))
+        if self.whole(k) {
+            self.unsaved.insert(k)
+        }
+        self.motions.insert(pos.pack(), m)
+        if not self.ticker_ids.contains(pos.pack()) {
+            self.add_ticker(pos)
+        }
+    }
+
+    fn remove_block_entity_at(mut self, x: i32, y: i32, z: i32) {
+        let pos = BlockPos { x: x, y: y, z: z }
+        self.remove_block_entity(pos.chunk().pack(), pos, false)
+    }
+
+    fn in_border(self, x: i32, z: i32) -> bool {
+        return self.place.in_border(x, z)
+    }
+
+    fn handling_tick(self) -> bool {
+        return self.handling
+    }
+
+    fn after_removal_of(mut self, old: u32, x: i32, y: i32, z: i32, moved: bool) {
+        let some_env = self.env.copy()
+        let shared = some_env else return
+        match after_removal(shared.value, mut self, old, x, y, z, moved) {
+            ok => {},
+            err(thrown) => self.report(thrown.message),
+        }
+    }
+}
+
+// A moving piston's block entity holding `m` at `pos`, as `saveWithFullMetadata` saves it: the
+// state it moves, `BlockState.CODEC`'s, the piston's facing, `Direction.LEGACY_ID_CODEC`'s byte,
+// how far along it was as its last tick started, and whether it's extending and the piston's
+// own (CAL-125).
+fn moving_tag(f: Facts, pos: BlockPos, m: MovingPiston) -> Tag {
+    var data = JavaHashMap<String, Tag>()
+    data.insert(String("blockState"), f.codec.encode(m.moved))
+    data.insert(String("facing"), Tag.Byte(i8.wrap(m.facing)))
+    data.insert(String("progress"), Tag.Float(m.progress_o))
+    data.insert(String("extending"), Tag.Byte(if m.extending { 1 } else { 0 }))
+    data.insert(String("source"), Tag.Byte(if m.source { 1 } else { 0 }))
+    return made_block_entity(String("minecraft:piston"), data, pos)
+}
+
+// What the moving piston's block entity `saved` holds, as `loadAdditional` reads it: its state,
+// air where it names none, its facing, the byte's remainder by 6, without its sign, down where
+// it has none, and its progress, both as it is and as its last tick started (CAL-125).
+fn moving_of(f: Facts, saved: Tag) -> MovingPiston? {
+    let tags = match saved {
+        Tag.Compound(t) => t.copy(),
+        _ => return none,
+    }
+    var moved = f.ids.air_state
+    if tags.contains("blockState") {
+        moved = match f.codec.decode(tags["blockState"]) {
+            ok(s) => s,
+            err(_) => f.ids.air_state,
+        }
+    }
+    let facing = if tags.contains("facing") {
+        match tags["facing"] {
+            Tag.Byte(b) => (i32(b) % 6).abs(),
+            _ => 0,
+        }
+    } else { 0 }
+    let progress = if tags.contains("progress") {
+        match tags["progress"] {
+            Tag.Float(v) => v,
+            _ => 0.0f32,
+        }
+    } else { 0.0f32 }
+    return some(MovingPiston { moved: moved, facing: facing, extending: flag_of(tags, "extending"), source: flag_of(tags, "source"), progress: progress, progress_o: progress })
+}
+
+// A saved boolean, a byte that isn't 0, false where there's none.
+fn flag_of(tags: JavaHashMap<String, Tag>, name: str) -> bool {
+    if not tags.contains(name) {
+        return false
+    }
+    return match tags[name] {
+        Tag.Byte(b) => b != 0,
+        _ => false,
     }
 }
 

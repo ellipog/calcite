@@ -262,6 +262,26 @@ final class BlockFlags {
         it.unimi.dsi.fastutil.objects.Object2IntMap<Block> burn =
                 (it.unimi.dsi.fastutil.objects.Object2IntMap<Block>) burnField.get(net.minecraft.world.level.block.Blocks.FIRE);
         Map<String, String> parents = new java.util.TreeMap<>();
+        // Each block's `getPistonPushReaction`, by its ordinal, and the blocks whose destroy speed is
+        // -1, which a piston can't move (CAL-125). Each is a field each state copies from its block's
+        // properties, so every state of a block has the same; that's checked.
+        StringBuilder pushReactions = new StringBuilder();
+        StringBuilder unbreakable = new StringBuilder();
+        for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
+            Block block = BuiltInRegistries.BLOCK.byId(id);
+            BlockState first = block.getStateDefinition().getPossibleStates().get(0);
+            int reaction = first.getPistonPushReaction().ordinal();
+            boolean fixed = first.getDestroySpeed(EmptyBlockGetter.INSTANCE, BlockPos.ZERO) == -1.0F;
+            for (BlockState s : block.getStateDefinition().getPossibleStates()) {
+                if (s.getPistonPushReaction().ordinal() != reaction || (s.getDestroySpeed(EmptyBlockGetter.INSTANCE, BlockPos.ZERO) == -1.0F) != fixed) {
+                    throw new IllegalStateException("BlockFlags: the states of " + BuiltInRegistries.BLOCK.getKey(block) + " differ in how a piston moves them");
+                }
+            }
+            pushReactions.append(id == 0 ? "" : ", ").append(reaction);
+            if (fixed) {
+                unbreakable.append(unbreakable.isEmpty() ? "" : ", ").append(id);
+            }
+        }
         for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
             Class<?> type = BuiltInRegistries.BLOCK.byId(id).getClass();
             while (type.isAnonymousClass()) {
@@ -387,6 +407,8 @@ final class BlockFlags {
         json.append("  \"has_analog_classes\": [").append(hasAnalog).append("],\n");
         json.append("  \"analog_classes\": [").append(analog).append("],\n");
         json.append("  \"item_stack_sizes\": [").append(stacks).append("],\n");
+        json.append("  \"push_reactions\": [").append(pushReactions).append("],\n");
+        json.append("  \"unbreakable_blocks\": [").append(unbreakable).append("],\n");
         json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
         json.append("  \"fire_odds\": [").append(fireOdds).append("],\n");
         json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");

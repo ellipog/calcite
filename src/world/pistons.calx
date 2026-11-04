@@ -1,0 +1,548 @@
+/// Pistons, as vanilla's move blocks (CAL-125). `PistonBaseBlock.checkIfExtend`, which a piston
+/// runs as it's placed and as the blocks around it change, keeps a block event for the level to
+/// run once its chunks have ticked; `triggerEvent`, which that event runs, moves what's in front
+/// out, or back in for a sticky piston, as `PistonStructureResolver` finds it, slime and honey
+/// pulling what they stick to along, twelve blocks at most. Each block moved is a moving piston
+/// for two ticks, whose block entity's tick, `PistonMovingBlockEntity.tick`, then sets the block
+/// it moved in its new place, shaped by what's around it; `finalTick` does that at once where a
+/// piston moves again first. Entities aren't moved with them yet, and what a broken block drops
+/// comes with items.
+module world.pistons
+
+import random.source.{RandomSource}
+import world.block_level.{BlockLevel, MovingPiston, remove_block, update_or_destroy}
+import world.level_writer.{UPDATE_LIMIT}
+import world.pos.{BlockPos}
+import worldgen.access.{BlockAccess}
+import worldgen.facts.{DOWN, Facts, IMMOVEABLE, POPPED, PUSH_ONLY, PUSH_PULL, UP, direction_name, opposite, step_x, step_y, step_z}
+import worldgen.interval.{Thrown}
+import worldgen.shapes.{update_from_neighbours}
+import worldgen.signals.{has_signal}
+import worldgen.survive.{Env, facing_of}
+
+/// `PistonStructureResolver.MAX_PUSH_DEPTH`: the most blocks a piston moves.
+pub const MAX_PUSH: usize = 12
+
+/// `PistonBaseBlock.checkIfExtend`: the piston `state` at `x`, `y`, `z`, powered and in, keeps
+/// the block event to move out, 0, if what's in front can move; unpowered and out, it keeps the
+/// one to move back in: 1, or 2 where what's two in front is still being pushed out by another
+/// piston, not yet half way or not yet ticked this tick, or while the level's ticks run.
+pub fn check_if_extend<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+    let facing = try facing_of(f, state)
+    let signal = try neighbour_signal(f, level, x, y, z, facing)
+    let extended = f.get_bool(state, "extended")
+    if signal and not extended {
+        let found = try resolve(f, level, x, y, z, facing, true)
+        if found != none {
+            level.block_event(x, y, z, f.block(state), 0, facing)
+        }
+        return
+    }
+    if signal or not extended {
+        return
+    }
+    let tx = x + 2 * step_x(facing)
+    let ty = y + 2 * step_y(facing)
+    let tz = z + 2 * step_z(facing)
+    let there = try level.state(f, tx, ty, tz)
+    var kind = 1
+    if f.block(there) == f.ids.moving_piston {
+        let there_facing = try facing_of(f, there)
+        if there_facing == facing {
+            if let m = level.moving_piston(tx, ty, tz) {
+                if m.extending and (m.progress_o < 0.5f32 or level.time_now() == m.last_ticked or level.handling_tick()) {
+                    kind = 2
+                }
+            }
+        }
+    }
+    level.block_event(x, y, z, f.block(state), kind, facing)
+}
+
+/// `PistonBaseBlock.triggerEvent`: the block event `b0`, `b1` that `check_if_extend` kept, run on
+/// the piston `state` at `x`, `y`, `z`, and whether it ran, so its players are sent it. One whose
+/// signal changed back by now does nothing, or, still powered with an event to go in, is set out
+/// with flags 2. Out, 0: what's in front moved, and the piston set out with flags 67, with its
+/// sound. In, 1 or 2: the piston a moving piston at once, `b1` the facing its base will have,
+/// the head's moving piston finished first; then a sticky piston pulls back what's two in front
+/// with event 1, if it can and it's no moving piston of another's still going out, which it
+/// finishes instead; else the head's taken away, with flags 3; and its sound.
+pub fn trigger_event<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mut L, state: u32, x: i32, y: i32, z: i32, b0: i32, b1: i32) -> bool ! Thrown {
+    let Env { facts: f, .. } = e
+    let facing = try facing_of(f, state)
+    let out = try f.with_bool(state, "extended", true)
+    let signal = try neighbour_signal(f, level, x, y, z, facing)
+    if signal and (b0 == 1 or b0 == 2) {
+        _ = level.set_block_limited(x, y, z, out, 2, UPDATE_LIMIT)
+        return false
+    }
+    if not signal and b0 == 0 {
+        return false
+    }
+    let sticky = f.block(state) == f.ids.sticky_piston
+    if b0 == 0 {
+        if not try move_blocks(e, mut level, x, y, z, facing, true, sticky) {
+            return false
+        }
+        _ = level.set_block_limited(x, y, z, out, 67, UPDATE_LIMIT)
+        let pitch = level.next_float() * 0.25f32 + 0.6f32
+        level.play_sound(x, y, z, "block.piston.extend", 0.5f32, pitch)
+        return true
+    }
+    if b0 != 1 and b0 != 2 {
+        return true
+    }
+    let hx = x + step_x(facing)
+    let hy = y + step_y(facing)
+    let hz = z + step_z(facing)
+    if let head = level.moving_piston(hx, hy, hz) {
+        try final_tick(e, mut level, hx, hy, hz, head)
+    }
+    let moving = try typed(f, f.ids.moving_piston, facing, sticky)
+    _ = level.set_block_limited(x, y, z, moving, 276, UPDATE_LIMIT)
+    // `Direction.from3DDataValue`, of the facing's three bits.
+    let base = try f.with_name(f.default_state(f.block(state)), "facing", direction_name((b1 & 7) % 6))
+    level.put_moving_piston(x, y, z, MovingPiston { moved: base, facing: facing, extending: false, source: true })
+    level.update_neighbours(x, y, z, f.ids.moving_piston)
+    level.neighbour_shapes(moving, x, y, z, 2)
+    if sticky {
+        let tx = x + 2 * step_x(facing)
+        let ty = y + 2 * step_y(facing)
+        let tz = z + 2 * step_z(facing)
+        let there = try level.state(f, tx, ty, tz)
+        var finished = false
+        if f.block(there) == f.ids.moving_piston {
+            if let m = level.moving_piston(tx, ty, tz) {
+                if m.facing == facing and m.extending {
+                    try final_tick(e, mut level, tx, ty, tz, m)
+                    finished = true
+                }
+            }
+        }
+        if not finished {
+            let block = f.block(there)
+            if b0 == 1 and not f.is_air(there) and is_pushable(f, level, there, tx, ty, tz, opposite(facing), false, facing) and (f.push_reaction(block) == PUSH_PULL or block == f.ids.piston or block == f.ids.sticky_piston) {
+                _ = try move_blocks(e, mut level, x, y, z, facing, false, sticky)
+            } else {
+                _ = try remove_block(f, mut level, hx, hy, hz)
+            }
+        }
+    } else {
+        _ = try remove_block(f, mut level, hx, hy, hz)
+    }
+    let pitch = level.next_float() * 0.15f32 + 0.6f32
+    level.play_sound(x, y, z, "block.piston.contract", 0.5f32, pitch)
+    return true
+}
+
+/// `PistonBaseBlock.isPushable`: whether a piston facing `facing` can move the block `state` at
+/// `x`, `y`, `z` toward `push`, breaking it where it pops if `destroy`. Nothing moves out of the
+/// world's height or its border, nor past its top or bottom; air always can; an extended piston
+/// can't, nor a block that can't be broken, nor one whose push reaction is `IMMOVEABLE`; one that
+/// pops can if `destroy`, and one that's only pushed if it's pushed the piston's way; else a
+/// block can unless it has a block entity.
+pub fn is_pushable<L: BlockAccess + BlockLevel>(f: Facts, level: L, state: u32, x: i32, y: i32, z: i32, push: i32, destroy: bool, facing: i32) -> bool {
+    if not level.in_height(y) or not level.in_border(x, z) {
+        return false
+    }
+    if f.is_air(state) {
+        return true
+    }
+    if push == DOWN and not level.in_height(y - 1) {
+        return false
+    }
+    if push == UP and not level.in_height(y + 1) {
+        return false
+    }
+    let block = f.block(state)
+    if block == f.ids.piston or block == f.ids.sticky_piston {
+        if f.get_bool(state, "extended") {
+            return false
+        }
+    } else {
+        if f.unbreakable(block) {
+            return false
+        }
+        let reaction = f.push_reaction(block)
+        if reaction == IMMOVEABLE {
+            return false
+        }
+        if reaction == POPPED {
+            return destroy
+        }
+        if reaction == PUSH_ONLY {
+            return push == facing
+        }
+    }
+    return not f.has_block_entity(state)
+}
+
+/// `PistonMovingBlockEntity.tick`: the moving piston at `x`, `y`, `z`, holding `m`, half a block
+/// further along, what it holds after; or, all the way along as the tick starts, gone, `none`,
+/// with the block it moved set in its place with flags 67, shaped by the blocks around and not
+/// waterlogged, and told it's there, or, where it can't be there, set with flags 340 and broken.
+pub fn tick_moving<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mut L, x: i32, y: i32, z: i32, m: MovingPiston) -> MovingPiston? ! Thrown {
+    let Env { facts: f, .. } = e
+    var now = m
+    now.last_ticked = level.time_now()
+    now.progress_o = now.progress
+    if now.progress_o >= 1.0f32 {
+        level.remove_block_entity_at(x, y, z)
+        if f.block(try level.state(f, x, y, z)) != f.ids.moving_piston {
+            return none
+        }
+        let shaped = try update_from_neighbours(e, mut level, now.moved, x, y, z)
+        if f.is_air(shaped) {
+            _ = level.set_block_limited(x, y, z, now.moved, 340, UPDATE_LIMIT)
+            try update_or_destroy(e, mut level, now.moved, shaped, x, y, z, 3, UPDATE_LIMIT)
+            return none
+        }
+        var placed = shaped
+        if f.has(placed, "waterlogged") and f.get_bool(placed, "waterlogged") {
+            placed = try f.with_bool(placed, "waterlogged", false)
+        }
+        _ = level.set_block_limited(x, y, z, placed, 67, UPDATE_LIMIT)
+        level.neighbour_changed(x, y, z, f.block(placed))
+        return none
+    }
+    // `moveCollidedEntities` and `moveStuckEntities` come with entities.
+    level.unimplemented(String("Entities moved by a piston"))
+    let next = now.progress + 0.5f32
+    now.progress = if next >= 1.0f32 { 1.0f32 } else { next }
+    return some(now)
+}
+
+/// `PistonMovingBlockEntity.finalTick`: the moving piston at `x`, `y`, `z`, holding `m`, done
+/// at once if it isn't all the way along: gone, with what it moved set in its place with flags
+/// 3, shaped by the blocks around, or air for a piston's own head, and told it's there.
+pub fn final_tick<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mut L, x: i32, y: i32, z: i32, m: MovingPiston) ! Thrown {
+    if m.progress_o >= 1.0f32 {
+        return
+    }
+    let Env { facts: f, .. } = e
+    level.remove_block_entity_at(x, y, z)
+    if f.block(try level.state(f, x, y, z)) != f.ids.moving_piston {
+        return
+    }
+    let placed = if m.source { f.ids.air_state } else { try update_from_neighbours(e, mut level, m.moved, x, y, z) }
+    _ = level.set_block_limited(x, y, z, placed, 3, UPDATE_LIMIT)
+    level.neighbour_changed(x, y, z, f.block(placed))
+}
+
+/// `PistonHeadBlock.isFittingBase`: whether `base` is the piston the head `head` is out of: of
+/// its type, extended, facing its way.
+pub fn fitting_base(f: Facts, head: u32, base: u32) -> bool ! Thrown {
+    let want = if (f.get_name(head, "type") ?? String("normal")) == "normal" { f.ids.piston } else { f.ids.sticky_piston }
+    if f.block(base) != want or not f.get_bool(base, "extended") {
+        return false
+    }
+    return try facing_of(f, base) == try facing_of(f, head)
+}
+
+// `getNeighborSignal`: whether any side but its front gives the piston at x, y, z a signal, or
+// below it, or any side of the block above but its bottom, as a piston's powered from above.
+fn neighbour_signal<R: BlockAccess>(f: Facts, r: R, x: i32, y: i32, z: i32, facing: i32) -> bool ! Thrown {
+    for d in 0..6 {
+        if d != facing and try has_signal(f, r, x + step_x(d), y + step_y(d), z + step_z(d), d, true) {
+            return true
+        }
+    }
+    if try has_signal(f, r, x, y, z, DOWN, true) {
+        return true
+    }
+    for d in 0..6 {
+        if d != DOWN and try has_signal(f, r, x + step_x(d), y + 1 + step_y(d), z + step_z(d), d, true) {
+            return true
+        }
+    }
+    return false
+}
+
+// The block's default state facing `facing`, with its `type` sticky if `sticky`, as a piston's
+// head and moving piston are.
+fn typed(f: Facts, block: u32, facing: i32, sticky: bool) -> u32 ! Thrown {
+    let faced = try f.with_name(f.default_state(block), "facing", direction_name(facing))
+    return try f.with_name(faced, "type", if sticky { String("sticky") } else { String("normal") })
+}
+
+// `moveBlocks`: what the piston at x, y, z facing `facing` moves, out if `extending`, else in,
+// moved, and whether it could be. In, its head's taken away first, with flags 276. Each block
+// that pops is broken, with flags 18, from the last found; each pushed, from the last, is a
+// moving piston in its next place with flags 324, holding the block as it was found; out, the
+// head's place is the head's moving piston. Where a block was and none's come, it's air, with
+// flags 82; then each place a block left is given its shapes, each broken block tells the
+// blocks around it went, and each pushed one, then the head, tells those around where it was.
+fn move_blocks<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mut L, x: i32, y: i32, z: i32, facing: i32, extending: bool, sticky: bool) -> bool ! Thrown {
+    let Env { facts: f, .. } = e
+    let hx = x + step_x(facing)
+    let hy = y + step_y(facing)
+    let hz = z + step_z(facing)
+    if not extending and f.block(try level.state(f, hx, hy, hz)) == f.ids.piston_head {
+        _ = level.set_block_limited(hx, hy, hz, f.ids.air_state, 276, UPDATE_LIMIT)
+    }
+    let found = try resolve(f, level, x, y, z, facing, extending)
+    let r = found else return false
+    // The places left, a `HashMap` of each pushed block's place to its state, in Java's order.
+    var left = JavaHashMap<BlockPos, u32>()
+    var states = List<u32>()
+    for p in r.to_push {
+        let s = try level.state(f, p.x, p.y, p.z)
+        states.push(s)
+        left.insert(p, s)
+    }
+    let dir = if extending { facing } else { opposite(facing) }
+    var affected = List<u32>()
+    var i = r.to_destroy.len()
+    while i > 0 {
+        i -= 1
+        let p = r.to_destroy[i]
+        let s = try level.state(f, p.x, p.y, p.z)
+        // `dropResources`, which comes with items.
+        level.unimplemented(String("What a broken block drops"))
+        _ = level.set_block_limited(p.x, p.y, p.z, f.ids.air_state, 18, UPDATE_LIMIT)
+        affected.push(s)
+    }
+    let moving = try f.with_name(f.default_state(f.ids.moving_piston), "facing", direction_name(facing))
+    i = r.to_push.len()
+    while i > 0 {
+        i -= 1
+        let p = r.to_push[i]
+        let s = try level.state(f, p.x, p.y, p.z)
+        let to = BlockPos { x: p.x + step_x(dir), y: p.y + step_y(dir), z: p.z + step_z(dir) }
+        _ = left.remove(to)
+        _ = level.set_block_limited(to.x, to.y, to.z, moving, 324, UPDATE_LIMIT)
+        level.put_moving_piston(to.x, to.y, to.z, MovingPiston { moved: states[i], facing: facing, extending: extending, source: false })
+        affected.push(s)
+    }
+    if extending {
+        let head = try typed(f, f.ids.piston_head, facing, sticky)
+        let head_moving = try typed(f, f.ids.moving_piston, facing, sticky)
+        _ = left.remove(BlockPos { x: hx, y: hy, z: hz })
+        _ = level.set_block_limited(hx, hy, hz, head_moving, 324, UPDATE_LIMIT)
+        level.put_moving_piston(hx, hy, hz, MovingPiston { moved: head, facing: facing, extending: true, source: true })
+    }
+    var places = List<(BlockPos, u32)>()
+    for (p, s) in left {
+        places.push((p, s))
+    }
+    for (p, _) in places {
+        _ = level.set_block_limited(p.x, p.y, p.z, f.ids.air_state, 82, UPDATE_LIMIT)
+    }
+    for (p, s) in places {
+        level.indirect_shapes(s, p.x, p.y, p.z, 2)
+        level.neighbour_shapes(f.ids.air_state, p.x, p.y, p.z, 2)
+        level.indirect_shapes(f.ids.air_state, p.x, p.y, p.z, 2)
+    }
+    var n: usize = 0
+    i = r.to_destroy.len()
+    while i > 0 {
+        i -= 1
+        let s = affected[n]
+        n += 1
+        let p = r.to_destroy[i]
+        level.after_removal_of(s, p.x, p.y, p.z, false)
+        level.indirect_shapes(s, p.x, p.y, p.z, 2)
+        level.update_neighbours(p.x, p.y, p.z, f.block(s))
+    }
+    i = r.to_push.len()
+    while i > 0 {
+        i -= 1
+        let p = r.to_push[i]
+        level.update_neighbours(p.x, p.y, p.z, f.block(affected[n]))
+        n += 1
+    }
+    if extending {
+        level.update_neighbours(hx, hy, hz, f.ids.piston_head)
+    }
+    return true
+}
+
+// `PistonStructureResolver`'s answer for a piston at `piston`: the way the blocks go, `push`, the
+// blocks it pushes, in the order found, and those it breaks.
+struct Moves {
+    piston: BlockPos
+    push: i32
+    to_push: List<BlockPos>
+    to_destroy: List<BlockPos>
+}
+
+// `resolve`: what the piston at x, y, z facing `facing` moves, out if `extending`, from the block
+// in front, else back in, from the block two in front; `none` if it can't. A block that can't
+// move stops it but where it pops going out, when it's broken; else the line from it, and those
+// each sticky block in it brings along.
+fn resolve<L: BlockAccess + BlockLevel>(f: Facts, level: L, x: i32, y: i32, z: i32, facing: i32, extending: bool) -> Moves? ! Thrown {
+    let push = if extending { facing } else { opposite(facing) }
+    let reach = if extending { 1 } else { 2 }
+    let start = BlockPos { x: x + reach * step_x(facing), y: y + reach * step_y(facing), z: z + reach * step_z(facing) }
+    var r = Moves { piston: BlockPos { x: x, y: y, z: z }, push: push, to_push: List<BlockPos>(), to_destroy: List<BlockPos>() }
+    let state = try level.state(f, start.x, start.y, start.z)
+    if not is_pushable(f, level, state, start.x, start.y, start.z, push, false, facing) {
+        if extending and f.push_reaction(f.block(state)) == POPPED {
+            r.to_destroy.push(start)
+            return some(r)
+        }
+        return none
+    }
+    if not try add_line(f, level, mut r, start, push) {
+        return none
+    }
+    var i: usize = 0
+    while i < r.to_push.len() {
+        let p = r.to_push[i]
+        if is_sticky(f, try level.state(f, p.x, p.y, p.z)) and not try add_branches(f, level, mut r, p) {
+            return none
+        }
+        i += 1
+    }
+    return some(r)
+}
+
+// `addBlockLine`: the line of blocks from `origin`, which a piston facing `d` would move, added
+// to those pushed, unless it's air, can't move, is the piston or is pushed already: first the
+// blocks behind it each sticky block pulls along, then those in front it pushes, up to the first
+// air, or a block that pops, broken. Where the line runs into blocks pushed already, those are
+// put after it, and the sticky blocks up to there bring theirs. Whether the piston can still move.
+fn add_line<L: BlockAccess + BlockLevel>(f: Facts, level: L, r: mut Moves, origin: BlockPos, d: i32) -> bool ! Thrown {
+    var state = try level.state(f, origin.x, origin.y, origin.z)
+    if f.is_air(state) {
+        return true
+    }
+    if not is_pushable(f, level, state, origin.x, origin.y, origin.z, r.push, false, d) {
+        return true
+    }
+    if same(origin, r.piston) or index_of(r.to_push, origin) >= 0 {
+        return true
+    }
+    var count = 1
+    if usize.wrap(count) + r.to_push.len() > MAX_PUSH {
+        return false
+    }
+    let back = opposite(r.push)
+    while is_sticky(f, state) {
+        let behind = offset(origin, back, count)
+        let before = state
+        state = try level.state(f, behind.x, behind.y, behind.z)
+        if f.is_air(state) or not stick_together(f, before, state) or not is_pushable(f, level, state, behind.x, behind.y, behind.z, r.push, false, back) or same(behind, r.piston) {
+            break
+        }
+        count += 1
+        if usize.wrap(count) + r.to_push.len() > MAX_PUSH {
+            return false
+        }
+    }
+    var added = 0
+    var j = count - 1
+    while j >= 0 {
+        r.to_push.push(offset(origin, back, j))
+        added += 1
+        j -= 1
+    }
+    var k = 1
+    loop {
+        let next = offset(origin, r.push, k)
+        let collision = index_of(r.to_push, next)
+        if collision > -1 {
+            reorder(mut r.to_push, added, collision)
+            var l = 0
+            while l <= collision + added {
+                let p = r.to_push[usize.wrap(l)]
+                if is_sticky(f, try level.state(f, p.x, p.y, p.z)) and not try add_branches(f, level, mut r, p) {
+                    return false
+                }
+                l += 1
+            }
+            return true
+        }
+        state = try level.state(f, next.x, next.y, next.z)
+        if f.is_air(state) {
+            return true
+        }
+        if not is_pushable(f, level, state, next.x, next.y, next.z, r.push, true, r.push) or same(next, r.piston) {
+            return false
+        }
+        if f.push_reaction(f.block(state)) == POPPED {
+            r.to_destroy.push(next)
+            return true
+        }
+        if r.to_push.len() >= MAX_PUSH {
+            return false
+        }
+        r.to_push.push(next)
+        added += 1
+        k += 1
+    }
+}
+
+// `reorderListAtCollision`: the blocks pushed, the last `added` of them put just before the one
+// at `collision`, which the line they're in runs into.
+fn reorder(to_push: mut List<BlockPos>, added: i32, collision: i32) {
+    let size = i32.wrap(to_push.len())
+    var out = List<BlockPos>()
+    for i in 0..collision {
+        out.push(to_push[usize.wrap(i)])
+    }
+    for i in size - added..size {
+        out.push(to_push[usize.wrap(i)])
+    }
+    for i in collision..size - added {
+        out.push(to_push[usize.wrap(i)])
+    }
+    to_push.clear()
+    for p in out {
+        to_push.push(p)
+    }
+}
+
+// `addBranchingBlocks`: the line from each block beside the sticky block at `from`, but those in
+// line with the push, that sticks to it. Whether the piston can still move.
+fn add_branches<L: BlockAccess + BlockLevel>(f: Facts, level: L, r: mut Moves, from: BlockPos) -> bool ! Thrown {
+    let state = try level.state(f, from.x, from.y, from.z)
+    for d in 0..6 {
+        if d >> 1 == r.push >> 1 {
+            continue
+        }
+        let p = offset(from, d, 1)
+        let beside = try level.state(f, p.x, p.y, p.z)
+        if stick_together(f, beside, state) and not try add_line(f, level, mut r, p, d) {
+            return false
+        }
+    }
+    return true
+}
+
+// `isSticky`: slime and honey.
+fn is_sticky(f: Facts, state: u32) -> bool {
+    let block = f.block(state)
+    return block == f.ids.slime_block or block == f.ids.honey_block
+}
+
+// `canStickToEachOther`: honey and slime don't stick together; else a sticky block sticks to any.
+fn stick_together(f: Facts, a: u32, b: u32) -> bool {
+    let first = f.block(a)
+    let second = f.block(b)
+    if first == f.ids.honey_block and second == f.ids.slime_block {
+        return false
+    }
+    if first == f.ids.slime_block and second == f.ids.honey_block {
+        return false
+    }
+    return is_sticky(f, a) or is_sticky(f, b)
+}
+
+fn offset(p: BlockPos, d: i32, n: i32) -> BlockPos {
+    return BlockPos { x: p.x + n * step_x(d), y: p.y + n * step_y(d), z: p.z + n * step_z(d) }
+}
+
+fn same(a: BlockPos, b: BlockPos) -> bool {
+    return a.x == b.x and a.y == b.y and a.z == b.z
+}
+
+// `List.indexOf`: where `p` is first among `ps`, or -1.
+fn index_of(ps: List<BlockPos>, p: BlockPos) -> i32 {
+    for i in 0..ps.len() {
+        if same(ps[i], p) {
+            return i32.wrap(i)
+        }
+    }
+    return -1
+}
