@@ -1,9 +1,9 @@
 // The home page's flight over a world of blocks, with no DOM in it, so it runs the same in a
 // worker, on an OffscreenCanvas the page hands it, or on the page itself where workers can't draw.
 //
-// The camera drifts over a new world and the pointer turns it. Chunks are generated around the
-// camera, nearest first, at the rate Calcite generates them, so the view fills in a fraction of a
-// second and new chunks keep loading at its edge. Frames are paced to what they cost and to the
+// The camera drifts over a new world, and flies where the pointer points. Chunks are generated
+// around the camera, nearest first, at the rate Calcite generates them, so the view fills in a
+// fraction of a second and new chunks keep loading at its edge, wherever the flight turns. Frames are paced to what they cost and to the
 // screen: a still frame for reduced motion, never more than 30 a second on a touch screen, and a
 // touch screen's flight rests a while after the last touch.
 
@@ -11,6 +11,8 @@ import { B, CHUNK, forget, frame, generate, groundAt, hash, isLoaded, reseed, SE
 
 /** The view distance, in chunks, and the seconds a touch screen's flight goes on after the last touch. */
 const VIEW = 14, REST = 30;
+/** The fastest the pointer turns the flight, in radians a second, with it at the picture's side. */
+const TURN = 0.9;
 /** At most this many cells a frame: past it the cells grow a pixel, so a big screen keeps its frame rate. */
 const MAX_CELLS = 240_000;
 
@@ -62,6 +64,9 @@ export class Hero {
 	private H = 0;
 	private cam = { x: 0, y: 0 };
 	private h = 0;
+	/** The way the camera flies, and how fast it's turning, in radians and radians a second. */
+	private heading = 0;
+	private turn = 0;
 	private look = { yaw: 0, hor: 0 };
 	private aim: [number, number] | null = null;
 	private last = -1;
@@ -162,12 +167,23 @@ export class Hero {
 		const o = this.o, w0 = performance.now(), cam = this.cam;
 		const dt = this.last < 0 ? 0 : Math.min(0.05, Math.max(0, t - this.last));
 		this.last = t;
-		// the pointer turns the camera and tips it a little; without one it looks ahead. The easing
-		// is by time, so it answers as quickly at 30 frames a second as at 60
-		const ay = this.aim ? (this.aim[0] - 0.5) * 0.9 : 0, ah = this.aim ? (this.aim[1] - 0.5) * 0.12 : 0, k = 1 - Math.exp(-dt * 9);
-		this.look.yaw += (ay - this.look.yaw) * k;
-		this.look.hor += (ah - this.look.hor) * k;
-		const heading = Math.sin(t * 0.045) * 0.5, fx = Math.sin(heading), fy = -Math.cos(heading);
+		// the camera flies where the pointer points: left or right of the middle turns it, faster the
+		// further out, past a little room in the middle that flies straight, and the view leans into
+		// the turn and tips a little with the pointer's height. Without a pointer it drifts on its
+		// own. The easing is by time, so it answers as quickly at 30 frames a second as at 60
+		let turn: number, lead = 0, tip = 0;
+		if (this.aim) {
+			const off = this.aim[0] - 0.5, out = Math.sign(off) * Math.max(0, Math.abs(off) - 0.04);
+			turn = out * 2 * TURN;
+			lead = off * 0.3;
+			tip = (this.aim[1] - 0.5) * 0.12;
+		} else turn = Math.cos(t * 0.045) * 0.0225;
+		const k = 1 - Math.exp(-dt * 9);
+		this.turn += (turn - this.turn) * (1 - Math.exp(-dt * 4));
+		this.heading += this.turn * dt;
+		this.look.yaw += (lead - this.look.yaw) * k;
+		this.look.hor += (tip - this.look.hor) * k;
+		const heading = this.heading, fx = Math.sin(heading), fy = -Math.cos(heading);
 		cam.x += fx * 16 * dt;
 		cam.y += fy * 16 * dt;
 		// fly over whatever is coming up, not into it

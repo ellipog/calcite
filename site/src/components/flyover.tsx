@@ -111,7 +111,8 @@ export function Flyover({ className, cue = false, cps = 2000 }: { className?: st
 		});
 		io.observe(box);
 		document.addEventListener('visibilitychange', tell);
-		// the pointer turns the camera; a touch wakes a resting flight
+		// the camera flies where the pointer points, and a sideways drag steers it on a touch screen;
+		// a touch wakes a resting flight
 		const move = (e: PointerEvent) => {
 			const r = box.getBoundingClientRect();
 			post({ type: 'point', p: [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height] });
@@ -136,7 +137,7 @@ export function Flyover({ className, cue = false, cps = 2000 }: { className?: st
 
 	return (
 		<div ref={fly} className={cn('relative min-h-[260px]', className)}>
-			<span className="pointer-events-none absolute top-4 right-(--side) z-10 rule bg-paper pointer-coarse:hidden motion-reduce:hidden px-2.5 py-2 font-mono text-xs leading-none">move to look around</span>
+			<span className="pointer-events-none absolute top-4 right-(--side) z-10 rule bg-paper pointer-coarse:hidden motion-reduce:hidden px-2.5 py-2 font-mono text-xs leading-none">point to steer</span>
 			<div className="pointer-events-none absolute bottom-5 left-(--side) z-10 flex flex-wrap gap-2 font-mono text-xs leading-none max-sm:hidden">
 				<span ref={count} className="rule bg-paper px-2.5 py-2 tabular-nums">
 					0 chunks
