@@ -15,8 +15,10 @@ on the east south of 0. The rig's bot joins each server at the origin with a vie
 `sessions.py` records a session, so the chunks from -8 to 7 are all sent, each server finishing
 the part-way rings first, from where it saved them (D334).
 
-Each chunk packet's blocks are decoded, so how a palette is written (D271) doesn't count, and the
-blocks of the chunks from -8 to 7 are compared. A block that differs in a way that waits on
+Each chunk packet's blocks are decoded, so how a palette is written (D271) doesn't count, with the
+blocks each `block_update` and `section_blocks_update` after it sets, as the client keeps them, so
+what each block's ticks set after the chunk was sent counts (D337), and the blocks of the chunks
+from -8 to 7 are compared. A block that differs in a way that waits on
 something not in Calcite yet is counted under it, by the card it waits on; any other fails the
 check.
 
@@ -57,23 +59,15 @@ def base(name):
     return name.split("[")[0]
 
 
-def props(name, without=()):
-    if "[" not in name:
-        return {}
-    pairs = (p.split("=") for p in name[name.index("[") + 1:-1].split(","))
-    return {k: v for k, v in pairs if k not in without}
-
-
-# What waits on something not in Calcite yet, each by vanilla's block and Calcite's.
+# What waits on something not in Calcite yet, each by vanilla's block and Calcite's. Since the
+# blocks set after a chunk is sent count, some come of how long each server ran.
 KNOWN = [
-    ("bubble columns, made by a water source's tick over soul sand or magma (CAL-106)",
-     lambda v, c: base(v) == "bubble_column" and base(c) == "water"),
-    ("leaves' distance, which their scheduled tick sets (CAL-106)",
-     lambda v, c: base(v) == base(c) and base(v).endswith("_leaves") and props(v, ("distance",)) == props(c, ("distance",))),
     ("precipitation's snow, and the grass under it (CAL-106)",
      lambda v, c: (base(v) == "snow" and c == "air") or (v == "grass_block[snowy=true]" and c == "grass_block[snowy=false]")),
+    ("random ticks, whose draws part from vanilla's while Calcite has few blocks' (CAL-106)",
+     lambda v, c: {base(v), base(c)} == {"grass_block", "dirt"}),
     ("falling blocks, which come down as entities",
-     lambda v, c: v == "air" and base(c) in FALLING),
+     lambda v, c: (v == "air" and base(c) in FALLING) or (base(v) in FALLING and base(c) not in FALLING)),
 ]
 
 
@@ -117,9 +111,26 @@ def container(b, at, entries, indirect_bits):
     return ([palette[i] for i in out] if palette is not None else out), at
 
 
-def chunks(side, chunk_id):
-    """Each chunk the side was sent, by its position: its sections' block states, by ID."""
+def signed(v, bits):
+    """`v`'s low `bits` bits as a signed number."""
+    v &= (1 << bits) - 1
+    return v - (1 << bits) if v >> (bits - 1) else v
+
+
+def set_block(out, x, y, z, state):
+    """The block at x, y, z set to `state` in the chunk it's in, if that was sent."""
+    sections = out.get((x >> 4, z >> 4))
+    s = (y - MIN_Y) >> 4
+    if sections is not None and 0 <= s < SECTIONS:
+        sections[s][((y & 15) << 8) | ((z & 15) << 4) | (x & 15)] = state
+
+
+def chunks(side, chunk_id, updates=None):
+    """Each chunk the side was sent, by its position: its sections' block states, by ID, with
+    the blocks set since, if `updates` gives the IDs of `block_update` and
+    `section_blocks_update`, in the order they came."""
     b = (sessions.SESSIONS / CONFIG / side / "join.bin").read_bytes()
+    block_id, section_id = updates or (None, None)
     out = {}
     at = 0
     while at < len(b):
@@ -130,6 +141,23 @@ def chunks(side, chunk_id):
         if state != PLAY:
             continue
         kind, p = varint(body, 0)
+        if kind == block_id:
+            # `BlockPos.asLong`: x in the top 26 bits, z in the next 26, y in the low 12.
+            packed = struct.unpack_from(">q", body, p)[0]
+            block, _ = varint(body, p + 8)
+            set_block(out, signed(packed >> 38, 26), signed(packed, 12), signed(packed >> 12, 26), block)
+            continue
+        if kind == section_id:
+            # `SectionPos.asLong`: x in the top 22 bits, z in the next 22, y in the low 20; then
+            # each block as its state over its place in the section, x, z and y, 4 bits each.
+            packed = struct.unpack_from(">q", body, p)[0]
+            sx, sy, sz = signed(packed >> 42, 22), signed(packed, 20), signed(packed >> 20, 22)
+            count, p = varint(body, p + 8)
+            for _ in range(count):
+                v, p = varint(body, p)
+                local = v & 0xFFF
+                set_block(out, sx * 16 + (local >> 8), sy * 16 + (local & 15), sz * 16 + ((local >> 4) & 15), v >> 12)
+            continue
         if kind != chunk_id:
             continue
         cx, cz = struct.unpack_from(">ii", body, p)
@@ -163,12 +191,14 @@ def main():
             p = s.get("properties") or {}
             names[s["id"]] = block.removeprefix("minecraft:") + ("[" + ",".join(f"{k}={p[k]}" for k in sorted(p)) + "]" if p else "")
     packets = json.loads((REPORTS / "packets.json").read_text(encoding="utf-8"))
-    chunk_id = packets["play"]["clientbound"]["minecraft:level_chunk_with_light"]["protocol_id"]
+    play = packets["play"]["clientbound"]
+    chunk_id = play["minecraft:level_chunk_with_light"]["protocol_id"]
+    updates = (play["minecraft:block_update"]["protocol_id"], play["minecraft:section_blocks_update"]["protocol_id"])
     if not args.reuse:
         server, bot = sessions.build_calcite(sessions.find_calx())
         sessions.record(CONFIG, "vanilla", sessions.vanilla_argv(sessions.adapter()), bot, ("join",))
         sessions.record(CONFIG, "calcite", [str(server)], bot, ("join",))
-    v, c = chunks("vanilla", chunk_id), chunks("calcite", chunk_id)
+    v, c = chunks("vanilla", chunk_id, updates), chunks("calcite", chunk_id, updates)
     compared = [pos for pos in sorted(set(v) & set(c)) if LOW <= pos[0] <= HIGH and LOW <= pos[1] <= HIGH]
     if len(compared) != (HIGH - LOW + 1) ** 2:
         sys.exit(f"ticking: only {len(compared)} of the chunks from {LOW} to {HIGH} were sent to both")
