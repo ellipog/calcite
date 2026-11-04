@@ -1,0 +1,38 @@
+// Writes src/styles/tiles.css, the dither tiles every component draws with, and src/app/icon.svg,
+// the favicon. Run from site/: bun run tiles
+
+import { writeFileSync } from 'node:fs';
+import { houseTiles } from '../src/lib/dither/tiles';
+import { markSVG } from '../src/lib/dither/mark';
+import { PAPER } from '../src/lib/dither/math';
+
+const tiles = houseTiles();
+const lines = [
+	'/* Calcite dither tiles. Made by scripts/tiles.ts from src/lib/dither/tiles.ts; edit those, not this.',
+	'   Each is an SVG drawn 2 px a cell, so give it its natural size:',
+	'     --t*   Bayer 8x8 levels in ink (16px)    --tp*  the same in paper',
+	'     --q*   Bayer 4x4 levels in ink (8px)     --qp*  the same in paper',
+	'     --u*   a one-cell line across (8px 2px)  --v*   a one-cell line down (2px 8px)',
+	"     --edge a fill's leading edge, 75, 50, 25% (12px 4px, repeat-y); --edge-p in paper,",
+	'            --edge-r the same facing left; --shine 25, 50, 75, 50, 25% (20px 4px)',
+	'     --ring diagonal halves for the focus ring and work under way (8px); --ring-p in paper',
+	"     --check2 a 50% bar (4px), --tail a tooltip's point (10px 6px), --chevron (10px 8px),",
+	'     --plus and --minus (10px); --solid is plain ink, for layering with the rest.',
+	'   The tint utilities: tint-{6..88} and tint-100, tint-paper-{6,12,25,50}, tint4-{6..75}. */',
+	'',
+	':root {',
+	'\t--solid: linear-gradient(var(--color-ink), var(--color-ink));',
+	...tiles.map(([n, u]) => `\t--${n}: ${u};`),
+	'}',
+	'',
+];
+for (const [n] of tiles) {
+	let m;
+	if ((m = /^t(\d+)$/.exec(n))) lines.push(`@utility tint-${m[1]} {\n\tbackground-image: var(--${n});\n\tbackground-size: 16px 16px;\n}`);
+	else if ((m = /^tp(\d+)$/.exec(n))) lines.push(`@utility tint-paper-${m[1]} {\n\tbackground-image: var(--${n});\n\tbackground-size: 16px 16px;\n}`);
+	else if ((m = /^q(\d+)$/.exec(n))) lines.push(`@utility tint4-${m[1]} {\n\tbackground-image: var(--${n});\n\tbackground-size: 8px 8px;\n}`);
+}
+lines.push('@utility tint-100 {\n\tbackground-color: var(--color-ink);\n}', '');
+writeFileSync('src/styles/tiles.css', lines.join('\n'));
+writeFileSync('src/app/icon.svg', markSVG(16, { paper: PAPER, size: 32 }) + '\n');
+console.log(`${tiles.length} tiles, icon.svg`);
