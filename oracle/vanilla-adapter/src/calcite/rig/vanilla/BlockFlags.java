@@ -224,6 +224,10 @@ final class BlockFlags {
         StringBuilder ownSignal = new StringBuilder();
         StringBuilder directSignal = new StringBuilder();
         StringBuilder signalSource = new StringBuilder();
+        // What a comparator reads of a block behind it: the class whose `hasAnalogOutputSignal`
+        // and `getAnalogOutputSignal` it runs (CAL-123).
+        StringBuilder hasAnalog = new StringBuilder();
+        StringBuilder analog = new StringBuilder();
         // `FireBlock.canBurn`: the blocks fire's ignite odds are above 0 for; and each block with
         // either of fire's odds above 0, with its ignite odds and its burn odds (D339).
         StringBuilder flammable = new StringBuilder();
@@ -312,6 +316,11 @@ final class BlockFlags {
             signal.append(id == 0 ? "\"" : ", \"").append(gs).append("\"");
             directSignal.append(id == 0 ? "\"" : ", \"").append(ds).append("\"");
             signalSource.append(id == 0 ? "\"" : ", \"").append(ss).append("\"");
+            String ha = declaring(type, "hasAnalogOutputSignal", BlockState.class);
+            String ga = declaring(type, "getAnalogOutputSignal", BlockState.class, net.minecraft.world.level.Level.class,
+                    BlockPos.class, Direction.class);
+            hasAnalog.append(id == 0 ? "\"" : ", \"").append(ha).append("\"");
+            analog.append(id == 0 ? "\"" : ", \"").append(ga).append("\"");
             Block block = BuiltInRegistries.BLOCK.byId(id);
             int instrument = block.defaultBlockState().instrument().ordinal();
             for (BlockState each : block.getStateDefinition().getPossibleStates()) {
@@ -327,6 +336,18 @@ final class BlockFlags {
                 waterloggable.append(waterloggable.isEmpty() ? "" : ", ").append(id);
             } else if (block instanceof net.minecraft.world.level.block.LiquidBlockContainer) {
                 containers.append(containers.isEmpty() ? "" : ", ").append(id);
+            }
+        }
+        // Each item whose default `max_stack_size` isn't 64, with it, which a container's comparator
+        // output divides each stack by (CAL-123), once their default components are bound as a
+        // server binds them.
+        RegistriesProbe.load();
+        StringBuilder stacks = new StringBuilder();
+        for (net.minecraft.world.item.Item item : BuiltInRegistries.ITEM) {
+            int most = item.getDefaultMaxStackSize();
+            if (most != 64) {
+                stacks.append(stacks.isEmpty() ? "[\"" : ", [\"").append(BuiltInRegistries.ITEM.getKey(item)).append("\", ")
+                        .append(most).append("]");
             }
         }
         // Each block with a block entity and its type, as `BlockEntityType.isValid` names it.
@@ -363,6 +384,9 @@ final class BlockFlags {
         json.append("  \"direct_signal_classes\": [").append(directSignal).append("],\n");
         json.append("  \"own_signal_classes\": [").append(ownSignal).append("],\n");
         json.append("  \"signal_source_classes\": [").append(signalSource).append("],\n");
+        json.append("  \"has_analog_classes\": [").append(hasAnalog).append("],\n");
+        json.append("  \"analog_classes\": [").append(analog).append("],\n");
+        json.append("  \"item_stack_sizes\": [").append(stacks).append("],\n");
         json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
         json.append("  \"fire_odds\": [").append(fireOdds).append("],\n");
         json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");

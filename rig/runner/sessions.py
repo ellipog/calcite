@@ -121,6 +121,11 @@ CONFIGS = {
     # each sent with its update packet as it changes (CAL-115); watched, as `redstone`.
     "block_entities": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "block_entities" / "world",
                              fixture="block_entities", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # Comparators by the spawn reading containers and other blocks, whose ticks wait in the save,
+    # and two whose sides a clock powers, subtracting and comparing (CAL-123); watched, as
+    # `redstone`.
+    "comparators": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "comparators" / "world",
+                          fixture="comparators", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.

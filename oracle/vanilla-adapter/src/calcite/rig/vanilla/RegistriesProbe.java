@@ -73,7 +73,7 @@ final class RegistriesProbe implements Probe {
         return layers.compositeAccess();
     }
 
-    private static synchronized void load() {
+    static synchronized void load() {
         if (layers != null) {
             return;
         }

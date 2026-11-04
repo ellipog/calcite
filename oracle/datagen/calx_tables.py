@@ -483,6 +483,22 @@ def block_facts_module(index, flags):
             fn, "classes", [where[c] if c else none for c in flags[fn]],
             [f"/// The class whose `{method}` each block runs, by its index in `class_names`, in block ID order",
              "/// (CAL-116)."])
+    for fn, method in [("has_analog_classes", "hasAnalogOutputSignal"), ("analog_classes", "getAnalogOutputSignal")]:
+        lines += number_list(
+            fn, "classes", [where[c] if c else none for c in flags[fn]],
+            [f"/// The class whose `{method}` each block runs, by its index in `class_names`, in block ID order",
+             "/// (CAL-123)."])
+    stacks = flags["item_stack_sizes"]
+    lines += [
+        "/// The items whose default `max_stack_size` isn't 64, by name, in item ID order (CAL-123).",
+        "pub fn small_stack_items() -> List<str> {",
+        "    return [",
+    ]
+    lines += [f'        "{name}",' for name, _ in stacks]
+    lines += ["    ]", "}", ""]
+    lines += number_list(
+        "small_stack_sizes", "sizes", [size for _, size in stacks],
+        ["/// Each of `small_stack_items`' default `max_stack_size`, in their order."])
     lines += number_list(
         "flammable_blocks", "blocks", flags["flammable_blocks"],
         ["/// The blocks fire can burn, by ID: those `FireBlock`'s ignite odds are above 0 for."])
