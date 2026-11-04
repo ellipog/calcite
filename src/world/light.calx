@@ -811,6 +811,14 @@ impl Layer {
 // at the end of a run, for the sections changed in it: everything else that changes is in the map
 // being lit, which packets don't read until then, or moves a layer without changing it. So once
 // it's `noting`, those are noted, as their columns, for the level, which keeps chunks' packets.
+//
+// Once it's `noting`, it keeps too the sections vanilla's `sectionsAffectedByLightUpdates` has,
+// which the server tells players on the edge of their view of with a light update (D342): those
+// with a block or beside one whose light was set, `SectionPos.aroundAndAtBlockPos`, and a section
+// starting to keep light and the 26 around it, `markSectionAndNeighborsAsAffected`. Rather than a
+// set of them as each light's set, each slot keeps which of the 27 sections about its own a light
+// set in it reached, `marks`, by bit, from `around`, and those are put in `affected` at the end of
+// the run, or as the section's let go of.
 struct Storage {
     sky: bool
     // Each section's state, as vanilla's `sectionStates` has it: whether it has blocks, and how
@@ -849,6 +857,9 @@ struct Storage {
     lowest: i32 = i32.MAX
     noting: bool = false
     noted: List<i64> = List<i64>()
+    around: List<u32> = List<u32>()
+    marks: List<u32> = List<u32>()
+    affected: Set<i64> = Set<i64>()
     // Whether a run is going on: nothing reads light until its end, which lets go of what
     // `touch` keeps, so `touch` keeps no copy then (D245).
     running: bool = false
@@ -922,6 +933,35 @@ impl Storage {
             self.touched[slot] = self.run_count
         }
         self.layers[slot].set(index, level)
+        if self.noting {
+            self.marks[slot] |= self.around[usize.wrap(index)]
+        }
+    }
+
+    // From now on, notes which chunks' light may change, and which sections a light set reached.
+    fn start_noting(mut self) {
+        self.noting = true
+        if self.around.is_empty() {
+            self.around = around_masks()
+        }
+        while self.marks.len() < self.layers.len() {
+            self.marks.push(0)
+        }
+    }
+
+    // Puts the sections a light set in the section at `slot` reached, as its marks have them, in
+    // `affected`, and clears them.
+    fn flush_marks(mut self, section: i64, slot: usize) {
+        let m = self.marks[slot]
+        if m == 0 {
+            return
+        }
+        self.marks[slot] = 0
+        for b in 0..27 {
+            if m & (1u32 << u32.wrap(b)) != 0 {
+                self.affected.insert(section_offset(section, b / 9 - 1, (b / 3) % 3 - 1, b % 3 - 1))
+            }
+        }
     }
 
     // Keeps `layer` for the section, in its slot or a free one.
@@ -936,18 +976,27 @@ impl Storage {
             self.touched[usize(slot)] = 0
             self.section_at[usize(slot)] = section
             self.slots.insert(section, slot)
+            if self.noting {
+                self.marks[usize(slot)] = 0
+            }
             return
         }
         self.slots.insert(section, u32.wrap(self.layers.len()))
         self.layers.push(layer)
         self.touched.push(0)
         self.section_at.push(section)
+        if self.noting {
+            self.marks.push(0)
+        }
     }
 
     // Takes the section's layer out, if one's kept, and frees its slot.
     fn take(mut self, section: i64) -> Layer? {
         self.forget_slot(section)
         let slot = self.slots.remove(section) else return none
+        if self.noting {
+            self.flush_marks(section, usize(slot))
+        }
         self.layers.push(Layer.filled(0))
         let layer = self.layers.swap_remove(usize(slot))
         self.free.push(slot)
@@ -989,11 +1038,18 @@ impl Storage {
         }
         if self.noting {
             var columns = List<i64>()
+            var kept = List<(i64, usize)>()
             for section in self.changed {
                 columns.push(zero_node(section))
+                if let slot = self.slots.get(section) {
+                    kept.push((section, usize(slot)))
+                }
             }
             for column in columns {
                 self.noted.push(column)
+            }
+            for (section, slot) in kept {
+                self.flush_marks(section, slot)
             }
         }
         // A changed layer that's one level all through keeps no bytes (D247).
@@ -1284,6 +1340,9 @@ impl Storage {
         self.touch(section)
         let layer = self.create_layer(section)
         self.put(section, layer)
+        if self.noting {
+            self.marks[self.slot_of(section)] = ALL_AROUND
+        }
         if self.sky {
             self.node_added(section)
         }
@@ -2476,8 +2535,26 @@ impl Light {
     /// Notes from now on which chunks' light, as a packet sends it, may change, for
     /// `take_changed` to give.
     pub fn note_changes(mut self) {
-        self.block.storage.noting = true
-        self.sky.storage.noting = true
+        self.block.storage.start_noting()
+        self.sky.storage.start_noting()
+    }
+
+    /// The sections whose light a run may have changed since this was last asked, once changes
+    /// are noted, each by its `x`, `y` and `z` with whether it's the sky's, as vanilla's
+    /// `onLightUpdate` is told of them at the end of a run, `swapSectionMap` (D342).
+    pub fn take_affected(mut self) -> List<(i32, i32, i32, bool)> {
+        var out = List<(i32, i32, i32, bool)>()
+        for section in self.block.storage.affected {
+            out.push((x_of(section), y_of(section), z_of(section), false))
+        }
+        self.block.storage.affected.clear()
+        if self.has_sky {
+            for section in self.sky.storage.affected {
+                out.push((x_of(section), y_of(section), z_of(section), true))
+            }
+        }
+        self.sky.storage.affected.clear()
+        return out
     }
 
     /// The chunks whose light, as a packet sends it, may have changed since this was last asked,
@@ -2552,6 +2629,40 @@ impl Light {
         }
         return data
     }
+}
+
+// Each of the 27 sections about a section, by its bit in a slot's marks.
+const ALL_AROUND: u32 = 0x7FFFFFF
+
+// For each block of a section, by its index, the sections `SectionPos.aroundAndAtBlockPos` gives
+// it, its own and those beside it that the blocks next to it are in, each as the bit
+// `(dx + 1) * 9 + (dy + 1) * 3 + dz + 1` of a slot's marks.
+fn around_masks() -> List<u32> {
+    var out = List<u32>()
+    for index in 0..4096 {
+        let x = index & 15
+        let z = (index >> 4) & 15
+        let y = index >> 8
+        var mask = 0u32
+        for dx in -1..2 {
+            if (dx == -1 and x != 0) or (dx == 1 and x != 15) {
+                continue
+            }
+            for dy in -1..2 {
+                if (dy == -1 and y != 0) or (dy == 1 and y != 15) {
+                    continue
+                }
+                for dz in -1..2 {
+                    if (dz == -1 and z != 0) or (dz == 1 and z != 15) {
+                        continue
+                    }
+                    mask |= 1u32 << u32.wrap((dx + 1) * 9 + (dy + 1) * 3 + dz + 1)
+                }
+            }
+        }
+        out.push(mask)
+    }
+    return out
 }
 
 // Sets bit `i` of a `BitSet`'s bytes, growing them only as far as the bit.
