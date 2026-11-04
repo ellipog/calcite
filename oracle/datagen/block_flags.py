@@ -40,6 +40,11 @@ def main():
     if flags["game_version"] != args.version:
         print(f"block_flags: the adapter is {flags['game_version']}, not {args.version}", file=sys.stderr)
         return 1
+    # What BlockFlags says it wrote and checked, from among vanilla's logging, which takes its
+    # standard error over.
+    for line in (r.stdout + r.stderr).splitlines():
+        if "BlockFlags: " in line:
+            print(line[line.index("BlockFlags: "):])
     print(f"wrote {out.relative_to(CALCITE).as_posix()}: {flags['states']} states")
     return 0
 

@@ -16,6 +16,8 @@ IDs the protocol needs, which every compatible server encodes:
   can't pass between, from the same file (CAL-66).
 - `world.collision_shapes`: each block state's collision shape, as the spawn finder sees it, and
   the boxes of each, from the same file (CAL-75).
+- `world.fluid_faces`: the faces a fluid sees of each block state, which two cover a face between
+  them, and the boxes of the states vanilla offsets by their position, from the same file (D327).
 - `world.entity_facts`: what natural spawning asks of each entity type and block state, from
   entity_facts.json, which oracle/datagen/entity_facts.py writes beside the tables (D317).
 """
@@ -675,6 +677,259 @@ BOX_UNIT = 32
 BOX_FLOOR = -16
 
 
+def box_units(c):
+    """A coordinate as BOX_UNITs above BOX_FLOOR, which must be whole and fit a byte."""
+    v = c * BOX_UNIT
+    if v != round(v) or not 0 <= round(v) - BOX_FLOOR < 256:
+        raise ValueError(f"the coordinate {c} isn't a 32nd of a block from {BOX_FLOOR / BOX_UNIT} to {(255 + BOX_FLOOR) / BOX_UNIT}")
+    return round(v) - BOX_FLOOR
+
+
+def numbers(values, per=24):
+    """Numbers as rows of a Calx list literal, `per` a row."""
+    rows = [", ".join(str(v) for v in values[i:i + per]) for i in range(0, len(values), per)]
+    return ",\n".join(f"        {r}" for r in rows)
+
+
+# How many bits each of a state's six fluid faces takes, packed down, up, north, south, west, east.
+FLUID_FACE_BITS = 8
+
+
+def fluid_faces_module(index, flags):
+    """The text of src/world/fluid_faces.calx."""
+    faces = flags["fluid_faces"]
+    boxes = flags["fluid_face_boxes"]
+    covers = flags["fluid_covers"]
+    count = len(boxes)
+    if len(faces) != flags["states"]:
+        raise ValueError(f"block_flags.json has {len(faces)} states' fluid faces for {flags['states']} states")
+    if count > 1 << FLUID_FACE_BITS or len(covers) != count or any(len(row) != count for row in covers):
+        raise ValueError(f"{count} fluid faces don't fit {FLUID_FACE_BITS} bits, or the table of which cover isn't square")
+    if any(covers[i][j] != covers[j][i] for i in range(count) for j in range(count)):
+        raise ValueError("mergedFaceOccludes isn't the same both ways round")
+    if boxes[0] != [] or boxes[1] != [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]:
+        raise ValueError("fluid face 0 isn't empty, or 1 isn't the whole face")
+    if any(len(f) != len(DIRECTIONS) or not all(0 <= s < count for s in f) for f in faces):
+        raise ValueError("a state's fluid faces aren't six of the table's")
+    # Each face's rectangles: its boxes, one block deep along z, as u, v from and to.
+    starts = []
+    rects = []
+    for face in boxes:
+        starts.append(len(rects) // 4)
+        for box in face:
+            if len(box) != 6 or box[2] != 0.0 or box[5] != 1.0:
+                raise ValueError(f"a fluid face's box {box} isn't one block deep along z")
+            rects += [box_units(box[0]), box_units(box[1]), box_units(box[3]), box_units(box[4])]
+    starts.append(len(rects) // 4)
+    words = (count + 63) // 64
+    rows = []
+    for i in range(count):
+        for w in range(words):
+            rows.append(sum(1 << (j - 64 * w) for j in range(64 * w, min(count, 64 * w + 64)) if covers[i][j]))
+    # Each state's six faces packed, the different sets the commonest first, and an index into
+    # them for each state, a character each or, for the rarest, a pair.
+    packed = [sum(s << (FLUID_FACE_BITS * d) for d, s in enumerate(f)) for f in faces]
+    counts = {}
+    for v in packed:
+        counts[v] = counts.get(v, 0) + 1
+    palette = sorted(counts, key=lambda v: (-counts[v], v))
+    pairs = 1
+    while len(ALPHABET) - pairs + pairs * len(ALPHABET) < len(palette):
+        pairs += 1
+    single = len(ALPHABET) - pairs
+    where = {v: i for i, v in enumerate(palette)}
+    text = []
+    for v in packed:
+        i = where[v]
+        if i < single:
+            text.append(ALPHABET[i])
+        else:
+            i -= single
+            text.append(ALPHABET[single + i // len(ALPHABET)] + ALPHABET[i % len(ALPHABET)])
+    chunks = [""]
+    for c in text:
+        if len(chunks[-1]) + len(c) > LINE:
+            chunks.append("")
+        chunks[-1] += c
+    # The states that move: each one's grid's ends, then its boxes.
+    moving = flags["fluid_moving"]
+    moving_states = []
+    grids = []
+    box_starts = []
+    moving_boxes = []
+    for state, grid, shape in moving:
+        if len(grid) != 6:
+            raise ValueError(f"state {state}'s grid has {len(grid)} ends")
+        moving_states.append(state)
+        grids += [box_units(c) for c in grid]
+        box_starts.append(len(moving_boxes) // 6)
+        for box in shape:
+            if len(box) != 6:
+                raise ValueError(f"a box of {len(box)} numbers")
+            moving_boxes += [box_units(c) for c in box]
+    box_starts.append(len(moving_boxes) // 6)
+    if moving_states != sorted(moving_states):
+        raise ValueError("the states that move aren't in ID order")
+    offsets = []
+    for block, xyz, horizontal, vertical in flags["offsets"]:
+        offsets += [block, xyz, horizontal, vertical]
+    cases = []
+    for case in flags["fluid_cases"]:
+        if len(case) != 7:
+            raise ValueError(f"a fluid case of {len(case)} numbers")
+        cases += case
+    offset_cases = []
+    for case in flags["offset_cases"]:
+        if len(case) != 6:
+            raise ValueError(f"an offset case of {len(case)} numbers")
+        offset_cases += case
+    lines = [
+        f"/// The faces a fluid sees of each of vanilla {index['game_version']}'s block states, as `FlowingFluid.canPassThroughWall`",
+        "/// asks them, and which two cover a face of a block between them, as `Shapes.mergedFaceOccludes`",
+        "/// says. Written by oracle/datagen/calx_tables.py from block_flags.json (D327, CAL-91): don't",
+        "/// edit it.",
+        "///",
+        "/// A face is a state's collision shape's slice toward a side, laid flat on that side's other two",
+        "/// axes, x before y before z: 0 is the empty face and 1 the whole one. A state vanilla offsets by",
+        "/// its position whose collision shape isn't empty, as pointed dripstone, moves: its faces here",
+        "/// are its shape's before it's offset, and it has its boxes and where its shape's grid starts and",
+        "/// ends, which `mergedFaceOccludes` slices at, so its faces where it is can be worked out.",
+        "/// Vanilla's own `canPassThroughWall` agreed with these for every two shapes, and for each state",
+        "/// that moves at 24 places, as they were written.",
+        "module world.fluid_faces",
+        "",
+        "/// How many bits each face takes in a state's faces, packed down, up, north, south, west, east",
+        "/// from the lowest.",
+        f"pub const FLUID_FACE_BITS: u32 = {FLUID_FACE_BITS}",
+        "/// How many different faces there are, and how many words each face's row of `fluid_covers`",
+        "/// takes.",
+        f"pub const FLUID_FACES: u32 = {count}",
+        f"pub const COVER_WORDS: u32 = {words}",
+        "/// How many 32nds of a block a coordinate is from, and above, `FACE_FLOOR`.",
+        f"pub const FACE_UNIT: i32 = {BOX_UNIT}",
+        f"pub const FACE_FLOOR: i32 = {BOX_FLOOR}",
+        "",
+        "/// The different sets of six faces, packed, and for each state, in state ID order, which it has.",
+        "pub fn state_fluid_faces() -> (List<u64>, List<u16>) {",
+        f"    // The sets, the commonest first, and an index into them for each state, a character",
+        f"    // each, from `alphabet`, or for the {max(0, len(palette) - single)} rarest a pair, whose first is one of its last {pairs}.",
+        f"    let palette: List<u64> = [{', '.join(str(v) for v in palette)}]",
+        "    let lines: List<String> = [",
+    ]
+    lines += [f'        "{c}",' for c in chunks]
+    lines += [
+        "    ]",
+        f'    let alphabet = "{ALPHABET}"',
+        "    var digit: List<u32> = []",
+        "    for _ in 0..128 {",
+        "        digit.push(0)",
+        "    }",
+        "    for i in 0..alphabet.len() {",
+        "        digit[usize(alphabet.byte_at(i))] = u32.wrap(i)",
+        "    }",
+        "    var states: List<u16> = []",
+        f"    states.reserve({len(packed)})",
+        "    for line in lines {",
+        "        var i: usize = 0",
+        "        while i < line.len() {",
+        "            let d = digit[usize(line.byte_at(i))]",
+        f"            if d >= {single} {{",
+        f"                states.push(u16.wrap({single} + (d - {single}) * {len(ALPHABET)} + digit[usize(line.byte_at(i + 1))]))",
+        "                i += 2",
+        "            } else {",
+        "                states.push(u16.wrap(d))",
+        "                i += 1",
+        "            }",
+        "        }",
+        "    }",
+        "    return (palette, states)",
+        "}",
+        "",
+        "/// For each face, `COVER_WORDS` words of the faces it and a fluid can't pass between, bit `j`",
+        "/// of a row's words for face `j`.",
+        "pub fn fluid_covers() -> List<u64> {",
+        "    return [",
+        numbers(rows, 6),
+        "    ]",
+        "}",
+        "",
+        "/// Where each face's rectangles start in `face_rects`, counted in rectangles, and where the last",
+        "/// ends.",
+        "pub fn face_starts() -> List<u16> {",
+        "    return [",
+        numbers(starts),
+        "    ]",
+        "}",
+        "",
+        "/// Every face's rectangles, four coordinates each, from u, v to u, v, in `FACE_UNIT`s above",
+        "/// `FACE_FLOOR`.",
+        "pub fn face_rects() -> List<u8> {",
+        "    return [",
+        numbers(rects),
+        "    ]",
+        "}",
+        "",
+        "/// The states that move, in state ID order.",
+        "pub fn moving_states() -> List<u32> {",
+        "    return [",
+        numbers(moving_states, 12),
+        "    ]",
+        "}",
+        "",
+        "/// Where each state that moves has its shape's grid start, on x, y, z, then end, in `FACE_UNIT`s",
+        "/// above `FACE_FLOOR`.",
+        "pub fn moving_grids() -> List<u8> {",
+        "    return [",
+        numbers(grids),
+        "    ]",
+        "}",
+        "",
+        "/// Where each state that moves has its boxes start in `moving_boxes`, counted in boxes, and",
+        "/// where the last ends.",
+        "pub fn moving_starts() -> List<u16> {",
+        "    return [",
+        numbers(box_starts),
+        "    ]",
+        "}",
+        "",
+        "/// The boxes of the states that move, before they're offset, six coordinates each, min x, y, z",
+        "/// then max x, y, z, in `FACE_UNIT`s above `FACE_FLOOR`.",
+        "pub fn moving_boxes() -> List<u8> {",
+        "    return [",
+        numbers(moving_boxes),
+        "    ]",
+        "}",
+        "",
+        "/// Each block vanilla offsets by its position, four numbers each: the block, 1 if it's offset up",
+        "/// and down too, and the bits of the `f32`s it's offset at most across and up and down,",
+        "/// `getMaxHorizontalOffset` and `getMaxVerticalOffset`.",
+        "pub fn offset_blocks() -> List<u32> {",
+        "    return [",
+        numbers(offsets, 8),
+        "    ]",
+        "}",
+        "",
+        "/// What vanilla's `canPassThroughWall` said where a state that moves meets another, seven numbers",
+        "/// each: x, y, z of the first, the direction toward the second, the two states, and 1 if a",
+        "/// fluid passes. Most are where moving changes the answer. For Calcite's tests.",
+        "pub fn wall_cases() -> List<i32> {",
+        "    return [",
+        numbers(cases, 7),
+        "    ]",
+        "}",
+        "",
+        "/// Where vanilla offsets a state that moves, six numbers each: the state, x, z, and the bits of",
+        "/// the offset's x, y and z. For Calcite's tests.",
+        "pub fn offset_cases() -> List<i64> {",
+        "    return [",
+        numbers(offset_cases, 6),
+        "    ]",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def collision_module(index, flags):
     """The text of src/world/collision_shapes.calx."""
     shapes = flags["collision"]
@@ -952,6 +1207,7 @@ def outputs(tables, version=VERSION):
         CALCITE / "src" / "world" / "block_facts.calx": block_facts_module(index, flags),
         CALCITE / "src" / "world" / "light_faces.calx": light_faces_module(index, flags),
         CALCITE / "src" / "world" / "collision_shapes.calx": collision_module(index, flags),
+        CALCITE / "src" / "world" / "fluid_faces.calx": fluid_faces_module(index, flags),
         CALCITE / "src" / "world" / "entity_facts.calx": entity_facts_module(index, entities),
     }
 

@@ -1,11 +1,14 @@
 package calcite.rig.vanilla;
 
+import com.google.common.math.DoubleMath;
 import java.io.IOException;
+import java.lang.reflect.Method;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import net.minecraft.SharedConstants;
@@ -14,6 +17,7 @@ import net.minecraft.core.Direction;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.world.entity.ai.village.poi.PoiTypes;
+import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Mirror;
@@ -21,6 +25,7 @@ import net.minecraft.world.level.block.Rotation;
 import net.minecraft.world.level.block.SupportType;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.lighting.LightEngine;
+import net.minecraft.world.level.material.FlowingFluid;
 import net.minecraft.world.level.material.FluidState;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.Vec3;
@@ -45,6 +50,21 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  * {@code OFFSET}. {@code COLLISION_TOP_FULL} is whether the shape with an empty context covers
  * its block's top, {@code Block.isFaceFull} on {@code UP}, and {@code LARGE_COLLISION} is {@code
  * hasLargeCollisionShape}, whether it reaches out of its block or changes with where it is.
+ *
+ * <p>And the faces a fluid sees of each state (CAL-91): its collision shape with an empty context,
+ * as {@code FlowingFluid.canPassThroughWall} asks it, toward each side, as {@code
+ * Shapes.mergedFaceOccludes} takes it: empty unless the shape reaches that side of its block, else
+ * the boxes that reach it, laid flat on the face's other two axes, x before y before z, one block
+ * deep along z. They're numbered as the light's faces are, with whether each two cover a face
+ * between them. A state vanilla offsets by its position whose collision shape isn't empty, as
+ * pointed dripstone, moves: its faces are where it is, so it's written with its boxes before
+ * they're offset and where its shape's grid starts and ends on each axis, as {@code
+ * mergedFaceOccludes} slices the grid's end cell, which moving can leave empty, and each block with
+ * an offset with how far it goes. Every two shapes the states
+ * have, each way round and toward each side, are checked against vanilla's own {@code
+ * canPassThroughWall}, and each state that moves at 24 places against every shape, so the table
+ * says what vanilla does or this fails; the cases where a state's moving changes the answer are
+ * written for Calcite's own test.
  *
  * <p>Every value is fixed when the states are made, before any data pack loads, so the table is
  * the same for every world.
@@ -95,6 +115,9 @@ final class BlockFlags {
         int count = Block.BLOCK_STATE_REGISTRY.size();
         Faces faces = new Faces();
         Faces collisions = new Faces();
+        Faces fluidFaces = new Faces();
+        int[][] fluidFaceIds = new int[count][Direction.values().length];
+        StringBuilder fluid = new StringBuilder();
         StringBuilder json = new StringBuilder();
         StringBuilder light = new StringBuilder();
         StringBuilder collision = new StringBuilder();
@@ -125,6 +148,14 @@ final class BlockFlags {
             }
             light.append("]");
             collision.append(id == 0 ? "" : ", ").append(collisions.id(collisionShape(state)));
+            VoxelShape walls = fluidShape(state);
+            fluid.append(id == 0 ? "[" : ", [");
+            for (Direction direction : Direction.values()) {
+                int face = fluidFaces.id(fluidFace(walls, direction));
+                fluidFaceIds[id][direction.ordinal()] = face;
+                fluid.append(direction.ordinal() == 0 ? "" : ", ").append(face);
+            }
+            fluid.append("]");
             facts.append(id == 0 ? "" : ", ").append(facts(state));
             boolean shapeFull = Block.isShapeFullBlock(state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO));
             if (shapeFull != state.isCollisionShapeFullBlock(EmptyBlockGetter.INSTANCE, BlockPos.ZERO)) {
@@ -290,24 +321,287 @@ final class BlockFlags {
             }
             json.append("]");
         }
-        json.append("]\n}\n");
+        json.append("]");
+        int fluidCount = fluidFaces.shapes.size();
+        boolean[][] covers = new boolean[fluidCount][fluidCount];
+        for (int i = 0; i < fluidCount; i++) {
+            for (int j = 0; j < fluidCount; j++) {
+                covers[i][j] = Shapes.mergedFaceOccludes(fluidFaces.shapes.get(i), fluidFaces.shapes.get(j), Direction.SOUTH);
+            }
+        }
+        StringBuilder cases = new StringBuilder();
+        StringBuilder offsetCases = new StringBuilder();
+        List<Integer> moving = checkFluidFaces(count, fluidFaces, fluidFaceIds, covers, cases, offsetCases);
+        StringBuilder movingJson = new StringBuilder();
+        for (int id : moving) {
+            VoxelShape moves = fluidShape(Block.BLOCK_STATE_REGISTRY.byId(id));
+            movingJson.append(movingJson.isEmpty() ? "[" : ", [").append(id).append(", [");
+            for (int end = 0; end < 2; end++) {
+                for (Direction.Axis axis : Direction.Axis.values()) {
+                    movingJson.append(end == 0 && axis == Direction.Axis.X ? "" : ", ").append(gridEnd(moves, axis, end == 1));
+                }
+            }
+            movingJson.append("], ");
+            boxesOf(movingJson, moves);
+            movingJson.append("]");
+        }
+        // How far each block with an offset goes, which its offset function reads from it.
+        Method horizontal = net.minecraft.world.level.block.state.BlockBehaviour.class.getDeclaredMethod("getMaxHorizontalOffset");
+        Method vertical = net.minecraft.world.level.block.state.BlockBehaviour.class.getDeclaredMethod("getMaxVerticalOffset");
+        horizontal.setAccessible(true);
+        vertical.setAccessible(true);
+        StringBuilder offsets = new StringBuilder();
+        for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
+            Block block = BuiltInRegistries.BLOCK.byId(id);
+            BlockState state = block.defaultBlockState();
+            if (!state.hasOffsetFunction()) {
+                continue;
+            }
+            boolean xyz = false;
+            for (int i = 0; i < 64; i++) {
+                xyz |= state.getOffset(new BlockPos(i * 7 - 200, 0, i * 13 - 400)).y != 0.0;
+            }
+            offsets.append(offsets.isEmpty() ? "[" : ", [").append(id).append(", ").append(xyz ? 1 : 0).append(", ")
+                    .append(Float.floatToIntBits((float) horizontal.invoke(block))).append(", ")
+                    .append(Float.floatToIntBits((float) vertical.invoke(block))).append("]");
+        }
+        json.append(",\n  \"fluid_faces\": [").append(fluid).append("],\n");
+        json.append("  \"fluid_face_boxes\": ");
+        boxes(json, fluidFaces);
+        json.append(",\n  \"fluid_covers\": [");
+        for (int i = 0; i < fluidCount; i++) {
+            json.append(i == 0 ? "[" : ", [");
+            for (int j = 0; j < fluidCount; j++) {
+                json.append(j == 0 ? "" : ", ").append(covers[i][j] ? 1 : 0);
+            }
+            json.append("]");
+        }
+        json.append("],\n  \"fluid_moving\": [").append(movingJson).append("],\n");
+        json.append("  \"offsets\": [").append(offsets).append("],\n");
+        json.append("  \"fluid_cases\": [").append(cases).append("],\n");
+        json.append("  \"offset_cases\": [").append(offsetCases).append("]\n}\n");
         Files.writeString(Path.of(args[0]), json, StandardCharsets.UTF_8);
-        System.err.println("BlockFlags: wrote " + count + " states, " + faces.shapes.size() + " face shapes and "
-                + collisions.shapes.size() + " collision shapes to " + args[0]);
+        System.err.println("BlockFlags: wrote " + count + " states, " + faces.shapes.size() + " face shapes, "
+                + collisions.shapes.size() + " collision shapes and " + fluidCount + " fluid faces to " + args[0]);
+    }
+
+    /** The state's collision shape as a fluid's wall test asks it, before vanilla offsets it by its position. */
+    private static VoxelShape fluidShape(BlockState state) {
+        VoxelShape shape = state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+        if (!state.hasOffsetFunction()) {
+            return shape;
+        }
+        Vec3 offset = state.getOffset(BlockPos.ZERO);
+        return shape.move(-offset.x, -offset.y, -offset.z);
+    }
+
+    // `VoxelShape.getCoords`, which `gridEnd` reads.
+    private static Method coords;
+
+    /** Where {@code shape}'s grid starts on {@code axis}, or ends if {@code last}. */
+    private static double gridEnd(VoxelShape shape, Direction.Axis axis, boolean last) throws ReflectiveOperationException {
+        if (coords == null) {
+            coords = VoxelShape.class.getDeclaredMethod("getCoords", Direction.Axis.class);
+            coords.setAccessible(true);
+        }
+        it.unimi.dsi.fastutil.doubles.DoubleList list = (it.unimi.dsi.fastutil.doubles.DoubleList) coords.invoke(shape, axis);
+        return last ? list.getDouble(list.size() - 1) : list.getDouble(0);
+    }
+
+    /**
+     * The face toward {@code d} of {@code state}, which moves, at {@code pos}, as Calcite works it
+     * out: its shape before it's offset moved by its offset there, empty unless the moved shape
+     * reaches that side of its block, as near as {@code mergedFaceOccludes} asks, else the boxes
+     * that reach its grid's end that way, which it slices, moved, and laid flat as {@code
+     * fluidFace} lays them.
+     */
+    private static VoxelShape movedFace(BlockState state, BlockPos pos, Direction d) throws ReflectiveOperationException {
+        VoxelShape shape = fluidShape(state);
+        Vec3 offset = state.getOffset(pos);
+        Direction.Axis axis = d.getAxis();
+        boolean positive = d.getAxisDirection() == Direction.AxisDirection.POSITIVE;
+        double moved = (positive ? shape.max(axis) : shape.min(axis)) + offset.get(axis);
+        if (!DoubleMath.fuzzyEquals(moved, positive ? 1.0 : 0.0, 1.0E-7)) {
+            return Shapes.empty();
+        }
+        double end = gridEnd(shape, axis, positive);
+        Direction.Axis u = axis == Direction.Axis.X ? Direction.Axis.Y : Direction.Axis.X;
+        Direction.Axis v = axis == Direction.Axis.Z ? Direction.Axis.Y : Direction.Axis.Z;
+        VoxelShape face = Shapes.empty();
+        for (AABB box : shape.toAabbs()) {
+            if ((positive ? box.max(axis) : box.min(axis)) == end) {
+                face = Shapes.or(face, Shapes.box(box.min(u) + offset.get(u), box.min(v) + offset.get(v), 0.0,
+                        box.max(u) + offset.get(u), box.max(v) + offset.get(v), 1.0));
+            }
+        }
+        return face;
+    }
+
+    /**
+     * The face of {@code shape} toward {@code d} as {@code Shapes.mergedFaceOccludes} slices it:
+     * empty unless the shape reaches that side of its block, as near as it asks, else the boxes
+     * that reach the shape's side, laid flat on the face's other two axes and one block deep along
+     * z, so two faces of the same axis can be joined as {@code SOUTH} joins them.
+     */
+    private static VoxelShape fluidFace(VoxelShape shape, Direction d) {
+        if (shape.isEmpty()) {
+            return Shapes.empty();
+        }
+        Direction.Axis axis = d.getAxis();
+        boolean positive = d.getAxisDirection() == Direction.AxisDirection.POSITIVE;
+        double side = positive ? shape.max(axis) : shape.min(axis);
+        if (!DoubleMath.fuzzyEquals(side, positive ? 1.0 : 0.0, 1.0E-7)) {
+            return Shapes.empty();
+        }
+        Direction.Axis u = axis == Direction.Axis.X ? Direction.Axis.Y : Direction.Axis.X;
+        Direction.Axis v = axis == Direction.Axis.Z ? Direction.Axis.Y : Direction.Axis.Z;
+        VoxelShape face = Shapes.empty();
+        for (AABB box : shape.toAabbs()) {
+            if ((positive ? box.max(axis) : box.min(axis)) == side) {
+                face = Shapes.or(face, Shapes.box(box.min(u), box.min(v), 0.0, box.max(u), box.max(v), 1.0));
+            }
+        }
+        return face;
+    }
+
+    /**
+     * Fails unless the fluid faces say what vanilla's own {@code canPassThroughWall} says. For every
+     * two shapes the states have that don't move, by a state of each, each way round and toward
+     * each side, the table must say it. For each state that moves, at 24 places, against a state of
+     * every shape's boxes and each that moves, each way round and toward each side, its faces where
+     * it is must: its boxes before they're offset, moved, as {@code fluidFace} slices them. Writes
+     * the cases where moving changes the answer, and some where it doesn't, to {@code cases}, and
+     * where each state that moves is offset at some places to {@code offsetCases}, and returns the
+     * states that move.
+     */
+    private static List<Integer> checkFluidFaces(int count, Faces fluidFaces, int[][] faces, boolean[][] covers,
+            StringBuilder cases, StringBuilder offsetCases) throws ReflectiveOperationException {
+        Method pass = FlowingFluid.class.getDeclaredMethod("canPassThroughWall", Direction.class, BlockGetter.class,
+                BlockPos.class, BlockState.class, BlockPos.class, BlockState.class);
+        pass.setAccessible(true);
+        Map<VoxelShape, Integer> seen = new IdentityHashMap<>();
+        Map<String, Integer> boxed = new HashMap<>();
+        List<Integer> shapes = new ArrayList<>();
+        List<Integer> kinds = new ArrayList<>();
+        List<Integer> moving = new ArrayList<>();
+        for (int id = 0; id < count; id++) {
+            BlockState state = Block.BLOCK_STATE_REGISTRY.byId(id);
+            if (state.hasOffsetFunction() && !fluidShape(state).isEmpty()) {
+                if (!state.getBlock().hasDynamicShape()) {
+                    throw new IllegalStateException(state + " moves with where it is, but its shape is kept as if it didn't");
+                }
+                moving.add(id);
+                continue;
+            }
+            if (state.getBlock().hasDynamicShape()) {
+                shapes.add(id);
+            } else if (seen.putIfAbsent(state.getCollisionShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO), id) == null) {
+                shapes.add(id);
+            }
+            VoxelShape shape = fluidShape(state);
+            if (boxed.putIfAbsent(shape.isEmpty() ? "" : shape.toAabbs().toString(), id) == null) {
+                kinds.add(id);
+            }
+        }
+        long checked = 0;
+        long started = System.nanoTime();
+        for (int a : shapes) {
+            for (int b : shapes) {
+                for (Direction d : Direction.values()) {
+                    BlockState first = Block.BLOCK_STATE_REGISTRY.byId(a);
+                    BlockState second = Block.BLOCK_STATE_REGISTRY.byId(b);
+                    boolean vanilla = (boolean) pass.invoke(null, d, EmptyBlockGetter.INSTANCE, BlockPos.ZERO, first,
+                            BlockPos.ZERO.relative(d), second);
+                    boolean table = !covers[faces[a][d.ordinal()]][faces[b][d.getOpposite().ordinal()]];
+                    if (vanilla != table) {
+                        throw new IllegalStateException("canPassThroughWall " + d + " from " + first + " to " + second
+                                + " is " + vanilla + ", but the fluid faces say " + table);
+                    }
+                    checked++;
+                }
+            }
+        }
+        List<Integer> others = new ArrayList<>(kinds);
+        others.addAll(moving);
+        java.util.Set<Integer> moves = new java.util.HashSet<>(moving);
+        int[] changed = new int[2];
+        int kept = 0;
+        for (int m : moving) {
+            BlockState state = Block.BLOCK_STATE_REGISTRY.byId(m);
+            for (int i = 0; i < 24; i++) {
+                BlockPos at = new BlockPos(i * 37 - 400, i % 7 - 3, i * i * 11 - 300);
+                Vec3 offset = state.getOffset(at);
+                VoxelShape there = state.getCollisionShape(EmptyBlockGetter.INSTANCE, at);
+                VoxelShape moved = fluidShape(state).move(offset.x, offset.y, offset.z);
+                if (!there.toAabbs().toString().equals(moved.toAabbs().toString())) {
+                    throw new IllegalStateException(state + " at " + at + " isn't its shape moved by its offset");
+                }
+                if (i < 4) {
+                    offsetCases.append(offsetCases.isEmpty() ? "[" : ", [").append(m).append(", ").append(at.getX())
+                            .append(", ").append(at.getZ()).append(", ").append(Double.doubleToLongBits(offset.x)).append(", ")
+                            .append(Double.doubleToLongBits(offset.y)).append(", ").append(Double.doubleToLongBits(offset.z)).append("]");
+                }
+                for (int b : others) {
+                    for (Direction d : Direction.values()) {
+                        for (int way = 0; way < 2; way++) {
+                            int a = way == 0 ? m : b;
+                            int c = way == 0 ? b : m;
+                            BlockState first = Block.BLOCK_STATE_REGISTRY.byId(a);
+                            BlockState second = Block.BLOCK_STATE_REGISTRY.byId(c);
+                            BlockPos to = at.relative(d);
+                            boolean vanilla = (boolean) pass.invoke(null, d, EmptyBlockGetter.INSTANCE, at, first, to, second);
+                            VoxelShape firstFace = moves.contains(a) ? movedFace(first, at, d)
+                                    : fluidFaces.shapes.get(faces[a][d.ordinal()]);
+                            VoxelShape secondFace = moves.contains(c) ? movedFace(second, to, d.getOpposite())
+                                    : fluidFaces.shapes.get(faces[c][d.getOpposite().ordinal()]);
+                            boolean model = !Shapes.mergedFaceOccludes(firstFace, secondFace, Direction.SOUTH);
+                            if (vanilla != model) {
+                                throw new IllegalStateException("canPassThroughWall " + d + " from " + first + " at " + at + " to "
+                                        + second + " is " + vanilla + ", but the faces where they are say " + model);
+                            }
+                            boolean table = !covers[faces[a][d.ordinal()]][faces[c][d.getOpposite().ordinal()]];
+                            boolean write = table != model ? changed[model ? 1 : 0] < 24 : (checked % 9973 == 0 && kept < 16);
+                            if (write) {
+                                if (table != model) {
+                                    changed[model ? 1 : 0]++;
+                                } else {
+                                    kept++;
+                                }
+                                cases.append(cases.isEmpty() ? "[" : ", [").append(at.getX()).append(", ").append(at.getY())
+                                        .append(", ").append(at.getZ()).append(", ").append(d.ordinal()).append(", ").append(a)
+                                        .append(", ").append(c).append(", ").append(vanilla ? 1 : 0).append("]");
+                            }
+                            checked++;
+                        }
+                    }
+                }
+            }
+        }
+        System.err.println("BlockFlags: the fluid faces agree with canPassThroughWall " + checked + " times, over "
+                + shapes.size() + " shapes and " + moving.size() + " states that move, " + (changed[0] + changed[1])
+                + " of the cases written where moving changes the answer, in "
+                + (System.nanoTime() - started) / 1000000 + " ms");
+        return moving;
     }
 
     /** Each shape's boxes, as a list of lists of six numbers. */
     private static void boxes(StringBuilder json, Faces shapes) {
         json.append("[");
         for (int i = 0; i < shapes.shapes.size(); i++) {
-            json.append(i == 0 ? "[" : ", [");
-            List<AABB> boxes = shapes.shapes.get(i).toAabbs();
-            for (int b = 0; b < boxes.size(); b++) {
-                AABB box = boxes.get(b);
-                json.append(b == 0 ? "[" : ", [").append(box.minX).append(", ").append(box.minY).append(", ").append(box.minZ)
-                        .append(", ").append(box.maxX).append(", ").append(box.maxY).append(", ").append(box.maxZ).append("]");
-            }
-            json.append("]");
+            json.append(i == 0 ? "" : ", ");
+            boxesOf(json, shapes.shapes.get(i));
+        }
+        json.append("]");
+    }
+
+    /** A shape's boxes, as a list of lists of six numbers. */
+    private static void boxesOf(StringBuilder json, VoxelShape shape) {
+        json.append("[");
+        List<AABB> boxes = shape.toAabbs();
+        for (int b = 0; b < boxes.size(); b++) {
+            AABB box = boxes.get(b);
+            json.append(b == 0 ? "[" : ", [").append(box.minX).append(", ").append(box.minY).append(", ").append(box.minZ)
+                    .append(", ").append(box.maxX).append(", ").append(box.maxY).append(", ").append(box.maxZ).append("]");
         }
         json.append("]");
     }

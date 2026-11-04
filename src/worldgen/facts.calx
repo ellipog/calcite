@@ -1,12 +1,15 @@
 /// What features ask of block states and blocks: which block a state is, its flags and the facts
-/// `world.block_facts` holds, its fluid, its block's class and tags, and its properties. Built
-/// once from the loaded block and fluid registries.
+/// `world.block_facts` holds, its fluid, its block's class and tags, its properties, and the faces
+/// a fluid sees of it, `world.fluid_faces` (D327). Built once from the loaded block and fluid
+/// registries.
 module worldgen.facts
 
+import random.source.{position_seed}
 import registry.registry.{Registry}
 import world.block_facts.{COLLISION_EMPTY, COLLISION_FACE_SHIFT, COLLISION_FULL_BLOCK, COLLISION_TOP_ANY, IGNITED_BY_LAVA, LIQUID, REDSTONE_CONDUCTOR, REPLACEABLE, SOLID, STURDY_CENTER_SHIFT, STURDY_FULL_SHIFT, STURDY_RIGID_SHIFT, block_classes, block_entity_blocks, block_entity_names, class_names, wall_cover, class_parents, dynamic_shape_blocks, flammable_blocks, outline_differs, liquid_containers, neighbour_classes, place_classes, place_on_classes, poi_states, removal_classes, shape_classes, tick_classes, state_facts, state_fluids, state_mirrors_front_back, state_mirrors_left_right, state_occlusion, state_turns, survive_classes, waterloggable_blocks}
-import world.block_flags.{AIR, BLOCK_ENTITY, LIGHT_EMISSION_SHIFT, SOLID_RENDER, state_flags}
+import world.block_flags.{AIR, BLOCK_ENTITY, LIGHT_EMISSION_SHIFT, OFFSET, SOLID_RENDER, state_flags}
 import world.chunk.{BlockStates}
+import world.fluid_faces.{COVER_WORDS, FACE_FLOOR, FACE_UNIT, FLUID_FACE_BITS, face_rects, face_starts, fluid_covers, moving_boxes, moving_grids, moving_starts, moving_states, offset_blocks, state_fluid_faces}
 import world.states.{Prop, StateCodec}
 import worldgen.interval.{Thrown}
 
@@ -32,6 +35,77 @@ pub fn step_z(d: i32) -> i32 {
 }
 
 /// The direction the other way.
+// A coordinate of `world.fluid_faces`, in blocks.
+fn units(c: u8) -> f64 {
+    return f64(i32(c) + FACE_FLOOR) / f64(FACE_UNIT)
+}
+
+// `Mth.clamp` of doubles.
+fn clamp(value: f64, low: f64, high: f64) -> f64 {
+    return if value < low { low } else { value.min(high) }
+}
+
+// Sorts the numbers, few as they are, and keeps one of those within 1e-7 of the one before, as
+// `IndirectMerger` joins two shapes' coordinates.
+fn merged(values: own List<f64>) -> List<f64> {
+    var xs = values
+    for i in 1..xs.len() {
+        var j = i
+        while j > 0 and xs[j - 1] > xs[j] {
+            xs.swap(j - 1, j)
+            j -= 1
+        }
+    }
+    var out = List<f64>()
+    for x in xs {
+        if out.len() == 0 or not (out[out.len() - 1] >= x - 0.0000001) {
+            out.push(x)
+        }
+    }
+    return out
+}
+
+// Adds `x` to `xs` if it's inside a block's face, between 0 and 1.
+fn inside(xs: mut List<f64>, x: f64) {
+    if x > 0.0 and x < 1.0 {
+        xs.push(x)
+    }
+}
+
+// Whether the rectangles, four numbers each, from u, v to u, v, cover a block's face, from 0, 0
+// to 1, 1, between them: as `mergedFaceOccludes` asks `joinIsNotEmpty(block(), their union,
+// ONLY_FIRST)`, each cell between their coordinates and the face's edges in one of them.
+fn covers_face(rects: List<f64>) -> bool {
+    var us: List<f64> = [0.0, 1.0]
+    var vs: List<f64> = [0.0, 1.0]
+    var r: usize = 0
+    while r + 3 < rects.len() {
+        inside(mut us, rects[r])
+        inside(mut vs, rects[r + 1])
+        inside(mut us, rects[r + 2])
+        inside(mut vs, rects[r + 3])
+        r += 4
+    }
+    let grid_u = merged(us)
+    let grid_v = merged(vs)
+    for i in 0..grid_u.len() - 1 {
+        let cu = (grid_u[i] + grid_u[i + 1]) / 2.0
+        for j in 0..grid_v.len() - 1 {
+            let cv = (grid_v[j] + grid_v[j + 1]) / 2.0
+            var covered = false
+            var q: usize = 0
+            while q + 3 < rects.len() and not covered {
+                covered = rects[q] < cu and cu < rects[q + 2] and rects[q + 1] < cv and cv < rects[q + 3]
+                q += 4
+            }
+            if not covered {
+                return false
+            }
+        }
+    }
+    return true
+}
+
 pub fn opposite(d: i32) -> i32 {
     return d ^ 1
 }
@@ -176,6 +250,28 @@ struct Tables {
     // them cover.
     wall_covers: Map<u32, u32>
     entity_names: List<String>
+    // Each state's six fluid faces, as an index into the different sets of them; for each face
+    // the faces it and a fluid can't pass between, and its rectangles (D327).
+    fluid_face_sets: List<u64>
+    fluid_face_of: List<u16>
+    fluid_covers: List<u64>
+    face_starts: List<u16>
+    face_rects: List<u8>
+    // The states that move, each as an index into the grids and the starts of their boxes, and
+    // each block vanilla offsets by its position.
+    moving: Map<u32, usize>
+    moving_grids: List<u8>
+    moving_starts: List<u16>
+    moving_boxes: List<u8>
+    offsets: Map<u32, Offset>
+}
+
+// How a block is offset by its position: up and down too, or only across, and how far at most
+// each way, `getMaxHorizontalOffset` and `getMaxVerticalOffset`.
+struct Offset {
+    xyz: bool
+    horizontal: f32
+    vertical: f32
 }
 
 /// The blocks features know by name, by ID, and some of their states.
@@ -306,6 +402,19 @@ impl Facts {
             poi.insert(pairs[i], i32.wrap(pairs[i + 1]))
             i += 2
         }
+        let (face_sets, face_of) = state_fluid_faces()
+        var moving = Map<u32, usize>()
+        let movers = moving_states()
+        for m in 0..movers.len() {
+            moving.insert(movers[m], m)
+        }
+        var offsets = Map<u32, Offset>()
+        let offset_list = offset_blocks()
+        var o: usize = 0
+        while o + 3 < offset_list.len() {
+            offsets.insert(offset_list[o], Offset { xyz: offset_list[o + 1] != 0, horizontal: f32.from_bits(offset_list[o + 2]), vertical: f32.from_bits(offset_list[o + 3]) })
+            o += 4
+        }
         return Facts {
             codec: codec,
             table: table,
@@ -341,7 +450,127 @@ impl Facts {
                 outline_flipped: outline_flipped,
                 wall_covers: wall_covers,
                 entity_names: entity_names,
+                fluid_face_sets: face_sets,
+                fluid_face_of: face_of,
+                fluid_covers: fluid_covers(),
+                face_starts: face_starts(),
+                face_rects: face_rects(),
+                moving: moving,
+                moving_grids: moving_grids(),
+                moving_starts: moving_starts(),
+                moving_boxes: moving_boxes(),
+                offsets: offsets,
             }),
+        }
+    }
+
+    /// The face of the state's collision shape toward `d` a fluid sees, as `world.fluid_faces`
+    /// numbers them: 0 empty, 1 whole. A state that moves has its face before it's offset here.
+    pub fn fluid_face(self, state: u32, d: i32) -> u32 {
+        let set = self.t.value.fluid_face_sets[usize(self.t.value.fluid_face_of[usize(state)])]
+        return u32.wrap((set >> u64(FLUID_FACE_BITS * u32.wrap(d))) & 255)
+    }
+
+    /// Whether the faces `a` and `b` cover a face of a block between them, as
+    /// `Shapes.mergedFaceOccludes` says of two faces of the same side.
+    pub fn faces_cover(self, a: u32, b: u32) -> bool {
+        let word = self.t.value.fluid_covers[usize(a * COVER_WORDS + b / 64)]
+        return (word >> u64(b & 63)) & 1 != 0
+    }
+
+    /// `BlockStateBase.getOffset`: how far vanilla moves the state at x, z, across and up and
+    /// down, as its block's offset function draws it from `Mth.getSeed`, or nothing if it has none.
+    pub fn offset(self, state: u32, x: i32, z: i32) -> (f64, f64, f64) {
+        if self.t.value.flag_bits[usize(state)] & OFFSET == 0 {
+            return (0.0, 0.0, 0.0)
+        }
+        let block = self.block(state)
+        if not self.t.value.offsets.contains(block) {
+            return (0.0, 0.0, 0.0)
+        }
+        let xyz = self.t.value.offsets[block].xyz
+        let vertical = self.t.value.offsets[block].vertical
+        let seed = position_seed(x, 0, z)
+        let most = f64(self.t.value.offsets[block].horizontal)
+        let dx = clamp((f64(f32.nearest(seed & 15) / 15.0f32) - 0.5) * 0.5, -most, most)
+        let dz = clamp((f64(f32.nearest((seed >> 8) & 15) / 15.0f32) - 0.5) * 0.5, -most, most)
+        let dy = if xyz { (f64(f32.nearest((seed >> 4) & 15) / 15.0f32) - 1.0) * f64(vertical) } else { 0.0 }
+        return (dx, dy, dz)
+    }
+
+    /// `FlowingFluid.canPassThroughWall`: whether a fluid passes between `state` at x, y, z and
+    /// `neighbour`, the block toward `d` of it, as the faces between their collision shapes say:
+    /// it doesn't where they cover a face of a block between them (D327). A state that moves has
+    /// its face where it is worked out from its boxes, but where the other's face is whole.
+    pub fn passes_wall(self, d: i32, x: i32, _y: i32, z: i32, state: u32, neighbour: u32) -> bool {
+        let back = opposite(d)
+        let a = self.fluid_face(state, d)
+        let b = self.fluid_face(neighbour, back)
+        let a_moves = self.moves(state)
+        let b_moves = self.moves(neighbour)
+        if not a_moves and not b_moves {
+            return not self.faces_cover(a, b)
+        }
+        if (not a_moves and a == 1) or (not b_moves and b == 1) {
+            return false
+        }
+        var rects = List<f64>()
+        self.face_rects_at(mut rects, state, d, x, z, a_moves, a)
+        self.face_rects_at(mut rects, neighbour, back, x + step_x(d), z + step_z(d), b_moves, b)
+        return not covers_face(rects)
+    }
+
+    // Whether the state is one that moves: offset by its position, with a collision shape.
+    fn moves(self, state: u32) -> bool {
+        return self.t.value.flag_bits[usize(state)] & OFFSET != 0 and self.t.value.moving.contains(state)
+    }
+
+    // The rectangles of the state's face toward `d`, four numbers each, from u, v to u, v: its
+    // face's, or, if it moves, those of its boxes that reach its grid's end that way, moved by its
+    // offset at x, z, if its moved shape reaches that side of its block, as near as
+    // `mergedFaceOccludes` asks, `DoubleMath.fuzzyEquals` within 1e-7.
+    fn face_rects_at(self, rects: mut List<f64>, state: u32, d: i32, x: i32, z: i32, moves: bool, face: u32) {
+        if not moves {
+            let from = usize(self.t.value.face_starts[usize(face)])
+            let to = usize(self.t.value.face_starts[usize(face) + 1])
+            for r in from..to {
+                rects.push(units(self.t.value.face_rects[4 * r]))
+                rects.push(units(self.t.value.face_rects[4 * r + 1]))
+                rects.push(units(self.t.value.face_rects[4 * r + 2]))
+                rects.push(units(self.t.value.face_rects[4 * r + 3]))
+            }
+            return
+        }
+        let m = self.t.value.moving[state]
+        let (ox, oy, oz) = self.offset(state, x, z)
+        let off = [ox, oy, oz]
+        let axis: usize = if d >= WEST { 0 } else if d >= NORTH { 2 } else { 1 }
+        let positive = d % 2 == 1
+        let u: usize = if axis == 0 { 1 } else { 0 }
+        let v: usize = if axis == 2 { 1 } else { 2 }
+        let side: usize = if positive { axis + 3 } else { axis }
+        let from = usize(self.t.value.moving_starts[m])
+        let to = usize(self.t.value.moving_starts[m + 1])
+        var reach = units(self.t.value.moving_boxes[6 * from + side])
+        for b in from..to {
+            let c = units(self.t.value.moving_boxes[6 * b + side])
+            if (positive and c > reach) or (not positive and c < reach) {
+                reach = c
+            }
+        }
+        let moved = reach + off[axis]
+        let edge = if positive { 1.0 } else { 0.0 }
+        if (moved - edge).abs() > 0.0000001 {
+            return
+        }
+        let end = units(self.t.value.moving_grids[6 * m + side])
+        for b in from..to {
+            if units(self.t.value.moving_boxes[6 * b + side]) == end {
+                rects.push(units(self.t.value.moving_boxes[6 * b + u]) + off[u])
+                rects.push(units(self.t.value.moving_boxes[6 * b + v]) + off[v])
+                rects.push(units(self.t.value.moving_boxes[6 * b + u + 3]) + off[u])
+                rects.push(units(self.t.value.moving_boxes[6 * b + v + 3]) + off[v])
+            }
         }
     }
 
