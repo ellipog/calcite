@@ -60,10 +60,11 @@ import server.log.{Entry}
 import server.pregen.{Holds}
 import storage.chunk.{RestStore}
 import storage.regions.{ChunkRead, region_of}
-import world.chunk.{AIR_STATE, Chunk, MOTION_BLOCKING}
+import world.chunk.{AIR_STATE, BlockStates, Chunk, MOTION_BLOCKING}
 import world.collision.{CollisionBlocks, CollisionStates}
 import world.distance.{DistanceManager, Ticking}
 import world.flat.{FlatChunk, FlatWorld}
+import world.level_writer.{LevelWriter, UPDATE_CLIENTS}
 import world.light.{SkySources}
 import world.natural.{SpawnLevel}
 import world.pos.{BlockPos, ChunkPos}
@@ -105,16 +106,20 @@ enum Body {
 
 // Each holder's chunk, by its packed position, once it's there, and the flat chunk each flat one
 // is. A chunk held whole has its rest kept with the others' in `rests`, not in its body, from
-// when it's put in until it's taken out (D289).
+// when it's put in until it's taken out (D289). A chunk whose blocks have been set since it came
+// is its own copy in `live`, made from the one it came as, shared or flat, as a block was first
+// set, which what reads it reads first; it's taken out as it is now (D321).
 struct Columns {
     slots: OpenHashMap<i64, Body> = OpenHashMap<i64, Body>()
     flat: FlatChunk? = none
     rests: RestStore = RestStore()
+    live: OpenHashMap<i64, Chunk> = OpenHashMap<i64, Chunk>()
 }
 
 impl Columns {
     // Puts in the body of the column at `k`, its rest in with the others.
     fn put(mut self, k: i64, given: own Body) {
+        _ = self.live.remove(k)
         match given {
             Body.Saved(s) => {
                 var saved = s
@@ -140,11 +145,15 @@ impl Columns {
     fn take(mut self, k: i64) -> Body? {
         let gone = self.slots.remove(k) else return none
         let rest = self.rests.take(k)
+        let changed = self.live.remove(k)
         match gone {
             Body.Saved(s) => {
                 var saved = s
                 if let r = rest {
                     saved.rest = some(r)
+                }
+                if let c = changed {
+                    saved.chunk = Shared(c)
                 }
                 return some(Body.Saved(saved))
             },
@@ -323,6 +332,24 @@ pub struct Level {
     zoom_seed: i64 = 0
     kept_light: OpenHashSet<i64> = OpenHashSet<i64>()
     flat_light: LightData? = none
+    // What a block's set with, its heightmaps and its section's counts, once the level's opened;
+    // the chunks with blocks set since the changes were last broadcast, in the order they first
+    // had one; and the blocks set in each of their sections, by the section's packed position, as
+    // each `ChunkHolder` keeps them in `changedBlocksPerSection` (D321).
+    table: BlockStates? = none
+    to_broadcast: LinkedSet<i64> = LinkedSet<i64>()
+    changed_blocks: OpenHashMap<i64, OpenHashSet<i16>> = OpenHashMap<i64, OpenHashSet<i16>>()
+}
+
+/// The blocks set in a section since they were last broadcast, as `ChunkHolder.broadcastChanges`
+/// sends them (D321): the chunk and the section's `y`, and each block's place in the section,
+/// `x << 8 | z << 4 | y`, as `SectionPos.sectionRelativePos` packs it, in the order its set gives
+/// them, with its state as it is now.
+pub struct SectionChanges {
+    pub chunk: ChunkPos
+    pub section_y: i32
+    pub places: List<i16>
+    pub states: List<u32>
 }
 
 /// How far around where a player's going to another dimension a `portal` ticket loads, as
@@ -439,7 +466,8 @@ impl Level {
             flat = some(f.copy())
         }
         if let f = flat {
-            let service = LightService.new(context.min_section, context.sections, context.sky_light, f)
+            var service = LightService.new(context.min_section, context.sections, context.sky_light, f)
+            service.set_table(context.table.copy())
             self.lighting = true
             if let j = jobs {
                 let asks = Receiver<Deque<LightAsk>>()
@@ -454,6 +482,7 @@ impl Level {
         }
         self.jobs = jobs
         self.gen = gen
+        self.table = some(context.table.copy())
         self.context = some(context)
     }
 
@@ -561,7 +590,12 @@ impl Level {
         if not self.full(pos) {
             return none
         }
-        match self.columns.slots[pos.pack()] {
+        let k = pos.pack()
+        if self.columns.live.contains(k) {
+            let from = if ceiling { top } else { top.min(self.columns.live[k].height(MOTION_BLOCKING, x & 15, z & 15)) }
+            return standing_y(states, self.columns.live[k], self, x, from, z)
+        }
+        match self.columns.slots[k] {
             Body.Saved(s) => {
                 let from = if ceiling { top } else { top.min(s.chunk.value.height(MOTION_BLOCKING, x & 15, z & 15)) }
                 return standing_y(states, s.chunk.value, self, x, from, z)
@@ -603,7 +637,11 @@ impl Level {
         if not self.full(pos) {
             return none
         }
-        match self.columns.slots[pos.pack()] {
+        let k = pos.pack()
+        if self.columns.live.contains(k) {
+            return respawn_pos(states, self.columns.live[k], x, z)
+        }
+        match self.columns.slots[k] {
             Body.Saved(s) => return respawn_pos(states, s.chunk.value, x, z),
             Body.Flat => {
                 if let f = self.columns.flat {
@@ -705,7 +743,12 @@ impl Level {
         if not self.full(pos) {
             return out
         }
-        match self.columns.slots[pos.pack()] {
+        let k = pos.pack()
+        if self.columns.live.contains(k) {
+            ticking_in(self.columns.live[k], mut out)
+            return out
+        }
+        match self.columns.slots[k] {
             Body.Saved(s) => ticking_in(s.chunk.value, mut out),
             Body.Flat => {
                 if let f = self.columns.flat {
@@ -713,6 +756,42 @@ impl Level {
                 }
             },
             Body.Loading => {},
+        }
+        return out
+    }
+
+    /// The blocks set since this was last asked in each chunk that ticks, as
+    /// `broadcastChangedChunks` goes over the holders with changes once the chunks have ticked, a
+    /// section at a time from the bottom (D321). The chunks go in the order they first had one, as
+    /// vanilla's go in the order of a set of holders by their identity. Those that don't tick by
+    /// now have theirs dropped.
+    pub fn take_changes(mut self) -> List<SectionChanges> {
+        var out = List<SectionChanges>()
+        if self.to_broadcast.is_empty() {
+            return out
+        }
+        var chunks = List<i64>()
+        for k in self.to_broadcast {
+            chunks.push(k)
+        }
+        self.to_broadcast.clear()
+        for k in chunks {
+            let pos = unpacked(k)
+            let ticks = self.sendable(pos)
+            for section_y in self.min_section..self.min_section + self.sections {
+                let set = self.changed_blocks.remove(section_key(pos.x, section_y, pos.z)) else continue
+                if not ticks {
+                    continue
+                }
+                var places = List<i16>()
+                var states = List<u32>()
+                for p in set {
+                    let place = i32(p)
+                    places.push(p)
+                    states.push(self.spawn_state(pos.x * 16 + ((place >> 8) & 15), section_y * 16 + (place & 15), pos.z * 16 + ((place >> 4) & 15)))
+                }
+                out.push(SectionChanges { chunk: pos, section_y: section_y, places: places, states: states })
+            }
         }
         return out
     }
@@ -904,16 +983,20 @@ impl Level {
             var made: List<u8>? = none
             if self.opened {
                 let light = self.light_for(k, keep)
-                match self.columns.slots[k] {
-                    Body.Saved(s) => made = some(chunk_packet(pos, s.chunk.value, light)),
-                    Body.Flat => {
-                        if not self.flat_around(pos) {
-                            if let f = self.columns.flat {
-                                made = some(chunk_packet(pos, f.chunk, light))
+                if self.columns.live.contains(k) {
+                    made = some(chunk_packet(pos, self.columns.live[k], light))
+                } else {
+                    match self.columns.slots[k] {
+                        Body.Saved(s) => made = some(chunk_packet(pos, s.chunk.value, light)),
+                        Body.Flat => {
+                            if not self.flat_around(pos) {
+                                if let f = self.columns.flat {
+                                    made = some(chunk_packet(pos, f.chunk, light))
+                                }
                             }
-                        }
-                    },
-                    Body.Loading => {},
+                        },
+                        Body.Loading => {},
+                    }
                 }
             }
             if let p = made {
@@ -1692,12 +1775,13 @@ impl Level {
         }
     }
 
-    // Whether every chunk in the 3×3 around `pos` is flat, so its light is the flat world's.
+    // Whether every chunk in the 3×3 around `pos` is flat, so its light is the flat world's: none
+    // of them has had a block set, which its light may reach out of (D321).
     fn flat_around(self, pos: ChunkPos) -> bool {
         for x in pos.x - 1..pos.x + 2 {
             for z in pos.z - 1..pos.z + 2 {
                 let k = ChunkPos { x: x, z: z }.pack()
-                if not self.columns.slots.contains(k) {
+                if not self.columns.slots.contains(k) or self.columns.live.contains(k) {
                     return false
                 }
                 match self.columns.slots[k] {
@@ -1824,7 +1908,11 @@ impl SpawnLevel for Level {
     fn surface(self, kind: i32, x: i32, z: i32) -> i32 {
         let pos = ChunkPos { x: x >> 4, z: z >> 4 }
         if self.full(pos) {
-            match self.columns.slots[pos.pack()] {
+            let k = pos.pack()
+            if self.columns.live.contains(k) {
+                return self.columns.live[k].height(kind, x & 15, z & 15)
+            }
+            match self.columns.slots[k] {
                 Body.Saved(s) => return s.chunk.value.height(kind, x & 15, z & 15),
                 Body.Flat => {
                     if let f = self.columns.flat {
@@ -1849,7 +1937,11 @@ impl SpawnLevel for Level {
         if not self.full(pos) {
             return -1
         }
-        match self.columns.slots[pos.pack()] {
+        let k = pos.pack()
+        if self.columns.live.contains(k) {
+            return i32.wrap(self.columns.live[k].noise_biome(qx & 3, qy, qz & 3))
+        }
+        match self.columns.slots[k] {
             Body.Saved(s) => return i32.wrap(s.chunk.value.noise_biome(qx & 3, qy, qz & 3)),
             Body.Flat => {
                 if let f = self.columns.flat {
@@ -1875,13 +1967,76 @@ impl SpawnLevel for Level {
     }
 }
 
+impl LevelWriter for Level {
+    // `Level.setBlock`, as far as Calcite has it (D321): in the world's height and a full chunk,
+    // the block's state set, as `LevelChunk.setBlockState` sets it, with the heightmaps, in the
+    // chunk's own copy; the chunk marked unsaved, and its kept packet dropped, as the next player
+    // to be sent it is sent it as it is now; light told, as `setBlockState` tells it; and with
+    // `UPDATE_CLIENTS`, in a chunk that ticks, the block kept for the broadcast after the chunks
+    // tick, as `sendBlockUpdated` keeps it through `ChunkHolder.blockChanged`. What it tells the
+    // blocks around, and their shapes, come with CAL-106.
+    fn set_block(mut self, x: i32, y: i32, z: i32, state: u32, flags: i32) -> bool {
+        if y < self.min_section * 16 or y >= (self.min_section + self.sections) * 16 {
+            return false
+        }
+        if x < -30000000 or x >= 30000000 or z < -30000000 or z >= 30000000 {
+            return false
+        }
+        let pos = ChunkPos { x: x >> 4, z: z >> 4 }
+        if not self.full(pos) or self.table == none {
+            return false
+        }
+        let k = pos.pack()
+        if not self.columns.live.contains(k) {
+            var copy: Chunk? = none
+            match self.columns.slots[k] {
+                Body.Saved(s) => copy = some(s.chunk.value.copy()),
+                Body.Flat => {
+                    if let f = self.columns.flat {
+                        copy = some(f.chunk.copy())
+                    }
+                },
+                Body.Loading => {},
+            }
+            let c = copy else return false
+            self.columns.live.insert(k, c)
+        }
+        let t = self.table.take() else return false
+        let old = self.columns.live[k].set_block(t, x & 15, y, z & 15, state)
+        self.table = some(t)
+        if old == none {
+            return false
+        }
+        if self.whole(k) {
+            self.unsaved.insert(k)
+        }
+        _ = self.packets.remove(k)
+        if self.lighting {
+            self.send_light(LightAsk.Block { k: k, x: x, y: y, z: z, state: state })
+        }
+        if flags & UPDATE_CLIENTS != 0 and self.sendable(pos) {
+            let key = section_key(pos.x, y >> 4, pos.z)
+            if not self.changed_blocks.contains(key) {
+                self.changed_blocks.insert(key, OpenHashSet<i16>())
+            }
+            self.changed_blocks[key].insert(i16.wrap(((x & 15) << 8) | ((z & 15) << 4) | (y & 15)))
+            self.to_broadcast.insert(k)
+        }
+        return true
+    }
+}
+
 impl CollisionBlocks for Level {
     fn collision_state(self, x: i32, y: i32, z: i32) -> u32? {
         let pos = ChunkPos { x: x >> 4, z: z >> 4 }
         if not self.full(pos) {
             return none
         }
-        match self.columns.slots[pos.pack()] {
+        let k = pos.pack()
+        if self.columns.live.contains(k) {
+            return some(self.columns.live[k].block(x & 15, y, z & 15))
+        }
+        match self.columns.slots[k] {
             Body.Saved(s) => return some(s.chunk.value.block(x & 15, y, z & 15)),
             Body.Flat => {
                 if let f = self.columns.flat {
@@ -1963,6 +2118,12 @@ fn body(loaded: own Loaded) -> Body {
 }
 
 // A chunk's packet's ID and fields.
+/// A section's position packed, as `SectionPos.asLong` packs it: 22 bits of `x` from bit 42, 22
+/// of `z` from bit 20, and 20 of `y` (D321).
+pub fn section_key(x: i32, y: i32, z: i32) -> i64 {
+    return ((i64(x) & 4194303) << 42) | (i64(y) & 1048575) | ((i64(z) & 4194303) << 20)
+}
+
 fn chunk_packet(pos: ChunkPos, chunk: Chunk, light: own LightData) -> List<u8> {
     var w = Writer.new()
     write_packet(ClientboundLevelChunkWithLight { x: pos.x, z: pos.z, chunk: chunk.chunk_data(), light: light }, State.Play, mut w)

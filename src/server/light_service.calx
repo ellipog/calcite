@@ -2,8 +2,8 @@
 /// the server's tick never waits for it (CAL-98, D264).
 ///
 /// The level tells light what happens to its chunks, in order, as `LightAsk`s: a chunk came, with
-/// the light it was saved with, or went; a holder came to be full or stopped being; and which
-/// chunks' light it wants for their packets. Light takes them a step at a time, as vanilla's
+/// the light it was saved with, or went; a holder came to be full or stopped being; a block was
+/// set (D321); and which chunks' light it wants for their packets. Light takes them a step at a time, as vanilla's
 /// light thread takes its tasks a batch at a time (`runUpdate`): the asks first, then each chunk
 /// that came is initialized, as `initializeLight` does it (its sections with blocks told, a run,
 /// then its light turned on, lit or not as it was saved), then each initialized chunk whose holder
@@ -22,7 +22,7 @@ import protocol.play.{LightData}
 import std.memory.{trim}
 import std.net.{Waker}
 import std.thread.{Task}
-import world.chunk.{Chunk}
+import world.chunk.{BlockStates, Chunk}
 import world.flat.{FlatChunk}
 import world.light.{Layer, Light, LightChunks, SectionStates, SkySources, NO_CHUNK, light_sources, section_bytes, section_states}
 import world.pos.{ChunkPos}
@@ -43,6 +43,9 @@ pub enum LightBody {
     Saved(Shared<Chunk>, SkySources)
     /// Flat: the flat world's chunk.
     Flat
+    /// Changed since it came: its own copy, made from what it came as when a block was first set,
+    /// with its sky's sources as they are now (D321).
+    Changed(Chunk, SkySources)
 }
 
 /// What the level tells light, in the order it happens.
@@ -58,6 +61,9 @@ pub enum LightAsk {
     Save(i64)
     /// The holder at `k` came to be full, or stopped being.
     Full { k: i64, full: bool }
+    /// The block at `x`, `y`, `z`, in the chunk at `k`, was set to `state`, as the level's
+    /// `set_block` set it (D321).
+    Block { k: i64, x: i32, y: i32, z: i32, state: u32 }
     /// The level wants the chunk at `k`'s light, for its packets, once it's initialized and each
     /// time it changes, until it's released or goes.
     Watch(i64)
@@ -99,6 +105,7 @@ impl LightChunks for LightColumns {
         return match self.slots[k] {
             LightBody.Saved(c, _) => some(c.value.block(x & 15, y, z & 15)),
             LightBody.Flat => some(self.flat.chunk.block(x & 15, y, z & 15)),
+            LightBody.Changed(c, _) => some(c.block(x & 15, y, z & 15)),
         }
     }
 
@@ -110,6 +117,7 @@ impl LightChunks for LightColumns {
         return match self.slots[k] {
             LightBody.Saved(c, _) => some(section_states(c.value, section_y)),
             LightBody.Flat => some(section_states(self.flat.chunk, section_y)),
+            LightBody.Changed(c, _) => some(section_states(c, section_y)),
         }
     }
 
@@ -121,6 +129,7 @@ impl LightChunks for LightColumns {
         return match self.slots[k] {
             LightBody.Saved(c, _) => section_bytes(c.value, section_y, table, mut out),
             LightBody.Flat => section_bytes(self.flat.chunk, section_y, table, mut out),
+            LightBody.Changed(c, _) => section_bytes(c, section_y, table, mut out),
         }
     }
 
@@ -132,6 +141,7 @@ impl LightChunks for LightColumns {
         return match self.slots[k] {
             LightBody.Saved(_, s) => some(s.lowest_source_y(x & 15, z & 15)),
             LightBody.Flat => some(self.flat.sources.lowest_source_y(x & 15, z & 15)),
+            LightBody.Changed(_, s) => some(s.lowest_source_y(x & 15, z & 15)),
         }
     }
 
@@ -143,6 +153,7 @@ impl LightChunks for LightColumns {
         return match self.slots[k] {
             LightBody.Saved(_, s) => some(s.highest_lowest_source_y()),
             LightBody.Flat => some(self.flat.sources.highest_lowest_source_y()),
+            LightBody.Changed(_, s) => some(s.highest_lowest_source_y()),
         }
     }
 
@@ -154,6 +165,7 @@ impl LightChunks for LightColumns {
         return match self.slots[k] {
             LightBody.Saved(c, _) => light_sources(c.value, self.flat.states, chunk_x, chunk_z),
             LightBody.Flat => light_sources(self.flat.chunk, self.flat.states, chunk_x, chunk_z),
+            LightBody.Changed(c, _) => light_sources(c, self.flat.states, chunk_x, chunk_z),
         }
     }
 }
@@ -183,6 +195,9 @@ pub struct LightService {
     sending: OpenHashSet<i64> = OpenHashSet<i64>()
     // How many asks it's taken.
     taken: u64 = 0
+    // What a block set in a chunk's copy here is set with, its heightmaps and its sections'
+    // counts, once the level's given it (D321).
+    table: BlockStates? = none
 }
 
 impl LightService {
@@ -192,6 +207,12 @@ impl LightService {
         var light = Light.new(min_section * 16, sections * 16, sky)
         light.note_changes()
         return LightService { light: light, columns: LightColumns { flat: flat }, min_section: min_section, sections: sections }
+    }
+
+    /// Gives light what its chunks' blocks are set with, so it can be told of a block set
+    /// (D321).
+    pub fn set_table(mut self, table: own BlockStates) {
+        self.table = some(table)
     }
 
     /// How many asks it's taken.
@@ -274,6 +295,7 @@ impl LightService {
                     self.full.remove(k)
                 }
             },
+            LightAsk.Block { k, x, y, z, state } => self.block_set(k, x, y, z, state),
             LightAsk.Watch(k) => {
                 self.watched.insert(k)
                 self.sending.insert(k)
@@ -327,6 +349,29 @@ impl LightService {
         self.columns.slots.insert(k, body)
         self.moved.push(k)
         self.arrived.insert(k)
+    }
+
+    // The block at `x`, `y`, `z` of the chunk at `k` was set to `state` (D321): the chunk's copy
+    // here is set as the level's was, made from what the chunk came as if this is its first block
+    // set, and the engine's told, as `LevelChunk.setBlockState` tells it: the section's status if
+    // it stopped or started being only air, and the sky's sources and a check of the block at the
+    // next run if its light changed, as `block_set` has them.
+    fn block_set(mut self, k: i64, x: i32, y: i32, z: i32, state: u32) {
+        let body = self.columns.slots.remove(k) else return
+        let (c, s) = owned(body, self.columns.flat)
+        var chunk = c
+        var sources = s
+        let pos = unpacked(k)
+        if let t = self.table.take() {
+            if y >= chunk.min_y() and y < chunk.min_y() + i32.wrap(chunk.section_count()) * 16 {
+                let was_empty = chunk.section_only_air(usize.wrap((y - chunk.min_y()) >> 4))
+                if let old = chunk.set_block(t, x & 15, y, z & 15, state) {
+                    self.light.block_set(self.columns.flat.states, chunk, mut sources, pos.x, pos.z, x & 15, y, z & 15, old, state, was_empty)
+                }
+            }
+            self.table = some(t)
+        }
+        self.columns.slots.insert(k, LightBody.Changed(chunk, sources))
     }
 
     // The chunk at `k` went: its light goes too, as `updateChunkStatus` lets it go, for the next
@@ -465,6 +510,7 @@ impl LightService {
         match self.columns.slots[k] {
             LightBody.Saved(c, _) => filled_sections(c.value, self.min_section, mut ys),
             LightBody.Flat => filled_sections(self.columns.flat.chunk, self.min_section, mut ys),
+            LightBody.Changed(c, _) => filled_sections(c, self.min_section, mut ys),
         }
         if not ys.is_empty() {
             self.light.update_column_status(pos.x, pos.z, ys, false)
@@ -481,6 +527,15 @@ impl LightService {
             }
         }
         return true
+    }
+}
+
+// The chunk `body` is, as its own copy, and its sky's sources, to set a block in (D321).
+fn owned(body: own LightBody, flat: FlatChunk) -> (Chunk, SkySources) {
+    return match body {
+        LightBody.Saved(c, s) => (c.value.copy(), s),
+        LightBody.Flat => (flat.chunk.copy(), flat.sources.copy()),
+        LightBody.Changed(c, s) => (c, s),
     }
 }
 
