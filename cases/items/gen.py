@@ -1,11 +1,14 @@
 """Writes cases/items/generated.json: item stacks read as vanilla reads them with
-`ItemStack.CODEC`, from a data pack's JSON, or from SNBT through `NbtOps`, as a save's are, and
-written to NBT, with the vanilla data pack's registries and the items' default components bound,
-as a server has them (CAL-77, D362, D363).
+`ItemStack.CODEC`, from a data pack's JSON, or from SNBT through `NbtOps`, as a save's are, or
+with `ItemStack.OPTIONAL_STREAM_CODEC` from the network, and written to NBT or the network, with
+the vanilla data pack's registries and the items' default components bound, as a server has them
+(CAL-77, D362, D363, D364). The `from-wire` cases are vanilla's own bytes for the `to-wire` ones,
+taken from the goldens once they're recorded, so a new one needs recording twice.
 
     py -I cases/items/gen.py
 """
 
+import base64
 import json
 import sys
 from pathlib import Path
@@ -247,7 +250,90 @@ def cases():
         nbt(f"components-{i}", snbt({"id": item, "components": components}))
     for name, components in packs.BAD_COMPONENTS.items():
         nbt(f"bad-{name}", snbt({"id": "minecraft:paper", "components": components}))
+
+    # Every JSON stack sent over the network with `ItemStack.OPTIONAL_STREAM_CODEC` (D364).
+    for c in list(out):
+        if c["input"]["from"] == "json" and c["input"]["to"] == "nbt":
+            out.append({"id": f"to-wire-{c['id']}", "input": dict(c["input"], to="wire")})
+
+    # Stacks off the network, made by hand: empty ones, air, what doesn't read, and patches that
+    # applying them to the item's defaults changes.
+    def wire(cid, data):
+        blob = base64.b64encode(bytes(data)).decode("ascii")
+        for to in ("nbt", "wire"):
+            out.append({"id": f"wire-{cid}-{to}", "input": {"from": "wire", "to": to}, "blobs": [blob]})
+
+    stone, paper, apple, sword = varint(1), varint(1145), varint(1007), varint(1050)
+    wire("empty", [0])
+    wire("negative", varint(-1))
+    wire("air", [1, 0, 0, 0])
+    wire("air-patch", [1, 0, 1, 0, 1, 5])
+    wire("truncated", [1])
+    wire("truncated-patch", [1] + stone + [1])
+    wire("unknown-item", [1] + varint(99999) + [0, 0])
+    wire("unknown-component", [1] + stone + [1, 0] + varint(9999))
+    wire("left", [1] + stone + [0, 0, 7])
+    wire("plain", [1] + stone + [0, 0])
+    wire("count-64", [64] + stone + [0, 0])
+    wire("count-100", varint(100) + stone + [0, 0])
+    wire("count-big", varint(1000000) + stone + [0, 0])
+    wire("stack-size-zero", [1] + stone + [1, 0, 1, 0])
+    wire("stack-size-same", [1] + paper + [1, 0, 1, 64])
+    wire("stack-size-twice", [1] + stone + [2, 0, 1, 5, 1, 6])
+    wire("removed-absent", [1] + stone + [0, 1, 23])
+    wire("removed-present", [1] + apple + [0, 1, 23])
+    wire("damage-negative", [1] + sword + [1, 0, 3] + varint(-5))
+    wire("name", [1] + stone + [1, 0, 6, 8, 0, 2, 72, 105])
+    wire("name-bad-nbt", [1] + stone + [1, 0, 6, 99])
+    wire("rarity-out-of-range", [1] + paper + [1, 0, 12, 9])
+    wire("rarity-epic", [1] + paper + [1, 0, 12, 3])
+    wire("lore-too-many", [1] + paper + [1, 0, 11] + varint(257))
+
+    # Vanilla's own bytes for each stack above, read back, from the goldens where they've been
+    # recorded, else as the case file had them.
+    out.extend(from_vanilla(out))
     return out
+
+
+def varint(n):
+    n &= 0xFFFFFFFF
+    data = []
+    while True:
+        if n < 0x80:
+            data.append(n)
+            return data
+        data.append((n & 0x7F) | 0x80)
+        n >>= 7
+
+
+def from_vanilla(cases):
+    """The stacks vanilla sends for the `to-wire` cases, read from the network as `from-wire`
+    cases: from the goldens, else kept from the case file as it was."""
+    golden = HERE.parents[1] / "golden" / "26.3" / "items.jsonl"
+    blobs = {}
+    if golden.is_file():
+        for line in golden.read_text(encoding="utf-8").splitlines():
+            record = json.loads(line)
+            if record["id"].startswith("to-wire-") and record.get("blobs"):
+                blobs[record["id"]] = record["blobs"][0]
+    old = {}
+    previous = HERE / "generated.json"
+    if previous.is_file():
+        for c in json.loads(previous.read_text(encoding="utf-8"))["cases"]:
+            if c["id"].startswith("from-wire-"):
+                old[c["id"]] = c
+    derived = []
+    for c in cases:
+        if not c["id"].startswith("to-wire-"):
+            continue
+        name = c["id"][len("to-wire-"):]
+        for to in ("nbt", "wire"):
+            cid = f"from-wire-{name}-{to}"
+            if c["id"] in blobs:
+                derived.append({"id": cid, "input": {"from": "wire", "to": to}, "blobs": [blobs[c["id"]]]})
+            elif cid in old:
+                derived.append(old[cid])
+    return derived
 
 
 def snbt(value):

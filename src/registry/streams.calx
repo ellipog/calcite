@@ -1,0 +1,601 @@
+/// Item components over the network, as each type's `STREAM_CODEC` sends its value, and the
+/// patch and the item stack that hold them, as `DataComponentPatch.STREAM_CODEC` and
+/// `ItemStack.OPTIONAL_STREAM_CODEC` send them (CAL-77, D364). A value is held as the NBT its
+/// codec writes, as `registry.components` reads it: a stream codec writes it from that, and what
+/// one reads becomes it through the codec, which leaves out what its defaults hold.
+module registry.streams
+
+import nbt.tag.{Accounter, Tag}
+import protocol.wire.{DecodeError, Reader, Writer}
+import registry.registries.{Registries}
+import resources.identifier.{Identifier}
+
+/// How a value goes over the network, between the wire and the NBT its codec writes.
+pub enum Stream {
+    /// `ByteBufCodecs.VAR_INT`, an int.
+    VarInt,
+    /// `ByteBufCodecs.INT`, an int in four bytes.
+    Int,
+    /// `ByteBufCodecs.FLOAT`.
+    Float,
+    /// `ByteBufCodecs.BOOL`, a byte 0 or 1 in NBT.
+    Bool,
+    /// `ByteBufCodecs.STRING_UTF8`, at most 32767 UTF-16 units.
+    Utf,
+    /// `Identifier.STREAM_CODEC`: an identifier as a string.
+    Id,
+    /// `Unit.STREAM_CODEC`: nothing, an empty compound in NBT.
+    Unit,
+    /// `ByteBufCodecs.fromCodecWithRegistries`: the NBT itself, as text is sent, and the value
+    /// of a type with no stream codec of its own.
+    Nbt,
+    /// `ByteBufCodecs.idMapper` of an enum, its ID, the place of its name here. An ID out of
+    /// range is the first, as `ByIdMap.OutOfBoundsStrategy.ZERO` reads it.
+    Names(List<String>),
+    /// `ByteBufCodecs.holderRegistry` and `registry`: an entry of the registry, by its network
+    /// ID, its ID in NBT.
+    Registry(String),
+    /// `ByteBufCodecs.list(max)`: a count, then each.
+    ListOf(usize, usize),
+    /// `ByteBufCodecs.optional`: whether there's one, then it. A record's field that isn't there.
+    Optional(usize),
+    /// `StreamCodec.composite`: each field in turn.
+    Record(List<StreamField>),
+    /// `ByteBufCodecs.map`: a count, then each key and its value, a compound in NBT.
+    Map(usize, usize),
+}
+
+/// A record's field: its name in the NBT, its stream, and what's sent where the NBT leaves it
+/// out, its codec's default, or `none` where it must be there or is optional.
+pub struct StreamField {
+    pub name: String
+    pub of: usize
+    pub absent: Tag?
+}
+
+/// The stream codecs, and each component type's, by its whole ID.
+pub struct Streams {
+    all: List<Stream>
+    names: Map<String, usize>
+    types: Map<String, usize>
+}
+
+/// A stack off the network, as `ItemStack.OPTIONAL_STREAM_CODEC` reads one: its item, how many,
+/// and its patch, each type's whole ID with its value as its stream codec reads it, or `none`
+/// where the patch takes it away, in the order they came.
+pub struct WireStack {
+    pub item: String
+    pub count: i32
+    pub patch: List<(String, Tag?)>
+}
+
+/// What a stack read from the network is: empty; a stack; a component type Calcite can't read
+/// the stream of yet; or what vanilla throws, as its `toString` gives it.
+pub enum Decoded {
+    Empty,
+    Stack(WireStack),
+    Missing(String),
+    Bad(String),
+}
+
+fn field(name: str, of: usize) -> StreamField {
+    return StreamField { name: String(name), of: of, absent: none }
+}
+
+fn def(name: str, of: usize, absent: own Tag) -> StreamField {
+    return StreamField { name: String(name), of: of, absent: some(absent) }
+}
+
+impl Streams {
+    /// Every component type's stream codec Calcite has.
+    pub fn new() -> Streams {
+        var s = Streams { all: List<Stream>(), names: Map<String, usize>(), types: Map<String, usize>() }
+        s.build()
+        return s
+    }
+
+    fn add(mut self, stream: own Stream) -> usize {
+        self.all.push(stream)
+        return self.all.len() - 1
+    }
+
+    // One stream of each kind that holds nothing else, shared.
+    fn shared(mut self, name: str, stream: own Stream) -> usize {
+        if let at = self.names.get(String(name)) {
+            return at
+        }
+        let at = self.add(stream)
+        self.names.insert(String(name), at)
+        return at
+    }
+
+    fn list(mut self, of: usize, max: usize) -> usize {
+        return self.add(Stream.ListOf(of, max))
+    }
+
+    fn optional(mut self, of: usize) -> usize {
+        return self.add(Stream.Optional(of))
+    }
+
+    fn registry(mut self, name: str) -> usize {
+        return self.add(Stream.Registry(String(name)))
+    }
+
+    fn set(mut self, name: str, at: usize) {
+        self.types.insert("minecraft:{name}", at)
+    }
+
+    fn build(mut self) {
+        let var_int = self.shared("var int", Stream.VarInt)
+        let int = self.shared("int", Stream.Int)
+        let float = self.shared("float", Stream.Float)
+        let flag = self.shared("bool", Stream.Bool)
+        let utf = self.shared("utf", Stream.Utf)
+        let id = self.shared("id", Stream.Id)
+        let unit = self.shared("unit", Stream.Unit)
+        let nbt = self.shared("nbt", Stream.Nbt)
+        let max = 2147483647usize
+        let dye = self.add(Stream.Names([
+            String("white"), String("orange"), String("magenta"), String("light_blue"), String("yellow"), String("lime"),
+            String("pink"), String("gray"), String("light_gray"), String("cyan"), String("purple"), String("blue"),
+            String("brown"), String("green"), String("red"), String("black"),
+        ]))
+        let enchantment = self.registry("minecraft:enchantment")
+        let enchantments = self.add(Stream.Map(enchantment, var_int))
+        for name in ["max_stack_size", "max_damage", "damage", "repair_cost", "map_id", "ominous_bottle_amplifier"] {
+            self.set(name, var_int)
+        }
+        for name in ["unbreakable", "glider", "waxed"] {
+            self.set(name, unit)
+        }
+        // The types with no stream codec of their own send their codec's NBT, as text does, and
+        // `bucket_entity_data`'s `COMPOUND_TAG` is NBT too.
+        for name in [
+            "custom_data", "custom_name", "item_name", "intangible_projectile", "map_decorations", "debug_stick_state",
+            "recipes", "lock", "container_loot", "bucket_entity_data",
+        ] {
+            self.set(name, nbt)
+        }
+        for name in ["minimum_attack_charge", "potion_duration_scale"] {
+            self.set(name, float)
+        }
+        for name in ["item_model", "tooltip_style", "note_block_sound"] {
+            self.set(name, id)
+        }
+        let lore = self.list(nbt, 256)
+        self.set("lore", lore)
+        let rarity = self.add(Stream.Names([String("common"), String("uncommon"), String("rare"), String("epic")]))
+        self.set("rarity", rarity)
+        for name in [
+            "dye", "base_color", "wolf/collar", "tropical_fish/base_color", "tropical_fish/pattern_color", "cat/collar",
+            "sheep/color", "shulker/color", "cushion/color",
+        ] {
+            self.set(name, dye)
+        }
+        self.set("enchantments", enchantments)
+        self.set("stored_enchantments", enchantments)
+        self.set("dyed_color", int)
+        self.set("enchantment_glint_override", flag)
+        let enchantable_fields: List<StreamField> = [field("value", var_int)]
+        let enchantable = self.add(Stream.Record(enchantable_fields))
+        self.set("enchantable", enchantable)
+        let villager_food_fields: List<StreamField> = [field("nutrition", var_int)]
+        let villager_food = self.add(Stream.Record(villager_food_fields))
+        self.set("villager_food", villager_food)
+        let food_fields: List<StreamField> = [field("nutrition", var_int), field("saturation", float), def("can_always_eat", flag, Tag.Byte(0i8))]
+        let food = self.add(Stream.Record(food_fields))
+        self.set("food", food)
+        let floats = self.list(float, max)
+        let flags = self.list(flag, max)
+        let strings = self.list(utf, max)
+        let colors = self.list(int, max)
+        let model_fields: List<StreamField> = [
+            def("floats", floats, Tag.List(List<Tag>())),
+            def("flags", flags, Tag.List(List<Tag>())),
+            def("strings", strings, Tag.List(List<Tag>())),
+            def("colors", colors, Tag.List(List<Tag>())),
+        ]
+        let model = self.add(Stream.Record(model_fields))
+        self.set("custom_model_data", model)
+        let weapon_fields: List<StreamField> = [def("item_damage_per_attack", var_int, Tag.Int(1)), def("disable_blocking_for_seconds", float, Tag.Float(0.0f32))]
+        let weapon = self.add(Stream.Record(weapon_fields))
+        self.set("weapon", weapon)
+        let effects_fields: List<StreamField> = [
+            def("can_sprint", flag, Tag.Byte(0i8)),
+            def("interact_vibrations", flag, Tag.Byte(1i8)),
+            def("speed_multiplier", float, Tag.Float(0.2f32)),
+        ]
+        let effects = self.add(Stream.Record(effects_fields))
+        self.set("use_effects", effects)
+        let group = self.optional(id)
+        let cooldown_fields: List<StreamField> = [field("seconds", float), field("cooldown_group", group)]
+        let cooldown = self.add(Stream.Record(cooldown_fields))
+        self.set("use_cooldown", cooldown)
+        let range_fields: List<StreamField> = [
+            def("min_reach", float, Tag.Float(0.0f32)),
+            def("max_reach", float, Tag.Float(3.0f32)),
+            def("min_creative_reach", float, Tag.Float(0.0f32)),
+            def("max_creative_reach", float, Tag.Float(5.0f32)),
+            def("hitbox_margin", float, Tag.Float(0.3f32)),
+            def("mob_factor", float, Tag.Float(1.0f32)),
+        ]
+        let range = self.add(Stream.Record(range_fields))
+        self.set("attack_range", range)
+        // The entries of a registry, by their network ID.
+        let holders: List<(str, str)> = [
+            ("damage_type", "minecraft:damage_type"), ("block_transformer", "minecraft:block_transformer"),
+            ("villager/variant", "minecraft:villager_type"), ("wolf/variant", "minecraft:wolf_variant"),
+            ("wolf/sound_variant", "minecraft:wolf_sound_variant"), ("pig/variant", "minecraft:pig_variant"),
+            ("pig/sound_variant", "minecraft:pig_sound_variant"), ("cow/variant", "minecraft:cow_variant"),
+            ("cow/sound_variant", "minecraft:cow_sound_variant"), ("chicken/variant", "minecraft:chicken_variant"),
+            ("chicken/sound_variant", "minecraft:chicken_sound_variant"),
+            ("zombie_nautilus/variant", "minecraft:zombie_nautilus_variant"), ("frog/variant", "minecraft:frog_variant"),
+            ("cat/variant", "minecraft:cat_variant"), ("cat/sound_variant", "minecraft:cat_sound_variant"),
+            ("provides_pottery_pattern", "minecraft:decorated_pot_pattern"),
+        ]
+        for (name, registry) in holders {
+            let at = self.registry(registry)
+            self.set(name, at)
+        }
+    }
+
+    /// Whether Calcite has the stream codec of the component type `name`, its whole ID.
+    pub fn has(self, name: String) -> bool {
+        return self.types.contains(name)
+    }
+
+    /// Writes `value`, the NBT its codec writes, with the stream at `at`. What can't be written
+    /// is refused, as vanilla's encoder throws.
+    pub fn write(self, at: usize, value: Tag, r: Registries, w: mut Writer) {
+        match self.all[at] {
+            Stream.VarInt => w.varint(value.int_value() ?? 0),
+            Stream.Int => w.i32(value.int_value() ?? 0),
+            Stream.Float => w.f32(value.number_float() ?? 0.0f32),
+            Stream.Bool => w.bool((value.byte_value() ?? 0) != 0),
+            Stream.Utf => w.string(text_of(value), 32767),
+            Stream.Id => w.string(text_of(value), 32767),
+            Stream.Unit => {},
+            Stream.Nbt => w.nbt(value),
+            Stream.Names(names) => {
+                let name = text_of(value)
+                for i in 0..names.len() {
+                    if names[i] == name {
+                        w.varint(i32.wrap(i))
+                        return
+                    }
+                }
+                w.refuse("no ID for {name}")
+            },
+            Stream.Registry(registry) => {
+                let name = text_of(value)
+                match network_id(r, registry, name) {
+                    some(id) => w.varint(id),
+                    none => w.refuse("Can't find id for '{name}' in registry {registry}"),
+                }
+            },
+            Stream.ListOf(of, max) => {
+                let items = match value {
+                    Tag.List(items) => items.copy(),
+                    _ => List<Tag>(),
+                }
+                w.count_at_most(items.len(), max)
+                for item in items {
+                    self.write(of, item, r, mut w)
+                }
+            },
+            Stream.Optional(of) => {
+                w.bool(true)
+                self.write(of, value, r, mut w)
+            },
+            Stream.Record(fields) => {
+                let m = match value {
+                    Tag.Compound(m) => m.copy(),
+                    _ => JavaHashMap<String, Tag>(),
+                }
+                for f in fields {
+                    if m.contains(f.name.copy()) {
+                        self.write(f.of, m[f.name.copy()], r, mut w)
+                    } else if let d = f.absent {
+                        self.write(f.of, d, r, mut w)
+                    } else {
+                        match self.all[f.of] {
+                            Stream.Optional(_) => w.bool(false),
+                            _ => w.refuse("a record with no `{f.name}`"),
+                        }
+                    }
+                }
+            },
+            Stream.Map(key, of) => {
+                let m = match value {
+                    Tag.Compound(m) => m.copy(),
+                    _ => JavaHashMap<String, Tag>(),
+                }
+                w.count(m.len())
+                for (k, v) in m {
+                    self.write(key, Tag.Str(k.copy()), r, mut w)
+                    self.write(of, v, r, mut w)
+                }
+            },
+        }
+    }
+
+    /// Reads a value with the stream at `at`, as NBT its codec can read: a record's fields with
+    /// their names, an optional field that isn't there left out.
+    pub fn read(self, at: usize, rd: mut Reader, r: Registries) -> Tag ! DecodeError {
+        match self.all[at] {
+            Stream.VarInt => return Tag.Int(try rd.varint()),
+            Stream.Int => return Tag.Int(try rd.i32()),
+            Stream.Float => return Tag.float(try rd.f32()),
+            Stream.Bool => return Tag.Byte(if try rd.bool() { 1i8 } else { 0i8 }),
+            Stream.Utf => return Tag.Str(try rd.string(32767)),
+            Stream.Id => {
+                let s = try rd.string(32767)
+                return match Identifier.parse(s.copy()) {
+                    ok(id) => Tag.Str(id.to_string()),
+                    err(e) => {
+                        fail DecodeError { message: "net.minecraft.IdentifierException: Non [a-z0-9_.-] character in namespace of location: {s} {e}" }
+                    },
+                }
+            },
+            Stream.Unit => return Tag.Compound(JavaHashMap<String, Tag>()),
+            Stream.Nbt => return try rd.nbt(Accounter.with_quota(2097152)),
+            Stream.Names(names) => {
+                let i = try rd.varint()
+                if i < 0 or usize.wrap(i) >= names.len() {
+                    return Tag.Str(names[0].copy())
+                }
+                return Tag.Str(names[usize.wrap(i)].copy())
+            },
+            Stream.Registry(registry) => {
+                let id = try rd.varint()
+                let name = entry_of(r, registry, id) else {
+                    fail DecodeError { message: "java.lang.IllegalArgumentException: No value with id {id}" }
+                }
+                return Tag.Str(name)
+            },
+            Stream.ListOf(of, max) => {
+                let n = try rd.count(max)
+                var items = List<Tag>()
+                for _ in 0..n {
+                    items.push(try self.read(of, mut rd, r))
+                }
+                return Tag.List(items)
+            },
+            Stream.Optional(of) => {
+                if not try rd.bool() {
+                    return Tag.End
+                }
+                return try self.read(of, mut rd, r)
+            },
+            Stream.Record(fields) => {
+                var m = JavaHashMap<String, Tag>()
+                for f in fields {
+                    let v = try self.read(f.of, mut rd, r)
+                    if v != Tag.End {
+                        m.insert(f.name.copy(), v)
+                    }
+                }
+                return Tag.Compound(m)
+            },
+            Stream.Map(key, of) => {
+                let n = try rd.count(2147483647)
+                var m = JavaHashMap<String, Tag>()
+                for _ in 0..n {
+                    let k = text_of(try self.read(key, mut rd, r))
+                    let v = try self.read(of, mut rd, r)
+                    m.insert(k, v)
+                }
+                return Tag.Compound(m)
+            },
+        }
+    }
+
+    /// Writes the patch `components`, each a component's whole ID, or `!` and the ID of one taken
+    /// away, with its value as its codec writes it, in the patch's order, as
+    /// `DataComponentPatch.STREAM_CODEC` writes it: how many it sets and takes away, each it
+    /// sets by its type's network ID and its value, then each it takes away.
+    pub fn write_patch(self, components: List<(String, Tag)>, r: Registries, w: mut Writer) {
+        var added: i32 = 0
+        var removed: i32 = 0
+        for (k, _) in components {
+            if k.starts_with("!") {
+                removed += 1
+            } else {
+                added += 1
+            }
+        }
+        w.varint(added)
+        w.varint(removed)
+        for (k, v) in components {
+            if k.starts_with("!") {
+                continue
+            }
+            let id = network_id(r, String("minecraft:data_component_type"), k) else {
+                w.refuse("no component type {k}")
+                return
+            }
+            w.varint(id)
+            let at = self.types.get(k.copy()) else {
+                w.refuse("Calcite sends the component {k} not yet")
+                return
+            }
+            self.write(at, v, r, mut w)
+        }
+        for (k, _) in components {
+            if not k.starts_with("!") {
+                continue
+            }
+            let name = k[1..].copy()
+            let id = network_id(r, String("minecraft:data_component_type"), name) else {
+                w.refuse("no component type {name}")
+                return
+            }
+            w.varint(id)
+        }
+    }
+
+    /// Writes the stack `stack`, as `ItemStack.CODEC` writes it to NBT, or `none` for an empty
+    /// one, with its components in the order `order` gives them, as
+    /// `ItemStack.OPTIONAL_STREAM_CODEC` writes it: its count, 0 for an empty one, its item by
+    /// its network ID, and its patch.
+    pub fn write_stack(self, stack: Tag?, order: List<String>, r: Registries, w: mut Writer) {
+        let m = match stack {
+            some(Tag.Compound(m)) => m.copy(),
+            _ => {
+                w.varint(0)
+                return
+            },
+        }
+        let count = if m.contains(String("count")) { m[String("count")].int_value() ?? 1 } else { 1 }
+        let item = text_of(if m.contains(String("id")) { m[String("id")].copy() } else { Tag.End })
+        var components = List<(String, Tag)>()
+        if m.contains(String("components")) {
+            match m[String("components")] {
+                Tag.Compound(patch) => {
+                    for k in order {
+                        if patch.contains(k.copy()) {
+                            components.push((k.copy(), patch[k.copy()].copy()))
+                        }
+                    }
+                },
+                _ => {},
+            }
+        }
+        self.write_parts(item, count, components, r, mut w)
+    }
+
+    /// Writes a stack of `count` of `item`, a whole ID, with the patch `components`, as
+    /// `write_patch` takes one: 0 for an empty one, which air or no items is.
+    pub fn write_parts(self, item: String, count: i32, components: List<(String, Tag)>, r: Registries, w: mut Writer) {
+        if count <= 0 or item == "minecraft:air" {
+            w.varint(0)
+            return
+        }
+        w.varint(count)
+        match network_id(r, String("minecraft:item"), item.copy()) {
+            some(id) => w.varint(id),
+            none => {
+                w.refuse("no item {item}")
+                return
+            },
+        }
+        self.write_patch(components, r, mut w)
+    }
+
+    /// The component types of the patch `components`, each a whole ID or `!` and one, whose
+    /// stream codec Calcite doesn't have yet.
+    pub fn missing(self, components: List<String>) -> List<String> {
+        var out = List<String>()
+        for k in components {
+            if not k.starts_with("!") and not self.types.contains(k.copy()) {
+                out.push(k.copy())
+            }
+        }
+        return out
+    }
+
+    /// Reads a stack as `ItemStack.OPTIONAL_STREAM_CODEC` does: its count, and if it's more
+    /// than 0, its item and its patch, each type it sets with its value, then each it takes
+    /// away. A type or an entry that isn't there throws as `IdMap.byIdOrThrow` does.
+    pub fn read_stack(self, rd: mut Reader, r: Registries) -> Decoded {
+        let count = match rd.varint() {
+            ok(n) => n,
+            err(e) => return Decoded.Bad(e.message),
+        }
+        if count <= 0 {
+            return Decoded.Empty
+        }
+        let item_id = match rd.varint() {
+            ok(n) => n,
+            err(e) => return Decoded.Bad(e.message),
+        }
+        let item = entry_of(r, String("minecraft:item"), item_id) else {
+            return Decoded.Bad("java.lang.IllegalArgumentException: No value with id {item_id}")
+        }
+        let added = match rd.varint() {
+            ok(n) => n,
+            err(e) => return Decoded.Bad(e.message),
+        }
+        let removed = match rd.varint() {
+            ok(n) => n,
+            err(e) => return Decoded.Bad(e.message),
+        }
+        var components = List<(String, Tag?)>()
+        if added < 0 or removed < 0 {
+            return Decoded.Bad(String("a patch of fewer than no components"))
+        }
+        for _ in 0..added {
+            let type_id = match rd.varint() {
+                ok(n) => n,
+                err(e) => return Decoded.Bad(e.message),
+            }
+            let name = entry_of(r, String("minecraft:data_component_type"), type_id) else {
+                return Decoded.Bad("java.lang.IllegalArgumentException: No value with id {type_id}")
+            }
+            let at = self.types.get(name.copy()) else return Decoded.Missing(name)
+            match self.read(at, mut rd, r) {
+                ok(v) => components.push((name, some(v))),
+                err(e) => return Decoded.Bad(e.message),
+            }
+        }
+        for _ in 0..removed {
+            let type_id = match rd.varint() {
+                ok(n) => n,
+                err(e) => return Decoded.Bad(e.message),
+            }
+            let name = entry_of(r, String("minecraft:data_component_type"), type_id) else {
+                return Decoded.Bad("java.lang.IllegalArgumentException: No value with id {type_id}")
+            }
+            components.push((name, none))
+        }
+        // Air in any number is an empty stack, once its patch is read.
+        if item == "minecraft:air" {
+            return Decoded.Empty
+        }
+        return Decoded.Stack(WireStack { item: item, count: count, patch: components })
+    }
+}
+
+// A string tag's text, or nothing.
+fn text_of(value: Tag) -> String {
+    return match value {
+        Tag.Str(s) => s.copy(),
+        _ => String(),
+    }
+}
+
+/// The network ID of `entry` in the registry `registry`, both whole IDs: its ID in the
+/// synchronized registry, as clients are sent it, or in the built-in one.
+pub fn network_id(r: Registries, registry: String, entry: String) -> i32? {
+    let id = match Identifier.parse(entry) {
+        ok(id) => id,
+        err(_) => return none,
+    }
+    if let s = r.find(registry.copy()) {
+        return r.synced[s].id(id)
+    }
+    if let b = r.find_builtin(registry) {
+        return r.builtin[b].id(id)
+    }
+    return none
+}
+
+/// The entry with the network ID `id` in the registry `registry`, its whole ID, or `none`.
+pub fn entry_of(r: Registries, registry: String, id: i32) -> String? {
+    if id < 0 {
+        return none
+    }
+    let i = usize.wrap(id)
+    if let s = r.find(registry.copy()) {
+        if i < r.synced[s].entries.len() {
+            return some(r.synced[s].entries[i].to_string())
+        }
+        return none
+    }
+    if let b = r.find_builtin(registry) {
+        if i < r.builtin[b].entries.len() {
+            return some(r.builtin[b].entries[i].to_string())
+        }
+    }
+    return none
+}
