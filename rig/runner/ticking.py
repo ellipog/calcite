@@ -59,11 +59,12 @@ def base(name):
     return name.split("[")[0]
 
 
-# What waits on something not in Calcite yet, each by vanilla's block and Calcite's. Since the
+# What waits on something not in Calcite yet, or comes of the levels' draws, which part from
+# vanilla's here, with no tape to seed them again, each by vanilla's block and Calcite's. Since the
 # blocks set after a chunk is sent count, some come of how long each server ran.
 KNOWN = [
-    ("precipitation's snow, and the grass under it (CAL-106)",
-     lambda v, c: (base(v) == "snow" and c == "air") or (v == "grass_block[snowy=true]" and c == "grass_block[snowy=false]")),
+    ("precipitation's snow, laid where each server's own draws put it, and the grass under it (D340)",
+     lambda v, c: {base(v), base(c)} == {"snow", "air"} or {v, c} == {"grass_block[snowy=true]", "grass_block[snowy=false]"}),
     ("random ticks, whose draws part from vanilla's while Calcite has few blocks' (CAL-106)",
      lambda v, c: {base(v), base(c)} == {"grass_block", "dirt"}),
     ("falling blocks, which come down as entities",
