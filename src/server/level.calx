@@ -58,7 +58,7 @@ import server.chunks.{Chunks, Next}
 import server.light_service.{LIGHT_ASKS, LightAsk, LightBody, LightDone, LightService, LightThread}
 import server.log.{Entry}
 import server.pregen.{Holds}
-import storage.chunk.{RestStore}
+import storage.chunk.{RestStore, SavedTick}
 import storage.regions.{ChunkRead, region_of}
 import world.chunk.{AIR_STATE, BlockStates, Chunk, MOTION_BLOCKING}
 import world.collision.{CollisionBlocks, CollisionStates}
@@ -70,6 +70,7 @@ import world.natural.{SpawnLevel}
 import world.pos.{BlockPos, ChunkPos}
 import world.spawn.{respawn_pos, standing_y}
 import world.tickets.{FULL_LEVEL, Holders, Ticket, TicketStorage, TicketType}
+import world.ticks.{ChunkTicks, LevelTicks, ScheduledTick}
 import worldgen.biome_manager.{corner}
 import worldgen.generator.{GenSetup, setup_data}
 import worldgen.scheduler.{Generator}
@@ -92,6 +93,9 @@ const TICKING: i32 = 32
 // The level at and below which a holder of a world that reads loads its chunk, for light, that
 // of `initialize_light`.
 const LIGHT_BORDER: i32 = 34
+// The most block or fluid ticks a level runs in a tick, as `ServerLevel.tick` has its
+// `LevelTicks` run.
+const MOST_TICKS: usize = 65536
 
 // A chunk the world has, or is reading.
 enum Body {
@@ -339,6 +343,18 @@ pub struct Level {
     table: BlockStates? = none
     to_broadcast: LinkedSet<i64> = LinkedSet<i64>()
     changed_blocks: OpenHashMap<i64, OpenHashSet<i16>> = OpenHashMap<i64, OpenHashSet<i16>>()
+    // Each full chunk's scheduled block and fluid ticks, from when it's full until it unloads, as
+    // `registerTickContainerInLevel` adds them, with those it was saved with scheduled once it
+    // ticks, as `startTickingChunk` schedules them (D322); the chunks that may have come to be
+    // full or to tick since `check_ticks` last looked, each whose holder's level changed and those
+    // around each that came to be loaded; and `subTickCount`, how many ticks have been
+    // scheduled, which orders those due together.
+    block_ticks: LevelTicks = LevelTicks()
+    fluid_ticks: LevelTicks = LevelTicks()
+    ticks_to_check: LinkedSet<i64> = LinkedSet<i64>()
+    sub_ticks: i64 = 0
+    /// The game time, which the level's ticks are scheduled and saved by, as the network has it.
+    pub game_time: i64 = 0
 }
 
 /// The blocks set in a section since they were last broadcast, as `ChunkHolder.broadcastChanges`
@@ -796,6 +812,55 @@ impl Level {
         return out
     }
 
+    /// Schedules a tick of the block `kind` at `x`, `y`, `z`, due in `delay` ticks with
+    /// `priority`, as `scheduleTick` does: dropped if its chunk isn't full, or if the block has
+    /// one of its kind already (D322).
+    pub fn schedule_block_tick(mut self, kind: u32, x: i32, y: i32, z: i32, delay: i32, priority: i32) {
+        let tick = self.new_tick(kind, x, y, z, delay, priority)
+        _ = self.block_ticks.schedule(tick)
+    }
+
+    /// Schedules a tick of the fluid `kind` at `x`, `y`, `z`, as `schedule_block_tick` does a
+    /// block's.
+    pub fn schedule_fluid_tick(mut self, kind: u32, x: i32, y: i32, z: i32, delay: i32, priority: i32) {
+        let tick = self.new_tick(kind, x, y, z, delay, priority)
+        _ = self.fluid_ticks.schedule(tick)
+    }
+
+    /// Whether the block at `x`, `y`, `z` has a tick of the block `kind` scheduled,
+    /// `hasScheduledTick`.
+    pub fn has_block_tick(self, kind: u32, x: i32, y: i32, z: i32) -> bool {
+        return self.block_ticks.has(kind, x, y, z)
+    }
+
+    /// Whether the block at `x`, `y`, `z` has a tick of the fluid `kind` scheduled.
+    pub fn has_fluid_tick(self, kind: u32, x: i32, y: i32, z: i32) -> bool {
+        return self.fluid_ticks.has(kind, x, y, z)
+    }
+
+    /// The block ticks due now, in the order they're to run, as `blockTicks.tick` takes them
+    /// (D322), from the chunks `tickCheck` says tick: in range for their blocks to tick, and
+    /// ticking. Vanilla's check asks too whether the chunk's entities are loaded, which a chunk's
+    /// are once it's full here.
+    pub fn take_block_ticks(mut self) -> List<ScheduledTick> {
+        self.check_ticks()
+        let ticking = self.ticking_of(self.block_ticks.due(self.game_time))
+        return self.block_ticks.collect(self.game_time, MOST_TICKS, ticking)
+    }
+
+    /// The fluid ticks due now, as `take_block_ticks` takes the blocks'.
+    pub fn take_fluid_ticks(mut self) -> List<ScheduledTick> {
+        self.check_ticks()
+        let ticking = self.ticking_of(self.fluid_ticks.due(self.game_time))
+        return self.fluid_ticks.collect(self.game_time, MOST_TICKS, ticking)
+    }
+
+    /// How many block and fluid ticks the level has, scheduled and saved, as `LevelTicks.count`
+    /// counts them.
+    pub fn tick_count(self) -> (usize, usize) {
+        return (self.block_ticks.count(), self.fluid_ticks.count())
+    }
+
     /// Gives the level the tickets its dimension's `chunk_tickets` saved, all deactivated, as
     /// `TicketStorage.fromPacked` keeps them, until `activate_saved_tickets` (D319).
     pub fn load_tickets(mut self, saved: own TicketStorage) {
@@ -913,6 +978,7 @@ impl Level {
                 any = true
             }
             if not any {
+                self.check_ticks()
                 self.flush_light()
                 return
             }
@@ -1104,9 +1170,10 @@ impl Level {
             keys.push(k)
         }
         for k in keys {
+            let ticks = self.ticks_now(k)
             if let gone = self.columns.take(k) {
                 _ = self.came_at.remove(k)
-                if let whole = self.to_save(k, gone) {
+                if let whole = self.to_save(k, gone, ticks) {
                     self.save_lit(k, whole, false)
                 }
             }
@@ -1344,6 +1411,7 @@ impl Level {
     // or stopped being, as one that's full may be lit; and one whose entities are to tick waits
     // for the chunks around it.
     fn changed(mut self, k: i64) {
+        self.ticks_to_check.insert(k)
         let level = self.dm.chunk_level(k, false)
         let reach = if self.opened { LIGHT_BORDER } else { FULL }
         if level <= reach and not self.columns.slots.contains(k) {
@@ -1380,13 +1448,88 @@ impl Level {
         }
     }
 
+    // `createTick`: a tick of `kind` at `x`, `y`, `z`, due in `delay` ticks with `priority`,
+    // the next in the level's count of them.
+    fn new_tick(mut self, kind: u32, x: i32, y: i32, z: i32, delay: i32, priority: i32) -> ScheduledTick {
+        let sub = self.sub_ticks
+        self.sub_ticks += 1
+        return ScheduledTick { kind: kind, x: x, y: y, z: z, trigger: self.game_time + i64(delay), priority: priority, sub: sub }
+    }
+
+    // The chunks of `chunks` whose ticks run, as `isPositionTickingWithEntitiesLoaded` has it.
+    fn ticking_of(self, chunks: List<i64>) -> OpenHashSet<i64> {
+        var out = OpenHashSet<i64>()
+        for k in chunks {
+            if self.dm.in_block_ticking_range(k) and self.sendable(unpacked(k)) {
+                out.insert(k)
+            }
+        }
+        return out
+    }
+
+    // Looks at each chunk that may have come to be full or to tick, in the order it was noted:
+    // one that's full gets its ticks, those it was saved with, as `registerTickContainerInLevel`
+    // adds them, and one that ticks schedules those, as `startTickingChunk` does, from the game
+    // time now (D322).
+    fn check_ticks(mut self) {
+        if self.ticks_to_check.is_empty() {
+            return
+        }
+        var keys = List<i64>()
+        for k in self.ticks_to_check {
+            keys.push(k)
+        }
+        self.ticks_to_check.clear()
+        for k in keys {
+            let pos = unpacked(k)
+            if not self.block_ticks.has_container(k) {
+                if not self.full(pos) {
+                    continue
+                }
+                var block = List<SavedTick>()
+                var fluid = List<SavedTick>()
+                if let saved = self.columns.rests.ticks(k) {
+                    let (b, f) = saved
+                    block = b
+                    fluid = f
+                }
+                self.block_ticks.add_container(k, ChunkTicks.saved(block))
+                self.fluid_ticks.add_container(k, ChunkTicks.saved(fluid))
+            }
+            if self.sendable(pos) {
+                self.block_ticks.unpack(k, self.game_time)
+                self.fluid_ticks.unpack(k, self.game_time)
+            }
+        }
+    }
+
+    // Takes out the chunk at `k`'s ticks as it unloads, as `unregisterTickContainerFromLevel`
+    // does, packed as they're saved now, if it was full.
+    fn drop_ticks(mut self, k: i64) -> (List<SavedTick>, List<SavedTick>)? {
+        let block = self.block_ticks.remove_container(k) else return none
+        let fluid = self.fluid_ticks.remove_container(k) ?? ChunkTicks.new()
+        return some((block.pack(self.game_time), fluid.pack(self.game_time)))
+    }
+
+    // The chunk at `k`'s ticks as they're saved now, if it's full.
+    fn ticks_now(self, k: i64) -> (List<SavedTick>, List<SavedTick>)? {
+        let block = self.block_ticks.pack(k, self.game_time) else return none
+        let fluid = self.fluid_ticks.pack(k, self.game_time) ?? List<SavedTick>()
+        return some((block, fluid))
+    }
+
     // The chunk at `k` came to be loaded, as `loaded` has it: each chunk waiting in the 5×5
     // around it may be ready now (D252).
     fn came_loaded(mut self, k: i64) {
+        let pos = unpacked(k)
+        for x in pos.x - 1..pos.x + 2 {
+            for z in pos.z - 1..pos.z + 2 {
+                self.ticks_to_check.insert(ChunkPos { x: x, z: z }.pack())
+            }
+        }
         if self.waiting.is_empty() {
             return
         }
-        let pos = unpacked(k)
         for x in pos.x - 2..pos.x + 3 {
             for z in pos.z - 2..pos.z + 3 {
                 let w = ChunkPos { x: x, z: z }.pack()
@@ -1408,6 +1551,7 @@ impl Level {
     // hasn't begun to (D243).
     fn unloaded(mut self, k: i64) {
         self.stop_waiting(k)
+        let ticks = self.drop_ticks(k)
         self.reading.unlit.remove(k)
         if self.opened {
             self.tell_full(k, false)
@@ -1422,16 +1566,17 @@ impl Level {
         if let gone = self.columns.take(k) {
             self.stale(k)
             if self.opened {
-                let save = self.to_save(k, gone)
+                let save = self.to_save(k, gone, ticks)
                 self.forget_light(k, save)
             }
         }
     }
 
-    // The chunk at `k` unloads, or the server stops, as `gone`: if it isn't saved as it is, made by
-    // the generator since, or lit, or its light changed, and it's held whole, it's to be saved,
-    // with its light if it's lit, as vanilla saves an unsaved chunk (D258).
-    fn to_save(mut self, k: i64, gone: own Body) -> Whole? {
+    // The chunk at `k` unloads, or the server stops, as `gone`, with `ticks`, its block and fluid
+    // ticks as they're saved now if it was full: if it isn't saved as it is, made by the generator
+    // since, or lit, or its light changed, and it's held whole, it's to be saved, with its light if
+    // it's lit, as vanilla saves an unsaved chunk (D258), and with those ticks (D322).
+    fn to_save(mut self, k: i64, gone: own Body, ticks: own (List<SavedTick>, List<SavedTick>)?) -> Whole? {
         if not self.unsaved.contains(k) {
             return none
         }
@@ -1444,6 +1589,10 @@ impl Level {
                 let SavedChunk { chunk: chunk, whole: whole, rest: rest, .. } = s
                 if whole {
                     let r = rest else return none
+                    if let t = ticks {
+                        let (block, fluid) = t
+                        return some(Whole { chunk: chunk, rest: r.with_ticks(block, fluid) })
+                    }
                     return some(Whole { chunk: chunk, rest: r })
                 }
             },

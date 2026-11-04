@@ -488,6 +488,28 @@ The result is one blob. As a listener is told of a chunk, the blob gets a byte 1
 
 `ChunkLevel.MAX_LEVEL` must be 44, for which the cases are written; the vanilla adapter checks it. Blobs, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, a chunk that isn't a decimal `long`, a coordinate, level or radius that isn't an `int`, a type that isn't one, and SNBT that isn't a compound are an `error` status.
 
+### `ticks` (v1)
+
+A level's scheduled ticks, in vanilla's own `LevelTicks` and `LevelChunkTicks`, through a list of operations, with the ticks each `tick` runs in the order it runs them (D322).
+
+Input `{"ops": [...]}`, with no blobs. What's ticked is a kind, 0 to 127, each the boxed `Integer` Java keeps for that number, so two ticks of one kind are of the same thing, as two of a block are. A game time, a trigger and an order are `long`s, as decimal strings. A priority is `TickPriority`'s value, -3 to 3, as `byValue` takes it, so one past either end is that end. A saved tick is `[kind, x, y, z, delay, priority]`. The level's `tickCheck` says a chunk ticks if the last `tick` gave it.
+
+The result is one blob, of what each operation gives, in order. A tick is its kind, `x`, `y` and `z` as `int`s.
+
+| Operation | Result |
+| --- | --- |
+| `["add", x, z, saved]` | nothing: `addContainer` with a new `LevelChunkTicks`, of the saved ticks given, or with none for `null`. The chunk isn't one the level has |
+| `["remove", x, z]` | nothing: `removeContainer` |
+| `["schedule", kind, x, y, z, trigger, priority, order]` | nothing: `schedule`, with a new `ScheduledTick` |
+| `["unpack", x, z, time]` | nothing: the chunk's `unpack`, of its blocks' or fluids' ticks as `LevelChunk.unpackTicks` calls it |
+| `["pack", x, z, time]` | the chunk's `pack`: an `int` count, then each saved tick as six `int`s, its kind, `x`, `y`, `z`, delay and priority |
+| `["has", kind, x, y, z]` | a byte, 1 if `hasScheduledTick` |
+| `["count"]` | `count`, an `int` |
+| `["tick", time, max, [[x, z], ...]]` | the chunks given tick, then `tick(time, max, ...)`: an `int` count, then each tick it runs, in order |
+| `["dump"]` | `nextTickForContainer`, in its table's order: an `int` count, then each chunk and time as `long`s; then each chunk with ticks, in the order they were added: its chunk as a `long`, its queue in its array's order, an `int` count and each tick as its kind, `x`, `y` and `z` as `int`s, its trigger as a `long`, its priority as an `int` and its order as a `long`, then its `count` as an `int` |
+
+Blobs, an operation that isn't a non-empty array named by a string, one it doesn't have or with the wrong count of arguments, a kind out of range, a number that isn't an `int` or a decimal `long` where one's wanted, and `unpack` or `pack` of a chunk without ticks are an `error` status.
+
 ### `levels` (v1)
 
 The graph every chunk tracker is, vanilla's own `ChunkTracker`, through a list of operations, with each level it sets written as it's set.

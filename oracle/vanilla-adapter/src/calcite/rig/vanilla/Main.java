@@ -54,6 +54,7 @@ public final class Main {
                 new AllowListProbe(),
                 new EntitiesPoiProbe(),
                 new TicketsProbe(),
+                new TicksProbe(),
                 new LevelsProbe(),
                 new DistanceProbe(),
                 new LightProbe(),
