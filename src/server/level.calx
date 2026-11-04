@@ -50,7 +50,7 @@
 module server.level
 
 import nbt.tag.{Tag}
-import protocol.play.{ClientboundLevelChunkWithLight, LightData}
+import protocol.play.{BlockEntityInfo, ClientboundLevelChunkWithLight, LightData}
 import protocol.state.{State}
 import protocol.wire.{Writer, write_packet}
 import random.source.{RandomSource}
@@ -70,6 +70,7 @@ import world.flowing.{tick_fluid}
 import world.post_process.{post_process}
 import world.precipitation.{Precipitation}
 import world.random_ticks.{RandomTicks, TickPlace}
+import world.block_entity_updates.{block_entity_ids, block_entity_infos, place_of}
 import world.block_updates.{BlockLevel, after_removal, on_neighbour_changed, on_place, shape_order, tick_block, update_or_destroy, update_order}
 import world.level_writer.{LevelWriter, UPDATE_CLIENTS, UPDATE_KNOWN_SHAPE, UPDATE_LIMIT, UPDATE_MOVE_BY_PISTON, UPDATE_NEIGHBORS, UPDATE_SKIP_ON_PLACE, UPDATE_SKIP_SHAPE_UPDATE_ON_WIRE}
 import world.light.{SkySources}
@@ -471,6 +472,9 @@ pub struct Level {
     running_at: usize = 0
     to_run: Set<(i64, u32)> = Set<(i64, u32)>()
     toggles: List<Toggle> = List<Toggle>()
+    // The `block_entity_type` registry's IDs by name, which a chunk's packet sends its block
+    // entities' types by, made as the first chunk's packet is (CAL-115).
+    block_entity_ids: OpenHashMap<String, i32> = OpenHashMap<String, i32>()
 }
 
 /// The blocks set in a section since they were last broadcast, as `ChunkHolder.broadcastChanges`
@@ -1593,6 +1597,9 @@ impl Level {
     /// light isn't wanted any more. Once it's compressed, what's sent is its frame's body.
     pub fn packet(mut self, pos: ChunkPos, flat: FlatWorld, keep: bool) -> ChunkPacket {
         let k = pos.pack()
+        if self.block_entity_ids.is_empty() {
+            self.block_entity_ids = block_entity_ids()
+        }
         if self.packets.contains(k) {
             if keep {
                 return self.packets[k].copied(k)
@@ -1606,15 +1613,22 @@ impl Level {
             var made: List<u8>? = none
             if self.opened {
                 let light = self.light_for(k, keep)
+                let saved = self.columns.rests.block_entities(k)
                 if self.columns.live.contains(k) {
-                    made = some(chunk_packet(pos, self.columns.live[k], light))
+                    let active = self.trials_active(saved, self.columns.live[k])
+                    let infos = self.infos(saved, active)
+                    made = some(chunk_packet(pos, self.columns.live[k], light, infos))
                 } else {
                     match self.columns.slots[k] {
-                        Body.Saved(s) => made = some(chunk_packet(pos, s.chunk.value, light)),
+                        Body.Saved(s) => {
+                            let active = self.trials_active(saved, s.chunk.value)
+                            let infos = self.infos(saved, active)
+                            made = some(chunk_packet(pos, s.chunk.value, light, infos))
+                        },
                         Body.Flat => {
                             if not self.flat_around(pos) {
                                 if let f = self.columns.flat {
-                                    made = some(chunk_packet(pos, f.chunk, light))
+                                    made = some(chunk_packet(pos, f.chunk, light, []))
                                 }
                             }
                         },
@@ -1636,7 +1650,12 @@ impl Level {
         if self.far.contains(k) {
             var packet: List<u8>? = none
             match self.far[k].body {
-                Body.Saved(s) => packet = some(chunk_packet(pos, s.chunk.value, s.saved_light())),
+                Body.Saved(s) => {
+                    let saved = if let r = s.rest { r.block_entities() } else { List<Tag>() }
+                    let active = self.trials_active(saved, s.chunk.value)
+                    let infos = self.infos(saved, active)
+                    packet = some(chunk_packet(pos, s.chunk.value, s.saved_light(), infos))
+                },
                 _ => {},
             }
             self.free_far(k)
@@ -1645,6 +1664,39 @@ impl Level {
             }
         }
         return ChunkPacket.Plain(flat.chunk_packet(pos.x, pos.z))
+    }
+
+    // What a chunk's packet sends of the block entities it saved, `saved`, `active` saying which
+    // are trial spawners that are active (CAL-115).
+    fn infos(self, saved: List<Tag>, active: List<bool>) -> List<BlockEntityInfo> {
+        if saved.is_empty() {
+            return List<BlockEntityInfo>()
+        }
+        return block_entity_infos(saved, active, self.block_entity_ids)
+    }
+
+    // For each block entity `chunk` saved, `saved`, whether its block is a trial spawner that's
+    // active, where the level has the block facts.
+    fn trials_active(self, saved: List<Tag>, chunk: Chunk) -> List<bool> {
+        var active = List<bool>()
+        if saved.is_empty() {
+            return active
+        }
+        let some_env = self.env.copy()
+        for t in saved {
+            var on = false
+            if let shared = some_env {
+                let Env { facts: f, .. } = shared.value
+                if let pos = place_of(t) {
+                    if pos.y >= chunk.min_y() and pos.y < chunk.min_y() + i32.wrap(chunk.section_count()) * 16 {
+                        let state = chunk.block(pos.x & 15, pos.y, pos.z & 15)
+                        on = (f.get_name(state, String("trial_spawner_state")) ?? String()) == "active"
+                    }
+                }
+            }
+            active.push(on)
+        }
+        return active
     }
 
     /// Keeps the frame's body a player's encoder compressed a kept packet to, with `threshold`,
@@ -3253,9 +3305,11 @@ pub fn section_key(x: i32, y: i32, z: i32) -> i64 {
     return ((i64(x) & 4194303) << 42) | (i64(y) & 1048575) | ((i64(z) & 4194303) << 20)
 }
 
-fn chunk_packet(pos: ChunkPos, chunk: Chunk, light: own LightData) -> List<u8> {
+fn chunk_packet(pos: ChunkPos, chunk: Chunk, light: own LightData, block_entities: own List<BlockEntityInfo>) -> List<u8> {
+    var data = chunk.chunk_data()
+    data.block_entities = block_entities
     var w = Writer.new()
-    write_packet(ClientboundLevelChunkWithLight { x: pos.x, z: pos.z, chunk: chunk.chunk_data(), light: light }, State.Play, mut w)
+    write_packet(ClientboundLevelChunkWithLight { x: pos.x, z: pos.z, chunk: data, light: light }, State.Play, mut w)
     return w.into_bytes()
 }
 
