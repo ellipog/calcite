@@ -6,7 +6,7 @@ import { changed, GUIDE, guideIndex } from '@/lib/repo';
 
 export function generateMetadata(): Metadata {
 	const d = guideIndex();
-	return meta({ title: 'Docs', description: d.description, path: '/docs', modified: changed(GUIDE) });
+	return meta({ title: 'Docs: running a server', description: d.description, path: '/docs', modified: changed(GUIDE) });
 }
 
 export default function Docs() {

@@ -218,7 +218,11 @@ export default function Benchmarks() {
 							title="Worldgen with data packs"
 							lead={
 								<p>
-									C2ME publishes a benchmark that generates a world with Terralith and Terratonic, beside Paper and vanilla. Calcite runs it with its own <code className="font-mono text-[0.9em]">pregen</code>, and vanilla, Paper and C2ME run it with Chunky, on the same machine and set up as C2ME&apos;s is. Calcite made {f2(ratio(1))} times as many chunks a second as C2ME on one thread, and {f2(ratio(32))} times as many on 32.
+									C2ME publishes a benchmark that generates a world with Terralith and Terratonic, beside Paper and vanilla. Calcite runs it with its own{' '}
+										<Link href="/docs/pregen" className="link">
+											<code className="font-mono text-[0.9em]">pregen</code>
+										</Link>
+										, and vanilla, Paper and C2ME run it with Chunky, on the same machine and set up as C2ME&apos;s is. Calcite made {f2(ratio(1))} times as many chunks a second as C2ME on one thread, and {f2(ratio(32))} times as many on 32.
 								</p>
 							}
 						/>
@@ -312,6 +316,13 @@ export default function Benchmarks() {
 								lead={
 									<>
 										<p>The rig runs its light probe on vanilla&apos;s server and on Calcite, 15 times each after a warm-up, on three workloads, and checks that the two engines give every block the same light level, from 0 to 15. They did in every run.</p>
+										<p className="mt-4">
+											How the rig checks the rest of vanilla, block for block and packet for packet, is in{' '}
+											<Link href="/docs/vanilla" className="link">
+												Worlds and vanilla
+											</Link>
+											.
+										</p>
 										<p className="mt-4">A flat world&apos;s light is the sky&apos;s, one level at a time, so there&apos;s little work either way. Terrain is where the difference shows.</p>
 									</>
 								}
