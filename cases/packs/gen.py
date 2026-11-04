@@ -531,6 +531,54 @@ BAD_COMPONENTS.update({
     "hidden-effect": {"potion_contents": {"custom_effects": [{"id": "minecraft:speed", "hidden_effect": {"duration": "x"}}]}},
 })
 
+# The last types: tooltips, books, the debug stick, profiles and signs.
+ITEM_COMPONENTS += [
+    {
+        "tooltip_display": {"hide_tooltip": False, "hidden_components": ["minecraft:damage", "lore", "minecraft:damage", "creative_slot_lock"]},
+        "writable_book_content": {"pages": ["a", {"raw": "b", "filtered": "c"}, {"raw": "d"}]},
+        "written_book_content": {"title": "T", "author": "A", "generation": 1, "pages": ["p", {"raw": {"text": "q", "bold": True}, "filtered": "r"}], "resolved": True},
+        "debug_stick_state": {"minecraft:oak_stairs": "facing", "redstone_wire": "power", "minecraft:oak_log": "axis"},
+        "sign_text_front": {"messages": ["a", "b", "c", "d"], "filtered_messages": ["a", "b", "c", "d"]},
+        "sign_text_back": {"messages": ["", "", "", {"text": "x"}], "filtered_messages": ["1", "2", "3"], "color": "red", "has_glowing_text": True},
+    },
+    {
+        "tooltip_display": {}, "writable_book_content": {}, "debug_stick_state": {},
+        "written_book_content": {"title": {"raw": "t", "filtered": "u"}, "author": "", "generation": 0, "pages": ["x" * 32765]},
+        "sign_text_front": {"messages": ["a", "b", "c", "d"], "filtered_messages": ["e", "b", "c", "d"], "color": "black", "has_glowing_text": False},
+    },
+    {"profile": "Steve", "written_book_content": {"title": "\U0001F600" * 16, "author": "a"}},
+    {"profile": {"name": "Alex", "id": [1, 2, 3, 4]}},
+    {"profile": {"name": "Alex", "texture": "w:skin", "model": "slim", "cape": "minecraft:c", "elytra": "e"}},
+    {"profile": {"id": [1, 2, 3, 4], "properties": [{"name": "textures", "value": "v", "signature": "s"}, {"name": "a", "value": "1"}, {"name": "textures", "value": "w"}]}},
+    {"profile": {"properties": {"b": ["1", "2"], "a": ["3"], "c": []}, "model": "wide"}},
+    {"profile": {"name": "x", "id": [1, 2, 3, 4], "properties": {}}},
+    {"profile": {}},
+]
+
+BAD_COMPONENTS.update({
+    "name-characters": {"profile": "a b"},
+    "profile-name-with-id": {"profile": {"id": [5, 6, 7, 8], "name": "a b"}},
+    "name-long": {"profile": "abcdefghijklmnopq"},
+    "profile-number": {"profile": 5},
+    "properties-not-list": {"profile": {"properties": {"k": "v"}}},
+    "properties-many": {"profile": {"properties": {f"k{i}": ["v"] for i in range(17)}}},
+    "properties-list-many": {"profile": {"properties": [{"name": "k", "value": "v"}] * 17}},
+    "property-name-long": {"profile": {"properties": [{"name": "k" * 65, "value": "v"}]}},
+    "debug-stick-property": {"debug_stick_state": {"minecraft:stone": "facing"}},
+    "debug-stick-block": {"debug_stick_state": {"w:nope": "facing"}},
+    "debug-stick-value": {"debug_stick_state": {"minecraft:oak_log": 1}},
+    "title-long": {"written_book_content": {"title": "x" * 33, "author": "a"}},
+    "title-units": {"written_book_content": {"title": "\U0001F600" * 17, "author": "a"}},
+    "page-long": {"writable_book_content": {"pages": ["x" * 1025]}},
+    "pages-many": {"writable_book_content": {"pages": ["x"] * 101}},
+    "generation": {"written_book_content": {"title": "t", "author": "a", "generation": 4}},
+    "page-too-large": {"written_book_content": {"title": "t", "author": "a", "pages": ["x" * 32766]}},
+    "no-author": {"written_book_content": {"title": "t"}},
+    "sign-lines": {"sign_text_front": {"messages": ["a", "b", "c"]}},
+    "sign-color": {"sign_text_back": {"messages": ["a", "b", "c", "d"], "color": "pink-ish"}},
+    "tooltip-unknown": {"tooltip_display": {"hidden_components": ["w:nope"]}},
+})
+
 
 def painting(width=1, height=1, asset="w:a", **more):
     data = {"width": width, "height": height, "asset_id": asset}
