@@ -3,8 +3,8 @@
     python assets/logo/logo.py
 
 Needs Pillow, numpy and fontTools, texture/calcite.png and fonts/Unbounded[wght].ttf. Vanilla
-material stays local, so texture/ isn't committed: take the textures banner.py and this script
-name from assets/minecraft/textures/block/ in the 26.3 client jar.
+material stays local, so texture/ isn't committed: take the textures this script names from
+assets/minecraft/textures/block/ in the 26.3 client jar.
 
 Writes calcite-mark.svg and calcite-512.png, the block alone, and calcite-logo.svg and
 calcite-logo-white.svg, the block with the wordmark.
