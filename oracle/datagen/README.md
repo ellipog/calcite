@@ -36,6 +36,7 @@ py -I oracle/fetch.py --jar <path>         # or install a jar you already have, 
 | `generated/26.3/datagen/data/` | Vanilla's built-in data pack as the generator writes it. Calcite doesn't read this copy: at runtime it reads the data pack from the jar (D61) |
 | `generated/26.3/tables/` | The converted tables, described below |
 | `generated/26.3/block_flags.json` | What each block state is, from vanilla's state cache, by [`block_flags.py`](block_flags.py) ([below](#block_flagsjson)) |
+| `generated/26.3/entity_facts.json` | What natural spawning asks of each entity type and block state, by [`entity_facts.py`](entity_facts.py) ([below](#entity_factsjson)) |
 
 ## Table format
 
@@ -104,6 +105,16 @@ And it has what features ask of states and blocks (CAL-84): `facts`, a number fo
 
 Which heightmaps count a state isn't here: in 26.3 that comes from the data pack's tags, which Calcite reads as it starts.
 
+### `entity_facts.json`
+
+What natural spawning asks of each entity type and block state (D317), which the reports don't say, so [`entity_facts.py`](entity_facts.py) asks the vanilla adapter's `EntityFacts`, which reads vanilla's own types and states:
+
+```sh
+py -I oracle/datagen/entity_facts.py
+```
+
+`categories` lists the `MobCategory` names in order. Each of `types`, in ID order, has its category; whether it can be summoned, is immune to fire, can spawn far from players and is allowed in peaceful; the block tag it's immune to; its spawn box's half width and height; and its `spawn_group`, which of the four kinds of type `isValidSpawn` treats differently it is: any other, immune to fire, ocelots and parrots, and polar bears. A type registered in `SpawnPlacements` also has its `placement`, `heightmap` and `rule`, the class and method of its spawn predicate. The predicates are lambdas and method references, so `EntityFacts` reads `SpawnPlacements`' class initializer with `java.lang.classfile` to find which method each type's is. `states` has a number for each block state, in ID order: bit 0 whether it's a signal source, and bit 1 + g whether `isValidSpawn` holds for spawn group g.
+
 ## What's compiled in and what's loaded (D61)
 
 Calcite compiles in what vanilla defines in code: everything in `tables/`. Codegen turns it into constant arrays, so a state lookup is arithmetic and an array read, with nothing parsed at startup. What vanilla loads from its built-in data pack (data-driven registries such as biomes, dimension types and damage types, worldgen settings, tags, loot tables, recipes, advancements and structure templates) Calcite loads at startup from the jar, through the same loader user data packs go through, so a data pack can override it as it can in vanilla.
@@ -126,6 +137,7 @@ py -I oracle/datagen/calx_tables.py --check    # fail if a committed one is out 
 | `src/world/block_flags.calx` | `../block_flags.json` | The flags' constants, and `state_flags()`, each state's flags in ID order. The 35,723 states are a printable character each, an index into the 102 different values, commonest first, in lines of 96; the 13 rarest take two, after `~`. It's decoded once, as the server starts |
 | `src/world/block_facts.calx` | `../block_flags.json` | The facts' constants, `state_facts()` and `state_fluids()`, each state's facts and its fluid and amount, a character a state as in `block_flags.calx`; `class_names()`, `block_classes()` and `class_parents()`, the classes and which one each block is; `survive_classes()` and `place_on_classes()`; `poi_states()`, each state with a point of interest and its type; and `block_entity_names()` and `block_entity_blocks()`, the block entity types and each block's; `outline_differs()`; and `wall_cover()` |
 | `src/world/light_faces.calx` | `../block_flags.json` | `state_faces()`, each state's six faces, packed in `FACE_BITS` each, as an index into the 53 different sets, a character a state; and `face_occludes()`, for each of the `FACE_SHAPES` shapes, a bit for each shape light can't pass between it and |
+| `src/world/entity_facts.calx` | `../entity_facts.json` | The categories in order and their serialized names; the type flags', placements' and state facts' constants; `rules()`, the spawn predicates' names; `immune_tags()`; `types()`, each type's `TypeFacts` in ID order; and `state_spawn_facts()`, each state's spawn facts, a character a state as in `block_flags.calx` |
 
 They're committed, and hold only the names, IDs and facts about states the protocol and the world need, which every compatible server encodes. Don't edit one: change the script and run it again. A new game version that changes them changes Calcite's build, which is the point: `@packet` then fails to compile for a packet that was renamed or removed.
 

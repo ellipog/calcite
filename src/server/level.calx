@@ -59,14 +59,16 @@ import server.log.{Entry}
 import server.pregen.{Holds}
 import storage.chunk.{RestStore}
 import storage.regions.{ChunkRead, region_of}
-import world.chunk.{Chunk, MOTION_BLOCKING}
+import world.chunk.{AIR_STATE, Chunk, MOTION_BLOCKING}
 import world.collision.{CollisionBlocks, CollisionStates}
 import world.distance.{DistanceManager, Ticking}
 import world.flat.{FlatChunk, FlatWorld}
 import world.light.{SkySources}
+import world.natural.{SpawnLevel}
 import world.pos.{BlockPos, ChunkPos}
 import world.spawn.{respawn_pos, standing_y}
 import world.tickets.{Holders, Ticket, TicketStorage, TicketType}
+import worldgen.biome_manager.{corner}
 import worldgen.generator.{GenSetup, setup_data}
 import worldgen.scheduler.{Generator}
 
@@ -314,6 +316,12 @@ pub struct Level {
     // the last version given one, whose top bits are the level's dimension (`set_dimension`).
     packets: OpenHashMap<i64, Kept> = OpenHashMap<i64, Kept>()
     versions: u64 = 0
+    // The world's hashed seed, which zooms the biomes in; the chunks whose light is kept for
+    // natural spawning, as `keep_light` was last given them; and the light of a flat chunk among
+    // flat ones (D317).
+    zoom_seed: i64 = 0
+    kept_light: OpenHashSet<i64> = OpenHashSet<i64>()
+    flat_light: LightData? = none
 }
 
 /// How far around where a player's going to another dimension a `portal` ticket loads, as
@@ -341,6 +349,73 @@ impl Level {
     /// it's the dimension at `dim` of them.
     pub fn set_dimension(mut self, dim: usize) {
         self.versions = u64(dim) << VERSION_SHIFT
+    }
+
+    /// Gives the level its dimension's bottom and height, which a level that's opened has from
+    /// what its chunks are made with, and the world's hashed seed, which zooms its biomes in from
+    /// quarts to blocks, as `BiomeManager` zooms them (D317).
+    pub fn set_bounds(mut self, min_y: i32, height: i32, zoom_seed: i64) {
+        self.min_section = min_y >> 4
+        self.sections = height >> 4
+        self.zoom_seed = zoom_seed
+    }
+
+    /// Gives the level the light of a flat chunk among flat ones, which theirs is, for natural
+    /// spawning, which reads it (D317).
+    pub fn set_flat_light(mut self, light: own LightData) {
+        self.flat_light = some(light)
+    }
+
+    /// How many chunks the natural spawn counter counts, `getNaturalSpawnChunkCount`, which the
+    /// mob categories' caps are scaled by (D317).
+    pub fn natural_spawn_chunk_count(mut self) -> i32 {
+        return i32.wrap(self.dm.natural_spawn_chunk_count())
+    }
+
+    /// Keeps the light of `chunks`, those natural spawning may read this tick, for as long as
+    /// they're given here each tick (D317). Vanilla's light is in its chunks; Calcite's is on
+    /// light's thread, which gives a chunk's for its packet and lets it go once it's sent. So the
+    /// level watches these as they come, and lets them go as they leave. A flat chunk among flat
+    /// ones has the flat world's light, and isn't watched.
+    pub fn keep_light(mut self, chunks: List<ChunkPos>) {
+        var now = OpenHashSet<i64>()
+        for pos in chunks {
+            let k = pos.pack()
+            now.insert(k)
+            self.kept_light.insert(k)
+            if self.lighting and not self.watching.contains(k) and not self.flat_around(pos) {
+                self.watch(k)
+            }
+        }
+        var gone = List<i64>()
+        for k in self.kept_light {
+            if not now.contains(k) {
+                gone.push(k)
+            }
+        }
+        for k in gone {
+            self.kept_light.remove(k)
+            self.release(k)
+        }
+    }
+
+    /// The light at the block, the sky's if `sky`, as `getBrightness` reads it from the light
+    /// engine's sections (D317): a section's layer, or for the sky, where a section has none, the
+    /// bottom of the first above it that has one, or 15 above them all; for the blocks, 0 where
+    /// there's none. A flat chunk among flat ones has the flat world's light. A chunk whose light
+    /// isn't here yet, kept only this tick, has the sky's 15 and no block light.
+    pub fn light_at(self, sky: bool, x: i32, y: i32, z: i32) -> i32 {
+        let pos = ChunkPos { x: x >> 4, z: z >> 4 }
+        let k = pos.pack()
+        if self.light_data.contains(k) {
+            return light_value(self.light_data[k], sky, self.min_section, self.sections, x, y, z)
+        }
+        if self.flat_around(pos) {
+            if let f = self.flat_light {
+                return light_value(f, sky, self.min_section, self.sections, x, y, z)
+            }
+        }
+        return if sky { 15 } else { 0 }
     }
 
     /// Makes every chunk generated `flat`, which the world's blocks are, for collisions, and
@@ -1296,6 +1371,7 @@ impl Level {
         _ = self.came_at.remove(k)
         _ = self.watching.remove(k)
         _ = self.light_data.remove(k)
+        self.kept_light.remove(k)
         if let whole = save {
             self.save_lit(k, whole, true)
         } else if self.lighting {
@@ -1347,6 +1423,9 @@ impl Level {
 
     // Doesn't want the chunk at `k`'s light any more, if it did, and lets go of what light gave.
     fn release(mut self, k: i64) {
+        if self.kept_light.contains(k) {
+            return
+        }
         if self.watching.remove(k) == none {
             return
         }
@@ -1378,7 +1457,7 @@ impl Level {
             _ = self.step_here()
         }
         if self.light_data.contains(k) {
-            if keep {
+            if keep or self.kept_light.contains(k) {
                 return self.light_data[k].copy()
             }
             if let l = self.light_data.remove(k) {
@@ -1631,6 +1710,66 @@ impl Level {
 }
 
 // Collisions see the full chunks, as `getChunkForCollisions` gives them.
+impl SpawnLevel for Level {
+    fn spawn_state(self, x: i32, y: i32, z: i32) -> u32 {
+        return self.collision_state(x, y, z) ?? AIR_STATE
+    }
+
+    // `Level.getHeight`: the world's bottom where the chunk isn't loaded.
+    fn surface(self, kind: i32, x: i32, z: i32) -> i32 {
+        let pos = ChunkPos { x: x >> 4, z: z >> 4 }
+        if self.full(pos) {
+            match self.columns.slots[pos.pack()] {
+                Body.Saved(s) => return s.chunk.value.height(kind, x & 15, z & 15),
+                Body.Flat => {
+                    if let f = self.columns.flat {
+                        return f.chunk.height(kind, x & 15, z & 15)
+                    }
+                },
+                Body.Loading => {},
+            }
+        }
+        return self.min_section * 16
+    }
+
+    fn biome(mut self, x: i32, y: i32, z: i32) -> i32 {
+        let (qx, qy, qz) = corner(self.zoom_seed, x, y, z)
+        return self.noise_biome(qx, qy, qz)
+    }
+
+    // `ChunkAccess.getNoiseBiome` of the chunk the quart's in, its height clamped to the world;
+    // -1, no biome, where the chunk isn't loaded, which vanilla would ask its generator for.
+    fn noise_biome(self, qx: i32, qy: i32, qz: i32) -> i32 {
+        let pos = ChunkPos { x: qx >> 2, z: qz >> 2 }
+        if not self.full(pos) {
+            return -1
+        }
+        match self.columns.slots[pos.pack()] {
+            Body.Saved(s) => return i32.wrap(s.chunk.value.noise_biome(qx & 3, qy, qz & 3)),
+            Body.Flat => {
+                if let f = self.columns.flat {
+                    return i32.wrap(f.chunk.noise_biome(qx & 3, qy, qz & 3))
+                }
+            },
+            Body.Loading => {},
+        }
+        return -1
+    }
+
+    fn light(self, sky: bool, x: i32, y: i32, z: i32) -> i32 {
+        return self.light_at(sky, x, y, z)
+    }
+
+    // A holder whose chunk ticks its entities, as the entity manager's sections tick once the
+    // chunk's full status comes to `ENTITY_TICKING`.
+    fn entities_tick(self, chunk_x: i32, chunk_z: i32) -> bool {
+        return match self.dm.holder(ChunkPos { x: chunk_x, z: chunk_z }.pack()) {
+            some(h) => h.ticking == Ticking.Ready,
+            none => false,
+        }
+    }
+}
+
 impl CollisionBlocks for Level {
     fn collision_state(self, x: i32, y: i32, z: i32) -> u32? {
         let pos = ChunkPos { x: x >> 4, z: z >> 4 }
@@ -1745,4 +1884,61 @@ impl Holds for Level {
     fn unhold(mut self, pos: ChunkPos) {
         _ = self.dm.remove_ticket(pos.pack(), Ticket.with_radius(TicketType.Pregen, 0))
     }
+}
+
+/// The light at the block in a chunk's light as a packet sends it, `data`, from the section below
+/// the world, `min_section - 1`, to the one above, as `SkyLightSectionStorage` and
+/// `BlockLightSectionStorage` read their sections' layers.
+pub fn light_value(data: LightData, sky: bool, min_section: i32, sections: i32, x: i32, y: i32, z: i32) -> i32 {
+    let count = sections + 2
+    var i = (y >> 4) - min_section + 1
+    if not sky {
+        if i < 0 or i >= count or not mask_bit(data.block_mask, i) {
+            return 0
+        }
+        return nibble(data.block[layer_at(data.block_mask, i)].data, x & 15, y & 15, z & 15)
+    }
+    var walked = false
+    if i < 0 {
+        i = 0
+        walked = true
+    }
+    while i < count {
+        if mask_bit(data.sky_mask, i) {
+            return nibble(data.sky[layer_at(data.sky_mask, i)].data, x & 15, if walked { 0 } else { y & 15 }, z & 15)
+        }
+        if mask_bit(data.empty_sky_mask, i) {
+            return 0
+        }
+        i += 1
+        walked = true
+    }
+    return 15
+}
+
+// Bit `i` of a `BitSet`'s bytes.
+fn mask_bit(mask: List<u8>, i: i32) -> bool {
+    let byte = usize.wrap(i >> 3)
+    return byte < mask.len() and (i32(mask[byte]) >> (i & 7)) & 1 != 0
+}
+
+// Where the layer of section `i` is among those sent: how many sections before it have one.
+fn layer_at(mask: List<u8>, i: i32) -> usize {
+    var n: usize = 0
+    for j in 0..i {
+        if mask_bit(mask, j) {
+            n += 1
+        }
+    }
+    return n
+}
+
+// `DataLayer.get`: the nibble of the block in its section's 2048 bytes, `y`, then `z`, then `x`,
+// the low nibble first.
+fn nibble(data: List<u8>, x: i32, y: i32, z: i32) -> i32 {
+    if data.len() < 2048 {
+        return 0
+    }
+    let index = (y << 8) | (z << 4) | x
+    return (i32(data[usize.wrap(index >> 1)]) >> ((index & 1) << 2)) & 15
 }

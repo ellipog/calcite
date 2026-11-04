@@ -1,0 +1,820 @@
+/// Natural spawning, as vanilla's `NaturalSpawner` picks where mobs spawn as each chunk mobs may
+/// spawn in ticks (P6.1, D317).
+///
+/// Each category that may spawn this tick, in `MobCategory` order, gets a place in the chunk: a
+/// random column and a height up to its surface. From there, three packs each wander up to four
+/// steps, and at each step the place is checked as vanilla checks it: far enough from the nearest
+/// player and the world's spawn, in a chunk whose entities tick, a mob picked from what spawns
+/// there by weight the first time, with its pack's size, and then the type's checks: its
+/// category, how far it spawns from players, whether that mob spawns there, its placement on the
+/// ground, in water or in lava, its spawn rule, and room for its box. Every draw is made from the
+/// level's random in vanilla's order.
+///
+/// Where a place passes all of them, vanilla makes the mob, and Calcite, which has no mobs yet,
+/// stops there for the chunk's category, as vanilla stops where it can't make one. With no mobs,
+/// every category is under its caps and the spawn potential is nothing, so the checks that read
+/// them always pass.
+///
+/// What spawns at a place is the biome's `minecraft:gameplay/natural_mob_spawns` over the
+/// dimension type's, as `ChunkGenerator.getMobsAt` reads it when no structure there spawns its
+/// own. Structures' spawns, and the Nether fortress's, come with structures, and the spawn rules
+/// of the types `rule_of` doesn't know yet hold nowhere, drawing nothing.
+module world.natural
+
+import nbt.tag.{Tag}
+import random.legacy.{LegacyRandom}
+import random.source.{RandomSource}
+import resources.identifier.{Identifier}
+import world.chunk.{WORLD_SURFACE}
+import world.collision.{Aabb, CollisionBlocks, CollisionStates}
+import world.entity_facts.{AMBIENT, AXOLOTLS, CREATURE, FAR, FIRE_IMMUNE, IN_LAVA, IN_WATER, MISC, MONSTER, NO_RESTRICTIONS, PEACEFUL, SIGNAL_SOURCE, SUMMON, TypeFacts, UNDERGROUND_WATER_CREATURE, VALID_SPAWN_SHIFT, WATER_AMBIENT, WATER_CREATURE, categories, category_names, immune_tags, rules, state_spawn_facts, types}
+import world.spawners.{SpawnerPlayer}
+import worldgen.facts.{BlockSet, Facts}
+import worldgen.interval.{Thrown}
+import worldgen.providers.{IntProvider, read_int}
+
+/// A mob a place may spawn, `MobSpawnSettings.SpawnerData`, by its type's ID, with how many come
+/// in its pack, and its weight.
+pub struct Spawner {
+    pub type_id: i32
+    pub count: IntProvider
+    pub weight: i32
+}
+
+impl Spawner {
+    /// `SpawnerData.equals`: the same type and count, whatever the weight.
+    pub fn same(self, other: Spawner) -> bool {
+        return self.type_id == other.type_id and self.count == other.count
+    }
+}
+
+/// The mobs that spawn at a place, `MobSpawnSettings`: each category's, in `MobCategory` order,
+/// or none where the settings don't name the category.
+pub struct MobSettings {
+    pub lists: List<List<Spawner>?>
+}
+
+impl MobSettings {
+    /// `MobSpawnSettings.EMPTY`, the attribute's default: no mobs.
+    pub fn empty() -> MobSettings {
+        var lists = List<List<Spawner>?>()
+        for _ in categories() {
+            lists.push(none)
+        }
+        return MobSettings { lists: lists }
+    }
+
+    /// The category's mobs, `getMobsToSpawn`: none where it isn't named.
+    pub fn mobs(self, category: i32) -> List<Spawner> {
+        if let l = self.lists[usize.wrap(category)] {
+            return l.copy()
+        }
+        return List<Spawner>()
+    }
+
+    /// The `overlay` modifier: each category `top` names is its, the others these settings'.
+    pub fn overlay(self, top: MobSettings) -> MobSettings {
+        var lists = List<List<Spawner>?>()
+        for i in 0..self.lists.len() {
+            lists.push(if top.lists[i] != none { top.lists[i].copy() } else { self.lists[i].copy() })
+        }
+        return MobSettings { lists: lists }
+    }
+
+    /// These settings with the attribute map entry `entry` applied, as a map's entry is: its
+    /// value alone overrides, and `{modifier, argument}` names its operation, `override` or
+    /// `overlay`. `entity_types` are the entity types' IDs, in ID order; a mob of a type that
+    /// isn't one is left out.
+    pub fn applied(self, entry: Tag, entity_types: List<Identifier>) -> MobSettings {
+        if entry == Tag.End {
+            return MobSettings { lists: self.lists.copy() }
+        }
+        match field(entry, "modifier") {
+            Tag.Str(op) => {
+                let argument = settings_of(field(entry, "argument"), entity_types)
+                if op == "overlay" {
+                    return self.overlay(argument)
+                }
+                return argument
+            },
+            _ => return settings_of(entry, entity_types),
+        }
+    }
+}
+
+// Mob spawn settings as the codec writes them in NBT: `spawns_by_category`, by each category's
+// serialized name, each a list of `{type, count, weight}`.
+fn settings_of(tag: Tag, entity_types: List<Identifier>) -> MobSettings {
+    var out = MobSettings.empty()
+    let by = field(tag, "spawns_by_category")
+    let names = category_names()
+    for c in 0..names.len() {
+        let Tag.List(items) = field_named(by, names[c]) else continue
+        var list = List<Spawner>()
+        for item in items {
+            let Tag.Str(name) = field(item, "type") else continue
+            let id = match Identifier.parse(name) {
+                ok(i) => i,
+                err(_) => continue,
+            }
+            var type_id: i32? = none
+            for i in 0..entity_types.len() {
+                if entity_types[i] == id {
+                    type_id = some(i32.wrap(i))
+                    break
+                }
+            }
+            let t = type_id else continue
+            let weight = match field(item, "weight") {
+                Tag.Int(w) => w,
+                _ => 0,
+            }
+            list.push(Spawner { type_id: t, count: count_of(field(item, "count")), weight: weight })
+        }
+        out.lists[c] = some(list)
+    }
+    return out
+}
+
+// A pack's size as the codec writes it, an int provider: the registries have read it, so it
+// reads.
+fn count_of(tag: Tag) -> IntProvider {
+    return match read_int(tag.to_json()) {
+        ok(p) => p,
+        err(_) => IntProvider.Constant(1),
+    }
+}
+
+/// An int provider as a codec writes it in NBT, as the dimension type's
+/// `monster_spawn_light_level`: `none` where it doesn't read.
+pub fn int_provider_of(tag: Tag) -> IntProvider? {
+    return match read_int(tag.to_json()) {
+        ok(p) => some(p),
+        err(_) => none,
+    }
+}
+
+fn field(tag: Tag, key: str) -> Tag {
+    return field_named(tag, String(key))
+}
+
+fn field_named(tag: Tag, key: String) -> Tag {
+    match tag {
+        Tag.Compound(fields) => {
+            if fields.contains(key) {
+                return fields[key].copy()
+            }
+            return Tag.End
+        },
+        _ => return Tag.End,
+    }
+}
+
+/// The spawn rules Calcite checks, from the methods `SpawnPlacements` registers.
+pub enum Rule {
+    /// `Mob.checkMobSpawnRules`.
+    Mob
+    /// `Monster.checkMonsterSpawnRules`, `checkAnyLightMonsterSpawnRules` and
+    /// `checkSurfaceMonstersSpawnRules`.
+    Monster
+    AnyLightMonster
+    SurfaceMonster
+    /// `Animal.checkAnimalSpawnRules`.
+    Animal
+    /// `Bat.checkBatSpawnRules`.
+    Bat
+    /// `Slime.checkSlimeSpawnRules`.
+    Slime
+    /// `GlowSquid.checkGlowSquidSpawnRules`.
+    GlowSquid
+    /// `WaterAnimal.checkSurfaceWaterAnimalSpawnRules`, and
+    /// `AgeableWaterCreature.checkSurfaceAgeableWaterCreatureSpawnRules`, the same.
+    SurfaceWater
+    /// One Calcite doesn't check yet: it holds nowhere.
+    Unknown
+}
+
+/// The rule the method `name`, as `Owner.method`, checks.
+pub fn rule_of(name: String) -> Rule {
+    if name == "Mob.checkMobSpawnRules" {
+        return Rule.Mob
+    }
+    if name == "Monster.checkMonsterSpawnRules" {
+        return Rule.Monster
+    }
+    if name == "Monster.checkAnyLightMonsterSpawnRules" {
+        return Rule.AnyLightMonster
+    }
+    if name == "Monster.checkSurfaceMonstersSpawnRules" {
+        return Rule.SurfaceMonster
+    }
+    if name == "Animal.checkAnimalSpawnRules" {
+        return Rule.Animal
+    }
+    if name == "Bat.checkBatSpawnRules" {
+        return Rule.Bat
+    }
+    if name == "Slime.checkSlimeSpawnRules" {
+        return Rule.Slime
+    }
+    if name == "GlowSquid.checkGlowSquidSpawnRules" {
+        return Rule.GlowSquid
+    }
+    if name == "WaterAnimal.checkSurfaceWaterAnimalSpawnRules" or name == "AgeableWaterCreature.checkSurfaceAgeableWaterCreatureSpawnRules" {
+        return Rule.SurfaceWater
+    }
+    return Rule.Unknown
+}
+
+/// What natural spawning reads of a level: its blocks, heights, biomes and light, and which
+/// chunks' entities tick. Each is asked only of a loaded chunk, or one beside it.
+pub interface SpawnLevel {
+    /// The state at the block, as `getBlockState` gives it: air outside the world's height.
+    fn spawn_state(self, x: i32, y: i32, z: i32) -> u32
+    /// The height of the column in heightmap `kind`, one above the highest block it counts, as
+    /// `Level.getHeight` gives it.
+    fn surface(self, kind: i32, x: i32, z: i32) -> i32
+    /// The biome at the block, by its ID, as `getBiome` zooms it.
+    fn biome(mut self, x: i32, y: i32, z: i32) -> i32
+    /// The biome of the quart, by its ID, as `getNoiseBiome` gives it.
+    fn noise_biome(self, qx: i32, qy: i32, qz: i32) -> i32
+    /// The light at the block, the sky's if `sky`, as `getBrightness` gives it.
+    fn light(self, sky: bool, x: i32, y: i32, z: i32) -> i32
+    /// Whether the chunk's entities tick, `PersistentEntitySectionManager.canPositionTick`.
+    fn entities_tick(self, chunk_x: i32, chunk_z: i32) -> bool
+}
+
+/// What natural spawning knows of the world's blocks and entity types, the same for every level.
+pub struct Natural {
+    pub types: List<TypeFacts>
+    rules: List<Rule>
+    spawn_facts: List<u32>
+    pub facts: Facts
+    collisions: CollisionStates
+    // Whether each state is a liquid, water or lava itself, which has no shape for a mob's room.
+    liquid: List<bool>
+    prevent_inside: BlockSet
+    fire: BlockSet
+    campfires: BlockSet
+    animals_on: BlockSet
+    bats_on: BlockSet
+    // The tags types are immune to, in `immune_tags`' order.
+    immune_sets: List<BlockSet>
+    lava: u32
+    magma_block: u32
+    lava_cauldron: u32
+    wither_rose: u32
+    sweet_berry_bush: u32
+    cactus: u32
+    powder_snow: u32
+    water: u32
+}
+
+impl Natural {
+    /// What spawning reads, from `facts`, the world's blocks, fluids and their tags.
+    pub fn new(facts: own Facts) -> Natural ! String {
+        let all = types()
+        let spawn_facts = state_spawn_facts()
+        if spawn_facts.len() != usize(facts.table.len()) {
+            fail "{spawn_facts.len()} states' spawn facts for {facts.table.len()} states"
+        }
+        var rules_by = List<Rule>()
+        for name in rules() {
+            rules_by.push(rule_of(name))
+        }
+        var immune_sets = List<BlockSet>()
+        for name in immune_tags() {
+            immune_sets.push(facts.tag(name))
+        }
+        let prevent_inside = facts.tag(String("minecraft:prevent_mob_spawning_inside"))
+        let fire = facts.tag(String("minecraft:fire"))
+        let campfires = facts.tag(String("minecraft:campfires"))
+        let animals_on = facts.tag(String("minecraft:animals_spawnable_on"))
+        let bats_on = facts.tag(String("minecraft:bats_spawnable_on"))
+        let lava = try block_id(facts, "minecraft:lava")
+        let magma_block = try block_id(facts, "minecraft:magma_block")
+        let lava_cauldron = try block_id(facts, "minecraft:lava_cauldron")
+        let wither_rose = try block_id(facts, "minecraft:wither_rose")
+        let sweet_berry_bush = try block_id(facts, "minecraft:sweet_berry_bush")
+        let cactus = try block_id(facts, "minecraft:cactus")
+        let powder_snow = try block_id(facts, "minecraft:powder_snow")
+        let water = try block_id(facts, "minecraft:water")
+        var liquid = List<bool>()
+        for s in 0..facts.table.len() {
+            liquid.push(facts.is_liquid(s))
+        }
+        return Natural {
+            types: all,
+            rules: rules_by,
+            spawn_facts: spawn_facts,
+            facts: facts,
+            collisions: CollisionStates.new(),
+            liquid: liquid,
+            prevent_inside: prevent_inside,
+            fire: fire,
+            campfires: campfires,
+            animals_on: animals_on,
+            bats_on: bats_on,
+            immune_sets: immune_sets,
+            lava: lava,
+            magma_block: magma_block,
+            lava_cauldron: lava_cauldron,
+            wither_rose: wither_rose,
+            sweet_berry_bush: sweet_berry_bush,
+            cactus: cactus,
+            powder_snow: powder_snow,
+            water: water,
+        }
+    }
+
+    // `isValidSpawn` of the state for the type: `BlockState.isValidSpawn`, by its group.
+    fn valid_spawn(self, state: u32, t: TypeFacts) -> bool {
+        return self.spawn_facts[usize(state)] & (1u32 << (VALID_SPAWN_SHIFT + u32.wrap(t.spawn_group))) != 0
+    }
+
+    // `NodeEvaluator.isBurningBlock`.
+    fn burning(self, state: u32) -> bool {
+        if self.facts.in_set(state, self.fire) or self.facts.is(state, self.lava) or self.facts.is(state, self.magma_block) {
+            return true
+        }
+        if self.facts.in_set(state, self.campfires) and self.facts.get_bool(state, String("lit")) {
+            return true
+        }
+        return self.facts.is(state, self.lava_cauldron)
+    }
+
+    // `EntityType.isBlockDangerous`.
+    fn dangerous(self, type_id: i32, state: u32) -> bool {
+        let t = self.types[usize.wrap(type_id)]
+        if self.facts.in_set(state, self.immune_sets[usize.wrap(t.immune_to)]) {
+            return false
+        }
+        if t.flags & FIRE_IMMUNE == 0 and self.burning(state) {
+            return true
+        }
+        return self.facts.is(state, self.wither_rose) or self.facts.is(state, self.sweet_berry_bush) or self.facts.is(state, self.cactus) or self.facts.is(state, self.powder_snow)
+    }
+
+    // `NaturalSpawner.isValidEmptySpawnBlock`.
+    fn empty_spawn_block(self, state: u32, type_id: i32) -> bool {
+        if self.facts.collision_full_block(state) {
+            return false
+        }
+        if self.spawn_facts[usize(state)] & SIGNAL_SOURCE != 0 {
+            return false
+        }
+        if self.facts.fluid(state) != 0 {
+            return false
+        }
+        if self.facts.in_set(state, self.prevent_inside) {
+            return false
+        }
+        return not self.dangerous(type_id, state)
+    }
+
+    // Whether the state's fluid is in the fluid tag `name`, as `FluidState.is` reads it.
+    fn fluid_in(self, state: u32, name: str) -> bool {
+        return self.facts.fluid_in(state, String(name))
+    }
+}
+
+// The block `name`'s ID.
+fn block_id(facts: Facts, name: str) -> u32 ! String {
+    let b = facts.block_named(String(name)) else fail "there's no block {name}"
+    return b
+}
+
+/// What spawning reads of a dimension that stays the same: what spawns in each biome, and the
+/// biome tags and attributes its rules read.
+pub struct Mobs {
+    /// Each biome's mobs, by the biome's ID: the biome's `natural_mob_spawns` over the dimension
+    /// type's.
+    pub by_biome: List<MobSettings>
+    /// Each biome's attribute map, as the registries keep it, and whether it's in
+    /// `#reduced_water_ambient_spawns` and `#allows_surface_slime_spawns`.
+    pub attributes: List<Tag>
+    pub reduced_water: List<bool>
+    pub surface_slimes: List<bool>
+}
+
+/// What spawning reads of a level this tick.
+pub struct SpawnPlace {
+    /// The world's bottom and the generator's sea level.
+    pub min_y: i32
+    pub sea_level: i32
+    /// The world's seed, which slime chunks hang on.
+    pub seed: i64
+    pub peaceful: bool
+    pub thundering: bool
+    /// How far the sky's light is under 15, `skyDarken`.
+    pub sky_darken: i32
+    /// The border's edges, as `isWithinBounds` reads them.
+    pub min_x: f64
+    pub max_x: f64
+    pub min_z: f64
+    pub max_z: f64
+    /// The world's spawn, `getRespawnData`'s position, where it's in this level.
+    pub respawn: (i32, i32, i32)?
+    /// The level's players, in the order `players()` has them.
+    pub players: List<SpawnerPlayer>
+    /// The dimension type's `monster_spawn_light_level` and `monster_spawn_block_light_limit`.
+    pub light_test: IntProvider
+    pub block_light_limit: i32
+    /// Each biome's `surface_slime_spawn_chance` this tick, by its ID.
+    pub slime_chances: List<f32>
+}
+
+impl SpawnPlace {
+    // `WorldBorder.isWithinBounds(x, z)`.
+    fn within(self, x: f64, z: f64) -> bool {
+        return x >= self.min_x and x < self.max_x and z >= self.min_z and z < self.max_z
+    }
+}
+
+/// `MobCategory.getDespawnDistance`.
+fn despawn_distance(category: i32) -> i32 {
+    return if category == WATER_AMBIENT { 64 } else { 128 }
+}
+
+/// `MobCategory.isFriendly` and `isPersistent`, and `getMaxInstancesPerChunk`.
+pub fn friendly(category: i32) -> bool {
+    return category != MONSTER
+}
+
+pub fn persistent(category: i32) -> bool {
+    return category == CREATURE or category == MISC
+}
+
+pub fn max_per_chunk(category: i32) -> i32 {
+    if category == MONSTER {
+        return 70
+    }
+    if category == CREATURE {
+        return 10
+    }
+    if category == AMBIENT {
+        return 15
+    }
+    if category == WATER_AMBIENT {
+        return 20
+    }
+    if category == MISC {
+        return -1
+    }
+    return 5
+}
+
+/// The categories that may spawn this tick, `getFilteredSpawningCategories`: each but `MISC`, in
+/// order, that's friendly or `enemies` lets spawn, that isn't persistent or `persistent` lets
+/// spawn, and that's under its cap for the `chunks` the natural spawn counter counts. With no
+/// mobs, it's under its cap wherever its cap is above nothing.
+pub fn spawning_categories(enemies: bool, persistent_too: bool, chunks: i32) -> List<i32> {
+    var out = List<i32>()
+    for c in [MONSTER, CREATURE, AMBIENT, AXOLOTLS, UNDERGROUND_WATER_CREATURE, WATER_CREATURE, WATER_AMBIENT] {
+        if not enemies and not friendly(c) {
+            continue
+        }
+        if not persistent_too and persistent(c) {
+            continue
+        }
+        if 0 < max_per_chunk(c) * chunks / 289 {
+            out.push(c)
+        }
+    }
+    return out
+}
+
+/// `Mth.ceil` of a float.
+fn ceil_float(f: f32) -> i32 {
+    let i = i32.saturate(f64(f))
+    return if f > f32.nearest(i) { i + 1 } else { i }
+}
+
+/// `NaturalSpawner.spawnForChunk` for the chunk at `chunk_x`, `chunk_z`: each of `spawning` in
+/// turn, as `spawnCategoryForChunk` spawns it, drawing from `r`, the level's random.
+pub fn spawn_for_chunk<L: SpawnLevel + CollisionBlocks, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, chunk_x: i32, chunk_z: i32, spawning: List<i32>, r: mut T) ! Thrown {
+    for c in spawning {
+        try spawn_category_for_chunk(n, mobs, place, mut level, chunk_x, chunk_z, c, mut r)
+    }
+}
+
+// `spawnCategoryForChunk`: a place in the chunk, as `getRandomPosWithin` picks it, a column and
+// a height from the world's bottom up to one above the column's top. One at the bottom spawns
+// nothing.
+fn spawn_category_for_chunk<L: SpawnLevel + CollisionBlocks, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, chunk_x: i32, chunk_z: i32, category: i32, r: mut T) ! Thrown {
+    let x = chunk_x * 16 + r.next_int_below(16)
+    let z = chunk_z * 16 + r.next_int_below(16)
+    let surface = level.surface(WORLD_SURFACE, x, z)
+    let y = r.next_int_below(surface - place.min_y + 1) + place.min_y
+    if y < place.min_y + 1 {
+        return
+    }
+    try spawn_category_for_position(n, mobs, place, mut level, chunk_x, chunk_z, category, x, y, z, mut r)
+}
+
+// `spawnCategoryForPosition`: nothing in a block that conducts redstone. Then three packs, each
+// of up to four steps, each a random walk of up to five blocks on x and z from the place, the
+// first step's place picking the pack's mob and its size, which bounds the pack's steps from
+// there.
+fn spawn_category_for_position<L: SpawnLevel + CollisionBlocks, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, chunk_x: i32, chunk_z: i32, category: i32, x: i32, y: i32, z: i32, r: mut T) ! Thrown {
+    if n.facts.redstone_conductor(level.spawn_state(x, y, z)) {
+        return
+    }
+    for _ in 0..3 {
+        var px = x
+        var pz = z
+        var data: Spawner? = none
+        var size = ceil_float(r.next_float() * 4.0f32)
+        var step = 0
+        while step < size {
+            px += r.next_int_below(6) - r.next_int_below(6)
+            pz += r.next_int_below(6) - r.next_int_below(6)
+            step += 1
+            let fx = f64(px) + 0.5
+            let fz = f64(pz) + 0.5
+            let found = nearest_player(place.players, fx, f64(y), fz) else continue
+            let (_, d) = found
+            if not right_distance(place, level, chunk_x, chunk_z, px, y, pz, d) {
+                continue
+            }
+            if data == none {
+                let picked = try random_mob(mobs, mut level, category, px, y, pz, mut r) else break
+                size = try picked.count.sample(mut r)
+                data = some(picked)
+            }
+            let spawner = data else continue
+            if not try valid_position_for_type(n, mobs, place, mut level, category, spawner, px, y, pz, d, mut r) {
+                continue
+            }
+            // The spawn potential, with no mobs, lets any spawn, and vanilla makes the mob here,
+            // which Calcite doesn't have.
+            return
+        }
+    }
+}
+
+// The nearest player to the place that isn't a spectator, and their distance squared, as
+// `getNearestPlayer` with no limit finds them: the first of the nearest, in the level's order.
+fn nearest_player(players: List<SpawnerPlayer>, x: f64, y: f64, z: f64) -> (usize, f64)? {
+    var best: (usize, f64)? = none
+    for i in 0..players.len() {
+        let p = players[i]
+        if p.spectator {
+            continue
+        }
+        let dx = p.x - x
+        let dy = p.y - y
+        let dz = p.z - z
+        let d = dx * dx + dy * dy + dz * dz
+        match best {
+            some((_, b)) => {
+                if d < b {
+                    best = some((i, d))
+                }
+            },
+            none => best = some((i, d)),
+        }
+    }
+    return best
+}
+
+// `isRightDistanceToPlayerAndSpawnPoint`: more than 24 blocks from the player, and from the
+// middle of the world's spawn if it's in this level, in the chunk being spawned in or one whose
+// entities tick within the border.
+fn right_distance<L: SpawnLevel>(place: SpawnPlace, level: L, chunk_x: i32, chunk_z: i32, x: i32, y: i32, z: i32, d: f64) -> bool {
+    if d <= 576.0 {
+        return false
+    }
+    if let (sx, sy, sz) = place.respawn {
+        let dx = f64(sx) + 0.5 - (f64(x) + 0.5)
+        let dy = f64(sy) + 0.5 - f64(y)
+        let dz = f64(sz) + 0.5 - (f64(z) + 0.5)
+        if dx * dx + dy * dy + dz * dz < 576.0 {
+            return false
+        }
+    }
+    let cx = x >> 4
+    let cz = z >> 4
+    if cx == chunk_x and cz == chunk_z {
+        return true
+    }
+    return spawns_in(place, level, cx, cz)
+}
+
+/// `ServerLevel.canSpawnEntitiesInChunk`: its entities tick, and it's within the border, both its
+/// least and its greatest corner.
+pub fn spawns_in<L: SpawnLevel>(place: SpawnPlace, level: L, cx: i32, cz: i32) -> bool {
+    if not level.entities_tick(cx, cz) {
+        return false
+    }
+    return place.within(f64(cx * 16), f64(cz * 16)) and place.within(f64(cx * 16 + 15), f64(cz * 16 + 15))
+}
+
+// `getRandomSpawnMobAt`: in a biome of `#reduced_water_ambient_spawns`, a water ambient mob only
+// one time in fifty; otherwise one of what spawns there, by weight, if any.
+fn random_mob<L: SpawnLevel, T: RandomSource>(mobs: Mobs, level: mut L, category: i32, x: i32, y: i32, z: i32, r: mut T) -> Spawner? ! Thrown {
+    let biome = level.biome(x, y, z)
+    if category == WATER_AMBIENT and flag_of(mobs.reduced_water, biome) and r.next_float() < 0.98f32 {
+        return none
+    }
+    let list = mobs_at(mobs, biome, category)
+    var total = 0
+    for s in list {
+        total += s.weight
+    }
+    if total == 0 {
+        return none
+    }
+    var pick = r.next_int_below(total)
+    for s in list {
+        pick -= s.weight
+        if pick < 0 {
+            return some(s.copy())
+        }
+    }
+    return none
+}
+
+fn flag_of(flags: List<bool>, biome: i32) -> bool {
+    return biome >= 0 and usize.wrap(biome) < flags.len() and flags[usize.wrap(biome)]
+}
+
+// `mobsAt`: what spawns of the category in the biome.
+fn mobs_at(mobs: Mobs, biome: i32, category: i32) -> List<Spawner> {
+    if biome < 0 or usize.wrap(biome) >= mobs.by_biome.len() {
+        return List<Spawner>()
+    }
+    return mobs.by_biome[usize.wrap(biome)].mobs(category)
+}
+
+// `isValidSpawnPostitionForType`, in its order.
+fn valid_position_for_type<L: SpawnLevel + CollisionBlocks, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, category: i32, data: Spawner, x: i32, y: i32, z: i32, d: f64, r: mut T) -> bool ! Thrown {
+    let t = n.types[usize.wrap(data.type_id)]
+    if t.category == MISC {
+        return false
+    }
+    let far = despawn_distance(t.category)
+    if t.flags & FAR == 0 and d > f64(far * far) {
+        return false
+    }
+    if t.flags & SUMMON == 0 {
+        return false
+    }
+    var there = false
+    for s in mobs_at(mobs, level.biome(x, y, z), category) {
+        if s.same(data) {
+            there = true
+            break
+        }
+    }
+    if not there {
+        return false
+    }
+    if not position_ok(n, place, level, data.type_id, x, y, z) {
+        return false
+    }
+    if not try spawn_rules(n, mobs, place, mut level, data.type_id, x, y, z, mut r) {
+        return false
+    }
+    let fx = f64(x) + 0.5
+    let fz = f64(z) + 0.5
+    let half = f64(t.half_width)
+    let b = Aabb { min_x: fx - half, min_y: f64(y), min_z: fz - half, max_x: fx + half, max_y: f64(y) + f64(t.height), max_z: fz + half }
+    return n.collisions.no_collision_without_fluids(level, b, n.liquid)
+}
+
+// `SpawnPlacements.isSpawnPositionOk`: the type's placement's check, within the border.
+fn position_ok<L: SpawnLevel>(n: Natural, place: SpawnPlace, level: L, type_id: i32, x: i32, y: i32, z: i32) -> bool {
+    let t = n.types[usize.wrap(type_id)]
+    let placement = t.placement ?? NO_RESTRICTIONS
+    if placement == NO_RESTRICTIONS {
+        return true
+    }
+    if not place.within(f64(x), f64(z)) {
+        return false
+    }
+    if placement == IN_WATER {
+        return n.fluid_in(level.spawn_state(x, y, z), "minecraft:water") and not n.facts.redstone_conductor(level.spawn_state(x, y + 1, z))
+    }
+    if placement == IN_LAVA {
+        return n.fluid_in(level.spawn_state(x, y, z), "minecraft:lava")
+    }
+    // On the ground: on a block it may spawn on, with room in its block and the one above.
+    if not n.valid_spawn(level.spawn_state(x, y - 1, z), t) {
+        return false
+    }
+    return n.empty_spawn_block(level.spawn_state(x, y, z), type_id) and n.empty_spawn_block(level.spawn_state(x, y + 1, z), type_id)
+}
+
+// `SpawnPlacements.checkSpawnRules`: none in peaceful for a type that isn't allowed in it, then
+// its rule, if it's registered one.
+fn spawn_rules<L: SpawnLevel, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, type_id: i32, x: i32, y: i32, z: i32, r: mut T) -> bool ! Thrown {
+    let t = n.types[usize.wrap(type_id)]
+    if t.flags & PEACEFUL == 0 and place.peaceful {
+        return false
+    }
+    let at = t.rule else return true
+    let rule = n.rules[usize.wrap(at)]
+    return match rule {
+        Rule.Mob => mob_rules(n, level, t, x, y, z),
+        Rule.Monster => try monster_rules(n, place, level, t, x, y, z, mut r),
+        Rule.AnyLightMonster => mob_rules(n, level, t, x, y, z),
+        Rule.SurfaceMonster => try monster_rules(n, place, level, t, x, y, z, mut r) and level.light(true, x, y, z) >= 15,
+        Rule.Animal => {
+            let bright = raw_brightness(level, x, y, z, 0) > 8
+            n.facts.in_set(level.spawn_state(x, y - 1, z), n.animals_on) and bright
+        },
+        Rule.Bat => bat_rules(n, place, level, t, x, y, z, mut r),
+        Rule.Slime => try slime_rules(n, mobs, place, mut level, t, x, y, z, mut r),
+        Rule.GlowSquid => y <= place.sea_level - 33 and raw_brightness(level, x, y, z, 0) == 0 and n.facts.is(level.spawn_state(x, y, z), n.water),
+        Rule.SurfaceWater => y >= place.sea_level - 13 and y <= place.sea_level and n.fluid_in(level.spawn_state(x, y - 1, z), "minecraft:water") and n.facts.is(level.spawn_state(x, y + 1, z), n.water),
+        Rule.Unknown => false,
+    }
+}
+
+// `Mob.checkMobSpawnRules`: on a block the type may spawn on.
+fn mob_rules<L: SpawnLevel>(n: Natural, level: L, t: TypeFacts, x: i32, y: i32, z: i32) -> bool {
+    return n.valid_spawn(level.spawn_state(x, y - 1, z), t)
+}
+
+// `Monster.checkMonsterSpawnRules`: dark enough, as `isDarkEnoughToSpawn` says, and
+// `checkMobSpawnRules`.
+fn monster_rules<L: SpawnLevel, T: RandomSource>(n: Natural, place: SpawnPlace, level: L, t: TypeFacts, x: i32, y: i32, z: i32, r: mut T) -> bool ! Thrown {
+    if not try dark_enough(place, level, x, y, z, mut r) {
+        return false
+    }
+    return mob_rules(n, level, t, x, y, z)
+}
+
+// `Monster.isDarkEnoughToSpawn`: the sky's light under a draw of 32, the blocks' no more than
+// the type's limit, and the brightest light there, the sky's darkened as in a thunderstorm in
+// one, no more than a draw of the type's test.
+fn dark_enough<L: SpawnLevel, T: RandomSource>(place: SpawnPlace, level: L, x: i32, y: i32, z: i32, r: mut T) -> bool ! Thrown {
+    if level.light(true, x, y, z) > r.next_int_below(32) {
+        return false
+    }
+    if place.block_light_limit < 15 and level.light(false, x, y, z) > place.block_light_limit {
+        return false
+    }
+    let darken = if place.thundering { 10 } else { place.sky_darken }
+    let light = raw_brightness(level, x, y, z, darken)
+    return light <= try place.light_test.sample(mut r)
+}
+
+// `getMaxLocalRawBrightness` with `darken`: the block's light or the sky's less `darken`,
+// whichever's more; 15 past 30,000,000 blocks out.
+fn raw_brightness<L: SpawnLevel>(level: L, x: i32, y: i32, z: i32, darken: i32) -> i32 {
+    if x < -30000000 or z < -30000000 or x >= 30000000 or z >= 30000000 {
+        return 15
+    }
+    let sky = level.light(true, x, y, z) - darken
+    let block = level.light(false, x, y, z)
+    return if block > sky { block } else { sky }
+}
+
+// `Bat.checkBatSpawnRules`: below the surface, half the time, in light under a draw of 4, on a
+// block bats spawn on.
+fn bat_rules<L: SpawnLevel, T: RandomSource>(n: Natural, place: SpawnPlace, level: L, t: TypeFacts, x: i32, y: i32, z: i32, r: mut T) -> bool {
+    if y >= level.surface(WORLD_SURFACE, x, z) {
+        return false
+    }
+    if r.next_boolean() {
+        return false
+    }
+    if raw_brightness(level, x, y, z, place.sky_darken) > r.next_int_below(4) {
+        return false
+    }
+    if not n.facts.in_set(level.spawn_state(x, y - 1, z), n.bats_on) {
+        return false
+    }
+    return mob_rules(n, level, t, x, y, z)
+}
+
+// `Slime.checkSlimeSpawnRules`: none in peaceful. In a biome of `#allows_surface_slime_spawns`
+// from 51 to 69 high, at the biome's chance and in light no more than a draw of 8; otherwise one
+// in ten in a slime chunk under 40 high, the draw made whatever the chunk.
+fn slime_rules<L: SpawnLevel, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, t: TypeFacts, x: i32, y: i32, z: i32, r: mut T) -> bool ! Thrown {
+    if place.peaceful {
+        return false
+    }
+    if flag_of(mobs.surface_slimes, level.biome(x, y, z)) and y > 50 and y < 70 {
+        let quart = level.noise_biome(x >> 2, y >> 2, z >> 2)
+        let chance = if quart >= 0 and usize.wrap(quart) < place.slime_chances.len() { place.slime_chances[usize.wrap(quart)] } else { 0.0f32 }
+        if r.next_float() < chance and raw_brightness(level, x, y, z, place.sky_darken) <= r.next_int_below(8) {
+            return mob_rules(n, level, t, x, y, z)
+        }
+    }
+    let in_slime_chunk = slime_chunk(x >> 4, z >> 4, place.seed)
+    if r.next_int_below(10) == 0 and in_slime_chunk and y < 40 {
+        return mob_rules(n, level, t, x, y, z)
+    }
+    return false
+}
+
+/// Whether the chunk is a slime chunk, as `WorldgenRandom.seedSlimeChunk` seeds a random for it
+/// with the world's `seed`: one in ten.
+pub fn slime_chunk(cx: i32, cz: i32, seed: i64) -> bool {
+    let s = (seed + i64(cx * cx * 4987142) + i64(cx * 5947611) + i64(cz * cz) * 4392871 + i64(cz * 389711)) ^ 987234911
+    var r = LegacyRandom.new(s)
+    return r.next_int_below(10) == 0
+}

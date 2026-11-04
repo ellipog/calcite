@@ -16,6 +16,8 @@ IDs the protocol needs, which every compatible server encodes:
   can't pass between, from the same file (CAL-66).
 - `world.collision_shapes`: each block state's collision shape, as the spawn finder sees it, and
   the boxes of each, from the same file (CAL-75).
+- `world.entity_facts`: what natural spawning asks of each entity type and block state, from
+  entity_facts.json, which oracle/datagen/entity_facts.py writes beside the tables (D317).
 """
 
 import argparse
@@ -790,6 +792,143 @@ def collision_module(index, flags):
     ]
     return "\n".join(lines)
 
+# What entity_facts.json gives each type, as calcite.rig.vanilla.EntityFacts sets them, a bit each.
+TYPE_FLAGS = [
+    ("SUMMON", "summon", "`canSummon`"),
+    ("FIRE_IMMUNE", "fire_immune", "`fireImmune`"),
+    ("FAR", "far", "`canSpawnFarFromPlayer`: it spawns however far it is from players"),
+    ("PEACEFUL", "peaceful", "`isAllowedInPeaceful`"),
+]
+# Vanilla's spawn placement types, as entity_facts.json names them.
+PLACEMENTS = ["no_restrictions", "in_water", "in_lava", "on_ground"]
+# `Heightmap.Types`, in its order, which world.chunk's kinds are in.
+HEIGHTMAPS = ["WORLD_SURFACE_WG", "WORLD_SURFACE", "OCEAN_FLOOR_WG", "OCEAN_FLOOR", "MOTION_BLOCKING", "MOTION_BLOCKING_NO_LEAVES"]
+
+
+def calx_float(v):
+    """A float as a Calx f32 literal that reads back as the same float."""
+    text = repr(float(v))
+    if "e" not in text and "." not in text:
+        text += ".0"
+    return text + "f32"
+
+
+def entity_facts_module(index, facts):
+    """The text of src/world/entity_facts.calx."""
+    if facts["game_version"] != index["game_version"]:
+        raise ValueError(f"entity_facts.json is {facts['game_version']}, the tables {index['game_version']}")
+    groups = facts["spawn_groups"]
+    for state, v in enumerate(facts["states"]):
+        if v >> (1 + groups):
+            raise ValueError(f"state {state}'s spawn facts {v:#x} have bits this script doesn't know")
+    categories = facts["categories"]
+    rules = sorted({t["rule"] for t in facts["types"] if "rule" in t})
+    immune = []
+    for t in facts["types"]:
+        if t["immune_to"] not in immune:
+            immune.append(t["immune_to"])
+    quoted = ", ".join('"' + c + '"' for c in categories)
+    serialized = ", ".join('"' + c.lower() + '"' for c in categories)
+    lines = [
+        f"/// What vanilla {index['game_version']}'s natural spawning asks of each entity type, in type ID order, and of each",
+        "/// block state, in state ID order. Written by oracle/datagen/calx_tables.py from entity_facts.json",
+        "/// (D317): don't edit it.",
+        "module world.entity_facts",
+        "",
+        "/// The mob categories, in `MobCategory` order, which a type's `category` is a place in.",
+        "pub fn categories() -> List<String> {",
+        f"    return [{quoted}]",
+        "}",
+        "",
+        "/// The categories' serialized names, as codecs read and write them, in the same order.",
+        "pub fn category_names() -> List<String> {",
+        f"    return [{serialized}]",
+        "}",
+        "",
+    ]
+    for i, c in enumerate(categories):
+        lines += [f"pub const {c}: i32 = {i}"]
+    lines += [""]
+    for i, (name, _, what) in enumerate(TYPE_FLAGS):
+        lines += [f"/// {what}.", f"pub const {name}: u32 = {1 << i}"]
+    lines += [""]
+    for i, p in enumerate(PLACEMENTS):
+        lines += [f"/// `SpawnPlacementTypes.{p.upper()}`.", f"pub const {p.upper()}: i32 = {i}"]
+    lines += [
+        "",
+        "/// A state is a signal source, in its spawn facts.",
+        "pub const SIGNAL_SOURCE: u32 = 1",
+        "/// Where the spawn groups' bits are in a state's spawn facts: `isValidSpawn` holds on the state",
+        "/// for the types of group `g` where bit `VALID_SPAWN_SHIFT + g` is set.",
+        "pub const VALID_SPAWN_SHIFT: u32 = 1",
+        "/// How many spawn groups there are.",
+        f"pub const SPAWN_GROUPS: i32 = {groups}",
+        "",
+        "/// The methods the types' spawn rules call, as `Owner.method`, which a type's `rule` is a place",
+        "/// in.",
+        "pub fn rules() -> List<String> {",
+        "    return [",
+    ]
+    lines += [f'        "{r}",' for r in rules]
+    lines += [
+        "    ]",
+        "}",
+        "",
+        "/// The block tags the types are immune to, as `isBlockDangerous` reads them, in the order the",
+        "/// types first name them, which a type's `immune_to` is a place in.",
+        "pub fn immune_tags() -> List<String> {",
+        "    return [",
+    ]
+    lines += [f'        "{name}",' for name in immune]
+    lines += [
+        "    ]",
+        "}",
+        "",
+        "/// What natural spawning asks of an entity type.",
+        "pub struct TypeFacts {",
+        "    /// Its place in `categories`.",
+        "    pub category: i32",
+        "    /// Its flags, from those above.",
+        "    pub flags: u32",
+        "    /// The block tag it's immune to, as its place in `immune_tags`.",
+        "    pub immune_to: i32",
+        "    /// Half its spawn box's width, and its height, as `getSpawnAABB` works them out.",
+        "    pub half_width: f32",
+        "    pub height: f32",
+        "    /// Its spawn group: which states `isValidSpawn` holds on for it.",
+        "    pub spawn_group: i32",
+        "    /// Where `SpawnPlacements` registers it, its placement type and its place in `rules`, or",
+        "    /// none where it isn't; and its heightmap, of world.chunk's kinds.",
+        "    pub placement: i32?",
+        "    pub heightmap: i32",
+        "    pub rule: i32?",
+        "}",
+        "",
+        "/// Each type's facts, in type ID order.",
+        "pub fn types() -> List<TypeFacts> {",
+        "    return [",
+    ]
+    for t in facts["types"]:
+        flags = sum(1 << i for i, (_, key, _) in enumerate(TYPE_FLAGS) if t[key])
+        placed = "rule" in t
+        placement = f"some({PLACEMENTS.index(t['placement'])})" if placed else "none"
+        heightmap = HEIGHTMAPS.index(t["heightmap"]) if placed else HEIGHTMAPS.index("MOTION_BLOCKING_NO_LEAVES")
+        rule = f"some({rules.index(t['rule'])})" if placed else "none"
+        lines.append(f"        // {t['id']}")
+        lines.append(
+            f"        TypeFacts {{ category: {categories.index(t['category'])}, flags: {flags}, immune_to: {immune.index(t['immune_to'])}, "
+            f"half_width: {calx_float(t['half_width'])}, height: {calx_float(t['height'])}, spawn_group: {t['spawn_group']}, "
+            f"placement: {placement}, heightmap: {heightmap}, rule: {rule} }},"
+        )
+    lines += [
+        "    ]",
+        "}",
+        "",
+        "/// Each state's spawn facts, in state ID order.",
+    ]
+    lines += encoded_table("state_spawn_facts", "facts", facts["states"])
+    return "\n".join(lines)
+
 
 def outputs(tables, version=VERSION):
     index = json.loads((tables / "index.json").read_text(encoding="utf-8"))
@@ -798,6 +937,7 @@ def outputs(tables, version=VERSION):
     blocks = json.loads((tables / "blocks.json").read_text(encoding="utf-8"))
     pins = json.loads((CALCITE / "oracle" / "versions.json").read_text(encoding="utf-8"))
     flags = json.loads((tables.parent / "block_flags.json").read_text(encoding="utf-8"))
+    entities = json.loads((tables.parent / "entity_facts.json").read_text(encoding="utf-8"))
     return {
         CALCITE / "src" / "protocol" / "ids.calx": ids_module(index, packets),
         CALCITE / "src" / "registry" / "builtin.calx": builtin_module(index, registries),
@@ -807,6 +947,7 @@ def outputs(tables, version=VERSION):
         CALCITE / "src" / "world" / "block_facts.calx": block_facts_module(index, flags),
         CALCITE / "src" / "world" / "light_faces.calx": light_faces_module(index, flags),
         CALCITE / "src" / "world" / "collision_shapes.calx": collision_module(index, flags),
+        CALCITE / "src" / "world" / "entity_facts.calx": entity_facts_module(index, entities),
     }
 
 
@@ -823,6 +964,9 @@ def main():
         return 2
     if not (args.tables.parent / "block_flags.json").exists():
         print(f"no block_flags.json beside {args.tables}: run oracle/datagen/block_flags.py first", file=sys.stderr)
+        return 2
+    if not (args.tables.parent / "entity_facts.json").exists():
+        print(f"no entity_facts.json beside {args.tables}: run oracle/datagen/entity_facts.py first", file=sys.stderr)
         return 2
     stale = []
     for path, text in outputs(args.tables, args.version).items():

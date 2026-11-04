@@ -56,9 +56,13 @@ import world.clocks.{saved_id as clocks_id}
 import world.collision.{Aabb, CollisionStates}
 import world.weather.{WeatherLevels, advance as advance_weather, joining as weather_joining, saved_id as weather_id}
 import world.flat.{MIN_Y, SECTIONS, SURFACE_Y}
+import worldgen.providers.{IntProvider}
 import world.item.{ItemStack}
-import world.modes.{GameType, PreviousGameType}
+import world.modes.{Difficulty, GameType, PreviousGameType}
 import world.pos.{BlockPos, ChunkPos}
+import world.entity_facts.{MONSTER}
+import world.environment.{surface_slime_spawn_chance}
+import world.natural.{SpawnPlace, spawn_for_chunk, spawning_categories, spawns_in}
 import world.spawners.{SpawnerPlayer, SpawnerView, Spawners, trader_id}
 import world.spawn.{BORDER_HALF, Candidate, DEFAULT_RESPAWN_RADIUS, SpawnSearch, border_distance, candidate_count, fits, fixup_height, search_radius}
 
@@ -511,6 +515,8 @@ impl Network {
         for d in 0..given.dims.len() {
             var level = Level.new(given.settings.chunk_radius(), given.settings.simulation_distance)
             level.set_dimension(d)
+            level.set_bounds(given.dims[d].min_y, given.dims[d].height, given.settings.hashed_seed)
+            level.set_flat_light(given.dims[d].ground.light())
             if let flat = given.dims[d].ground.take_chunk() {
                 level.ground(flat)
             }
@@ -1393,10 +1399,28 @@ impl Network {
                 near.push((p.x, p.z))
             }
         }
+        // The categories that may spawn, `getFilteredSpawningCategories`, while `spawn_mobs` is
+        // on: creatures only every 400 ticks (D317).
+        var spawning = List<i32>()
+        if self.world.spawn_rules.mobs {
+            let counted = self.levels[d].natural_spawn_chunk_count()
+            spawning = spawning_categories(self.world.spawn_rules.enemies(), self.world.game_time % 400 == 0, counted)
+        }
         var chunks = self.levels[d].spawning_chunks(near)
         shuffle(mut chunks, mut self.world.dims[d].random)
+        var place: SpawnPlace? = none
+        var kept = List<ChunkPos>()
+        if not spawning.is_empty() and self.world.natural_ready() {
+            for pos in chunks {
+                if self.levels[d].entities_tick(pos.x, pos.z) {
+                    kept.push(pos)
+                }
+            }
+            place = some(self.spawn_place(d, players.copy(), spawning))
+        }
+        self.levels[d].keep_light(kept)
         for pos in chunks {
-            self.tick_spawning_chunk(d, pos)
+            self.tick_spawning_chunk(d, pos, spawning, place)
         }
         if d != 0 or not self.world.spawn_rules.mobs {
             return
@@ -1407,16 +1431,76 @@ impl Network {
     }
 
     // A chunk mobs may spawn in, as `tickSpawningChunk` ticks it (D315). Its inhabited time goes
-    // up a tick, which waits for what reads it, the local difficulty. If its entities tick, it's
-    // `tickThunder`: in a thunderstorm, one in 100,000 strikes, and the strike, with its bolt
-    // and maybe a skeleton trap, comes with entities. Then natural spawning, while `spawn_mobs`
-    // is on, comes with the mobs.
-    fn tick_spawning_chunk(mut self, d: usize, pos: ChunkPos) {
-        if not self.levels[d].entity_ticking(pos) {
+    // up a tick, which waits for what reads it, the local difficulty. If it's in range for its
+    // entities to tick, it's `tickThunder`: in a thunderstorm, one in 100,000 strikes, and the
+    // strike, with its bolt and maybe a skeleton trap, comes with entities. Then, if any
+    // category may spawn and the chunk's entities tick within the border, natural spawning
+    // (D317), at `place`.
+    fn tick_spawning_chunk(mut self, d: usize, pos: ChunkPos, spawning: List<i32>, place: SpawnPlace?) {
+        if self.levels[d].entity_ticking(pos) and self.world.dims[d].weathered and self.world.dims[d].weather.raining() and self.world.dims[d].weather.thundering() {
+            _ = self.world.dims[d].random.next_int_below(100000)
+        }
+        if spawning.is_empty() {
             return
         }
-        if self.world.dims[d].weathered and self.world.dims[d].weather.raining() and self.world.dims[d].weather.thundering() {
-            _ = self.world.dims[d].random.next_int_below(100000)
+        let p = place else return
+        if not spawns_in(p, self.levels[d], pos.x, pos.z) {
+            return
+        }
+        // Taken out while it runs, as it reads the world while the level and the random change.
+        let n = self.world.natural.take() else return
+        var thrown: String? = none
+        match spawn_for_chunk(n, self.world.mobs[d], p, mut self.levels[d], pos.x, pos.z, spawning, mut self.world.dims[d].random) {
+            ok => {},
+            err(e) => thrown = some("{e.exception}: {e.message}"),
+        }
+        self.world.natural = some(n)
+        if let e = thrown {
+            self.logs.push(Entry.error("Natural spawning in {pos.x}, {pos.z} threw {e}"))
+        }
+    }
+
+    // What natural spawning reads of the level at `d` this tick (D317): its players, the
+    // world's spawn if it's in this level, the difficulty, the thunder and the sky, the border,
+    // its type's light for monsters, and, if monsters may spawn, each biome's chance of a slime
+    // on the surface.
+    fn spawn_place(mut self, d: usize, players: own List<SpawnerPlayer>, spawning: List<i32>) -> SpawnPlace {
+        var respawn: (i32, i32, i32)? = none
+        let here = self.world.dims[d].id.copy()
+        if self.respawn.dimension.namespace == here.namespace and self.respawn.dimension.path == here.path {
+            respawn = some((self.respawn.pos.x, self.respawn.pos.y, self.respawn.pos.z))
+        }
+        let peaceful = self.world.settings.difficulty == Difficulty.Peaceful
+        var chances = List<f32>()
+        if not peaceful and spawning.contains(MONSTER) {
+            let at = surface_slime_spawn_chance()
+            let rain = self.world.dims[d].weather.rain_level()
+            let thunder = self.world.dims[d].weather.thunder_level()
+            for b in 0..self.world.mobs[d].attributes.len() {
+                let biome = self.world.mobs[d].attributes[b].copy()
+                chances.push(self.world.dims[d].environment.value_at(at, biome, self.world.clocks, rain, thunder).number)
+            }
+        }
+        let border = self.world.dims[d].border
+        return SpawnPlace {
+            min_y: self.world.dims[d].min_y,
+            sea_level: self.world.dims[d].sea_level,
+            seed: self.world.seed,
+            peaceful: peaceful,
+            thundering: self.world.dims[d].weathered and self.world.dims[d].weather.thundering(),
+            sky_darken: self.world.dims[d].sky_darken,
+            min_x: border.min_x(),
+            max_x: border.max_x(),
+            min_z: border.min_z(),
+            max_z: border.max_z(),
+            respawn: respawn,
+            players: players,
+            light_test: match self.world.dims[d].light_test {
+                some(p) => p.copy(),
+                none => IntProvider.Constant(0),
+            },
+            block_light_limit: self.world.dims[d].block_light_limit,
+            slime_chances: chances,
         }
     }
 

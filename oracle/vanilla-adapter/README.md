@@ -71,6 +71,7 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `ChunkNbtProbe.java` | `chunk_nbt`: a chunk's NBT read by `SerializableChunkData.parse` and written back by its `write`, with the data pack's biomes, and what it logs, caught by an appender on the root logger |
 | `LightProbe.java` | `light`: a `LevelLightEngine` over `ProtoChunk`s the case makes, each with its own `ChunkSkyLightSources`, through a `LightChunkGetter` over a map, called as `ThreadedLevelLightEngine` calls it, with blocks set as generation sets them or as `LevelChunk.setBlockState` tells light |
 | `BlockFlags.java` | Not a probe: writes each block state's flags from vanilla's state cache, and the faces light sees of each, run by `oracle/datagen/block_flags.py` |
+| `EntityFacts.java` | Not a probe: writes what natural spawning asks of each entity type and block state, each type's spawn placement read from `SpawnPlacements`' class initializer, run by `oracle/datagen/entity_facts.py` (D317) |
 | `PacketCheck.java` | Vanilla reading Calcite's packets, run by `check_packets.py` |
 | `ChatCheck.java` | Vanilla's client checking the signed chat in `build/packets/chat/`, run by `check_packets.py` |
 | `SessionDump.java` | Vanilla reading the protocol bot's sessions, as trees, run by `rig/runner/sessions.py` |
