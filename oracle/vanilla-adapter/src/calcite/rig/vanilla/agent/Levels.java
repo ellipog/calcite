@@ -36,14 +36,31 @@ public final class Levels {
         if (level.dimension() == Level.OVERWORLD) {
             counter().set(0);
         }
-        level.getRandom().setSeed(RandomSupport.mixStafford13(Tape.seed() ^ name.hashCode()));
+        seed(level, name);
         Tape.watch(level.getRandom(), name, level::getGameTime);
     }
 
     /**
+     * Seeds {@code level}'s random, and sets the value {@code getBlockRandomPos} steps, which
+     * picks where random ticks and precipitation land, to the seed's low 32 bits, where vanilla
+     * starts it from a random of the thread's own (D318).
+     */
+    private static void seed(ServerLevel level, String name) {
+        long seed = RandomSupport.mixStafford13(Tape.seed() ^ name.hashCode());
+        level.getRandom().setSeed(seed);
+        try {
+            Field f = Level.class.getDeclaredField("randValue");
+            f.setAccessible(true);
+            f.setInt(level, (int) seed);
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("agent: Level has no randValue", e);
+        }
+    }
+
+    /**
      * As {@code level}'s tick starts: the first time it's at the reseed time or later, its random
-     * is seeded again as {@link #made} seeded it, so the two servers' draws line up again from
-     * there, whatever each drew before (D316).
+     * is seeded again as {@link #made} seeded it, with its {@code randValue}, so the two servers'
+     * draws line up again from there, whatever each drew before (D316, D318).
      */
     public static void ticking(ServerLevel level) {
         if (reseedAt < 0 || level.getGameTime() < reseedAt) {
@@ -51,7 +68,7 @@ public final class Levels {
         }
         String name = level.dimension().identifier().toString();
         if (reseeded.add(name)) {
-            level.getRandom().setSeed(RandomSupport.mixStafford13(Tape.seed() ^ name.hashCode()));
+            seed(level, name);
         }
     }
 

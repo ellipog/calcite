@@ -76,7 +76,7 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `ChatCheck.java` | Vanilla's client checking the signed chat in `build/packets/chat/`, run by `check_packets.py` |
 | `SessionDump.java` | Vanilla reading the protocol bot's sessions, as trees, run by `rig/runner/sessions.py` |
 | `agent/Agent.java` | The rig's Java agent: its arguments, and the two classes it changes as they load |
-| `agent/Levels.java` | What it does as each level's made: its random seeded, the entity counter set back |
+| `agent/Levels.java` | What it does as each level's made: its random seeded, with its `randValue` (D318), the entity counter set back |
 | `agent/Tape.java` | The RNG tape: each draw of a level's random, with where it was drawn |
 | `WorldCheck.java` | Vanilla reading a world it saved and the same world saved by Calcite, with `RegionFile`, `NbtIo` and Gson, and comparing them file by file and chunk by chunk, run by `rig/runner/roundtrip.py` (`G5.2`) |
 | `EnvironmentProbe.java` | `environment`: an `EnvironmentAttributeSystem` built as a level's but for the biomes, from a dimension type or a data pack's map and timelines, with every clock at the record's ticks and the record's rain and thunder, read by `getDimensionValue` |
@@ -93,10 +93,10 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 
 Vanilla isn't repeatable run to run. Each level's `random` is seeded from `RandomSupport.generateUniqueSeed()`, which mixes in `System.nanoTime()`, and the entity ID counter is a static `AtomicInteger`, `ServerLevel.ENTITY_COUNTER`. The Phase 1 probes touch neither. For what does, the build also writes `build/<platform>/agent.jar`, the rig's Java agent ([D311](../../docs/decisions.md)), and names it in `adapter.json`'s `agent`. A vanilla server started with `-javaagent:agent.jar=seed=N`:
 
-- seeds each level's random, as the level's made, with `mixStafford13(N ^ name.hashCode())`, the name its dimension's, such as `minecraft:overworld`. Calcite's `level-random-seed=N` seeds its own the same way;
+- seeds each level's random, as the level's made, with `mixStafford13(N ^ name.hashCode())`, the name its dimension's, such as `minecraft:overworld`, and sets the level's `randValue`, which picks where random ticks land, to the seed's low 32 bits, where vanilla starts it from a random of the thread's own ([D318](../../docs/decisions.md)). Calcite's `level-random-seed=N` seeds its own the same way;
 - sets the entity counter back to 0 as the Overworld's level is made, so the first entity is 1;
 - with `,tape=PATH` as well, writes each value a level's random draws to `PATH`, the RNG tape, a line each: the level, its game time, the bits drawn, the value, and the two frames of the stack that asked for it outside the random classes. As the JVM ends it adds `# end LEVEL TIME` for each level, its game time then. Calcite's `--rng-tape PATH` writes the same lines, without where each was drawn, and [`tapediff.py`](../../rig/runner/tapediff.py) lines the two up ([D312](../../docs/decisions.md));
-- with `,reseed=T` as well, seeds each level's random again as it was seeded, the first time the level's tick starts at game time T or later, as Calcite's `--rng-reseed T` does, so the tapes line up again from there whatever each server drew before ([D316](../../docs/decisions.md)).
+- with `,reseed=T` as well, seeds each level's random again as it was seeded, with its `randValue`, the first time the level's tick starts at game time T or later, as Calcite's `--rng-reseed T` does, so the tapes line up again from there whatever each server drew before ([D316](../../docs/decisions.md)).
 
 ```
 # seed 1103
