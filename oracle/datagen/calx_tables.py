@@ -463,6 +463,11 @@ def block_facts_module(index, flags):
     lines += number_list(
         "shape_classes", "classes", [where[c] if c else none for c in flags["shape_classes"]],
         [f"/// The class whose `updateShape` each block runs, by its index in `class_names`, in block ID order."])
+    for fn, method in [("neighbour_classes", "neighborChanged"), ("place_classes", "onPlace"),
+                       ("removal_classes", "affectNeighborsAfterRemoval"), ("tick_classes", "tick")]:
+        lines += number_list(
+            fn, "classes", [where[c] if c else none for c in flags[fn]],
+            [f"/// The class whose `{method}` each block runs, by its index in `class_names`, in block ID order (D325)."])
     lines += number_list(
         "flammable_blocks", "blocks", flags["flammable_blocks"],
         ["/// The blocks fire can burn, by ID: those `FireBlock`'s ignite odds are above 0 for."])
