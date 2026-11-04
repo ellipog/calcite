@@ -1,0 +1,426 @@
+/// What a fluid's scheduled tick does in the server's level: vanilla's `FlowingFluid.tick`, a
+/// fluid that isn't a source made again from those around it, then spread down and to the sides,
+/// the way down the slope to the nearest hole, with `WaterFluid`'s and `LavaFluid`'s own drop off,
+/// slope find distance, tick delays and source conversion, and lava flowing down onto water
+/// turning it to stone (D328, CAL-91). Whether a fluid passes between two blocks is
+/// `Facts.passes_wall` (D327). What a block washed away drops, and the sounds and block entities
+/// of the blocks that take water with them, aren't in Calcite yet: the level reports them.
+module world.flowing
+
+import random.source.{RandomSource}
+import world.block_updates.{BlockLevel, LAVA_FIZZ}
+import world.level_writer.{UPDATE_ALL, UPDATE_LIMIT}
+import worldgen.access.{BlockAccess}
+import worldgen.facts.{DOWN, EAST, EMPTY_FLUID, FLOWING_LAVA, FLOWING_WATER, Facts, LAVA_FLUID, NORTH, SOUTH, UP, WATER_FLUID, WEST, opposite, step_x, step_z}
+import worldgen.interval.{Thrown}
+import worldgen.survive.{Env}
+
+/// A fluid state: its fluid, by its ID in the fluid registry, `EMPTY_FLUID` for none; its
+/// amount, 8 for a source and 0 for none; and whether it's falling.
+pub struct Liquid {
+    pub fluid: u32
+    pub amount: i32
+    pub falling: bool
+}
+
+/// The fluid state the block `state` holds, `getFluidState`: a liquid block's flowing states
+/// from level 8 up are falling, with the amount 8.
+pub fn liquid_of(f: Facts, state: u32) -> Liquid {
+    let fluid = f.fluid(state)
+    let amount = f.fluid_amount(state)
+    return Liquid { fluid: fluid, amount: amount, falling: (fluid == FLOWING_WATER or fluid == FLOWING_LAVA) and amount == 8 }
+}
+
+/// `FluidState.isSource`.
+pub fn is_source(l: Liquid) -> bool {
+    return l.fluid == WATER_FLUID or l.fluid == LAVA_FLUID
+}
+
+/// `FluidState.createLegacyBlock`: air for none, else water's or lava's block with the level
+/// `getLegacyLevel` gives, 0 for a source, else 8 less the amount, and 8 more if it's falling.
+pub fn legacy(f: Facts, l: Liquid) -> u32 ! Thrown {
+    if l.fluid == EMPTY_FLUID {
+        return f.ids.air_state
+    }
+    let base = if l.fluid == LAVA_FLUID or l.fluid == FLOWING_LAVA { f.ids.lava_state } else { f.ids.water_state }
+    if is_source(l) {
+        return base
+    }
+    let level = 8 - l.amount.min(8) + if l.falling { 8 } else { 0 }
+    return try f.with_int(base, String("level"), level)
+}
+
+// The fluid whose tick runs, `this` in `FlowingFluid`: water or lava, its source and flowing
+// fluids, and what `WaterFluid` and `LavaFluid` say of it in this level: how much less it is a
+// block on, how far it looks for a way down, its tick delay, and whether two sources make a third.
+struct Flow {
+    fluid: u32
+    lava: bool
+    source: u32
+    flowing: u32
+    drop_off: i32
+    slope: i32
+    delay: i32
+    converts: bool
+}
+
+fn flow_of<L: BlockLevel>(level: L, fluid: u32) -> Flow {
+    let lava = fluid == LAVA_FLUID or fluid == FLOWING_LAVA
+    let fast = lava and level.is_fast_lava()
+    let slow = lava and not fast
+    return Flow {
+        fluid: fluid,
+        lava: lava,
+        source: if lava { LAVA_FLUID } else { WATER_FLUID },
+        flowing: if lava { FLOWING_LAVA } else { FLOWING_WATER },
+        drop_off: if slow { 2 } else { 1 },
+        slope: if slow { 2 } else { 4 },
+        delay: if lava { if fast { 10 } else { 30 } } else { 5 },
+        converts: level.converts_to_source(lava),
+    }
+}
+
+// `isSame`: the fluid is this one, flowing or not.
+fn same(w: Flow, fluid: u32) -> bool {
+    return fluid == w.source or fluid == w.flowing
+}
+
+// `isSourceBlockOfThisType`.
+fn source_of_this(w: Flow, l: Liquid) -> bool {
+    return same(w, l.fluid) and is_source(l)
+}
+
+// `Direction.Plane.HORIZONTAL`, its `i`th: north, east, south, west.
+fn horizontal(i: i32) -> i32 {
+    return match i {
+        0 => NORTH,
+        1 => EAST,
+        2 => SOUTH,
+        _ => WEST,
+    }
+}
+
+/// `ServerLevel.tickFluid`: the tick of `fluid` at `x`, `y`, `z`, which runs `FlowingFluid.tick`
+/// if the block there still holds that fluid.
+pub fn tick_fluid<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mut L, fluid: u32, x: i32, y: i32, z: i32) ! Thrown {
+    let Env { facts: f, .. } = e
+    let state = try level.state(f, x, y, z)
+    let here = liquid_of(f, state)
+    if here.fluid != fluid or fluid == EMPTY_FLUID {
+        return
+    }
+    let w = flow_of(level, fluid)
+    var now = state
+    var fluid_now = here
+    if not is_source(here) {
+        let new = try new_liquid(f, w, level, x, y, z, state)
+        let delay = try spread_delay(f, w, mut level, x, y, z, here, new)
+        if new.fluid == EMPTY_FLUID {
+            fluid_now = new
+            now = f.ids.air_state
+            _ = level.set_block_limited(x, y, z, now, UPDATE_ALL, UPDATE_LIMIT)
+        } else if new.fluid != here.fluid or new.amount != here.amount or new.falling != here.falling {
+            fluid_now = new
+            now = try legacy(f, new)
+            _ = level.set_block_limited(x, y, z, now, UPDATE_ALL, UPDATE_LIMIT)
+            level.schedule_fluid_in(new.fluid, x, y, z, delay)
+        }
+    }
+    try spread(f, w, mut level, x, y, z, now, fluid_now)
+}
+
+// `getSpreadDelay`: the tick delay, and for lava rising, four times it three times in four, drawn
+// from the level's random, unless either is falling or the same lava's above it, which makes
+// both a whole block high.
+fn spread_delay<L: BlockAccess + RandomSource>(f: Facts, w: Flow, level: mut L, x: i32, y: i32, z: i32, old: Liquid, new: Liquid) -> i32 ! Thrown {
+    if not w.lava or old.fluid == EMPTY_FLUID or new.fluid == EMPTY_FLUID or old.falling or new.falling {
+        return w.delay
+    }
+    let above = liquid_of(f, try level.state(f, x, y + 1, z))
+    if not same(w, above.fluid) and new.amount > old.amount and level.next_int_below(4) != 0 {
+        return w.delay * 4
+    }
+    return w.delay
+}
+
+// `getNewLiquid`: what the fluid at `x`, `y`, `z`, in `state`, becomes from those around it: a
+// source between two sources of its own over something solid or a source, if it may; a falling
+// fluid under its own; else the most of those beside it less the drop off, or none.
+fn new_liquid<L: BlockAccess>(f: Facts, w: Flow, level: L, x: i32, y: i32, z: i32, state: u32) -> Liquid ! Thrown {
+    var most = 0
+    var sources = 0
+    for i in 0..4 {
+        let d = horizontal(i)
+        let there = try level.state(f, x + step_x(d), y, z + step_z(d))
+        let l = liquid_of(f, there)
+        if same(w, l.fluid) and f.passes_wall(d, x, y, z, state, there) {
+            if is_source(l) {
+                sources += 1
+            }
+            most = most.max(l.amount)
+        }
+    }
+    if sources >= 2 and w.converts {
+        let below = try level.state(f, x, y - 1, z)
+        if f.is_solid(below) or source_of_this(w, liquid_of(f, below)) {
+            return Liquid { fluid: w.source, amount: 8, falling: false }
+        }
+    }
+    let above = try level.state(f, x, y + 1, z)
+    let up = liquid_of(f, above)
+    if up.fluid != EMPTY_FLUID and same(w, up.fluid) and f.passes_wall(UP, x, y, z, state, above) {
+        return Liquid { fluid: w.flowing, amount: 8, falling: true }
+    }
+    let amount = most - w.drop_off
+    if amount <= 0 {
+        return Liquid { fluid: EMPTY_FLUID, amount: 0, falling: false }
+    }
+    return Liquid { fluid: w.flowing, amount: amount, falling: false }
+}
+
+// `spread`: down if it can, and then to the sides too where three sources of its own are beside
+// it; else to the sides if it's a source or isn't over a hole.
+fn spread<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, w: Flow, level: mut L, x: i32, y: i32, z: i32, state: u32, here: Liquid) ! Thrown {
+    if here.fluid == EMPTY_FLUID {
+        return
+    }
+    let below = try level.state(f, x, y - 1, z)
+    let under = liquid_of(f, below)
+    if can_maybe_pass(f, w, x, y, z, state, DOWN, below, under) {
+        let new = try new_liquid(f, w, level, x, y - 1, z, below)
+        if try replaced_with(f, level, under, x, y - 1, z, new.fluid, DOWN) and holds_this(f, below, new.fluid) {
+            try spread_to(f, w, mut level, x, y - 1, z, below, DOWN, new)
+            if try source_neighbours(f, w, level, x, y, z) >= 3 {
+                try spread_to_sides(f, w, mut level, x, y, z, here, state)
+            }
+            return
+        }
+    }
+    if is_source(here) or not water_hole(f, w, x, y, z, state, below) {
+        try spread_to_sides(f, w, mut level, x, y, z, here, state)
+    }
+}
+
+// `spreadToSides`: the fluid less its drop off, or 7 if it's falling, to each side `getSpread`
+// picks, in `Direction` order, unless that leaves none.
+fn spread_to_sides<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, w: Flow, level: mut L, x: i32, y: i32, z: i32, here: Liquid, state: u32) ! Thrown {
+    let amount = if here.falling { 7 } else { here.amount - w.drop_off }
+    if amount <= 0 {
+        return
+    }
+    let (picked, liquids) = try spread_ways(f, w, level, x, y, z, state)
+    // North, south, west, east: the `EnumMap`'s order.
+    for slot in 0..picked.len() {
+        if picked[slot] {
+            let d = i32.wrap(slot) + NORTH
+            let nx = x + step_x(d)
+            let nz = z + step_z(d)
+            let there = try level.state(f, nx, y, nz)
+            try spread_to(f, w, mut level, nx, y, nz, there, d, liquids[slot])
+        }
+    }
+}
+
+// `getSpread`: of the sides the fluid can flow to, those nearest a way down within its slope find
+// distance, each with what it would become there, by `Direction`'s order less two.
+fn spread_ways<L: BlockAccess>(f: Facts, w: Flow, level: L, x: i32, y: i32, z: i32, state: u32) -> (List<bool>, List<Liquid>) ! Thrown {
+    var best = 1000
+    var picked: List<bool> = [false, false, false, false]
+    let dry = Liquid { fluid: EMPTY_FLUID, amount: 0, falling: false }
+    var liquids: List<Liquid> = [dry, dry, dry, dry]
+    for i in 0..4 {
+        let d = horizontal(i)
+        let nx = x + step_x(d)
+        let nz = z + step_z(d)
+        let there = try level.state(f, nx, y, nz)
+        let l = liquid_of(f, there)
+        if not can_maybe_pass(f, w, x, y, z, state, d, there, l) {
+            continue
+        }
+        let new = try new_liquid(f, w, level, nx, y, nz, there)
+        if not holds_this(f, there, new.fluid) {
+            continue
+        }
+        let distance = if try is_hole(f, w, level, nx, y, nz, there) { 0 } else { try slope_distance(f, w, level, nx, y, nz, 1, opposite(d), there) }
+        if distance < best {
+            for k in 0..picked.len() {
+                picked[k] = false
+            }
+        }
+        if distance <= best {
+            if try replaced_with(f, level, l, nx, y, nz, new.fluid, d) {
+                picked[usize.wrap(d - NORTH)] = true
+                liquids[usize.wrap(d - NORTH)] = new
+            }
+            best = distance
+        }
+    }
+    return (picked, liquids)
+}
+
+// `getSlopeDistance`: how many blocks from `x`, `y`, `z`, `depth` already, the nearest way down
+// is, not going back toward `from`, within the slope find distance, or 1000.
+fn slope_distance<L: BlockAccess>(f: Facts, w: Flow, level: L, x: i32, y: i32, z: i32, depth: i32, from: i32, state: u32) -> i32 ! Thrown {
+    var best = 1000
+    for i in 0..4 {
+        let d = horizontal(i)
+        if d == from {
+            continue
+        }
+        let nx = x + step_x(d)
+        let nz = z + step_z(d)
+        let there = try level.state(f, nx, y, nz)
+        let l = liquid_of(f, there)
+        if not (can_maybe_pass(f, w, x, y, z, state, d, there, l) and holds_this(f, there, w.flowing)) {
+            continue
+        }
+        if try is_hole(f, w, level, nx, y, nz, there) {
+            return depth
+        }
+        if depth < w.slope {
+            let found = try slope_distance(f, w, level, nx, y, nz, depth + 1, opposite(d), there)
+            if found < best {
+                best = found
+            }
+        }
+    }
+    return best
+}
+
+// `SpreadContext.isHole`: whether the block at `x`, `y`, `z`, `state`, is over a way down.
+fn is_hole<L: BlockAccess>(f: Facts, w: Flow, level: L, x: i32, y: i32, z: i32, state: u32) -> bool ! Thrown {
+    let below = try level.state(f, x, y - 1, z)
+    return water_hole(f, w, x, y, z, state, below)
+}
+
+// `isWaterHole`: whether the fluid passes down from `state` at `x`, `y`, `z` into `below`, its own
+// fluid or a block that takes it.
+fn water_hole(f: Facts, w: Flow, x: i32, y: i32, z: i32, state: u32, below: u32) -> bool {
+    if not f.passes_wall(DOWN, x, y, z, state, below) {
+        return false
+    }
+    if same(w, f.fluid(below)) {
+        return true
+    }
+    return f.holds_fluid(below) and holds_this(f, below, w.flowing)
+}
+
+// `canMaybePassThrough`: the fluid at `x`, `y`, `z`, in `state`, can reach the block toward `d`,
+// `there` with the fluid `l`, unless it's a source of its own, or a block that takes no fluid.
+fn can_maybe_pass(f: Facts, w: Flow, x: i32, y: i32, z: i32, state: u32, d: i32, there: u32, l: Liquid) -> bool {
+    return not source_of_this(w, l) and f.holds_fluid(there) and f.passes_wall(d, x, y, z, state, there)
+}
+
+// `canHoldSpecificFluid`: a block that holds liquid takes `fluid` if its `canPlaceLiquid` says
+// so, with no one placing it; any other block takes any.
+fn holds_this(f: Facts, state: u32, fluid: u32) -> bool {
+    let block = f.block(state)
+    if f.fixed_container(block) {
+        // Kelp and seagrass: their `canPlaceLiquid` says no.
+        return false
+    }
+    if not f.waterloggable(block) {
+        return true
+    }
+    // `SimpleWaterloggedBlock`'s: water's source, but a barrier's, which only a creative player
+    // fills, and a double slab's.
+    if f.is_a(block, String("BarrierBlock")) or double_slab(f, block, state) {
+        return false
+    }
+    return fluid == WATER_FLUID
+}
+
+fn double_slab(f: Facts, block: u32, state: u32) -> bool {
+    if not f.is_a(block, String("SlabBlock")) {
+        return false
+    }
+    let kind = f.get_name(state, String("type")) else return false
+    return kind == "double"
+}
+
+// `FluidState.canBeReplacedWith`: whether the fluid `l` at `x`, `y`, `z` gives way to `fluid`
+// flowing toward `d`: none always; water only to something not water from above; lava to water
+// if it's at least four high, or its own's above it.
+fn replaced_with<L: BlockAccess>(f: Facts, level: L, l: Liquid, x: i32, y: i32, z: i32, fluid: u32, d: i32) -> bool ! Thrown {
+    if l.fluid == EMPTY_FLUID {
+        return true
+    }
+    let water = f.fluid_type_in(fluid, String("minecraft:water"))
+    if l.fluid == WATER_FLUID or l.fluid == FLOWING_WATER {
+        return d == DOWN and not water
+    }
+    if not water {
+        return false
+    }
+    let above = f.fluid(try level.state(f, x, y + 1, z))
+    return above == LAVA_FLUID or above == FLOWING_LAVA or l.amount >= 4
+}
+
+// `sourceNeighborCount`: how many sources of its own are beside `x`, `y`, `z`.
+fn source_neighbours<L: BlockAccess>(f: Facts, w: Flow, level: L, x: i32, y: i32, z: i32) -> i32 ! Thrown {
+    var n = 0
+    for i in 0..4 {
+        let d = horizontal(i)
+        if source_of_this(w, liquid_of(f, try level.state(f, x + step_x(d), y, z + step_z(d)))) {
+            n += 1
+        }
+    }
+    return n
+}
+
+// `spreadTo`: the fluid `new` put in the block at `x`, `y`, `z`, `state`, flowing toward `d`:
+// lava flowing down onto water's block makes stone with a fizz; a block that holds liquid takes it
+// as it does; anything else is washed away and replaced by the fluid's block.
+fn spread_to<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, w: Flow, level: mut L, x: i32, y: i32, z: i32, state: u32, d: i32, new: Liquid) ! Thrown {
+    if w.lava and d == DOWN and f.fluid_type_in(w.fluid, String("minecraft:lava")) and f.fluid_in(state, String("minecraft:water")) {
+        if f.is_a(f.block(state), String("LiquidBlock")) {
+            _ = level.set_block_limited(x, y, z, f.default_state(f.ids.stone), UPDATE_ALL, UPDATE_LIMIT)
+        }
+        level.level_event(LAVA_FIZZ, x, y, z, 0)
+        return
+    }
+    let block = f.block(state)
+    if f.liquid_container(block) or f.waterloggable(block) {
+        try place_liquid(f, mut level, x, y, z, state, new)
+        return
+    }
+    if not f.is_air(state) {
+        // `beforeDestroyingBlock`: lava fizzes; water drops what the block drops.
+        if w.lava {
+            level.level_event(LAVA_FIZZ, x, y, z, 0)
+        } else {
+            level.unimplemented(String("What a block washed away drops"))
+        }
+    }
+    _ = level.set_block_limited(x, y, z, try legacy(f, new), UPDATE_ALL, UPDATE_LIMIT)
+}
+
+// `LiquidBlockContainer.placeLiquid`, as each class has it: kelp and seagrass take none; a block
+// that can hold water, but a double slab, takes water's source if it holds none, held and
+// ticking; a campfire's put out, and a lit candle too.
+fn place_liquid<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, level: mut L, x: i32, y: i32, z: i32, state: u32, new: Liquid) ! Thrown {
+    let block = f.block(state)
+    if f.fixed_container(block) or double_slab(f, block, state) {
+        return
+    }
+    if f.get_bool(state, String("waterlogged")) or new.fluid != WATER_FLUID {
+        return
+    }
+    let wet = try f.with_bool(state, String("waterlogged"), true)
+    if f.is_a(block, String("CampfireBlock")) {
+        if f.get_bool(state, String("lit")) {
+            level.unimplemented(String("A campfire's sound and block entity as water puts it out"))
+        }
+        _ = level.set_block_limited(x, y, z, try f.with_bool(wet, String("lit"), false), UPDATE_ALL, UPDATE_LIMIT)
+    } else if f.is_a(block, String("CandleBlock")) and f.get_bool(state, String("lit")) {
+        // `extinguish`: put out with flags 11, with its sound.
+        level.unimplemented(String("A candle's sound as water puts it out"))
+        _ = level.set_block_limited(x, y, z, try f.with_bool(wet, String("lit"), false), 11, UPDATE_LIMIT)
+    } else {
+        if f.is_a(block, String("DriedGhastBlock")) {
+            level.unimplemented(String("A dried ghast's sound as it takes water"))
+        }
+        _ = level.set_block_limited(x, y, z, wet, UPDATE_ALL, UPDATE_LIMIT)
+    }
+    level.schedule_fluid(WATER_FLUID, x, y, z)
+}
