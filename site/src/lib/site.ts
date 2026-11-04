@@ -5,7 +5,7 @@ const vercel = process.env.VERCEL_PROJECT_PRODUCTION_URL;
 export const SITE = {
 	name: 'calcite',
 	title: 'calcite · a Minecraft server written in Calx',
-	description: 'Calcite is a Minecraft: Java Edition server written from scratch in Calx, built to play exactly like vanilla while using every core of the machine.',
+	description: 'Calcite is a Minecraft: Java Edition server written from scratch in Calx that runs the world on every core of the machine.',
 	/** Where the site lives: SITE_URL when it's set, else Vercel's production address, else here. */
 	url: (process.env.SITE_URL ?? (vercel ? `https://${vercel}` : 'http://localhost:3000')).replace(/\/$/, ''),
 	github: 'https://github.com/ellipog/calcite',

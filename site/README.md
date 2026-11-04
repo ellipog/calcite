@@ -53,6 +53,14 @@ The pages in `docs/guide/` are plain Markdown and read fine on GitHub. On the si
 
 To add a page, write it in `docs/guide/` with front matter and add it to the list under "Pages" in `docs/guide/README.md`.
 
+### The home page's world
+
+The hero fills the first screen with a forest flown over, in `src/components/flyover.tsx`. It's a new world on every visit, from a random seed, generated a chunk at a time by `src/lib/brand/blocks.ts`: rolling grass hills, rivers and lakes, sand on the shores, oaks and birches in vanilla's shape. Chunks load around the camera nearest first at the rate of the fastest recorded worldgen run, `DATA.worldgen.runs`' last, so the view fills in a fraction of a second and the chips under it say how many have loaded and how fast. It's drawn as voxel-space, one ray a screen column, with each block's top and sides shaded apart, fog toward the edge of the view and a flat layer of clouds. The pointer turns the camera.
+
+If a reader hasn't scrolled after a few seconds, a chip at the bottom shows a block being mined, in ten stages of cracks, that crumbles into an arrow down, beside "more below"; pressing it scrolls to the next section. With reduced motion the world is drawn once and the chip shows the arrow.
+
+The flight is paced to what a frame costs, so it doesn't drain a phone. On a fast desktop CPU a frame takes about 2.4 ms at a phone's size and 7 to 8 ms at a laptop's. It runs at 60 frames a second while a frame takes under 8 ms, 30 when it takes more and 20 past 16, and never more than 30 on a touch screen. A touch screen's flight also rests after 30 seconds without a touch, holding its last frame, and a touch starts it again. With reduced motion, or with the browser's Save-Data on, it draws one still frame with the whole view generated. It stops whenever it's off screen or the tab is hidden.
+
 ### The roadmap
 
 `/roadmap` is rebuilt at most once an hour. On a rebuild it also reads Acta's public feed for the board and shows its tasks under "From the board", if any are marked public. With none, that section doesn't appear.

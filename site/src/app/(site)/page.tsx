@@ -44,11 +44,11 @@ function excerpt() {
 // What a server does, each with the phase of the plan that builds it. Until that phase has passed
 // its gate, the item says so; once every phase has, the tags are gone.
 const FEATURES: { title: string; text: string; phase: number }[] = [
-	{ title: 'Survival as vanilla plays it', text: 'Blocks, mobs, redstone and farms behave as they do on vanilla’s server, and the rig checks them against it. A farm built for vanilla works the same here.', phase: 6 },
-	{ title: 'Vanilla’s worlds', text: 'Worlds are generated as vanilla generates them and saved in its format, so one can move to Calcite and back. Data packs such as Terralith work too.', phase: 5 },
 	{ title: 'Every core', text: 'The world is split into regions that tick in parallel, in lockstep. A busy server uses the whole machine, and gets the same result on one thread as on 32.', phase: 5 },
 	{ title: 'Plugins', text: 'Plugins in Calx run natively, at full speed. Plugins in any language that builds to WASM run in a sandbox. Both use the same API.', phase: 7 },
-	{ title: 'Logins and proxies', text: 'Online and offline mode, signed chat, the whitelist, bans and operators as vanilla keeps them, and Velocity’s modern forwarding.', phase: 4 },
+	{ title: 'The same files', text: 'server.properties, the operators, the whitelist and the ban lists are read where vanilla keeps them, so moving a server over is starting a different program in the same folder.', phase: 4 },
+	{ title: 'Worlds and data packs', text: 'Worlds are saved in vanilla’s format, so an existing one moves to Calcite and back. Data packs such as Terralith generate as they do on vanilla.', phase: 5 },
+	{ title: 'Logins and proxies', text: 'Online and offline mode, signed chat, and Velocity’s modern forwarding.', phase: 4 },
 	{ title: 'Pregeneration', text: 'The pregen command is built in and takes Chunky’s subcommands. A task carries on after a restart, and steps aside while players are loading in.', phase: 5 },
 	{ title: 'The console', text: 'A live dashboard on a terminal, and vanilla’s exact log lines in a file or a pipe, so hosting panels read it as they read vanilla.', phase: 4 },
 	{ title: 'Recording and replay', text: 'A server can record everything it’s sent and replay it later, tick for tick, so a bug a player hit can be seen again and its fix checked.', phase: 5 },
@@ -70,24 +70,25 @@ export default function Home() {
 	return (
 		<>
 			{/* ---- hero ---- */}
-			<section className="pt-14 md:pt-20">
-				<div className="wrap grid grid-cols-1 items-end gap-10 md:grid-cols-[minmax(0,1.55fr)_minmax(0,1fr)]">
+			{/* the heading shrinks on short screens too, so a laptop sees most of the world above the fold */}
+			<section className="flex min-h-[calc(100svh-4rem-1px)] flex-col pt-8 md:pt-[min(3.5rem,5svh)]">
+				<div className="wrap grid grid-cols-1 items-end gap-6 md:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)] md:gap-10">
 					<div>
 						<Kicker>Minecraft: Java Edition {SITE.minecraft}</Kicker>
-						<h1 className="font-display text-[clamp(48px,7.4vw,112px)] leading-[0.9] font-extrabold tracking-display text-balance">A Minecraft server written from scratch</h1>
+						<h1 className="font-display text-[clamp(64px,min(13vw,20svh),184px)] leading-[0.8] font-extrabold tracking-display">calcite</h1>
 					</div>
-					<div className="pb-2">
+					<div className="pb-1">
 						<p className="text-lg leading-normal md:text-xl">
-							Calcite is built to play exactly like vanilla while using every core of the machine it runs on. It&apos;s written in Calx, and plugins can be written in Calx or in anything that builds to WASM.
+							A Minecraft server that runs the world on every core of the machine. It&apos;s written in Calx, and plugins can be written in Calx or in anything that builds to WASM.
 						</p>
-						<div className="mt-7 flex flex-wrap gap-2.5">
+						<div className="mt-6 flex flex-wrap gap-2.5">
 							<ButtonLink href="/docs/start">Get started</ButtonLink>
 							<ButtonLink href="/benchmarks" variant="secondary">
 								Benchmarks
 							</ButtonLink>
 						</div>
 						{now && (
-							<Link href="/roadmap" className="group mt-6 inline-flex items-center gap-3 text-[15px]">
+							<Link href="/roadmap" className="group mt-5 inline-flex items-center gap-3 text-[15px]">
 								<Tag status="running">pre-release</Tag>
 								<span className="group-hover:underline group-hover:decoration-2 group-hover:underline-offset-4">
 									Phase {now.n}, {now.builds.toLowerCase()}, is in progress
@@ -96,12 +97,12 @@ export default function Home() {
 						)}
 					</div>
 				</div>
-				<Flyover className="mt-14" chips={['a world Calcite generated']} />
+				<Flyover className="mt-4 flex-1 md:mt-6" cue cps={top.cps} />
 			</section>
 
 			{/* ---- what it does ---- */}
-			<section className="wrap mt-24">
-				<SectionHead title="What it does" lead={<p>Calcite shares no code with vanilla, Paper or any other server. It reads the same <code className="font-mono text-[0.9em]">server.properties</code> and the same worlds, and Mojang&apos;s client joins it as it joins vanilla.</p>} />
+			<section id="more" className="wrap scroll-mt-24 mt-24">
+				<SectionHead title="What it does" lead={<p>Calcite is written from scratch, with no code from vanilla, Paper or any other server.</p>} />
 				<ul className="grid grid-cols-1 rule-t md:grid-cols-2">
 					{FEATURES.map((f, i) => (
 						<li key={f.title} className={i % 2 === 0 ? 'rule-b py-6 md:pr-10' : 'rule-b py-6 md:rule-l md:pl-10'}>
