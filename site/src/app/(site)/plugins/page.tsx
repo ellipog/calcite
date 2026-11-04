@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import { meta } from '@/lib/meta';
+import { PAGES } from '@/lib/pages';
 import Link from 'next/link';
 import { Markdown } from '@/components/markdown';
 import { Band, PageHead, SectionHead } from '@/components/site/parts';
@@ -13,7 +14,7 @@ import { inline, plain } from '@/lib/markdown';
 import { phases, read, samples, section } from '@/lib/repo';
 import { SITE } from '@/lib/site';
 
-export const metadata: Metadata = meta({ title: 'Plugins', description: "Calcite's plugin API: native Calx plugins that run at full speed, WASM plugins in a sandbox, where a plugin's code runs, and the five samples the API was designed with.", path: '/plugins' });
+export const metadata: Metadata = meta(PAGES.plugins);
 
 const API = 'plugins/api/HOST_API.md', SAMPLES = 'plugins/samples/README.md';
 

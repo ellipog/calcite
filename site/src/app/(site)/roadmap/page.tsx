@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import { meta } from '@/lib/meta';
+import { PAGES } from '@/lib/pages';
 import { MarkdownLine } from '@/components/markdown';
 import { PageHead, PhaseStrip } from '@/components/site/parts';
 import { Disclosure, Tag } from '@/components/ui/feedback';
@@ -7,7 +8,7 @@ import { phases, type Phase } from '@/lib/repo';
 import { SITE } from '@/lib/site';
 import { cn } from '@/lib/cn';
 
-export const metadata: Metadata = meta({ title: 'Roadmap', description: "Calcite's plan in ten phases, each with a gate it passes before the next starts: which have passed, what's in progress, and what's to come.", path: '/roadmap' });
+export const metadata: Metadata = meta(PAGES.roadmap);
 
 // The board's public roadmap on Acta, read again at most once an hour. It lists only tasks marked
 // public, and the site shows them only when there are some.

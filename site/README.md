@@ -25,6 +25,7 @@ The site is then at http://localhost:3000. Under `next dev` it also serves two i
 | `bun run lint` | ESLint |
 | `bun run data` | Regenerates `src/lib/data.ts` only |
 | `bun run tiles` | Redraws the Bayer tiles in `src/styles/tiles.css` and the icons in `src/app/` |
+| `bun run banner` | Redraws the repo README's banner, `assets/logo/calcite-banner.png` |
 
 ## Where each page comes from
 
@@ -83,16 +84,24 @@ An address with no page (`src/app/not-found.tsx`) shows a strip of a finished wo
 
 `/roadmap` is rebuilt at most once an hour. On a rebuild it also reads Acta's public feed for the board and shows its tasks under "From the board", if any are marked public. With none, that section doesn't appear.
 
+### Search and link previews
+
+Each public page's title is its own name and then ` · calcite Minecraft server` (`SUFFIX` in `src/lib/meta.ts`), the words people search with; the home page's is `SITE.title`. Its description is cut to 160 characters, at a sentence's end where one ends late enough, so a search result shows all of it. The benchmarks, plugins and roadmap pages keep their titles and descriptions in `src/lib/pages.ts`; the docs take theirs from each page's front matter, or its heading and first paragraph. `meta()` gives every page its canonical address and the same title and description for link previews.
+
+Every page has its own card, the picture a link to it shows: the mark and the name, the section, the page's title and what it's about, over a strip of the world, from `src/lib/og-card.tsx`. Each page's `opengraph-image.tsx` sits beside it, since a page that sets its own preview text no longer inherits a card from above it; the docs' pages share one, `docs/[slug]/opengraph-image.tsx`, built for each page. The home page's card, `src/app/opengraph-image.tsx`, has the name large instead, and `(site)/opengraph-image.tsx` is the same card for the home page.
+
+The repo README's banner is drawn by `scripts/banner.tsx` as the brand guide's README header is: the world from the README's camera coming in from the left, and the mark and the name on paper over it, 1600 by 400.
+
 ## How it's laid out
 
 ```text
 src/app/(site)/        the public pages, with their header and footer
 src/app/(internal)/    the brand guide and the component sheet (*.internal.tsx)
-src/app/               the root layout, icons, the social card, robots.txt and the sitemap
+src/app/               the root layout, icons, the site's card, robots.txt and the sitemap
 src/components/ui/     the components, each drawn in the brand's dither
 src/components/site/   pieces of the public pages: the header, the footer and its ground, the strip of steps, the tick band, the charts, the page and docs navs
 src/lib/               the brand's math and tiles, the Markdown parser, what's read from the repo
-scripts/               data.ts and tiles.ts
+scripts/               data.ts, tiles.ts and banner.tsx
 ```
 
 The internal pages' files end in `.internal.tsx`, which `next.config.ts` only counts as a page extension under `next dev` or with `CALCITE_INTERNAL=1`. A production build doesn't see them at all.

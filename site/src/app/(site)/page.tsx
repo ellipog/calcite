@@ -102,7 +102,9 @@ export default function Home() {
 				<div className="wrap grid grid-cols-1 items-end gap-6 md:grid-cols-[minmax(0,1.3fr)_minmax(0,1fr)] md:gap-10">
 					<div>
 						<Kicker>Minecraft: Java Edition {SITE.minecraft}</Kicker>
-						<h1 className="font-display text-[clamp(64px,min(13vw,20svh),240px)] leading-[0.8] font-extrabold tracking-display">calcite</h1>
+						<h1 className="font-display text-[clamp(64px,min(13vw,20svh),240px)] leading-[0.8] font-extrabold tracking-display">
+							calcite<span className="sr-only">, a Minecraft: Java Edition server written in Calx</span>
+						</h1>
 					</div>
 					<div className="pb-1">
 						<p className="max-w-[44ch] text-lg leading-normal md:text-xl">

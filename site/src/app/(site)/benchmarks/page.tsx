@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import { meta } from '@/lib/meta';
+import { PAGES } from '@/lib/pages';
 import Link from 'next/link';
 import { CpuBars, FlightChart, LightBars, MemoryBars, ThreadsChart } from '@/components/site/bench-charts';
 import { PageHead, SectionHead, SPLIT_XL, Stats } from '@/components/site/parts';
@@ -12,7 +13,7 @@ import { phases } from '@/lib/repo';
 import { cn } from '@/lib/cn';
 import { SITE } from '@/lib/site';
 
-export const metadata: Metadata = meta({ title: 'Benchmarks', description: "Calcite with 100 players, with Mojang's client joining and flying, generating worlds beside vanilla, Paper and C2ME, and lighting them beside vanilla, with the source of every number.", path: '/benchmarks' });
+export const metadata: Metadata = meta(PAGES.benchmarks);
 
 const f1 = (v: number) => v.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const f2 = (v: number) => v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });

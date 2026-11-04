@@ -5,7 +5,8 @@ import { LostChunk } from '@/components/site/lost-chunk';
 import { Kicker } from '@/components/site/parts';
 import { ButtonLink } from '@/components/ui/button';
 
-export const metadata: Metadata = { title: 'Not found', robots: { index: false } };
+// Next marks a page that isn't there noindex itself
+export const metadata: Metadata = { title: 'Not found' };
 
 // A page that isn't there: the chunk where it would be was never generated, so the server
 // generates it, and what it builds there is the number (lost-chunk.tsx).
