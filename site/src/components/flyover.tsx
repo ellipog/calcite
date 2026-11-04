@@ -11,8 +11,7 @@ import { ordered } from '@/lib/dither/bayer';
 import { surface, type Surface } from '@/lib/dither/canvas';
 import { PAPER, rgb } from '@/lib/dither/math';
 import { still, useFrames } from '@/lib/dither/motion';
-import { fade } from '@/lib/brand/terrain';
-import { B, blockView, CHUNK, forget, generate, groundAt, hash, isLoaded, reseed, SEA } from '@/lib/brand/blocks';
+import { B, CHUNK, forget, frame, generate, groundAt, hash, isLoaded, reseed, SEA } from '@/lib/brand/blocks';
 import { cn } from '@/lib/cn';
 
 /** The view distance, in chunks, and the seconds a touch screen's flight goes on after the last touch. */
@@ -37,7 +36,7 @@ function start() {
 export function Flyover({ className, cue = false, cps = 2000 }: { className?: string; cue?: boolean; cps?: number }) {
 	const fly = useRef<HTMLDivElement>(null), cv = useRef<HTMLCanvasElement>(null), count = useRef<HTMLSpanElement>(null);
 	const st = useRef({
-		S: null as Surface | null, T: new Float32Array(0), last: -1, budget: 0, shown: -1, aim: null as [number, number] | null, look: { yaw: 0, hor: 0 }, cam: null as { x: number; y: number } | null, h: 0, heading: 0,
+		S: null as Surface | null, last: -1, full: NaN, budget: 0, shown: -1, aim: null as [number, number] | null, look: { yaw: 0, hor: 0 }, cam: null as { x: number; y: number } | null, h: 0, heading: 0,
 		// pacing: still draws one frame; touch screens rest a while after the last touch; frames are spaced by what they cost
 		still: false, touch: false, drawn: false, next: 0, rest: Infinity, wake: true, cost: 0,
 	});
@@ -78,26 +77,28 @@ export function Flyover({ className, cue = false, cps = 2000 }: { className?: st
 		for (const d of [0, 40, 80, 120]) ahead = Math.max(ahead, groundAt(cam.x + fx * d, cam.y + fy * d));
 		s.h += ((ahead + 24) * B - s.h) * Math.min(1, dt * 0.8);
 		// generate the nearest chunks missing, as many as Calcite would in the time since the last frame
-		const ccx = Math.floor(cam.x / CHUNK), ccz = Math.floor(cam.y / CHUNK), t0 = performance.now();
-		// (a still frame generates the whole view, however long it takes)
-		s.budget = s.still ? ORDER.length : Math.min(s.budget + cps * (dt || 1 / 60), ORDER.length);
-		let n = 0;
-		for (const [x, z] of ORDER) {
-			if (isLoaded(ccx + x, ccz + z)) {
+		// (none to look for while the camera stays in a chunk whose view is already whole)
+		const ccx = Math.floor(cam.x / CHUNK), ccz = Math.floor(cam.y / CHUNK), here = ccx * 65536 + ccz;
+		let n = ORDER.length;
+		if (s.full !== here) {
+			const t0 = performance.now();
+			// (a still frame generates the whole view, however long it takes)
+			s.budget = s.still ? ORDER.length : Math.min(s.budget + cps * (dt || 1 / 60), ORDER.length);
+			n = 0;
+			for (const [x, z] of ORDER) {
+				if (isLoaded(ccx + x, ccz + z)) {
+					n++;
+					continue;
+				}
+				if (s.budget < 1 || (!s.still && performance.now() - t0 > 10)) continue;
+				generate(ccx + x, ccz + z);
+				s.budget--;
 				n++;
-				continue;
 			}
-			if (s.budget < 1 || (!s.still && performance.now() - t0 > 10)) continue;
-			generate(ccx + x, ccz + z);
-			s.budget--;
-			n++;
+			if (n === ORDER.length) s.full = here;
 		}
-		blockView(s.T, cols, rows, { x: cam.x, y: cam.y, yaw: s.heading + s.look.yaw }, { height: s.h, horizon: 0.22 + s.look.hor, far: VIEW * CHUNK, sky: 0.22, haze: 0.08, drift: t * 3 });
 		// the sky dissolves into the page above, and the land into it below
-		// (twice at the top, so the first dots come in slowly rather than as a line)
-		fade(s.T, cols, rows, { t: 0.32, b: 0.2 });
-		fade(s.T, cols, rows, { t: 0.32 });
-		S.bits(ordered(s.T, cols, rows, 8));
+		frame(S.u32, cols, rows, { x: cam.x, y: cam.y, yaw: s.heading + s.look.yaw }, { height: s.h, horizon: 0.22 + s.look.hor, far: VIEW * CHUNK, sky: 0.22, haze: 0.08, drift: t * 3, fadeTop: 0.32, fadeBottom: 0.2 });
 		S.flush();
 		s.drawn = true;
 		if (n !== s.shown && count.current) {
@@ -125,8 +126,7 @@ export function Flyover({ className, cue = false, cps = 2000 }: { className?: st
 			if (Math.round(r.width) === w && Math.round(r.height) === h) return;
 			w = Math.round(r.width);
 			h = Math.round(r.height);
-			const S = (s.S = surface(cv.current!, 2));
-			s.T = new Float32Array(S.cols * S.rows);
+			s.S = surface(cv.current!, 2);
 			s.drawn = false;
 			if (s.still) draw(0);
 		};

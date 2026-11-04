@@ -14,6 +14,8 @@ export interface Surface {
 	w: number;
 	h: number;
 	ctx: CanvasRenderingContext2D;
+	/** The cells' pixels as little-endian RGBA words, for drawings that write them directly. */
+	u32: Uint32Array;
 	set(i: number, c: RGB | null): void;
 	bits(bits: ArrayLike<number>, ink?: RGB, paper?: RGB | null): void;
 	flush(): void;
@@ -36,6 +38,7 @@ export function surface(canvas: HTMLCanvasElement, dot = 2): Surface {
 	const d = img.data;
 	const S: Surface = {
 		cols, rows, px, dpr, W, H, ctx,
+		u32: new Uint32Array(d.buffer, d.byteOffset, cols * rows),
 		w: r.width,
 		h: r.height,
 		set(i, c) {

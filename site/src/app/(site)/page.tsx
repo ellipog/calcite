@@ -147,7 +147,7 @@ export default function Home() {
 			</section>
 
 			{/* ---- parity ---- */}
-			<section className="wrap mt-28 grid grid-cols-1 items-center gap-12 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+			<section id="parity" className="wrap mt-28 grid scroll-mt-24 grid-cols-1 items-center gap-12 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
 				<div>
 					<SectionHead
 						className="mb-7"

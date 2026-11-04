@@ -3,17 +3,48 @@
 // The brand's generated pictures, shared by the site and the brand guide: the world from above in
 // relief with contours, the crystal turning, and stills of the world from the ground.
 
-import { useRef } from 'react';
+import { useEffect, useRef } from 'react';
 import { ordered } from '@/lib/dither/bayer';
 import { surface, type Surface } from '@/lib/dither/canvas';
 import { crystal } from '@/lib/dither/crystal';
 import { useFrames, useSized } from '@/lib/dither/motion';
 import { at, CAMS, fade, getBlurred, getWorld, still, WATER, type Cam, type Fade, type ViewOptions } from '@/lib/brand/terrain';
 
-// A canvas filling its box, drawn by fn(surface) whenever its width changes.
+// A canvas filling its box, drawn by fn(surface) whenever its width changes. The first drawing
+// waits until the canvas is within a screen or so of the view, and then for the browser to be
+// idle, so a picture far down the page doesn't build its world while the page is loading.
 export function Drawn({ draw, className, label }: { draw: (s: Surface, c: HTMLCanvasElement) => void; className?: string; label?: string }) {
-	const ref = useRef<HTMLCanvasElement>(null);
-	useSized(ref, () => draw(surface(ref.current!, 2), ref.current!));
+	const ref = useRef<HTMLCanvasElement>(null), near = useRef(false), pending = useRef(false);
+	const run = () => {
+		pending.current = false;
+		if (ref.current) draw(surface(ref.current, 2), ref.current);
+	};
+	useEffect(() => {
+		const el = ref.current;
+		if (!el) return;
+		let idle = 0;
+		const io = new IntersectionObserver(
+			([e]) => {
+				if (!e.isIntersecting || near.current) return;
+				near.current = true;
+				io.disconnect();
+				if (pending.current) idle = typeof requestIdleCallback === 'function' ? requestIdleCallback(run, { timeout: 400 }) : window.setTimeout(run, 0);
+			},
+			{ rootMargin: '100% 0px' },
+		);
+		io.observe(el);
+		return () => {
+			io.disconnect();
+			if (typeof cancelIdleCallback === 'function') cancelIdleCallback(idle);
+			clearTimeout(idle);
+		};
+		// run draws through refs, so the first one is the only one needed
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, []);
+	useSized(ref, () => {
+		if (near.current) run();
+		else pending.current = true;
+	});
 	return <canvas ref={ref} className={className} aria-label={label} role={label ? 'img' : undefined} />;
 }
 
