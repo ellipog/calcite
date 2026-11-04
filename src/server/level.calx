@@ -70,9 +70,9 @@ import world.flowing.{tick_fluid}
 import world.post_process.{post_process}
 import world.precipitation.{Precipitation}
 import world.random_ticks.{RandomTicks, TickPlace}
-import world.block_entity_updates.{block_entity_ids, block_entity_infos, place_of}
+import world.block_entity_updates.{block_entity_ids, block_entity_infos, block_entity_map, holds_anything, kind_of, made_block_entity, saved_block_entities}
 import world.block_updates.{BlockLevel, after_removal, on_neighbour_changed, on_place, shape_order, tick_block, update_or_destroy, update_order}
-import world.level_writer.{LevelWriter, UPDATE_CLIENTS, UPDATE_KNOWN_SHAPE, UPDATE_LIMIT, UPDATE_MOVE_BY_PISTON, UPDATE_NEIGHBORS, UPDATE_SKIP_ON_PLACE, UPDATE_SKIP_SHAPE_UPDATE_ON_WIRE}
+import world.level_writer.{LevelWriter, UPDATE_CLIENTS, UPDATE_KNOWN_SHAPE, UPDATE_LIMIT, UPDATE_MOVE_BY_PISTON, UPDATE_NEIGHBORS, UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS, UPDATE_SKIP_ON_PLACE, UPDATE_SKIP_SHAPE_UPDATE_ON_WIRE}
 import world.light.{SkySources}
 import world.natural.{SpawnLevel}
 import world.pos.{BlockPos, ChunkPos}
@@ -81,6 +81,7 @@ import world.tickets.{FULL_LEVEL, Holders, Ticket, TicketStorage, TicketType}
 import world.ticks.{ChunkTicks, LevelTicks, ScheduledTick}
 import worldgen.access.{BlockAccess}
 import worldgen.biome_manager.{corner}
+import worldgen.block_entities.{fresh}
 import worldgen.facts.{FLOWING_LAVA, Facts, LAVA_FLUID, horizontal, opposite, step_x, step_y, step_z}
 import worldgen.generator.{GenSetup, setup_data}
 import worldgen.interval.{Thrown}
@@ -126,7 +127,9 @@ enum Body {
 // is. A chunk held whole has its rest kept with the others' in `rests`, not in its body, from
 // when it's put in until it's taken out (D289). A chunk whose blocks have been set since it came
 // is its own copy in `live`, made from the one it came as, shared or flat, as a block was first
-// set, which what reads it reads first; it's taken out as it is now (D321).
+// set, which what reads it reads first; it's taken out as it is now (D321). A chunk whose block
+// entities a block set has changed since it came has its map of them in `block_entities`, in
+// place of those its rest saved, which they go back into as it's taken out (CAL-115).
 struct Columns {
     slots: OpenHashMap<i64, Body> = OpenHashMap<i64, Body>()
     flat: FlatChunk? = none
@@ -135,6 +138,7 @@ struct Columns {
     // A chunk nothing reads, one for the level, which a saved body whose own copy is in `live`
     // holds in place of the shared one it came as (D330).
     stand_in: Shared<Chunk>? = none
+    block_entities: Map<i64, OpenHashMap<BlockPos, Tag>> = Map<i64, OpenHashMap<BlockPos, Tag>>()
 }
 
 impl Columns {
@@ -158,6 +162,7 @@ impl Columns {
     // Puts in the body of the column at `k`, its rest in with the others.
     fn put(mut self, k: i64, given: own Body) {
         _ = self.live.remove(k)
+        _ = self.block_entities.remove(k)
         match given {
             Body.Saved(s) => {
                 var saved = s
@@ -179,16 +184,22 @@ impl Columns {
         }
     }
 
-    // Takes out the body of the column at `k`, if it has one, with its rest back in it.
+    // Takes out the body of the column at `k`, if it has one, with its rest back in it, with the
+    // block entities it has now where a block set changed them.
     fn take(mut self, k: i64) -> Body? {
         let gone = self.slots.remove(k) else return none
         let rest = self.rests.take(k)
         let changed = self.live.remove(k)
+        let entities = self.block_entities.remove(k)
         match gone {
             Body.Saved(s) => {
                 var saved = s
                 if let r = rest {
-                    saved.rest = some(r)
+                    if let m = entities {
+                        saved.rest = some(r.with_block_entities(saved_block_entities(m)))
+                    } else {
+                        saved.rest = some(r)
+                    }
                 }
                 if let c = changed {
                     saved.chunk = c.into_shared()
@@ -197,6 +208,23 @@ impl Columns {
             },
             Body.Loading => return some(Body.Loading),
             Body.Flat => return some(Body.Flat),
+        }
+    }
+
+    // The chunk at `k`'s map of its block entities: its own where a block set changed them, else
+    // made from those its rest saved.
+    fn block_entities_of(self, k: i64) -> OpenHashMap<BlockPos, Tag> {
+        if self.block_entities.contains(k) {
+            return self.block_entities[k].copy()
+        }
+        return block_entity_map(self.rests.block_entities(k))
+    }
+
+    // Makes the chunk at `k`'s map of its block entities its own, from those its rest saved, if it
+    // isn't yet, for a block set to change.
+    fn own_block_entities(mut self, k: i64) {
+        if not self.block_entities.contains(k) {
+            self.block_entities.insert(k, block_entity_map(self.rests.block_entities(k)))
         }
     }
 }
@@ -1613,16 +1641,14 @@ impl Level {
             var made: List<u8>? = none
             if self.opened {
                 let light = self.light_for(k, keep)
-                let saved = self.columns.rests.block_entities(k)
+                let entities = self.columns.block_entities_of(k)
                 if self.columns.live.contains(k) {
-                    let active = self.trials_active(saved, self.columns.live[k])
-                    let infos = self.infos(saved, active)
+                    let infos = self.infos(entities, self.columns.live[k])
                     made = some(chunk_packet(pos, self.columns.live[k], light, infos))
                 } else {
                     match self.columns.slots[k] {
                         Body.Saved(s) => {
-                            let active = self.trials_active(saved, s.chunk.value)
-                            let infos = self.infos(saved, active)
+                            let infos = self.infos(entities, s.chunk.value)
                             made = some(chunk_packet(pos, s.chunk.value, light, infos))
                         },
                         Body.Flat => {
@@ -1652,8 +1678,7 @@ impl Level {
             match self.far[k].body {
                 Body.Saved(s) => {
                     let saved = if let r = s.rest { r.block_entities() } else { List<Tag>() }
-                    let active = self.trials_active(saved, s.chunk.value)
-                    let infos = self.infos(saved, active)
+                    let infos = self.infos(block_entity_map(saved), s.chunk.value)
                     packet = some(chunk_packet(pos, s.chunk.value, s.saved_light(), infos))
                 },
                 _ => {},
@@ -1666,37 +1691,60 @@ impl Level {
         return ChunkPacket.Plain(flat.chunk_packet(pos.x, pos.z))
     }
 
-    // What a chunk's packet sends of the block entities it saved, `saved`, `active` saying which
-    // are trial spawners that are active (CAL-115).
-    fn infos(self, saved: List<Tag>, active: List<bool>) -> List<BlockEntityInfo> {
-        if saved.is_empty() {
+    // What a chunk's packet sends of the block entities in its map, `map`, with `chunk`'s blocks
+    // saying which are trial spawners that are active, where the level has the block facts
+    // (CAL-115).
+    fn infos(self, map: OpenHashMap<BlockPos, Tag>, chunk: Chunk) -> List<BlockEntityInfo> {
+        if map.is_empty() {
             return List<BlockEntityInfo>()
         }
-        return block_entity_infos(saved, active, self.block_entity_ids)
-    }
-
-    // For each block entity `chunk` saved, `saved`, whether its block is a trial spawner that's
-    // active, where the level has the block facts.
-    fn trials_active(self, saved: List<Tag>, chunk: Chunk) -> List<bool> {
-        var active = List<bool>()
-        if saved.is_empty() {
-            return active
-        }
+        var active = Set<i64>()
         let some_env = self.env.copy()
-        for t in saved {
-            var on = false
-            if let shared = some_env {
-                let Env { facts: f, .. } = shared.value
-                if let pos = place_of(t) {
-                    if pos.y >= chunk.min_y() and pos.y < chunk.min_y() + i32.wrap(chunk.section_count()) * 16 {
-                        let state = chunk.block(pos.x & 15, pos.y, pos.z & 15)
-                        on = (f.get_name(state, String("trial_spawner_state")) ?? String()) == "active"
+        if let shared = some_env {
+            let Env { facts: f, .. } = shared.value
+            for (pos, _) in map {
+                if pos.y >= chunk.min_y() and pos.y < chunk.min_y() + i32.wrap(chunk.section_count()) * 16 {
+                    let state = chunk.block(pos.x & 15, pos.y, pos.z & 15)
+                    if (f.get_name(state, String("trial_spawner_state")) ?? String()) == "active" {
+                        active.insert(pos.pack())
                     }
                 }
             }
-            active.push(on)
         }
-        return active
+        return block_entity_infos(map, active, self.block_entity_ids)
+    }
+
+    // `removeBlockEntity`: the block entity at `pos` in the chunk at `k` taken away, if it has one;
+    // with `effects`, what it holds dropped first, `preRemoveSideEffects`, which isn't yet.
+    fn remove_block_entity(mut self, k: i64, pos: BlockPos, effects: bool) {
+        self.columns.own_block_entities(k)
+        if not self.columns.block_entities[k].contains(pos) {
+            return
+        }
+        if effects and holds_anything(self.columns.block_entities[k][pos]) {
+            self.report(String("What a block entity holds dropped as it's removed, `preRemoveSideEffects`"))
+        }
+        _ = self.columns.block_entities[k].remove(pos)
+    }
+
+    // The block entity of `block`, set at `pos` in the chunk at `k`, as `setBlockState` gives it
+    // one: the one there kept if it's of the block's type, `isValidBlockState`, else a fresh one
+    // of that type in its place, `newBlockEntity`, as `addAndRegisterBlockEntity` adds it.
+    fn make_block_entity(mut self, f: Facts, k: i64, pos: BlockPos, block: u32) {
+        let kind = f.block_entity_kind(block) else return
+        self.columns.own_block_entities(k)
+        if self.columns.block_entities[k].contains(pos) {
+            if (kind_of(self.columns.block_entities[k][pos]) ?? String()) == kind {
+                return
+            }
+            // One of another type is taken away, with a warning, as `setBlockState` does.
+            _ = self.columns.block_entities[k].remove(pos)
+        }
+        let made = fresh(kind.copy()) else {
+            self.report("A fresh {kind}")
+            return
+        }
+        self.columns.block_entities[k].insert(pos, made_block_entity(kind, made, pos))
     }
 
     /// Keeps the frame's body a player's encoder compressed a kept packet to, with `threshold`,
@@ -2883,10 +2931,10 @@ impl BlockLevel for Level {
         let Env { facts: f, .. } = shared.value
         let block = f.block(state)
         let moved = flags & UPDATE_MOVE_BY_PISTON != 0
-        // The block entity of the block replaced, which `removeBlockEntity` takes away, and the
-        // one the block set makes or keeps, aren't in the server's level yet.
-        if f.block(old) != block and f.has_block_entity(old) {
-            self.report(String("A block entity taken away with its block"))
+        // The block entity of the block replaced goes, unless the block set keeps it, what it holds
+        // dropping first unless `UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS` (CAL-115).
+        if f.block(old) != block and f.has_block_entity(old) and not keeps_block_entity(f, old, state) {
+            self.remove_block_entity(k, BlockPos { x: x, y: y, z: z }, flags & UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS == 0)
         }
         if (f.block(old) != block or f.is_a(block, "BaseRailBlock")) and (flags & UPDATE_NEIGHBORS != 0 or moved) {
             match after_removal(shared.value, mut self, old, x, y, z, moved) {
@@ -2904,8 +2952,8 @@ impl BlockLevel for Level {
                 err(thrown) => self.report(thrown.message),
             }
         }
-        if f.has_block_entity(state) {
-            self.report(String("A block entity made or kept with its block"))
+        if f.has_block_entity(state) and f.block(self.block_state(x, y, z) ?? state) == block {
+            self.make_block_entity(f, k, BlockPos { x: x, y: y, z: z }, block)
         }
         let now = self.block_state(x, y, z) ?? state
         if now != state {
@@ -3311,6 +3359,20 @@ fn chunk_packet(pos: ChunkPos, chunk: Chunk, light: own LightData, block_entitie
     var w = Writer.new()
     write_packet(ClientboundLevelChunkWithLight { x: pos.x, z: pos.z, chunk: data, light: light }, State.Play, mut w)
     return w.into_bytes()
+}
+
+// `shouldChangedStateKeepBlockEntity`: whether `state`, set in place of `old`, keeps its block
+// entity, as a copper chest keeps a copper chest's and a copper golem statue a statue's as they
+// weather, the blocks of `COPPER_CHESTS` and `COPPER_GOLEM_STATUES` being those of the classes
+// that say so.
+fn keeps_block_entity(f: Facts, old: u32, state: u32) -> bool {
+    for name in ["minecraft:copper_chests", "minecraft:copper_golem_statues"] {
+        let set = f.tag(String(name))
+        if f.in_set(state, set) and f.in_set(old, set) {
+            return true
+        }
+    }
+    return false
 }
 
 // The chunk a packed position is.

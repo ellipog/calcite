@@ -1,13 +1,35 @@
-/// Checks what a chunk's packet sends of its block entities (CAL-115), as
+/// Checks a chunk's block entities (CAL-115). What its packet sends of them, as
 /// `ClientboundLevelChunkPacketData.BlockEntityInfo.create` makes them: a chest sends no update
 /// tag, a sign sends its own data but not its type, place or components, a banner its
 /// components too, a spawner all but `SpawnPotentials`, a trial spawner its next mob's time only
 /// while it's active; each in the order fastutil's map of their places goes over them, with its
-/// type's registry ID and its place in the chunk.
+/// type's registry ID and its place in the chunk, a later one saved at a place in place of an
+/// earlier. The order they're saved in, a `HashSet`'s, with `keepPacked` false; a rest given
+/// others in place of those it had, its ticks and structures as they were. And, on a flat level
+/// with block facts, block entities made as blocks with them are set and taken away as they're
+/// replaced, kept as a block's state changes and as a copper chest weathers, where one made again
+/// would come in another order, and replaced by one of the right type, each sent in its chunk's
+/// packet in fastutil's order.
 module test.block_entity_updates
 
 import nbt.tag.{Tag}
-import world.block_entity_updates.{block_entity_ids, block_entity_infos, update_tag}
+import protocol.play.{BlockEntityInfo, ClientboundLevelChunkWithLight}
+import protocol.wire.{Reader}
+import registry.builtin.{builtin_entries, builtin_names}
+import registry.registries.{Registries}
+import registry.registry.{Registry, Tag as RegistryTag}
+import resources.identifier.{Identifier}
+import server.chunk_jobs.{ChunkContext, Loaded}
+import server.level.{ChunkPacket, Level, SPAWN_RADIUS}
+import storage.chunk.{ChunkFormat, ChunkRest, PackedRest, SavedTick}
+import world.block_entity_updates.{block_entity_ids, block_entity_infos, block_entity_map, holds_anything, saved_block_entities, update_tag}
+import world.chunk.{AIR_STATE, BlockStates}
+import world.flat.{FlatBlocks, FlatChunk, FlatWorld}
+import world.level_writer.{UPDATE_ALL}
+import world.pos.{ChunkPos}
+import worldgen.facts.{Facts}
+import worldgen.providers.{GenContext}
+import worldgen.survive.{Env}
 
 fn check(got: bool, what: str) {
     if not got {
@@ -54,25 +76,259 @@ fn tags() {
     println("ok tags")
 }
 
+// Three saved block entities, the sign's data `waxed`, and a second chest at the first's place
+// before the sign if `twice`.
+fn three(waxed: i8, twice: bool) -> List<Tag> {
+    var sign = JavaHashMap<String, Tag>()
+    sign.insert(String("is_waxed"), Tag.Byte(waxed))
+    var all: List<Tag> = [saved("minecraft:chest", 20, 70, 37, JavaHashMap<String, Tag>())]
+    if twice {
+        var items = JavaHashMap<String, Tag>()
+        items.insert(String("LootTable"), Tag.Str(String("minecraft:chests/simple_dungeon")))
+        all.push(saved("minecraft:chest", 20, 70, 37, items))
+    }
+    all.push(saved("minecraft:sign", 17, 64, 33, sign))
+    all.push(saved("minecraft:chest", 16, 64, 32, JavaHashMap<String, Tag>()))
+    return all
+}
+
 fn infos() {
     let ids = block_entity_ids()
     check(ids.get(String("minecraft:chest")) == some(1) and ids.get(String("minecraft:sign")) == some(7), "the block entity types' IDs")
-    var sign = JavaHashMap<String, Tag>()
-    sign.insert(String("is_waxed"), Tag.Byte(0))
-    let all: List<Tag> = [saved("minecraft:chest", 20, 70, 37, JavaHashMap<String, Tag>()), saved("minecraft:sign", 17, 64, 33, sign), saved("minecraft:chest", 16, 64, 32, JavaHashMap<String, Tag>())]
-    let inactive: List<bool> = [false, false, false]
-    let got = block_entity_infos(all, inactive, ids)
+    let got = block_entity_infos(block_entity_map(three(0, false)), Set<i64>(), ids)
     check(got.len() == 3, "a block entity wasn't sent")
     // `HashCommon.mix` of their `Vec3i` hashes puts 20, 70, 37 in slot 11 of 32, 17, 64, 33 in
     // slot 30 and 16, 64, 32 in slot 20, and fastutil's loop goes down from the top.
     check(got[0].kind == 7 and got[0].packed_xz == 17 and got[0].y == 64 and got[0].data != none, "the first isn't the sign at 17, 64, 33")
     check(got[1].kind == 1 and got[1].packed_xz == 0 and got[1].y == 64 and got[1].data == none, "the second isn't the chest at 16, 64, 32")
     check(got[2].kind == 1 and got[2].packed_xz == 69 and got[2].y == 70, "the third isn't the chest at 20, 70, 37")
+    // The second chest saved at 20, 70, 37 is the one there, with its loot table.
+    let map = block_entity_map(three(0, true))
+    check(map.len() == 3, "two block entities at a place weren't one")
+    var at_20 = false
+    for (pos, t) in map {
+        if pos.x == 20 {
+            at_20 = holds_anything(t)
+        }
+    }
+    check(at_20, "the earlier chest saved at a place is the one there")
+    check(not holds_anything(saved("minecraft:chest", 0, 0, 0, JavaHashMap<String, Tag>())), "a chest with nothing in it holds something")
     println("ok infos")
+}
+
+// They're saved by the bins of a `HashSet` of their places, 16 to start: the `Vec3i` hashes of
+// 16, 64, 32, 17, 64, 33 and 20, 70, 37 are 32752, 33730 and 37747, in bins 0, 2 and 3.
+fn saving() {
+    let out = saved_block_entities(block_entity_map(three(1, false)))
+    check(out.len() == 3, "a block entity wasn't saved")
+    var xs = List<i32>()
+    for t in out {
+        match t {
+            Tag.Compound(m) => {
+                check(m.contains("keepPacked"), "a block entity was saved without `keepPacked`")
+                match m["keepPacked"] {
+                    Tag.Byte(v) => check(v == 0, "a block entity the chunk holds was saved packed"),
+                    _ => panic("`keepPacked` isn't a byte"),
+                }
+                match m["x"] {
+                    Tag.Int(v) => xs.push(v),
+                    _ => panic("`x` isn't an int"),
+                }
+            },
+            _ => panic("a saved block entity isn't a compound"),
+        }
+    }
+    check(xs[0] == 16 and xs[1] == 17 and xs[2] == 20, "they aren't saved in their places' `HashSet`'s order")
+    // A rest given others keeps its ticks, marks and structures.
+    var rest = ChunkRest.empty(24)
+    rest.block_ticks.push(SavedTick { kind: 1, x: 1, y: 2, z: 3, delay: 4, priority: 0 })
+    rest.block_entities = three(0, false)
+    let packed = PackedRest.of(rest)
+    let swapped = packed.with_block_entities([saved("minecraft:sign", 1, 2, 3, JavaHashMap<String, Tag>())])
+    check(swapped.block_entities().len() == 1, "the rest kept the block entities it had")
+    let back = swapped.unpack()
+    check(back.block_ticks.len() == 1 and back.block_ticks[0].delay == 4, "the rest's ticks went with its block entities")
+    check(back.post_processing.len() == 24, "the rest's marks went with its block entities")
+    check(back.block_entities.len() == 1, "the rest unpacks with the block entities it had")
+    println("ok saving")
+}
+
+fn full(name: String) -> Identifier {
+    if let c = name.find(":") {
+        return Identifier { namespace: name[..c], path: name[c + 1..] }
+    }
+    return Identifier { namespace: "minecraft", path: name.copy() }
+}
+
+// The built-in registries, and plains as the one biome, in a world from y -64 to 320.
+fn context() -> ChunkContext {
+    var builtin = List<Registry>()
+    let names = builtin_names()
+    for i in 0..names.len() {
+        var r = Registry.new(Identifier { namespace: "minecraft", path: names[i].copy() }, false)
+        for e in builtin_entries(i) {
+            r.add(full(e), none)
+        }
+        builtin.push(r)
+    }
+    var biomes = Registry.new(Identifier { namespace: "minecraft", path: "worldgen/biome" }, true)
+    biomes.add(Identifier { namespace: "minecraft", path: "plains" }, some(0))
+    let made = ChunkFormat.new(Registries { synced: [biomes], builtin: builtin })!
+    return ChunkContext { format: made, table: BlockStates.new([1], [1], 1), min_section: -4, sections: 24, sky_light: true }
+}
+
+// The flat world: bedrock, two dirt and grass, by vanilla's IDs, air from y -60.
+fn flat_world() -> FlatWorld {
+    return FlatWorld.new(FlatBlocks { bedrock: 88, dirt: 10, grass_block: 9, biome: 0 }, BlockStates.new([1], [1], 1))
+}
+
+fn flat_chunk() -> FlatChunk {
+    var world = flat_world()
+    let made = world.take_chunk() else panic("the flat world has no chunk")
+    return made
+}
+
+fn registry(index: usize, name: str) -> Registry {
+    var r = Registry.new(full(String(name)), false)
+    for e in builtin_entries(index) {
+        r.add(full(e), none)
+    }
+    return r
+}
+
+// The block facts, from the built-in block and fluid registries (4 and 2), with the copper
+// chests' tag, as the data pack has it.
+fn facts() -> Facts {
+    var blocks = registry(4, "block")
+    var copper = List<i32>()
+    for name in ["copper_chest", "exposed_copper_chest", "weathered_copper_chest", "oxidized_copper_chest", "waxed_copper_chest", "waxed_exposed_copper_chest", "waxed_weathered_copper_chest", "waxed_oxidized_copper_chest"] {
+        let id = blocks.id(full(String(name))) else panic("no block {name}")
+        copper.push(id)
+    }
+    blocks.tags.push(RegistryTag { name: full(String("copper_chests")), values: copper })
+    return match Facts.new(blocks, registry(2, "fluid"), BlockStates.new([1], [1], 1)) {
+        ok(f) => f,
+        err(e) => panic("the block facts: {e}"),
+    }
+}
+
+// A flat level, its spawn's chunks full and given the facts.
+fn flat_level(f: Facts) -> Level {
+    var level = Level.new(10, 10)
+    level.ground(flat_chunk())
+    level.open(none, context(), none)
+    let spawn = ChunkPos { x: 0, z: 0 }
+    level.load_spawn(spawn)
+    let reach = SPAWN_RADIUS + 1
+    for x in -reach..reach + 1 {
+        for z in -reach..reach + 1 {
+            check(level.read_chunk(ChunkPos { x: x, z: z }, [], Loaded.Generate, []), "a spawn chunk wasn't asked for")
+        }
+    }
+    check(level.full_around(spawn, SPAWN_RADIUS), "the spawn isn't full")
+    level.add_player(spawn, 1)
+    level.pump()
+    level.set_env(Env { facts: f.copy(), ctx: GenContext { min_y: -64, depth: 384, sea: -63 }, sky_light: true, gen_depth: 384 })
+    return level
+}
+
+fn named(f: Facts, name: str) -> u32 {
+    return match f.named_block(String(name)) {
+        ok(b) => f.default_state(b),
+        err(_) => panic("no block {name}"),
+    }
+}
+
+fn set(level: mut Level, x: i32, y: i32, z: i32, state: u32, what: str) {
+    check(level.set_block(x, y, z, state, UPDATE_ALL), what)
+}
+
+// The block entities chunk (0, 0)'s packet sends.
+fn sent(level: mut Level) -> List<BlockEntityInfo> {
+    let bytes = match level.packet(ChunkPos { x: 0, z: 0 }, flat_world(), false) {
+        ChunkPacket.Plain(b) => b.copy(),
+        ChunkPacket.Shared { packet, .. } => packet.copy(),
+        ChunkPacket.Compressed { .. } => panic("a packet was given compressed"),
+    }
+    var r = Reader.new(bytes)
+    _ = r.varint()!
+    let p = ClientboundLevelChunkWithLight.read(mut r)!
+    return p.chunk.block_entities.copy()
+}
+
+// What the level reported isn't in Calcite yet, one line each.
+fn quiet(level: mut Level, what: str) {
+    var out = String("")
+    for e in level.take_lines() {
+        if e.message.contains("isn't in Calcite yet") {
+            out = "{out}{e.message}; "
+        }
+    }
+    if not out.is_empty() {
+        panic("{what} reported {out}")
+    }
+}
+
+fn kept() {
+    let f = facts()
+    var level = flat_level(f)
+    check(sent(mut level).is_empty(), "a flat chunk sent a block entity")
+    set(mut level, 1, -60, 1, named(f, "chest"), "the chest wasn't set")
+    set(mut level, 3, -60, 3, named(f, "oak_sign"), "the sign wasn't set")
+    set(mut level, 5, -60, 9, named(f, "chest"), "the second chest wasn't set")
+    // In slots 9, 7 and 30 of 32, sent from the top.
+    var got = sent(mut level)
+    check(got.len() == 3, "a block entity set wasn't sent")
+    check(got[0].kind == 1 and got[0].packed_xz == (5 * 16 + 9) and got[0].y == -60 and got[0].data == none, "the first sent isn't the chest at 5, -60, 9")
+    check(got[1].kind == 1 and got[1].packed_xz == 17, "the second sent isn't the chest at 1, -60, 1")
+    check(got[2].kind == 7 and got[2].packed_xz == 51, "the third sent isn't the sign")
+    let sign_data = match got[2].data.copy() {
+        some(Tag.Compound(m)) => m,
+        _ => panic("a fresh sign sent no update tag"),
+    }
+    check(sign_data.contains("front_text") and sign_data.contains("back_text") and sign_data.contains("is_waxed") and not sign_data.contains("id"), "a fresh sign's update tag isn't its own data")
+    // Taken away with its block.
+    set(mut level, 1, -60, 1, AIR_STATE, "the chest wasn't taken away")
+    got = sent(mut level)
+    check(got.len() == 2 and got[0].packed_xz == (5 * 16 + 9) and got[1].kind == 7, "the chest taken away is still sent")
+    // Kept as the sign turns; a trapped chest's replaces a chest's.
+    let turned = match f.with_name(named(f, "oak_sign"), String("rotation"), String("4")) {
+        ok(s) => s,
+        err(_) => panic("an oak sign has no rotation 4"),
+    }
+    set(mut level, 3, -60, 3, turned, "the sign didn't turn")
+    set(mut level, 5, -60, 9, named(f, "trapped_chest"), "the trapped chest wasn't set")
+    got = sent(mut level)
+    check(got.len() == 2 and got[0].kind == 2 and got[0].packed_xz == (5 * 16 + 9) and got[1].kind == 7, "the trapped chest hasn't a trapped chest's block entity in the chest's place")
+    quiet(mut level, "block entities")
+    println("ok kept")
+}
+
+// 4, -60, 12 and 5, -60, 3 both go in slot 0 of 32: the second set goes in slot 1, and is sent
+// first. Were the copper chest's block entity made again as it weathers, the other would move
+// down to slot 0 as it's taken away, and it would go in slot 1.
+fn weathered() {
+    let f = facts()
+    var level = flat_level(f)
+    set(mut level, 4, -60, 12, named(f, "copper_chest"), "the copper chest wasn't set")
+    set(mut level, 5, -60, 3, named(f, "chest"), "the chest wasn't set")
+    var got = sent(mut level)
+    check(got.len() == 2 and got[0].packed_xz == (5 * 16 + 3) and got[1].packed_xz == (4 * 16 + 12), "the chest set second isn't sent first")
+    set(mut level, 4, -60, 12, named(f, "exposed_copper_chest"), "the copper chest didn't weather")
+    got = sent(mut level)
+    check(got.len() == 2 and got[0].packed_xz == (5 * 16 + 3) and got[1].packed_xz == (4 * 16 + 12), "the copper chest's block entity was made again as it weathered")
+    set(mut level, 4, -60, 12, named(f, "furnace"), "the furnace wasn't set")
+    got = sent(mut level)
+    check(got.len() == 2 and got[0].packed_xz == (4 * 16 + 12) and got[1].packed_xz == (5 * 16 + 3), "the furnace's block entity wasn't made in the copper chest's place")
+    quiet(mut level, "weathering")
+    println("ok weathered")
 }
 
 fn main() {
     tags()
     infos()
+    saving()
+    kept()
+    weathered()
     println("ok")
 }
