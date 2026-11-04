@@ -132,6 +132,6 @@ The site is built to deploy on Vercel, but any host that runs Next.js 16 works. 
 - **Root directory:** `site`.
 - **Include files outside the root directory in the build step:** on. The site reads `../docs`, `../bench`, `../cases`, `../plugins`, `../rig` and `../src` as it builds, so the whole repo has to be checked out.
 - **Install command:** `bun install`. **Build command:** `bun run build`.
-- **Environment:** `SITE_URL`, the site's address with no trailing slash, such as `https://calcite.example`. Canonical links, the sitemap and the social card's address use it. Without it Vercel's production address is used.
+- **Environment:** nothing. The site's address, `https://calcitemc.com`, is `SITE.url` in `src/lib/site.ts`; canonical links, the sitemap, robots.txt and the cards' addresses use it from every build, preview deploys and local ones included.
 
 Every page is static except `/roadmap`, which is regenerated in the background when it's more than an hour old.
