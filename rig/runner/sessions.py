@@ -84,6 +84,8 @@ class Config:
     commands: tuple = ()
     # Where the copy of `world` has its spawn, both servers' level.dat's, if it's moved.
     spawn: tuple | None = None
+    # Whether the copy keeps the world's entities, each dimension's `entities` folder.
+    entities: bool = True
 
 
 CONFIGS = {
@@ -94,6 +96,9 @@ CONFIGS = {
     # save. Its spawn is moved to the origin, so the player is in chunk (0, 0), on the ground
     # there, as each server finds it (CAL-75).
     "saved": Config({}, view=3, scenarios=("join",), world=SAVED_WORLD, spawn=(0, 100, 0)),
+    # The same world without its entities, so its blocks' random ticks show on the tape past the
+    # mobs, whose brains draw first, and the End's crystals, which come with entities (CAL-106).
+    "terrain": Config({}, view=3, scenarios=("join",), world=SAVED_WORLD, spawn=(0, 100, 0), entities=False),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
@@ -165,8 +170,10 @@ def prepare(folder, config, port, vanilla):
     props["server-port"] = str(port)
     if c.world is not None:
         # Without the lock, which vanilla held, and the players' data, so neither server's
-        # player starts where the round trip's bot was.
-        shutil.copytree(c.world, folder / "world", ignore=lambda at, names: [n for n in names if n in ("session.lock", "players") and Path(at) == c.world])
+        # player starts where the round trip's bot was, and without the entities if the
+        # configuration leaves them out.
+        shutil.copytree(c.world, folder / "world", ignore=lambda at, names: [
+            n for n in names if (n in ("session.lock", "players") and Path(at) == c.world) or (n == "entities" and not c.entities)])
         if c.spawn is not None:
             level = nbt.read(folder / "world" / "level.dat")
             level["Data"]["spawn"]["pos"] = nbt.IntArray(c.spawn)
