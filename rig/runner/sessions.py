@@ -141,6 +141,11 @@ CONFIGS = {
     # tripped tripwire line detaching (CAL-128); watched, as `redstone`.
     "sources": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "sources" / "world",
                       fixture="sources", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # Sponges and frosted ice by the spawn: a lake a sponge took up as the world was built flowing
+    # into the hole, water flowing up a channel to a dry sponge, and frosted ice aging and melting
+    # (CAL-127); watched, as `redstone`.
+    "water_blocks": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "water_blocks" / "world",
+                           fixture="water_blocks", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
