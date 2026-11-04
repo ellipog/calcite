@@ -8,7 +8,7 @@ import { ordered } from '@/lib/dither/bayer';
 import { surface, type Surface } from '@/lib/dither/canvas';
 import { crystal } from '@/lib/dither/crystal';
 import { useFrames, useSized } from '@/lib/dither/motion';
-import { at, CAMS, fade, getBlurred, getWorld, N, still, WATER, type Cam, type Fade, type ViewOptions } from '@/lib/brand/terrain';
+import { at, CAMS, fade, getBlurred, getWorld, still, WATER, type Cam, type Fade, type ViewOptions } from '@/lib/brand/terrain';
 
 // A canvas filling its box, drawn by fn(surface) whenever its width changes. The first drawing
 // waits until the canvas is within a screen or so of the view, and then for the browser to be
@@ -48,12 +48,8 @@ export function Drawn({ draw, className, label }: { draw: (s: Surface, c: HTMLCa
 	return <canvas ref={ref} className={className} aria-label={label} role={label ? 'img' : undefined} />;
 }
 
-const MAP_FADE: Fade = { l: 0.08, r: 0.08, t: 0.14, b: 0.14 };
-
-export function drawMap(s: Surface, at0: [number, number] = [30, 260], scale = 1.4, edges: Fade = MAP_FADE) {
+export function drawMap(s: Surface, at0: [number, number] = [30, 260], scale = 1.4) {
 	const { LIT } = getWorld(), HB = getBlurred(), { cols, rows } = s, tone = new Float32Array(cols * rows);
-	// the world repeats every N cells, so a wide map is drawn closer in rather than show it twice
-	scale = Math.min(scale, (N - 32) / Math.max(cols, rows));
 	const [ox, oy] = at0, lev = (h: number) => Math.floor(h / 0.075);
 	for (let y = 0; y < rows; y++)
 		for (let x = 0; x < cols; x++) {
@@ -65,17 +61,14 @@ export function drawMap(s: Surface, at0: [number, number] = [30, 260], scale = 1
 			else t = 0.03 + 0.5 * (1 - at(LIT, wx, wy)) ** 1.6;
 			tone[y * cols + x] = t;
 		}
-	fade(tone, cols, rows, edges);
+	fade(tone, cols, rows, { l: 0.08, r: 0.08, t: 0.14, b: 0.14 });
 	s.bits(ordered(tone, cols, rows, 8));
 	s.flush();
 }
 
-/**
- * The world from above, in relief with contours, fading out at its edges. A map that runs off the
- * page on one side passes `edges` without that side's fade, so the page's edge cuts it.
- */
-export function Relief({ className, label = 'A generated world from above, in relief with contours', origin, scale, edges }: { className?: string; label?: string; origin?: [number, number]; scale?: number; edges?: Fade }) {
-	return <Drawn className={className} draw={(s) => drawMap(s, origin, scale, edges)} label={label} />;
+/** The world from above, in relief with contours. */
+export function Relief({ className, label = 'A generated world from above, in relief with contours', origin, scale }: { className?: string; label?: string; origin?: [number, number]; scale?: number }) {
+	return <Drawn className={className} draw={(s) => drawMap(s, origin, scale)} label={label} />;
 }
 
 /** A still of the world from the ground. */

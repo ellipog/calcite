@@ -67,6 +67,14 @@ export interface Difference {
 	body: string;
 }
 
+/** How many cases the rig has for a probe: every case in every file in cases/<probe>/. */
+export function probeCases(probe: string): number {
+	const dir = join(ROOT, 'cases', probe);
+	let n = 0;
+	for (const f of readdirSync(dir)) if (f.endsWith('.json')) n += (JSON.parse(readFileSync(join(dir, f), 'utf8')).cases ?? []).length;
+	return n;
+}
+
 export function differences(): Difference[] {
 	return readdirSync(join(ROOT, 'rig/differences'))
 		.filter((f) => f.endsWith('.md') && f !== 'README.md')

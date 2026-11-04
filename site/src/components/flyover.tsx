@@ -10,6 +10,7 @@ import { surface } from '@/lib/dither/canvas';
 import { PAPER, rgb } from '@/lib/dither/math';
 import { still } from '@/lib/dither/motion';
 import { hash } from '@/lib/brand/blocks';
+import { cracks } from '@/lib/brand/slab';
 import { Hero } from '@/lib/brand/hero';
 import { cn } from '@/lib/cn';
 
@@ -154,27 +155,6 @@ export function Flyover({ className, cue = false, cps = 2000 }: { className?: st
 const BLOCK = 16, STAGES = 10, MINE = 1.6, CRUMBLE = 0.45;
 const PAPER_RGB = rgb(PAPER);
 
-function cracks() {
-	// cracks walked out from the middle, each stage adding to the last
-	const stages: number[][] = [];
-	const seen = new Set<number>(), tips: [number, number][] = [[7, 8], [8, 7]];
-	let k = 1;
-	const r = () => ((k = Math.imul(k ^ (k >>> 15), 2246822507) + 0x9e3779b9), (k >>> 0) / 4294967296);
-	for (let s = 0; s < STAGES; s++) {
-		for (let step = 0; step < 3 + s; step++) {
-			for (const tip of tips) {
-				const a = Math.floor(r() * 8), dx = [1, 1, 0, -1, -1, -1, 0, 1][a], dy = [0, 1, 1, 1, 0, -1, -1, -1][a];
-				tip[0] = Math.min(BLOCK - 2, Math.max(1, tip[0] + dx));
-				tip[1] = Math.min(BLOCK - 2, Math.max(1, tip[1] + dy));
-				seen.add(tip[1] * BLOCK + tip[0]);
-			}
-			if (r() < 0.25 && tips.length < 6) tips.push([...tips[Math.floor(r() * tips.length)]] as [number, number]);
-		}
-		stages.push([...seen]);
-	}
-	return stages;
-}
-
 function MineCue() {
 	const [on, setOn] = useState(false);
 	const cv = useRef<HTMLCanvasElement>(null);
@@ -198,7 +178,7 @@ function MineCue() {
 
 	useEffect(() => {
 		if (!on) return;
-		const S = surface(cv.current!, 2), n = S.cols, bits = new Uint8Array(n * S.rows), crack = cracks();
+		const S = surface(cv.current!, 2), n = S.cols, bits = new Uint8Array(n * S.rows), crack = cracks(BLOCK, STAGES);
 		// the block's face: stone, its cells a little lighter or darker, framed in ink
 		const face = new Float32Array(BLOCK * BLOCK);
 		for (let y = 0; y < BLOCK; y++) for (let x = 0; x < BLOCK; x++) face[y * BLOCK + x] = x === 0 || y === 0 || x === BLOCK - 1 || y === BLOCK - 1 ? 1 : 0.28 + hash(x, y + 40) * 0.22;

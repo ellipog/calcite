@@ -1,7 +1,7 @@
 import Link from 'next/link';
 import { AaenMark } from '@/components/aaen-mark';
 import { Mark } from '@/components/mark';
-import { Wordmark } from '@/components/site/wordmark';
+import { Ground } from '@/components/site/ground';
 import { NAV, NOT_MOJANG, SITE } from '@/lib/site';
 
 const OUT = [
@@ -10,8 +10,8 @@ const OUT = [
 	{ href: SITE.calx, label: 'Calx, the language' },
 ];
 
-// The links, split as the pages' heads are, then the name set across the whole frame, sitting on
-// the bottom bar.
+// The links, split as the pages' heads are, then the ground across the whole window, standing on
+// the bottom bar: a cut through a world, to bedrock, that can be mined (ground.tsx).
 export function SiteFooter() {
 	return (
 		<footer className="mt-24 rule-t md:mt-32">
@@ -49,9 +49,7 @@ export function SiteFooter() {
 					</nav>
 				</div>
 			</div>
-			<div className="wrap">
-				<Wordmark />
-			</div>
+			<Ground />
 			<div className="rule-t">
 				<div className="wrap flex flex-wrap items-center justify-between gap-x-8 gap-y-2 py-6 font-mono text-xs leading-[1.6]">
 					<a href={SITE.studio} className="inline-flex items-center gap-2">

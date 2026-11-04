@@ -2,16 +2,16 @@ import type { Metadata } from 'next';
 import { meta } from '@/lib/meta';
 import Link from 'next/link';
 import { Flyover } from '@/components/flyover';
-import { Relief } from '@/components/pictures';
+import { GenSteps } from '@/components/site/gen-steps';
+import { TickBand } from '@/components/site/tick-band';
 import { Band, Kicker, PhaseStrip, SectionHead, Stats } from '@/components/site/parts';
 import { ButtonLink } from '@/components/ui/button';
 import { Tag } from '@/components/ui/feedback';
 import { CodeBlock } from '@/components/ui/overlay';
 import { Tabs } from '@/components/ui/tabs';
-import { Panel } from '@/components/ui/text';
 import { cn } from '@/lib/cn';
 import { DATA } from '@/lib/data';
-import { differences, phases, samples, type Phase } from '@/lib/repo';
+import { differences, phases, probeCases, samples, type Phase } from '@/lib/repo';
 import { SITE } from '@/lib/site';
 
 export const metadata: Metadata = meta({ description: SITE.description, path: '/' });
@@ -65,8 +65,19 @@ function Pending({ phase, plan }: { phase: number; plan: Phase[] }) {
 	return <Tag status={p.state === 'now' ? 'running' : 'planned'}>{p.state === 'now' ? `phase ${p.n}, in progress` : `phase ${p.n}`}</Tag>;
 }
 
-const Points = ({ items }: { items: string[] }) => (
-	<ul className="grid gap-3 text-[17px] leading-normal">
+// The steps of generation the strip by "Vanilla parity" shows, each with the rig's cases for it.
+const GEN = () => [
+	{ name: 'structure starts', cases: probeCases('structures') },
+	{ name: 'biomes', cases: probeCases('biomes') },
+	{ name: 'noise', cases: probeCases('noise') + probeCases('density') },
+	{ name: 'surface', cases: probeCases('surface') },
+	{ name: 'carvers', cases: probeCases('carvers') },
+	{ name: 'features', cases: probeCases('features') },
+	{ name: 'light', cases: probeCases('light') },
+];
+
+const Points = ({ items, className }: { items: string[]; className?: string }) => (
+	<ul className={cn('grid gap-3 text-[17px] leading-normal', className)}>
 		{items.map((t) => (
 			<li key={t} className="relative pl-7">
 				<span aria-hidden className="absolute top-[0.55em] left-0 size-[6px] bg-ink" />
@@ -157,6 +168,8 @@ export default function Home() {
 						</Link>
 					}
 				/>
+				{/* a tick across the window, and what 100 players took of it, to scale */}
+				<TickBand className="mb-14" mean={B.windows.mean} p99={B.windows.p99} max={B.windows.max} runs={B.runs} />
 				<Stats
 					bleed
 					items={[
@@ -169,39 +182,37 @@ export default function Home() {
 			</Band>
 
 			{/* ---- parity ---- */}
-			{/* the map runs off the right of the page, and off both sides of a phone */}
+			{/* a strip of a world across the window, a chunk at each step of generation, each replaying its step */}
 			<Band id="parity">
-				<div className="grid grid-cols-1 items-center gap-12 lg:grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)] lg:gap-16">
-					<div>
-						<SectionHead
-							className="mb-7"
-							title="Vanilla parity"
-							lead={
-								<p>
-									A test rig gives vanilla&apos;s server and Calcite the same inputs and compares what comes out bit for bit, so a near miss counts as a failure. When matching vanilla and being fast pull apart, vanilla wins wherever a player, a farm or a data pack could notice.
-								</p>
-							}
-						/>
-						<Points
-							items={[
-								'Worldgen passes the rig’s suites in the Overworld, the Nether and the End, on a grid of seeds.',
-								'With Terralith and Terratonic, every one of 264 sampled chunks has what must be vanilla’s.',
-								'Light matches vanilla’s to the nibble.',
-								'Logins match vanilla’s packet for packet.',
-								'Worlds move between vanilla and Calcite in both directions.',
-								`The ${diffs} places Calcite differs on purpose are listed, each a vanilla bug fixed or a limit stated.`,
-							]}
-						/>
-						<p className="mt-7">
-							<Link href="/docs/vanilla" className="link">
-								Worlds, vanilla and the differences
-							</Link>
+				<SectionHead
+					split
+					title="Vanilla parity"
+					lead={
+						<p>
+							A test rig gives vanilla&apos;s server and Calcite the same inputs and compares what comes out bit for bit, so a near miss counts as a failure. When matching vanilla and being fast pull apart, vanilla wins wherever a player, a farm or a data pack could notice.
 						</p>
-					</div>
-					<Panel label="A generated world, from above" className="overflow-hidden p-0 pt-0 max-lg:bleed max-lg:border-x-0 lg:bleed-r lg:border-r-0">
-						<Relief className="h-[380px] w-full lg:h-[min(640px,75svh)]" edges={{ l: 0.08, t: 0.14, b: 0.14 }} />
-					</Panel>
-				</div>
+					}
+					more={
+						<Link href="/docs/vanilla" className="link">
+							Worlds, vanilla and the differences
+						</Link>
+					}
+				/>
+				<GenSteps className="bleed" steps={GEN()} />
+				<p className="mt-4 max-w-[96ch] font-mono text-xs leading-normal">
+					A world is made in steps, and a chunk takes its next only once the chunks around it have taken theirs, so the edge of a world being made looks like this strip. Each chunk here is a step further on than the one to its left, and replays that step. Under each step is how many of the rig&apos;s cases compare it with vanilla&apos;s.
+				</p>
+				<Points
+					className="mt-14 md:grid-cols-2 md:gap-x-10 xl:grid-cols-3"
+					items={[
+						'Worldgen passes the rig’s suites in the Overworld, the Nether and the End, on a grid of seeds.',
+						'With Terralith and Terratonic, every one of 264 sampled chunks has what must be vanilla’s.',
+						'Light matches vanilla’s to the nibble.',
+						'Logins match vanilla’s packet for packet.',
+						'Worlds move between vanilla and Calcite in both directions.',
+						`The ${diffs} places Calcite differs on purpose are listed, each a vanilla bug fixed or a limit stated.`,
+					]}
+				/>
 			</Band>
 
 			{/* ---- plugins ---- */}

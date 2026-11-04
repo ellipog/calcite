@@ -1,6 +1,6 @@
 # Calcite's website
 
-The public site, and the brand guide and component sheet behind it. It's a Next.js app, built with bun, that reads the rest of the repo as it builds: the guide's Markdown, the plan, the benchmark results and the sample plugins. Change those and the site follows on its next build. There's nothing to keep in sync by hand.
+The public site, and the brand guide and component sheet behind it. It's a Next.js app, built with bun, that reads the rest of the repo as it builds: the guide's Markdown, the plan, the benchmark results, the rig's cases and the sample plugins. Change those and the site follows on its next build. There's nothing to keep in sync by hand.
 
 ## Running it
 
@@ -30,7 +30,7 @@ The site is then at http://localhost:3000. Under `next dev` it also serves two i
 
 | Page | Source |
 |---|---|
-| `/` | `src/app/(site)/page.tsx`, with numbers from `src/lib/data.ts`, the phases from `docs/PLAN.md`, the count of differences from `rig/differences/` and the homes sample |
+| `/` | `src/app/(site)/page.tsx`, with numbers from `src/lib/data.ts`, the phases from `docs/PLAN.md`, the count of differences from `rig/differences/`, the count of cases for each step of world generation from `cases/<probe>/*.json` and the homes sample |
 | `/benchmarks` | `src/lib/data.ts` |
 | `/docs` and `/docs/*` | `docs/guide/*.md`, `docs/pregen.md` and `plugins/api/HOST_API.md`, in the order `docs/guide/README.md` lists them |
 | `/plugins` | Sections of `plugins/api/HOST_API.md` and `plugins/samples/README.md`, and the samples' code |
@@ -65,7 +65,15 @@ The flight is paced to what a frame costs, so it doesn't drain a phone. In V8 on
 
 With the flight in a worker, the page's main thread stays free. Measured on the production build in headless Edge over 8 seconds with the CPU slowed 4×, the page's frames came a median of 5.3 ms apart with four long tasks, all while loading. With the flight on the main thread they came 52 to 58 ms apart, with 79 to 91 long tasks blocking it for 5.2 to 5.6 of the 8 seconds. A touch screen's flight also rests after 30 seconds without a touch, holding its last frame, and a touch starts it again. With reduced motion, or with the browser's Save-Data on, it draws one still frame with the whole view generated. It stops whenever it's off screen or the tab is hidden.
 
-The other pictures drawn on the page, such as the relief map by "Vanilla parity", wait until they're within a screen of the view and then for the browser to be idle, so the world they're built from (about 55 ms of work) isn't made while the page is loading.
+### The strip of steps and the ground
+
+By "Vanilla parity" a strip of a world runs across the window (`src/components/site/gen-steps.tsx`), each chunk a step further through vanilla's generation than the one to its left: structure starts, biomes, noise, surface, carvers, features and light, with chunks not yet begun to the left and finished ones to the right, out to the window's edges. The steps start on the frame's left edge, one to a chunk, with the rig's count of cases for each under it. Each step's chunk replays its step every 6.4 seconds, a little after the one before: a structure's box is drawn edge by edge, biomes arrive a 4×4 quart at a time, stone rises, grass and sand sweep across, a tunnel is bored along the chunk's front, ores are set and oaks grow log by log and then leaves, and light darkens the caves and the ground under the trees. Pointing at a chunk holds it finished. With reduced motion every chunk is drawn finished. Where seven chunks don't fit at a readable size, as on a phone, the strip scrolls sideways.
+
+The world and its drawing are `src/lib/brand/slab.ts`, which has no DOM. The world is made once, with each step's blocks kept, and when each block changes within its step, so a chunk part way through a step is a lookup. The drawing is oblique: a block's front is square and its top and right side are seen at half depth. Faces are toned from above (tops lightest, right sides darkest) on the 4×4 Bayer matrix, aligned to the screen so a slanted top doesn't shear into stripes, and each block kind has its own marks: grass's ragged band down the sides and tufts on top, ore lumps, bark, holes in leaves, ripples and level lines on water, pebbles in gravel. Every cell keeps which plane of which block it shows and how near it is, and wherever two neighbouring cells differ the nearer gets an ink edge. So a terrace, a tree, an ore or a cave's mouth is a shape with an outline rather than a field of dots, and chunk borders show on the ground as the game's chunk-border view draws them. A face that looks into air under the ground is in a cave, and dark. The blocks are drawn nearest first, each face filling only the cells nothing nearer has, so a hidden cell is never worked out. On a fast desktop CPU a frame of the strip at 1920 px wide takes about 4 ms to draw, and about 6 ms with copying it to the canvas in a development build. It draws at most 15 frames a second, since blocks change one at a time, skips a frame in which no chunk has moved, and stops when it's out of view.
+
+The footer's ground (`src/components/site/ground.tsx`) is a cut through another world from the same file, seen square on, from the treetops to bedrock, as wide as the window. It draws the first four blocks back, fainter in the open the further back they are, and the far walls of any cave or tunnel behind them, dark. Holding the pointer on a block mines it: ten stages of the same cracks as the hero's chip (`cracks()` in `slab.ts`), for about as long as a hand takes on that block, from 0.3 s for leaves to 2.6 s for deepslate. Then the block is gone and what's behind it shows, and if the pointer is still held the next one starts after a quarter of a second, as in the game. Bedrock and water can't be mined. The block under the pointer has a crisp outline, ink round it and paper just inside, so it shows on any block. The count of blocks mined replaces the hint in the corner. The world is made once the footer is within half a screen of the view, and the cut is drawn again only when something changes.
+
+By "Performance" a band across the window is one tick (`src/components/site/tick-band.tsx`): its 50 ms are the window's width, and what 100 players took of it is marked to scale at its left end, solid to the mean, half-tone to the 99th percentile and a line at the longest, from `DATA.bots.windows`. It's plain CSS.
 
 ### The roadmap
 
@@ -78,7 +86,7 @@ src/app/(site)/        the public pages, with their header and footer
 src/app/(internal)/    the brand guide and the component sheet (*.internal.tsx)
 src/app/               the root layout, icons, the social card, robots.txt and the sitemap
 src/components/ui/     the components, each drawn in the brand's dither
-src/components/site/   pieces of the public pages: the header, the footer and its wordmark, the charts, the page and docs navs
+src/components/site/   pieces of the public pages: the header, the footer and its ground, the strip of steps, the tick band, the charts, the page and docs navs
 src/lib/               the brand's math and tiles, the Markdown parser, what's read from the repo
 scripts/               data.ts and tiles.ts
 ```
@@ -93,10 +101,10 @@ The public pages span the window. Their content sits in a frame up to 1920 px wi
 
 - Each section of the home page and the plugins page is a `Band` (`src/components/site/parts.tsx`), whose dotted rule runs from one edge of the window to the other. So do the roadmap's phases, with the phase in progress on a solid rule.
 - A wide head is split as the hero is, with the title on the left and the lead on the right: `SectionHead` with `split`, and `PageHead`. Anything beside a table or a chart under such a head uses the same columns (`SPLIT_XL`), so text in the right-hand column starts on the lead's line down the whole page.
-- The `bleed-r`, `bleed-l` and `bleed` utilities take something in the frame out to the window's edge. The home page's stats run their rules across the window (`Stats` with `bleed`), and the relief map by "Vanilla parity" runs off the right of the page, or off both sides of a phone, with no fade on the side the page's edge cuts.
+- The `bleed-r`, `bleed-l` and `bleed` utilities take something in the frame out to the window's edge. The home page's stats run their rules across the window (`Stats` with `bleed`), as do the tick band by "Performance" and the strip of steps by "Vanilla parity", whose chunks run out to both edges.
 - Grids get more columns as the width grows: the home page's features go four across, the plugin API's needs go as many across as fill every row, and a roadmap phase's checklist sits beside its gate.
 - On a wide screen the benchmarks page lists its sections in a sticky column on the left (`src/components/site/page-nav.tsx`), marking the one being read. On a narrower one they're a row of chips under the head.
-- The footer sets the name across the whole frame (`src/components/site/wordmark.tsx`), standing on the bottom bar's rule. It's type rather than a picture, so it needs no script: the word is sized in container units to the frame's width, trimmed to its cap height and baseline, and drawn seven times, each copy clipped to a band of the letters' height and filled with a Bayer tile, from solid at the top to a quarter at the foot. The ink's width and the c's side bearing are measured constants, so the letters touch both sides of the frame. If the display face changes, measure them again.
+- The footer's ground runs from one edge of the window to the other and stands on the bottom bar's rule.
 
 The docs, being for reading, keep the old 1200 px frame, as do the internal pages: an element with `data-frame="narrow"` sets `--frame` and `--side` again for everything in it. The header and footer still span the window there.
 
@@ -105,7 +113,7 @@ The docs, being for reading, keep the old 1200 px frame, as do the internal page
 The site is built to deploy on Vercel, but any host that runs Next.js 16 works. On Vercel:
 
 - **Root directory:** `site`.
-- **Include files outside the root directory in the build step:** on. The site reads `../docs`, `../bench`, `../plugins`, `../rig` and `../src` as it builds, so the whole repo has to be checked out.
+- **Include files outside the root directory in the build step:** on. The site reads `../docs`, `../bench`, `../cases`, `../plugins`, `../rig` and `../src` as it builds, so the whole repo has to be checked out.
 - **Install command:** `bun install`. **Build command:** `bun run build`.
 - **Environment:** `SITE_URL`, the site's address with no trailing slash, such as `https://calcite.example`. Canonical links, the sitemap and the social card's address use it. Without it Vercel's production address is used.
 
