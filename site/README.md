@@ -71,6 +71,8 @@ scripts/               data.ts and tiles.ts
 
 The internal pages' files end in `.internal.tsx`, which `next.config.ts` only counts as a page extension under `next dev` or with `CALCITE_INTERNAL=1`. A production build doesn't see them at all.
 
+The footer's bottom bar credits Aaen Studios, which makes Calcite and Calx, and links to its site, `SITE.studio` in `src/lib/site.ts`. The studio's mark, in `src/components/aaen-mark.tsx`, is traced from `logo-mark.png` on aaenz.no and drawn in the footer's ink. Calx's site has the same credit.
+
 ## Deploying
 
 The site is built to deploy on Vercel, but any host that runs Next.js 16 works. On Vercel:

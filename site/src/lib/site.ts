@@ -13,6 +13,8 @@ export const SITE = {
 	tree: 'https://github.com/ellipog/calcite/tree/main/',
 	acta: 'https://acta.aaenz.no/p/aaen-studios/calcite',
 	calx: 'https://calxlang.com',
+	/** Aaen Studios, which makes Calcite and Calx. */
+	studio: 'https://aaenz.no',
 	calxInstall: 'https://calxlang.com/guide/install/',
 	minecraft: '26.3',
 } as const;

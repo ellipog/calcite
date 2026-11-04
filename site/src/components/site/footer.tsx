@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { AaenMark } from '@/components/aaen-mark';
 import { Mark } from '@/components/mark';
 import { NAV, NOT_MOJANG, SITE } from '@/lib/site';
 
@@ -45,7 +46,11 @@ export function SiteFooter() {
 				</nav>
 			</div>
 			<div className="rule-t">
-				<div className="wrap flex flex-wrap justify-between gap-x-8 gap-y-2 py-6 font-mono text-xs leading-[1.6]">
+				<div className="wrap flex flex-wrap items-center justify-between gap-x-8 gap-y-2 py-6 font-mono text-xs leading-[1.6]">
+					<a href={SITE.studio} className="inline-flex items-center gap-2">
+						<AaenMark size={16} />
+						<span className="link">An Aaen Studios project</span>
+					</a>
 					<p>
 						MIT licensed. Calcite contains no Mojang code or assets.
 					</p>
