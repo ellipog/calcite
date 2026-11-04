@@ -460,6 +460,77 @@ BAD_COMPONENTS = {
     "not-object": [],
 }
 
+# The types with codecs of their own, from attribute modifiers to fuels.
+ITEM_COMPONENTS += [
+    {
+        "attribute_modifiers": [
+            {"type": "minecraft:armor", "id": "w:a", "amount": 2, "operation": "add_value", "slot": "chest"},
+            {"type": "attack_damage", "id": "w:b", "amount": 0.5, "operation": "add_multiplied_total", "display": {"type": "override", "value": "X"}},
+            {"type": "minecraft:luck", "id": "w:c", "amount": 1, "operation": "add_multiplied_base", "display": {"type": "hidden"}, "slot": "any"},
+            {"type": "minecraft:luck", "id": "w:d", "amount": 1, "operation": "add_value", "display": {"type": "default"}},
+        ],
+        "custom_model_data": {"floats": [1, 2.5], "flags": [True, False], "strings": ["a"], "colors": [16711680, [0.0, 1.0, 0.5]]},
+        "dyed_color": [1.0, 0.5, 0.0], "attack_animation": {"type": "stab", "duration": 8}, "interact_animation": {"type": "none"},
+    },
+    {
+        "consumable": {"consume_seconds": 2, "animation": "drink", "sound": "minecraft:entity.generic.drink", "on_consume_effects": [
+            {"type": "minecraft:apply_effects", "effects": [{"id": "minecraft:speed", "duration": 100, "amplifier": 1}], "probability": 0.5},
+            {"type": "remove_effects", "effects": ["minecraft:poison"]},
+            {"type": "clear_all_effects"},
+            {"type": "teleport_randomly", "diameter": 8},
+            {"type": "play_sound", "sound": "minecraft:entity.player.burp"},
+        ]},
+        "death_protection": {"death_effects": [{"type": "clear_all_effects"}, {"type": "apply_effects", "effects": [{"id": "regeneration", "duration": 900, "amplifier": 1, "show_particles": False, "hidden_effect": {"duration": 1000, "amplifier": 2}}]}]},
+        "potion_contents": {"potion": "minecraft:long_swiftness", "custom_color": 123, "custom_effects": [{"id": "minecraft:speed", "duration": 20, "hidden_effect": {"duration": 5, "amplifier": 300}}], "custom_name": "n"},
+        "suspicious_stew_effects": [{"id": "minecraft:night_vision"}, {"id": "minecraft:poison", "duration": "x"}, {"id": "saturation", "duration": 40}],
+    },
+    {
+        "tool": {"rules": [{"blocks": "#minecraft:mineable/pickaxe", "speed": 8, "correct_for_drops": True}, {"blocks": ["minecraft:cobweb"], "speed": 15}], "damage_per_block": 2},
+        "equippable": {"slot": "head", "equip_sound": "minecraft:item.armor.equip_iron", "asset_id": "minecraft:iron", "allowed_entities": "minecraft:player", "dispensable": False, "shearing_sound": "minecraft:item.shears.snip"},
+        "blocks_attacks": {"block_delay_seconds": 0.25, "damage_reductions": [{"type": "#minecraft:is_explosion", "base": 0, "factor": 0.5}], "item_damage": {"threshold": 3, "base": 1, "factor": 1}, "bypassed_by": "#minecraft:bypasses_shield", "block_sound": "minecraft:item.shield.block"},
+        "kinetic_weapon": {"delay_ticks": 5, "dismount_conditions": {"max_duration_ticks": 20, "min_speed": 1}, "damage_multiplier": 2, "sound": "minecraft:item.trident.hit"},
+    },
+    {
+        "map_decorations": {"a": {"type": "minecraft:red_x", "x": 1, "z": -2.5, "rotation": 180}},
+        "trim": {"material": "minecraft:gold", "pattern": {"asset_id": "w:p", "description": "P"}},
+        "instrument": {"sound_event": "minecraft:item.goat_horn.sound.0", "use_duration": 7, "range": 256, "description": "d"},
+        "provides_trim_material": "minecraft:iron", "jukebox_playable": "minecraft:cat",
+        "lodestone_tracker": {"target": {"dimension": "minecraft:overworld", "pos": [1, 64, -3]}, "tracked": False},
+        "firework_explosion": {"shape": "star", "colors": [1, 2], "has_twinkle": True},
+        "fireworks": {"flight_duration": 200, "explosions": [{"shape": "burst", "fade_colors": [5]}]},
+    },
+    {
+        "banner_patterns": [{"pattern": "minecraft:stripe_top", "color": "red"}, {"pattern": {"asset_id": "w:x", "translation_key": "k"}, "color": "blue"}],
+        "container": [{"slot": 0, "item": {"id": "minecraft:stone", "count": 2}}, {"slot": 26, "item": "minecraft:dirt"}],
+        "bees": [{"entity_data": {"id": "minecraft:bee", "Health": 5.0}, "ticks_in_hive": 10, "min_ticks_in_hive": 20}],
+        "entity_data": {"id": "bee", "x": 1}, "block_entity_data": "{id:\"minecraft:chest\",Items:[]}",
+        "compostable": {"layers": 2}, "cooking_fuel": {"burn_time": 200, "speed_multiplier": 1.5}, "brewing_fuel": {"uses": 20, "speed_multiplier": "w:fast"},
+    },
+    {"potion_contents": "minecraft:swiftness", "dyed_color": 255, "instrument": "minecraft:ponder_goat_horn", "trim": {"material": "minecraft:iron", "pattern": "minecraft:coast"}},
+    {"potion_contents": {"custom_effects": [
+        {"id": "minecraft:speed", "duration": 20, "hidden_effect": {"duration": 30, "amplifier": 1}},
+        {"id": "minecraft:haste", "duration": 20, "hidden_effect": {"duration": 5}},
+        {"id": "minecraft:luck", "duration": 20, "amplifier": 2, "hidden_effect": {"duration": 30, "amplifier": 1, "hidden_effect": {"duration": 40, "show_icon": False}}},
+    ]}},
+    {"potion_contents": {"custom_effects": [{"id": "minecraft:speed", "duration": 20, "show_particles": False, "hidden_effect": {"duration": 30}}]},
+     "death_protection": {"death_effects": [{"type": "apply_effects", "effects": [{"id": "minecraft:speed", "duration": 20, "hidden_effect": {"duration": 30}}]}]}},
+]
+
+BAD_COMPONENTS.update({
+    "attribute-unknown": {"attribute_modifiers": [{"type": "w:nope", "id": "w:a", "amount": 1, "operation": "add_value"}]},
+    "effect-unknown": {"potion_contents": {"custom_effects": [{"id": "w:nope"}]}},
+    "consume-type": {"consumable": {"on_consume_effects": [{"type": "w:nope"}]}},
+    "equip-slot": {"equippable": {"slot": "tail"}},
+    "entity-no-id": {"entity_data": {"x": 1}},
+    "entity-unknown": {"entity_data": {"id": "w:nope"}},
+    "container-slot": {"container": [{"slot": 300, "item": "minecraft:stone"}]},
+    "firework-shape": {"firework_explosion": {"shape": "cube"}},
+    "color-floats": {"dyed_color": [1, 2]},
+    "map-decoration": {"map_decorations": {"a": {"type": "w:nope", "x": 0, "z": 0, "rotation": 0}}},
+    "tool-rules": {"tool": {}},
+    "hidden-effect": {"potion_contents": {"custom_effects": [{"id": "minecraft:speed", "hidden_effect": {"duration": "x"}}]}},
+})
+
 
 def painting(width=1, height=1, asset="w:a", **more):
     data = {"width": width, "height": height, "asset_id": asset}
