@@ -3,14 +3,19 @@ vanilla and by Calcite, as the vanilla adapter's SessionDump read it with vanill
 
 A session is cut into the bot's steps, and each step's packets are lined up by kind, as `diff`
 lines up text. Two lined-up packets match when their values are the same tree and, unless
-vanilla doesn't fix the order (`UNORDERED`), the same bytes. Three things are taken out of the
-line first, since when they come depends on timing rather than on the server:
+vanilla doesn't fix the order (`UNORDERED`), the same bytes. Four things are taken out of the
+line first, since when or in what order they come depends on timing rather than on the server:
 
 - **Clock packets.** `set_time` and keep-alives come every so many ticks or milliseconds. Each
   side's are compared by their values with the times taken out, once a step.
 - **Chunks.** Vanilla sends the chunks that are ready, nearest first, and they get ready on
   worker threads, so how many go in a batch and in what order changes from run to run. A step's
   chunks are compared as a set, by position, where its first batch began.
+- **Block changes.** Vanilla broadcasts the chunks whose blocks changed in a tick from a
+  `ReferenceOpenHashSet` of their holders, by identity, so in another order between chunks each
+  run, and a light update comes as its light thread gets to the change. A step's
+  `block_update`, `section_blocks_update` and `light_update` packets are compared as a multiset,
+  those left over paired by where they are, to show what differs (D341).
 - **What isn't a packet.** The bot's mark that the server closed the connection is lined up
   like a packet, as `<closed>`.
 
@@ -32,6 +37,7 @@ CLOCK = {"play/set_time", "play/keep_alive", "configuration/keep_alive"}
 # The fields of a clock packet that hold the time.
 CLOCK_TIMES = {"gameTime", "totalTicks", "id"}
 CHUNKS = {"play/chunk_batch_start", "play/chunk_batch_finished", "play/level_chunk_with_light"}
+CHANGES = {"play/block_update", "play/section_blocks_update", "play/light_update"}
 # Packets whose bytes vanilla itself doesn't fix: their values must match, but not their bytes.
 # PacketCheck lists the first three. A chunk's heightmaps are a HashMap, from `Collectors.toMap`,
 # keyed by an enum, which hashes by identity, so vanilla writes them in another order each run;
@@ -63,6 +69,7 @@ class Step:
     chunks: dict = field(default_factory=dict)
     batches: int = 0
     batched: int = 0
+    changes: list = field(default_factory=list)
 
 
 def load(path):
@@ -95,8 +102,11 @@ def load(path):
             else:
                 step.chunks[(value.get("x"), value.get("z"))] = Entry(kind, without(value, {"x", "z"}), r["sha256"], r.get("error", ""))
             continue
+        if kind in CHANGES:
+            step.changes.append(Entry(kind, value, r["sha256"], r.get("error", "")))
+            continue
         step.entries.append(Entry(kind, value, r["sha256"], r.get("error", "")))
-    return [s for s in steps if s.name != "start" or s.entries]
+    return [s for s in steps if s.name != "start" or s.entries or s.changes]
 
 
 def without(value, names):
@@ -202,6 +212,8 @@ def compare_step(scenario, va, ca, findings, counts):
             found(x.kind, "only vanilla sends it" if not x.kind.startswith("<") else f"only vanilla's session has {x.kind}")
         for y in b[j1:j2]:
             found(y.kind, "only Calcite sends it" if not y.kind.startswith("<") else f"only Calcite's session has {y.kind}")
+    if va.changes or ca.changes:
+        compare_changes(va, ca, found, tally)
     for kind in sorted(set(va.clock) | set(ca.clock)):
         if kind not in ca.clock:
             found(kind, "only vanilla sends it")
@@ -211,6 +223,55 @@ def compare_step(scenario, va, ca, findings, counts):
             found(kind, "differs, with the times taken out", paths(va.clock[kind], ca.clock[kind]))
         else:
             tally["match"] += 1
+
+
+def where(entry):
+    """Where a block change is: a block's position, a section's, or a light update's chunk."""
+    v = entry.value if isinstance(entry.value, dict) else {}
+    at = v.get("pos") or v.get("sectionPos") or {k: v.get(k) for k in ("x", "z")}
+    return entry.kind, json.dumps(without(at, {"@"}), sort_keys=True)
+
+
+def compare_changes(va, ca, found, tally):
+    """A step's block changes as a multiset: each of vanilla's matched with one of Calcite's with
+    the same value, then those left paired by where they are, in the order each side sent them,
+    and the rest each side's own."""
+    left_v = []
+    by_value = {}
+    for e in ca.changes:
+        by_value.setdefault((e.kind, e.text()), []).append(e)
+    for x in va.changes:
+        same = by_value.get((x.kind, x.text()))
+        if not same:
+            left_v.append(x)
+            continue
+        y = same.pop(0)
+        problem = compare_entries(x, y)
+        if problem:
+            found(x.kind, "differs", problem)
+        else:
+            tally["match"] += 1
+    remaining = {id(e) for es in by_value.values() for e in es}
+    left_c = [e for e in ca.changes if id(e) in remaining]
+    by_place = {}
+    for y in left_c:
+        by_place.setdefault(where(y), []).append(y)
+    only_v = []
+    for x in left_v:
+        there = by_place.get(where(x))
+        if there:
+            found(x.kind, "differs", compare_entries(x, there.pop(0)) or ["the same values"])
+        else:
+            only_v.append(x)
+    only_c = [y for ys in by_place.values() for y in ys]
+    for side, xs in (("vanilla", only_v), ("Calcite", only_c)):
+        by_kind = {}
+        for x in xs:
+            by_kind.setdefault(x.kind, []).append(x)
+        for kind, ys in sorted(by_kind.items()):
+            what = f"only {side} sends it" if len(ys) == 1 else f"only {side} sends {len(ys)} of them"
+            found(kind, what, [f"at {where(y)[1]}" for y in ys[:3]])
+            tally["differ"] += len(ys) - 1
 
 
 def compare_chunks(va, ca, found, tally):

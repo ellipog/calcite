@@ -306,6 +306,28 @@ class Sessions(unittest.TestCase):
         # The two chunks that are the same still count.
         self.assertEqual(report.counts["play"]["match"], 2)
 
+    def test_block_changes_in_any_order(self):
+        def block(x, state):
+            return self.packet("play", "block_update", {"pos": {"@": "BlockPos", "x": x, "y": 0, "z": 0}, "blockState": state})
+
+        def section(x, changes):
+            return self.packet("play", "section_blocks_update", {"sectionPos": {"@": "SectionPos", "x": x, "y": 0, "z": 0}, "positions": changes})
+        light = self.packet("play", "light_update", {"x": 5, "z": 5, "lightData": "l"})
+        vanilla = [{"mark": "step join"}, block(1, "stone"), section(2, [1, 2]), self.packet("play", "commands", {"entries": 3}),
+                   block(3, "dirt"), block(4, "snow"), light]
+        calcite = [{"mark": "step join"}, block(3, "dirt"), section(2, [1, 2]), self.packet("play", "commands", {"entries": 3}),
+                   block(1, "stone"), block(4, "air"), block(6, "air")]
+        report, _ = self.compare(vanilla, calcite)
+        found = sorted((f.key, f.what, tuple(f.detail)) for f in report.findings)
+        # Those in another order match; the one at x 4 differs; the light update and the block at 6
+        # are each side's own.
+        self.assertEqual(found, [
+            ("session:join/join/block_update", "differs", (".blockState: \"snow\" vs \"air\"",)),
+            ("session:join/join/block_update", "only Calcite sends it", ('at {"x": 6, "y": 0, "z": 0}',)),
+            ("session:join/join/light_update", "only vanilla sends it", ('at {"x": 5, "z": 5}',)),
+        ])
+        self.assertEqual(report.counts["play"], {"match": 4, "differ": 3})
+
     def test_scenarios_by_configuration(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
