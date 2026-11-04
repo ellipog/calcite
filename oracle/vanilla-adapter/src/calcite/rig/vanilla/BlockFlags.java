@@ -216,8 +216,10 @@ final class BlockFlags {
         StringBuilder removal = new StringBuilder();
         StringBuilder tick = new StringBuilder();
         StringBuilder randomTick = new StringBuilder();
-        // `FireBlock.canBurn`: the blocks fire's ignite odds are above 0 for.
+        // `FireBlock.canBurn`: the blocks fire's ignite odds are above 0 for; and each block with
+        // either of fire's odds above 0, with its ignite odds and its burn odds (D339).
         StringBuilder flammable = new StringBuilder();
+        StringBuilder fireOdds = new StringBuilder();
         // The blocks that are `LiquidBlockContainer`s, as structure templates fill them: those that
         // are `SimpleWaterloggedBlock`s, and the others.
         StringBuilder waterloggable = new StringBuilder();
@@ -242,6 +244,11 @@ final class BlockFlags {
         @SuppressWarnings("unchecked")
         it.unimi.dsi.fastutil.objects.Object2IntMap<Block> ignite =
                 (it.unimi.dsi.fastutil.objects.Object2IntMap<Block>) igniteField.get(net.minecraft.world.level.block.Blocks.FIRE);
+        java.lang.reflect.Field burnField = net.minecraft.world.level.block.FireBlock.class.getDeclaredField("burnOdds");
+        burnField.setAccessible(true);
+        @SuppressWarnings("unchecked")
+        it.unimi.dsi.fastutil.objects.Object2IntMap<Block> burn =
+                (it.unimi.dsi.fastutil.objects.Object2IntMap<Block>) burnField.get(net.minecraft.world.level.block.Blocks.FIRE);
         Map<String, String> parents = new java.util.TreeMap<>();
         for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
             Class<?> type = BuiltInRegistries.BLOCK.byId(id).getClass();
@@ -260,8 +267,13 @@ final class BlockFlags {
             String u = declaring(type, "updateShape", BlockState.class, net.minecraft.world.level.LevelReader.class,
                     net.minecraft.world.level.ScheduledTickAccess.class, BlockPos.class, Direction.class, BlockPos.class,
                     BlockState.class, net.minecraft.util.RandomSource.class);
-            if (ignite.getInt(BuiltInRegistries.BLOCK.byId(id)) > 0) {
+            int igniteOdds = ignite.getInt(BuiltInRegistries.BLOCK.byId(id));
+            int burnOdds = burn.getInt(BuiltInRegistries.BLOCK.byId(id));
+            if (igniteOdds > 0) {
                 flammable.append(flammable.isEmpty() ? "" : ", ").append(id);
+            }
+            if (igniteOdds > 0 || burnOdds > 0) {
+                fireOdds.append(fireOdds.isEmpty() ? "[" : ", [").append(id).append(", ").append(igniteOdds).append(", ").append(burnOdds).append("]");
             }
             shape.append(id == 0 ? "\"" : ", \"").append(u).append("\"");
             String nc = declaring(type, "neighborChanged", BlockState.class, net.minecraft.world.level.Level.class, BlockPos.class,
@@ -326,6 +338,7 @@ final class BlockFlags {
         json.append("  \"tick_classes\": [").append(tick).append("],\n");
         json.append("  \"random_tick_classes\": [").append(randomTick).append("],\n");
         json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
+        json.append("  \"fire_odds\": [").append(fireOdds).append("],\n");
         json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");
         json.append("  \"liquid_containers\": [").append(containers).append("],\n");
         json.append("  \"dynamic_shape_blocks\": [").append(dynamic).append("],\n");

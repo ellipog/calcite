@@ -477,6 +477,10 @@ def block_facts_module(index, flags):
         "flammable_blocks", "blocks", flags["flammable_blocks"],
         ["/// The blocks fire can burn, by ID: those `FireBlock`'s ignite odds are above 0 for."])
     lines += number_list(
+        "fire_odds", "odds", [v for each in flags["fire_odds"] for v in each],
+        ["/// Each block either of `FireBlock`'s odds is above 0 for, by ID, then its ignite odds and its",
+         "/// burn odds: three numbers a block (D339)."])
+    lines += number_list(
         "waterloggable_blocks", "blocks", flags["waterloggable_blocks"],
         ["/// The blocks that are `SimpleWaterloggedBlock`s, by ID."])
     lines += number_list(
