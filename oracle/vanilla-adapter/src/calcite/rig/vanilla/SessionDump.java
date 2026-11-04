@@ -178,6 +178,12 @@ public final class SessionDump {
         if (v instanceof Tag t) {
             return nbt(t);
         }
+        // A block's or a fluid's state as its block and properties, `Block{minecraft:stone}[...]`,
+        // not its fields, whose table of the states a property away holds every state of its
+        // block, as many as redstone wire's 1,296, each with its own (CAL-116).
+        if (v instanceof net.minecraft.world.level.block.state.StateHolder<?, ?> s) {
+            return new JsonPrimitive(s.toString());
+        }
         String registered = REGISTERED.get(v);
         if (registered != null) {
             return new JsonPrimitive(registered);
@@ -281,6 +287,10 @@ public final class SessionDump {
                         }
                         try {
                             f.setAccessible(true);
+                            if (v instanceof net.minecraft.network.protocol.game.ClientboundLevelChunkPacketData && f.getName().equals("buffer")) {
+                                o.add("buffer", sections((byte[]) f.get(v)));
+                                continue;
+                            }
                             o.add(f.getName(), tree(f.get(v), path, depth + 1));
                         } catch (ReflectiveOperationException | RuntimeException e) {
                             o.addProperty(f.getName(), "<" + e + ">");
@@ -295,6 +305,61 @@ public final class SessionDump {
         } finally {
             path.remove(v);
         }
+    }
+
+    // A chunk packet's sections as the client reads them: each its counts of blocks and fluids,
+    // and a hash of its block states and one of its biomes, an ID for each place, so how a
+    // palette's written, its order and its bits, doesn't count (D271), only what it holds.
+    private static JsonElement sections(byte[] bytes) {
+        ByteBuf in = Unpooled.wrappedBuffer(bytes);
+        JsonArray a = new JsonArray();
+        try {
+            while (in.isReadable()) {
+                int blocks = in.readShort();
+                int fluids = in.readShort();
+                int[] states = container(in, 4096, 8);
+                int[] biomes = container(in, 64, 3);
+                a.add(blocks + " " + fluids + " states " + sha256(ints(states)) + " biomes " + sha256(ints(biomes)));
+            }
+        } catch (RuntimeException e) {
+            a.add("<" + e + ">");
+        }
+        return a;
+    }
+
+    // A paletted container's `n` values as IDs: one value for 0 bits, indices into a palette up
+    // to `indexed` bits, and IDs themselves past that.
+    private static int[] container(ByteBuf in, int n, int indexed) {
+        int bits = in.readUnsignedByte();
+        int[] out = new int[n];
+        if (bits == 0) {
+            java.util.Arrays.fill(out, net.minecraft.network.VarInt.read(in));
+            return out;
+        }
+        int[] palette = null;
+        if (bits <= indexed) {
+            palette = new int[net.minecraft.network.VarInt.read(in)];
+            for (int i = 0; i < palette.length; i++) {
+                palette[i] = net.minecraft.network.VarInt.read(in);
+            }
+        }
+        int per = 64 / bits;
+        long mask = (1L << bits) - 1;
+        int i = 0;
+        while (i < n) {
+            long word = in.readLong();
+            for (int j = 0; j < per && i < n; j++, i++) {
+                int value = (int) ((word >>> (j * bits)) & mask);
+                out[i] = palette == null ? value : palette[value];
+            }
+        }
+        return out;
+    }
+
+    private static byte[] ints(int[] values) {
+        java.nio.ByteBuffer b = java.nio.ByteBuffer.allocate(values.length * 4);
+        b.asIntBuffer().put(values);
+        return b.array();
     }
 
     // A tag as SNBT, except compounds and lists, which are trees, compounds sorted by key.
