@@ -20,8 +20,11 @@
 /// most urgent first, and hands each chunk back as it's finished, not yet saved: the server saves
 /// it, lit once it's lit, as it lets go of it, and the generator saves one nothing wants, keeping
 /// it until it's written (D258). A chunk is a pure function of
-/// where it is, so what comes back depends on nothing but the read, and a replay generates it
-/// again. So when the terrain kept for chunks far from any wanted lately is too much, the
+/// where it is, and of what's saved of the chunks around it, which the generator's thread looks
+/// at through the IO thread, to carry on from a chunk saved part-way (D334). So in a world with
+/// none, what comes back depends on nothing but the read, and a replay generates it again; a
+/// replay of one with chunks saved part-way, whose looks the input log doesn't hold, makes them
+/// from the start. So when the terrain kept for chunks far from any wanted lately is too much, the
 /// scheduler is let go and a new one starts, which makes again from nothing what it needs, and
 /// memory doesn't grow with the chunks made (D220). The generator's thread also finds a new world's spawn, as
 /// `setInitialSpawn` does: from the chunk `getOrigin` picks, which a worker finds, the first
@@ -37,7 +40,7 @@ import std.fs.{write}
 import std.thread.{Task}
 import std.memory.{trim}
 import std.time.{Instant, Timestamp}
-import storage.chunk.{ChunkData, ChunkFormat, ChunkRest, PackedRest, written_whole}
+import storage.chunk.{ChunkData, ChunkFormat, ChunkRest, PackedRest, this_version, written_whole}
 import storage.region.{Compression, ReadError, Stored, encode, unpack}
 import storage.regions.{ChunkRead, RegionStorage, read_root}
 import world.chunk.{BlockStates, Chunk, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, OCEAN_FLOOR_WG, Section, WORLD_SURFACE, WORLD_SURFACE_WG}
@@ -47,7 +50,7 @@ import world.pos.{BlockPos, ChunkPos}
 import world.spawn.{respawn_pos}
 import worldgen.generator.{GenSetup, Job, Made, Worker, setup_data}
 import worldgen.references.{chunk_key}
-import worldgen.scheduler.{Scheduler}
+import worldgen.scheduler.{Saved, Scheduler}
 import worldgen.template.{TemplateAsk}
 
 /// The thread vanilla's region files log on, `Util.ioPool`'s first.
@@ -207,11 +210,9 @@ pub fn generated(chunk: own Chunk, rest: own ChunkRest, light: LightStates, sect
 /// - a chunk saved under another position logs that it's in the wrong location, and that it
 ///   failed to load, and loads where it was asked for.
 ///
-/// A chunk saved before it's full is generated as one that isn't saved (D333). Vanilla goes on
-/// from where it was saved: one at `terrain` has none of its own features yet, and one past them
-/// is still to get those its neighbours put in it. Generated from the start, with its neighbours'
-/// features done again as the scheduler finishes it, it comes out as vanilla makes it, since no
-/// one's changed it: only a full chunk is played in.
+/// A chunk saved before it's full goes to the generator (D333), which carries on from what was
+/// saved, as vanilla does (D334): one at `terrain` has none of its own features yet, and one past
+/// them is still to get those its neighbours put in it.
 ///
 /// The rest loads as `SerializableChunkData.read` reads it: each section saved in the world in
 /// its place, a later one over an earlier at the same height, and air with plains in each one
@@ -458,10 +459,13 @@ fn on(from: List<Entry>, thread: String, to: mut List<Entry>) {
 // What the IO thread is asked: which chunks a region's file has, a chunk read, a chunk, encoded,
 // written, a chunk the server holds whole saved, with its light once it's lit, and its bytes back
 // from the saver that encoded them, none if they couldn't be (D258), or everything written and the
-// files closed.
+// files closed; and, for the generator's thread, which chunks a region's file has, and what's
+// saved of a chunk (D334).
 enum Ask {
     Region(ChunkPos)
     Chunk(ChunkPos)
+    Presence(ChunkPos)
+    Peek(ChunkPos)
     Write(ChunkPos, List<u8>)
     Save(ChunkPos, Whole, LightData?)
     Saved(ChunkPos, List<u8>?)
@@ -469,10 +473,12 @@ enum Ask {
 }
 
 // What a chunk worker is handed: a chunk the IO thread read, with what it logged, or a chunk to
-// encode with its light, to go back to the IO thread to write (D258).
+// encode with its light, to go back to the IO thread to write (D258), or a chunk the IO thread
+// read for the generator's thread to look at (D334).
 enum Work {
     Read(ChunkPos, List<Entry>, ChunkRead)
     Save(ChunkPos, Whole, LightData?)
+    Peek(ChunkPos, Stored)
 }
 
 // The IO thread: it owns the region files, and reads and writes what it's asked, in the order
@@ -575,6 +581,14 @@ impl Task for IoThread {
                         s.read(pos)
                     }
                 },
+                Ask.Presence(region) => {
+                    // What finding it logs isn't logged: the server's own ask of the region's
+                    // file logs it.
+                    var logged = List<Entry>()
+                    let presence = s.storage.presence(region, mut logged)
+                    s.gen.send(GenIn.Presence(chunk_key(region.x, region.z), presence))
+                },
+                Ask.Peek(pos) => s.peek(pos),
             }
         }
     }
@@ -610,6 +624,23 @@ impl IoState {
         var lines = List<Entry>()
         on(logged, io_thread(), mut lines)
         self.work.send(Work.Read(pos, lines, read))
+    }
+
+    // Looks at what's saved of the chunk at `pos` for the generator's thread (D334): one about to
+    // be written is full, as only a full chunk is saved; one not saved, or whose file can't be
+    // read, has nothing to carry on from; and one saved goes to a worker to read. What reading it
+    // logs isn't logged, as the read the chunk's asked for logs it.
+    fn peek(mut self, pos: ChunkPos) {
+        let key = chunk_key(pos.x, pos.z)
+        if self.pending.contains(key) or self.encoding.contains(key) {
+            self.gen.send(GenIn.Peeked(pos.x, pos.z, Saved.Full))
+            return
+        }
+        var logged = List<Entry>()
+        match self.storage.read_chunk(pos, mut logged) {
+            ChunkRead.Stored(stored) => self.work.send(Work.Peek(pos, stored)),
+            _ => self.gen.send(GenIn.Peeked(pos.x, pos.z, Saved.Nothing)),
+        }
     }
 
     // Reads each read held for the chunk at `key`, which is saved now.
@@ -678,7 +709,8 @@ fn write_out(storage: mut RegionStorage, writes: mut List<(ChunkPos, List<u8>?)>
 // A chunk worker: it makes each chunk the IO thread read, sends it back, and wakes the poll; one
 // with nothing to use goes to the generator, if the world generates. It works out the block
 // states' light properties with the first chunk it's handed. A chunk to save it encodes with its
-// light and hands back to the IO thread (D258).
+// light and hands back to the IO thread (D258), and one the generator's thread looks at it reads
+// and hands what's saved of it there (D334).
 struct ChunkWorker {
     context: ChunkContext
     work: Receiver<Work>
@@ -698,6 +730,13 @@ impl Task for ChunkWorker {
         while let w = work.wait() {
             match w {
                 Work.Save(pos, whole, light) => to_io.send(Ask.Saved(pos, saved_bytes(self.context, pos, whole.chunk.value, whole.rest.unpack(), light))),
+                Work.Peek(pos, stored) => {
+                    if let held = generate.take() {
+                        var g = held
+                        g.send(GenIn.Peeked(pos.x, pos.z, saved_of(self.context, pos, stored)))
+                        generate = some(g)
+                    }
+                },
                 Work.Read(pos, io, read) => {
                     var lines = List<Entry>()
                     let made = states.take() ?? LightStates.new()
@@ -723,6 +762,45 @@ impl Task for ChunkWorker {
             }
         }
     }
+}
+
+// What's saved of the chunk at `pos`, read from its region file, for the generator's thread to
+// carry on from (D334): nothing where it can't be read, isn't this version's, or was saved before
+// its terrain; full, at `minecraft:full`; and the chunk as it was saved where it's part-way,
+// unless it was saved at another position. What reading it logs isn't logged.
+fn saved_of(context: ChunkContext, pos: ChunkPos, stored: Stored) -> Saved {
+    var io = List<Entry>()
+    let unpacked: List<u8>? = match unpack(pos, stored, mut io) {
+        ok(b) => b,
+        err(_) => return Saved.Nothing,
+    }
+    let bytes = unpacked else return Saved.Nothing
+    let fields = match read_root(bytes) {
+        ok(Tag.Compound(f)) => f,
+        _ => return Saved.Nothing,
+    }
+    if not this_version(fields) {
+        return Saved.Nothing
+    }
+    var lines = List<Entry>()
+    let parsed: ChunkData? = match ChunkData.parse(context.format, context.min_section, context.sections, fields, mut lines) {
+        ok(d) => d,
+        err(_) => return Saved.Nothing,
+    }
+    let data = parsed else return Saved.Nothing
+    if not context.format.has_terrain(data.status) {
+        return Saved.Nothing
+    }
+    if context.format.is_full(data.status) {
+        return Saved.Full
+    }
+    if data.pos.x != pos.x or data.pos.z != pos.z {
+        return Saved.Nothing
+    }
+    if context.format.has_features(data.status) {
+        return Saved.Decorated(data)
+    }
+    return Saved.Terrain(data)
 }
 
 /// The chunk at `pos`, which the server holds whole, with `rest`, as its region file holds it:
@@ -781,6 +859,10 @@ enum GenIn {
     Spawn
     // A worker's done the jobs of a task, having handed back what each made.
     Free
+    // What's saved of a chunk the scheduler asked to look at, and which chunks a region's file
+    // has, by `chunk_key` of the region, for those looks (D334).
+    Peeked(i32, i32, Saved)
+    Presence(i64, List<u64>)
 }
 
 // A chunk to generate, with what the IO thread logged and read, and what the worker logged.
@@ -957,6 +1039,10 @@ struct GenState {
     asked: Map<i64, List<GenWork>> = Map<i64, List<GenWork>>()
     finished: Map<i64, SavedChunk> = Map<i64, SavedChunk>()
     held: List<i64> = List<i64>()
+    // Which chunks each region's file has, by `chunk_key` of the region, as the IO thread found
+    // them and has written since, and the chunks to look at that wait for their region's (D334).
+    presence: Map<i64, List<u64>> = Map<i64, List<u64>>()
+    looks: Map<i64, List<(i32, i32)>> = Map<i64, List<(i32, i32)>>()
     // The chunks asked for after they were written and let go, by a read from before they were
     // written, which are read again.
     reread: Map<i64, bool> = Map<i64, bool>()
@@ -1177,6 +1263,14 @@ impl GenOut {
                     s.lines.push(e.copy())
                 }
                 for k in keys {
+                    // On the disk now, for the scheduler's looks (D334).
+                    let x = i32.wrap(k)
+                    let z = i32.wrap(k >> 32)
+                    let region = chunk_key(x >> 5, z >> 5)
+                    if s.presence.contains(region) {
+                        let i = (x & 31) + (z & 31) * 32
+                        s.presence[region][usize.wrap(i >> 6)] |= 1u64 << u64.wrap(i & 63)
+                    }
                     if s.spawn_wanted or s.spawn != none {
                         s.held.push(k)
                     } else {
@@ -1191,6 +1285,25 @@ impl GenOut {
                 s.spawn = some(SpawnFind { x: x, z: z, offsets: spiral(), at: 0, asked: false })
             },
             GenIn.Free => s.tasks_out -= 1,
+            GenIn.Peeked(x, z, saved) => {
+                if let g = s.sched.take() {
+                    var sched = g
+                    sched.peeked(x, z, saved)
+                    s.sched = some(sched)
+                }
+            },
+            GenIn.Presence(region, bits) => {
+                s.presence.insert(region, bits)
+                let waiting = s.looks.remove(region) ?? List<(i32, i32)>()
+                if let g = s.sched.take() {
+                    var sched = g
+                    for spot in waiting {
+                        let (x, z) = spot
+                        look(mut s, mut sched, x, z)
+                    }
+                    s.sched = some(sched)
+                }
+            },
             GenIn.Spawn => {
                 s.spawn_wanted = true
                 if let t = s.to_tasks.take() {
@@ -1242,6 +1355,13 @@ impl GenOut {
             }
         }
         if self.spawn_next(mut s, mut sched) {
+            progressed = true
+        }
+        // The looks at what's saved the scheduler asks for go first, as what they find makes
+        // jobs ready (D334).
+        while let spot = sched.next_peek() {
+            let (x, z) = spot
+            look(mut s, mut sched, x, z)
             progressed = true
         }
         if let t = s.to_tasks.take() {
@@ -1524,6 +1644,27 @@ fn forget(s: mut GenState) {
     }
 }
 
+// Looks at what's saved of the chunk at `x`, `z` for the scheduler (D334): nothing where its
+// region's file doesn't have it, as the IO thread found it and has written since, told at once;
+// else the IO thread reads it. A region not yet known is asked for, and the look waits for it.
+fn look(s: mut GenState, sched: mut Scheduler, x: i32, z: i32) {
+    let region = chunk_key(x >> 5, z >> 5)
+    if s.presence.contains(region) {
+        let i = (x & 31) + (z & 31) * 32
+        if (s.presence[region][usize.wrap(i >> 6)] & (1u64 << u64.wrap(i & 63))) == 0 {
+            sched.peeked(x, z, Saved.Nothing)
+        } else {
+            s.to_io.send(Ask.Peek(ChunkPos { x: x, z: z }))
+        }
+        return
+    }
+    if not s.looks.contains(region) {
+        s.looks.insert(region, List<(i32, i32)>())
+        s.to_io.send(Ask.Presence(ChunkPos { x: x >> 5, z: z >> 5 }))
+    }
+    s.looks[region].push((x, z))
+}
+
 // Whether the spawn's search is trying the chunk at `x`, `z`.
 fn spawn_tries(s: GenState, x: i32, z: i32) -> bool {
     if let find = s.spawn {
@@ -1790,6 +1931,11 @@ impl ChunkJobs {
         while self.savers < self.most {
             _ = unsafe { Thread.spawn(ChunkWorker { context: self.context.copy(), work: self.saves.share(), done: self.to_done.share(), generate: none, to_io: self.to_asks.share(), waker: self.waker }) }
             self.savers += 1
+        }
+        // A chunk worker reads what the generator's looks find saved, so a world that generates
+        // has one from the start (D334).
+        if self.gen != none and self.started == 0 {
+            self.add_worker()
         }
         let setup = self.gen.take() else return
         let to_gen = self.to_gen else return

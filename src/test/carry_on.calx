@@ -1,0 +1,326 @@
+/// Checks carrying on from the chunks a save left part-way (D334). `RegionChunk.saved` reads a
+/// chunk saved before it's full as vanilla's `ProtoChunk` reads it back: its blocks, its
+/// heightmaps as saved and those not saved made from the blocks, the blocks it marked, its ticks,
+/// its entities, and its block entities, a marker and a chest. And the scheduler, handed what's
+/// saved around the chunks it's asked for, carries on from it: in a world saved as vanilla saves
+/// one, a chunk saved decorated isn't decorated again, nor a full one beside it, whose terrain
+/// isn't made; a chunk saved with its terrain has it read and is decorated before the fresh
+/// chunks near it; and what's finished has what was saved. In a world saved as Calcite saves
+/// one, a full chunk beside one that isn't saved is made again from nothing, each job as with
+/// nothing saved at all.
+module test.carry_on
+
+import nbt.tag.{Tag}
+import registry.builtin.{builtin_entries, builtin_names}
+import registry.registries.{Registries}
+import registry.registry.{Registry}
+import resources.identifier.{Identifier}
+import std.palette.{BitStorage}
+import storage.chunk.{ChunkData, ChunkFormat, ChunkRest, SavedTick}
+import world.chunk.{BlockStates, Chunk, OCEAN_FLOOR_WG, WORLD_SURFACE}
+import world.pos.{ChunkPos}
+import worldgen.facts.{Facts}
+import worldgen.generator.{FinishJob, Job, Made, TerrainJob}
+import worldgen.pieces.{Start}
+import worldgen.region.{RegionChunk}
+import worldgen.scheduler.{Saved, Scheduler}
+import worldgen.structures.{RingSearch, Structure, StructureSet, Structures}
+import worldgen.terrain.{air_filled}
+
+fn check(got: String, want: String, what: String) {
+    if got != want {
+        panic("{what}: got {got}, want {want}")
+    }
+}
+
+fn full(name: String) -> Identifier {
+    if let c = name.find(":") {
+        return Identifier { namespace: name[..c], path: name[c + 1..] }
+    }
+    return Identifier { namespace: "minecraft", path: name.copy() }
+}
+
+fn registry(index: usize, name: str) -> Registry {
+    var r = Registry.new(full(String(name)), false)
+    for e in builtin_entries(index) {
+        r.add(full(e), none)
+    }
+    return r
+}
+
+// The chunks' format, from the built-in registries, with plains as the one biome.
+fn chunk_format() -> ChunkFormat {
+    var builtin = List<Registry>()
+    let names = builtin_names()
+    for i in 0..names.len() {
+        var r = Registry.new(Identifier { namespace: "minecraft", path: names[i].copy() }, false)
+        for e in builtin_entries(i) {
+            r.add(full(e), none)
+        }
+        builtin.push(r)
+    }
+    var biomes = Registry.new(Identifier { namespace: "minecraft", path: "worldgen/biome" }, true)
+    biomes.add(Identifier { namespace: "minecraft", path: "plains" }, some(0))
+    return ChunkFormat.new(Registries { synced: [biomes], builtin: builtin })!
+}
+
+// The block facts, from the built-in block and fluid registries (4 and 2).
+fn facts() -> Facts {
+    return match Facts.new(registry(4, "block"), registry(2, "fluid"), BlockStates.new([1], [1], 1)) {
+        ok(f) => f,
+        err(e) => panic("the block facts: {e}"),
+    }
+}
+
+fn named(f: Facts, name: str) -> u32 {
+    return match f.named_block(String(name)) {
+        ok(b) => f.default_state(b),
+        err(_) => panic("no block {name}"),
+    }
+}
+
+// Where a block is in a chunk's states, by its place in the chunk.
+fn at(x: i32, y: i32, z: i32) -> usize {
+    return usize.wrap(((y + 64) << 8) | (z << 4) | x)
+}
+
+// A heightmap of the world from -64 to 320 as a save holds it: each column at `height`, but the
+// first at `first`.
+fn heights(height: i32, first: i32) -> List<i64> {
+    var b = BitStorage.new(9, 256)
+    for i in 0..256usize {
+        let h = if i == 0 { first } else { height }
+        b.set(i, u32.wrap(h + 64))
+    }
+    return b.longs()
+}
+
+// A chunk saved part-way: stone at y 0, a gold block at 5, 70, 5, two chests, one its marker
+// left and one with what it saved; the gold block marked, a tick of the stone, a pig, its
+// `OCEAN_FLOOR_WG` saved, at 40 but for the first column at 30, and `WORLD_SURFACE` saved but
+// for the first column at 200.
+fn part_way(f: Facts, format: ChunkFormat, cx: i32, cz: i32) -> ChunkData {
+    let table = BlockStates.new([1], [1], 1)
+    var chunk = Chunk.new(table, -64, 24, format.plains)
+    let stone = named(f, "stone")
+    for z in 0..16 {
+        for x in 0..16 {
+            _ = chunk.set_block(table, x, 0, z, stone)
+        }
+    }
+    _ = chunk.set_block(table, 5, 70, 5, named(f, "gold_block"))
+    _ = chunk.set_block(table, 3, 70, 3, named(f, "chest"))
+    _ = chunk.set_block(table, 4, 70, 4, named(f, "chest"))
+    var rest = ChunkRest.empty(24)
+    var marker = JavaHashMap<String, Tag>()
+    marker.insert("id", Tag.Str("DUMMY"))
+    marker.insert("x", Tag.Int(cx * 16 + 3))
+    marker.insert("y", Tag.Int(70))
+    marker.insert("z", Tag.Int(cz * 16 + 3))
+    rest.block_entities.push(Tag.Compound(marker))
+    var chest = JavaHashMap<String, Tag>()
+    chest.insert("id", Tag.Str("minecraft:chest"))
+    chest.insert("x", Tag.Int(cx * 16 + 4))
+    chest.insert("y", Tag.Int(70))
+    chest.insert("z", Tag.Int(cz * 16 + 4))
+    chest.insert("LootTable", Tag.Str("minecraft:chests/simple_dungeon"))
+    rest.block_entities.push(Tag.Compound(chest))
+    rest.block_ticks.push(SavedTick { kind: f.block(stone), x: cx * 16 + 1, y: 0, z: cz * 16 + 2, delay: 0, priority: -1 })
+    var marks = List<i16>()
+    marks.push(i16.wrap(5 | ((70 & 15) << 4) | (5 << 8)))
+    rest.post_processing[8] = some(marks)
+    var data = ChunkData.generated(format, ChunkPos { x: cx, z: cz }, chunk, rest)
+    var pig = JavaHashMap<String, Tag>()
+    pig.insert("id", Tag.Str("minecraft:pig"))
+    data.entities.push(Tag.Compound(pig))
+    data.heightmaps[usize.wrap(OCEAN_FLOOR_WG)] = some(heights(40, 30))
+    var surface = BitStorage.from_longs(9, 256, chunk.heightmap_longs(WORLD_SURFACE))!
+    surface.set(0, u32.wrap(200 + 64))
+    data.heightmaps[usize.wrap(WORLD_SURFACE)] = some(surface.longs())
+    return data
+}
+
+// `RegionChunk.saved` of a chunk saved part-way.
+fn reading(f: Facts, format: ChunkFormat) {
+    var c = RegionChunk.saved(f, part_way(f, format, 2, -3), -64, 384)
+    let gold = named(f, "gold_block")
+    let stone = named(f, "stone")
+    let air = named(f, "air")
+    check("{c.filled.states[at(5, 70, 5)]} {c.filled.states[at(9, 0, 9)]} {c.filled.states[at(9, 1, 9)]}", "{gold} {stone} {air}", "the blocks")
+    // The sections above the gold block's, only air, aren't kept.
+    check("{c.filled.states.len()}", "{9 * 4096}", "the blocks kept")
+    // `OCEAN_FLOOR_WG` as saved; `WORLD_SURFACE_WG`, not saved, from the blocks.
+    check("{c.filled.ocean_floor[0]} {c.filled.ocean_floor[1]}", "30 40", "the saved _WG heightmap")
+    check("{c.filled.world_surface[0]} {c.filled.world_surface[5 + 5 * 16]}", "1 71", "the _WG heightmap made from the blocks")
+    // `WORLD_SURFACE` as saved, not as the blocks have it.
+    let surface = c.final_heights(f, WORLD_SURFACE)
+    check("{surface[0]} {surface[5 + 5 * 16]} {surface[9]}", "200 71 1", "the saved final heightmap")
+    check("{c.filled.marked[8].len()} {c.filled.marked[8][0]} {c.filled.marked[7].len()}", "1 {5 | (6 << 4) | (5 << 8)} 0", "the blocks marked")
+    check("{c.block_ticks.len()} {c.block_ticks[0].x} {c.block_ticks[0].z} {c.block_ticks[0].priority} {c.fluid_ticks.len()}", "1 33 -46 -1 0", "the ticks")
+    check("{c.entities.len()}", "1", "the entities")
+    check("{c.block_entities.len()}", "2", "the block entities")
+    check("{c.block_entities[0].real} {c.block_entities[0].x}", "false 35", "the marker")
+    let loot = c.block_entities[1].fields.contains("LootTable")
+    check("{c.block_entities[1].real} {c.block_entities[1].kind} {loot}", "true minecraft:chest true", "the chest")
+    // Saved as a full chunk saves them, the marker becomes the chest's own, fresh.
+    let saved = c.saved_block_entities(f)
+    check("{saved.len()}", "2", "the block entities saved")
+    let terrain = format.statuses.parse("minecraft:terrain")!
+    let biomes = format.statuses.parse("minecraft:biomes")!
+    let initialize_light = format.statuses.parse("minecraft:initialize_light")!
+    check("{format.has_terrain(terrain)} {format.has_terrain(biomes)}", "true false", "statuses with their terrain")
+    check("{format.has_features(initialize_light)} {format.has_features(terrain)}", "true false", "statuses with their features")
+}
+
+// What the scheduler hands out, as it goes: each terrain, at its chunk, and whether it's read
+// from a save; each decoration; and each chunk finished, with its blocks.
+struct Ran {
+    terrains: List<(i32, i32, bool)>
+    decorations: List<(i32, i32)>
+    finished: List<(i32, i32, RegionChunk)>
+}
+
+// The worlds: nothing saved; saved as Calcite saves one, full west of x 0 and nothing from it;
+// and saved as vanilla saves one, full west of x 0, decorated at x 0, waiting for its light, with
+// its terrain at x 1, and nothing past it.
+const NOTHING: i32 = 0
+const CALCITE: i32 = 1
+const VANILLA: i32 = 2
+
+fn saved_at(f: Facts, format: ChunkFormat, world: i32, x: i32, z: i32) -> Saved {
+    if world == NOTHING {
+        return Saved.Nothing
+    }
+    if x < 0 {
+        return Saved.Full
+    }
+    if world == CALCITE or x > 1 {
+        return Saved.Nothing
+    }
+    let data = part_way(f, format, x, z)
+    return if x == 0 { Saved.Decorated(data) } else { Saved.Terrain(data) }
+}
+
+// A scheduler with no structures and no rings to search.
+fn scheduler() -> Scheduler {
+    let none_at_all = Structures { sets: List<StructureSet>(), registered: 0, structures: List<Structure>(), structure_ids: Map<String, usize>() }
+    return Scheduler.new(none_at_all, List<RingSearch>())
+}
+
+// The chunks at 0, 0 and 1, 0 finished in `world`, each job done here: no starts, plains, air
+// for a terrain not saved, and a decoration that changes nothing.
+fn run(f: Facts, format: ChunkFormat, world: i32) -> Ran {
+    var s = scheduler()
+    var ran = Ran { terrains: List<(i32, i32, bool)>(), decorations: List<(i32, i32)>(), finished: List<(i32, i32, RegionChunk)>() }
+    s.want(0, 0)
+    s.want(1, 0)
+    while not s.is_finished(0, 0) or not s.is_finished(1, 0) {
+        if let spot = s.next_peek() {
+            let (x, z) = spot
+            s.peeked(x, z, saved_at(f, format, world, x, z))
+            continue
+        }
+        let job = s.next() else panic("nothing to do, with what was asked for not finished")
+        match job {
+            Job.Ring(_) => panic("there's no ring to search"),
+            Job.Starts(bx, bz, _) => {
+                var lists = List<List<Start>>()
+                for _ in 0..16 {
+                    lists.push(List<Start>())
+                }
+                s.take(Made.Starts(bx, bz, lists, List<String>()))
+            },
+            Job.Biomes(bx, bz) => {
+                var lists = List<List<i32>>()
+                for _ in 0..16 {
+                    lists.push([0; 1536])
+                }
+                s.take(Made.Biomes(bx, bz, lists, List<String>()))
+            },
+            Job.Terrain(t) => {
+                let TerrainJob { x: x, z: z, saved: given, .. } = t
+                var saved = given
+                if let data = saved.take() {
+                    ran.terrains.push((x, z, true))
+                    s.take(Made.Terrain(x, z, RegionChunk.saved(f, data, -64, 384), List<String>()))
+                } else {
+                    ran.terrains.push((x, z, false))
+                    s.take(Made.Terrain(x, z, RegionChunk.of(f, air_filled(-64, 384)), List<String>()))
+                }
+            },
+            Job.Decorate(d) => {
+                ran.decorations.push((d.x, d.z))
+                s.take(Made.Decorated(d, List<String>()))
+            },
+            Job.Finish(fj) => {
+                let FinishJob { x: x, z: z, made: made, .. } = fj
+                ran.finished.push((x, z, made))
+                s.finished_at(x, z)
+            },
+        }
+    }
+    return ran
+}
+
+// Where each decoration went, in order.
+fn listed(ran: Ran) -> String {
+    var out = String()
+    for d in ran.decorations {
+        out.push_str("{d.0},{d.1} ")
+    }
+    return out
+}
+
+fn scheduling(f: Facts, format: ChunkFormat) {
+    let fresh = run(f, format, NOTHING)
+    let calcite = run(f, format, CALCITE)
+    // Each full chunk beside one not saved is made again, as with nothing saved, in the same order.
+    check(listed(calcite), listed(fresh), "the decorations of a world Calcite saved")
+    check("{calcite.terrains.len()}", "{fresh.terrains.len()}", "the terrains of a world Calcite saved")
+    var full_made = false
+    for d in calcite.decorations {
+        full_made = full_made or d.0 < 0
+    }
+    check("{full_made}", "true", "a full chunk beside one not saved made again")
+    for t in calcite.terrains {
+        check("{t.2}", "false", "a terrain of a world Calcite saved read from it")
+    }
+
+    let vanilla = run(f, format, VANILLA)
+    for t in vanilla.terrains {
+        // No full chunk's terrain is made: none is decorated around.
+        check("{t.0 < 0}", "false", "a full chunk's terrain made at {t.0}, {t.1}")
+        check("{t.2}", "{t.0 <= 1}", "the terrain at {t.0}, {t.1} read from what was saved")
+    }
+    var at_one = 0
+    for i in 0..vanilla.decorations.len() {
+        let (x, z) = vanilla.decorations[i]
+        check("{x <= 0}", "false", "the chunk at {x}, {z}, decorated already, decorated")
+        if x != 1 {
+            continue
+        }
+        at_one += 1
+        // Before every fresh decoration 2 or less from it.
+        for j in 0..i {
+            let (ox, oz) = vanilla.decorations[j]
+            if ox > 1 and ox - x <= 2 and (oz - z).abs() <= 2 {
+                panic("the chunk at {ox}, {oz} was decorated before the one at {x}, {z}, saved with its terrain")
+            }
+        }
+    }
+    check("{at_one > 0}", "true", "the chunks saved with their terrain decorated")
+    // Finished with what was saved: the chunk saved decorated, and the one saved with its terrain.
+    check("{vanilla.finished.len()}", "2", "the chunks finished")
+    let gold = named(f, "gold_block")
+    for c in vanilla.finished {
+        check("{c.2.filled.states[at(5, 70, 5)]} {c.2.block_entities.len()} {c.2.entities.len()}", "{gold} 2 1", "the chunk finished at {c.0}, {c.1}")
+    }
+}
+
+fn main() {
+    let f = facts()
+    let format = chunk_format()
+    reading(f, format)
+    scheduling(f, format)
+    println("ok")
+}

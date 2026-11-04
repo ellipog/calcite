@@ -1,18 +1,19 @@
 """Checks what a chunk does as it starts to tick against vanilla (D329, CAL-91): its
 post-processing, `LevelChunk.postProcessGeneration`, and its first ticks; and the chunks a save
-left part-way, as their generation goes on (D333, CAL-113).
+left part-way, as their generation goes on (D333, D334, CAL-113).
 
     py -I rig/runner/ticking.py [--reuse] [--show N]
 
 Both servers load the world the round trip has vanilla make and save (rig/runner/roundtrip.py),
-whose chunks from -6 to 5 are full. Those vanilla ticked, from -5 to 4, it post-processed before it
-saved them. The ring at the edge, -6 and 5, it didn't, so they still have the blocks their
-generation marked, `PostProcessing`: aquifers' water and lava, mushrooms, ice, glow lichen, leaves.
-Out from them, the save has a ring at -7 and 6 with its features, waiting for its light, then one
-at -8 and 7 with only its terrain, then one with only its biomes. The rig's bot joins each server
-at the origin with a view of 10, as `sessions.py` records a session, so the chunks from -8 to 7
-are all sent, each server finishing the part-way rings first: vanilla from where it saved them,
-Calcite from the start.
+whose chunks from -6 to 5 are full, and more to the north and east, where vanilla loaded the
+spawn's. Those vanilla ticked it post-processed before it saved them. Those at the edge it didn't,
+so they still have the blocks their generation marked, `PostProcessing`: aquifers' water and lava,
+mushrooms, ice, glow lichen, leaves. Round the full chunks, the save has a ring with its features,
+waiting for its light, then one with only its terrain, then one with only its biomes: among the
+chunks from -8 to 7, at -7 and -8 on the west, 6 and 7 on the south, at the north-west corner, and
+on the east south of 0. The rig's bot joins each server at the origin with a view of 10, as
+`sessions.py` records a session, so the chunks from -8 to 7 are all sent, each server finishing
+the part-way rings first, from where it saved them (D334).
 
 Each chunk packet's blocks are decoded, so how a palette is written (D271) doesn't count, and the
 blocks of the chunks from -8 to 7 are compared. A block that differs in a way that waits on
@@ -42,7 +43,7 @@ REPORTS = CALCITE / "generated" / "26.3" / "datagen" / "reports"
 CONFIG = "ticking"
 sessions.CONFIGS[CONFIG] = sessions.Config({}, view=10, scenarios=("join",), world=sessions.SAVED_WORLD,
                                            spawn=(0, 100, 0), entities=False)
-# The chunks compared: those the save has full, and the two rings it left part-way out from them.
+# The chunks compared: those the save has full, and the two rings it left part-way round them.
 LOW, HIGH = -8, 7
 # The Overworld's sections, from y -64.
 SECTIONS, MIN_Y = 24, -64

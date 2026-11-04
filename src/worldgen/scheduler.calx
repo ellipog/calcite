@@ -21,11 +21,28 @@
 /// apart and go in rank order; the pieces a decoration hands back that reach its chunk replace
 /// the scheduler's.
 ///
+/// What's saved of a chunk is carried on from, as vanilla carries on from a chunk saved part-way
+/// (D334). A chunk's terrain and its decoration first need a look at what's saved of it, which
+/// isn't a worker's job but the caller's, who hands back what it found with `peeked`; what they
+/// need then is worked out from it. A chunk saved with its terrain has what was saved read as its
+/// terrain, and is decorated. One saved with its features too is read the same way and isn't
+/// decorated again, and it's finished once the nine around it are decorated, as vanilla's still
+/// takes what its neighbours' features put in it. A full chunk's decoration needs a look at the
+/// eight around it: where each is saved decorated or full, and one at least decorated, as around
+/// every full chunk vanilla saves, they have what its features put in them, so it isn't
+/// decorated again. Any other full chunk, as one Calcite finished has, whose neighbours it
+/// doesn't save, is made again from nothing, as before, so the chunks beside it come to what
+/// they came to when it was made. A chunk saved with its terrain is decorated before the chunks
+/// 2 or less from it that aren't, whatever their ranks, as vanilla goes on from it before it
+/// makes the chunks past it; so a decoration needs a look at each chunk 2 or less from it too.
+/// A world with no chunk saved part-way, as every world Calcite made is, is decorated in the
+/// order it was.
+///
 /// `Generator` does the jobs one at a time on the thread it's on, as a check of the threads' and
 /// for what wants a chunk at once.
 module worldgen.scheduler
 
-import storage.chunk.{ChunkRest}
+import storage.chunk.{ChunkData, ChunkRest}
 import world.chunk.{BlockStates, Chunk}
 import worldgen.beardifier.{Beardifier}
 import worldgen.generator.{BLOCK_SHIFT, DecorateJob, FinishJob, GenSetup, HEIGHT, Job, MIN_Y, Made, TerrainJob, Worker, rank_of, source_of}
@@ -36,13 +53,33 @@ import worldgen.region.{RegionChunk}
 import worldgen.structures.{RING_REACH, RingSearch, Rings, StructureState, Structures, UNKNOWN_RING}
 import pack.data.{Data}
 
-// The kinds of node, most urgent first.
+// The kinds of node, most urgent first: the workers' jobs, then a chunk's look at what's saved
+// of it, which is the caller's (D334).
 const FINISH: i64 = 0
 const DECORATE: i64 = 1
 const TERRAIN: i64 = 2
 const BIOMES: i64 = 3
 const STARTS: i64 = 4
-const KINDS: usize = 5
+const PEEK: i64 = 5
+const KINDS: usize = 6
+const JOBS: usize = 5
+
+// What a look found saved of a chunk (D334).
+const SAVED_NOTHING: u8 = 0
+const SAVED_TERRAIN: u8 = 1
+const SAVED_DECORATED: u8 = 2
+const SAVED_FULL: u8 = 3
+
+/// What's saved of a chunk, as a look at it finds it (D334): nothing to carry on from, which is
+/// made from the start, as a chunk saved before its terrain, or by another version, is; its
+/// terrain, at `minecraft:terrain`; its features too, from `minecraft:features` to
+/// `minecraft:spawn`; or the chunk full.
+pub enum Saved {
+    Nothing
+    Terrain(ChunkData)
+    Decorated(ChunkData)
+    Full
+}
 
 // What a node is doing.
 const WAITING: u8 = 0
@@ -90,6 +127,10 @@ pub struct Scheduler {
     biomes: Map<i64, List<i32>>
     refs: Map<i64, List<Refs>>
     protos: Map<i64, RegionChunk>
+    // What a look found saved of each chunk, and of each whose terrain is saved, what was, until
+    // its terrain goes out to be read (D334).
+    seeds: Map<i64, u8>
+    saved: Map<i64, ChunkData>
     // The ring searches, each until it goes out; where each starts and its set and place; whether
     // it's back; the starts' nodes that wait for it; those some node waits for, to go out first;
     // and the next to go out when nothing else is ready. The rings fill in as they come back.
@@ -157,6 +198,8 @@ impl Scheduler {
             biomes: Map<i64, List<i32>>(),
             refs: Map<i64, List<Refs>>(),
             protos: Map<i64, RegionChunk>(),
+            seeds: Map<i64, u8>(),
+            saved: Map<i64, ChunkData>(),
             searches: queue,
             all_searches: all,
             search_origins: origins,
@@ -214,7 +257,8 @@ impl Scheduler {
                 without(mut self.search_waiting[k], n)
             }
         }
-        for d in needs(n) {
+        let deps = self.needs(n)
+        for d in deps {
             if self.nodes.contains(d) {
                 without(mut self.nodes[d].dependents, n)
                 self.drop_node(d)
@@ -241,8 +285,8 @@ impl Scheduler {
     /// How many jobs are ready to go out.
     pub fn ready(self) -> usize {
         var n: usize = 0
-        for q in self.queues {
-            n += q.len()
+        for k in 0..JOBS {
+            n += self.queues[k].len()
         }
         return n
     }
@@ -254,13 +298,13 @@ impl Scheduler {
 
     /// Whether it keeps anything but what its ring searches found: jobs to do, or what jobs made.
     pub fn holds_any(self) -> bool {
-        return not self.nodes.is_empty() or not self.protos.is_empty() or not self.starts.chunks.is_empty() or not self.biomes.is_empty()
+        return not self.nodes.is_empty() or not self.protos.is_empty() or not self.starts.chunks.is_empty() or not self.biomes.is_empty() or not self.saved.is_empty()
     }
 
     /// How many of each thing it keeps, for a look at what's using memory: nodes, starts,
-    /// biomes, references and terrain.
+    /// biomes, references, terrain, what's been looked at and what was saved.
     pub fn counts(self) -> String {
-        return "nodes {self.nodes.len()} starts {self.starts.chunks.len()} biomes {self.biomes.len()} refs {self.refs.len()} protos {self.protos.len()} finished {self.finished.len()}"
+        return "nodes {self.nodes.len()} starts {self.starts.chunks.len()} biomes {self.biomes.len()} refs {self.refs.len()} protos {self.protos.len()} finished {self.finished.len()} seeds {self.seeds.len()} saved {self.saved.len()}"
     }
 
     /// How many chunks' terrain is kept outside `cells`, squares of chunks `1 << shift` a side,
@@ -302,7 +346,7 @@ impl Scheduler {
                 return some(Job.Ring(r))
             }
         }
-        for k in 0..KINDS {
+        for k in 0..JOBS {
             while let n = self.queues[k].pop_first() {
                 // One dropped while it was ready isn't there, or is there again, and queued
                 // again, if it was asked for again (D243).
@@ -323,6 +367,48 @@ impl Scheduler {
             }
         }
         return none
+    }
+
+    /// The next chunk to look at what's saved of, which the caller finds and hands to `peeked`
+    /// (D334), or none if no look is waiting.
+    pub fn next_peek(mut self) -> (i32, i32)? {
+        let q = usize.wrap(PEEK)
+        while let n = self.queues[q].pop_first() {
+            if not self.nodes.contains(n) or self.nodes[n].state != READY {
+                continue
+            }
+            self.nodes[n].state = RUNNING
+            return some((x_of(n), z_of(n)))
+        }
+        return none
+    }
+
+    /// Takes in what's saved of the chunk at `x`, `z`, as a look found it (D334). What's known of
+    /// a chunk stays as it was first found, so what each node needs only grows: another look,
+    /// such as one a scheduler before this one asked for, changes nothing.
+    pub fn peeked(mut self, x: i32, z: i32, saved: own Saved) {
+        let key = chunk_key(x, z)
+        if self.seeds.contains(key) {
+            return
+        }
+        var seed = SAVED_NOTHING
+        match saved {
+            Saved.Nothing => {},
+            Saved.Terrain(d) => {
+                self.saved.insert(key, d)
+                seed = SAVED_TERRAIN
+            },
+            Saved.Decorated(d) => {
+                self.saved.insert(key, d)
+                seed = SAVED_DECORATED
+            },
+            Saved.Full => seed = SAVED_FULL,
+        }
+        self.seeds.insert(key, seed)
+        let n = node(PEEK, x, z)
+        if self.nodes.contains(n) and self.nodes[n].state != DONE {
+            self.complete(n)
+        }
     }
 
     /// A terrain job that's ready for a chunk next to the one at `x`, `z`, along a side or across
@@ -424,19 +510,23 @@ impl Scheduler {
         return self.finished.pop_first()
     }
 
-    // Makes the node, unless it's made, waiting for the nodes it needs; whether it's done.
+    // Makes the node, unless it's made, waiting for the nodes it needs; whether it's done. A look
+    // at a chunk already looked at is done at once (D334).
     fn need(mut self, n: i64) -> bool {
         if self.nodes.contains(n) {
             return self.nodes[n].state == DONE
         }
         self.nodes.insert(n, Node { missing: 0, state: WAITING, dependents: List<i64>() })
-        var missing: u32 = 0
-        for d in needs(n) {
-            if not self.need(d) {
-                missing += 1
-                self.nodes[d].dependents.push(n)
+        if kind_of(n) == PEEK {
+            if self.seeds.contains(chunk_key(x_of(n), z_of(n))) {
+                self.nodes[n].state = DONE
+                return true
             }
+            self.nodes[n].state = READY
+            self.queues[usize.wrap(PEEK)].push_last(n)
+            return false
         }
+        var searching: u32 = 0
         if kind_of(n) == STARTS {
             // The ring searches whose position its chunks, or the exclusion zones about them, can
             // meet; a position found elsewhere doesn't change them.
@@ -448,7 +538,7 @@ impl Scheduler {
             for k in 0..self.search_origins.len() {
                 let (ox, oz) = self.search_origins[k]
                 if not self.search_done[k] and ox + RING_REACH >= x0 and ox - RING_REACH <= x1 and oz + RING_REACH >= z0 and oz - RING_REACH <= z1 {
-                    missing += 1
+                    searching += 1
                     self.search_waiting[k].push(n)
                     if not self.search_urgent[k] {
                         self.search_urgent[k] = true
@@ -457,17 +547,74 @@ impl Scheduler {
                 }
             }
         }
-        self.nodes[n].missing = missing
-        if missing == 0 {
-            self.nodes[n].state = READY
-            self.queues[usize.wrap(kind_of(n))].push_last(n)
+        if searching > 0 {
+            self.nodes[n].missing = searching
+            return false
         }
+        return self.expand(n)
+    }
+
+    // Works out what the node needs, as far as what's been looked at says, and waits for what of
+    // it isn't done. With nothing to wait for it's ready, or, with no job to do, done (D334).
+    // Whether it's done.
+    fn expand(mut self, n: i64) -> bool {
+        var missing: u32 = 0
+        let deps = self.needs(n)
+        for d in deps {
+            if not self.need(d) {
+                missing += 1
+                self.nodes[d].dependents.push(n)
+            }
+        }
+        self.nodes[n].missing = missing
+        if missing > 0 {
+            return false
+        }
+        if self.nothing_to_do(n) {
+            self.complete(n)
+            return true
+        }
+        self.nodes[n].state = READY
+        self.queues[usize.wrap(kind_of(n))].push_last(n)
         return false
     }
 
-    // The node is done: each that waits for it needs one fewer, and is ready with none.
-    fn done(mut self, n: i64) {
-        self.out -= 1
+    // Whether the node, with what it needs done, has no job to do (D334): the decoration of a
+    // chunk saved decorated, or of a full one decorated already, as `beside_decorated` says.
+    fn nothing_to_do(self, n: i64) -> bool {
+        if kind_of(n) != DECORATE {
+            return false
+        }
+        let seed = self.seeds.get(chunk_key(x_of(n), z_of(n))) ?? SAVED_NOTHING
+        return seed == SAVED_DECORATED or (seed == SAVED_FULL and self.beside_decorated(x_of(n), z_of(n)) == some(true))
+    }
+
+    // Whether the full chunk at `x`, `z` is decorated already, for what's saved around it: each of
+    // the eight around it saved decorated or full, and one at least decorated, as around each
+    // full chunk vanilla saves, whose neighbours have what its features put in them (D334). Not,
+    // where one isn't saved, as around a chunk Calcite finished. `none` while it can't be told,
+    // as one of the eight hasn't been looked at.
+    fn beside_decorated(self, x: i32, z: i32) -> bool? {
+        var decorated = false
+        for dz in -1..2 {
+            for dx in -1..2 {
+                if dx == 0 and dz == 0 {
+                    continue
+                }
+                let seed = self.seeds.get(chunk_key(x + dx, z + dz)) else return none
+                if seed == SAVED_DECORATED {
+                    decorated = true
+                } else if seed != SAVED_FULL {
+                    return some(false)
+                }
+            }
+        }
+        return some(decorated)
+    }
+
+    // The node is done: each that waits for it needs one fewer, and what it needs is worked out
+    // again with none.
+    fn complete(mut self, n: i64) {
         self.nodes[n].state = DONE
         let waiting = self.nodes[n].dependents.copy()
         self.nodes[n].dependents = List<i64>()
@@ -476,12 +623,17 @@ impl Scheduler {
         }
     }
 
-    // One fewer of what the node needs isn't done; it's ready if that was the last.
+    // A job's node is done, and it's no longer out.
+    fn done(mut self, n: i64) {
+        self.out -= 1
+        self.complete(n)
+    }
+
+    // One fewer of what the node needs isn't done; with none, what it needs is worked out again.
     fn ready_one(mut self, n: i64) {
         self.nodes[n].missing -= 1
         if self.nodes[n].missing == 0 {
-            self.nodes[n].state = READY
-            self.queues[usize.wrap(kind_of(n))].push_last(n)
+            _ = self.expand(n)
         }
     }
 
@@ -503,6 +655,10 @@ impl Scheduler {
             return Job.Biomes(x, z)
         }
         if kind == TERRAIN {
+            // One whose terrain was saved is read from what was (D334).
+            if let data = self.saved.remove(chunk_key(x, z)) {
+                return Job.Terrain(TerrainJob { x: x, z: z, beard: none, biomes: List<List<i32>>(), saved: some(data) })
+            }
             let refs = self.refs_of(x, z)
             let beard: Beardifier? = beardifier_for(self.structures, self.starts, refs, x, z, List<f32>())
             return Job.Terrain(TerrainJob { x: x, z: z, beard: beard, biomes: self.around(x, z) })
@@ -537,6 +693,96 @@ impl Scheduler {
         let refs = self.refs.remove(key) ?? create_references(self.structures, self.starts, x, z)
         let starts = if self.starts.chunks.contains(key) { self.starts.chunks[key].copy() } else { List<Start>() }
         return Job.Finish(FinishJob { x: x, z: z, made: made, biomes: biomes, refs: refs, starts: starts })
+    }
+
+    // The nodes the node needs, as far as what's been looked at says (D334): a chunk's terrain
+    // and its decoration first need a look at what's saved of it, and a full chunk's decoration a
+    // look at the eight around it. What's known only grows, so what a node needs only does, and
+    // it's worked out again once all it needed is done.
+    fn needs(self, n: i64) -> List<i64> {
+        let kind = kind_of(n)
+        let x = x_of(n)
+        let z = z_of(n)
+        var out = List<i64>()
+        if kind == TERRAIN {
+            out.push(node(PEEK, x, z))
+            if not self.seeds.contains(chunk_key(x, z)) {
+                return out
+            }
+            // The starts within 8, and the biomes 1 or less away, by block, which a terrain read
+            // from a save needs too: its references are made from the starts, and the
+            // decorations around it read its biomes.
+            for bz in (z - 8) >> BLOCK_SHIFT..((z + 8) >> BLOCK_SHIFT) + 1 {
+                for bx in (x - 8) >> BLOCK_SHIFT..((x + 8) >> BLOCK_SHIFT) + 1 {
+                    out.push(node(STARTS, bx, bz))
+                }
+            }
+            for bz in (z - 1) >> BLOCK_SHIFT..((z + 1) >> BLOCK_SHIFT) + 1 {
+                for bx in (x - 1) >> BLOCK_SHIFT..((x + 1) >> BLOCK_SHIFT) + 1 {
+                    out.push(node(BIOMES, bx, bz))
+                }
+            }
+        } else if kind == DECORATE {
+            out.push(node(PEEK, x, z))
+            let seed = self.seeds.get(chunk_key(x, z)) else return out
+            if seed == SAVED_DECORATED {
+                // Decorated already: its terrain is read from what was saved, and nothing else.
+                out.push(node(TERRAIN, x, z))
+                return out
+            }
+            // A look at each chunk 2 or less from it, which says whether a full one is decorated
+            // already, and which of the decorations there go first.
+            var known = true
+            for dz in -2..3 {
+                for dx in -2..3 {
+                    if dx != 0 or dz != 0 {
+                        out.push(node(PEEK, x + dx, z + dz))
+                        known = known and self.seeds.contains(chunk_key(x + dx, z + dz))
+                    }
+                }
+            }
+            if seed == SAVED_FULL {
+                match self.beside_decorated(x, z) {
+                    some(false) => {},
+                    _ => return out,
+                }
+            }
+            if not known {
+                return out
+            }
+            let order = self.order_of(x, z)
+            for dz in -2..3 {
+                for dx in -2..3 {
+                    if self.order_of(x + dx, z + dz) < order {
+                        out.push(node(DECORATE, x + dx, z + dz))
+                    }
+                }
+            }
+            for dz in -1..2 {
+                for dx in -1..2 {
+                    out.push(node(TERRAIN, x + dx, z + dz))
+                }
+            }
+        } else if kind == FINISH {
+            for dz in -1..2 {
+                for dx in -1..2 {
+                    out.push(node(DECORATE, x + dx, z + dz))
+                }
+            }
+            // Its terrain, which the decorations it needs have made, but where it's a full
+            // chunk decorated already, which only a chunk saved since it was asked for is.
+            out.push(node(TERRAIN, x, z))
+        }
+        return out
+    }
+
+    // Where the decoration of the chunk at `x`, `z` goes among those 2 or less from it, the lower
+    // first, as what's saved of it says (D334): a chunk saved with its terrain before any other,
+    // as vanilla goes on from those before it makes the chunks past them, then by rank (D214). Of
+    // two chunks 2 or less apart, one always goes first, as their ranks differ.
+    fn order_of(self, x: i32, z: i32) -> i32 {
+        let first = self.seeds.get(chunk_key(x, z)) == some(SAVED_TERRAIN)
+        return rank_of(x, z) + if first { 0 } else { 9 }
     }
 
     // The chunk's references to the structures started within 8 of it, whose starts are all made.
@@ -614,47 +860,6 @@ fn without(list: mut List<i64>, n: i64) {
     }
 }
 
-// The nodes the node needs.
-fn needs(n: i64) -> List<i64> {
-    let kind = kind_of(n)
-    let x = x_of(n)
-    let z = z_of(n)
-    var out = List<i64>()
-    if kind == TERRAIN {
-        // The starts within 8, and the biomes 1 or less away, by block.
-        for bz in (z - 8) >> BLOCK_SHIFT..((z + 8) >> BLOCK_SHIFT) + 1 {
-            for bx in (x - 8) >> BLOCK_SHIFT..((x + 8) >> BLOCK_SHIFT) + 1 {
-                out.push(node(STARTS, bx, bz))
-            }
-        }
-        for bz in (z - 1) >> BLOCK_SHIFT..((z + 1) >> BLOCK_SHIFT) + 1 {
-            for bx in (x - 1) >> BLOCK_SHIFT..((x + 1) >> BLOCK_SHIFT) + 1 {
-                out.push(node(BIOMES, bx, bz))
-            }
-        }
-    } else if kind == DECORATE {
-        let rank = rank_of(x, z)
-        for dz in -2..3 {
-            for dx in -2..3 {
-                if rank_of(x + dx, z + dz) < rank {
-                    out.push(node(DECORATE, x + dx, z + dz))
-                }
-            }
-        }
-        for dz in -1..2 {
-            for dx in -1..2 {
-                out.push(node(TERRAIN, x + dx, z + dz))
-            }
-        }
-    } else if kind == FINISH {
-        for dz in -1..2 {
-            for dx in -1..2 {
-                out.push(node(DECORATE, x + dx, z + dz))
-            }
-        }
-    }
-    return out
-}
 
 /// The Overworld's generator, making chunks on the thread it's on, a job at a time, and keeping
 /// each it finishes.
@@ -662,6 +867,9 @@ pub struct Generator {
     worker: Worker
     s: Scheduler
     finished: Map<i64, (Chunk, ChunkRest)>
+    // What's saved of each chunk, as `give` has it, for a look to find: nothing where it has
+    // none, as this thread reads no save (D334).
+    given: Map<i64, Saved>
     /// What went wrong making chunks, to be logged, oldest first.
     pub problems: List<String>
 }
@@ -672,7 +880,12 @@ impl Generator {
         let worker = try Worker.new(zip, setup)
         var s = Scheduler.new(worker.structures(), worker.ring_searches())
         s.set_level(worker.level())
-        return Generator { worker: worker, s: s, finished: Map<i64, (Chunk, ChunkRest)>(), problems: List<String>() }
+        return Generator { worker: worker, s: s, finished: Map<i64, (Chunk, ChunkRest)>(), given: Map<i64, Saved>(), problems: List<String>() }
+    }
+
+    /// Has a look at what's saved of the chunk at `x`, `z` find `saved` (D334).
+    pub fn give(mut self, x: i32, z: i32, saved: own Saved) {
+        self.given.insert(chunk_key(x, z), saved)
     }
 
     /// The block states' table the chunks are made with.
@@ -691,6 +904,11 @@ impl Generator {
         if not self.finished.contains(key) {
             self.s.want(x, z)
             while not self.s.is_finished(x, z) {
+                if let at = self.s.next_peek() {
+                    let (px, pz) = at
+                    self.s.peeked(px, pz, self.given.remove(chunk_key(px, pz)) ?? Saved.Nothing)
+                    continue
+                }
                 let job = self.s.next() else fail Thrown { exception: "IllegalStateException", message: "chunk {x}, {z} can't be finished" }
                 self.s.take(self.worker.run(job))
             }
