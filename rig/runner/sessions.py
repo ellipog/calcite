@@ -117,6 +117,10 @@ CONFIGS = {
     # never stop, so the bot watches it a fixed time.
     "redstone": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "redstone" / "world", fixture="redstone",
                        rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # Block entities saved by the spawn, sent with their chunks, and two heads a clock powers,
+    # each sent with its update packet as it changes (CAL-115); watched, as `redstone`.
+    "block_entities": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "block_entities" / "world",
+                             fixture="block_entities", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.

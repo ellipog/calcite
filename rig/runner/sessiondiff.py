@@ -15,7 +15,8 @@ line first, since when or in what order they come depends on timing rather than 
   `ReferenceOpenHashSet` of their holders, by identity, so in another order between chunks each
   run, and a light update comes as its light thread gets to the change. A step's
   `block_update`, `section_blocks_update` and `light_update` packets are compared as a multiset,
-  those left over paired by where they are, to show what differs (D341).
+  those left over paired by where they are, to show what differs (D341), with the
+  `block_entity_data` each block change brings, which comes as its tick does (D350).
 - **What isn't a packet.** The bot's mark that the server closed the connection is lined up
   like a packet, as `<closed>`.
 
@@ -37,7 +38,7 @@ CLOCK = {"play/set_time", "play/keep_alive", "configuration/keep_alive"}
 # The fields of a clock packet that hold the time.
 CLOCK_TIMES = {"gameTime", "totalTicks", "id"}
 CHUNKS = {"play/chunk_batch_start", "play/chunk_batch_finished", "play/level_chunk_with_light"}
-CHANGES = {"play/block_update", "play/section_blocks_update", "play/light_update"}
+CHANGES = {"play/block_update", "play/section_blocks_update", "play/light_update", "play/block_entity_data"}
 # Packets whose bytes vanilla itself doesn't fix: their values must match, but not their bytes.
 # PacketCheck lists the first three. A chunk's heightmaps are a HashMap, from `Collectors.toMap`,
 # keyed by an enum, which hashes by identity, so vanilla writes them in another order each run;
