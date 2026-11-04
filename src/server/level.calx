@@ -80,12 +80,12 @@ import world.tickets.{FULL_LEVEL, Holders, Ticket, TicketStorage, TicketType}
 import world.ticks.{ChunkTicks, LevelTicks, ScheduledTick}
 import worldgen.access.{BlockAccess}
 import worldgen.biome_manager.{corner}
-import worldgen.facts.{FLOWING_LAVA, Facts, LAVA_FLUID, opposite, step_x, step_y, step_z}
+import worldgen.facts.{FLOWING_LAVA, Facts, LAVA_FLUID, horizontal, opposite, step_x, step_y, step_z}
 import worldgen.generator.{GenSetup, setup_data}
 import worldgen.interval.{Thrown}
 import worldgen.scheduler.{Generator}
 import worldgen.shapes.{update_shape}
-import worldgen.survive.{Env}
+import worldgen.survive.{Env, direction_property}
 import worldgen.temperature.{Temperatures}
 
 /// How far around the spawn chunk a joining player's spawn ticket loads full chunks,
@@ -308,6 +308,14 @@ pub struct LevelEvent {
     pub data: i32
 }
 
+// A redstone torch's toggle, `RedstoneTorchBlock.Toggle`: where, and the game time it toggled at.
+struct Toggle {
+    x: i32
+    y: i32
+    z: i32
+    when: i64
+}
+
 /// The overworld's chunks, and the distance manager that says which load.
 pub struct Level {
     /// The tickets and players, and the chunks' holders.
@@ -452,6 +460,14 @@ pub struct Level {
     pub max_chained: i32 = 1000000
     reported: Set<String> = Set<String>()
     events: List<LevelEvent> = List<LevelEvent>()
+    // The block ticks running this tick, as `LevelTicks.tick` collects them, `toRunThisTick`, with
+    // the next to run, and those still to run, `toRunThisTickSet`, which `willTickThisTick` makes
+    // as it first asks; and the redstone torches' toggles, oldest first, `RECENT_TOGGLES`'s
+    // list for the level (CAL-116).
+    running: List<ScheduledTick> = List<ScheduledTick>()
+    running_at: usize = 0
+    to_run: Set<(i64, u32)> = Set<(i64, u32)>()
+    toggles: List<Toggle> = List<Toggle>()
 }
 
 /// The blocks set in a section since they were last broadcast, as `ChunkHolder.broadcastChanges`
@@ -1079,12 +1095,24 @@ impl Level {
         let ticks = self.take_block_ticks()
         let some_env = self.env.copy()
         let shared = some_env else return
-        for t in ticks {
+        // Each taken off those still to run before it runs, as `runCollectedTicks` polls it.
+        self.running = ticks
+        self.running_at = 0
+        self.to_run.clear()
+        while self.running_at < self.running.len() {
+            let t = self.running[self.running_at]
+            self.running_at += 1
+            if not self.to_run.is_empty() {
+                self.to_run.remove((BlockPos { x: t.x, y: t.y, z: t.z }.pack(), t.kind))
+            }
             match tick_block(shared.value, mut self, t.kind, t.x, t.y, t.z) {
                 ok => {},
                 err(thrown) => self.report(thrown.message),
             }
         }
+        self.running.clear()
+        self.running_at = 0
+        self.to_run.clear()
     }
 
     /// Runs the fluid ticks due now, as `fluidTicks.tick` runs them with `tickFluid` (D328): each
@@ -1304,6 +1332,35 @@ impl Level {
             let nz = z + step_z(d)
             self.add_and_run(nx, ny, nz, Update.Shape { d: opposite(d), neighbour: state, x: nx, y: ny, z: nz, flags: flags, limit: limit })
             i += 1
+        }
+    }
+
+    // `BlockState.updateIndirectNeighbourShapes`, which only redstone wire's does something,
+    // `RedstoneWireBlock`'s: toward each side, in `Direction.Plane.HORIZONTAL`'s order, it's
+    // joined to where what's there isn't wire, the wire below that, then above, told its shape
+    // from the block below or above x, y, z, as that is now (CAL-116).
+    fn update_indirect_shapes(mut self, f: Facts, state: u32, x: i32, y: i32, z: i32, flags: i32, limit: i32) {
+        let wire = f.ids.redstone_wire
+        if f.block(state) != wire {
+            return
+        }
+        for i in 0..4 {
+            let d = horizontal(i)
+            if (f.get_name(state, direction_property(d)) ?? String("none")) == "none" {
+                continue
+            }
+            let (nx, nz) = (x + step_x(d), z + step_z(d))
+            let beside = self.state_or_report(f, nx, y, nz) else continue
+            if f.block(beside) == wire {
+                continue
+            }
+            for dy in [-1, 1] {
+                let there = self.state_or_report(f, nx, y + dy, nz) else continue
+                if f.block(there) == wire {
+                    let neighbour = self.state_or_report(f, x, y + dy, z) else continue
+                    self.add_and_run(nx, y + dy, nz, Update.Shape { d: opposite(d), neighbour: neighbour, x: nx, y: y + dy, z: nz, flags: flags, limit: limit })
+                }
+            }
         }
     }
 
@@ -2728,7 +2785,7 @@ impl BlockLevel for Level {
             self.report(String("A block entity taken away with its block"))
         }
         if (f.block(old) != block or f.is_a(block, "BaseRailBlock")) and (flags & UPDATE_NEIGHBORS != 0 or moved) {
-            match after_removal(shared.value, self, old, x, y, z, moved) {
+            match after_removal(shared.value, mut self, old, x, y, z, moved) {
                 ok => {},
                 err(thrown) => self.report(thrown.message),
             }
@@ -2755,11 +2812,10 @@ impl BlockLevel for Level {
             self.update_neighbours_at(x, y, z, f.block(old))
         }
         if flags & UPDATE_KNOWN_SHAPE == 0 and limit > 0 {
-            if f.block(old) == f.ids.redstone_wire or block == f.ids.redstone_wire {
-                self.report(String("Redstone wire's shapes of the blocks diagonal to it"))
-            }
             let shape_flags = flags & -34
+            self.update_indirect_shapes(f, old, x, y, z, shape_flags, limit - 1)
             self.update_neighbour_shapes(state, x, y, z, shape_flags, limit - 1)
+            self.update_indirect_shapes(f, state, x, y, z, shape_flags, limit - 1)
         }
         if f.poi(old) != f.poi(now) {
             self.report(String("Points of interest changed as blocks are set"))
@@ -2801,6 +2857,68 @@ impl BlockLevel for Level {
 
     fn neighbour_changed(mut self, x: i32, y: i32, z: i32, source: u32) {
         self.add_and_run(x, y, z, Update.Simple { x: x, y: y, z: z, source: source })
+    }
+
+    fn update_neighbours(mut self, x: i32, y: i32, z: i32, source: u32) {
+        self.update_neighbours_at(x, y, z, source)
+    }
+
+    // `MultiNeighborUpdate` past `skip` from the first, as its constructor starts it.
+    fn update_neighbours_except(mut self, x: i32, y: i32, z: i32, source: u32, skip: i32) {
+        let first = if update_order(0) == skip { 1 } else { 0 }
+        self.add_and_run(x, y, z, Update.Multi { x: x, y: y, z: z, source: source, skip: skip, next: first })
+    }
+
+    // `willTickThisTick`: whether it's among the block ticks still to run, a set of them made as
+    // it's first asked, `calculateTickSetIfNeeded`, where it's empty; none outside the ticks.
+    fn will_tick_this_tick(mut self, block: u32, x: i32, y: i32, z: i32) -> bool {
+        if self.to_run.is_empty() {
+            var i = self.running_at
+            while i < self.running.len() {
+                let t = self.running[i]
+                self.to_run.insert((BlockPos { x: t.x, y: t.y, z: t.z }.pack(), t.kind))
+                i += 1
+            }
+        }
+        return self.to_run.contains((BlockPos { x: x, y: y, z: z }.pack(), block))
+    }
+
+    fn time_now(self) -> i64 {
+        return self.game_time
+    }
+
+    // `isToggledTooFrequently`: the toggle added now if `add`, then whether 8 are at the place.
+    fn torch_toggled(mut self, x: i32, y: i32, z: i32, add: bool) -> bool {
+        if add {
+            self.toggles.push(Toggle { x: x, y: y, z: z, when: self.game_time })
+        }
+        var count = 0
+        for i in 0..self.toggles.len() {
+            let t = self.toggles[i]
+            if t.x == x and t.y == y and t.z == z {
+                count += 1
+                if count >= 8 {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    // The toggles from the oldest on let go while each is more than 60 ticks old.
+    fn forget_toggles(mut self) {
+        var gone: usize = 0
+        while gone < self.toggles.len() and self.game_time - self.toggles[gone].when > 60 {
+            gone += 1
+        }
+        if gone == 0 {
+            return
+        }
+        var kept = List<Toggle>()
+        for i in gone..self.toggles.len() {
+            kept.push(self.toggles[i])
+        }
+        self.toggles = kept
     }
 
     fn fire_spreads(self, x: i32, y: i32, z: i32) -> bool {

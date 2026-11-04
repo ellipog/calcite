@@ -2,7 +2,9 @@
 /// in the server's level: vanilla's `onPlace`, `affectNeighborsAfterRemoval`, `neighborChanged`
 /// and `tick`, each as the class that declares it runs it (D325, D335), and `Block.updateOrDestroy`
 /// and `Level.destroyBlock`, which a shape update ends in (D326). Fire is placed, ticks, burns
-/// what's by it and spreads as `FireBlock` has it (D339). The order the blocks around are told in
+/// what's by it and spreads as `FireBlock` has it (D339). Redstone's observers, repeaters,
+/// torches, lamps and wire run as theirs do, with the signals `worldgen.signals` reads (CAL-116).
+/// The order the blocks around are told in
 /// is the level's, as `CollectingNeighborUpdater` keeps it. A class Calcite doesn't have yet
 /// throws `Unimplemented`, which the level reports once and goes on past, leaving the block as it
 /// is.
@@ -11,17 +13,25 @@ module world.block_updates
 import random.source.{RandomSource}
 import world.level_writer.{UPDATE_LIMIT}
 import worldgen.access.{BlockAccess}
-import worldgen.facts.{DOWN, EAST, EMPTY_FLUID, FULL, Facts, NORTH, SOUTH, UP, WEST, opposite, step_x, step_y, step_z}
+import worldgen.facts.{DOWN, EAST, EMPTY_FLUID, FULL, Facts, NORTH, SIGNAL_COMPARATOR, SIGNAL_REPEATER, SOUTH, UP, WEST, horizontal, opposite, step_x, step_y, step_z}
 import worldgen.interval.{Thrown}
 import worldgen.portal_shape.{PortalShape, find_any_shape}
 import worldgen.shapes.{can_occupy, coral_die_tick, fire_with_age, leaf_distance, touches_water}
-import worldgen.survive.{Env, can_survive}
+import worldgen.signals.{best_neighbour_signal, has_neighbour_signal, has_signal, repeater_locked, signal}
+import worldgen.survive.{Env, can_survive, facing_of}
 
 /// `levelEvent`'s types: a block broken, as `spawnDestroyParticles` sends it, with the state's
 /// ID; a straw bed broken; and lava fizzing as water meets it.
 pub const BLOCK_BROKEN: i32 = 2001
 pub const STRAW_BED_BROKEN: i32 = 2014
 pub const LAVA_FIZZ: i32 = 1501
+/// `levelEvent`'s type for a redstone torch that burns out, toggled too often (CAL-116).
+pub const TORCH_BURNOUT: i32 = 1502
+
+/// `TickPriority`'s values: a diode's ticks come before others due the same tick (CAL-116).
+pub const EXTREMELY_HIGH: i32 = -3
+pub const VERY_HIGH: i32 = -2
+pub const HIGH: i32 = -1
 
 /// `NeighborUpdater.UPDATE_ORDER`, the order the six blocks around one are told it changed: its
 /// `i`th.
@@ -108,6 +118,23 @@ pub interface BlockLevel {
     fn infiniburn(self) -> String
     /// `INCREASED_FIRE_BURNOUT` at the block `x`, `y`, `z`, as its biome has it (D339).
     fn fire_burnout(self, x: i32, y: i32, z: i32) -> bool
+    /// `updateNeighborsAt(pos, block)`: the six around `x`, `y`, `z` told the block `source`
+    /// there changed, in `UPDATE_ORDER`, as one update (CAL-116).
+    fn update_neighbours(mut self, x: i32, y: i32, z: i32, source: u32)
+    /// `updateNeighborsAtExceptFromFacing`: the six around `x`, `y`, `z` but the one toward
+    /// `skip` told the block `source` there changed (CAL-116).
+    fn update_neighbours_except(mut self, x: i32, y: i32, z: i32, source: u32, skip: i32)
+    /// `LevelTicks.willTickThisTick`: whether a tick of the block `block` at `x`, `y`, `z` is
+    /// among those still to run this tick (CAL-116).
+    fn will_tick_this_tick(mut self, block: u32, x: i32, y: i32, z: i32) -> bool
+    /// `getGameTime` (CAL-116).
+    fn time_now(self) -> i64
+    /// `RedstoneTorchBlock.isToggledTooFrequently`: the level's torches' recent toggles, with
+    /// one at `x`, `y`, `z` now if `add`, and whether that place has 8 of them (CAL-116).
+    fn torch_toggled(mut self, x: i32, y: i32, z: i32, add: bool) -> bool
+    /// The torches' toggles more than 60 ticks old let go, oldest first, as `tick` lets them go
+    /// as a torch's tick starts (CAL-116).
+    fn forget_toggles(mut self)
 }
 
 /// `BlockState.onPlace`: what the block `state` does as it's set at `x`, `y`, `z` where `old`
@@ -152,15 +179,76 @@ pub fn on_place<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mut L
         try fire_placed(e, mut level, state, x, y, z, old)
         return
     }
+    if kind == "ObserverBlock" {
+        // One set powered, as a command or a structure sets it, with no tick of its own waiting,
+        // is unpowered at once, with flags 18, and tells what's behind it.
+        if f.block(old) != block and f.get_bool(state, "powered") and not level.has_block_tick(block, x, y, z) {
+            let off = try f.with_bool(state, "powered", false)
+            _ = level.set_block_limited(x, y, z, off, 18, UPDATE_LIMIT)
+            try update_in_front(f, mut level, off, x, y, z)
+        }
+        return
+    }
+    if kind == "DiodeBlock" {
+        try update_in_front(f, mut level, state, x, y, z)
+        return
+    }
+    if kind == "RedstoneTorchBlock" {
+        torch_neighbours(mut level, block, x, y, z)
+        return
+    }
+    if kind == "RedstoneWireBlock" {
+        // Not where it was wire already: its power, then the blocks around those above and below
+        // it, and those its neighbouring wires reach.
+        if f.block(old) == block {
+            return
+        }
+        try wire_power(f, mut level, state, x, y, z)
+        level.update_neighbours(x, y + 1, z, block)
+        level.update_neighbours(x, y - 1, z, block)
+        try wire_neighbours_of_wires(f, mut level, block, x, y, z)
+        return
+    }
     fail Thrown { exception: "Unimplemented", message: "onPlace of {kind}" }
 }
 
 /// `BlockState.affectNeighborsAfterRemoval`: what the block `old`, replaced at `x`, `y`, `z`,
 /// does to the blocks around, `moved` if a piston moved it.
-pub fn after_removal<L: BlockAccess + BlockLevel + RandomSource>(e: Env, _level: L, old: u32, _x: i32, _y: i32, _z: i32, _moved: bool) ! Thrown {
+pub fn after_removal<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mut L, old: u32, x: i32, y: i32, z: i32, moved: bool) ! Thrown {
     let Env { facts: f, .. } = e
-    let kind = f.removal_class(f.block(old))
+    let block = f.block(old)
+    let kind = f.removal_class(block)
     if kind == "BlockBehaviour" {
+        return
+    }
+    if kind == "ObserverBlock" {
+        // A powered one whose tick to turn off waits tells what was behind it it's off.
+        if f.get_bool(old, "powered") and level.has_block_tick(block, x, y, z) {
+            try update_in_front(f, mut level, try f.with_bool(old, "powered", false), x, y, z)
+        }
+        return
+    }
+    if kind == "DiodeBlock" {
+        if not moved {
+            try update_in_front(f, mut level, old, x, y, z)
+        }
+        return
+    }
+    if kind == "RedstoneTorchBlock" {
+        if not moved {
+            torch_neighbours(mut level, block, x, y, z)
+        }
+        return
+    }
+    if kind == "RedstoneWireBlock" {
+        if moved {
+            return
+        }
+        for d in 0..6 {
+            level.update_neighbours(x + step_x(d), y + step_y(d), z + step_z(d), block)
+        }
+        try wire_power(f, mut level, old, x, y, z)
+        try wire_neighbours_of_wires(f, mut level, block, x, y, z)
         return
     }
     fail Thrown { exception: "Unimplemented", message: "affectNeighborsAfterRemoval of {kind}" }
@@ -176,6 +264,53 @@ pub fn on_neighbour_changed<L: BlockAccess + BlockLevel + RandomSource>(e: Env, 
     }
     if kind == "LiquidBlock" {
         try liquid_changed(e, mut level, state, x, y, z)
+        return
+    }
+    if kind == "DiodeBlock" {
+        // Still there: its tick checked where it can stay, else it's broken, with what it drops,
+        // and the blocks around each of the six beside it told.
+        let here = try level.state(f, x, y, z)
+        if f.block(here) != f.block(state) {
+            return
+        }
+        if try can_survive(e, level, state, x, y, z) {
+            try diode_check(f, mut level, state, x, y, z)
+            return
+        }
+        level.unimplemented(String("What a broken block drops"))
+        _ = try remove_block(f, mut level, x, y, z)
+        for d in 0..6 {
+            level.update_neighbours(x + step_x(d), y + step_y(d), z + step_z(d), f.block(state))
+        }
+        return
+    }
+    if kind == "RedstoneLampBlock" {
+        // Lit at once, with flags 2, as a signal comes; put out 4 ticks on as it goes.
+        let lit = f.get_bool(state, "lit")
+        if lit != try has_neighbour_signal(f, level, x, y, z, true) {
+            if lit {
+                level.schedule_block(f.block(state), x, y, z, 4, 0)
+            } else {
+                _ = level.set_block_limited(x, y, z, try f.with_bool(state, "lit", true), 2, UPDATE_LIMIT)
+            }
+        }
+        return
+    }
+    if kind == "RedstoneTorchBlock" {
+        // Lit with what it's on powered, or out with it not: its tick 2 on, unless one runs this
+        // tick.
+        if f.get_bool(state, "lit") == try torch_powered(f, level, state, x, y, z) and not level.will_tick_this_tick(f.block(state), x, y, z) {
+            level.schedule_block(f.block(state), x, y, z, 2, 0)
+        }
+        return
+    }
+    if kind == "RedstoneWireBlock" {
+        if try can_survive(e, level, state, x, y, z) {
+            try wire_power(f, mut level, state, x, y, z)
+        } else {
+            level.unimplemented(String("What a broken block drops"))
+            _ = try remove_block(f, mut level, x, y, z)
+        }
         return
     }
     fail Thrown { exception: "Unimplemented", message: "neighborChanged of {kind}" }
@@ -257,7 +392,268 @@ pub fn tick_block<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mut
         try fire_tick(e, mut level, state, x, y, z)
         return
     }
+    if kind == "ObserverBlock" {
+        // Powered, with its tick to turn off 2 on, or off; then what's behind it told, with
+        // flags 2 either way.
+        if f.get_bool(state, "powered") {
+            _ = level.set_block_limited(x, y, z, try f.with_bool(state, "powered", false), 2, UPDATE_LIMIT)
+        } else {
+            _ = level.set_block_limited(x, y, z, try f.with_bool(state, "powered", true), 2, UPDATE_LIMIT)
+            level.schedule_block(block, x, y, z, 2, 0)
+        }
+        try update_in_front(f, mut level, state, x, y, z)
+        return
+    }
+    if kind == "DiodeBlock" {
+        // Unless it's locked: off where it's powered and its input's gone; on where it isn't,
+        // with its tick to go off again its delay on, at a very high priority, where its input's
+        // gone already. With flags 2, its `onPlace` tells what's in front.
+        if try diode_locked(f, level, state, x, y, z) {
+            return
+        }
+        let powered = f.get_bool(state, "powered")
+        let on = try diode_input(f, level, state, x, y, z) > 0
+        if powered and not on {
+            _ = level.set_block_limited(x, y, z, try f.with_bool(state, "powered", false), 2, UPDATE_LIMIT)
+        } else if not powered {
+            _ = level.set_block_limited(x, y, z, try f.with_bool(state, "powered", true), 2, UPDATE_LIMIT)
+            if not on {
+                level.schedule_block(block, x, y, z, diode_delay(f, state), VERY_HIGH)
+            }
+        }
+        return
+    }
+    if kind == "RedstoneLampBlock" {
+        if f.get_bool(state, "lit") and not try has_neighbour_signal(f, level, x, y, z, true) {
+            _ = level.set_block_limited(x, y, z, try f.with_bool(state, "lit", false), 2, UPDATE_LIMIT)
+        }
+        return
+    }
+    if kind == "RedstoneTorchBlock" {
+        try torch_tick(f, mut level, state, x, y, z)
+        return
+    }
     fail Thrown { exception: "Unimplemented", message: "tick of {kind}" }
+}
+
+// `ObserverBlock.updateNeighborsInFront` and `DiodeBlock`'s: the block behind it, the way it
+// faces away from, told it changed, then the blocks around that but the one back toward it.
+fn update_in_front<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+    let facing = try facing_of(f, state)
+    let back = opposite(facing)
+    let (fx, fy, fz) = (x + step_x(back), y + step_y(back), z + step_z(back))
+    let block = f.block(state)
+    level.neighbour_changed(fx, fy, fz, block)
+    level.update_neighbours_except(fx, fy, fz, block, facing)
+}
+
+// `RedstoneTorchBlock.notifyNeighbors`: the blocks around each of the six beside it told, in
+// `Direction`'s order.
+fn torch_neighbours<L: BlockLevel>(level: mut L, block: u32, x: i32, y: i32, z: i32) {
+    for d in 0..6 {
+        level.update_neighbours(x + step_x(d), y + step_y(d), z + step_z(d), block)
+    }
+}
+
+// `RedstoneTorchBlock.hasNeighborSignal`: whether what the torch is on gives it a signal, the
+// block below, or behind a wall torch, `RedstoneWallTorchBlock`'s.
+fn torch_powered<R: BlockAccess>(f: Facts, r: R, state: u32, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if f.is_a(f.block(state), "RedstoneWallTorchBlock") {
+        let back = opposite(try facing_of(f, state))
+        return try has_signal(f, r, x + step_x(back), y + step_y(back), z + step_z(back), back, true)
+    }
+    return try has_signal(f, r, x, y - 1, z, DOWN, true)
+}
+
+// `RedstoneTorchBlock.tick`: the level's toggles more than 60 ticks old let go. A lit torch whose
+// block is powered goes out, `setBlockAndUpdate`, and where that's its eighth toggle in 60 ticks
+// it burns out, with the event its players see, and tries again 160 ticks on; one that's out,
+// with nothing powering it, lights again unless it's toggled 8 times in that time.
+fn torch_tick<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+    let powered = try torch_powered(f, level, state, x, y, z)
+    level.forget_toggles()
+    if f.get_bool(state, "lit") {
+        if powered {
+            _ = level.set_block_limited(x, y, z, try f.with_bool(state, "lit", false), 3, UPDATE_LIMIT)
+            if level.torch_toggled(x, y, z, true) {
+                level.level_event(TORCH_BURNOUT, x, y, z, 0)
+                let now = try level.state(f, x, y, z)
+                level.schedule_block(f.block(now), x, y, z, 160, 0)
+            }
+        }
+    } else if not powered and not level.torch_toggled(x, y, z, false) {
+        _ = level.set_block_limited(x, y, z, try f.with_bool(state, "lit", true), 3, UPDATE_LIMIT)
+    }
+}
+
+// `DiodeBlock.isLocked`: a repeater's, a diode at either side powering it; no other diode's.
+fn diode_locked<R: BlockAccess>(f: Facts, r: R, state: u32, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if f.signal_kind(f.block(state)) != SIGNAL_REPEATER {
+        return false
+    }
+    return try repeater_locked(f, r, state, x, y, z)
+}
+
+// `DiodeBlock.getInputSignal`: the signal of the block behind it, the way it faces, toward it,
+// or that wire's power where that's more.
+fn diode_input<R: BlockAccess>(f: Facts, r: R, state: u32, x: i32, y: i32, z: i32) -> i32 ! Thrown {
+    let facing = try facing_of(f, state)
+    let (bx, by, bz) = (x + step_x(facing), y + step_y(facing), z + step_z(facing))
+    let s = try signal(f, r, bx, by, bz, facing, true)
+    if s >= 15 {
+        return s
+    }
+    let behind = try r.state(f, bx, by, bz)
+    return s.max(if f.block(behind) == f.ids.redstone_wire { f.get_int(behind, "power") ?? 0 } else { 0 })
+}
+
+// `RepeaterBlock.getDelay`: twice its `delay`.
+fn diode_delay(f: Facts, state: u32) -> i32 {
+    return (f.get_int(state, "delay") ?? 1) * 2
+}
+
+// `DiodeBlock.checkTickOnNeighbor`, a repeater's: unless it's locked, where it's powered or
+// not and its input says otherwise, its tick its delay on, unless one runs this tick: at an
+// extremely high priority where it feeds a diode that doesn't face back into it,
+// `shouldPrioritize`, a very high one where it's powered, else a high one. A comparator's comes
+// with what it holds.
+fn diode_check<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+    let block = f.block(state)
+    if f.signal_kind(block) != SIGNAL_REPEATER {
+        fail Thrown { exception: "Unimplemented", message: "neighborChanged of {f.class_name(block)}" }
+    }
+    if try diode_locked(f, level, state, x, y, z) {
+        return
+    }
+    let powered = f.get_bool(state, "powered")
+    let on = try diode_input(f, level, state, x, y, z) > 0
+    if powered == on or level.will_tick_this_tick(block, x, y, z) {
+        return
+    }
+    let front = opposite(try facing_of(f, state))
+    let ahead = try level.state(f, x + step_x(front), y + step_y(front), z + step_z(front))
+    let kind = f.signal_kind(f.block(ahead))
+    var priority = HIGH
+    if (kind == SIGNAL_REPEATER or kind == SIGNAL_COMPARATOR) and try facing_of(f, ahead) != front {
+        priority = EXTREMELY_HIGH
+    } else if powered {
+        priority = VERY_HIGH
+    }
+    level.schedule_block(block, x, y, z, diode_delay(f, state), priority)
+}
+
+// `DefaultRedstoneWireEvaluator.updatePowerStrength`: where the power the wire at x, y, z should
+// have, `calculateTargetStrength`, isn't `state`'s, it's set, with flags 2, if the wire's still
+// `state`, and the blocks around it and the six beside it told, in the order a `HashSet` of them
+// gives.
+fn wire_power<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+    let target = try wire_target(f, level, x, y, z)
+    if (f.get_int(state, "power") ?? 0) == target {
+        return
+    }
+    if try level.state(f, x, y, z) == state {
+        _ = level.set_block_limited(x, y, z, try f.with_int(state, "power", target), 2, UPDATE_LIMIT)
+    }
+    let wire = f.ids.redstone_wire
+    for (px, py, pz) in hash_set_order(x, y, z) {
+        level.update_neighbours(px, py, pz, wire)
+    }
+}
+
+// `calculateTargetStrength`: the most the blocks around give it, read with wire not signalling,
+// `getBlockSignal`, or, under 15, the most of that and the wire beside it, one less,
+// `getIncomingWireSignal`.
+fn wire_target<R: BlockAccess>(f: Facts, r: R, x: i32, y: i32, z: i32) -> i32 ! Thrown {
+    let s = try best_neighbour_signal(f, r, x, y, z, false)
+    if s == 15 {
+        return 15
+    }
+    return s.max(try incoming_wire(f, r, x, y, z))
+}
+
+// `RedstoneWireEvaluator.getIncomingWireSignal`: the most power of the wire beside it, in
+// `Direction.Plane.HORIZONTAL`'s order, and above that where it conducts and what's above this
+// doesn't, or below it where it doesn't, one less.
+fn incoming_wire<R: BlockAccess>(f: Facts, r: R, x: i32, y: i32, z: i32) -> i32 ! Thrown {
+    var most = 0
+    for i in 0..4 {
+        let d = horizontal(i)
+        let (nx, nz) = (x + step_x(d), z + step_z(d))
+        let next = try r.state(f, nx, y, nz)
+        most = most.max(wire_power_of(f, next))
+        if f.redstone_conductor(next) {
+            if not f.redstone_conductor(try r.state(f, x, y + 1, z)) {
+                most = most.max(wire_power_of(f, try r.state(f, nx, y + 1, nz)))
+            }
+        } else {
+            most = most.max(wire_power_of(f, try r.state(f, nx, y - 1, nz)))
+        }
+    }
+    return (most - 1).max(0)
+}
+
+// `getWireSignal`: the state's power if it's wire, else 0.
+fn wire_power_of(f: Facts, state: u32) -> i32 {
+    if f.block(state) != f.ids.redstone_wire {
+        return 0
+    }
+    return f.get_int(state, "power") ?? 0
+}
+
+// The block at x, y, z and the six beside it, added in `Direction`'s order to a `HashSet` of 16
+// buckets, as it iterates them: by the bucket each one's `Vec3i.hashCode`, spread as
+// `HashMap.hash` spreads it, falls in, then in the order they came within one.
+fn hash_set_order(x: i32, y: i32, z: i32) -> List<(i32, i32, i32)> {
+    var all = List<(i32, i32, i32)>()
+    all.push((x, y, z))
+    for d in 0..6 {
+        all.push((x + step_x(d), y + step_y(d), z + step_z(d)))
+    }
+    var out = List<(i32, i32, i32)>()
+    for bucket in 0u32..16 {
+        for (px, py, pz) in all {
+            if bucket_of(px, py, pz) == bucket {
+                out.push((px, py, pz))
+            }
+        }
+    }
+    return out
+}
+
+// The bucket of 16 a `HashSet` puts the position at x, y, z in.
+fn bucket_of(x: i32, y: i32, z: i32) -> u32 {
+    let h = u32.wrap((i64(y) + i64(z) * 31) * 31 + i64(x))
+    return (h ^ (h >> 16)) & 15
+}
+
+// `updateNeighborsOfNeighboringWires`: each wire beside it, then each above or below the blocks
+// beside it, above where that conducts, `checkCornerChangeAt`.
+fn wire_neighbours_of_wires<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, wire: u32, x: i32, y: i32, z: i32) ! Thrown {
+    for i in 0..4 {
+        let d = horizontal(i)
+        try corner_change(f, mut level, wire, x + step_x(d), y, z + step_z(d))
+    }
+    for i in 0..4 {
+        let d = horizontal(i)
+        let (nx, nz) = (x + step_x(d), z + step_z(d))
+        if f.redstone_conductor(try level.state(f, nx, y, nz)) {
+            try corner_change(f, mut level, wire, nx, y + 1, nz)
+        } else {
+            try corner_change(f, mut level, wire, nx, y - 1, nz)
+        }
+    }
+}
+
+// `checkCornerChangeAt`: where there's wire at x, y, z, the blocks around it and around each of
+// the six beside it told.
+fn corner_change<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, wire: u32, x: i32, y: i32, z: i32) ! Thrown {
+    if f.block(try level.state(f, x, y, z)) != wire {
+        return
+    }
+    level.update_neighbours(x, y, z, wire)
+    for d in 0..6 {
+        level.update_neighbours(x + step_x(d), y + step_y(d), z + step_z(d), wire)
+    }
 }
 
 /// `BaseFireBlock.getState`: the fire set at `x`, `y`, `z` as it's placed there, soul fire on
