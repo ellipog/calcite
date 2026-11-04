@@ -146,6 +146,12 @@ CONFIGS = {
     # (CAL-127); watched, as `redstone`.
     "water_blocks": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "water_blocks" / "world",
                            fixture="water_blocks", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # Block entities' tickers at dusk: daylight detectors putting out the sky's light as it
+    # darkens and the sun goes down, plain, inverted, under leaves and stone, lighting lamps; a
+    # crafter done crafting, a brewing stand showing its bottles, a hopper's cooldown, and
+    # tickers with nothing to do (CAL-130); watched, as `redstone`.
+    "tickers": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "tickers" / "world",
+                      fixture="tickers", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
