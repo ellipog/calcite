@@ -222,6 +222,19 @@ final class BlockFlags {
         StringBuilder containers = new StringBuilder();
         // `Block.hasDynamicShape`: blocks whose shape can change where they stand.
         StringBuilder dynamic = new StringBuilder();
+        // `BlockState.instrument()`, which a note block plays over each block: a block's states all
+        // have its properties' one, as an ordinal of `NoteBlockInstrument`, with the instruments'
+        // names and those that `worksAboveNoteBlock`.
+        StringBuilder instruments = new StringBuilder();
+        StringBuilder instrumentNames = new StringBuilder();
+        StringBuilder instrumentsAbove = new StringBuilder();
+        for (net.minecraft.world.level.block.state.properties.NoteBlockInstrument i
+                : net.minecraft.world.level.block.state.properties.NoteBlockInstrument.values()) {
+            instrumentNames.append(instrumentNames.isEmpty() ? "\"" : ", \"").append(i.getSerializedName()).append("\"");
+            if (i.worksAboveNoteBlock()) {
+                instrumentsAbove.append(instrumentsAbove.isEmpty() ? "" : ", ").append(i.ordinal());
+            }
+        }
         java.lang.reflect.Field igniteField = net.minecraft.world.level.block.FireBlock.class.getDeclaredField("igniteOdds");
         igniteField.setAccessible(true);
         @SuppressWarnings("unchecked")
@@ -262,6 +275,13 @@ final class BlockFlags {
             removal.append(id == 0 ? "\"" : ", \"").append(ar).append("\"");
             tick.append(id == 0 ? "\"" : ", \"").append(tk).append("\"");
             Block block = BuiltInRegistries.BLOCK.byId(id);
+            int instrument = block.defaultBlockState().instrument().ordinal();
+            for (BlockState each : block.getStateDefinition().getPossibleStates()) {
+                if (each.instrument().ordinal() != instrument) {
+                    throw new IllegalStateException(BuiltInRegistries.BLOCK.getKey(block) + "'s states play more than one instrument");
+                }
+            }
+            instruments.append(id == 0 ? "" : ", ").append(instrument);
             if (block.hasDynamicShape()) {
                 dynamic.append(dynamic.isEmpty() ? "" : ", ").append(id);
             }
@@ -305,6 +325,9 @@ final class BlockFlags {
         json.append("  \"dynamic_shape_blocks\": [").append(dynamic).append("],\n");
         json.append("  \"outline_differs\": [").append(outline).append("],\n");
         json.append("  \"wall_cover\": [").append(wallCover).append("],\n");
+        json.append("  \"instruments\": [").append(instruments).append("],\n");
+        json.append("  \"instrument_names\": [").append(instrumentNames).append("],\n");
+        json.append("  \"instruments_above\": [").append(instrumentsAbove).append("],\n");
         json.append("  \"class_parents\": {").append(parentJson).append("},\n");
         json.append("  \"poi\": [").append(poi).append("],\n");
         json.append("  \"block_entities\": [").append(blockEntities).append("],\n");

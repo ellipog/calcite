@@ -497,6 +497,21 @@ def block_facts_module(index, flags):
     ]
     lines += ["        " + ", ".join(pairs[i:i + 24]) + "," for i in range(0, len(pairs), 24)]
     lines += ["    ]", "    return pairs", "}", ""]
+    lines += [
+        "/// The instruments a note block plays, by name, in `NoteBlockInstrument`'s order.",
+        "pub fn instrument_names() -> List<str> {",
+        "    return [",
+    ]
+    lines += [f'        "{n}",' for n in flags["instrument_names"]]
+    lines += ["    ]", "}", ""]
+    lines += number_list(
+        "block_instruments", "instruments", flags["instruments"],
+        ["/// The instrument a note block plays over each block, by its index in `instrument_names`, in",
+         "/// block ID order: `BlockState.instrument()`, which each of a block's states has."])
+    lines += number_list(
+        "instruments_above", "instruments", flags["instruments_above"],
+        ["/// The instruments that play from above a note block, the heads', by index in",
+         "/// `instrument_names`: `worksAboveNoteBlock`."])
     pairs = [str(v) for pair in flags["poi"] for v in pair]
     lines += [
         "/// The states that are points of interest, each followed by its type's ID in the",
