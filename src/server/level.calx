@@ -67,6 +67,7 @@ import world.collision.{CollisionBlocks, CollisionStates}
 import world.distance.{DistanceManager, Ticking}
 import world.flat.{FlatChunk, FlatWorld}
 import world.flowing.{tick_fluid}
+import world.post_process.{post_process}
 import world.block_updates.{BlockLevel, after_removal, on_neighbour_changed, on_place, shape_order, update_or_destroy, update_order}
 import world.level_writer.{LevelWriter, UPDATE_CLIENTS, UPDATE_KNOWN_SHAPE, UPDATE_LIMIT, UPDATE_MOVE_BY_PISTON, UPDATE_NEIGHBORS, UPDATE_SKIP_ON_PLACE, UPDATE_SKIP_SHAPE_UPDATE_ON_WIRE}
 import world.light.{SkySources}
@@ -384,6 +385,12 @@ pub struct Level {
     block_ticks: LevelTicks = LevelTicks()
     fluid_ticks: LevelTicks = LevelTicks()
     ticks_to_check: LinkedSet<i64> = LinkedSet<i64>()
+    // The chunks that came to tick before the level had its block facts, as the spawn's do at
+    // the server's start, in the order they came to, post-processed once it has them (D329).
+    post_waiting: LinkedSet<i64> = LinkedSet<i64>()
+    // The chunks that came to tick before the level had their light, which post-processing
+    // reads, post-processed as it comes (D329).
+    post_lit: LinkedSet<i64> = LinkedSet<i64>()
     sub_ticks: i64 = 0
     /// The game time, which the level's ticks are scheduled and saved by, as the network has it.
     pub game_time: i64 = 0
@@ -969,9 +976,22 @@ impl Level {
 
     /// Gives the level what a block's shape and its survival read, the block facts and the
     /// dimension's light, as the network has them once the registries are read. Till then, a
-    /// block set tells nothing around it (D326).
+    /// block set tells nothing around it (D326), and a chunk that comes to tick waits to be
+    /// post-processed until it's given them (D329).
     pub fn set_env(mut self, env: own Env) {
         self.env = some(env)
+        // The chunks that came to tick without them, the spawn's at the server's start, are
+        // post-processed now, in the order they came to, each that still ticks (D329).
+        var waiting = List<i64>()
+        for k in self.post_waiting {
+            waiting.push(k)
+        }
+        self.post_waiting.clear()
+        for k in waiting {
+            if self.sendable(unpacked(k)) {
+                self.post_process_lit(k)
+            }
+        }
     }
 
     /// Whether the level has `set_env`'s.
@@ -1798,9 +1818,64 @@ impl Level {
                 self.fluid_ticks.add_container(k, ChunkTicks.saved(fluid))
             }
             if self.sendable(pos) {
+                self.post_process_lit(k)
                 self.block_ticks.unpack(k, self.game_time)
                 self.fluid_ticks.unpack(k, self.game_time)
             }
+        }
+    }
+
+    // The chunk at `k`, come to tick, post-processed once the level has its light, which what it
+    // does reads, as a chunk vanilla ticks is lit (D329): at once if the light's here or there's
+    // none to wait for, else once light gives it, which is asked for. One that marked nothing
+    // has nothing to do.
+    fn post_process_lit(mut self, k: i64) {
+        if not self.columns.rests.marked(k) {
+            return
+        }
+        if self.lighting and not self.light_data.contains(k) and not self.flat_around(unpacked(k)) {
+            if not self.watching.contains(k) {
+                self.watch(k)
+            }
+            if not self.light_eager {
+                self.post_lit.insert(k)
+                return
+            }
+            _ = self.step_here()
+        }
+        self.post_process_chunk(k)
+    }
+
+    // The chunk at `k`, coming to tick, post-processed as `postProcessGeneration` does it before
+    // `startTickingChunk` and before it's sent (D329): each block its generation marked, in each
+    // section from the bottom and in the order marked, done as `world.post_process` has it, and
+    // the marks cleared from its rest, as vanilla clears each list, so it's done once. A level
+    // without the block facts yet keeps the chunk waiting for them. What isn't in Calcite yet is
+    // reported.
+    fn post_process_chunk(mut self, k: i64) {
+        let some_env = self.env.copy()
+        let e = some_env else {
+            self.post_waiting.insert(k)
+            return
+        }
+        let marks = self.columns.rests.take_marks(k)
+        let pos = unpacked(k)
+        var section_y = self.min_section
+        for section in marks {
+            if let list = section {
+                for packed in list {
+                    // `ProtoChunk.unpackOffsetCoordinates`.
+                    let p = i32(packed)
+                    let x = pos.x * 16 + (p & 15)
+                    let y = section_y * 16 + ((p >> 4) & 15)
+                    let z = pos.z * 16 + ((p >> 8) & 15)
+                    match post_process(e, mut self, x, y, z) {
+                        ok => {},
+                        err(thrown) => self.report(thrown.message),
+                    }
+                }
+            }
+            section_y += 1
         }
     }
 
@@ -2033,6 +2108,12 @@ impl Level {
     // Tells light the holder at `k` came to be full, or that it stopped being, and its light isn't
     // wanted any more.
     fn tell_full(mut self, k: i64, full: bool) {
+        if not full {
+            // One that's no longer full waits to be post-processed no more; its marks stay in
+            // its rest, as a chunk vanilla never ticked saves them (D329).
+            self.post_lit.remove(k)
+            self.post_waiting.remove(k)
+        }
         if not self.lighting or full == self.told_full.contains(k) {
             return
         }
@@ -2153,6 +2234,22 @@ impl Level {
             let from = self.watching.get(k) ?? (covered + 1)
             if self.current(k, covered) and from <= covered {
                 self.light_data.insert(k, light)
+            }
+        }
+        // The chunks that came to tick before their light was here, post-processed now it is,
+        // in the order they came to, each that still ticks (D329).
+        if not self.post_lit.is_empty() {
+            var ready = List<i64>()
+            for k in self.post_lit {
+                if self.light_data.contains(k) {
+                    ready.push(k)
+                }
+            }
+            for k in ready {
+                self.post_lit.remove(k)
+                if self.sendable(unpacked(k)) {
+                    self.post_process_chunk(k)
+                }
             }
         }
         var saves = d.saves
