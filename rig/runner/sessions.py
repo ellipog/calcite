@@ -135,6 +135,12 @@ CONFIGS = {
     # a bell, a big dripleaf, a command block, rails and shelves (CAL-124); watched, as `redstone`.
     "receivers": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "receivers" / "world",
                         fixture="receivers", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # The blocks that make a signal of their own by the spawn, set as a command sets them, each
+    # beside a lamp an observer clock pulses: buttons, a lever, pressure plates, a lectern, a
+    # detector rail, a lightning rod let go as it ticks, a target, a trapped chest, a jukebox and a
+    # tripped tripwire line detaching (CAL-128); watched, as `redstone`.
+    "sources": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "sources" / "world",
+                      fixture="sources", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.

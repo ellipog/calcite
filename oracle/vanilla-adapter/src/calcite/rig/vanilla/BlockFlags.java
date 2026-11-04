@@ -271,11 +271,21 @@ final class BlockFlags {
         // a trapdoor's and a button's and a pressure plate's from its `BlockSetType`, a fence gate's
         // from its `WoodType`, each by the sound event's name.
         StringBuilder toggles = new StringBuilder();
+        // How long a button stays pressed, `ticksToStayPressed`, and how many entities a weighted
+        // pressure plate weighs at most, `maxWeight` (CAL-128).
+        StringBuilder buttonTicks = new StringBuilder();
+        StringBuilder plateWeights = new StringBuilder();
         for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
             Block block = BuiltInRegistries.BLOCK.byId(id);
             String[] sounds = toggleSounds(block);
             if (sounds != null) {
                 toggles.append(toggles.isEmpty() ? "" : ", ").append("[").append(id).append(", \"").append(sounds[0]).append("\", \"").append(sounds[1]).append("\"]");
+            }
+            if (block instanceof net.minecraft.world.level.block.ButtonBlock) {
+                buttonTicks.append(buttonTicks.isEmpty() ? "" : ", ").append("[").append(id).append(", ").append(fieldOf(block, "ticksToStayPressed")).append("]");
+            }
+            if (block instanceof net.minecraft.world.level.block.WeightedPressurePlateBlock) {
+                plateWeights.append(plateWeights.isEmpty() ? "" : ", ").append("[").append(id).append(", ").append(fieldOf(block, "maxWeight")).append("]");
             }
             BlockState first = block.getStateDefinition().getPossibleStates().get(0);
             int reaction = first.getPistonPushReaction().ordinal();
@@ -418,6 +428,8 @@ final class BlockFlags {
         json.append("  \"push_reactions\": [").append(pushReactions).append("],\n");
         json.append("  \"unbreakable_blocks\": [").append(unbreakable).append("],\n");
         json.append("  \"toggle_sounds\": [").append(toggles).append("],\n");
+        json.append("  \"button_ticks\": [").append(buttonTicks).append("],\n");
+        json.append("  \"plate_weights\": [").append(plateWeights).append("],\n");
         json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
         json.append("  \"fire_odds\": [").append(fireOdds).append("],\n");
         json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");

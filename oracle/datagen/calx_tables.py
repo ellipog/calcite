@@ -518,6 +518,17 @@ def block_facts_module(index, flags):
         ]
         lines += [f'        "{t[at]}",' for t in toggles]
         lines += ["    ]", "}", ""]
+    for key, blocks_fn, values_fn, what in [
+            ("button_ticks", "button_tick_blocks", "button_ticks", "how many ticks each stays pressed, `ticksToStayPressed`"),
+            ("plate_weights", "plate_weight_blocks", "plate_weights", "how many entities each weighs at most, `maxWeight`")]:
+        pairs = flags[key]
+        kind = "buttons" if key == "button_ticks" else "weighted pressure plates"
+        lines += number_list(
+            blocks_fn, "blocks", [b for b, _ in pairs],
+            [f"/// The {kind}, by ID, whose `{values_fn}` give {what} (CAL-128)."])
+        lines += number_list(
+            values_fn, "values", [v for _, v in pairs],
+            [f"/// For each of `{blocks_fn}` in their order, {what} (CAL-128)."])
     lines += number_list(
         "flammable_blocks", "blocks", flags["flammable_blocks"],
         ["/// The blocks fire can burn, by ID: those `FireBlock`'s ignite odds are above 0 for."])
