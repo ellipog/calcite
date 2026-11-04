@@ -477,6 +477,12 @@ def block_facts_module(index, flags):
         "precipitation_classes", "classes", [where[c] if c else none for c in flags["precipitation_classes"]],
         ["/// The class whose `handlePrecipitation` each block runs, by its index in `class_names`, in block ID order",
          "/// (D340)."])
+    for fn, method in [("signal_classes", "getSignal"), ("direct_signal_classes", "getDirectSignal"),
+                       ("own_signal_classes", "ownSignal"), ("signal_source_classes", "isSignalSource")]:
+        lines += number_list(
+            fn, "classes", [where[c] if c else none for c in flags[fn]],
+            [f"/// The class whose `{method}` each block runs, by its index in `class_names`, in block ID order",
+             "/// (CAL-116)."])
     lines += number_list(
         "flammable_blocks", "blocks", flags["flammable_blocks"],
         ["/// The blocks fire can burn, by ID: those `FireBlock`'s ignite odds are above 0 for."])

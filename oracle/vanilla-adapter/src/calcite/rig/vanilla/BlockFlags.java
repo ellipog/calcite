@@ -217,6 +217,13 @@ final class BlockFlags {
         StringBuilder tick = new StringBuilder();
         StringBuilder randomTick = new StringBuilder();
         StringBuilder precipitation = new StringBuilder();
+        // The signal a block gives, weak and strong, its own, which `BlockBehaviour.getSignal`
+        // gives, and whether it's a source of one: the class whose `getSignal`, `getDirectSignal`,
+        // `ownSignal` and `isSignalSource` it runs (CAL-116).
+        StringBuilder signal = new StringBuilder();
+        StringBuilder ownSignal = new StringBuilder();
+        StringBuilder directSignal = new StringBuilder();
+        StringBuilder signalSource = new StringBuilder();
         // `FireBlock.canBurn`: the blocks fire's ignite odds are above 0 for; and each block with
         // either of fire's odds above 0, with its ignite odds and its burn odds (D339).
         StringBuilder flammable = new StringBuilder();
@@ -295,6 +302,16 @@ final class BlockFlags {
             tick.append(id == 0 ? "\"" : ", \"").append(tk).append("\"");
             randomTick.append(id == 0 ? "\"" : ", \"").append(rt).append("\"");
             precipitation.append(id == 0 ? "\"" : ", \"").append(hp).append("\"");
+            String gs = declaring(type, "getSignal", BlockState.class, net.minecraft.world.level.BlockGetter.class, BlockPos.class,
+                    Direction.class);
+            String ds = declaring(type, "getDirectSignal", BlockState.class, net.minecraft.world.level.BlockGetter.class,
+                    BlockPos.class, Direction.class);
+            String ss = declaring(type, "isSignalSource", BlockState.class);
+            String os = declaring(type, "ownSignal", BlockState.class, net.minecraft.world.level.BlockGetter.class, BlockPos.class);
+            ownSignal.append(id == 0 ? "\"" : ", \"").append(os).append("\"");
+            signal.append(id == 0 ? "\"" : ", \"").append(gs).append("\"");
+            directSignal.append(id == 0 ? "\"" : ", \"").append(ds).append("\"");
+            signalSource.append(id == 0 ? "\"" : ", \"").append(ss).append("\"");
             Block block = BuiltInRegistries.BLOCK.byId(id);
             int instrument = block.defaultBlockState().instrument().ordinal();
             for (BlockState each : block.getStateDefinition().getPossibleStates()) {
@@ -342,6 +359,10 @@ final class BlockFlags {
         json.append("  \"tick_classes\": [").append(tick).append("],\n");
         json.append("  \"random_tick_classes\": [").append(randomTick).append("],\n");
         json.append("  \"precipitation_classes\": [").append(precipitation).append("],\n");
+        json.append("  \"signal_classes\": [").append(signal).append("],\n");
+        json.append("  \"direct_signal_classes\": [").append(directSignal).append("],\n");
+        json.append("  \"own_signal_classes\": [").append(ownSignal).append("],\n");
+        json.append("  \"signal_source_classes\": [").append(signalSource).append("],\n");
         json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
         json.append("  \"fire_odds\": [").append(fireOdds).append("],\n");
         json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");
