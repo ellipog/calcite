@@ -1,6 +1,7 @@
-"""Writes cases/items/generated.json: item stacks read as vanilla reads them, from a data pack's
-JSON with `ItemStack.CODEC`, and written to NBT, with the vanilla data pack's registries and the
-items' default components bound, as a server has them (CAL-77).
+"""Writes cases/items/generated.json: item stacks read as vanilla reads them with
+`ItemStack.CODEC`, from a data pack's JSON, or from SNBT through `NbtOps`, as a save's are, and
+written to NBT, with the vanilla data pack's registries and the items' default components bound,
+as a server has them (CAL-77, D362, D363).
 
     py -I cases/items/gen.py
 """
@@ -82,6 +83,13 @@ def cases():
         "item_name": "B", "item_model": "w:m", "lore": ["c"], "rarity": "epic", "enchantment_glint_override": False,
         "glider": {}, "minimum_attack_charge": 0.5, "use_effects": {"can_sprint": True}, "tooltip_style": "w:t",
         "enchantments": {"unbreaking": 1}, "intangible_projectile": {}}})
+    # Text that's none of a string, a list and an object, or a list none of whose parts read.
+    add("name-number", {"id": "minecraft:paper", "components": {"custom_name": 5}})
+    add("name-bool", {"id": "minecraft:paper", "components": {"custom_name": True}})
+    add("name-empty-list", {"id": "minecraft:paper", "components": {"custom_name": []}})
+    add("name-list-one-bad", {"id": "minecraft:paper", "components": {"custom_name": ["a", 5]}})
+    add("name-list-all-bad", {"id": "minecraft:paper", "components": {"custom_name": [5, False]}})
+    add("lore-number", {"id": "minecraft:paper", "components": {"lore": [1]}})
     # Every component type, as the packs cases have them, on an item it may be on.
     items = ["minecraft:paper", "minecraft:paper", "minecraft:apple", "minecraft:paper", "minecraft:paper", "minecraft:paper",
              "minecraft:diamond_sword", "minecraft:potion", "minecraft:diamond_pickaxe", "minecraft:paper", "minecraft:paper",
@@ -91,7 +99,179 @@ def cases():
         add(f"components-{i}", {"id": item, "components": components})
     for name, components in packs.BAD_COMPONENTS.items():
         add(f"bad-{name}", {"id": "minecraft:paper", "components": components})
+
+    # The same stacks as NBT, as a save has them, read through `NbtOps` (D363).
+    def nbt(cid, text, to="nbt"):
+        out.append({"id": f"snbt-{cid}", "input": {"from": "snbt", "value": text, "to": to}})
+
+    nbt("plain", '{id:"minecraft:stone"}')
+    nbt("short", '{id:stone,count:64}')
+    nbt("count-byte", '{id:stone,count:5b}')
+    nbt("count-short", '{id:stone,count:7s}')
+    nbt("count-long", '{id:stone,count:3L}')
+    nbt("count-long-wraps", '{id:stone,count:4294967298L}')
+    nbt("count-float", '{id:stone,count:2.9f}')
+    nbt("count-double", '{id:stone,count:3.99d}')
+    nbt("count-negative-float", '{id:stone,count:-0.5f}')
+    nbt("count-huge-float", '{id:stone,count:1.0E10f}')
+    nbt("count-string", '{id:stone,count:"2"}')
+    nbt("count-array", '{id:stone,count:[I;2]}')
+    nbt("count-zero", '{id:stone,count:0b}')
+    nbt("id-number", '{id:5}')
+    nbt("id-list", '{id:[stone]}')
+    nbt("no-id", '{count:2}')
+    nbt("not-compound", '"minecraft:stone"')
+    nbt("list", '[{id:stone}]')
+    nbt("number", '5b')
+    nbt("air", '{id:air}')
+    nbt("unknown", '{id:"w:nope"}')
+    nbt("components-not-compound", '{id:stone,components:[]}')
+    nbt("components-string", '{id:stone,components:"x"}')
+    # Components with NBT's own types.
+    nbt("stack-size-byte", '{id:paper,components:{max_stack_size:10b}}')
+    nbt("stack-size-double", '{id:paper,components:{max_stack_size:10.7d}}')
+    nbt("stack-size-same", '{id:paper,components:{max_stack_size:64b}}')
+    nbt("glint-byte", '{id:paper,components:{enchantment_glint_override:1b}}')
+    nbt("glint-zero", '{id:paper,components:{enchantment_glint_override:0b}}')
+    nbt("glint-half", '{id:paper,components:{enchantment_glint_override:0.5f}}')
+    nbt("glint-int", '{id:paper,components:{enchantment_glint_override:2}}')
+    nbt("glint-string", '{id:paper,components:{enchantment_glint_override:"true"}}')
+    nbt("glint-list", '{id:paper,components:{enchantment_glint_override:[1b]}}')
+    nbt("damage-byte", '{id:diamond_sword,components:{damage:5b}}')
+    nbt("damage-negative", '{id:diamond_sword,components:{damage:-1}}')
+    nbt("removed", '{id:apple,components:{"!food":{},"!minecraft:consumable":{}, "!lore":{}}}')
+    nbt("unknown-component", '{id:paper,components:{"w:x":1}}')
+    nbt("transient", '{id:paper,components:{"minecraft:creative_slot_lock":{}}}')
+    nbt("custom-data", '{id:paper,components:{custom_data:{a:1b,b:[I;1,2],c:[B;],d:[L;5L],e:[],f:{},g:1.5f,'
+                       'h:2.5d,i:"s",j:[1,2],k:3s,l:4L,m:[B;1B,-2B],n:[I;],o:[L;],p:[[1b],[2s]],q:["a",1]}}}')
+    nbt("custom-data-list", '{id:paper,components:{custom_data:[1]}}')
+    nbt("custom-data-string", '{id:paper,components:{custom_data:"{a:1}"}}')
+    nbt("custom-data-bad-string", '{id:paper,components:{custom_data:"{a:"}}')
+    nbt("name-string", '{id:paper,components:{custom_name:"Hi"}}')
+    nbt("name-compound", '{id:paper,components:{custom_name:{text:"Hi",bold:1b,italic:0b,color:"red"}}}')
+    nbt("name-list", '{id:paper,components:{custom_name:["a",{text:"b",underlined:1b}]}}')
+    nbt("name-bold-two", '{id:paper,components:{custom_name:{text:"Hi",bold:2b}}}')
+    nbt("name-bold-string", '{id:paper,components:{custom_name:{text:"Hi",bold:"true"}}}')
+    nbt("name-number", '{id:paper,components:{custom_name:5}}')
+    nbt("name-empty-list", '{id:paper,components:{custom_name:[]}}')
+    nbt("name-list-one-bad", '{id:paper,components:{custom_name:["a",5]}}')
+    nbt("name-list-all-bad", '{id:paper,components:{custom_name:[5,0b]}}')
+    nbt("name-bold-big", '{id:paper,components:{custom_name:{text:"Hi",bold:256}}}')
+    nbt("name-italic-half", '{id:paper,components:{custom_name:{text:"Hi",italic:0.5f}}}')
+    nbt("lore", '{id:paper,components:{lore:["a",{text:"b"},[c,d]]}}')
+    nbt("lore-empty", '{id:paper,components:{lore:[]}}')
+    nbt("lore-empty-array", '{id:paper,components:{lore:[I;]}}')
+    nbt("lore-array", '{id:paper,components:{lore:[I;1]}}')
+    nbt("lore-string", '{id:paper,components:{lore:"a"}}')
+    nbt("profile-name", '{id:player_head,components:{profile:{name:"Steve"}}}')
+    nbt("profile-string", '{id:player_head,components:{profile:"Steve"}}')
+    nbt("profile-id", '{id:player_head,components:{profile:{id:[I;1,2,3,4],name:"Al"}}}')
+    nbt("profile-id-list", '{id:player_head,components:{profile:{id:[1,2,3,4]}}}')
+    nbt("profile-id-bytes", '{id:player_head,components:{profile:{id:[B;1B,2B,3B,4B]}}}')
+    nbt("profile-id-longs", '{id:player_head,components:{profile:{id:[L;1L,2L,3L,4L]}}}')
+    nbt("profile-id-three", '{id:player_head,components:{profile:{id:[I;1,2,3]}}}')
+    nbt("profile-id-five", '{id:player_head,components:{profile:{id:[I;1,2,3,4,5]}}}')
+    nbt("profile-id-empty", '{id:player_head,components:{profile:{id:[I;]}}}')
+    nbt("profile-id-strings", '{id:player_head,components:{profile:{id:["a","b","c","d"]}}}')
+    nbt("profile-id-number", '{id:player_head,components:{profile:{id:5}}}')
+    nbt("profile-properties", '{id:player_head,components:{profile:{name:"Al",properties:[{name:"textures",value:"v",signature:"s"}]}}}')
+    nbt("dyed-color", '{id:leather_helmet,components:{dyed_color:16711680}}')
+    nbt("dyed-color-byte", '{id:leather_helmet,components:{dyed_color:5b}}')
+    nbt("enchantments", '{id:diamond_sword,components:{enchantments:{"minecraft:sharpness":2b,unbreaking:3s}}}')
+    nbt("enchantments-high", '{id:diamond_sword,components:{enchantments:{sharpness:300}}}')
+    nbt("enchantments-list", '{id:diamond_sword,components:{enchantments:[sharpness]}}')
+    nbt("container", '{id:shulker_box,components:{container:[{slot:0b,item:{id:stone,count:3b}},{slot:5,item:{id:dirt}}]}}')
+    nbt("container-bad-item", '{id:shulker_box,components:{container:[{slot:0b,item:{id:5}}]}}')
+    nbt("bundle", '{id:bundle,components:{bundle_contents:[{id:stone,count:32b},{id:ender_pearl,count:8s}]}}')
+    nbt("projectiles", '{id:crossbow,components:{charged_projectiles:[{id:arrow,count:1b}]}}')
+    nbt("attributes", '{id:diamond_sword,components:{attribute_modifiers:[{type:"attack_damage",id:"w:a",amount:1.5d,'
+                      'operation:"add_value",slot:"mainhand"},{type:"armor",id:"w:b",amount:2,operation:"add_value"}]}}')
+    nbt("food", '{id:apple,components:{food:{nutrition:4,saturation:2.4f}}}')
+    nbt("food-same-double", '{id:apple,components:{food:{nutrition:4b,saturation:2.4d}}}')
+    nbt("food-other", '{id:apple,components:{food:{nutrition:5b,saturation:2.4f,can_always_eat:1b}}}')
+    nbt("custom-model-data", '{id:paper,components:{custom_model_data:{floats:[1.0f,2.5d,3],flags:[1b,0b,5],strings:["a"],colors:[I;1,2]}}}')
+    nbt("firework", '{id:firework_star,components:{firework_explosion:{shape:"star",colors:[I;1,2],fade_colors:[3],has_trail:1b}}}')
+    nbt("lodestone", '{id:compass,components:{lodestone_tracker:{target:{dimension:"minecraft:overworld",pos:[I;1,2,3]},tracked:0b}}}')
+    nbt("lodestone-pos-list", '{id:compass,components:{lodestone_tracker:{target:{dimension:"minecraft:overworld",pos:[1,2,3]}}}}')
+    nbt("lodestone-pos-short", '{id:compass,components:{lodestone_tracker:{target:{dimension:"minecraft:overworld",pos:[I;1,2]}}}}')
+    nbt("debug-stick", '{id:debug_stick,components:{debug_stick_state:{"minecraft:oak_log":"axis"}}}')
+    nbt("debug-stick-bad", '{id:debug_stick,components:{debug_stick_state:{"minecraft:oak_log":"nope"}}}')
+    nbt("map-id", '{id:filled_map,components:{map_id:5b}}')
+    nbt("map-color", '{id:filled_map,components:{map_color:16711680L}}')
+    nbt("book", '{id:written_book,components:{written_book_content:{title:"T",author:"A",generation:1b,pages:["a",{raw:"b"},'
+                '{raw:{text:"c",bold:1b}},{raw:"d",filtered:"e"}],resolved:1b}}}')
+    nbt("book-title-filtered", '{id:written_book,components:{written_book_content:{title:{raw:"T",filtered:"U"},author:"A"}}}')
+    nbt("writable-book", '{id:writable_book,components:{writable_book_content:{pages:["a",{raw:"b"}]}}}')
+    nbt("entity-data", '{id:pig_spawn_egg,components:{entity_data:{id:"minecraft:pig",Health:5.0f}}}')
+    nbt("entity-data-no-id", '{id:pig_spawn_egg,components:{entity_data:{Health:5.0f,Tags:[a]}}}')
+    nbt("entity-data-id-number", '{id:pig_spawn_egg,components:{entity_data:{id:5}}}')
+    nbt("block-entity-data", '{id:chest,components:{block_entity_data:{id:"minecraft:chest",Items:[],Lock:{}}}}')
+    nbt("bees", '{id:bee_nest,components:{bees:[{entity_data:{id:"minecraft:bee"},ticks_in_hive:5s,min_ticks_in_hive:6b}]}}')
+    nbt("block-state", '{id:oak_log,components:{block_state:{axis:"x"}}}')
+    nbt("block-state-number", '{id:oak_log,components:{block_state:{axis:1}}}')
+    nbt("unbreakable", '{id:diamond_sword,components:{unbreakable:{}}}')
+    nbt("unbreakable-list", '{id:diamond_sword,components:{unbreakable:[]}}')
+    nbt("tooltip-display", '{id:paper,components:{tooltip_display:{hide_tooltip:1b,hidden_components:[damage,"minecraft:lore",damage]}}}')
+    nbt("can-break", '{id:diamond_pickaxe,components:{can_break:{blocks:"minecraft:stone"}}}')
+    nbt("can-break-list", '{id:diamond_pickaxe,components:{can_break:[{blocks:["stone","#minecraft:logs"]}]}}')
+    nbt("potion", '{id:potion,components:{potion_contents:{potion:"minecraft:swiftness",custom_color:5b,'
+                  'custom_effects:[{id:"minecraft:speed",amplifier:1b,duration:200s,show_icon:0b}]}}}')
+    nbt("suspicious-stew", '{id:suspicious_stew,components:{suspicious_stew_effects:[{id:"minecraft:speed",duration:5L}]}}')
+    nbt("rarity-number", '{id:paper,components:{rarity:1}}')
+    nbt("instrument", '{id:goat_horn,components:{instrument:"minecraft:ponder_goat_horn"}}')
+    nbt("trim", '{id:diamond_chestplate,components:{trim:{material:"minecraft:gold",pattern:"minecraft:coast"}}}')
+    nbt("banner", '{id:white_banner,components:{banner_patterns:[{pattern:"minecraft:stripe_top",color:"red"}],base_color:"blue"}}')
+    nbt("pot", '{id:decorated_pot,components:{pot_decorations:[brick,"minecraft:angler_pottery_sherd"]}}')
+    nbt("sign", '{id:oak_sign,components:{block_entity_data:{id:"minecraft:sign",front_text:{messages:["a","b","c","d"]}}}}')
+    nbt("note-block-sound", '{id:player_head,components:{note_block_sound:"minecraft:block.note_block.harp"}}')
+    nbt("consumable", '{id:paper,components:{consumable:{consume_seconds:2,animation:"eat",has_consume_particles:0b,'
+                      'on_consume_effects:[{type:"minecraft:teleport_randomly",diameter:8.5d}]}}}')
+    nbt("tool", '{id:paper,components:{tool:{rules:[{blocks:"#minecraft:logs",speed:4,correct_for_drops:1b}],default_mining_speed:2b,damage_per_block:3L}}}')
+    nbt("equippable", '{id:paper,components:{equippable:{slot:"head",dispensable:0b,swappable:1b,damage_on_hurt:1b,equip_on_interact:0b}}}')
+    nbt("weapon", '{id:paper,components:{weapon:{item_damage_per_attack:2b,disable_blocking_for_seconds:1.5d}}}')
+    nbt("ominous", '{id:ominous_bottle,components:{ominous_bottle_amplifier:3b}}')
+    nbt("ominous-high", '{id:ominous_bottle,components:{ominous_bottle_amplifier:5}}')
+    nbt("item-name", '{id:paper,components:{item_name:{translate:"item.minecraft.paper"},item_model:"minecraft:paper"}}')
+    nbt("repair-cost", '{id:paper,components:{repair_cost:0b,max_damage:5s,damage:0L}}')
+    nbt("many", '{id:paper,count:3b,components:{max_stack_size:16b,lore:["c"],custom_name:"A",rarity:"epic",'
+                'enchantment_glint_override:0b,repair_cost:3,enchantments:{unbreaking:1b},glider:{},tooltip_style:"w:t",'
+                'custom_data:{x:1b}}}')
+    # Every component type and broken patch the `packs` cases have, written as SNBT. Vanilla
+    # caches what it encodes most components to, and writes a value equal to one it wrote before
+    # as that one was, so a profile, whose properties are equal in any order, is given a name of
+    # its own here, or it would come out in the order the JSON case's did (D363).
+    for i, components in enumerate(packs.ITEM_COMPONENTS):
+        item = items[i] if i < len(items) else "minecraft:paper"
+        if "profile" in components and isinstance(components["profile"], dict):
+            components = dict(components, profile=dict(components["profile"], name="Snbt"))
+        nbt(f"components-{i}", snbt({"id": item, "components": components}))
+    for name, components in packs.BAD_COMPONENTS.items():
+        nbt(f"bad-{name}", snbt({"id": "minecraft:paper", "components": components}))
     return out
+
+
+def snbt(value):
+    """`value`, JSON, as SNBT: a boolean as a byte, a whole number as an int, or a long past an
+    int, another number as a double, and every key quoted."""
+    if value is True:
+        return "1b"
+    if value is False:
+        return "0b"
+    if isinstance(value, int):
+        return str(value) if -2**31 <= value < 2**31 else f"{value}L"
+    if isinstance(value, float):
+        return f"{value!r}d"
+    if isinstance(value, str):
+        return quote(value)
+    if isinstance(value, list):
+        return "[" + ",".join(snbt(v) for v in value) + "]"
+    if isinstance(value, dict):
+        return "{" + ",".join(f"{quote(k)}:{snbt(v)}" for k, v in value.items()) + "}"
+    raise TypeError(f"no SNBT for {value!r}")
+
+
+def quote(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def main():
