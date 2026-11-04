@@ -1,166 +1,142 @@
 'use client';
 
-// The hero: a world of blocks flown over. Its chunks are generated around the camera, nearest
-// first, at the rate Calcite generates them (the fastest recorded worldgen run), so the view fills
-// in a fraction of a second and new chunks keep loading at its edge as the flight goes on. The
-// pointer turns the camera; left alone, it drifts. Under it, for visitors who don't scroll, a block
-// is mined.
+// The hero: a world of blocks flown over (src/lib/brand/hero.ts). It draws in a worker, on a
+// canvas the page hands over, so the flight never holds up scrolling or input; where a worker
+// can't draw, it draws on the page. Under it, for visitors who don't scroll, a block is mined.
 
 import { useEffect, useRef, useState } from 'react';
 import { ordered } from '@/lib/dither/bayer';
-import { surface, type Surface } from '@/lib/dither/canvas';
+import { surface } from '@/lib/dither/canvas';
 import { PAPER, rgb } from '@/lib/dither/math';
-import { still, useFrames } from '@/lib/dither/motion';
-import { B, CHUNK, forget, frame, generate, groundAt, hash, isLoaded, reseed, SEA } from '@/lib/brand/blocks';
+import { still } from '@/lib/dither/motion';
+import { hash } from '@/lib/brand/blocks';
+import { Hero } from '@/lib/brand/hero';
 import { cn } from '@/lib/cn';
 
-/** The view distance, in chunks, and the seconds a touch screen's flight goes on after the last touch. */
-const VIEW = 14, REST = 30;
-// The chunks in view around the camera's, nearest first, a little shuffled within each ring as a
-// server's generation threads finish them.
-const ORDER = (() => {
-	const o: [number, number, number][] = [];
-	for (let z = -VIEW; z <= VIEW; z++) for (let x = -VIEW; x <= VIEW; x++) if (x * x + z * z <= VIEW * VIEW) o.push([x, z, Math.hypot(x, z) + hash(x + 500, z) * 1.2]);
-	return o.sort((a, b) => a[2] - b[2]);
-})();
+const LABEL = 'A world of blocks flown over, its chunks generated as fast as Calcite generates them';
 
-// Somewhere to start: land, a little above the sea, with the ground rising somewhere ahead.
-function start() {
-	for (let i = 0; i < 400; i++) {
-		const x = 1000 + i * 97, y = 3000 - i * 61, g = groundAt(x, y);
-		if (g > SEA + 4 && g < SEA + 16 && groundAt(x, y - 260) < SEA + 24) return { x, y };
-	}
-	return { x: 1000, y: 3000 };
-}
+type Message = { type: 'size'; w: number; h: number; dpr: number } | { type: 'point'; p: [number, number] | null } | { type: 'wake' } | { type: 'show'; on: boolean };
 
 export function Flyover({ className, cue = false, cps = 2000 }: { className?: string; cue?: boolean; cps?: number }) {
-	const fly = useRef<HTMLDivElement>(null), cv = useRef<HTMLCanvasElement>(null), count = useRef<HTMLSpanElement>(null);
-	const st = useRef({
-		S: null as Surface | null, last: -1, full: NaN, budget: 0, shown: -1, aim: null as [number, number] | null, look: { yaw: 0, hor: 0 }, cam: null as { x: number; y: number } | null, h: 0, heading: 0,
-		// pacing: still draws one frame; touch screens rest a while after the last touch; frames are spaced by what they cost
-		still: false, touch: false, drawn: false, next: 0, rest: Infinity, wake: true, cost: 0,
-	});
+	const fly = useRef<HTMLDivElement>(null), count = useRef<HTMLSpanElement>(null);
 
-	const draw = (t: number) => {
-		const s = st.current, S = s.S;
-		if (!S) return;
-		if (s.still) {
-			if (s.drawn) return;
-		} else if (s.last >= 0) {
-			if (s.wake) {
-				s.wake = false;
-				s.rest = t + REST;
-			}
-			if (t < s.next || (s.touch && t > s.rest)) return;
-		}
-		const w0 = performance.now();
-		if (!s.cam) {
-			// a new world on every visit, and a spawn found in it
-			reseed(Math.floor(Math.random() * 1e9));
-			forget();
-			s.cam = start();
-			s.h = (groundAt(s.cam.x, s.cam.y) + 24) * B;
-		}
-		const dt = s.last < 0 ? 0 : Math.min(0.05, Math.max(0, t - s.last));
-		s.last = t;
-		const { cols, rows } = S, cam = s.cam;
-		// the pointer turns the camera and tips it a little; without one it looks ahead
-		const ay = s.aim ? (s.aim[0] - 0.5) * 0.9 : 0, ah = s.aim ? (s.aim[1] - 0.5) * 0.12 : 0;
-		s.look.yaw += (ay - s.look.yaw) * 0.06;
-		s.look.hor += (ah - s.look.hor) * 0.06;
-		s.heading = Math.sin(t * 0.045) * 0.5;
-		const fx = Math.sin(s.heading), fy = -Math.cos(s.heading);
-		cam.x += fx * 16 * dt;
-		cam.y += fy * 16 * dt;
-		// fly over whatever is coming up, not into it
-		let ahead = 0;
-		for (const d of [0, 40, 80, 120]) ahead = Math.max(ahead, groundAt(cam.x + fx * d, cam.y + fy * d));
-		s.h += ((ahead + 24) * B - s.h) * Math.min(1, dt * 0.8);
-		// generate the nearest chunks missing, as many as Calcite would in the time since the last frame
-		// (none to look for while the camera stays in a chunk whose view is already whole)
-		const ccx = Math.floor(cam.x / CHUNK), ccz = Math.floor(cam.y / CHUNK), here = ccx * 65536 + ccz;
-		let n = ORDER.length;
-		if (s.full !== here) {
-			const t0 = performance.now();
-			// (a still frame generates the whole view, however long it takes)
-			s.budget = s.still ? ORDER.length : Math.min(s.budget + cps * (dt || 1 / 60), ORDER.length);
-			n = 0;
-			for (const [x, z] of ORDER) {
-				if (isLoaded(ccx + x, ccz + z)) {
-					n++;
-					continue;
-				}
-				if (s.budget < 1 || (!s.still && performance.now() - t0 > 10)) continue;
-				generate(ccx + x, ccz + z);
-				s.budget--;
-				n++;
-			}
-			if (n === ORDER.length) s.full = here;
-		}
-		// the sky dissolves into the page above, and the land into it below
-		frame(S.u32, cols, rows, { x: cam.x, y: cam.y, yaw: s.heading + s.look.yaw }, { height: s.h, horizon: 0.22 + s.look.hor, far: VIEW * CHUNK, sky: 0.22, haze: 0.08, drift: t * 3, fadeTop: 0.32, fadeBottom: 0.2 });
-		S.flush();
-		s.drawn = true;
-		if (n !== s.shown && count.current) {
-			s.shown = n;
-			count.current.textContent = `${n.toLocaleString('en-US')} chunks`;
-		}
-		// 60 frames a second while a frame is cheap, fewer as it costs more, and never more than 30 on a touch screen
-		const ms = performance.now() - w0;
-		s.cost = s.cost ? s.cost * 0.9 + ms * 0.1 : ms;
-		const fps = s.cost > 16 ? 20 : s.cost > 8 || s.touch ? 30 : 60;
-		s.next = t + 1 / fps - 0.004;
-	};
-
-	// a new surface whenever the box changes size, either way
 	useEffect(() => {
-		const el = fly.current;
-		if (!el) return;
-		const s = st.current;
-		// reduced motion, or a reader saving data, gets one still frame
-		s.still = still() || !!(navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData;
-		s.touch = matchMedia('(pointer: coarse)').matches;
-		let w = -1, h = -1, id = 0;
-		const make = () => {
-			const r = el.getBoundingClientRect();
-			if (Math.round(r.width) === w && Math.round(r.height) === h) return;
-			w = Math.round(r.width);
-			h = Math.round(r.height);
-			s.S = surface(cv.current!, 2);
-			s.drawn = false;
-			if (s.still) draw(0);
+		const box = fly.current;
+		if (!box) return;
+		// reduced motion, or a reader saving data, gets one still frame; a touch screen, fewer frames
+		const o = {
+			cps,
+			still: still() || !!(navigator as Navigator & { connection?: { saveData?: boolean } }).connection?.saveData,
+			touch: matchMedia('(pointer: coarse)').matches,
+			seed: Math.floor(Math.random() * 1e9),
 		};
-		// a touch wakes a resting flight
-		const wake = () => (s.wake = true);
-		el.addEventListener('pointerdown', wake, { passive: true });
+		const shown = (n: number) => {
+			if (count.current) count.current.textContent = `${n.toLocaleString('en-US')} chunks`;
+		};
+		// a canvas of its own each time, since one can be handed to a worker only once
+		const make = () => {
+			const c = document.createElement('canvas');
+			c.className = 'absolute inset-0 size-full cursor-crosshair touch-pan-y';
+			c.setAttribute('role', 'img');
+			c.setAttribute('aria-label', LABEL);
+			box.prepend(c);
+			return c;
+		};
+		let canvas = make(), send: (m: Message) => void = () => {}, end = () => {}, size: Message | null = null, show: Message | null = null;
+
+		// on the page, where a worker can't draw
+		const local = () => {
+			const hero = new Hero(canvas, { ...o, raf: (f) => requestAnimationFrame(f), caf: (id) => cancelAnimationFrame(id), count: shown });
+			send = (m) => {
+				if (m.type === 'size') hero.resize(m.w, m.h, m.dpr);
+				else if (m.type === 'point') hero.point(m.p);
+				else if (m.type === 'wake') hero.wake();
+				else hero.show(m.on);
+			};
+			end = () => hero.stop();
+		};
+		let worker: Worker | null = null;
+		if (typeof Worker !== 'undefined' && typeof OffscreenCanvas !== 'undefined' && 'transferControlToOffscreen' in canvas) {
+			try {
+				worker = new Worker(new URL('../lib/brand/hero.worker.ts', import.meta.url), { type: 'module' });
+				const off = canvas.transferControlToOffscreen();
+				worker.postMessage({ type: 'init', canvas: off, o }, [off]);
+			} catch {
+				worker?.terminate();
+				worker = null;
+			}
+		}
+		if (worker) {
+			const w = worker;
+			w.onmessage = (e: MessageEvent<{ type: string; n: number }>) => e.data.type === 'count' && shown(e.data.n);
+			// if the worker can't start, draw on the page instead, on a fresh canvas
+			w.onerror = () => {
+				w.terminate();
+				canvas.remove();
+				canvas = make();
+				local();
+				if (size) send(size);
+				if (show) send(show);
+			};
+			send = (m) => w.postMessage(m);
+			end = () => w.terminate();
+		} else local();
+		const post = (m: Message) => {
+			if (m.type === 'size') size = m;
+			if (m.type === 'show') show = m;
+			send(m);
+		};
+
+		// the canvas's size, at once and then as it changes
+		let id = 0, first = true;
+		const measure = () => {
+			const r = box.getBoundingClientRect();
+			post({ type: 'size', w: r.width, h: r.height, dpr: window.devicePixelRatio || 1 });
+		};
 		const ro = new ResizeObserver(() => {
 			clearTimeout(id);
-			id = window.setTimeout(make, w < 0 ? 0 : 120);
+			if (first) {
+				first = false;
+				measure();
+			} else id = window.setTimeout(measure, 120);
 		});
-		ro.observe(el);
+		ro.observe(box);
+		// on screen and the page shown, or the flight stops
+		let seen = false;
+		const tell = () => post({ type: 'show', on: seen && !document.hidden });
+		const io = new IntersectionObserver(([e]) => {
+			seen = e.isIntersecting;
+			tell();
+		});
+		io.observe(box);
+		document.addEventListener('visibilitychange', tell);
+		// the pointer turns the camera; a touch wakes a resting flight
+		const move = (e: PointerEvent) => {
+			const r = box.getBoundingClientRect();
+			post({ type: 'point', p: [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height] });
+		};
+		const leave = () => post({ type: 'point', p: null });
+		const down = () => post({ type: 'wake' });
+		box.addEventListener('pointermove', move, { passive: true });
+		box.addEventListener('pointerleave', leave);
+		box.addEventListener('pointerdown', down, { passive: true });
 		return () => {
 			ro.disconnect();
+			io.disconnect();
 			clearTimeout(id);
-			el.removeEventListener('pointerdown', wake);
+			document.removeEventListener('visibilitychange', tell);
+			box.removeEventListener('pointermove', move);
+			box.removeEventListener('pointerleave', leave);
+			box.removeEventListener('pointerdown', down);
+			end();
+			canvas.remove();
 		};
-		// draw reads everything through st, so the first one is the only one needed
-		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, []);
-	useFrames(fly, draw);
+	}, [cps]);
 
 	return (
-		<div
-			ref={fly}
-			className={cn('relative min-h-[260px]', className)}
-			onPointerMove={(e) => {
-				const r = cv.current!.getBoundingClientRect();
-				st.current.aim = [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height];
-			}}
-			onPointerLeave={() => (st.current.aim = null)}
-		>
-			<canvas ref={cv} className="absolute inset-0 size-full cursor-crosshair touch-pan-y" aria-label="A world of blocks flown over, its chunks generated as fast as Calcite generates them" />
-			<span className="pointer-events-none absolute top-4 right-(--gutter) rule bg-paper pointer-coarse:hidden motion-reduce:hidden px-2.5 py-2 font-mono text-xs leading-none">move to look around</span>
-			<div className="pointer-events-none absolute bottom-5 left-(--gutter) flex flex-wrap gap-2 font-mono text-xs leading-none max-sm:hidden">
+		<div ref={fly} className={cn('relative min-h-[260px]', className)}>
+			<span className="pointer-events-none absolute top-4 right-(--gutter) z-10 rule bg-paper pointer-coarse:hidden motion-reduce:hidden px-2.5 py-2 font-mono text-xs leading-none">move to look around</span>
+			<div className="pointer-events-none absolute bottom-5 left-(--gutter) z-10 flex flex-wrap gap-2 font-mono text-xs leading-none max-sm:hidden">
 				<span ref={count} className="rule bg-paper px-2.5 py-2 tabular-nums">
 					0 chunks
 				</span>
