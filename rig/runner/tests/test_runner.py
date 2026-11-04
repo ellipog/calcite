@@ -253,6 +253,32 @@ class Sessions(unittest.TestCase):
         self.assertTrue(report.passed)
         self.assertFalse(report.findings)
 
+    def test_sky_under_the_world(self):
+        # A chunk whose sky layer under the world is 2048 bytes of 0 matches one whose layer
+        # there is empty, as vanilla's light makes it either way from run to run (CAL-122); a
+        # layer there that isn't all 0 still differs.
+        def chunk(x, sky, empty, updates):
+            light = {"@": "ClientboundLightUpdatePacketData", "skyYMask": sky, "emptySkyYMask": empty, "skyUpdates": updates}
+            return self.packet("play", "level_chunk_with_light", {"x": x, "z": 0, "lightData": light}, f"c{x}")
+
+        zero, other = sessiondiff.ZERO_LAYER, "2048 bytes, sha256 1111111111111111"
+        vanilla = [
+            {"mark": "step join"},
+            chunk(0, "{0, 1}", "{}", [zero, other]),
+            chunk(1, "{1}", "{0}", [other]),
+            chunk(2, "{0, 1}", "{}", [other, other]),
+            self.packet("play", "chunk_batch_finished", {"batchSize": 3}),
+        ]
+        calcite = [
+            {"mark": "step join"},
+            chunk(0, "{1}", "{0}", [other]),
+            chunk(1, "{0, 1}", "{}", [zero, other]),
+            chunk(2, "{1}", "{0}", [other]),
+            self.packet("play", "chunk_batch_finished", {"batchSize": 3}),
+        ]
+        report, _ = self.compare(vanilla, calcite)
+        self.assertEqual([(f.key, f.what) for f in report.findings], [("session:join/join/level_chunk_with_light", "chunk (2, 0) differs")])
+
     def test_differences_and_masks(self):
         vanilla = [
             {"mark": "step login"},

@@ -22,7 +22,13 @@ line first, since when or in what order they come depends on timing rather than 
 - **What isn't a packet.** The bot's mark that the server closed the connection is lined up
   like a packet, as `<closed>`.
 
-Fields vanilla draws afresh each run (`DRAWN`) are left out of both sides' values.
+Fields vanilla draws afresh each run (`DRAWN`) are left out of both sides' values. And the sky's
+light under the world is read as vanilla's light leaves it either way (CAL-122): the section below
+the world's bottom is all 0, but whether its layer is kept as 2048 bytes of 0, `repeatFirstLayer`
+of the bottom section's, or empty, `new DataLayer()`, is down to whether its chunk's sections were
+set up before a neighbour's set up its own, which goes by which of the chunks being read vanilla's
+workers finish first, and changes from run to run. A chunk sends such a layer as one of 0 in
+`skyYMask`, so each side's is read as empty, in `emptySkyYMask`, as the other would have it.
 
 Each packet that differs is keyed `session:SCENARIO/STEP/KIND`, which a file in
 rig/differences/ can cover. The steps of login and configuration, and the status scenario, are
@@ -55,6 +61,10 @@ SUITES = {"status": "status", "login": "login", "configuration": "configuration"
 # Packets lined up by where they are as well as by kind: a block's event and a sound, which
 # pistons and clocks send over and over (CAL-125).
 PLACED = {"play/block_event", "play/sound"}
+# Packets with a chunk's light, whose sky layer under the world is read as empty where it's all 0
+# (CAL-122), and how SessionDump writes a layer that's all 0.
+LIT = {"play/level_chunk_with_light", "play/light_update"}
+ZERO_LAYER = "2048 bytes, sha256 e5a00aa9991ac8a5"
 
 
 @dataclass
@@ -96,6 +106,8 @@ def load(path):
         value = r.get("value")
         if kind in DRAWN:
             value = without(value, DRAWN[kind])
+        if kind in LIT:
+            value = under_world_empty(value)
         if kind in CLOCK:
             step.clock.setdefault(kind, without_times(value))
             continue
@@ -126,6 +138,33 @@ def without(value, names):
 
 def without_times(value):
     return without(value, CLOCK_TIMES)
+
+
+def mask(text):
+    """The sections a light mask, as SessionDump writes a `BitSet`, `{0, 1, 2}`, holds."""
+    inner = text.strip()[1:-1].strip()
+    return [int(s) for s in inner.split(",")] if inner else []
+
+
+def mask_text(bits):
+    return "{" + ", ".join(str(b) for b in sorted(bits)) + "}"
+
+
+def under_world_empty(value):
+    """The packet's light with its sky layer under the world, section 0, read as empty where it's
+    all 0, as vanilla's light makes it one way or the other from run to run (CAL-122)."""
+    if not isinstance(value, dict):
+        return value
+    light = value.get("lightData")
+    if not isinstance(light, dict) or not isinstance(light.get("skyYMask"), str):
+        return value
+    sky = mask(light["skyYMask"])
+    updates = light.get("skyUpdates")
+    if not sky or sky[0] != 0 or not isinstance(updates, list) or not updates or updates[0] != ZERO_LAYER:
+        return value
+    empty = mask(light.get("emptySkyYMask", "{}"))
+    light = dict(light, skyYMask=mask_text(sky[1:]), emptySkyYMask=mask_text(set(empty) | {0}), skyUpdates=updates[1:])
+    return dict(value, lightData=light)
 
 
 def paths(a, b, at="", out=None, limit=12):
