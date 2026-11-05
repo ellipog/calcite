@@ -1,0 +1,610 @@
+/// An item entity, a stack lying or flying in a level, as vanilla's `ItemEntity` runs it (CAL-148):
+/// made with its random's UUID, spin and motion, then each tick as `ServerLevel.tickNonPassenger`
+/// and `ItemEntity.tick` run it. Water and lava hold it up and slow it, else it falls 0.04 a tick;
+/// fluids push it with their currents (`world.currents`); stuck in a block, it's pushed out the
+/// nearest way; it moves as `Entity.move` moves it, against the blocks' shapes (`world.movement`),
+/// stands on the block below it, slows by the air and that block's friction, and bounces as that
+/// block makes it; a moving item looks to merge every 2 ticks and a still one every 40; and it's
+/// gone after 6000 ticks, or 64 blocks below the level.
+///
+/// What blocks do to an item in or on them, `applyEffectsFromBlocks`, `stepOn` and `fallOn`, as fire
+/// and lava burning it, cactus breaking it, cobwebs and berry bushes holding it, pressure plates
+/// and hoppers, isn't in Calcite yet; nor are portals, nor the fall a long move clips short.
+module world.item_entity
+
+import nbt.tag.{Tag}
+import random.legacy.{LegacyRandom}
+import world.collision.{Aabb, CollisionBlocks}
+import world.currents.{FlowFacts, fluids_at, push}
+import world.movement.{Mover, MovementStates, collide_with, moved, swept}
+import worldgen.facts.{BlockSet, EAST, Facts, NORTH, SOUTH, UP, WEST, step_x, step_y, step_z}
+
+/// How many ticks an item lasts, `LIFETIME`.
+pub const LIFETIME: i32 = 6000
+/// The pickup delay that never counts down, and the age that never counts up.
+pub const INFINITE_PICKUP_DELAY: i32 = 32767
+pub const INFINITE_LIFETIME: i32 = -32768
+
+/// A sound an item played, `Entity.playSound`, `NEUTRAL` where it was: its splash as it came
+/// into water.
+pub struct ItemSound {
+    pub sound: String
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    pub volume: f32
+    pub pitch: f32
+}
+
+/// What an item's tick reads of blocks besides their shapes: the water and bubble column
+/// blocks, the fences, walls and fence gates an item stands on top of, the blocks that don't
+/// bounce, and what fluids flow by.
+pub struct ItemFacts {
+    water: u32
+    bubble_column: u32
+    fences: BlockSet
+    walls: BlockSet
+    no_bounce: BlockSet
+    pub flow: FlowFacts
+}
+
+impl ItemFacts {
+    /// As `f` has them, its tags those its level loaded.
+    pub fn new(f: Facts) -> ItemFacts {
+        let water = f.block_named(String("minecraft:water")) else panic("no water block")
+        let column = f.block_named(String("minecraft:bubble_column")) else panic("no bubble column block")
+        return ItemFacts {
+            water: water,
+            bubble_column: column,
+            fences: f.tag_or_empty(String("minecraft:fences")),
+            walls: f.tag_or_empty(String("minecraft:walls")),
+            no_bounce: f.tag_or_empty(String("minecraft:suppresses_bounce")),
+            flow: FlowFacts.new(f),
+        }
+    }
+}
+
+/// An item entity.
+pub struct ItemEntity {
+    /// Its network ID and UUID, most then least significant bits.
+    pub id: i32
+    pub uuid: (i64, i64)
+    /// The stack, as `ItemStack.CODEC` writes it.
+    pub stack: Tag
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    /// Where it was as its tick began, `xo`, `yo` and `zo`.
+    pub xo: f64 = 0.0
+    pub yo: f64 = 0.0
+    pub zo: f64 = 0.0
+    pub vx: f64 = 0.0
+    pub vy: f64 = 0.0
+    pub vz: f64 = 0.0
+    pub y_rot: f32 = 0.0f32
+    pub x_rot: f32 = 0.0f32
+    /// `bobOffs`, which only the client's renderer reads.
+    pub bob: f32 = 0.0f32
+    pub on_ground: bool = false
+    pub horizontal_collision: bool = false
+    pub vertical_collision: bool = false
+    pub vertical_below: bool = false
+    /// The block it stands on, `mainSupportingBlockPos`, and whether it stood on none when it
+    /// last landed, `onGroundNoBlocks`.
+    pub support: (i32, i32, i32)? = none
+    pub no_blocks: bool = false
+    pub fall: f64 = 0.0
+    pub tick_count: i32 = 0
+    pub age: i32 = 0
+    pub pickup_delay: i32 = 0
+    pub health: i32 = 5
+    /// Who threw it, and whom alone it's for, by UUID.
+    pub thrower: (i64, i64)? = none
+    pub target: (i64, i64)? = none
+    /// Whether it was in water at its last look, `wasTouchingWater`, and how deep it was in water
+    /// and in lava.
+    pub in_water: bool = false
+    pub water: f64 = 0.0
+    pub lava: f64 = 0.0
+    pub first_tick: bool = true
+    pub no_gravity: bool = false
+    pub no_physics: bool = false
+    /// Whether its tracker's to send its motion and place now, `needsSync`, and its place,
+    /// `syncPosition`, as after a bounce.
+    pub needs_sync: bool = false
+    /// Whether its stack was set since its tracker last sent its data, `DATA_ITEM` dirty.
+    pub stack_changed: bool = false
+    pub sync_position: bool = false
+    pub removed: bool = false
+    /// Whether it's due to look for others to merge with this tick.
+    pub merge_due: bool = false
+    random: LegacyRandom
+    // Its motion as its tick began, after its first look at the fluids it's in.
+    old_vx: f64 = 0.0
+    old_vy: f64 = 0.0
+    old_vz: f64 = 0.0
+}
+
+impl ItemEntity {
+    /// An item of `stack` at x, y, z, with its own random seeded `seed`, as `new ItemEntity(level,
+    /// x, y, z, stack)` makes one: its UUID, `bobOffs` and spin drawn, then its motion, up 0.2 and
+    /// up to 0.1 across either way.
+    pub fn new(id: i32, seed: i64, x: f64, y: f64, z: f64, stack: own Tag) -> ItemEntity {
+        var e = ItemEntity.made(id, seed, x, y, z, stack)
+        e.vx = e.random.next_double() * 0.2 - 0.1
+        e.vy = 0.2
+        e.vz = e.random.next_double() * 0.2 - 0.1
+        return e
+    }
+
+    /// An item of `stack` at x, y, z moving vx, vy, vz, as `new ItemEntity(level, x, y, z, stack,
+    /// dx, dy, dz)` makes one.
+    pub fn moving(id: i32, seed: i64, x: f64, y: f64, z: f64, stack: own Tag, vx: f64, vy: f64, vz: f64) -> ItemEntity {
+        var e = ItemEntity.made(id, seed, x, y, z, stack)
+        e.vx = vx
+        e.vy = vy
+        e.vz = vz
+        return e
+    }
+
+    // `Entity`'s fields, its random first, then its UUID, `Mth.createInsecureUUID`; then
+    // `ItemEntity`'s `bobOffs`, then its spin.
+    fn made(id: i32, seed: i64, x: f64, y: f64, z: f64, stack: own Tag) -> ItemEntity {
+        var random = LegacyRandom.new(seed)
+        let most = (random.next_long() & -61441) | 16384
+        let least = (random.next_long() & 4611686018427387903) | i64.MIN
+        let bob = random.next_float() * 3.1415927f32 * 2.0f32
+        let spin = random.next_float() * 360.0f32
+        return ItemEntity { id: id, uuid: (most, least), stack: stack, x: x, y: y, z: z, xo: x, yo: y, zo: z, bob: bob, y_rot: spin, random: random }
+    }
+
+    /// Its box, `EntityDimensions.makeBoundingBox` of 0.25 by 0.25, floats.
+    pub fn bounding_box(self) -> Aabb {
+        let half = f64(0.25f32 / 2.0f32)
+        return Aabb { min_x: self.x - half, min_y: self.y, min_z: self.z - half, max_x: self.x + half, max_y: self.y + f64(0.25f32), max_z: self.z + half }
+    }
+
+    /// Whether its stack is nothing, `ItemStack.isEmpty`.
+    pub fn is_empty(self) -> bool {
+        if self.count() <= 0 {
+            return true
+        }
+        let Tag.Compound(m) = self.stack else return true
+        return match m["id"] {
+            Tag.Str(name) => name == "minecraft:air",
+            _ => true,
+        }
+    }
+
+    /// Whether it's in lava, `isInLava`: not on its first tick.
+    pub fn in_lava(self) -> bool {
+        return not self.first_tick and self.lava > 0.0
+    }
+
+    // What its collisions see of it, `EntityCollisionContext`.
+    fn mover(self) -> Mover {
+        return Mover { y: self.y, fall: self.fall }
+    }
+
+    /// The first part of its tick, up to where it looks for others to merge with, as
+    /// `tickNonPassenger` and `ItemEntity.tick` run it among `blocks`, in a level whose floor is
+    /// `min_y`, where lava's fast if `fast_lava`: `merge_due` says whether it's to look.
+    pub fn tick_moving<B: CollisionBlocks>(mut self, f: Facts, m: MovementStates, t: ItemFacts, blocks: B, min_y: i32, fast_lava: bool, sounds: mut List<ItemSound>) {
+        self.merge_due = false
+        // `commonTick`.
+        self.xo = self.x
+        self.yo = self.y
+        self.zo = self.z
+        self.tick_count += 1
+        if self.is_empty() {
+            self.removed = true
+            return
+        }
+        // `baseTick`: its fluids, then halving the fall in lava, then below the level.
+        _ = self.update_fluids(f, t, blocks, fast_lava, mut sounds)
+        if self.in_lava() {
+            self.fall = self.fall * 0.5
+        }
+        if self.y < f64(min_y - 64) {
+            self.removed = true
+        }
+        self.first_tick = false
+        if self.pickup_delay > 0 and self.pickup_delay != INFINITE_PICKUP_DELAY {
+            self.pickup_delay -= 1
+        }
+        self.xo = self.x
+        self.yo = self.y
+        self.zo = self.z
+        self.old_vx = self.vx
+        self.old_vy = self.vy
+        self.old_vz = self.vz
+        if self.in_water and self.water > f64(0.1f32) {
+            self.fluid_movement(f64(0.99f32))
+        } else if self.in_lava() and self.lava > f64(0.1f32) {
+            self.fluid_movement(f64(0.95f32))
+        } else if not self.no_gravity {
+            self.vy = self.vy + -0.04
+        }
+        // Stuck in a block, pushed out the nearest way.
+        let b = self.bounding_box()
+        self.no_physics = not m.colliders(f, blocks, b.deflate(1.0e-7), self.mover()).is_empty()
+        if self.no_physics {
+            let (x, z) = (self.x, self.z)
+            self.closest_space(f, blocks, x, (b.min_y + b.max_y) / 2.0, z)
+        }
+        if self.on_ground and not (self.vx * self.vx + self.vz * self.vz > f64(1.0e-5f32)) and (self.tick_count + self.id) % 4 != 0 {
+            // `applyEffectsFromBlocksForLastMovements`, what blocks do to it, isn't in Calcite.
+        } else {
+            let (vx, vy, vz) = (self.vx, self.vy, self.vz)
+            self.move_by(f, m, t, blocks, vx, vy, vz)
+            let air = 0.98f32
+            var ground = air
+            if self.on_ground {
+                let (bx, by, bz) = self.on_pos(f, t, blocks, 0.999999f32)
+                ground = ground * m.friction(f.block(blocks.collision_state(bx, by, bz) ?? 0))
+            }
+            self.vx = self.vx * f64(ground)
+            self.vy = self.vy * f64(air)
+            self.vz = self.vz * f64(ground)
+            if self.on_ground and self.vy < 0.0 {
+                self.vx = self.vx * 1.0
+                self.vy = self.vy * -0.5
+                self.vz = self.vz * 1.0
+            }
+        }
+        let went = self.xo.floor() != self.x.floor() or self.yo.floor() != self.y.floor() or self.zo.floor() != self.z.floor()
+        let rate = if went { 2 } else { 40 }
+        self.merge_due = self.tick_count % rate == 0
+    }
+
+    /// The rest of its tick, after it's looked to merge: its age, its fluids again, whether its
+    /// motion changed enough to send, and its going at 6000 ticks.
+    pub fn tick_after<B: CollisionBlocks>(mut self, f: Facts, t: ItemFacts, blocks: B, fast_lava: bool, sounds: mut List<ItemSound>) {
+        if self.age != INFINITE_LIFETIME {
+            self.age += 1
+        }
+        let any = self.update_fluids(f, t, blocks, fast_lava, mut sounds)
+        self.needs_sync = self.needs_sync or any
+        let dx = self.vx - self.old_vx
+        let dy = self.vy - self.old_vy
+        let dz = self.vz - self.old_vz
+        if dx * dx + dy * dy + dz * dz > 0.01 {
+            self.needs_sync = true
+        }
+        if self.age >= LIFETIME {
+            self.removed = true
+        }
+    }
+
+    /// Whether it can merge with another, `isMergable`: alive, with a pickup delay and age that
+    /// count, younger than 6000 ticks, and less than `max` of it, its stack's most.
+    pub fn mergable(self, max: i32) -> bool {
+        return not self.removed and self.pickup_delay != INFINITE_PICKUP_DELAY and self.age != INFINITE_LIFETIME and self.age < LIFETIME and self.count() < max
+    }
+
+    /// How many of its item it has, 1 where its stack writes no count, as `count_of` reads it.
+    pub fn count(self) -> i32 {
+        let Tag.Compound(m) = self.stack else return 0
+        if not m.contains("count") {
+            return 1
+        }
+        return match m["count"] {
+            Tag.Int(n) => n,
+            _ => 1,
+        }
+    }
+
+    // `setFluidMovement`: slowed across by `by`, and held up a little while it isn't rising fast.
+    fn fluid_movement(mut self, by: f64) {
+        let up = if self.vy < f64(0.06f32) { f64(5.0e-4f32) } else { f64(0.0f32) }
+        self.vx = self.vx * by
+        self.vy = self.vy + up
+        self.vz = self.vz * by
+    }
+
+    // `Entity.updateFluidInteraction`: the fluids it's in, its fall forgotten in water, a splash
+    // as it comes into it, then the currents' pushes; whether it's in any fluid.
+    fn update_fluids<B: CollisionBlocks>(mut self, f: Facts, t: ItemFacts, blocks: B, fast_lava: bool, sounds: mut List<ItemSound>) -> bool {
+        let r = fluids_at(f, t.flow, blocks, self.bounding_box(), false)
+        self.water = r.water
+        self.lava = r.lava
+        let wet = r.water > 0.0
+        if wet {
+            self.fall = 0.0
+            if not self.in_water and not self.first_tick {
+                self.splash(mut sounds)
+            }
+        }
+        self.in_water = wet
+        if wet {
+            let (x, y, z) = push(r.water_current, 0.014, false, self.vx, self.vy, self.vz)
+            self.vx = x
+            self.vy = y
+            self.vz = z
+        }
+        if r.lava > 0.0 {
+            let scale = if fast_lava { 0.007 } else { 0.0023333333333333335 }
+            let (x, y, z) = push(r.lava_current, scale, false, self.vx, self.vy, self.vz)
+            self.vx = x
+            self.vy = y
+            self.vz = z
+        }
+        return r.any
+    }
+
+    // `doWaterSplashEffect`: the splash's sound, as loud as it's moving, and its random's draws
+    // for the bubbles and splashes, which a server sends nothing of.
+    fn splash(mut self, sounds: mut List<ItemSound>) {
+        let fast = (self.vx * self.vx * f64(0.2f32) + self.vy * self.vy + self.vz * self.vz * f64(0.2f32)).sqrt()
+        let loud = f32.nearest(fast) * 0.2f32
+        let volume = if loud < 1.0f32 { loud } else { 1.0f32 }
+        let a = self.random.next_float()
+        let b = self.random.next_float()
+        let pitch = 1.0f32 + (a - b) * 0.4f32
+        sounds.push(ItemSound { sound: String("minecraft:entity.generic.splash"), x: self.x, y: self.y, z: self.z, volume: volume, pitch: pitch })
+        // `1.0F + width * 20.0F` of each, 6 for an item: three draws a bubble, two a splash.
+        for _ in 0..18 {
+            _ = self.random.next_double()
+        }
+        for _ in 0..12 {
+            _ = self.random.next_double()
+        }
+    }
+
+    // `moveTowardsClosestSpace`: pushed out of the block at x, y, z toward its nearest side
+    // that isn't a whole block, north, south, west, east or up, up if they all are, at 0.1 to 0.3.
+    fn closest_space<B: CollisionBlocks>(mut self, f: Facts, blocks: B, x: f64, y: f64, z: f64) {
+        let px = i32.saturate(x.floor())
+        let py = i32.saturate(y.floor())
+        let pz = i32.saturate(z.floor())
+        let dx = x - f64(px)
+        let dy = y - f64(py)
+        let dz = z - f64(pz)
+        var best = UP
+        var closest = f64.MAX
+        let sides: List<i32> = [NORTH, SOUTH, WEST, EAST, UP]
+        for d in sides {
+            let state = blocks.collision_state(px + step_x(d), py + step_y(d), pz + step_z(d)) ?? 0
+            if f.collision_full_block(state) {
+                continue
+            }
+            let along = if d == WEST or d == EAST { dx } else if d == UP { dy } else { dz }
+            let toward = if d == SOUTH or d == EAST or d == UP { 1.0 - along } else { along }
+            if toward < closest {
+                closest = toward
+                best = d
+            }
+        }
+        let speed = self.random.next_float() * 0.2f32 + 0.1f32
+        let step = if best == SOUTH or best == EAST or best == UP { 1.0f32 } else { -1.0f32 }
+        let sx = self.vx * 0.75
+        let sy = self.vy * 0.75
+        let sz = self.vz * 0.75
+        let out = f64(step * speed)
+        if best == WEST or best == EAST {
+            self.vx = out
+            self.vy = sy
+            self.vz = sz
+        } else if best == UP {
+            self.vx = sx
+            self.vy = out
+            self.vz = sz
+        } else {
+            self.vx = sx
+            self.vy = sy
+            self.vz = out
+        }
+    }
+
+    // `Entity.move` by dx, dy, dz, for itself: through blocks with no physics, else as far as
+    // their shapes let it, then whether it hit anything and stands on a block, its fall, its
+    // bounce off what it hit, and the speed factor of the block it's in or on.
+    fn move_by<B: CollisionBlocks>(mut self, f: Facts, m: MovementStates, t: ItemFacts, blocks: B, dx: f64, dy: f64, dz: f64) {
+        if self.no_physics {
+            self.x = self.x + dx
+            self.y = self.y + dy
+            self.z = self.z + dz
+            self.horizontal_collision = false
+            self.vertical_collision = false
+            self.vertical_below = false
+            return
+        }
+        var mx = dx
+        var my = dy
+        var mz = dz
+        let asked = dx * dx + dy * dy + dz * dz
+        if asked != 0.0 {
+            let b = self.bounding_box()
+            let c = m.colliders(f, blocks, swept(b, dx, dy, dz), self.mover())
+            let (cx, cy, cz) = collide_with(c, b, dx, dy, dz)
+            mx = cx
+            my = cy
+            mz = cz
+        }
+        let length = mx * mx + my * my + mz * mz
+        if length > 1.0e-7 or asked - length < 1.0e-7 {
+            self.x = self.x + mx
+            self.y = self.y + my
+            self.z = self.z + mz
+        }
+        let x_hit = not equal(dx, mx)
+        let z_hit = not equal(dz, mz)
+        self.horizontal_collision = x_hit or z_hit
+        let vertically = dy.abs() > 0.0
+        // An item's own side, the server's, has the say, `isLocalInstanceAuthoritative`.
+        self.vertical_collision = dy != my
+        self.vertical_below = self.vertical_collision and dy < 0.0
+        let below = self.vertical_below
+        self.set_on_ground(f, m, blocks, below, mx, mz)
+        let (ex, ey, ez) = self.on_pos(f, t, blocks, 0.2f32)
+        let effect = blocks.collision_state(ex, ey, ez) ?? 0
+        // `checkFallDamage`; a block's `fallOn` isn't in Calcite.
+        if not self.in_water and my < 0.0 {
+            self.fall = self.fall - f64(f32.nearest(my))
+        }
+        if self.on_ground {
+            self.fall = 0.0
+        }
+        if self.removed {
+            return
+        }
+        if (vertically and self.vertical_collision) or self.horizontal_collision {
+            self.restitute(f, m, t, effect, x_hit, z_hit, my)
+        }
+        let speed = f64(self.speed_factor(f, m, t, blocks))
+        self.vx = self.vx * speed
+        self.vy = self.vy * 1.0
+        self.vz = self.vz * speed
+    }
+
+    // `setOnGroundWithMovement`, `checkSupportingBlock`: on the ground if it hit something going
+    // down, and then standing on the nearest block just below its box's bottom, or below where it
+    // came across from if there's none and it had one.
+    fn set_on_ground<B: CollisionBlocks>(mut self, f: Facts, m: MovementStates, blocks: B, ground: bool, mx: f64, mz: f64) {
+        self.on_ground = ground
+        if not ground {
+            self.no_blocks = false
+            self.support = none
+            return
+        }
+        let b = self.bounding_box()
+        let test = Aabb { min_x: b.min_x, min_y: b.min_y - 1.0e-6, min_z: b.min_z, max_x: b.max_x, max_y: b.min_y, max_z: b.max_z }
+        var found = self.supporting(f, m, blocks, test)
+        if found != none or self.no_blocks {
+            self.support = found
+        } else {
+            found = self.supporting(f, m, blocks, moved(test, -mx, 0.0, -mz))
+            self.support = found
+        }
+        self.no_blocks = found == none
+    }
+
+    // `findSupportingBlock`: of the blocks whose shapes meet `test`, the one whose middle is
+    // nearest, the greatest by y, z and x of those as near.
+    fn supporting<B: CollisionBlocks>(self, f: Facts, m: MovementStates, blocks: B, test: Aabb) -> (i32, i32, i32)? {
+        let c = m.colliders(f, blocks, test, self.mover())
+        var best: (i32, i32, i32)? = none
+        var nearest = f64.MAX
+        for (x, y, z) in c.at {
+            let dx = f64(x) + 0.5 - self.x
+            let dy = f64(y) + 0.5 - self.y
+            let dz = f64(z) + 0.5 - self.z
+            let d = dx * dx + dy * dy + dz * dz
+            var take = d < nearest
+            if not take and d == nearest {
+                take = match best {
+                    some(b) => before(b, (x, y, z)),
+                    none => true,
+                }
+            }
+            if take {
+                best = some((x, y, z))
+                nearest = d
+            }
+        }
+        return best
+    }
+
+    // `getOnPos`: the block it stands on, at `offset` below its feet unless that's a fence's,
+    // wall's or fence gate's top it stands on; or the block that far below it where it stands on
+    // none.
+    fn on_pos<B: CollisionBlocks>(self, f: Facts, t: ItemFacts, blocks: B, offset: f32) -> (i32, i32, i32) {
+        let below = i32.saturate((self.y - f64(offset)).floor())
+        if let s = self.support {
+            let (sx, sy, sz) = s
+            if not (offset > 1.0e-5f32) {
+                return (sx, sy, sz)
+            }
+            let state = blocks.collision_state(sx, sy, sz) ?? 0
+            let fence = f.in_set(state, t.fences)
+            let wall = f.in_set(state, t.walls)
+            let gate = f.is_a(f.block(state), String("FenceGateBlock"))
+            if (not (f64(offset) <= 0.5) or not fence) and not wall and not gate {
+                return (sx, below, sz)
+            }
+            return (sx, sy, sz)
+        }
+        return (i32.saturate(self.x.floor()), below, i32.saturate(self.z.floor()))
+    }
+
+    // `restituteMovementAfterCollisions`: an item doesn't bounce off a wall, its motion across
+    // into it gone; and coming down onto a block, it bounces as high as the block's bounce, 0.8
+    // of it for what isn't alive, unless it was hardly falling or the block doesn't bounce.
+    fn restitute(mut self, f: Facts, m: MovementStates, t: ItemFacts, effect: u32, x_hit: bool, z_hit: bool, my: f64) {
+        var restitution = 0.0
+        let cx = self.vx
+        let cy = self.vy
+        let cz = self.vz
+        var bx = cx
+        var by = cy
+        var bz = cz
+        if x_hit {
+            bx = -cx * restitution
+        }
+        if z_hit {
+            bz = -cz * restitution
+        }
+        var bounced = restitution > 0.0 and (x_hit or z_hit)
+        if self.vertical_collision {
+            let gravity = if self.no_gravity { 0.0 } else { 0.04 }
+            if self.vertical_below {
+                let block = f.block(effect)
+                if not (-cy <= gravity) and not f.in_set(effect, t.no_bounce) {
+                    let bounce = f64(m.bounce(block) * 0.8f32)
+                    restitution = if restitution > bounce { restitution } else { bounce }
+                } else {
+                    restitution = 0.0
+                }
+            }
+            var compensation = 0.0
+            var drag = 1.0
+            if restitution > 0.0 {
+                let portion = my / cy
+                compensation = portion * gravity
+                drag = 1.0 + portion * (f64(0.98f32) - 1.0)
+                bounced = true
+            }
+            by = (compensation - cy) * drag * restitution
+        }
+        if bounced {
+            // `bounceOn` and the `BOUNCE` game event aren't in Calcite; its place is sent.
+            self.sync_position = true
+        }
+        self.vx = bx
+        self.vy = by
+        self.vz = bz
+    }
+
+    // `getBlockSpeedFactor`: the block it's in's, unless that's 1 and it isn't water or a bubble
+    // column, then the block under it's.
+    fn speed_factor<B: CollisionBlocks>(self, f: Facts, m: MovementStates, t: ItemFacts, blocks: B) -> f32 {
+        let here = f.block(blocks.collision_state(i32.saturate(self.x.floor()), i32.saturate(self.y.floor()), i32.saturate(self.z.floor())) ?? 0)
+        let speed = m.speed_factor(here)
+        if here == t.water or here == t.bubble_column {
+            return speed
+        }
+        if f64(speed) == 1.0 {
+            let (bx, by, bz) = self.on_pos(f, t, blocks, 0.999999f32)
+            return m.speed_factor(f.block(blocks.collision_state(bx, by, bz) ?? 0))
+        }
+        return speed
+    }
+}
+
+// `Mth.equal`: closer than 1.0E-5F.
+fn equal(a: f64, b: f64) -> bool {
+    return (b - a).abs() < f64(1.0e-5f32)
+}
+
+// `BlockPos.compareTo(b) < 0`: `a` comes before `b` by y, then z, then x.
+fn before(a: (i32, i32, i32), b: (i32, i32, i32)) -> bool {
+    let (ax, ay, az) = a
+    let (bx, by, bz) = b
+    if ay != by {
+        return ay < by
+    }
+    if az != bz {
+        return az < bz
+    }
+    return ax < bx
+}
