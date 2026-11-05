@@ -1,0 +1,1211 @@
+/// Vanilla's loot (CAL-153): a loot table rolled as `LootTable.getRandomItems` rolls it, with the
+/// parameters `LootParams` gives it, each draw from the random it's given, in vanilla's order.
+/// The tables, predicates, item modifiers and number providers are the reloadable registries'
+/// entries, as `registry.loot_tables`' codecs read them, each read again from its NBT as it's
+/// used, so nothing's made of them as the server starts.
+///
+/// What block tables use is here: the entries `item`, `empty`, `loot_table`, `dynamic`, `tag`,
+/// `alternatives`, `sequence` and `group`; the conditions `survives_explosion`, `match_block`,
+/// `match_tool`, `table_bonus`, `random_chance`, `location_check` of a block, `entity_properties`
+/// asking only that there's an entity, `inverted`, `any_of` and `all_of`, and named predicates;
+/// the modifiers `set_count`, `explosion_decay`, `apply_bonus`, `limit_count`, `copy_state`,
+/// `copy_components` from a block entity or the tool, and `sequence`, and named ones; and the
+/// numbers `constant`, `uniform` and `binomial`, and named ones. Whatever else a table uses is
+/// said to be missing, and the roll goes on as if it weren't there.
+module world.loot
+
+import nbt.tag.{Accounter, Tag, read_any}
+import random.source.{RandomSource}
+import registry.components.{ItemCodecs}
+import registry.registries.{Registries}
+import resources.identifier.{Identifier}
+import world.block_level.{BlockLevel}
+import worldgen.access.{BlockAccess}
+import worldgen.facts.{Facts}
+
+// The registries loot reads, by their places in `Loot.places`.
+const TABLES: usize = 0
+const PREDICATES: usize = 1
+const MODIFIERS: usize = 2
+const INTS: usize = 3
+const FLOATS: usize = 4
+
+/// The world's loot tables, predicates, item modifiers and number providers, by name, with the
+/// item codecs its stacks are made with. Nothing changes it, so the levels share one.
+pub struct Loot {
+    registries: Shared<Registries>
+    pub items: ItemCodecs
+    // Each registry's place among the reloadable ones, and its entries' places by name.
+    places: List<usize?>
+    names: List<JavaHashMap<String, usize>>
+}
+
+impl Loot {
+    /// The loot of `registries`' reloadable registries.
+    pub fn new(registries: own Shared<Registries>) -> Loot {
+        let kinds: List<str> = ["loot_table", "predicate", "item_modifier", "context_int_provider", "context_float_provider"]
+        var places = List<usize?>()
+        var names = List<JavaHashMap<String, usize>>()
+        for k in kinds {
+            let at = registries.value.find_reloadable(String(k))
+            var by = JavaHashMap<String, usize>()
+            if let a = at {
+                for i in 0..registries.value.reloadable[a].entries.len() {
+                    by.insert(registries.value.reloadable[a].entries[i].to_string(), i)
+                }
+            }
+            places.push(at)
+            names.push(by)
+        }
+        let items = ItemCodecs.new(registries.copy())
+        return Loot { registries: registries, items: items, places: places, names: names }
+    }
+
+    /// The loot table `name`, a whole ID, as its codec wrote it.
+    pub fn table(self, name: String) -> Tag? {
+        return self.entry(TABLES, name)
+    }
+
+    // The entry `name` of the registry `kind`, read from its NBT.
+    fn entry(self, kind: usize, name: String) -> Tag? {
+        let at = self.places[kind] else return none
+        if not self.names[kind].contains(name.copy()) {
+            return none
+        }
+        let i = self.names[kind][name]
+        if i >= self.registries.value.reloadable[at].contents.len() {
+            return none
+        }
+        var pos: usize = 0
+        var accounter = Accounter.unlimited()
+        return match read_any(self.registries.value.reloadable[at].contents[i], mut pos, mut accounter) {
+            ok(t) => some(t),
+            err(_) => none,
+        }
+    }
+
+    // Whether the enchantment `name` is in `set`, a `HolderSet` of the `enchantment` registry as
+    // its codec writes it: an ID, a list of them, or a tag, `#` and its name.
+    fn enchantment_in(self, set: Tag, name: String) -> bool {
+        match set {
+            Tag.Str(s) => {
+                if not s.starts_with("#") {
+                    return s == name
+                }
+                let place = self.registries.value.find(String("minecraft:enchantment")) else return false
+                let tag = match Identifier.parse(s[1..].copy()) {
+                    ok(t) => t,
+                    err(_) => return false,
+                }
+                let key = match Identifier.parse(name) {
+                    ok(k) => k,
+                    err(_) => return false,
+                }
+                let n = self.registries.value.synced[place].id(key) else return false
+                for v in self.registries.value.synced[place].tag_ids(tag) {
+                    if v == n {
+                        return true
+                    }
+                }
+                return false
+            },
+            Tag.List(entries) => {
+                for each in entries {
+                    if self.enchantment_in(each, name.copy()) {
+                        return true
+                    }
+                }
+                return false
+            },
+            _ => return false,
+        }
+    }
+}
+
+/// What a table is rolled with, `LootParams`, each parameter `none` where it isn't given.
+pub struct LootParams {
+    /// `ORIGIN`.
+    pub origin: (f64, f64, f64)? = none
+    /// Whether `TOOL` is given, and the stack, `none` for `ItemStack.EMPTY`, as `ItemStack.CODEC`
+    /// writes it.
+    pub has_tool: bool = false
+    pub tool: Tag? = none
+    /// Whether there's a `THIS_ENTITY`, as what breaks a block. What predicates ask of it comes
+    /// with entities.
+    pub this_entity: bool = false
+    /// `BLOCK_STATE`.
+    pub state: u32? = none
+    /// `BLOCK_ENTITY`'s components, as `collectComponents` gives them, by their whole IDs.
+    pub block_entity: JavaHashMap<String, Tag>? = none
+    /// `EXPLOSION_RADIUS`.
+    pub explosion_radius: f32? = none
+    pub luck: f32 = 0.0f32
+    /// The dynamic drops, `withDynamicDrop`: each one's name and its stacks, `none` for an empty
+    /// one.
+    pub dynamic: List<(String, List<Tag?>)> = List<(String, List<Tag?>)>()
+}
+
+// A stack as loot makes it, `ItemStack`: its item, its count, which a modifier can take to 0 and
+// back again, and its components as a patch of its item's, as `ItemStack.CODEC` writes them.
+struct Stack {
+    id: String
+    count: i32
+    patch: JavaHashMap<String, Tag>
+}
+
+impl Stack {
+    fn of(id: String) -> Stack {
+        return Stack { id: id.copy(), count: 1, patch: JavaHashMap<String, Tag>() }
+    }
+
+    // `ItemStack.CODEC`'s form of a stack, or none for `ItemStack.EMPTY`.
+    fn from(t: Tag?) -> Stack? {
+        let given = t else return none
+        let Tag.Compound(m) = given else return none
+        if not m.contains("id") {
+            return none
+        }
+        let id = match m["id"] {
+            Tag.Str(s) => s.copy(),
+            _ => return none,
+        }
+        var count = 1
+        if m.contains("count") {
+            count = m["count"].number_int() ?? 1
+        }
+        var patch = JavaHashMap<String, Tag>()
+        if m.contains("components") {
+            if let Tag.Compound(c) = m["components"] {
+                patch = c.copy()
+            }
+        }
+        return some(Stack { id: id, count: count, patch: patch })
+    }
+
+    // `isEmpty`.
+    fn empty(self) -> bool {
+        return self.count <= 0 or self.id == "minecraft:air"
+    }
+
+    // The stack as `ItemStack.CODEC` writes it, none where it's empty.
+    fn tag(self) -> Tag? {
+        if self.empty() {
+            return none
+        }
+        var m = JavaHashMap<String, Tag>()
+        m.insert(String("id"), Tag.Str(self.id.copy()))
+        m.insert(String("count"), Tag.Int(self.count))
+        if not self.patch.is_empty() {
+            m.insert(String("components"), Tag.Compound(self.patch.copy()))
+        }
+        return some(Tag.Compound(m))
+    }
+
+    // Its component `name`, a whole ID: its patch's, none where its patch takes it away, or
+    // else its item's.
+    fn component(self, items: ItemCodecs, name: String) -> Tag? {
+        if self.patch.contains(name.copy()) {
+            return some(self.patch[name].copy())
+        }
+        if self.patch.contains("!{name}") {
+            return none
+        }
+        return items.default_component(self.id.copy(), name)
+    }
+
+    // `set(name, value)`: in its patch unless it's its item's own, as `PatchedDataComponentMap`
+    // keeps it.
+    fn set(mut self, items: ItemCodecs, name: String, value: own Tag) {
+        _ = self.patch.remove("!{name}")
+        if items.default_component(self.id.copy(), name.copy()) == some(value.copy()) {
+            _ = self.patch.remove(name)
+            return
+        }
+        self.patch.insert(name.copy(), value)
+    }
+}
+
+// Where a roll is: what it met that Calcite hasn't, and the tables and modifiers it's going
+// through by name, as `LootContext.visitedElements` keeps them, so one that names itself stops.
+struct Roll {
+    missing: List<String>
+    visited: List<String>
+}
+
+impl Roll {
+    fn miss(mut self, what: String) {
+        for m in self.missing {
+            if m == what {
+                return
+            }
+        }
+        self.missing.push(what.copy())
+    }
+}
+
+/// `LootTable.getRandomItems(params)`: the stacks the table `name`, a whole ID, gives, rolled with
+/// `random`, each split as `createStackSplitter` splits a stack bigger than it can be, with
+/// those a modifier left empty as `none`, which `popResource` draws for all the same. What it
+/// met that Calcite hasn't yet goes in `missing`, once each. A table that isn't there gives
+/// nothing, as `getLootTable` gives `LootTable.EMPTY`.
+pub fn roll_table<R: RandomSource, B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, random: mut R, params: LootParams, name: String, missing: mut List<String>) -> List<Tag?> {
+    var out = List<Tag?>()
+    let table = loot.table(name.copy()) else return out
+    var r = Roll { missing: missing.copy(), visited: List<String>() }
+    var made = List<Stack>()
+    table_items(loot, f, level, mut random, params, mut r, table, some(name.copy()), [], mut made)
+    for s in made {
+        let most = loot.items.max_stack_size(s.tag() ?? Tag.End).max(1)
+        if s.count < most {
+            out.push(s.tag())
+            continue
+        }
+        var count = s.count
+        while count > 0 {
+            var copy = Stack { id: s.id.copy(), count: count.min(most), patch: s.patch.copy() }
+            count -= copy.count
+            out.push(copy.tag())
+            copy.count = 0
+        }
+    }
+    missing.clear()
+    for m in r.missing {
+        missing.push(m.copy())
+    }
+    return out
+}
+
+/// The random sequence the table `name` draws from, `random_sequence`, or `none` where it has
+/// none, or there's no such table, and it draws from the level's random.
+pub fn random_sequence(loot: Loot, name: String) -> String? {
+    let table = loot.table(name) else return none
+    let Tag.Compound(m) = table else return none
+    if not m.contains("random_sequence") {
+        return none
+    }
+    return match m["random_sequence"] {
+        Tag.Str(s) => some(s.copy()),
+        _ => none,
+    }
+}
+
+// `getRandomItemsRaw`: each pool's items, each through the table's modifier, then `chain`, the
+// modifiers whose output it goes to, into `out`. A table named again inside itself gives
+// nothing, as `pushVisitedElement` stops it.
+fn table_items<R: RandomSource, B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, random: mut R, params: LootParams, roll: mut Roll, table: Tag, name: String?, chain: List<Tag>, out: mut List<Stack>) {
+    let Tag.Compound(m) = table else return
+    let mark = match name {
+        some(n) => some("table {n}"),
+        none => none,
+    }
+    if let k = mark {
+        for v in roll.visited {
+            if v == k {
+                return
+            }
+        }
+        roll.visited.push(k.copy())
+    }
+    var wrapped = chain.copy()
+    if m.contains("modifier") {
+        wrapped.insert(0, m["modifier"].copy())
+    }
+    if m.contains("pools") {
+        if let Tag.List(pools) = m["pools"] {
+            for pool in pools {
+                pool_items(loot, f, level, mut random, params, mut roll, pool, wrapped, mut out)
+            }
+        }
+    }
+    if let k = mark {
+        var i = roll.visited.len()
+        while i > 0 {
+            i -= 1
+            if roll.visited[i] == k {
+                _ = roll.visited.remove(i)
+                break
+            }
+        }
+    }
+}
+
+// An entry as a pool weighs it, `LootPoolEntry`: the singleton entry, its weight, and the
+// modifiers its stacks go through, the innermost first, as `adjustOutput` wraps them; or, for
+// one of a tag's items an expanded tag entry gives, that item.
+struct Weighed {
+    entry: Tag
+    weight: i32
+    modifiers: List<Tag>
+    item: String? = none
+}
+
+// `LootPool.addRandomItems`: if its condition holds, `rolls` and `bonus_rolls` times its luck
+// rolls, each a weighted pick of the entries that expand.
+fn pool_items<R: RandomSource, B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, random: mut R, params: LootParams, roll: mut Roll, pool: Tag, chain: List<Tag>, out: mut List<Stack>) {
+    let Tag.Compound(m) = pool else return
+    if m.contains("condition") {
+        let c = m["condition"].copy()
+        if not test(loot, f, level, mut random, params, mut roll, c) {
+            return
+        }
+    }
+    var wrapped = chain.copy()
+    if m.contains("modifier") {
+        wrapped.insert(0, m["modifier"].copy())
+    }
+    let rolls = if m.contains("rolls") { int_value(loot, mut random, mut roll, m["rolls"]) } else { 0 }
+    let bonus = if m.contains("bonus_rolls") { float_value(loot, mut random, mut roll, m["bonus_rolls"]) } else { 0.0f32 }
+    let count = rolls + floor_f32(bonus * params.luck)
+    var i = 0
+    while i < count {
+        i += 1
+        var valid = List<Weighed>()
+        if m.contains("entries") {
+            if let Tag.List(entries) = m["entries"] {
+                for e in entries {
+                    _ = expand(loot, f, level, mut random, params, mut roll, e, mut valid)
+                }
+            }
+        }
+        var total = 0
+        var kept = List<Weighed>()
+        for w in valid {
+            let weight = w.weight
+            if weight > 0 {
+                total += weight
+                kept.push(w.copy())
+            }
+        }
+        if total == 0 or kept.is_empty() {
+            continue
+        }
+        if kept.len() == 1 {
+            create(loot, f, level, mut random, params, mut roll, kept[0], wrapped, mut out)
+            continue
+        }
+        var index = random.next_int_below(total)
+        for w in kept {
+            index -= w.weight
+            if index < 0 {
+                create(loot, f, level, mut random, params, mut roll, w, wrapped, mut out)
+                break
+            }
+        }
+    }
+}
+
+// `LootPoolEntryContainer.expand`: whether `entry`, if its condition holds, gave what it can be
+// picked as, into `out`, each with its own modifier wrapped round it.
+fn expand<R: RandomSource, B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, random: mut R, params: LootParams, roll: mut Roll, entry: Tag, out: mut List<Weighed>) -> bool {
+    let Tag.Compound(m) = entry else return false
+    if m.contains("condition") {
+        let c = m["condition"].copy()
+        if not test(loot, f, level, mut random, params, mut roll, c) {
+            return false
+        }
+    }
+    let kind = text_of(m, "type")
+    var mine = List<Weighed>()
+    var expanded = false
+    if kind == "minecraft:alternatives" or kind == "minecraft:sequence" or kind == "minecraft:group" {
+        let children = if m.contains("children") { m["children"].copy() } else { Tag.List([]) }
+        let Tag.List(each) = children else return false
+        // As `compose` has them: `alternatives` stops at the first child that expands, and with
+        // none expands nothing; `sequence` stops at the first that doesn't, and with none
+        // expands; `group` expands them all and says it did, but for one child, whose answer
+        // is its own.
+        if kind == "minecraft:alternatives" {
+            for c in each {
+                if expand(loot, f, level, mut random, params, mut roll, c, mut mine) {
+                    expanded = true
+                    break
+                }
+            }
+        } else if kind == "minecraft:sequence" {
+            expanded = true
+            for c in each {
+                if not expand(loot, f, level, mut random, params, mut roll, c, mut mine) {
+                    expanded = false
+                    break
+                }
+            }
+        } else {
+            expanded = true
+            for c in each {
+                let one = expand(loot, f, level, mut random, params, mut roll, c, mut mine)
+                if each.len() == 1 {
+                    expanded = one
+                }
+            }
+        }
+    } else if kind == "minecraft:tag" and (if m.contains("expand") { m["expand"].number_bool() ?? false } else { false }) {
+        // `addExpandedEntries`: each of the tag's items its own entry, of the entry's weight.
+        let weight = weight_of(m, params.luck)
+        for item in tag_items(loot, text_of(m, "name")) {
+            mine.push(Weighed { entry: entry.copy(), weight: weight, modifiers: [], item: some(item.copy()) })
+        }
+        expanded = true
+    } else if kind == "minecraft:slots" {
+        roll.miss(String("Slot sources in loot tables"))
+        return false
+    } else {
+        mine.push(Weighed { entry: entry.copy(), weight: weight_of(m, params.luck), modifiers: [] })
+        expanded = true
+    }
+    let modifier: Tag? = if m.contains("modifier") { some(m["modifier"].copy()) } else { none }
+    for w in mine {
+        var adjusted = w.copy()
+        if let md = modifier {
+            adjusted.modifiers.push(md.copy())
+        }
+        out.push(adjusted)
+    }
+    return expanded
+}
+
+// `getWeight(luck)`: `weight` and `quality` times the luck, rounded down, at least 0.
+fn weight_of(m: JavaHashMap<String, Tag>, luck: f32) -> i32 {
+    let weight = if m.contains("weight") { m["weight"].number_int() ?? 1 } else { 1 }
+    let quality = if m.contains("quality") { m["quality"].number_int() ?? 0 } else { 0 }
+    return floor_f32(f32.nearest(weight) + f32.nearest(quality) * luck).max(0)
+}
+
+// `createItemStack`: the stacks the picked entry makes, each through its modifiers and then
+// `chain`.
+fn create<R: RandomSource, B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, random: mut R, params: LootParams, roll: mut Roll, w: Weighed, chain: List<Tag>, out: mut List<Stack>) {
+    var through = w.modifiers.copy()
+    for c in chain {
+        through.push(c.copy())
+    }
+    if let item = w.item {
+        emit(loot, f, level, mut random, params, mut roll, Stack.of(item.copy()), through, mut out)
+        return
+    }
+    let Tag.Compound(m) = w.entry else return
+    let kind = text_of(m, "type")
+    if kind == "minecraft:item" {
+        emit(loot, f, level, mut random, params, mut roll, Stack.of(text_of(m, "name")), through, mut out)
+    } else if kind == "minecraft:loot_table" {
+        // `NestedLootTable`: a table by its ID, or one given whole.
+        if not m.contains("value") {
+            return
+        }
+        match m["value"] {
+            Tag.Str(id) => {
+                let nested = loot.table(id.copy()) else return
+                table_items(loot, f, level, mut random, params, mut roll, nested, some(id.copy()), through, mut out)
+            },
+            other => table_items(loot, f, level, mut random, params, mut roll, other.copy(), none, through, mut out),
+        }
+    } else if kind == "minecraft:dynamic" {
+        let name = text_of(m, "name")
+        for (n, stacks) in params.dynamic {
+            if n != name {
+                continue
+            }
+            for s in stacks {
+                let given = Stack.from(s.copy()) ?? Stack { id: String("minecraft:air"), count: 0, patch: JavaHashMap<String, Tag>() }
+                emit(loot, f, level, mut random, params, mut roll, given, through, mut out)
+            }
+        }
+    } else if kind == "minecraft:tag" {
+        for item in tag_items(loot, text_of(m, "name")) {
+            emit(loot, f, level, mut random, params, mut roll, Stack.of(item), through, mut out)
+        }
+    }
+}
+
+// A stack made, through each of `chain` in turn, into `out`, as `LootItemFunction.decorate`'s
+// consumers pass it on.
+fn emit<R: RandomSource, B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, random: mut R, params: LootParams, roll: mut Roll, stack: own Stack, chain: List<Tag>, out: mut List<Stack>) {
+    var s = stack
+    for md in chain {
+        s = modify(loot, f, level, mut random, params, mut roll, s, md)
+    }
+    out.push(s)
+}
+
+// The items of the item tag `name`, by name, in the tag's order.
+fn tag_items(loot: Loot, name: String) -> List<String> {
+    var out = List<String>()
+    let id = match Identifier.parse(name) {
+        ok(i) => i,
+        err(_) => return out,
+    }
+    let at = loot.registries.value.find_builtin(String("item")) else return out
+    for n in loot.registries.value.builtin[at].tag_ids(id) {
+        if let item = loot.items.builtin_name("item", n) {
+            out.push(item)
+        }
+    }
+    return out
+}
+
+// An item modifier, `LootItemFunction.apply`, on `stack`: by its ID, a list of them in turn, or
+// one given whole, which a condition can stop, as `LootItemConditionalFunction.apply` does.
+fn modify<R: RandomSource, B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, random: mut R, params: LootParams, roll: mut Roll, stack: own Stack, md: Tag) -> Stack {
+    var s = stack
+    match md {
+        Tag.Str(id) => {
+            let k = "modifier {id}"
+            for v in roll.visited {
+                if v == k {
+                    return s
+                }
+            }
+            let named = loot.entry(MODIFIERS, id.copy()) else return s
+            roll.visited.push(k.copy())
+            s = modify(loot, f, level, mut random, params, mut roll, s, named)
+            _ = roll.visited.pop()
+            return s
+        },
+        Tag.List(each) => {
+            for one in each {
+                s = modify(loot, f, level, mut random, params, mut roll, s, one)
+            }
+            return s
+        },
+        Tag.Compound(m) => {
+            if m.contains("condition") {
+                let c = m["condition"].copy()
+                if not test(loot, f, level, mut random, params, mut roll, c) {
+                    return s
+                }
+            }
+            return run(loot, f, level, mut random, params, mut roll, s, m)
+        },
+        _ => return s,
+    }
+}
+
+// A modifier's own work, `run`, once its condition holds.
+fn run<R: RandomSource, B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, random: mut R, params: LootParams, roll: mut Roll, stack: own Stack, m: JavaHashMap<String, Tag>) -> Stack {
+    var s = stack
+    let kind = text_of(m, "type")
+    if kind == "minecraft:set_count" {
+        let add = if m.contains("add") { m["add"].number_bool() ?? false } else { false }
+        let base = if add { s.count } else { 0 }
+        let n = if m.contains("count") { int_value(loot, mut random, mut roll, m["count"]) } else { 0 }
+        s.count = base + n
+    } else if kind == "minecraft:explosion_decay" {
+        if let radius = params.explosion_radius {
+            let p = 1.0f32 / radius
+            var kept = 0
+            var i = 0
+            while i < s.count {
+                i += 1
+                if random.next_float() <= p {
+                    kept += 1
+                }
+            }
+            s.count = kept
+        }
+    } else if kind == "minecraft:apply_bonus" {
+        if params.has_tool {
+            let lv = enchantment_level(loot, params.tool, text_of(m, "enchantment"))
+            s.count = bonus_count(m, mut random, s.count, lv)
+        }
+    } else if kind == "minecraft:limit_count" {
+        if m.contains("limit") {
+            s.count = limited(loot, mut random, mut roll, m["limit"], s.count)
+        }
+    } else if kind == "minecraft:copy_state" {
+        if let state = params.state {
+            s = copied_state(loot, f, s, m, state)
+        }
+    } else if kind == "minecraft:copy_components" {
+        s = copied_components(loot, params, mut roll, s, m)
+    } else if kind == "minecraft:sequence" {
+        if m.contains("functions") {
+            if let Tag.List(each) = m["functions"] {
+                for one in each {
+                    s = modify(loot, f, level, mut random, params, mut roll, s, one)
+                }
+            }
+        }
+    } else {
+        roll.miss("The item modifier {kind}")
+    }
+    return s
+}
+
+// `ApplyBonusCount`'s formula on `count` at the enchantment's level `lv`.
+fn bonus_count<R: RandomSource>(m: JavaHashMap<String, Tag>, random: mut R, count: i32, lv: i32) -> i32 {
+    let formula = text_of(m, "formula")
+    let parameters = if m.contains("parameters") { m["parameters"].copy() } else { Tag.End }
+    if formula == "minecraft:binomial_with_bonus_count" {
+        let Tag.Compound(p) = parameters else return count
+        let extra = if p.contains("extra") { p["extra"].number_int() ?? 0 } else { 0 }
+        let probability = if p.contains("probability") { p["probability"].number_float() ?? 0.0f32 } else { 0.0f32 }
+        var n = count
+        var i = 0
+        while i < lv + extra {
+            i += 1
+            if random.next_float() < probability {
+                n += 1
+            }
+        }
+        return n
+    }
+    if formula == "minecraft:ore_drops" {
+        if lv <= 0 {
+            return count
+        }
+        let bonus = (random.next_int_below(lv + 2) - 1).max(0)
+        return count * (bonus + 1)
+    }
+    if formula == "minecraft:uniform_bonus_count" {
+        let Tag.Compound(p) = parameters else return count
+        let multiplier = if p.contains("bonusMultiplier") { p["bonusMultiplier"].number_int() ?? 0 } else { 0 }
+        return count + random.next_int_below(multiplier * lv + 1)
+    }
+    return count
+}
+
+// `IntLimit.clamp`: `count` held to `min` and `max`, each drawn as it's needed, the least first.
+fn limited<R: RandomSource>(loot: Loot, random: mut R, roll: mut Roll, limit: Tag, count: i32) -> i32 {
+    let Tag.Compound(m) = limit else return count
+    let has_min = m.contains("min")
+    let has_max = m.contains("max")
+    if has_min and has_max {
+        let low = int_value(loot, mut random, mut roll, m["min"])
+        let high = int_value(loot, mut random, mut roll, m["max"])
+        if count < low {
+            return low
+        }
+        return count.min(high)
+    }
+    if has_min {
+        return int_value(loot, mut random, mut roll, m["min"]).max(count)
+    }
+    if has_max {
+        return int_value(loot, mut random, mut roll, m["max"]).min(count)
+    }
+    return count
+}
+
+// `CopyBlockState`: each of `properties` the named block has, which the broken state has too,
+// set in the stack's `block_state` to the state's value of it.
+fn copied_state(loot: Loot, f: Facts, stack: own Stack, m: JavaHashMap<String, Tag>, state: u32) -> Stack {
+    var s = stack
+    let named = f.block_named(text_of(m, "block")) else return s
+    let default = f.default_state(named)
+    var values = match s.component(loot.items, String("minecraft:block_state")) {
+        some(Tag.Compound(v)) => v.copy(),
+        _ => JavaHashMap<String, Tag>(),
+    }
+    if m.contains("properties") {
+        if let Tag.List(names) = m["properties"] {
+            for n in names {
+                let Tag.Str(prop) = n else continue
+                let wanted = f.prop(default, prop.copy()) else continue
+                let have = f.prop(state, prop.copy()) else continue
+                if have.id != wanted.id {
+                    continue
+                }
+                values.insert(prop.copy(), Tag.Str(f.codec.value_name(have, have.get(state))))
+            }
+        }
+    }
+    s.set(loot.items, String("minecraft:block_state"), Tag.Compound(values))
+    return s
+}
+
+// `CopyComponentsFunction`: from a block entity's components, those `include` names and
+// `exclude` doesn't, each set on the stack; from the tool's, the same of each component it has,
+// in the order its item's and patch's give them. From an entity comes with entities.
+fn copied_components(loot: Loot, params: LootParams, roll: mut Roll, stack: own Stack, m: JavaHashMap<String, Tag>) -> Stack {
+    var s = stack
+    let source = text_of(m, "source")
+    let include: List<String>? = names_of(m, "include")
+    let exclude = names_of(m, "exclude") ?? List<String>()
+    var given = JavaHashMap<String, Tag>()
+    if source == "block_entity" {
+        let found = params.block_entity else return s
+        given = found.copy()
+    } else if source == "tool" {
+        let tool = Stack.from(params.tool.copy()) else return s
+        if params.tool == none {
+            return s
+        }
+        let defaults = loot.items.default_components(tool.id.copy())
+        for (k, v) in defaults {
+            if not tool.patch.contains("!{k}") and not tool.patch.contains(k.copy()) {
+                given.insert(k.copy(), v.copy())
+            }
+        }
+        for (k, v) in tool.patch {
+            if not k.starts_with("!") {
+                given.insert(k.copy(), v.copy())
+            }
+        }
+    } else {
+        roll.miss("Copying components from {source}")
+        return s
+    }
+    for (k, v) in given {
+        var wanted = true
+        if let only = include {
+            wanted = false
+            for n in only {
+                if n == k {
+                    wanted = true
+                }
+            }
+        }
+        for n in exclude {
+            if n == k {
+                wanted = false
+            }
+        }
+        if wanted {
+            s.set(loot.items, k.copy(), v.copy())
+        }
+    }
+    return s
+}
+
+// The component names a list field of `m` gives, or none where it has none.
+fn names_of(m: JavaHashMap<String, Tag>, key: str) -> List<String>? {
+    if not m.contains(key) {
+        return none
+    }
+    let Tag.List(each) = m[key] else return none
+    var out = List<String>()
+    for t in each {
+        if let Tag.Str(s) = t {
+            out.push(s.copy())
+        }
+    }
+    return some(out)
+}
+
+// `EnchantmentHelper.getItemEnchantmentLevel`: the level of the enchantment `name` on `tool`, 0
+// for none or for no tool.
+fn enchantment_level(loot: Loot, tool: Tag?, name: String) -> i32 {
+    let t = tool else return 0
+    let found = loot.items.component(t, String("minecraft:enchantments")) else return 0
+    let Tag.Compound(levels) = found else return 0
+    if not levels.contains(name.copy()) {
+        return 0
+    }
+    return levels[name].number_int() ?? 0
+}
+
+// A condition, `LootItemCondition.test`: by its ID, a named predicate, or given whole.
+fn test<R: RandomSource, B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, random: mut R, params: LootParams, roll: mut Roll, c: Tag) -> bool {
+    match c {
+        Tag.Str(id) => {
+            let k = "predicate {id}"
+            for v in roll.visited {
+                if v == k {
+                    return false
+                }
+            }
+            let named = loot.entry(PREDICATES, id.copy()) else return false
+            roll.visited.push(k.copy())
+            let holds = test(loot, f, level, mut random, params, mut roll, named)
+            _ = roll.visited.pop()
+            return holds
+        },
+        Tag.Compound(m) => return test_typed(loot, f, level, mut random, params, mut roll, m),
+        _ => return false,
+    }
+}
+
+fn test_typed<R: RandomSource, B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, random: mut R, params: LootParams, roll: mut Roll, m: JavaHashMap<String, Tag>) -> bool {
+    let kind = text_of(m, "type")
+    if kind == "minecraft:survives_explosion" {
+        let radius = params.explosion_radius else return true
+        return random.next_float() <= 1.0f32 / radius
+    }
+    if kind == "minecraft:inverted" {
+        if not m.contains("term") {
+            return true
+        }
+        let term = m["term"].copy()
+        return not test(loot, f, level, mut random, params, mut roll, term)
+    }
+    if kind == "minecraft:any_of" or kind == "minecraft:all_of" {
+        let any = kind == "minecraft:any_of"
+        if not m.contains("terms") {
+            return not any
+        }
+        let Tag.List(terms) = m["terms"] else {
+            roll.miss(String("Predicate tags in loot"))
+            return false
+        }
+        for t in terms {
+            let holds = test(loot, f, level, mut random, params, mut roll, t)
+            if any and holds {
+                return true
+            }
+            if not any and not holds {
+                return false
+            }
+        }
+        return not any
+    }
+    if kind == "minecraft:random_chance" {
+        let p = if m.contains("chance") { float_value(loot, mut random, mut roll, m["chance"]) } else { 0.0f32 }
+        return random.next_float() < p
+    }
+    if kind == "minecraft:table_bonus" {
+        let lv = if params.has_tool { enchantment_level(loot, params.tool, text_of(m, "enchantment")) } else { 0 }
+        let chances = if m.contains("chances") { m["chances"].floats() ?? List<f32>() } else { List<f32>() }
+        if chances.is_empty() {
+            return false
+        }
+        let at = usize.wrap(lv.max(0)).min(chances.len() - 1)
+        return random.next_float() < chances[at]
+    }
+    if kind == "minecraft:match_block" {
+        let state = params.state else return false
+        return block_matches(f, mut roll, m, state, params.block_entity != none)
+    }
+    if kind == "minecraft:match_tool" {
+        if not params.has_tool {
+            return false
+        }
+        if not m.contains("predicate") {
+            return true
+        }
+        return item_matches(loot, mut roll, m["predicate"], params.tool)
+    }
+    if kind == "minecraft:location_check" {
+        let (x, y, z) = params.origin else return false
+        if not m.contains("predicate") {
+            return true
+        }
+        let ox = if m.contains("offsetX") { m["offsetX"].number_int() ?? 0 } else { 0 }
+        let oy = if m.contains("offsetY") { m["offsetY"].number_int() ?? 0 } else { 0 }
+        let oz = if m.contains("offsetZ") { m["offsetZ"].number_int() ?? 0 } else { 0 }
+        return location_matches(f, level, mut roll, m["predicate"], x + f64(ox), y + f64(oy), z + f64(oz))
+    }
+    if kind == "minecraft:entity_properties" {
+        if not m.contains("predicate") {
+            return true
+        }
+        let target = text_of(m, "entity")
+        let present = target == "this" and params.this_entity
+        if not present {
+            return false
+        }
+        if let Tag.Compound(p) = m["predicate"] {
+            if p.is_empty() {
+                return true
+            }
+        }
+        roll.miss(String("Entity predicates in loot"))
+        return false
+    }
+    roll.miss("The loot condition {kind}")
+    return false
+}
+
+// `BlockPredicate.matchesState`, with `matchesBlockEntity` said to be missing where it asks
+// for data or components: whether `state`'s block is among `blocks` and its properties match
+// `state`'s.
+fn block_matches(f: Facts, roll: mut Roll, m: JavaHashMap<String, Tag>, state: u32, has_entity: bool) -> bool {
+    if m.contains("blocks") {
+        if not block_in(f, m["blocks"], state) {
+            return false
+        }
+    }
+    if m.contains("state") {
+        if not properties_match(f, m["state"], state) {
+            return false
+        }
+    }
+    if m.contains("nbt") or m.contains("components") or m.contains("predicates") {
+        roll.miss(String("Block entity data in block predicates"))
+        return false
+    }
+    _ = has_entity
+    return true
+}
+
+// Whether `state`'s block is in `set`, a block `HolderSet`: an ID, a tag, or a list.
+fn block_in(f: Facts, set: Tag, state: u32) -> bool {
+    match set {
+        Tag.Str(s) => {
+            if s.starts_with("#") {
+                let tag = f.find_tag(s[1..].copy()) else return false
+                return f.in_set(state, tag)
+            }
+            let b = f.block_named(s.copy()) else return false
+            return f.block(state) == b
+        },
+        Tag.List(each) => {
+            for one in each {
+                if block_in(f, one, state) {
+                    return true
+                }
+            }
+            return false
+        },
+        _ => return false,
+    }
+}
+
+// `StatePropertiesPredicate.matches`: each named property of `state`'s block, which it must have,
+// its value the one given, or within `min` and `max`, as the property's values compare.
+fn properties_match(f: Facts, given: Tag, state: u32) -> bool {
+    let Tag.Compound(m) = given else return true
+    for (name, want) in m {
+        let p = f.prop(state, name.copy()) else return false
+        let have = p.get(state)
+        match want {
+            Tag.Str(v) => {
+                let at = f.codec.value_of(p, v.copy()) else return false
+                if at != have {
+                    return false
+                }
+            },
+            Tag.Compound(range) => {
+                if range.contains("min") {
+                    let Tag.Str(v) = range["min"] else return false
+                    let at = f.codec.value_of(p, v.copy()) else return false
+                    if f.codec.compare(p, have, at) < 0 {
+                        return false
+                    }
+                }
+                if range.contains("max") {
+                    let Tag.Str(v) = range["max"] else return false
+                    let at = f.codec.value_of(p, v.copy()) else return false
+                    if f.codec.compare(p, have, at) > 0 {
+                        return false
+                    }
+                }
+            },
+            _ => return false,
+        }
+    }
+    return true
+}
+
+// `LocationPredicate.matches` at x, y, z, of which only `block` is here: the block there,
+// loaded, as `BlockPredicate.matches` reads it.
+fn location_matches<B: BlockAccess + BlockLevel>(f: Facts, level: B, roll: mut Roll, given: Tag, x: f64, y: f64, z: f64) -> bool {
+    let Tag.Compound(m) = given else return false
+    for (k, _) in m {
+        if k != "block" {
+            roll.miss("The location predicate's {k}")
+            return false
+        }
+    }
+    if not m.contains("block") {
+        return true
+    }
+    let bx = i32.saturate(x.floor())
+    let by = i32.saturate(y.floor())
+    let bz = i32.saturate(z.floor())
+    if not level.is_loaded(bx, by, bz) {
+        return false
+    }
+    let state = match level.state(f, bx, by, bz) {
+        ok(s) => s,
+        err(e) => {
+            roll.miss(e.message.copy())
+            return false
+        },
+    }
+    let Tag.Compound(b) = m["block"] else return false
+    return block_matches(f, mut roll, b, state, level.block_entity_tag(bx, by, bz) != none)
+}
+
+// `ItemPredicate.test` of `stack`, `none` for `ItemStack.EMPTY`: its item among `items`, its
+// count within `count`, its components exactly `components`, and `predicates` holding, of which
+// `enchantments` and `stored_enchantments` are here.
+fn item_matches(loot: Loot, roll: mut Roll, given: Tag, stack: Tag?) -> bool {
+    let Tag.Compound(m) = given else return false
+    let s = Stack.from(stack.copy()) ?? Stack { id: String("minecraft:air"), count: 0, patch: JavaHashMap<String, Tag>() }
+    if m.contains("items") {
+        let id = loot.items.builtin_id("item", if s.empty() { String("minecraft:air") } else { s.id.copy() }) ?? -1
+        if not loot.items.holder_set_has("item", m["items"], id) {
+            return false
+        }
+    }
+    if m.contains("count") {
+        if not bounds_match(m["count"], if s.empty() { 0 } else { s.count }) {
+            return false
+        }
+    }
+    if m.contains("components") {
+        if let Tag.Compound(exact) = m["components"] {
+            for (k, v) in exact {
+                if s.empty() {
+                    return false
+                }
+                if s.component(loot.items, k.copy()) != some(v.copy()) {
+                    return false
+                }
+            }
+        }
+    }
+    if m.contains("predicates") {
+        if let Tag.Compound(partial) = m["predicates"] {
+            for (k, v) in partial {
+                if k != "minecraft:enchantments" and k != "minecraft:stored_enchantments" {
+                    roll.miss("The item predicate {k}")
+                    return false
+                }
+                if s.empty() {
+                    return false
+                }
+                let found = s.component(loot.items, k.copy()) else return false
+                let Tag.Compound(levels) = found else return false
+                let Tag.List(each) = v else return false
+                for p in each {
+                    if not enchantment_matches(loot, p, levels) {
+                        return false
+                    }
+                }
+            }
+        }
+    }
+    return true
+}
+
+// `EnchantmentPredicate.containedIn`: of `levels`, the item's enchantments, one of those named at
+// a level within `levels`' bounds; any at such a level where none are named; or any at all.
+fn enchantment_matches(loot: Loot, p: Tag, levels: JavaHashMap<String, Tag>) -> bool {
+    let Tag.Compound(m) = p else return false
+    let bounds: Tag? = if m.contains("levels") { some(m["levels"].copy()) } else { none }
+    if m.contains("enchantments") {
+        for (name, lv) in levels {
+            if not loot.enchantment_in(m["enchantments"], name.copy()) {
+                continue
+            }
+            let n = lv.number_int() ?? 0
+            if n == 0 {
+                continue
+            }
+            match bounds {
+                some(b) => if bounds_match(b, n) {
+                    return true
+                },
+                none => return true,
+            }
+        }
+        return false
+    }
+    if let b = bounds {
+        for (_, lv) in levels {
+            if bounds_match(b, lv.number_int() ?? 0) {
+                return true
+            }
+        }
+        return false
+    }
+    return not levels.is_empty()
+}
+
+// `MinMaxBounds.Ints.matches`: a number exactly, or `min` and `max`, each optional.
+fn bounds_match(b: Tag, n: i32) -> bool {
+    match b {
+        Tag.Compound(m) => {
+            if m.contains("min") {
+                if (m["min"].number_int() ?? i32.MIN) > n {
+                    return false
+                }
+            }
+            if m.contains("max") {
+                if (m["max"].number_int() ?? i32.MAX) < n {
+                    return false
+                }
+            }
+            return true
+        },
+        other => return (other.number_int() ?? n) == n,
+    }
+}
+
+// `ContextIntProvider.getInt`: a constant, a named provider, or one given whole, of which
+// `constant`, `uniform` and `binomial` are here.
+fn int_value<R: RandomSource>(loot: Loot, random: mut R, roll: mut Roll, t: Tag) -> i32 {
+    match t {
+        Tag.Str(id) => {
+            let named = loot.entry(INTS, id.copy()) else return 0
+            return int_value(loot, mut random, mut roll, named)
+        },
+        Tag.Compound(m) => {
+            let kind = text_of(m, "type")
+            if kind == "minecraft:constant" {
+                return if m.contains("value") { m["value"].number_int() ?? 0 } else { 0 }
+            }
+            if kind == "minecraft:uniform" {
+                let low = if m.contains("min") { int_value(loot, mut random, mut roll, m["min"]) } else { 0 }
+                let high = if m.contains("max") { int_value(loot, mut random, mut roll, m["max"]) } else { 0 }
+                // `Mth.nextInt`, which draws nothing where the range is one number or none.
+                if low >= high {
+                    return low
+                }
+                return random.next_int_below(high - low + 1) + low
+            }
+            if kind == "minecraft:binomial" {
+                let n = if m.contains("n") { int_value(loot, mut random, mut roll, m["n"]) } else { 0 }
+                let p = if m.contains("p") { float_value(loot, mut random, mut roll, m["p"]) } else { 0.0f32 }
+                var got = 0
+                var i = 0
+                while i < n {
+                    i += 1
+                    if random.next_float() < p {
+                        got += 1
+                    }
+                }
+                return got
+            }
+            roll.miss("The number provider {kind}")
+            return 0
+        },
+        other => return other.number_int() ?? 0,
+    }
+}
+
+// `ContextFloatProvider.getFloat`: a constant, a named provider, or one given whole, of which
+// `constant` and `uniform` are here; 0 for one that isn't finite.
+fn float_value<R: RandomSource>(loot: Loot, random: mut R, roll: mut Roll, t: Tag) -> f32 {
+    let v = match t {
+        Tag.Str(id) => {
+            let named = loot.entry(FLOATS, id.copy()) else return 0.0f32
+            float_value(loot, mut random, mut roll, named)
+        },
+        Tag.Compound(m) => {
+            let kind = text_of(m, "type")
+            if kind == "minecraft:constant" {
+                if m.contains("value") { m["value"].number_float() ?? 0.0f32 } else { 0.0f32 }
+            } else if kind == "minecraft:uniform" {
+                let low = if m.contains("min") { float_value(loot, mut random, mut roll, m["min"]) } else { 0.0f32 }
+                let high = if m.contains("max") { float_value(loot, mut random, mut roll, m["max"]) } else { 0.0f32 }
+                // `Mth.nextFloat`, which draws nothing where the range is one number or none.
+                if low >= high { low } else { random.next_float() * (high - low) + low }
+            } else {
+                roll.miss("The number provider {kind}")
+                0.0f32
+            }
+        },
+        other => other.number_float() ?? 0.0f32,
+    }
+    if v != v or v == f32.INFINITY or v == -f32.INFINITY {
+        return 0.0f32
+    }
+    return v
+}
+
+// `Mth.floor` of a float.
+fn floor_f32(v: f32) -> i32 {
+    let i = i32.saturate(v)
+    return if v < f32.nearest(i) { i - 1 } else { i }
+}
+
+// The string field `key` of `m`, empty where it isn't one.
+fn text_of(m: JavaHashMap<String, Tag>, key: str) -> String {
+    if not m.contains(key) {
+        return String()
+    }
+    return match m[key] {
+        Tag.Str(s) => s.copy(),
+        _ => String(),
+    }
+}

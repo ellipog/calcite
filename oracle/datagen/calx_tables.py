@@ -572,6 +572,18 @@ def block_facts_module(index, flags):
         "needs_tool_blocks", "blocks", flags["needs_tool_blocks"],
         ["/// The blocks that drop nothing unless dug with the right tool, `requiresCorrectToolForDrops`,",
          "/// by ID (D376)."])
+    tables = flags["loot_tables"]
+    lines += number_list(
+        "loot_table_blocks", "blocks", [b for b, _ in tables],
+        ["/// The blocks whose loot table, `getLootTable`, isn't `blocks/` and their name, by ID, whose",
+         "/// `loot_table_names` give theirs in their order (CAL-153)."])
+    lines += [
+        "/// For each of `loot_table_blocks` in their order, its loot table, empty for none (CAL-153).",
+        "pub fn loot_table_names() -> List<str> {",
+        "    return [",
+    ]
+    lines += [f'        "{t or ""}",' for _, t in tables]
+    lines += ["    ]", "}", ""]
     toggles = flags["toggle_sounds"]
     lines += number_list(
         "toggle_sound_blocks", "blocks", [b for b, _, _ in toggles],

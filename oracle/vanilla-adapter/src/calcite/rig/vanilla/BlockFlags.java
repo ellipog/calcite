@@ -299,8 +299,19 @@ final class BlockFlags {
         // pressure plate weighs at most, `maxWeight` (CAL-128).
         StringBuilder buttonTicks = new StringBuilder();
         StringBuilder plateWeights = new StringBuilder();
+        // Each block whose loot table, `getLootTable`, isn't `blocks/<its name>`, with it, or null
+        // for one that has none (CAL-153).
+        StringBuilder lootTables = new StringBuilder();
         for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
             Block block = BuiltInRegistries.BLOCK.byId(id);
+            java.util.Optional<net.minecraft.resources.ResourceKey<net.minecraft.world.level.storage.loot.LootTable>> table = block.getLootTable();
+            String usual = BuiltInRegistries.BLOCK.getKey(block).withPrefix("blocks/").toString();
+            if (table.isEmpty()) {
+                lootTables.append(lootTables.isEmpty() ? "" : ", ").append("[").append(id).append(", null]");
+            } else if (!table.get().identifier().toString().equals(usual)) {
+                lootTables.append(lootTables.isEmpty() ? "" : ", ").append("[").append(id).append(", \"")
+                        .append(table.get().identifier()).append("\"]");
+            }
             String[] sounds = toggleSounds(block);
             if (sounds != null) {
                 toggles.append(toggles.isEmpty() ? "" : ", ").append("[").append(id).append(", \"").append(sounds[0]).append("\", \"").append(sounds[1]).append("\"]");
@@ -537,6 +548,7 @@ final class BlockFlags {
         json.append("  \"toggle_sounds\": [").append(toggles).append("],\n");
         json.append("  \"button_ticks\": [").append(buttonTicks).append("],\n");
         json.append("  \"plate_weights\": [").append(plateWeights).append("],\n");
+        json.append("  \"loot_tables\": [").append(lootTables).append("],\n");
         json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
         json.append("  \"fire_odds\": [").append(fireOdds).append("],\n");
         json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");
