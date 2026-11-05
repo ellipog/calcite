@@ -11,6 +11,7 @@
 module registry.codec
 
 import chat.language.{Language}
+import hash.ops.{hash_bool, hash_list, hash_map, hash_string, hash_tag}
 import json.gson.{JsonWriter, int_value, long_value}
 import json.tree.{Json, Member}
 import nbt.tag.{Tag, typed_number}
@@ -1220,6 +1221,265 @@ impl Codecs {
         }
         let e = message else return Read.ok(Tag.Compound(out))
         return Read { value: some(Tag.Compound(out)), error: some("{e} missed input: {self.shown(Json.Object(failed))}") }
+    }
+
+    /// `value`, as the codec at `at` writes it to NBT, hashed as the codec writes it to
+    /// `HashOps.CRC32C_INSTANCE`, as `TypedDataComponent.encodeValue` hashes a component for a
+    /// slot's `HashedStack`. Each part is hashed by the codec's own type, so a `Codec.BOOL`'s byte
+    /// is a boolean and a list's ints are a list, which NBT alone can't tell from a byte or an int
+    /// array. A codec written out by hand hashes its NBT by the tags' own types, as one that
+    /// passes NBT through does; an item stack's goes by its record. Where a value isn't the shape
+    /// its codec writes, it too goes by its tags' types. The codecs must be reading NBT, as
+    /// `nbt` has them, since an alternative is picked by reading the value back (CAL-136).
+    pub fn hash(self, at: usize, value: Tag, r: Registries) -> u32 {
+        match self.all[at] {
+            Codec.Bool => {
+                return match value {
+                    Tag.Byte(v) => hash_bool(v != 0),
+                    _ => hash_tag(value),
+                }
+            },
+            Codec.ListOf(many) => {
+                let items = elements(value) else return hash_tag(value)
+                var hashes = List<u32>()
+                hashes.reserve(items.len())
+                for item in items {
+                    hashes.push(self.hash(many.of, item, r))
+                }
+                return hash_list(hashes)
+            },
+            Codec.Record(_) => return self.hash_fields(at, value, r),
+            Codec.Dispatch(_) => return self.hash_fields(at, value, r),
+            Codec.Matcher(_) => return self.hash_fields(at, value, r),
+            Codec.Either(first, second) => {
+                if self.reads(first, value, r) {
+                    return self.hash(first, value, r)
+                }
+                return self.hash(second, value, r)
+            },
+            Codec.Xor(first, second) => {
+                if self.reads(first, value, r) {
+                    return self.hash(first, value, r)
+                }
+                return self.hash(second, value, r)
+            },
+            Codec.Compact(of) => {
+                // A list of one is written as the value alone, as `compactListCodec` writes it.
+                if let items = elements(value) {
+                    var all_read = true
+                    for item in items {
+                        if not self.reads(of, item, r) {
+                            all_read = false
+                            break
+                        }
+                    }
+                    if all_read {
+                        var hashes = List<u32>()
+                        for item in items {
+                            hashes.push(self.hash(of, item, r))
+                        }
+                        return hash_list(hashes)
+                    }
+                }
+                return self.hash(of, value, r)
+            },
+            Codec.Holder(h) => return self.hash_holder(h, value, r),
+            Codec.Holders(h) => {
+                let items = elements(value) else return self.hash_holder(h, value, r)
+                var hashes = List<u32>()
+                for item in items {
+                    hashes.push(self.hash_holder(h, item, r))
+                }
+                return hash_list(hashes)
+            },
+            Codec.Dispatched(d) => {
+                let Tag.Compound(m) = value else return hash_tag(value)
+                var entries = List<(u32, u32)>()
+                for (k, v) in m {
+                    var picked = d.keyed
+                    for (name, of) in d.values {
+                        if name == k {
+                            picked = some(of)
+                            break
+                        }
+                    }
+                    let key = self.hash(d.key, Tag.Str(k.copy()), r)
+                    entries.push((key, match picked {
+                        some(of) => self.hash(of, v, r),
+                        none => hash_tag(v),
+                    }))
+                }
+                return hash_map(entries)
+            },
+            Codec.MapOf(mo) => {
+                let Tag.Compound(m) = value else return hash_tag(value)
+                var entries = List<(u32, u32)>()
+                for (k, v) in m {
+                    entries.push((self.hash(mo.key, Tag.Str(k.copy()), r), self.hash(mo.value, v, r)))
+                }
+                return hash_map(entries)
+            },
+            Codec.Then(t) => return self.hash(t.of, value, r),
+            Codec.Promote(of) => return self.hash(of, value, r),
+            Codec.Late(name) => {
+                let place = self.find(name) else return hash_tag(value)
+                return self.hash(place, value, r)
+            },
+            Codec.Nested(_) => {
+                let place = self.nested_record(at) else return hash_tag(value)
+                return self.hash(place, value, r)
+            },
+            _ => return hash_tag(value),
+        }
+    }
+
+    // A record's fields, or a dispatched kind's, as a map: each key a string, each value hashed
+    // with its field's codec.
+    fn hash_fields(self, at: usize, value: Tag, r: Registries) -> u32 {
+        let Tag.Compound(m) = value else return hash_tag(value)
+        var entries = List<(u32, u32)>()
+        entries.reserve(m.len())
+        for (k, v) in m {
+            let h = match self.field_codec(at, k, m) {
+                some(of) => self.hash(of, v, r),
+                none => hash_tag(v),
+            }
+            entries.push((hash_string(k), h))
+        }
+        return hash_map(entries)
+    }
+
+    // The codec of the field `key` of the record at `at`, or of a record whose fields are its
+    // own, `m` being the whole map, which names a dispatched kind.
+    fn field_codec(self, at: usize, key: String, m: JavaHashMap<String, Tag>) -> usize? {
+        match self.all[at] {
+            Codec.Record(fields) => {
+                for f in fields {
+                    if f.name.len() == 0 {
+                        if let found = self.field_codec(f.of, key, m) {
+                            return some(found)
+                        }
+                    } else if f.name == key {
+                        return some(f.of)
+                    }
+                }
+                return none
+            },
+            Codec.Dispatch(kinds) => {
+                if kinds.key == key {
+                    return some(kinds.by)
+                }
+                var kind = kinds.default.copy()
+                if m.contains(kinds.key.copy()) {
+                    match m[kinds.key.copy()] {
+                        Tag.Str(s) => kind = s.copy(),
+                        _ => {},
+                    }
+                }
+                for (name, record) in kinds.kinds {
+                    if name == kind {
+                        return self.field_codec(record, key, m)
+                    }
+                }
+                return none
+            },
+            Codec.Matcher(kinds) => {
+                if kinds.key == key {
+                    return some(kinds.by)
+                }
+                for (_, record) in kinds.kinds {
+                    if let found = self.field_codec(record, key, m) {
+                        return some(found)
+                    }
+                }
+                return none
+            },
+            Codec.Either(first, second) => {
+                if let found = self.field_codec(first, key, m) {
+                    return some(found)
+                }
+                return self.field_codec(second, key, m)
+            },
+            Codec.Then(t) => return self.field_codec(t.of, key, m),
+            Codec.Promote(of) => return self.field_codec(of, key, m),
+            Codec.Late(name) => {
+                let place = self.find(name) else return none
+                return self.field_codec(place, key, m)
+            },
+            Codec.Nested(_) => {
+                let place = self.nested_record(at) else return none
+                return self.field_codec(place, key, m)
+            },
+            _ => return none,
+        }
+    }
+
+    // A registry's entry: its ID, a string, or the entry in full, with its own codec.
+    fn hash_holder(self, h: HolderCodec, value: Tag, r: Registries) -> u32 {
+        match value {
+            Tag.Str(s) => return hash_string(s),
+            _ => {},
+        }
+        let inline = h.inline else return hash_tag(value)
+        return self.hash(inline, value, r)
+    }
+
+    // The codec a codec written out by hand writes with, where it's an item stack's or a patch's,
+    // which hash by their records.
+    fn nested_record(self, at: usize) -> usize? {
+        if self.is_named(at, "item stack") {
+            return self.find(String("item stack record"))
+        }
+        if self.is_named(at, "item stack with slot") {
+            return self.find(String("item stack with slot record"))
+        }
+        if self.is_named(at, "nested component patch") {
+            return self.find(String("component patch"))
+        }
+        if self.is_named(at, "exact components") {
+            return self.find(String("component map"))
+        }
+        return none
+    }
+
+    fn is_named(self, at: usize, name: str) -> bool {
+        let found = self.find(String(name)) else return false
+        return found == at
+    }
+
+    // Whether the codec at `at` reads `value`, NBT, back in full.
+    fn reads(self, at: usize, value: Tag, r: Registries) -> bool {
+        var refs = Refs.new()
+        return self.read(at, value.to_typed_json(), r, mut refs).is_ok()
+    }
+}
+
+// The elements of a list or an array, each its own tag, or `none` for anything else.
+fn elements(value: Tag) -> List<Tag>? {
+    return match value {
+        Tag.List(items) => some(items.copy()),
+        Tag.ByteArray(a) => {
+            var out = List<Tag>()
+            for v in a {
+                out.push(Tag.Byte(v))
+            }
+            some(out)
+        },
+        Tag.IntArray(a) => {
+            var out = List<Tag>()
+            for v in a {
+                out.push(Tag.Int(v))
+            }
+            some(out)
+        },
+        Tag.LongArray(a) => {
+            var out = List<Tag>()
+            for v in a {
+                out.push(Tag.Long(v))
+            }
+            some(out)
+        },
+        _ => none,
     }
 }
 

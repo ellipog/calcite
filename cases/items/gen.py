@@ -1,8 +1,8 @@
 """Writes cases/items/generated.json: item stacks read as vanilla reads them with
 `ItemStack.CODEC`, from a data pack's JSON, or from SNBT through `NbtOps`, as a save's are, or
-with `ItemStack.OPTIONAL_STREAM_CODEC` from the network, and written to NBT or the network, with
-the vanilla data pack's registries and the items' default components bound, as a server has them
-(CAL-77, D362, D363, D364, D365). The `from-wire` cases are vanilla's own bytes for the `to-wire` ones,
+with `ItemStack.OPTIONAL_STREAM_CODEC` from the network, and written to NBT or the network, or
+hashed as a slot's `HashedStack` is, with the vanilla data pack's registries and the items' default
+components bound, as a server has them (CAL-77, D362, D363, D364, D365, D373). The `from-wire` cases are vanilla's own bytes for the `to-wire` ones,
 taken from the goldens once they're recorded, so a new one needs recording twice.
 
     py -I cases/items/gen.py
@@ -360,6 +360,16 @@ def cases():
     # Vanilla's own bytes for each stack above, read back, from the goldens where they've been
     # recorded, else as the case file had them.
     out.extend(from_vanilla(out))
+
+    # Each stack above, hashed as a slot's `HashedStack` is: each component its patch sets,
+    # written with its codec to `HashOps.CRC32C_INSTANCE`, which the client and server check each
+    # other's slots by (CAL-136).
+    for c in list(out):
+        if c["input"]["to"] == "nbt":
+            hashed = {"id": f"hash-{c['id']}", "input": dict(c["input"], to="hash")}
+            if "blobs" in c:
+                hashed["blobs"] = c["blobs"]
+            out.append(hashed)
     return out
 
 

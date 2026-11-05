@@ -3,10 +3,12 @@
 /// `ItemStack.OPTIONAL_STREAM_CODEC` reads one from the network, against the vanilla data pack's
 /// registries, complete, as a server's are once its packs have loaded, and written to NBT as
 /// `writeAnyTag` writes it, or to the network, a stack from the network as `world.item` reads and
-/// sends it (CAL-77, D362, D363, D364, D366).
+/// sends it (CAL-77, D362, D363, D364, D366), or hashed as a slot's `HashedStack` is, each component
+/// its patch sets written with its codec to `HashOps` (D373).
 module rig.items
 
 import chat.language.{Language}
+import hash.ops.{hash_tag}
 import json.tree.{Json, Member, as_string, parse, take}
 import nbt.snbt.{parse as parse_snbt}
 import nbt.tag.{Tag}
@@ -27,8 +29,8 @@ pub fn run_items(input: own List<Member>, blobs: List<List<u8>>, registries: Reg
     if from != "json" and from != "snbt" and from != "wire" {
         return Outcome.Failed("`from` must be `json`, `snbt` or `wire`, not `{from}`")
     }
-    if to != "nbt" and to != "wire" {
-        return Outcome.Failed("`to` must be `nbt` or `wire`, not `{to}`")
+    if to != "nbt" and to != "wire" and to != "hash" {
+        return Outcome.Failed("`to` must be `nbt`, `wire` or `hash`, not `{to}`")
     }
     if lang == none {
         match load_language() {
@@ -98,6 +100,32 @@ pub fn run_items(input: own List<Member>, blobs: List<List<u8>>, registries: Reg
     if let s = wire_stack {
         let applied = apply_wire(mut codecs, s, registries)
         output.push(Member { key: "empty", value: Json.Bool(false) })
+        if to == "hash" {
+            // What vanilla's encoder can't write, a type that isn't saved or a value its codec
+            // doesn't take, hashes as the encoder's error.
+            var patch = List<(String, Tag)>()
+            var errors = List<(String, String)>()
+            codecs.writing = true
+            for (k, v, raw) in applied.patch {
+                patch.push((k.copy(), v.copy()))
+                if k.starts_with("!") {
+                    continue
+                }
+                match codecs.find("component {k}") {
+                    some(place) => {
+                        var refs = Refs.new()
+                        if let e = codecs.read(place, raw, registries, mut refs).error {
+                            errors.push((k.copy(), "error: {e}"))
+                        }
+                    },
+                    none => errors.push((k.copy(), "error: Component of type {k} is not encodable")),
+                }
+            }
+            codecs.writing = false
+            codecs.nbt = true
+            output.push(Member { key: "hash", value: hashed(codecs, registries, s.item, s.count, patch, errors) })
+            return Outcome.Done { output: output, blobs: [] }
+        }
         if let e = applied.error {
             output.push(Member { key: "write_error", value: Json.Str(e.copy()) })
             return Outcome.Done { output: output, blobs: [] }
@@ -113,6 +141,34 @@ pub fn run_items(input: own List<Member>, blobs: List<List<u8>>, registries: Reg
     }
     let tag = read.value.take() ?? Tag.End
     output.push(Member { key: "empty", value: Json.Bool(false) })
+    if to == "hash" {
+        // An alternative is picked by reading what was written back, as NBT.
+        codecs.nbt = true
+        let Tag.Compound(m) = tag else return Outcome.Failed(String("the stack read isn't a compound"))
+        let item = match m["id"] {
+            Tag.Str(i) => i.copy(),
+            _ => String(),
+        }
+        let count = if not m.contains("count") { 1 } else {
+            match m["count"] {
+                Tag.Int(n) => n,
+                _ => 1,
+            }
+        }
+        var patch = List<(String, Tag)>()
+        if m.contains("components") {
+            match m["components"] {
+                Tag.Compound(p) => {
+                    for (k, v) in p {
+                        patch.push((k.copy(), v.copy()))
+                    }
+                },
+                _ => {},
+            }
+        }
+        output.push(Member { key: "hash", value: hashed(codecs, registries, item, count, patch, List<(String, String)>()) })
+        return Outcome.Done { output: output, blobs: [] }
+    }
     if to == "wire" {
         var w = Writer.new()
         streams.write_stack(some(tag), value, registries, mut w)
@@ -151,6 +207,57 @@ fn sent_again(rd: mut Reader, total: usize, streams: Streams, c: mut Codecs, reg
         return Outcome.Done { output: output, blobs: [] }
     }
     return Outcome.Done { output: output, blobs: [w.into_bytes()] }
+}
+
+// The stack as a slot's `HashedStack` has it, as the vanilla adapter writes it: its item, its
+// count, each component its patch sets, by its type's ID in order, with its value hashed with its
+// codec, or the error in `errors` for one vanilla's encoder can't write, and each type its patch
+// takes away, in order.
+fn hashed(c: Codecs, r: Registries, item: String, count: i32, patch: List<(String, Tag)>, errors: List<(String, String)>) -> Json {
+    var names = List<String>()
+    var removed = List<String>()
+    for (k, _) in patch {
+        if k.starts_with("!") {
+            removed.push(k[1..].copy())
+        } else {
+            names.push(k.copy())
+        }
+    }
+    names.sort()
+    removed.sort()
+    var added = List<Member>()
+    for name in names {
+        for (k, v) in patch {
+            if k == name {
+                var failed: String? = none
+                for (n, e) in errors {
+                    if n == name {
+                        failed = some(e.copy())
+                    }
+                }
+                if let e = failed {
+                    added.push(Member { key: name.copy(), value: Json.Str(e) })
+                    break
+                }
+                let h = match c.find("component {k}") {
+                    some(at) => c.hash(at, v, r),
+                    none => hash_tag(v),
+                }
+                added.push(Member { key: name.copy(), value: Json.Number("{i32.wrap(h)}") })
+                break
+            }
+        }
+    }
+    var gone = List<Json>()
+    for k in removed {
+        gone.push(Json.Str(k.copy()))
+    }
+    return Json.Object([
+        Member { key: "item", value: Json.Str(item.copy()) },
+        Member { key: "count", value: Json.Number("{count}") },
+        Member { key: "added", value: Json.Object(added) },
+        Member { key: "removed", value: Json.Array(gone) },
+    ])
 }
 
 // The output with the stack's NBT, as `writeAnyTag` writes it.
