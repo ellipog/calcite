@@ -22,7 +22,7 @@ import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{DATA_VERSION, PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
-import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockChangedAck, ClientboundBlockDestruction, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundContainerSetSlot, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundBlockEvent, ClientboundLevelEvent, ClientboundSound, ClientboundLightUpdate, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetCursorItem, ClientboundSetDefaultSpawnPosition, ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetPlayerInventory, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateAttributes, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SentAttribute, SentModifier, ServerboundContainerClick, ServerboundPlayerAction, ServerboundSetCreativeModeSlot, ServerboundUseItemOn, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
+import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockChangedAck, ClientboundBlockDestruction, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundContainerSetSlot, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundBlockEvent, ClientboundLevelEvent, ClientboundLevelParticles, ClientboundSound, ClientboundLightUpdate, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetCursorItem, ClientboundSetDefaultSpawnPosition, ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetPlayerInventory, ClientboundSetTime, ClientboundSwingAnimation, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateAttributes, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SentAttribute, SentModifier, ServerboundContainerClick, ServerboundPlayerAction, ServerboundSetCreativeModeSlot, ServerboundUseItemOn, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{DecodeError, Reader, Writer, Wire, Packet, write_packet}
@@ -535,9 +535,17 @@ pub struct Network {
     // The `sound_event` registry's IDs by name, which a sound's packet sends it by, made as the
     // first is sent (CAL-125).
     sound_ids: OpenHashMap<String, i32> = OpenHashMap<String, i32>()
+    // The `particle_type` registry's IDs by name, which particles' packets send them by, made as
+    // the first are sent (CAL-143).
+    particle_ids: OpenHashMap<String, i32> = OpenHashMap<String, i32>()
     // The codecs players' items are read and written with, and their streams, made as the first
     // player joins, once the world has its registries (D372).
     items: ItemCodecs? = none
+    // Whether the levels have the world's jukebox songs yet (CAL-143).
+    songs_given: bool = false
+    // Whether the block a player's using swung their arm, `SUCCESS_SERVER`, until it's sent them
+    // (CAL-143).
+    server_swing: bool = false
     // What placing blocks reads of vanilla's tables, made the first time a block's used (CAL-139).
     placing: PlaceFacts? = none
     streams: Streams? = none
@@ -1474,6 +1482,11 @@ impl Network {
     // them, with the custom spawners (D314). Sleep, block and fluid ticks, raids, block events
     // and entities come with what they tick.
     fn tick_level(mut self, d: usize) {
+        // The world's jukebox songs, for its jukeboxes to play, once its registries are read
+        // (CAL-143).
+        if not self.songs_given {
+            self.give_songs()
+        }
         // `handlingTick`, from the tick's start until its block events have run (CAL-125).
         self.levels[d].handling = true
         if let r = self.reseed {
@@ -1599,17 +1612,18 @@ impl Network {
     // What the players of the level `d` heard since it was last sent, in the order it happened,
     // each to those near enough, as `PlayerList.broadcast` sends it: a level event within 64
     // blocks (D326), a block event that ran within 64, and a sound within 16 of where it's
-    // played, `SoundEvent.getRange` of a volume of 1 or less (CAL-125).
+    // played, `SoundEvent.getRange` of a volume of 1 or less (CAL-125); and particles to those
+    // whose block's middle is within 32, as `ServerLevel.sendParticles` sends them (CAL-143).
     fn send_level_events(mut self, d: usize) {
         let heard = self.levels[d].take_heard()
         for h in heard {
-            let (packet, x, y, z, range, except) = self.heard_packet(h)
+            let (packet, x, y, z, range, except, centered) = self.heard_packet(h)
             for i in 0..self.connections.len() {
                 if not self.playing(i) {
                     continue
                 }
                 var other = self.connections[i].take() else continue
-                self.hear(mut other, d, packet, x, y, z, range, except)
+                self.hear(mut other, d, packet, x, y, z, range, except, centered)
                 self.connections[i] = some(other)
             }
         }
@@ -1620,44 +1634,51 @@ impl Network {
     fn send_level_events_with(mut self, d: usize, con: mut Connection) {
         let heard = self.levels[d].take_heard()
         for h in heard {
-            let (packet, x, y, z, range, except) = self.heard_packet(h)
+            let (packet, x, y, z, range, except, centered) = self.heard_packet(h)
             if not con.closing and con.phase == Phase.Play {
-                self.hear(mut con, d, packet, x, y, z, range, except)
+                self.hear(mut con, d, packet, x, y, z, range, except, centered)
             }
             for i in 0..self.connections.len() {
                 if not self.playing(i) {
                     continue
                 }
                 var other = self.connections[i].take() else continue
-                self.hear(mut other, d, packet, x, y, z, range, except)
+                self.hear(mut other, d, packet, x, y, z, range, except, centered)
                 self.connections[i] = some(other)
             }
         }
     }
 
     // What the players near enough are sent of `h`: its packet, where it is, how near they're
-    // to be, and the player not sent it, by their entity, -1 for none (D376).
-    fn heard_packet(mut self, h: Heard) -> (List<u8>, f64, f64, f64, f64, i32) {
+    // to be, the player not sent it, by their entity, -1 for none (D376), and whether it's their
+    // block's middle that's to be near, `closerToCenterThan` (CAL-143).
+    fn heard_packet(mut self, h: Heard) -> (List<u8>, f64, f64, f64, f64, i32, bool) {
         return match h {
-            Heard.Event(e) => (encode_play(ClientboundLevelEvent { kind: e.kind, pos: BlockPos { x: e.x, y: e.y, z: e.z }, data: e.data, global: false }), f64(e.x), f64(e.y), f64(e.z), 64.0, e.except),
-            Heard.Block(e) => (encode_play(ClientboundBlockEvent { pos: BlockPos { x: e.x, y: e.y, z: e.z }, b0: u8.wrap(e.b0), b1: u8.wrap(e.b1), block: i32.wrap(e.block) }), f64(e.x), f64(e.y), f64(e.z), 64.0, -1),
+            Heard.Event(e) => (encode_play(ClientboundLevelEvent { kind: e.kind, pos: BlockPos { x: e.x, y: e.y, z: e.z }, data: e.data, global: false }), f64(e.x), f64(e.y), f64(e.z), 64.0, e.except, false),
+            Heard.Block(e) => (encode_play(ClientboundBlockEvent { pos: BlockPos { x: e.x, y: e.y, z: e.z }, b0: u8.wrap(e.b0), b1: u8.wrap(e.b1), block: i32.wrap(e.block) }), f64(e.x), f64(e.y), f64(e.z), 64.0, -1, false),
+            Heard.Particles(p) => {
+                let id = self.particle_id(p.particle)
+                (encode_play(ClientboundLevelParticles { particle: id, override_limiter: false, always_show: false, x: p.x, y: p.y, z: p.z, x_dist: p.dx, y_dist: p.dy, z_dist: p.dz, x_speed: p.speed, y_speed: p.speed, z_speed: p.speed, count: p.count, randomization: 0 }), p.x, p.y, p.z, 32.0, -1, true)
+            },
             Heard.Sound(s) => {
                 let id = self.sound_id(s.sound)
                 let range = if s.volume > 1.0f32 { 16.0 * f64(s.volume) } else { 16.0 }
-                (encode_play(ClientboundSound { sound: id + 1, source: s.source, x: i32.saturate(s.x * 8.0), y: i32.saturate(s.y * 8.0), z: i32.saturate(s.z * 8.0), volume: s.volume, pitch: s.pitch, seed: s.seed }), s.x, s.y, s.z, range, s.except)
+                (encode_play(ClientboundSound { sound: id + 1, source: s.source, x: i32.saturate(s.x * 8.0), y: i32.saturate(s.y * 8.0), z: i32.saturate(s.z * 8.0), volume: s.volume, pitch: s.pitch, seed: s.seed }), s.x, s.y, s.z, range, s.except, false)
             },
         }
     }
 
     // Sends the player `con` `packet` if they're in the level `d`, aren't `except`, and are
-    // nearer `x`, `y`, `z` than `range`, as `PlayerList.broadcast` sends it.
-    fn hear(mut self, con: mut Connection, d: usize, packet: List<u8>, x: f64, y: f64, z: f64, range: f64, except: i32) {
+    // nearer `x`, `y`, `z` than `range`, as `PlayerList.broadcast` sends it, or, if `centered`,
+    // their block's middle is, as `ServerLevel.sendParticles` sends particles (CAL-143).
+    fn hear(mut self, con: mut Connection, d: usize, packet: List<u8>, x: f64, y: f64, z: f64, range: f64, except: i32, centered: bool) {
         if con.player.dim != d or con.player.entity_id == except {
             return
         }
-        let dx = x - con.player.x
-        let dy = y - con.player.y
-        let dz = z - con.player.z
+        let (px, py, pz) = if centered { (con.player.x.floor() + 0.5, con.player.y.floor() + 0.5, con.player.z.floor() + 0.5) } else { (con.player.x, con.player.y, con.player.z) }
+        let dx = x - px
+        let dy = y - py
+        let dz = z - pz
         if dx * dx + dy * dy + dz * dz < range * range {
             self.send_bytes(mut con, packet.copy())
         }
@@ -1678,6 +1699,23 @@ impl Network {
             }
         }
         return self.sound_ids.get(name) ?? -1
+    }
+
+    // The `particle_type` registry's ID of the particle `name`, as `note`, the table
+    // made the first time; -1 for one it hasn't (CAL-143).
+    fn particle_id(mut self, name: String) -> i32 {
+        if self.particle_ids.is_empty() {
+            let names = builtin_names()
+            for r in 0..names.len() {
+                if names[r] == "particle_type" {
+                    let entries = builtin_entries(r)
+                    for i in 0..entries.len() {
+                        self.particle_ids.insert(entries[i].copy(), i32.wrap(i))
+                    }
+                }
+            }
+        }
+        return self.particle_ids.get(name) ?? -1
     }
 
     // The blocks set in the level at `d` since the last broadcast, sent to each player in it who
@@ -3315,6 +3353,21 @@ impl Network {
         self.menu_effects(mut con, fx)
     }
 
+    // Gives each level the world's jukebox songs, from the item codecs, once there are some
+    // (CAL-143).
+    fn give_songs(mut self) {
+        if not self.items_ready() {
+            return
+        }
+        let codecs = self.items.take() else return
+        let songs = codecs.songs()
+        self.items = some(codecs)
+        for d in 0..self.levels.len() {
+            self.levels[d].songs = songs.copy()
+        }
+        self.songs_given = true
+    }
+
     // Whether players' items can be read and sent: the item codecs and their streams, made the
     // first time they're asked for, from the world's registries, which a test's world hasn't.
     fn items_ready(mut self) -> bool {
@@ -3751,7 +3804,10 @@ impl Network {
     // and a block placement that does nothing at the top or bottom of the world tells them its
     // limit, twice at the top as vanilla does; else they're told of the top's. Then the block and
     // the one beside the face are sent them as they are, and what else was set off. A use that
-    // swings the arm swings it for those who see the player, who see no one yet.
+    // swings the arm swings it for those who see the player, who see no one yet; one the server
+    // swings, `SUCCESS_SERVER`, swings it for the player too, twice, as `handleUseItemOn` does,
+    // with what the hand held as it was used (CAL-143). A swing half through another is let be,
+    // `SwingState.startIfAble`, which waits for the client's own swings to be read.
     fn use_item_on(mut self, con: mut Connection, u: ServerboundUseItemOn) -> bool {
         if u.sequence < 0 {
             self.suppress("net.minecraft.network.protocol.game.ServerboundUseItemOnPacket", "java.lang.IllegalArgumentException: Expected packet sequence nr >= 0")
@@ -3789,12 +3845,19 @@ impl Network {
             let text = Component.translatable("build.spawn_protection", [Component.literal("{x}, {y}, {z}")]).colored("red")
             self.send(mut con, ClientboundSystemChat { content: text, overlay: true }, State.Play)
         } else if not con.player.awaiting and self.world.dims[d].border.within(f64(x), f64(z)) {
+            let (kind, duration) = self.interact_animation(con, hand)
+            let me = con.player.entity_id
+            self.server_swing = false
             let consumed = self.use_on_block(mut con, hand, x, y, z, face, at_x, at_y, at_z, u.inside)
             // What the use was heard to do is sent as it's done, before what follows (CAL-142).
             self.send_level_events_with(d, mut con)
+            let swing = self.server_swing
+            self.server_swing = false
             let attempt = self.placement_attempt(con, hand)
             if face == UP and not consumed and y >= max_y and attempt {
                 self.build_limit(mut con, true, max_y)
+            } else if swing {
+                self.send(mut con, ClientboundSwingAnimation { entity_id: me, hand: hand, kind: kind, duration: duration }, State.Play)
             }
             if not consumed and attempt {
                 if face == UP and y >= max_y {
@@ -3802,6 +3865,8 @@ impl Network {
                 } else if face == DOWN and y <= min_y {
                     self.build_limit(mut con, false, min_y)
                 }
+            } else if swing {
+                self.send(mut con, ClientboundSwingAnimation { entity_id: me, hand: hand, kind: kind, duration: duration }, State.Play)
             }
         } else {
             self.build_limit(mut con, true, max_y)
@@ -3813,6 +3878,29 @@ impl Network {
         }
         self.send_level_events_with(d, mut con)
         return true
+    }
+
+    // `ItemStack.getInteractAnimation` of what the player's hand `hand` holds: its
+    // `interact_animation`'s type, by `SwingAnimationType`'s ID, and its ticks, a whack of 6 where
+    // it has none (CAL-143).
+    fn interact_animation(mut self, con: Connection, hand: i32) -> (i32, i32) {
+        let held = held_in(con, hand) else return (1, 6)
+        if not self.items_ready() {
+            return (1, 6)
+        }
+        let items = self.items.take() else return (1, 6)
+        let found = items.component(held, String("minecraft:interact_animation"))
+        self.items = some(items)
+        let given = found else return (1, 6)
+        let Tag.Compound(m) = given else return (1, 6)
+        var kind = 1
+        if m.contains("type") {
+            if let Tag.Str(name) = m["type"].copy() {
+                kind = if name == "none" { 0 } else if name == "stab" { 2 } else { 1 }
+            }
+        }
+        let duration = if m.contains("duration") { m["duration"].number_int() ?? 6 } else { 6 }
+        return (kind, duration)
     }
 
     // `sendBuildLimitMessage`: the player told, over their hotbar in red, that blocks go no higher
@@ -3922,6 +4010,7 @@ impl Network {
             can_place: can_place,
             player: con.player.entity_id,
             y_rot: con.player.y_rot,
+            hotbar: hotbar_of(con),
         }
         var handed = List<Handed>()
         let block_took = not suppressed and self.block_used(d, f, p, state, x, y, z, who, mut handed)
@@ -4016,6 +4105,15 @@ impl Network {
                 Handed.Changed(s) => set_held(mut con, hand, some(s.copy())),
                 Handed.Added(s) => dropped = dropped or add_item(mut con.player.inventory, s, items, who) != none,
                 Handed.Ate(nutrition, modifier) => con.player.status.eat(nutrition, modifier),
+                Handed.Swapped(taken) => {
+                    // `swapSingleItem`: a player with infinite materials given nothing keeps
+                    // what they held (CAL-143).
+                    if taken != none or not who.infinite {
+                        set_held(mut con, hand, taken.copy())
+                    }
+                },
+                Handed.Slot(slot, stack) => con.player.inventory.set_menu_slot(usize.wrap(36 + slot), stack.copy()),
+                Handed.Swing => self.server_swing = true,
             }
         }
         self.items = some(items)
@@ -6619,6 +6717,15 @@ fn held_in(con: Connection, hand: i32) -> Tag? {
 }
 
 // What the player's hand `hand` holds set to `stack`, as `setItemInHand` (CAL-139).
+// The player's hotbar, its 9 slots (CAL-143).
+fn hotbar_of(con: Connection) -> List<Tag?> {
+    var out = List<Tag?>()
+    for i in 0..9 {
+        out.push(con.player.inventory.selected(i))
+    }
+    return out
+}
+
 fn set_held(con: mut Connection, hand: i32, stack: Tag?) {
     let slot = if hand == 0 { usize.wrap(36 + con.player.selected) } else { 45usize }
     con.player.inventory.set_menu_slot(slot, stack.copy())

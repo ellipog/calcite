@@ -229,13 +229,15 @@ USE_ITEMS = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, [
     slotted(8, "bucket", 2),
 ]), equipment={}, foodLevel=nbt.Int(10))
 # In `use_books`: in survival mode, holding a book and quill, two books, an enchanted book, stone and
-# dirt, with its sixth slot empty (CAL-142).
+# dirt, with its sixth slot empty (CAL-142), and cat's record in the seventh, the last two empty
+# (CAL-143).
 USE_BOOKS = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, [
     slotted(0, "writable_book"),
     slotted(1, "book", 2),
     slotted(2, "enchanted_book"),
     slotted(3, "stone", 3),
     slotted(4, "dirt"),
+    slotted(6, "music_disc_cat"),
 ]), equipment={})
 # The use_items rules: the dig configurations', and no natural regeneration, so the bot's food stays
 # where the cake it eats puts it (CAL-142).
@@ -334,7 +336,8 @@ CONFIGS = {
     "use_items": Config({}, view=3, scenarios=("use-items",), world=FIXTURES / "use_items" / "world",
                         fixture="use_items", rules=USE_ITEMS_RULES, player=USE_ITEMS),
     # The bot, in survival mode, puts a book on the use_items fixture's lectern, books in its
-    # chiseled bookshelf and takes one back, and stone in its decorated pot (CAL-142).
+    # chiseled bookshelf and takes one back, and stone in its decorated pot (CAL-142); then plays
+    # a record in its jukebox and swaps stacks on its shelves (CAL-143).
     "use_books": Config({}, view=3, scenarios=("use-books",), world=FIXTURES / "use_items" / "world",
                         fixture="use_items", rules=USE_ITEMS_RULES, player=USE_BOOKS),
 }

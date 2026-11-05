@@ -19,11 +19,12 @@ module world.block_use
 import nbt.tag.{Tag}
 import random.source.{RandomSource}
 import registry.components.{ItemCodecs}
-import world.block_entity_ticks.{update_signal_strength}
-import world.block_level.{BlockLevel, remove_block}
+import world.block_entity_ticks.{play_song, playing_song, song_changed, stop_song, update_signal_strength}
+import world.block_level.{BlockLevel, remove_block, update_output_signal}
 import world.block_updates.{comparator_refresh, play_note}
 import world.level_writer.{UPDATE_LIMIT}
 import world.placing.{PlaceFacts, component_of, from_y_rot}
+import world.shelves.{chain_of}
 import world.sources.{attached_neighbours}
 import worldgen.access.{BlockAccess}
 import worldgen.facts.{DOWN, EAST, Facts, NORTH, SOUTH, UP, WATER_FLUID, WEST, direction_name, horizontal, opposite, step_x, step_y, step_z}
@@ -55,6 +56,13 @@ pub enum Handed {
     Changed(Tag)
     Added(Tag)
     Ate(i32, f32)
+    /// What's held swapped for what was in a shelf's slot, or for nothing: the player holds it,
+    /// but one with infinite materials who's given nothing keeps theirs (CAL-143).
+    Swapped(Tag?)
+    /// The hotbar's slot set to a stack, or emptied, as a powered shelf swaps it (CAL-143).
+    Slot(i32, Tag?)
+    /// The player's arm swung by the server, `SUCCESS_SERVER`, which they're sent too (CAL-143).
+    Swing
 }
 
 /// Who uses the block and how (CAL-139): what's held in the hand used, by its item's ID, as
@@ -81,6 +89,8 @@ pub struct User {
     pub can_place: bool
     pub player: i32 = -1
     pub y_rot: f32 = 0.0f32
+    /// The player's hotbar, its 9 slots, which a powered shelf swaps with (CAL-143).
+    pub hotbar: List<Tag?> = List<Tag?>()
 }
 
 // Whether what's held is in the item tag `tag`, as `minecraft:candles`.
@@ -179,7 +189,7 @@ pub fn use_item_on<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p: Plac
         if not tagged(items, u, "minecraft:bookshelf_books") {
             return Used.Empty
         }
-        let slot = shelf_slot(u, x, y, z, try facing_of(f, state)) else return Used.Pass
+        let slot = shelf_slot(u, x, y, z, try facing_of(f, state), 2) else return Used.Pass
         if f.get_bool(state, "slot_{slot}_occupied") {
             return Used.Empty
         }
@@ -225,8 +235,9 @@ pub fn use_item_on<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p: Plac
         done = String("Posing copper golem statues")
     } else if kind == "DecoratedPotBlock" {
         // One of what's held in the pot, if it's empty or holds the same with room, spent: its
-        // wobble, its sound, higher the fuller it is, for everyone, and the dust it puffs, which
-        // waits for particles. A pot with a loot table unpacks it first, which waits for loot.
+        // wobble, its sound, higher the fuller it is, for everyone, the dust it puffs, and
+        // `setChanged`, the comparators by it told (CAL-143). A pot with a loot table unpacks it
+        // first, which waits for loot.
         let stack = u.held.copy() else return Used.Empty
         let tag = level.block_entity_tag(x, y, z) ?? Tag.Compound(JavaHashMap<String, Tag>())
         let Tag.Compound(pot) = tag else return Used.Pass
@@ -253,7 +264,8 @@ pub fn use_item_on<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p: Plac
         level.set_block_entity_value(x, y, z, "item", with_count(inside ?? stack, count))
         let bend = f32.nearest(f64(count)) / f32.nearest(f64(most))
         level.play_sound(x, y, z, "block.decorated_pot.insert", 1.0f32, 0.7f32 + 0.5f32 * bend)
-        missing.push(String("The dust a decorated pot puffs"))
+        level.send_particles("dust_plume", f64(x) + 0.5, f64(y) + 1.2, f64(z) + 0.5, 7, 0.0, 0.0, 0.0, 0.0)
+        try update_output_signal(f, mut level, block, x, y, z)
         return Used.Done
     } else if kind == "FlowerPotBlock" {
         // A plant that pots goes in an empty pot, spent, set with flags 3; a full pot takes the use.
@@ -266,21 +278,36 @@ pub fn use_item_on<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p: Plac
         handed.push(Handed.Spent)
         return Used.Done
     } else if kind == "JukeboxBlock" {
+        // `JukeboxPlayable.tryInsertIntoJukebox`: one of a stack that plays in jukeboxes, spent,
+        // `setTheItem`: kept as its record, the jukebox set with a record with flags 2, and the
+        // song it plays, if the world has it, played from its start. Its game events and the
+        // stat wait for what makes them.
         if f.get_bool(state, "has_record") {
             return Used.Empty
         }
-        if component_of_item(items, u, "minecraft:jukebox_playable") {
-            used = Used.Done
+        if not component_of_item(items, u, "minecraft:jukebox_playable") {
+            return Used.Empty
         }
-        done = String("Playing records in jukeboxes")
+        let stack = u.held.copy() else return Used.Empty
+        handed.push(Handed.Spent)
+        let record = with_count(stack, 1)
+        let song = level.jukebox_song(record.copy())
+        level.set_block_entity_value(x, y, z, "RecordItem", record)
+        let full = try f.with_bool(state, "has_record", true)
+        _ = level.set_block_limited(x, y, z, full, 2, UPDATE_LIMIT)
+        if let playing = song {
+            try play_song(f, mut level, block, playing, x, y, z)
+        }
+        return Used.Done
     } else if kind == "LecternBlock" {
         if f.get_bool(state, "has_book") {
             return Used.Empty
         }
         if tagged(items, u, "minecraft:lectern_books") {
-            // `placeBook`: one of the book in its block entity at its first page, spent; the
-            // lectern set unpowered with a book, with flags 3, the block under it told; its sound
-            // for everyone. A written book's text is resolved first, which waits for it.
+            // `placeBook`: one of the book in its block entity at its first page, spent, and
+            // `setChanged`, the comparators by it told (CAL-143); the lectern set unpowered with a
+            // book, with flags 3, the block under it told; its sound for everyone. A written
+            // book's text is resolved first, which waits for it.
             let stack = u.held.copy() else return Used.Pass
             if let content = items.component(stack, String("minecraft:written_book_content")) {
                 if not resolved(content) {
@@ -288,10 +315,11 @@ pub fn use_item_on<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p: Plac
                 }
             }
             handed.push(Handed.Spent)
-            let now = try f.with_bool(try f.with_bool(state, "powered", false), "has_book", true)
-            _ = level.set_block_limited(x, y, z, now, 3, UPDATE_LIMIT)
             level.set_block_entity_value(x, y, z, "Book", one_of(stack))
             level.set_block_entity_value(x, y, z, "Page", Tag.Int(0))
+            try update_output_signal(f, mut level, block, x, y, z)
+            let now = try f.with_bool(try f.with_bool(state, "powered", false), "has_book", true)
+            _ = level.set_block_limited(x, y, z, now, 3, UPDATE_LIMIT)
             level.update_neighbours(x, y - 1, z, block)
             level.play_sound(x, y, z, "item.book.put", 1.0f32, 1.0f32)
             return Used.Done
@@ -316,15 +344,62 @@ pub fn use_item_on<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p: Plac
         }
         done = String("Charging respawn anchors")
     } else if kind == "ShelfBlock" {
-        if u.hand != 0 or u.face != try facing_of(f, state) {
+        // `ShelfBlock.useItemOn`, by the main hand, on its front, by the slot hit of the 3 across
+        // it (CAL-143). Unpowered, what's held, or nothing, swaps with what's in the slot; the
+        // shelf's `setChanged`, with its game event, which waits for game events; and its sound as
+        // something's taken, swapped or put, a use of nothing on nothing passing. Powered, its
+        // chain's slots swap with the hotbar's, the chain's last with the hotbar's last, each shelf
+        // `setChanged`; its sound where anything swapped.
+        if u.hand != 0 {
             return Used.Pass
         }
-        if u.held == none {
-            missing.push(String("Taking items off shelves"))
-            return Used.Pass
+        let facing = try facing_of(f, state)
+        let slot = shelf_slot(u, x, y, z, facing, 1) else return Used.Pass
+        if not f.get_bool(state, "powered") {
+            let removed = try book_in(level, x, y, z, slot)
+            try set_shelf_item(mut level, x, y, z, slot, u.held.copy())
+            handed.push(Handed.Swapped(removed.copy()))
+            try shelf_changed(f, mut level, block, x, y, z)
+            if removed != none {
+                level.play_sound(x, y, z, if u.held == none { String("block.shelf.take_item") } else { String("block.shelf.single_swap") }, 1.0f32, 1.0f32)
+            } else {
+                if u.held == none {
+                    return Used.Pass
+                }
+                level.play_sound(x, y, z, "block.shelf.place_item", 1.0f32, 1.0f32)
+            }
+            handed.push(Handed.Swing)
+            return Used.Done
         }
-        used = Used.Done
-        done = String("Putting items on shelves")
+        let chain = try chain_of(f, level, x, y, z)
+        let n = i32.wrap(chain.len())
+        var swapped = false
+        for i in 0..chain.len() {
+            let at = chain[i]
+            let part = try level.state(f, at.x, at.y, at.z)
+            if level.block_entity_tag(at.x, at.y, at.z) == none and f.block_entity_kind(f.block(part)) == none {
+                continue
+            }
+            for s in 0..3 {
+                let hotbar = 9 - (n - i32.wrap(i)) * 3 + s
+                if hotbar < 0 or hotbar > 36 {
+                    continue
+                }
+                let placed = if hotbar < 9 and usize.wrap(hotbar) < u.hotbar.len() { u.hotbar[usize.wrap(hotbar)].copy() } else { none }
+                let taken = try book_in(level, at.x, at.y, at.z, s)
+                try set_shelf_item(mut level, at.x, at.y, at.z, s, placed.copy())
+                if placed != none or taken != none {
+                    handed.push(Handed.Slot(hotbar, taken.copy()))
+                    swapped = true
+                }
+            }
+            try shelf_changed(f, mut level, f.block(part), at.x, at.y, at.z)
+        }
+        if swapped {
+            level.play_sound(x, y, z, "block.shelf.multi_swap", 1.0f32, 1.0f32)
+            handed.push(Handed.Swing)
+        }
+        return Used.Done
     } else if kind == "SignBlock" or kind == "CeilingHangingSignBlock" or kind == "WallHangingSignBlock" {
         if kind != "SignBlock" and p.kind_of(u.item_id) == "HangingSignItem" {
             let under = kind == "CeilingHangingSignBlock" and u.face == DOWN
@@ -425,7 +500,9 @@ pub fn use_without_item<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p:
     } else if kind == "CakeBlock" or kind == "CandleCakeBlock" {
         // `CakeBlock.eat`: a slice, 2 food with a modifier of 0.1, then the cake a bite further,
         // set with flags 3, or gone after its last. A candle cake is eaten as a whole cake, and
-        // its candle dropped, which waits for item entities.
+        // its candle dropped, `dropResources`: its loot, one candle, which draws nothing, popped
+        // where the level's random puts it, `popResource`, which comes with item entities
+        // (CAL-143).
         if not u.can_eat {
             return Used.Pass
         }
@@ -442,6 +519,9 @@ pub fn use_without_item<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p:
             _ = try remove_block(f, mut level, x, y, z)
         }
         if kind == "CandleCakeBlock" {
+            _ = level.next_double()
+            _ = level.next_double()
+            _ = level.next_double()
             missing.push(String("The candle a candle cake drops as it's eaten"))
         }
         return Used.Done
@@ -453,7 +533,7 @@ pub fn use_without_item<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p:
     } else if kind == "ChiseledBookShelfBlock" {
         // `removeBook`: the book in the slot hit taken, its sound for everyone, and given the
         // player; an empty slot takes the use.
-        let slot = shelf_slot(u, x, y, z, try facing_of(f, state)) else return Used.Pass
+        let slot = shelf_slot(u, x, y, z, try facing_of(f, state), 2) else return Used.Pass
         if not f.get_bool(state, "slot_{slot}_occupied") {
             return Used.Done
         }
@@ -545,10 +625,30 @@ pub fn use_without_item<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p:
         _ = level.set_block_limited(x, y, z, f.default_state(empty), 3, UPDATE_LIMIT)
         return Used.Done
     } else if kind == "JukeboxBlock" {
+        // `popOutTheItem`: its record taken out, `setTheItem` of nothing: the jukebox set without
+        // a record with flags 2 and its song stopped if it plays one; then the record's drawn where
+        // it lands, from the level's random, as an item, which waits for item entities, and the
+        // blocks around told again, `onSongChanged`.
         if not f.get_bool(state, "has_record") {
             return Used.Pass
         }
-        done = String("Taking records from jukeboxes")
+        let tags = level.block_entity_tag(x, y, z) ?? Tag.Compound(JavaHashMap<String, Tag>())
+        let Tag.Compound(box) = tags else return Used.Done
+        if not box.contains("RecordItem") {
+            return Used.Done
+        }
+        let playing = playing_song(level, box) != none
+        level.remove_block_entity_value(x, y, z, "RecordItem")
+        let empty = try f.with_bool(state, "has_record", false)
+        _ = level.set_block_limited(x, y, z, empty, 2, UPDATE_LIMIT)
+        if playing {
+            try stop_song(f, mut level, empty, x, y, z)
+        }
+        _ = level.next_float()
+        _ = level.next_float()
+        missing.push(String("The record a jukebox gives back"))
+        try song_changed(f, mut level, f.block(state), x, y, z)
+        return Used.Done
     } else if kind == "LecternBlock" {
         if not f.get_bool(state, "has_book") {
             return Used.Done
@@ -566,9 +666,11 @@ pub fn use_without_item<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p:
         if not u.game_master {
             return Used.Done
         }
-        // Its level turned one up, from 15 round to 0, with flags 2.
+        // Its level turned one up, from 15 round to 0, with flags 2, the arm swung by the server
+        // (CAL-143).
         let lit = ((f.get_int(state, "level") ?? 15) + 1) % 16
         _ = level.set_block_limited(x, y, z, try f.with_int(state, "level", lit), 2, UPDATE_LIMIT)
+        handed.push(Handed.Swing)
         return Used.Done
     } else if kind == "NoteBlock" {
         // Tuned a semitone up, from 24 round to 0, set with flags 3, then played.
@@ -609,7 +711,7 @@ pub fn use_without_item<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, p:
 // The slot of a chiseled bookshelf facing `facing` a hit on that face is in, as
 // `SelectableSlotContainer.getHitSlot` finds it in its 2 rows of 3, from where it was hit across
 // the face, as floats; none on another face.
-fn shelf_slot(u: User, x: i32, y: i32, z: i32, facing: i32) -> i32? {
+fn shelf_slot(u: User, x: i32, y: i32, z: i32, facing: i32, rows: i32) -> i32? {
     if u.face != facing {
         return none
     }
@@ -628,7 +730,7 @@ fn shelf_slot(u: User, x: i32, y: i32, z: i32, facing: i32) -> i32? {
     } else {
         return none
     }
-    let row = section(1.0f32 - f32.nearest(ry), 2)
+    let row = section(1.0f32 - f32.nearest(ry), rows)
     let column = section(across, 3)
     return some(column + row * 3)
 }
@@ -658,6 +760,30 @@ fn book_in<L: BlockAccess>(level: L, x: i32, y: i32, z: i32, slot: i32) -> Tag? 
         }
     }
     return none
+}
+
+// A shelf's slot `slot` given `stack`, or emptied, `swapItemNoUpdate`: its block entity's
+// `Items`, by slot, `ContainerHelper.saveAllItems` (CAL-143).
+fn set_shelf_item<L: BlockAccess + BlockLevel>(level: mut L, x: i32, y: i32, z: i32, slot: i32, stack: Tag?) ! Thrown {
+    var items = List<Tag>()
+    for i in 0..3 {
+        let kept = if i == slot { stack.copy() } else { try book_in(level, x, y, z, i) }
+        if let k = kept {
+            if let Tag.Compound(m) = k {
+                var entry = m.copy()
+                entry.insert(String("Slot"), Tag.Byte(i8.wrap(i)))
+                items.push(Tag.Compound(entry))
+            }
+        }
+    }
+    level.set_block_entity_value(x, y, z, "Items", Tag.List(items))
+}
+
+// `ShelfBlockEntity.setChanged`: the shelf `block` at x, y, z sent again with its items, and the
+// comparators by it told, `BlockEntity.setChanged` (CAL-143).
+fn shelf_changed<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, block: u32, x: i32, y: i32, z: i32) ! Thrown {
+    try update_output_signal(f, mut level, block, x, y, z)
+    level.send_block_updated(x, y, z)
 }
 
 // A chiseled bookshelf's slot `slot` given `book`, or emptied: its block entity's `Items`, by
