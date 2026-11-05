@@ -193,7 +193,7 @@ Input, one of:
 - `{"json": "..."}`: a text component as JSON, as data packs write them
 - `{"snbt": "..."}`: as SNBT, as commands like `/tellraw` take them since 1.21.5
 
-The component is decoded with `ComponentSerialization.CODEC`, using `RegistryOps` over vanilla's built-in registries (`VanillaRegistries.createWorldLookup()`), so hover events can show items and entities.
+The component is decoded with `ComponentSerialization.CODEC`, using `RegistryOps` over vanilla's built-in registries (`VanillaRegistries.createWorldLookup()`), so hover events can show items and entities. Calcite's adapter reads it with `registry.codecs`' text codec against the vanilla data pack's registries, loaded as its other registry probes load them (D368).
 
 Output: `{"json": <re-encoded with the same codec, written by GsonHelper.toStableString>, "plain": <getString()>}` and one blob, the component encoded as NBT and written with `NbtIo.writeAnyTag`. That's the network form since 1.20.3. `toStableString` sorts object keys, so `json` doesn't depend on codec field order. `plain` is resolved with vanilla's `en_us` language file.
 

@@ -5,11 +5,17 @@
 /// out their spawn conditions, the description reads only the ones it keeps.
 module registry.codecs
 
-import chat.component.{Component, Style, as_8bit_channel, chat_string}
+import chat.component.{Component, Style, TextColor, as_8bit_channel, chat_string}
+import chat.language.{Language}
+import command.coordinates.{block_pos}
+import command.reader.{Reader}
 import java.categories.{is_letter_or_digit}
 import java.uri.{Uri, exception_message}
+import java.uuid.{Uuid}
 import json.tree.{Json, Member}
-import nbt.tag.{Tag}
+import nbt.path.{PathError, read as read_path}
+import nbt.snbt.{units_of}
+import nbt.tag.{Tag, json_number_tag}
 import registry.builtin.{builtin_entries, builtin_names}
 import registry.codec.{Codec, Codecs, Dispatched, DoubleRange, Field, FloatRange, HolderCodec, HolderKind, IntRange, Kinds, LongRange, Many, MapOf, Need, Read, Refs, Then, after, given, same}
 import registry.registries.{Registries}
@@ -36,7 +42,7 @@ pub fn registry_codec(c: mut Codecs, name: String) -> usize? {
     if name == "chat_type" {
         let parameters = c.add(Codec.Names(["sender", "target", "content"]))
         let list = c.add(Codec.ListOf(Many { of: parameters }))
-        let style = c.add(Codec.Custom(read_style))
+        let style = style_codec(mut c)
         let decoration: List<Field> = [
             req("translation_key", string(mut c)),
             req("parameters", list),
@@ -631,8 +637,18 @@ pub fn item_stack_template(c: mut Codecs) -> usize {
         def("components", components, Tag.Compound(JavaHashMap<String, Tag>())),
     ]
     let full = c.add(Codec.Record(fields))
+    c.name(String("item stack template record"), full)
     let bare = c.add(Codec.Then(Then { of: item, then: stack_of_item, with: Tag.End }))
     return c.add(Codec.Either(full, bare))
+}
+
+/// `ItemStackTemplate.MAP_CODEC`: an item and how many, as `{id, count, components}`.
+pub fn item_stack_template_record(c: mut Codecs) -> usize {
+    if let at = c.find(String("item stack template record")) {
+        return at
+    }
+    _ = item_stack_template(mut c)
+    return c.find(String("item stack template record")) ?? 0
 }
 
 /// `Item.CODEC`'s check: any item but air.
@@ -1666,100 +1682,374 @@ pub fn positive_float(c: mut Codecs) -> usize {
     return c.shared(String("positive_float"), Codec.Float(range))
 }
 
-// `ComponentSerialization.CODEC`.
+/// `ComponentSerialization.CODEC`, as Calcite keeps what it reads: written back as
+/// `Component.to_nbt` writes it (D368).
 pub fn text(c: mut Codecs) -> usize {
-    return c.shared(String("text"), Codec.Custom(read_text))
+    let key = String("text")
+    if let at = c.find(key) {
+        return at
+    }
+    let raw = text_raw(mut c)
+    return c.shared(key, Codec.Then(Then { of: raw, then: canonical_text, with: Tag.End }))
 }
 
-fn read_text(c: Codecs, value: Json, _r: Registries) -> Read {
-    return match component_of(c, value) {
+/// `ComponentSerialization.CODEC` as it reads, before what it read is written back: a string, a
+/// list of components the first of which the rest follow, which can't be empty, or a compound of
+/// the fields of one of the contents, as the legacy component matcher picks them, `extra` and
+/// the style's. Its eithers and records fail with DataFixerUpper's messages, in its order. A
+/// translation's argument that was a JSON boolean is an array of one byte, which
+/// `Component.from_raw` reads (D368).
+pub fn text_raw(c: mut Codecs) -> usize {
+    return c.named(String("text raw"), make_text_raw)
+}
+
+fn make_text_raw(c: mut Codecs) -> Codec {
+    let me = c.find(String("text raw")) ?? 0
+    let s = string(mut c)
+    let list = c.add(Codec.ListOf(Many { of: me }))
+    let some_list = non_empty(mut c, list)
+    let special = c.add(Codec.Either(s, some_list))
+    let contents = text_contents(mut c, me)
+    let style = style_record(mut c)
+    let nothing: List<Tag> = []
+    let fields: List<Field> = [inline(contents), def("extra", some_list, Tag.List(nothing)), inline(style)]
+    let full = c.add(Codec.Record(fields))
+    return Codec.Either(special, full)
+}
+
+// The component `value` is, from the NBT the text codec read, written back.
+fn canonical_text(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    return match Component.from_raw(value) {
         ok(t) => Read.ok(t.to_nbt()),
         err(e) => Read.bad(e),
     }
 }
 
-/// The text component `value` is, as `ComponentSerialization.CODEC` reads it from JSON, or,
-/// reading NBT, from the tag: `Codec.either(Codec.either(STRING, nonEmptyList(list)), full)`,
-/// so what is none of a string, a list and an object fails with each one's message, and a
-/// list whose components all fail adds that it must have some (D363).
-pub fn component_of(c: Codecs, value: Json) -> Component ! String {
-    match value {
-        Json.Str(s) => return Component.literal(s.copy()),
-        Json.Object(_) => {
-            if c.nbt {
-                return try Component.from_nbt(Tag.from_typed_json(value))
-            }
-            return try Component.from_json(value)
-        },
-        Json.Array(items) => {
-            // `ListCodec` puts each part's message before those of the parts before it.
-            var read = List<Component>()
-            var errors = String()
-            for item in items {
-                match component_of(c, item) {
-                    ok(t) => read.push(t),
-                    err(e) => {
-                        errors = if errors.is_empty() { e } else { "{e}; {errors}" }
-                    },
-                }
-            }
-            if read.is_empty() {
-                if not errors.is_empty() {
-                    errors.push_str("; ")
-                }
-                errors.push_str("List must have contents")
-                fail either_text(c.not_string(value), errors, c.not_map(value))
-            }
-            if not errors.is_empty() {
-                fail errors
-            }
-            var first = read[0].copy()
-            for i in 1..read.len() {
-                first.extra.push(read[i].copy())
-            }
-            return first
-        },
-        _ => {
-            if c.empty_array(value) {
-                fail either_text(c.not_string(value), String("List must have contents"), c.not_map(value))
-            }
-            fail either_text(c.not_string(value), c.not_list(value), c.not_map(value))
-        },
+/// The text component `value` is, as `ComponentSerialization.CODEC` reads it, with the text codec
+/// `c` has made, `text_raw`, against `r`, or the message of its first error.
+pub fn component_of(c: Codecs, value: Json, r: Registries) -> Component ! String {
+    let at = c.find(String("text raw")) else fail String("there's no text codec")
+    var refs = Refs.new()
+    var got = c.read(at, value, r, mut refs)
+    if let e = got.error.take() {
+        fail e
     }
+    let raw = got.value.take() else fail String("the text codec read nothing")
+    return try Component.from_raw(raw)
 }
 
-// What `ComponentSerialization.CODEC`'s eithers say when none of a string, a list and an object
-// reads.
-fn either_text(as_string: String, as_list: String, as_object: String) -> String {
-    return "Failed to parse either. First: Failed to parse either. First: {as_string}; Second: {as_list}; Second: {as_object}"
+// `ComponentSerialization`'s contents, `createLegacyComponentMatcher` of each kind of contents'
+// `MAP_CODEC`, in the order `bootstrap` puts them, by the field `type`.
+fn text_contents(c: mut Codecs, me: usize) -> usize {
+    let key = String("text contents")
+    if let at = c.find(key) {
+        return at
+    }
+    let s = string(mut c)
+    let flag = bool_codec(mut c)
+    let ident = id(mut c)
+    let selector = c.add(Codec.Custom(read_selector))
+    let text_fields: List<Field> = [req("text", s)]
+    let primitive = c.add(Codec.Custom(read_primitive_arg))
+    let arg = c.add(Codec.Either(primitive, me))
+    let args = c.add(Codec.ListOf(Many { of: arg }))
+    let translate_fields: List<Field> = [req("translate", s), Field { name: "fallback", of: s, need: Need.Loose }, opt("with", args)]
+    let keybind_fields: List<Field> = [req("keybind", s)]
+    let name = c.add(Codec.Either(selector, s))
+    let score_inner: List<Field> = [req("name", name), req("objective", s)]
+    let score = c.add(Codec.Record(score_inner))
+    let score_fields: List<Field> = [req("score", score)]
+    let selector_fields: List<Field> = [req("selector", selector), opt("separator", me)]
+    // `DataSources.CODEC`, by the field `source`.
+    let entity_fields: List<Field> = [req("entity", selector)]
+    let position = c.add(Codec.Custom(read_block_pos))
+    let block_fields: List<Field> = [req("block", position)]
+    let storage_fields: List<Field> = [req("storage", ident)]
+    let sources: List<(String, usize)> = [
+        ("entity", c.add(Codec.Record(entity_fields))),
+        ("block", c.add(Codec.Record(block_fields))),
+        ("storage", c.add(Codec.Record(storage_fields))),
+    ]
+    let source = c.add(Codec.Matcher(Kinds { key: "source", by: s, kinds: sources }))
+    let path = c.add(Codec.Custom(read_nbt_path))
+    let nbt_fields: List<Field> = [
+        req("nbt", path),
+        Field { name: "interpret", of: flag, need: Need.Lenient(Tag.Byte(0i8)) },
+        Field { name: "plain", of: flag, need: Need.Lenient(Tag.Byte(0i8)) },
+        Field { name: "separator", of: me, need: Need.Loose },
+        inline(source),
+    ]
+    let nbt_record = c.add(Codec.Record(nbt_fields))
+    let nbt = c.add(Codec.Then(Then { of: nbt_record, then: one_nbt_flag, with: Tag.End }))
+    // `ObjectInfos.CODEC`, by the field `object`.
+    let atlas_fields: List<Field> = [def("atlas", ident, Tag.Str(String("minecraft:blocks"))), req("sprite", ident)]
+    let player_fields: List<Field> = [req("player", profile(mut c)), def("hat", flag, Tag.Byte(1i8))]
+    let infos: List<(String, usize)> = [
+        ("atlas", c.add(Codec.Record(atlas_fields))),
+        ("player", c.add(Codec.Record(player_fields))),
+    ]
+    let info = c.add(Codec.Matcher(Kinds { key: "object", by: s, kinds: infos }))
+    let object_fields: List<Field> = [inline(info), opt("fallback", me)]
+    let kinds: List<(String, usize)> = [
+        ("text", c.add(Codec.Record(text_fields))),
+        ("translatable", c.add(Codec.Record(translate_fields))),
+        ("keybind", c.add(Codec.Record(keybind_fields))),
+        ("score", c.add(Codec.Record(score_fields))),
+        ("selector", c.add(Codec.Record(selector_fields))),
+        ("nbt", nbt),
+        ("object", c.add(Codec.Record(object_fields))),
+    ]
+    return c.shared(key, Codec.Matcher(Kinds { key: "type", by: s, kinds: kinds }))
 }
 
-// The style the object `value`, of `members`, is, from JSON, or, reading NBT, from the tag.
-fn style_of(c: Codecs, value: Json, members: List<Member>) -> Style ! String {
+// `TranslatableContents.PRIMITIVE_ARG_CODEC`: a number, a boolean or a string, as
+// `ExtraCodecs.JAVA` makes it a Java object, kept as it came: a number with its type, as
+// `json_number_tag` gives a JSON number's, and a JSON boolean as an array of one byte, so it
+// isn't taken for a number.
+fn read_primitive_arg(c: Codecs, value: Json, _r: Registries) -> Read {
     if c.nbt {
-        match Tag.from_typed_json(value) {
-            Tag.Compound(fields) => return try Style.from_nbt(fields),
+        if let n = c.number(value) {
+            return Read.ok(n)
+        }
+    } else {
+        match value {
+            Json.Number(n) => return Read.ok(json_number_tag(n)),
+            Json.Bool(b) => {
+                let byte: List<i8> = [if b { 1i8 } else { 0i8 }]
+                return Read.ok(Tag.ByteArray(byte))
+            },
             _ => {},
         }
     }
-    return try Style.from_json(members)
+    return match value {
+        Json.Str(s) => Read.ok(Tag.Str(s.copy())),
+        _ => Read.bad(String("This value needs to be parsed as component")),
+    }
 }
 
-// `Style.Serializer.CODEC`.
-fn read_style(c: Codecs, value: Json, _r: Registries) -> Read {
-    match value {
-        Json.Object(members) => {
-            match style_of(c, value, members) {
-                ok(s) => {
-                    var m = JavaHashMap<String, Tag>()
-                    s.write_nbt(mut m)
-                    return Read.ok(Tag.Compound(m))
-                },
-                err(e) => return Read.bad(e),
-            }
-        },
-        _ => return Read.bad(c.not_map(value)),
+// `EntitySelector.COMPILABLE_CODEC`: a selector, kept as written. Calcite doesn't parse
+// selectors yet, so it takes any string (CAL-134).
+fn read_selector(c: Codecs, value: Json, _r: Registries) -> Read {
+    return match value {
+        Json.Str(s) => Read.ok(Tag.Str(s.copy())),
+        _ => Read.bad(c.not_string(value)),
     }
+}
+
+// `NbtContents.NBT_PATH_CODEC`: a path, as `NbtPathArgument` reads it with nothing after it,
+// kept as written.
+fn read_nbt_path(c: Codecs, value: Json, _r: Registries) -> Read {
+    let written_as = match value {
+        Json.Str(s) => s.copy(),
+        _ => return Read.bad(c.not_string(value)),
+    }
+    let lang = match c.lang {
+        some(l) => l.copy(),
+        none => Language.empty(),
+    }
+    match read_path(written_as, 0) {
+        ok((_, stop)) => {
+            var r = Reader.new(written_as)
+            r.at = stop
+            if r.can_read() {
+                return Read.bad("Invalid NBT path: {written_as}: {r.trailing_data(lang)}")
+            }
+            return Read.ok(Tag.Str(written_as))
+        },
+        err(PathError.Syntax(e)) => return Read.bad("Invalid NBT path: {written_as}: {e.text(lang)}"),
+        err(PathError.PastEnd(at)) => return Read.exception("java.lang.StringIndexOutOfBoundsException: Index {at} out of bounds for length {at}"),
+    }
+}
+
+// `BlockDataSource.BLOCK_POS_CODEC`: a position, as `BlockPosArgument` reads it with nothing
+// after it, kept as written.
+fn read_block_pos(c: Codecs, value: Json, _r: Registries) -> Read {
+    let written_as = match value {
+        Json.Str(s) => s.copy(),
+        _ => return Read.bad(c.not_string(value)),
+    }
+    let lang = match c.lang {
+        some(l) => l.copy(),
+        none => Language.empty(),
+    }
+    var r = Reader.new(written_as)
+    match block_pos(mut r) {
+        ok(_) => {
+            if r.can_read() {
+                return Read.bad("Invalid coordinates path: {written_as}: {r.trailing_data(lang)}")
+            }
+            return Read.ok(Tag.Str(written_as))
+        },
+        err(e) => return Read.bad("Invalid coordinates path: {written_as}: {e.text(lang)}"),
+    }
+}
+
+// `NbtContents.MAP_CODEC`'s check: not both `interpret` and `plain`.
+fn one_nbt_flag(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let both = match value {
+        Tag.Compound(m) => m.contains("interpret") and m.contains("plain"),
+        _ => false,
+    }
+    if both {
+        return Read.bad(String("'interpret' and 'plain' flags can't be both on"))
+    }
+    return Read.ok(value.copy())
+}
+
+/// `Style.Serializer.MAP_CODEC`: a style's fields, each one it may leave out, as it reads them,
+/// with a hover event's text as `text_raw` reads it.
+pub fn style_record(c: mut Codecs) -> usize {
+    return c.named(String("style record"), make_style_record)
+}
+
+fn make_style_record(c: mut Codecs) -> Codec {
+    let s = string(mut c)
+    let color = c.add(Codec.Then(Then { of: s, then: read_text_color, with: Tag.End }))
+    let flag = bool_codec(mut c)
+    let fields: List<Field> = [
+        opt("color", color),
+        opt("shadow_color", argb_int(mut c)),
+        opt("bold", flag),
+        opt("italic", flag),
+        opt("underlined", flag),
+        opt("strikethrough", flag),
+        opt("obfuscated", flag),
+        opt("click_event", click_event(mut c)),
+        opt("hover_event", hover_event(mut c)),
+        opt("insertion", s),
+        opt("font", id(mut c)),
+    ]
+    return Codec.Record(fields)
+}
+
+// `TextColor.CODEC`: a color's name or `#` and its hex, written as `serialize` writes it.
+fn read_text_color(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let name = match value {
+        Tag.Str(s) => s.copy(),
+        _ => return Read.ok(value.copy()),
+    }
+    return match TextColor.parse(name) {
+        ok(color) => Read.ok(Tag.Str(color.to_string())),
+        err(e) => Read.bad(e),
+    }
+}
+
+// `Style.Serializer.CODEC`: a style as its record reads it, written back.
+fn style_codec(c: mut Codecs) -> usize {
+    let key = String("style")
+    if let at = c.find(key) {
+        return at
+    }
+    let fields = style_record(mut c)
+    return c.shared(key, Codec.Then(Then { of: fields, then: canonical_style, with: Tag.End }))
+}
+
+fn canonical_style(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let fields = match value {
+        Tag.Compound(m) => m.copy(),
+        _ => return Read.ok(value.copy()),
+    }
+    return match Style.from_raw(fields) {
+        ok(s) => {
+            var m = JavaHashMap<String, Tag>()
+            s.write_nbt(mut m)
+            Read.ok(Tag.Compound(m))
+        },
+        err(e) => Read.bad(e),
+    }
+}
+
+// `ClickEvent.CODEC`: an event by its `action`, which can't be one only the client makes.
+fn click_event(c: mut Codecs) -> usize {
+    return c.named(String("click event"), make_click_event)
+}
+
+fn make_click_event(c: mut Codecs) -> Codec {
+    let command = c.add(Codec.Custom(read_chat_string))
+    let url = c.add(Codec.Custom(read_untrusted_uri))
+    let url_fields: List<Field> = [req("url", url)]
+    let run_fields: List<Field> = [req("command", command)]
+    let suggest_fields: List<Field> = [req("command", command)]
+    let show_fields: List<Field> = [req("dialog", dialog_holder(mut c))]
+    let page_fields: List<Field> = [req("page", positive_int(mut c))]
+    let copy_fields: List<Field> = [req("value", string(mut c))]
+    let payload = c.add(Codec.Custom(read_nbt))
+    let custom_fields: List<Field> = [req("id", id(mut c)), opt("payload", payload)]
+    let kinds: List<(String, usize)> = [
+        ("open_url", c.add(Codec.Record(url_fields))),
+        ("run_command", c.add(Codec.Record(run_fields))),
+        ("suggest_command", c.add(Codec.Record(suggest_fields))),
+        ("show_dialog", c.add(Codec.Record(show_fields))),
+        ("change_page", c.add(Codec.Record(page_fields))),
+        ("copy_to_clipboard", c.add(Codec.Record(copy_fields))),
+        ("custom", c.add(Codec.Record(custom_fields))),
+    ]
+    let names = c.add(Codec.Names(["open_url", "open_file", "run_command", "suggest_command", "show_dialog", "change_page", "copy_to_clipboard", "custom"]))
+    let by = c.add(Codec.Then(Then { of: names, then: allowed_click, with: Tag.End }))
+    return Codec.Dispatch(Kinds { key: "action", by: by, kinds: kinds })
+}
+
+// `ClickEvent.Action.filterForSerialization`: `open_file` only a client makes.
+fn allowed_click(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let file = match value {
+        Tag.Str(s) => s == "open_file",
+        _ => false,
+    }
+    if file {
+        return Read.bad(String("Click event type not allowed: OPEN_FILE"))
+    }
+    return Read.ok(value.copy())
+}
+
+// `HoverEvent.CODEC`: text, an item or an entity, by its `action`.
+fn hover_event(c: mut Codecs) -> usize {
+    return c.named(String("hover event"), make_hover_event)
+}
+
+fn make_hover_event(c: mut Codecs) -> Codec {
+    let me = text_raw(mut c)
+    let text_fields: List<Field> = [req("value", me)]
+    let item = item_stack_template_record(mut c)
+    let entity_fields: List<Field> = [
+        req("id", by_name(mut c, "minecraft:entity_type")),
+        req("uuid", lenient_uuid(mut c)),
+        opt("name", me),
+    ]
+    let kinds: List<(String, usize)> = [
+        ("show_text", c.add(Codec.Record(text_fields))),
+        ("show_item", item),
+        ("show_entity", c.add(Codec.Record(entity_fields))),
+    ]
+    let names = c.add(Codec.Names(["show_text", "show_item", "show_entity"]))
+    return Codec.Dispatch(Kinds { key: "action", by: names, kinds: kinds })
+}
+
+// `UUIDUtil.LENIENT_CODEC`: four ints, or a UUID's text, written as the ints.
+fn lenient_uuid(c: mut Codecs) -> usize {
+    let key = String("lenient uuid")
+    if let at = c.find(key) {
+        return at
+    }
+    let ints = uuid(mut c)
+    let s = string(mut c)
+    let written = c.add(Codec.Then(Then { of: s, then: uuid_of_text, with: Tag.End }))
+    return c.shared(key, Codec.Either(ints, written))
+}
+
+// `UUIDUtil.STRING_CODEC`: a UUID as `UUID.fromString` reads it, with its message where it
+// doesn't, for text that's the wrong shape.
+fn uuid_of_text(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let written_as = match value {
+        Tag.Str(s) => s.copy(),
+        _ => return Read.ok(value.copy()),
+    }
+    let parsed = Uuid.parse(written_as) else {
+        if units_of(written_as).len() > 36 {
+            return Read.bad("Invalid UUID {written_as}: UUID string too large")
+        }
+        return Read.bad("Invalid UUID {written_as}: Invalid UUID string: {written_as}")
+    }
+    return Read.ok(Tag.IntArray(parsed.ints()))
 }
 
 // `SoundEvent.CODEC`: a sound event by its ID, or given in full.
@@ -3152,4 +3442,182 @@ fn read_unchecked(c: Codecs, value: Json, _r: Registries) -> Read {
         Json.Object(_) => Read.ok(Tag.End),
         _ => Read.bad(c.not_map(value)),
     }
+}
+
+// DataFixerUpper's `Codec.string(min, max)`: a string whose length in UTF-16 units is from
+// `min` to `max`.
+pub fn string_within(c: mut Codecs, min: i32, max: i32) -> usize {
+    let bounds: List<i32> = [min, max]
+    let text_codec = string(mut c)
+    return c.add(Codec.Then(Then { of: text_codec, then: length_within, with: Tag.IntArray(bounds) }))
+}
+
+fn length_within(_c: Codecs, value: Tag, with: Tag) -> Read {
+    let s = match value {
+        Tag.Str(s) => s.copy(),
+        _ => return Read.ok(value.copy()),
+    }
+    let bounds: List<i32> = match with {
+        Tag.IntArray(b) => b.copy(),
+        _ => [0, 0],
+    }
+    let min = bounds[0]
+    let max = bounds[1]
+    let length = i32.wrap(units_of(s.copy()).len())
+    if length < min {
+        return Read.bad("String \"{s}\" is too short: {length}, expected range [{min}-{max}]")
+    }
+    if length > max {
+        return Read.bad("String \"{s}\" is too long: {length}, expected range [{min}-{max}]")
+    }
+    return Read.ok(Tag.Str(s))
+}
+
+// `ResolvableProfile.CODEC`: a whole profile, an ID and name, or part of one, with the skin it
+// shows, or a player's name alone, which is written as the name of a profile.
+pub fn profile(c: mut Codecs) -> usize {
+    let name = player_name(mut c)
+    let uuids = uuid(mut c)
+    let properties = property_map(mut c)
+    let nothing: List<Tag> = []
+    let stored_fields: List<Field> = [req("id", uuids), req("name", name), def("properties", properties, Tag.List(nothing.copy()))]
+    let stored = c.add(Codec.Record(stored_fields))
+    let partial_fields: List<Field> = [opt("name", name), opt("id", uuids), def("properties", properties, Tag.List(nothing))]
+    let partial = c.add(Codec.Record(partial_fields))
+    let either = c.add(Codec.Either(stored, partial))
+    // `PlayerSkin.Patch.MAP_CODEC`.
+    let texture = id(mut c)
+    let models: List<String> = [String("slim"), String("wide")]
+    let model = c.add(Codec.Names(models))
+    let patch_fields: List<Field> = [opt("texture", texture), opt("cape", texture), opt("elytra", texture), opt("model", model)]
+    let patch = c.add(Codec.Record(patch_fields))
+    let full_fields: List<Field> = [inline(either), inline(patch)]
+    let full = c.add(Codec.Record(full_fields))
+    let alone = c.add(Codec.Then(Then { of: name, then: name_alone, with: Tag.End }))
+    return c.add(Codec.Either(full, alone))
+}
+
+fn name_alone(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    var m = JavaHashMap<String, Tag>()
+    m.insert(String("name"), value.copy())
+    return Read.ok(Tag.Compound(m))
+}
+
+// `ExtraCodecs.PLAYER_NAME`: up to 16 units, each from `!` to `~`.
+fn player_name(c: mut Codecs) -> usize {
+    let key = String("player name")
+    if let at = c.find(key) {
+        return at
+    }
+    let sized = string_within(mut c, 0, 16)
+    return c.shared(key, Codec.Then(Then { of: sized, then: valid_player_name, with: Tag.End }))
+}
+
+fn valid_player_name(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let s = match value {
+        Tag.Str(s) => s.copy(),
+        _ => return Read.ok(value.copy()),
+    }
+    for each in units_of(s.copy()) {
+        let v = u32(each)
+        if v <= 32 or v >= 127 {
+            return Read.bad("Player name contained disallowed characters: '{s}'")
+        }
+    }
+    return Read.ok(Tag.Str(s))
+}
+
+// `ExtraCodecs.PROPERTY_MAP`: a profile's properties, as an object of each name's values, at
+// most 16 names, or a list of at most 16 properties. Written as the list, the properties of a
+// name together, the names in the order they're first given, as a `Multimap` keeps them.
+fn property_map(c: mut Codecs) -> usize {
+    let key = String("property map")
+    if let at = c.find(key) {
+        return at
+    }
+    let text_codec = string(mut c)
+    let texts = c.add(Codec.ListOf(Many { of: text_codec }))
+    let map = c.add(Codec.MapOf(MapOf { key: text_codec, value: texts }))
+    let limited = c.add(Codec.Then(Then { of: map, then: at_most_16, with: Tag.End }))
+    c.name(String("property map object"), limited)
+    let in_order = c.add(Codec.Nested(read_property_object))
+    let fields: List<Field> = [req("name", string_within(mut c, 0, 64)), req("value", string_within(mut c, 0, 32767)), opt("signature", string_within(mut c, 0, 1024))]
+    let one = c.add(Codec.Record(fields))
+    let list = c.add(Codec.ListOf(Many { of: one, max: 16 }))
+    let either = c.add(Codec.Either(in_order, list))
+    return c.shared(key, Codec.Then(Then { of: either, then: grouped, with: Tag.End }))
+}
+
+fn at_most_16(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let count = match value {
+        Tag.Compound(m) => m.len(),
+        _ => 0,
+    }
+    if count > 16 {
+        return Read.bad("Cannot have more than 16 properties, but was {count}")
+    }
+    return Read.ok(value.copy())
+}
+
+// The object form as properties, each name's values in the order the object gives the names.
+fn read_property_object(c: Codecs, value: Json, r: Registries, refs: mut Refs) -> Read {
+    let at = c.find(String("property map object")) else return Read.bad(String("no property map codec"))
+    var got = c.read(at, value, r, mut refs)
+    let read = match got.value.take() {
+        some(Tag.Compound(m)) => m,
+        _ => return got,
+    }
+    var out = List<Tag>()
+    match value {
+        Json.Object(members) => {
+            for m in members {
+                if not read.contains(m.key.copy()) {
+                    continue
+                }
+                match read[m.key.copy()] {
+                    Tag.List(values) => {
+                        for v in values {
+                            var p = JavaHashMap<String, Tag>()
+                            p.insert(String("name"), Tag.Str(m.key.copy()))
+                            p.insert(String("value"), v.copy())
+                            out.push(Tag.Compound(p))
+                        }
+                    },
+                    _ => {},
+                }
+            }
+        },
+        _ => {},
+    }
+    return Read { value: some(Tag.List(out)), error: got.error.take() }
+}
+
+// Properties with each name's together, the names in the order they're first given.
+fn grouped(_c: Codecs, value: Tag, _with: Tag) -> Read {
+    let items = match value {
+        Tag.List(items) => items.copy(),
+        _ => return Read.ok(value.copy()),
+    }
+    var names = List<Tag>()
+    for each in items {
+        let n = field(each.copy(), String("name"))
+        var seen = false
+        for kept in names {
+            if same(kept, n) {
+                seen = true
+            }
+        }
+        if not seen {
+            names.push(n)
+        }
+    }
+    var out = List<Tag>()
+    for n in names {
+        for each in items {
+            if same(field(each.copy(), String("name")), n) {
+                out.push(each.copy())
+            }
+        }
+    }
+    return Read.ok(Tag.List(out))
 }
