@@ -1,0 +1,832 @@
+/// Entity selectors as commands and text write them, read as vanilla's `EntitySelectorParser`
+/// reads them: `@` and a type, with options in brackets after it, or a player's name or a UUID.
+/// Each option and its range reads as `EntitySelectorOptions` and `MinMaxBounds` read them, with
+/// their errors in the same places (D371).
+module command.selector
+
+import chat.component.{Component}
+import command.reader.{Reader, java_double, java_float}
+import java.number.{parse_int}
+import java.uuid.{Uuid}
+import nbt.snbt.{SyntaxError, compound_at, from_units, units_of}
+import nbt.tag.{Tag}
+import registry.registry.{Registry}
+import resources.identifier.{Identifier}
+import world.modes.{GameType}
+
+/// How a selector orders the entities it finds before it takes as many as it may.
+pub enum Sorting {
+    Arbitrary
+    Nearest
+    Furthest
+    Random
+}
+
+/// A range of `double`s, `MinMaxBounds.Doubles`: either end may be open.
+pub struct Doubles {
+    pub min: f64?
+    pub max: f64?
+}
+
+/// A range of `int`s, `MinMaxBounds.Ints`.
+pub struct Ints {
+    pub min: i32?
+    pub max: i32?
+}
+
+/// A range of angles, `MinMaxBounds.FloatDegrees`, whose ends may be either way round.
+pub struct Degrees {
+    pub min: f32?
+    pub max: f32?
+}
+
+/// A score an entity must have: its objective and the range.
+pub struct Score {
+    pub objective: String
+    pub range: Ints
+}
+
+/// A criterion of an advancement and whether it must be done.
+pub struct Criterion {
+    pub name: String
+    pub done: bool
+}
+
+/// What a player must have of an advancement: all of it done or not, or some of its criteria.
+pub enum Progress {
+    Done(bool)
+    Criteria(List<Criterion>)
+}
+
+/// An advancement and what a player must have of it.
+pub struct Advancement {
+    pub id: Identifier
+    pub progress: Progress
+}
+
+/// What an entity must be for a selector to pick it, in the order the selector's options say so,
+/// as `EntitySelectorParser` adds its predicates. Each `bool` is whether a `!` turns it round.
+pub enum Test {
+    /// `@e` and `@n`: alive.
+    Alive
+    Name(String, bool)
+    GameMode(GameType, bool)
+    Team(String, bool)
+    Type(Identifier, bool)
+    TypeTag(Identifier, bool)
+    EntityTag(String, bool)
+    Nbt(Tag, bool)
+    /// Every score in its range; a missing objective or score fails it.
+    Scores(List<Score>)
+    /// Every advancement as it says, for a player.
+    Advancements(List<Advancement>)
+    Predicate(Identifier, bool)
+    XRotation(Degrees)
+    YRotation(Degrees)
+    /// A player's experience level.
+    Level(Ints)
+}
+
+/// A selector as written, vanilla's `EntitySelector` before it runs.
+pub struct Selector {
+    /// How many entities it picks at most.
+    pub most: i32
+    /// Whether it may pick entities that aren't players.
+    pub entities: bool
+    /// Whether it picks only in the dimension it runs in.
+    pub world_limited: bool
+    pub tests: List<Test>
+    /// How far from where it runs an entity may be.
+    pub distance: Doubles?
+    /// Where it runs, each part as written or, where it isn't, the command's.
+    pub x: f64?
+    pub y: f64?
+    pub z: f64?
+    /// The box it picks in, from where it runs, each part as written.
+    pub dx: f64?
+    pub dy: f64?
+    pub dz: f64?
+    pub order: Sorting
+    /// `@s`: the entity it runs as.
+    pub current: bool
+    pub player: String?
+    pub uuid: Uuid?
+    /// The one type it may pick, where there is one: a player's for `@a`, `@p` and `@r`.
+    pub only: Identifier?
+    /// Whether it was written with `@`.
+    pub uses_selector: bool
+}
+
+// `InvertableSetOptionState`'s limitation: nothing parsed yet, one value, or values turned
+// round and tags.
+enum Limitation {
+    Open
+    Single
+    Multiple
+}
+
+// `InvertableSetOptionState`: what an option that a `!` may turn round has had.
+struct SetState {
+    limitation: Limitation
+    tags: List<String>
+}
+
+impl SetState {
+    fn new() -> SetState {
+        return SetState { limitation: Limitation.Open, tags: List<String>() }
+    }
+
+    // `canParseAny`, which is `canParseAnyTag` too.
+    fn can_any(self) -> bool {
+        return self.limitation != Limitation.Single
+    }
+
+    // `canParseElement`: one turned round as long as there's no single one, else only the first.
+    fn can_element(self, inverted: bool) -> bool {
+        if inverted {
+            return self.limitation != Limitation.Single
+        }
+        return self.limitation == Limitation.Open
+    }
+
+    fn can_tag(self, tag: Identifier) -> bool {
+        let name = tag.to_string()
+        for t in self.tags {
+            if t == name {
+                return false
+            }
+        }
+        return self.can_any()
+    }
+
+    fn mark_element(mut self, inverted: bool) {
+        self.limitation = if inverted { Limitation.Multiple } else { Limitation.Single }
+    }
+
+    fn mark_tag(mut self, tag: Identifier) {
+        self.limitation = Limitation.Multiple
+        self.tags.push(tag.to_string())
+    }
+}
+
+// What `EntitySelectorParser` keeps as it reads: the selector so far, the ranges it adds as
+// tests once it's read them all, and what each option has had.
+struct Parsing {
+    s: Selector
+    level: Ints?
+    rot_x: Degrees?
+    rot_y: Degrees?
+    names: SetState
+    modes: SetState
+    teams: SetState
+    types: SetState
+    limited: bool
+    sorted: bool
+    scored: bool
+    advanced: bool
+}
+
+/// `EntitySelectorParser.parse` with selectors allowed, from `r`'s place: `@` and a selector, or
+/// a name or UUID. `types` is the entity types a `type` option may name.
+pub fn read_selector(r: mut Reader, types: Registry) -> Selector ! SyntaxError {
+    var p = Parsing {
+        s: Selector {
+            most: 0,
+            entities: false,
+            world_limited: false,
+            tests: List<Test>(),
+            distance: none,
+            x: none,
+            y: none,
+            z: none,
+            dx: none,
+            dy: none,
+            dz: none,
+            order: Sorting.Arbitrary,
+            current: false,
+            player: none,
+            uuid: none,
+            only: none,
+            uses_selector: false,
+        },
+        level: none,
+        rot_x: none,
+        rot_y: none,
+        names: SetState.new(),
+        modes: SetState.new(),
+        teams: SetState.new(),
+        types: SetState.new(),
+        limited: false,
+        sorted: false,
+        scored: false,
+        advanced: false,
+    }
+    if r.can_read() and r.peek() == '@' {
+        r.skip()
+        try selector(mut r, mut p, types)
+    } else {
+        try name_or_uuid(mut r, mut p)
+    }
+    // `finalizePredicates`.
+    if let d = p.rot_x.take() {
+        p.s.tests.push(Test.XRotation(d))
+    }
+    if let d = p.rot_y.take() {
+        p.s.tests.push(Test.YRotation(d))
+    }
+    if let l = p.level.take() {
+        p.s.tests.push(Test.Level(l))
+    }
+    return p.s
+}
+
+// `parseSelector`: the type after `@`, then the options if a `[` follows.
+fn selector(r: mut Reader, p: mut Parsing, types: Registry) ! SyntaxError {
+    p.s.uses_selector = true
+    if not r.can_read() {
+        fail r.error_here("argument.entity.selector.missing", [])
+    }
+    let start = r.at
+    let kind = r.peek()
+    r.skip()
+    if kind == 'a' {
+        p.s.most = 2147483647
+        p.s.order = Sorting.Arbitrary
+        p.s.only = some(player())
+    } else if kind == 'e' {
+        p.s.most = 2147483647
+        p.s.entities = true
+        p.s.order = Sorting.Arbitrary
+        p.s.tests.push(Test.Alive)
+    } else if kind == 'n' {
+        p.s.most = 1
+        p.s.entities = true
+        p.s.order = Sorting.Nearest
+        p.s.tests.push(Test.Alive)
+    } else if kind == 'p' {
+        p.s.most = 1
+        p.s.order = Sorting.Nearest
+        p.s.only = some(player())
+    } else if kind == 'r' {
+        p.s.most = 1
+        p.s.order = Sorting.Random
+        p.s.only = some(player())
+    } else if kind == 's' {
+        p.s.most = 1
+        p.s.entities = true
+        p.s.current = true
+    } else {
+        r.at = start
+        fail r.error_here("argument.entity.selector.unknown", [Component.literal("@{from_units(r.units, start, start + 1)}")])
+    }
+    if r.can_read() and r.peek() == '[' {
+        r.skip()
+        try options(mut r, mut p, types)
+    }
+}
+
+// `parseNameOrUUID`: a string, a UUID where `UUID.fromString` reads it, else a name of 1 to 16
+// units.
+fn name_or_uuid(r: mut Reader, p: mut Parsing) ! SyntaxError {
+    let start = r.at
+    let name = try r.read_string()
+    if let id = Uuid.parse(name) {
+        p.s.uuid = some(id)
+        p.s.entities = true
+    } else {
+        if name.is_empty() or units_of(name).len() > 16 {
+            r.at = start
+            fail r.error_here("argument.entity.invalid", [])
+        }
+        p.s.player = some(name)
+    }
+    p.s.most = 1
+}
+
+// `parseOptions`: `key=value`, split by `,`, to `]`, white space around each part.
+fn options(r: mut Reader, p: mut Parsing, types: Registry) ! SyntaxError {
+    r.skip_whitespace()
+    while r.can_read() and r.peek() != ']' {
+        r.skip_whitespace()
+        let start = r.at
+        let key = try r.read_string()
+        // `EntitySelectorOptions.get`.
+        let can = usable(p, key) else {
+            r.at = start
+            fail r.error_here("argument.entity.options.unknown", [Component.literal(key)])
+        }
+        if not can {
+            r.at = start
+            fail inapplicable(r, key)
+        }
+        r.skip_whitespace()
+        if not r.can_read() or r.peek() != '=' {
+            r.at = start
+            fail r.error_here("argument.entity.options.valueless", [Component.literal(key)])
+        }
+        r.skip()
+        r.skip_whitespace()
+        try option(mut r, mut p, key, types)
+        r.skip_whitespace()
+        if r.can_read() {
+            if r.peek() != ',' {
+                if r.peek() != ']' {
+                    fail r.error_here("argument.entity.options.unterminated", [])
+                }
+                break
+            }
+            r.skip()
+        }
+    }
+    if not r.can_read() {
+        fail r.error_here("argument.entity.options.unterminated", [])
+    }
+    r.skip()
+}
+
+// Whether the option `key` may come next, as its `canUse` says, or `none` where there's no such
+// option.
+fn usable(p: Parsing, key: String) -> bool? {
+    if key == "name" {
+        return some(p.names.can_any())
+    }
+    if key == "distance" {
+        return some(p.s.distance == none)
+    }
+    if key == "level" {
+        return some(p.level == none)
+    }
+    if key == "x" {
+        return some(p.s.x == none)
+    }
+    if key == "y" {
+        return some(p.s.y == none)
+    }
+    if key == "z" {
+        return some(p.s.z == none)
+    }
+    if key == "dx" {
+        return some(p.s.dx == none)
+    }
+    if key == "dy" {
+        return some(p.s.dy == none)
+    }
+    if key == "dz" {
+        return some(p.s.dz == none)
+    }
+    if key == "x_rotation" {
+        return some(p.rot_x == none)
+    }
+    if key == "y_rotation" {
+        return some(p.rot_y == none)
+    }
+    if key == "limit" {
+        return some(not p.s.current and not p.limited)
+    }
+    if key == "sort" {
+        return some(not p.s.current and not p.sorted)
+    }
+    if key == "gamemode" {
+        return some(p.modes.can_any())
+    }
+    if key == "team" {
+        return some(p.teams.can_any())
+    }
+    if key == "type" {
+        return some(p.types.can_any())
+    }
+    if key == "scores" {
+        return some(not p.scored)
+    }
+    if key == "advancements" {
+        return some(not p.advanced)
+    }
+    if key == "tag" or key == "nbt" or key == "predicate" {
+        return some(true)
+    }
+    return none
+}
+
+// The option `key`'s value, as its modifier reads it.
+fn option(r: mut Reader, p: mut Parsing, key: String, types: Registry) ! SyntaxError {
+    if key == "name" {
+        let start = r.at
+        let inverted = invert(mut r)
+        let name = try r.read_string()
+        if not p.names.can_element(inverted) {
+            r.at = start
+            fail inapplicable(r, "name")
+        }
+        p.names.mark_element(inverted)
+        p.s.tests.push(Test.Name(name, inverted))
+    } else if key == "distance" {
+        let start = r.at
+        let d = try doubles(mut r)
+        if (d.min ?? 0.0) < 0.0 or (d.max ?? 0.0) < 0.0 {
+            r.at = start
+            fail r.error_here("argument.entity.options.distance.negative", [])
+        }
+        p.s.distance = some(d)
+        p.s.world_limited = true
+    } else if key == "level" {
+        let start = r.at
+        let l = try ints(mut r)
+        if (l.min ?? 0) < 0 or (l.max ?? 0) < 0 {
+            r.at = start
+            fail r.error_here("argument.entity.options.level.negative", [])
+        }
+        p.level = some(l)
+        p.s.entities = false
+    } else if key == "x" or key == "y" or key == "z" or key == "dx" or key == "dy" or key == "dz" {
+        p.s.world_limited = true
+        let v = some(try r.read_double())
+        if key == "x" {
+            p.s.x = v
+        } else if key == "y" {
+            p.s.y = v
+        } else if key == "z" {
+            p.s.z = v
+        } else if key == "dx" {
+            p.s.dx = v
+        } else if key == "dy" {
+            p.s.dy = v
+        } else {
+            p.s.dz = v
+        }
+    } else if key == "x_rotation" {
+        p.rot_x = some(try degrees(mut r))
+    } else if key == "y_rotation" {
+        p.rot_y = some(try degrees(mut r))
+    } else if key == "limit" {
+        let start = r.at
+        let count = try r.read_int()
+        if count < 1 {
+            r.at = start
+            fail r.error_here("argument.entity.options.limit.toosmall", [])
+        }
+        p.s.most = count
+        p.limited = true
+    } else if key == "sort" {
+        let start = r.at
+        let name = r.read_unquoted()
+        p.s.order = if name == "nearest" {
+            Sorting.Nearest
+        } else if name == "furthest" {
+            Sorting.Furthest
+        } else if name == "random" {
+            Sorting.Random
+        } else if name == "arbitrary" {
+            Sorting.Arbitrary
+        } else {
+            r.at = start
+            fail r.error_here("argument.entity.options.sort.irreversible", [Component.literal(name)])
+        }
+        p.sorted = true
+    } else if key == "gamemode" {
+        let start = r.at
+        let inverted = invert(mut r)
+        if not p.modes.can_element(inverted) {
+            r.at = start
+            fail inapplicable(r, "gamemode")
+        }
+        let name = r.read_unquoted()
+        let mode = GameType.by_name(name) else {
+            r.at = start
+            fail r.error_here("argument.entity.options.mode.invalid", [Component.literal(name)])
+        }
+        p.s.entities = false
+        p.s.tests.push(Test.GameMode(mode, inverted))
+        p.modes.mark_element(inverted)
+    } else if key == "team" {
+        let start = r.at
+        let inverted = invert(mut r)
+        let team = r.read_unquoted()
+        if not p.teams.can_element(inverted) {
+            r.at = start
+            fail inapplicable(r, "team")
+        }
+        p.s.tests.push(Test.Team(team, inverted))
+        p.teams.mark_element(inverted)
+    } else if key == "type" {
+        try entity_type(mut r, mut p, types)
+    } else if key == "tag" {
+        let inverted = invert(mut r)
+        let tag = r.read_unquoted()
+        p.s.tests.push(Test.EntityTag(tag, inverted))
+    } else if key == "nbt" {
+        let inverted = invert(mut r)
+        let (tag, end) = try compound_at(r.units, r.text, r.at)
+        r.at = end
+        p.s.tests.push(Test.Nbt(tag, inverted))
+    } else if key == "scores" {
+        try scores(mut r, mut p)
+    } else if key == "advancements" {
+        try advancements(mut r, mut p)
+    } else {
+        let inverted = invert(mut r)
+        let id = try r.read_identifier()
+        p.s.tests.push(Test.Predicate(id, inverted))
+    }
+}
+
+// The `type` option: a type, or `#` and a tag of types, either turned round by a `!`. A type must
+// be one of `types`; a tag needn't be anything.
+fn entity_type(r: mut Reader, p: mut Parsing, types: Registry) ! SyntaxError {
+    let start = r.at
+    let inverted = invert(mut r)
+    if starts_tag(mut r) {
+        if not p.types.can_any() {
+            r.at = start
+            fail inapplicable(r, "type")
+        }
+        let tag = try r.read_identifier()
+        if not p.types.can_tag(tag) {
+            r.at = start
+            fail inapplicable(r, "type")
+        }
+        p.types.mark_tag(tag)
+        p.s.tests.push(Test.TypeTag(tag, inverted))
+        return
+    }
+    if not p.types.can_element(inverted) {
+        r.at = start
+        fail inapplicable(r, "type")
+    }
+    let id = try r.read_identifier()
+    if types.id(id) == none {
+        r.at = start
+        fail r.error_here("argument.entity.options.type.invalid", [Component.literal(id.to_string())])
+    }
+    if not inverted {
+        if id.to_string() == "minecraft:player" {
+            p.s.entities = false
+        }
+        p.s.only = some(id.copy())
+    }
+    p.s.tests.push(Test.Type(id, inverted))
+    p.types.mark_element(inverted)
+}
+
+// The `scores` option: `{objective=range,...}`, the `,`s optional, a later objective's range in
+// place of an earlier one's.
+fn scores(r: mut Reader, p: mut Parsing) ! SyntaxError {
+    var expected = List<Score>()
+    try r.expect('{')
+    r.skip_whitespace()
+    while r.can_read() and r.peek() != '}' {
+        r.skip_whitespace()
+        let name = r.read_unquoted()
+        r.skip_whitespace()
+        try r.expect('=')
+        r.skip_whitespace()
+        let range = try ints(mut r)
+        var found: usize? = none
+        for i in 0..expected.len() {
+            if expected[i].objective == name {
+                found = some(i)
+                break
+            }
+        }
+        if let i = found {
+            expected[i].range = range
+        } else {
+            expected.push(Score { objective: name, range: range })
+        }
+        r.skip_whitespace()
+        if r.can_read() and r.peek() == ',' {
+            r.skip()
+        }
+    }
+    try r.expect('}')
+    if not expected.is_empty() {
+        p.s.tests.push(Test.Scores(expected))
+    }
+    p.scored = true
+}
+
+// The `advancements` option: `{id=done,...}` or `{id={criterion=done,...},...}`, the `,`s
+// optional, a later one in place of an earlier one with its name.
+fn advancements(r: mut Reader, p: mut Parsing) ! SyntaxError {
+    var expected = List<Advancement>()
+    try r.expect('{')
+    r.skip_whitespace()
+    while r.can_read() and r.peek() != '}' {
+        r.skip_whitespace()
+        let id = try r.read_identifier()
+        r.skip_whitespace()
+        try r.expect('=')
+        r.skip_whitespace()
+        let progress = if r.can_read() and r.peek() == '{' {
+            Progress.Criteria(try criteria(mut r))
+        } else {
+            Progress.Done(try r.read_boolean())
+        }
+        var found: usize? = none
+        for i in 0..expected.len() {
+            if expected[i].id == id {
+                found = some(i)
+                break
+            }
+        }
+        if let i = found {
+            expected[i].progress = progress
+        } else {
+            expected.push(Advancement { id: id, progress: progress })
+        }
+        r.skip_whitespace()
+        if r.can_read() and r.peek() == ',' {
+            r.skip()
+        }
+    }
+    try r.expect('}')
+    if not expected.is_empty() {
+        p.s.tests.push(Test.Advancements(expected))
+        p.s.entities = false
+    }
+    p.advanced = true
+}
+
+// An advancement's criteria: `{criterion=done,...}`.
+fn criteria(r: mut Reader) -> List<Criterion> ! SyntaxError {
+    var out = List<Criterion>()
+    r.skip_whitespace()
+    try r.expect('{')
+    r.skip_whitespace()
+    while r.can_read() and r.peek() != '}' {
+        r.skip_whitespace()
+        let name = r.read_unquoted()
+        r.skip_whitespace()
+        try r.expect('=')
+        r.skip_whitespace()
+        let done = try r.read_boolean()
+        var found: usize? = none
+        for i in 0..out.len() {
+            if out[i].name == name {
+                found = some(i)
+                break
+            }
+        }
+        if let i = found {
+            out[i].done = done
+        } else {
+            out.push(Criterion { name: name, done: done })
+        }
+        r.skip_whitespace()
+        if r.can_read() and r.peek() == ',' {
+            r.skip()
+        }
+    }
+    r.skip_whitespace()
+    try r.expect('}')
+    r.skip_whitespace()
+    return out
+}
+
+// `shouldInvertValue`: whether a `!` comes next, the white space around it skipped.
+fn invert(r: mut Reader) -> bool {
+    return marked(mut r, '!')
+}
+
+// `isTag`: whether a `#` comes next, the white space around it skipped.
+fn starts_tag(r: mut Reader) -> bool {
+    return marked(mut r, '#')
+}
+
+fn marked(r: mut Reader, c: char) -> bool {
+    r.skip_whitespace()
+    if r.can_read() and r.peek() == c {
+        r.skip()
+        r.skip_whitespace()
+        return true
+    }
+    return false
+}
+
+// `argument.entity.options.inapplicable` for `key`, at the reader's place.
+fn inapplicable(r: Reader, key: String) -> SyntaxError {
+    return r.error_here("argument.entity.options.inapplicable", [Component.literal(key)])
+}
+
+fn player() -> Identifier {
+    return Identifier { namespace: "minecraft", path: "player" }
+}
+
+// The text of a range's two ends, as `MinMaxBounds.Bounds.fromReader` reads them before it
+// converts them, and where the range starts, where each of its errors is.
+struct RangeText {
+    min: String
+    max: String
+    start: usize
+}
+
+// A range's ends: its minimum and its maximum.
+const ENDS: usize = 2
+
+// `Bounds.fromReader` up to its converter: what `readNumber` reads, then, after `..`, what it
+// reads again, else the first once more. Nothing left is `argument.range.empty`.
+fn range_text(r: mut Reader) -> RangeText ! SyntaxError {
+    if not r.can_read() {
+        fail r.error_here("argument.range.empty", [])
+    }
+    let start = r.at
+    let min = range_number(mut r)
+    var max = min.copy()
+    if r.can_read() and r.peek() == '.' and r.peek_at(1) == some('.') {
+        r.at += 2
+        max = range_number(mut r)
+    }
+    return RangeText { min: min, max: max, start: start }
+}
+
+// `readNumber`'s text: digits, `-`s, and `.`s but one before another.
+fn range_number(r: mut Reader) -> String {
+    let start = r.at
+    while r.can_read() {
+        let c = r.peek()
+        if not ((c >= '0' and c <= '9') or c == '-' or (c == '.' and r.peek_at(1) != some('.'))) {
+            break
+        }
+        r.skip()
+    }
+    return from_units(r.units, start, r.at)
+}
+
+// An error at the start of a range, where `Bounds.fromReader` puts every one.
+fn range_error(r: mut Reader, start: usize, key: String, args: own List<Component>) -> SyntaxError {
+    r.at = start
+    return r.error_here(key, args)
+}
+
+// `MinMaxBounds.Doubles.fromReader`: each end as `Double.parseDouble` reads it, and not the
+// higher end first, as `Double.compareTo` has it, so `0..-0` is the wrong way round.
+fn doubles(r: mut Reader) -> Doubles ! SyntaxError {
+    let t = try range_text(mut r)
+    var ends: [f64?; 2] = [none, none]
+    for i in 0..ENDS {
+        let text = if i == 0 { t.min.copy() } else { t.max.copy() }
+        if not text.is_empty() {
+            let v = java_double(text) else fail range_error(mut r, t.start, "parsing.double.invalid", [Component.literal(text)])
+            ends[i] = some(v)
+        }
+    }
+    let min = ends[0]
+    let max = ends[1]
+    if min == none and max == none {
+        fail range_error(mut r, t.start, "argument.range.empty", [])
+    }
+    if let a = min {
+        if let b = max {
+            if a > b or (a == 0.0 and b == 0.0 and a.to_bits() == 0 and b.to_bits() != 0) {
+                fail range_error(mut r, t.start, "argument.range.swapped", [])
+            }
+        }
+    }
+    return Doubles { min: min, max: max }
+}
+
+// `MinMaxBounds.Ints.fromReader`: each end as `Integer.parseInt` reads it, and not the higher
+// end first.
+fn ints(r: mut Reader) -> Ints ! SyntaxError {
+    let t = try range_text(mut r)
+    var ends: [i32?; 2] = [none, none]
+    for i in 0..ENDS {
+        let text = if i == 0 { t.min.copy() } else { t.max.copy() }
+        if not text.is_empty() {
+            match parse_int(text, 10) {
+                ok(v) => ends[i] = some(v),
+                err(_) => fail range_error(mut r, t.start, "parsing.int.invalid", [Component.literal(text)]),
+            }
+        }
+    }
+    let min = ends[0]
+    let max = ends[1]
+    if min == none and max == none {
+        fail range_error(mut r, t.start, "argument.range.empty", [])
+    }
+    if let a = min {
+        if let b = max {
+            if a > b {
+                fail range_error(mut r, t.start, "argument.range.swapped", [])
+            }
+        }
+    }
+    return Ints { min: min, max: max }
+}
+
+// `MinMaxBounds.FloatDegrees.fromReader`: each end as `Float.parseFloat` reads it, either way
+// round.
+fn degrees(r: mut Reader) -> Degrees ! SyntaxError {
+    let t = try range_text(mut r)
+    var ends: [f32?; 2] = [none, none]
+    for i in 0..ENDS {
+        let text = if i == 0 { t.min.copy() } else { t.max.copy() }
+        if not text.is_empty() {
+            let v = java_float(text) else fail range_error(mut r, t.start, "parsing.float.invalid", [Component.literal(text)])
+            ends[i] = some(v)
+        }
+    }
+    if ends[0] == none and ends[1] == none {
+        fail range_error(mut r, t.start, "argument.range.empty", [])
+    }
+    return Degrees { min: ends[0], max: ends[1] }
+}
