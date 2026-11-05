@@ -74,10 +74,10 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # `dig` and `dig-creative`, where it digs blocks; `place` and `place-creative`, where it places
 # them; `use`, where it uses them; `use-items` and `use-books`, where it uses items on them; and
 # `use-containers`, where it opens containers and clicks in them; `items`, where it drops,
-# throws and picks up items; and `items-saved`, where it picks up items saved in the world
-# (src/rig/session.calx).
+# throws and picks up items; `items-saved`, where it picks up items saved in the world; and
+# `orbs`, where it breaks blocks that give experience (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
-                   "use-books", "use-containers", "items", "items-saved"]
+                   "use-books", "use-containers", "items", "items-saved", "orbs"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -280,6 +280,12 @@ ITEMS = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, [
     slotted(2, "iron_sword"),
     slotted(9, "oak_log", 5),
 ]), equipment={})
+# The bot's data in `orbs`: in survival mode at the spawn, facing east, holding a diamond hoe with
+# mending, one use off whole (CAL-154).
+ORBS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "diamond_hoe", 1, {"minecraft:damage": nbt.Int(1),
+                                  "minecraft:enchantments": {"minecraft:mending": nbt.Int(1)}}),
+]), equipment={})
 # The use_items rules: the dig configurations', and no natural regeneration, so the bot's food stays
 # where the cake it eats puts it (CAL-142).
 USE_ITEMS_RULES = DIG_RULES + (("minecraft:natural_health_regeneration", nbt.Byte(0)),)
@@ -411,6 +417,11 @@ CONFIGS = {
     # walks over them, picking up those it may; each server saves the rest again (CAL-148).
     "items_saved": Config({}, view=3, scenarios=("items-saved",), world=FIXTURES / "items_saved" / "world",
                            fixture="items_saved", rules=DIG_RULES, player=ITEMS),
+    # The bot, in survival mode with drops on, breaks the orbs fixture's sculk and sculk catalyst
+    # with a diamond hoe with mending; their experience orbs, split as `award` splits it, follow it
+    # and are picked up one a touch, mending the hoe first, the rest the bot's (CAL-154).
+    "orbs": Config({}, view=3, scenarios=("orbs",), world=FIXTURES / "orbs" / "world", fixture="orbs",
+                   rules=DIG_DROP_RULES, player=ORBS),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
