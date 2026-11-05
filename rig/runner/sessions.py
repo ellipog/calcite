@@ -72,8 +72,11 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # slots of its inventory as the creative menu does (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "creative", "clicks"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
-# its inventory and on it, the slot it holds and its game mode (CAL-135).
-PLAYER_KEYS = ("Inventory", "equipment", "SelectedItemSlot", "playerGameType")
+# its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
+# whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
+# their IDs (D375).
+PLAYER_KEYS = ("Inventory", "equipment", "SelectedItemSlot", "playerGameType", "attributes")
+SORTED_KEYS = {"attributes": "id"}
 # The world the round trip has vanilla make and save (rig/runner/roundtrip.py), from the seed
 # `calcite` with real terrain, its chunks full from -6 to 5 around the origin.
 SAVED_WORLD = CALCITE / "build" / "rig" / "roundtrip" / "vanilla" / "world"
@@ -404,7 +407,13 @@ def compare_saved(config):
             print(f"saved player   differs  [{config}] {side} saved no data for the bot")
             return False
         saved[side] = nbt.read(path)
-    differ = [k for k in PLAYER_KEYS if typed(saved["vanilla"].get(k)) != typed(saved["calcite"].get(k))]
+    def kept(side, k):
+        value = saved[side].get(k)
+        if k in SORTED_KEYS and isinstance(value, list):
+            return sorted((typed(v) for v in value), key=repr)
+        return typed(value)
+
+    differ = [k for k in PLAYER_KEYS if kept("vanilla", k) != kept("calcite", k)]
     print(f"saved player   {'PASS' if not differ else 'differs'}    {len(PLAYER_KEYS) - len(differ)} match, {len(differ)} differ")
     for k in differ:
         print(f"  [{config}] {k}:\n      vanilla: {saved['vanilla'].get(k)}\n      calcite: {saved['calcite'].get(k)}")

@@ -22,7 +22,7 @@ import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{DATA_VERSION, PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
-import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundContainerSetSlot, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundBlockEvent, ClientboundLevelEvent, ClientboundSound, ClientboundLightUpdate, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetCursorItem, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetPlayerInventory, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, ServerboundContainerClick, ServerboundSetCreativeModeSlot, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
+import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundContainerSetSlot, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundBlockEvent, ClientboundLevelEvent, ClientboundSound, ClientboundLightUpdate, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetCursorItem, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetPlayerInventory, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateAttributes, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SentAttribute, SentModifier, ServerboundContainerClick, ServerboundSetCreativeModeSlot, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{DecodeError, Reader, Writer, Wire, Packet, write_packet}
@@ -64,6 +64,7 @@ import world.weather.{WeatherLevels, advance as advance_weather, joining as weat
 import world.flat.{MIN_Y, SECTIONS, SURFACE_Y}
 import worldgen.providers.{GenContext, IntProvider}
 import worldgen.survive.{Env}
+import world.attributes.{Attributes, Snapshot, attribute_id, equip, sprint, unworn, update_player}
 import world.inventory.{Inventory, MENU_SLOTS}
 import world.menu.{Clicker, Effect, HashedStack, Menu, OUTSIDE, put_by_player}
 import world.item.{ItemStack, SentStack}
@@ -363,6 +364,16 @@ struct Player {
     // the server knows of their client's slots (D374).
     inventory: Inventory = Inventory()
     menu: Menu = Menu()
+    // Their attributes, what they wore and held as it last looked, `lastEquipmentItems`, and
+    // whether their data was saved before 26.3, whose `attributes` are written back as they
+    // were (D375). Their entity's tracker's ticks in the level they're in, `ServerEntity`'s
+    // `tickCount`, and whether they joined this tick, so tick from the next, as a player who
+    // joins between vanilla's ticks does.
+    attributes: Attributes = Attributes()
+    worn: List<Tag?> = List<Tag?>()
+    old_attributes: bool = false
+    tracked: i32 = 0
+    fresh: bool = false
 }
 
 // A command, or a game mode picked with F3 and F4, from the player in a slot, which runs once
@@ -1497,6 +1508,7 @@ impl Network {
         self.tick_chunks(d)
         self.send_level_events(d)
         self.broadcast_changes(d)
+        self.track_players(d)
         self.levels[d].tick_unload()
         // The block events, `runBlockEvents`, each sent as it runs with what it did, then the
         // tick's handled; entities, which come with them, and then the block entities,
@@ -1506,6 +1518,27 @@ impl Network {
         self.send_level_events(d)
         self.levels[d].tick_block_entities()
         self.send_level_events(d)
+    }
+
+    // `ChunkMap.tick`'s trackers, as far as a player's own needs them (D375): each player in the
+    // level `d` is sent what of their attributes changed, as `sendDirtyEntityData` sends them,
+    // every second tick their tracker runs, a player's `updateInterval`, from when they came into
+    // the level. Their entity data, which would send them sooner, waits for entity data.
+    fn track_players(mut self, d: usize) {
+        for i in 0..self.connections.len() {
+            var con = self.connections[i].take() else continue
+            if not con.closing and con.phase == Phase.Play and con.player.dim == d {
+                if con.player.tracked % 2 == 0 {
+                    let changed = con.player.attributes.take_synced()
+                    if not changed.is_empty() {
+                        let id = con.player.entity_id
+                        self.send(mut con, attributes_packet(id, changed), State.Play)
+                    }
+                }
+                con.player.tracked += 1
+            }
+            self.connections[i] = some(con)
+        }
     }
 
     // Gives the level `d` what a block's shape and its survival read, once natural spawning's
@@ -2915,6 +2948,11 @@ impl Network {
         var previous: GameType? = none
         var selected = 0
         var inventory = Inventory.empty()
+        // Their attributes, as `readAdditionalSaveData` reads them: those saved, then their
+        // movement speed's base, their abilities' walking speed; none for a player new to the
+        // world. Calcite doesn't upgrade older data yet, so its `attributes` are kept (D375).
+        var attributes = Attributes()
+        var old_attributes = false
         let reads_items = self.items_ready()
         if let d = saved_data {
             kept = saved_abilities(d)
@@ -2926,6 +2964,11 @@ impl Network {
                     inventory = Inventory.read(d, items, data_version_or(d, -1) < DATA_VERSION)
                 }
             }
+            old_attributes = data_version_or(d, -1) < DATA_VERSION
+            if not old_attributes and d.contains("attributes") {
+                attributes.apply(d["attributes"])
+            }
+            attributes.set_base(attribute_id(String("movement_speed")) ?? 0, f64(kept.walking_speed))
         }
         var mode = saved_mode ?? self.world.settings.game_type
         if self.world.settings.force_game_mode {
@@ -2933,7 +2976,7 @@ impl Network {
         }
         kept.update(mode)
         self.joins += 1
-        con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam, data: saved_data, mode: mode, previous_mode: previous, abilities: kept, level: self.access.level(profile.id), joined: self.joins, sender: ChunkSender.with_rate(self.world.settings.chunk_send_cap, self.world.settings.chunk_send_multiplier, self.world.settings.chunk_send_boost), dim: con.prepare.dim, selected: selected, inventory: inventory }
+        con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam, data: saved_data, mode: mode, previous_mode: previous, abilities: kept, level: self.access.level(profile.id), joined: self.joins, sender: ChunkSender.with_rate(self.world.settings.chunk_send_cap, self.world.settings.chunk_send_multiplier, self.world.settings.chunk_send_boost), dim: con.prepare.dim, selected: selected, inventory: inventory, attributes: attributes, worn: unworn(), old_attributes: old_attributes, fresh: true }
         self.logs.push(Entry.info("{profile.name}[{con.address}] logged in with entity id {id} at ({con.player.x}, {con.player.y}, {con.player.z})").calcite(Look.Join(joined_words(profile.name, con.address))))
         let spawn = self.spawn_info(con.player.dim, mode, previous)
         let secure = self.enforces_secure_chat()
@@ -3340,6 +3383,8 @@ impl Network {
         con.player.dim = to
         self.teleport(mut con, x, y, z, y_rot, x_rot)
         self.enter_level(mut con)
+        // The new level tracks them afresh, from its next tick (D375).
+        con.player.tracked = 0
         let abilities = con.player.abilities
         self.send(mut con, ClientboundPlayerAbilities { abilities: abilities }, State.Play)
         self.level_info(mut con)
@@ -3477,6 +3522,30 @@ impl Network {
         con.player.command_spam.tick()
         // `ServerPlayer.tick`'s `broadcastChanges` (D374).
         self.broadcast_menu(mut con)
+        self.tick_attributes(mut con)
+    }
+
+    // What the player's tick does to their attributes (D375): `updatePlayerAttributes`, then
+    // `detectEquipmentUpdates`, their main hand the hotbar slot they hold, then `aiStep`'s
+    // `removeFrost`, which asks for their movement speed. A player who joined this tick starts
+    // from the next.
+    fn tick_attributes(mut self, con: mut Connection) {
+        if con.player.fresh {
+            con.player.fresh = false
+            return
+        }
+        update_player(mut con.player.attributes, con.player.mode == GameType.Creative)
+        if self.items_ready() {
+            if let items = self.items {
+                var now = List<Tag?>()
+                now.push(con.player.inventory.selected(con.player.selected))
+                for slot in 1..con.player.inventory.equipment.len() {
+                    now.push(con.player.inventory.equipment[slot].copy())
+                }
+                _ = equip(mut con.player.attributes, mut con.player.worn, now, items)
+            }
+        }
+        _ = con.player.attributes.instance(attribute_id(String("movement_speed")) ?? 0)
     }
 
     // Sends the player the chunks due this tick that are ready, as `sendNextChunks` does, in as
@@ -3605,6 +3674,19 @@ impl Network {
                     self.logs.push(Entry.warn("Player {player_name(con)} tried to change game mode to {short} without required permissions"))
                 } else {
                     self.queued.push_last(Queued.Mode(con.conn.slot(), mode))
+                }
+                return true
+            },
+            // `handlePlayerCommand`: sprinting started and stopped, as `setSprinting` changes
+            // the movement speed's modifiers; what else it starts waits for beds, vehicles and
+            // elytra. An action past `Action`'s last stops the connection, as `readEnum` does.
+            PlayIn.PlayerCommand(c) => {
+                if c.action < 0 or c.action > 6 {
+                    self.fault(mut con, decode_exception("Failed to decode packet 'serverbound/minecraft:player_command': Index {c.action} out of bounds for length 7"))
+                    return false
+                }
+                if c.action == 1 or c.action == 2 {
+                    sprint(mut con.player.attributes, c.action == 1)
                 }
                 return true
             },
@@ -4956,6 +5038,19 @@ impl Network {
     }
 }
 
+// `ClientboundUpdateAttributesPacket` of the player `id`'s attributes `changed` (D375).
+fn attributes_packet(id: i32, changed: List<Snapshot>) -> ClientboundUpdateAttributes {
+    var sent = List<SentAttribute>()
+    for s in changed {
+        var modifiers = List<SentModifier>()
+        for m in s.modifiers {
+            modifiers.push(SentModifier { id: m.id.copy(), amount: m.amount, operation: m.operation })
+        }
+        sent.push(SentAttribute { attribute: i32.wrap(s.attribute), base: s.base, modifiers: modifiers })
+    }
+    return ClientboundUpdateAttributes { entity_id: id, attributes: sent }
+}
+
 // The Overworld, where the world's spawn is.
 fn overworld() -> Identifier {
     return Identifier { namespace: "minecraft", path: "overworld" }
@@ -4978,6 +5073,10 @@ fn player_tag(player: Player, id: Uuid, dimension: own String) -> JavaHashMap<St
     data.insert(String("Dimension"), Tag.Str(dimension))
     data.insert(String("SelectedItemSlot"), Tag.Int(player.selected))
     player.inventory.write(mut data, player.selected)
+    // `attributes`, each instance made, as `addAdditionalSaveData` writes them (D375).
+    if not player.old_attributes {
+        data.insert(String("attributes"), player.attributes.pack())
+    }
     // `storeGameTypes`, and `Abilities.Packed.CODEC`, every field written.
     data.insert(String("playerGameType"), Tag.Int(player.mode.id()))
     if let previous = player.previous_mode {

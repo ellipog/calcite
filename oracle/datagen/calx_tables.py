@@ -1151,6 +1151,70 @@ def calx_float(v):
     return text + "f32"
 
 
+def calx_double(v):
+    """A double as a Calx f64 literal that reads back as the same double."""
+    text = repr(float(v))
+    mantissa, _, exponent = text.partition("e")
+    if "." not in mantissa:
+        mantissa += ".0"
+    return mantissa + (f"e{int(exponent)}" if exponent else "")
+
+
+def attribute_lines(facts):
+    """world.entity_facts' attributes: each one's default, range and whether it's synced, in ID
+    order, and the player's, with their bases (CAL-137)."""
+    attributes = facts["attributes"]
+    ids = {a["id"]: i for i, a in enumerate(attributes)}
+    player = facts["player_attributes"]
+    for a in player:
+        if a["id"] not in ids:
+            raise ValueError(f"the player has {a['id']}, which isn't an attribute")
+
+    def doubles(values):
+        return ", ".join(calx_double(v) for v in values)
+
+    names = ", ".join('"' + a["id"].removeprefix("minecraft:") + '"' for a in attributes)
+    return [
+        "/// The attributes' names, without their namespace, in attribute ID order.",
+        "pub fn attribute_names() -> List<String> {",
+        f"    return [{names}]",
+        "}",
+        "",
+        "/// Each attribute's default, `getDefaultValue`, in attribute ID order.",
+        "pub fn attribute_defaults() -> List<f64> {",
+        f"    return [{doubles(a['default'] for a in attributes)}]",
+        "}",
+        "",
+        "/// The least each attribute's value is, as `RangedAttribute.sanitizeValue` keeps it, in ID order.",
+        "pub fn attribute_mins() -> List<f64> {",
+        f"    return [{doubles(a['min'] for a in attributes)}]",
+        "}",
+        "",
+        "/// The most each attribute's value is, as `sanitizeValue` keeps it, in ID order.",
+        "pub fn attribute_maxes() -> List<f64> {",
+        f"    return [{doubles(a['max'] for a in attributes)}]",
+        "}",
+        "",
+        "/// The attributes sent to clients, `isClientSyncable`, by ID.",
+        "pub fn synced_attributes() -> List<u32> {",
+        "    let synced: List<u32> = [" + ", ".join(str(i) for i, a in enumerate(attributes) if a["synced"]) + "]",
+        "    return synced",
+        "}",
+        "",
+        "/// The attributes a player has, as `DefaultAttributes` gives them for `EntityTypes.PLAYER`, by ID,",
+        "/// in ID order.",
+        "pub fn player_attributes() -> List<u32> {",
+        "    let had: List<u32> = [" + ", ".join(str(ids[a["id"]]) for a in player) + "]",
+        "    return had",
+        "}",
+        "",
+        "/// The bases of `player_attributes`, in the same order.",
+        "pub fn player_attribute_bases() -> List<f64> {",
+        f"    return [{doubles(a['base'] for a in player)}]",
+        "}",
+    ]
+
+
 def entity_facts_module(index, facts):
     """The text of src/world/entity_facts.calx."""
     if facts["game_version"] != index["game_version"]:
@@ -1169,8 +1233,8 @@ def entity_facts_module(index, facts):
     serialized = ", ".join('"' + c.lower() + '"' for c in categories)
     lines = [
         f"/// What vanilla {index['game_version']}'s natural spawning asks of each entity type, in type ID order, and of each",
-        "/// block state, in state ID order. Written by oracle/datagen/calx_tables.py from entity_facts.json",
-        "/// (D317): don't edit it.",
+        "/// block state, in state ID order, and each attribute and the player's (D375). Written by",
+        "/// oracle/datagen/calx_tables.py from entity_facts.json (D317): don't edit it.",
         "module world.entity_facts",
         "",
         "/// The mob categories, in `MobCategory` order, which a type's `category` is a place in.",
@@ -1265,6 +1329,7 @@ def entity_facts_module(index, facts):
         "/// Each state's spawn facts, in state ID order.",
     ]
     lines += encoded_table("state_spawn_facts", "facts", facts["states"])
+    lines += attribute_lines(facts)
     return "\n".join(lines)
 
 

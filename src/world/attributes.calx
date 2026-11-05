@@ -1,0 +1,873 @@
+/// A player's attributes, as vanilla's `AttributeMap` and `AttributeInstance` keep them (D375):
+/// each attribute a player has, `DefaultAttributes`' for `EntityTypes.PLAYER`, made as it's first
+/// asked for, with its base and its modifiers, and its value worked out from them as
+/// `calculateValue` works it out; which of them changed since they were last sent; what's saved
+/// of them; and the modifiers of what the player wears and holds, put on and taken off as
+/// `collectEquipmentChanges` puts them on and takes them off.
+module world.attributes
+
+import java.text.{string_hash}
+import nbt.tag.{Tag}
+import registry.components.{ItemCodecs}
+import resources.identifier.{Identifier}
+import std.java.math.{pow}
+import world.entity_facts.{attribute_defaults, attribute_maxes, attribute_mins, attribute_names, player_attribute_bases, player_attributes, synced_attributes}
+import world.menu.{same_stack}
+
+/// `AttributeModifier.Operation`s, by their IDs.
+pub const ADD_VALUE: i32 = 0
+pub const ADD_MULTIPLIED_BASE: i32 = 1
+pub const ADD_MULTIPLIED_TOTAL: i32 = 2
+
+/// The operations' names, as `AttributeModifier.CODEC` writes them, in ID order.
+pub fn operation_names() -> List<String> {
+    return ["add_value", "add_multiplied_base", "add_multiplied_total"]
+}
+
+/// The attribute named `name`, with its namespace or without, by its ID, or none.
+pub fn attribute_id(name: String) -> u32? {
+    let id = match Identifier.parse(name) {
+        ok(i) => i,
+        err(_) => return none,
+    }
+    if id.namespace != "minecraft" {
+        return none
+    }
+    let names = attribute_names()
+    for i in 0..names.len() {
+        if names[i] == id.path {
+            return some(u32.wrap(i))
+        }
+    }
+    return none
+}
+
+/// The attribute `a`'s whole name, `minecraft:` and its name.
+pub fn attribute_name(a: u32) -> String {
+    let names = attribute_names()
+    if usize(a) >= names.len() {
+        return String("minecraft:unknown")
+    }
+    let name = names[usize(a)].copy()
+    return "minecraft:{name}"
+}
+
+/// An attribute modifier, `AttributeModifier`: its ID, how much it is and its operation.
+pub struct Modifier {
+    pub id: Identifier
+    pub amount: f64
+    pub operation: i32
+}
+
+impl Modifier {
+    /// A modifier with the ID `minecraft:` and `path`.
+    pub fn named(path: own String, amount: f64, operation: i32) -> Modifier {
+        return Modifier { id: Identifier { namespace: "minecraft", path: path }, amount: amount, operation: operation }
+    }
+}
+
+// Whether two identifiers are the same.
+fn same_id(a: Identifier, b: Identifier) -> bool {
+    return a.namespace == b.namespace and a.path == b.path
+}
+
+// Whether two modifiers are the same, as a modifier put in place of one with its ID is.
+fn same_modifier(a: Modifier, b: Modifier) -> bool {
+    return same_id(a.id, b.id) and a.amount == b.amount and a.operation == b.operation
+}
+
+// `Identifier.hashCode`, which places it in fastutil's maps: `31 * namespace + path`, as Java's
+// ints wrap.
+fn identifier_hash(id: Identifier) -> i32 {
+    return string_hash(id.namespace.copy()).wrapping_mul(31).wrapping_add(string_hash(id.path.copy()))
+}
+
+// `HashCommon.mix` of an int: its bits spread by the golden ratio.
+fn mix(x: i32) -> i32 {
+    let h = x.wrapping_mul(-1640531527)
+    return h ^ i32.wrap(u32.wrap(h) >> 16)
+}
+
+// `HashCommon.arraySize` at a load factor of 0.75: the power of two at least `expected / 0.75`,
+// and at least 2.
+fn array_size(expected: i32) -> i32 {
+    let want = (f64(expected) / f64(0.75f32)).ceil()
+    var n = 2
+    while f64(n) < want {
+        n *= 2
+    }
+    return n
+}
+
+// `HashCommon.maxFill` at a load factor of 0.75.
+fn max_fill(n: i32) -> i32 {
+    return i32.saturate((f64(n) * f64(0.75f32)).ceil()).min(n - 1)
+}
+
+fn empty_slots(n: i32) -> List<Modifier?> {
+    var out = List<Modifier?>()
+    for _ in 0..n {
+        out.push(none)
+    }
+    return out
+}
+
+// fastutil's `Object2ObjectOpenHashMap` of identifiers to modifiers, as an instance keeps each
+// operation's, made with its defaults: room for 16 at a load factor of 0.75, so a table of 32
+// that doubles once it's three quarters full and halves as it empties, not below 32. Its
+// modifiers come out down the table, the order `calculateValue` takes them in, which decides the
+// last bits of a sum of three or more.
+struct ModifierMap {
+    slots: List<Modifier?> = List<Modifier?>()
+    n: i32 = 0
+    mask: i32 = 0
+    max_fill: i32 = 0
+    min_n: i32 = 0
+    size: i32 = 0
+}
+
+impl ModifierMap {
+    fn new() -> ModifierMap {
+        let n = array_size(16)
+        return ModifierMap { slots: empty_slots(n), n: n, mask: n - 1, max_fill: max_fill(n), min_n: n, size: 0 }
+    }
+
+    // Where the modifier with `id` is, or none.
+    fn find(self, id: Identifier) -> i32? {
+        var pos = mix(identifier_hash(id)) & self.mask
+        while let m = self.slots[usize.wrap(pos)] {
+            if same_id(m.id, id) {
+                return some(pos)
+            }
+            pos = (pos + 1) & self.mask
+        }
+        return none
+    }
+
+    // `put`: `m` in place of the modifier with its ID, or in the first free slot from its hash,
+    // the table doubling as it fills.
+    fn put(mut self, m: Modifier) {
+        if let at = self.find(m.id) {
+            self.slots[usize.wrap(at)] = some(m.copy())
+            return
+        }
+        var pos = mix(identifier_hash(m.id)) & self.mask
+        while self.slots[usize.wrap(pos)] != none {
+            pos = (pos + 1) & self.mask
+        }
+        self.slots[usize.wrap(pos)] = some(m.copy())
+        let before = self.size
+        self.size += 1
+        if before >= self.max_fill {
+            let grown = array_size(self.size + 1)
+            self.rehash(grown)
+        }
+    }
+
+    // `remove`: the modifier with `id` taken out and those after it shifted back, `shiftKeys`,
+    // the table halving as it empties.
+    fn remove(mut self, id: Identifier) {
+        let at = self.find(id) else return
+        self.size -= 1
+        self.shift_keys(at)
+        if self.n > self.min_n and self.size < self.max_fill / 4 and self.n > 16 {
+            let halved = self.n / 2
+            self.rehash(halved)
+        }
+    }
+
+    fn shift_keys(mut self, from: i32) {
+        var pos = from
+        loop {
+            let last = pos
+            pos = (last + 1) & self.mask
+            var found = false
+            while not found {
+                let curr = match self.slots[usize.wrap(pos)] {
+                    some(c) => c.copy(),
+                    none => {
+                        self.slots[usize.wrap(last)] = none
+                        return
+                    },
+                }
+                let slot = mix(identifier_hash(curr.id)) & self.mask
+                let moves = if last <= pos { last >= slot or slot > pos } else { last >= slot and slot > pos }
+                if moves {
+                    found = true
+                } else {
+                    pos = (pos + 1) & self.mask
+                }
+            }
+            self.slots[usize.wrap(last)] = self.slots[usize.wrap(pos)].copy()
+        }
+    }
+
+    // `rehash`: every modifier, from the top of the table down, put in a table `n` long.
+    fn rehash(mut self, n: i32) {
+        let mask = n - 1
+        var fresh = empty_slots(n)
+        var i = self.n
+        for _ in 0..self.size {
+            i -= 1
+            while self.slots[usize.wrap(i)] == none {
+                i -= 1
+            }
+            let m = self.slots[usize.wrap(i)].copy()
+            let k = m else continue
+            var pos = mix(identifier_hash(k.id)) & mask
+            while fresh[usize.wrap(pos)] != none {
+                pos = (pos + 1) & mask
+            }
+            fresh[usize.wrap(pos)] = some(k.copy())
+        }
+        self.n = n
+        self.mask = mask
+        self.max_fill = max_fill(n)
+        self.slots = fresh
+    }
+
+    // The modifiers' amounts as the map's iterator gives them, down the table.
+    fn amounts(self) -> List<f64> {
+        var out = List<f64>()
+        var pos = self.n
+        while pos > 0 {
+            pos -= 1
+            if let m = self.slots[usize.wrap(pos)] {
+                out.push(m.amount)
+            }
+        }
+        return out
+    }
+}
+
+// Where the modifier with `id` is in `list`, or none.
+fn place_of(list: List<Modifier>, id: Identifier) -> usize? {
+    for i in 0..list.len() {
+        if same_id(list[i].id, id) {
+            return some(i)
+        }
+    }
+    return none
+}
+
+// `Object2ObjectArrayMap.put`: in place of the modifier with its ID, or after the rest.
+fn put_in(list: mut List<Modifier>, m: Modifier) {
+    if let at = place_of(list, m.id) {
+        list[at] = m.copy()
+        return
+    }
+    list.push(m.copy())
+}
+
+// `Object2ObjectArrayMap.remove`: the modifier with `id` taken out, the rest kept in order.
+fn take_out(list: mut List<Modifier>, id: Identifier) -> Modifier? {
+    let at = place_of(list, id) else return none
+    var out = List<Modifier>()
+    var taken: Modifier? = none
+    for i in 0..list.len() {
+        if i == at {
+            taken = some(list[i].copy())
+        } else {
+            out.push(list[i].copy())
+        }
+    }
+    list.clear()
+    for m in out {
+        list.push(m.copy())
+    }
+    return taken
+}
+
+// `RangedAttribute.sanitizeValue`: NaN is the least it can be, and the rest kept in its range,
+// as `Mth.clamp` keeps it.
+fn sanitize(a: u32, value: f64) -> f64 {
+    let least = attribute_mins()[usize(a)]
+    if value != value {
+        return least
+    }
+    if value < least {
+        return least
+    }
+    let most = attribute_maxes()[usize(a)]
+    return if value > most { most } else { value }
+}
+
+/// An attribute's instance, `AttributeInstance`: its base, and its modifiers by ID in the order
+/// they came, as `modifierById`, an array map, keeps them, each also in its operation's map,
+/// which `calculateValue` reads; and those of them saved with the player, `permanentModifiers`,
+/// in the order they came.
+pub struct Instance {
+    pub attribute: u32 = 0
+    pub base: f64 = 0.0
+    pub modifiers: List<Modifier> = List<Modifier>()
+    pub permanent: List<Modifier> = List<Modifier>()
+    orders: List<ModifierMap> = List<ModifierMap>()
+}
+
+impl Instance {
+    // `AttributeSupplier.createInstance`: the attribute with the player's base, and no modifiers.
+    fn made(attribute: u32, base: f64) -> Instance {
+        return Instance { attribute: attribute, base: base, modifiers: [], permanent: [], orders: [ModifierMap.new(), ModifierMap.new(), ModifierMap.new()] }
+    }
+
+    /// `getValue`: the base with each `ADD_VALUE` added, then `ADD_MULTIPLIED_BASE`s of that
+    /// added, then each `ADD_MULTIPLIED_TOTAL` multiplied in, each operation's in its map's order,
+    /// then kept in the attribute's range.
+    pub fn value(self) -> f64 {
+        var base = self.base
+        for a in self.orders[0].amounts() {
+            base += a
+        }
+        var result = base
+        for a in self.orders[1].amounts() {
+            result += base * a
+        }
+        for a in self.orders[2].amounts() {
+            result *= 1.0 + a
+        }
+        return sanitize(self.attribute, result)
+    }
+
+    // `addModifier`, a transient one: false where one with its ID's already on, which vanilla
+    // throws for.
+    fn add(mut self, m: Modifier) -> bool {
+        if place_of(self.modifiers, m.id) != none {
+            return false
+        }
+        self.modifiers.push(m.copy())
+        self.order_put(m)
+        return true
+    }
+
+    // `addOrUpdateTransientModifier`: whether it changed anything.
+    fn add_or_update(mut self, m: Modifier) -> bool {
+        if let at = place_of(self.modifiers, m.id) {
+            if same_modifier(self.modifiers[at], m) {
+                return false
+            }
+        }
+        put_in(mut self.modifiers, m)
+        self.order_put(m)
+        return true
+    }
+
+    // `removeModifier`: whether one with `id` was on.
+    fn remove(mut self, id: Identifier) -> bool {
+        let m = take_out(mut self.modifiers, id) else return false
+        if m.operation >= 0 and m.operation < 3 {
+            self.orders[usize.wrap(m.operation)].remove(id)
+        }
+        _ = take_out(mut self.permanent, id)
+        return true
+    }
+
+    fn order_put(mut self, m: Modifier) {
+        if m.operation >= 0 and m.operation < 3 {
+            self.orders[usize.wrap(m.operation)].put(m)
+        }
+    }
+
+    // `apply`, of what was saved: its base, and each modifier put on, saved again.
+    fn apply(mut self, base: f64, saved: List<Modifier>) {
+        self.base = base
+        for m in saved {
+            put_in(mut self.modifiers, m)
+            self.order_put(m)
+            put_in(mut self.permanent, m)
+        }
+    }
+
+    // `pack`, as `AttributeInstance.Packed.CODEC` writes it: its ID, its base, always, and the
+    // modifiers saved with it where there are any.
+    fn pack(self) -> Tag {
+        var m = JavaHashMap<String, Tag>()
+        m.insert(String("id"), Tag.Str(attribute_name(self.attribute)))
+        m.insert(String("base"), Tag.double(self.base))
+        if not self.permanent.is_empty() {
+            var list = List<Tag>()
+            for p in self.permanent {
+                list.push(modifier_tag(p))
+            }
+            m.insert(String("modifiers"), Tag.List(list))
+        }
+        return Tag.Compound(m)
+    }
+}
+
+// `AttributeModifier.CODEC`'s fields: its ID, how much and its operation's name.
+fn modifier_tag(p: Modifier) -> Tag {
+    var m = JavaHashMap<String, Tag>()
+    m.insert(String("id"), Tag.Str(p.id.to_string()))
+    m.insert(String("amount"), Tag.double(p.amount))
+    m.insert(String("operation"), Tag.Str(operation_names()[usize.wrap(p.operation)].copy()))
+    return Tag.Compound(m)
+}
+
+// A modifier as `AttributeModifier.CODEC` reads it, or none where it doesn't.
+fn read_modifier(t: Tag) -> Modifier? {
+    let Tag.Compound(m) = t else return none
+    if not m.contains("id") or not m.contains("amount") or not m.contains("operation") {
+        return none
+    }
+    let named = text(m, "id") else return none
+    let id = match Identifier.parse(named) {
+        ok(i) => i,
+        err(_) => return none,
+    }
+    let amount = m["amount"].number_double() else return none
+    let op = text(m, "operation") else return none
+    let names = operation_names()
+    for i in 0..names.len() {
+        if names[i] == op {
+            return some(Modifier { id: id, amount: amount, operation: i32.wrap(i) })
+        }
+    }
+    return none
+}
+
+/// What an attribute is as `ClientboundUpdateAttributesPacket` sends it: its ID, its base and
+/// its modifiers in the order they came.
+pub struct Snapshot {
+    pub attribute: u32
+    pub base: f64
+    pub modifiers: List<Modifier>
+}
+
+/// A player's attributes, `AttributeMap`: the instances made, in the order they were made, and
+/// those that changed since they were last sent and are sent to clients, in the order they first
+/// changed. Vanilla's map and set of them go by their identity hashes, so neither has an order
+/// to keep, and the protocol suite compares them without one.
+pub struct Attributes {
+    pub instances: List<Instance> = List<Instance>()
+    to_sync: List<u32> = List<u32>()
+}
+
+impl Attributes {
+    fn find(self, a: u32) -> usize? {
+        for i in 0..self.instances.len() {
+            if self.instances[i].attribute == a {
+                return some(i)
+            }
+        }
+        return none
+    }
+
+    // The player's base for `a`, from `DefaultAttributes`, or none where a player hasn't it.
+    fn supplied(a: u32) -> f64? {
+        let had = player_attributes()
+        for i in 0..had.len() {
+            if had[i] == a {
+                return some(player_attribute_bases()[i])
+            }
+        }
+        return none
+    }
+
+    /// `getInstance`: `a`'s instance, made where it isn't yet, which marks it changed, as
+    /// `createInstance`'s `replaceFrom` does; none for one a player hasn't.
+    pub fn instance(mut self, a: u32) -> usize? {
+        if let at = self.find(a) {
+            return some(at)
+        }
+        let base = Attributes.supplied(a) else return none
+        self.instances.push(Instance.made(a, base))
+        self.changed(a)
+        return some(self.instances.len() - 1)
+    }
+
+    // `onAttributeModified`: `a` is sent again where it's sent to clients.
+    fn changed(mut self, a: u32) {
+        for s in synced_attributes() {
+            if s == a {
+                for t in self.to_sync {
+                    if t == a {
+                        return
+                    }
+                }
+                self.to_sync.push(a)
+                return
+            }
+        }
+    }
+
+    /// `getValue`: `a`'s value, from its instance, or the player's base where none's made yet,
+    /// or its default for one a player hasn't, which vanilla throws for.
+    pub fn value(self, a: u32) -> f64 {
+        if let at = self.find(a) {
+            return self.instances[at].value()
+        }
+        let base = Attributes.supplied(a) ?? attribute_defaults()[usize(a)]
+        return sanitize(a, base)
+    }
+
+    /// `setBaseValue` on `a`'s instance, made where it isn't.
+    pub fn set_base(mut self, a: u32, base: f64) {
+        let at = self.instance(a) else return
+        if self.instances[at].base != base {
+            self.instances[at].base = base
+            self.changed(a)
+        }
+    }
+
+    /// `removeModifier` then `addTransientModifier` on `a`'s instance, made where it isn't, as
+    /// `collectEquipmentChanges` puts an item's modifiers on.
+    pub fn replace(mut self, a: u32, m: Modifier) {
+        let at = self.instance(a) else return
+        _ = self.instances[at].remove(m.id)
+        if self.instances[at].add(m) {
+            self.changed(a)
+        }
+    }
+
+    /// `addOrUpdateTransientModifier` on `a`'s instance, made where it isn't.
+    pub fn update(mut self, a: u32, m: Modifier) {
+        let at = self.instance(a) else return
+        if self.instances[at].add_or_update(m) {
+            self.changed(a)
+        }
+    }
+
+    /// `removeModifier` on `a`'s instance, made where it isn't.
+    pub fn take_off(mut self, a: u32, id: Identifier) {
+        let at = self.instance(a) else return
+        if self.instances[at].remove(id) {
+            self.changed(a)
+        }
+    }
+
+    /// The attributes changed since they were last sent, as `getAttributesToSync` has them,
+    /// which are then sent, as `sendDirtyEntityData` clears them.
+    pub fn take_synced(mut self) -> List<Snapshot> {
+        var out = List<Snapshot>()
+        for a in self.to_sync {
+            if let at = self.find(a) {
+                let i = self.instances[at].copy()
+                out.push(Snapshot { attribute: a, base: i.base, modifiers: i.modifiers.copy() })
+            }
+        }
+        self.to_sync.clear()
+        return out
+    }
+
+    /// `pack`, as `LivingEntity.addAdditionalSaveData` writes it under `attributes`: each
+    /// instance made.
+    pub fn pack(self) -> Tag {
+        var out = List<Tag>()
+        for i in self.instances {
+            out.push(i.pack())
+        }
+        return Tag.List(out)
+    }
+
+    /// `apply`, of `attributes` as `readAdditionalSaveData` reads it with
+    /// `AttributeInstance.Packed.LIST_CODEC`: each instance by its attribute, made, its base,
+    /// 0 where there's none, and its modifiers, which it saves again. An entry whose attribute
+    /// isn't one, or whose base isn't a number, is left out, as the codec leaves it out of what
+    /// it reads, and so is a modifier that doesn't read.
+    pub fn apply(mut self, saved: Tag) {
+        let Tag.List(entries) = saved else return
+        for e in entries {
+            let Tag.Compound(m) = e else continue
+            let named = text(m, "id") else continue
+            let attribute = attribute_id(named) else continue
+            var base = 0.0
+            if m.contains("base") {
+                let b = m["base"].number_double() else continue
+                base = b
+            }
+            var modifiers = List<Modifier>()
+            if m.contains("modifiers") {
+                match m["modifiers"] {
+                    Tag.List(list) => {
+                        for t in list {
+                            if let r = read_modifier(t) {
+                                modifiers.push(r)
+                            }
+                        }
+                    },
+                    _ => {},
+                }
+            }
+            let at = self.instance(attribute) else continue
+            self.instances[at].apply(base, modifiers)
+            self.changed(attribute)
+        }
+    }
+}
+
+/// Nothing in any of the 8 equipment slots, as `lastEquipmentItems` starts.
+pub fn unworn() -> List<Tag?> {
+    var out = List<Tag?>()
+    for _ in 0..8 {
+        out.push(none)
+    }
+    return out
+}
+
+/// `EquipmentSlot`'s names, in its order, which the slots below are places in.
+pub fn slot_names() -> List<String> {
+    return ["mainhand", "offhand", "feet", "legs", "chest", "head", "body", "saddle"]
+}
+
+/// Whether the slot `slot` is in the `EquipmentSlotGroup` named `group`, as its predicate
+/// tests it: `armor` has the four a player wears and an animal's body.
+pub fn group_has(group: String, slot: usize) -> bool {
+    if group == "any" {
+        return true
+    }
+    if group == "hand" {
+        return slot <= 1
+    }
+    if group == "armor" {
+        return slot >= 2 and slot <= 6
+    }
+    let names = slot_names()
+    return slot < names.len() and names[slot] == group
+}
+
+// The field `key` of `m`, or none where it hasn't one.
+fn field(m: JavaHashMap<String, Tag>, key: str) -> Tag? {
+    if not m.contains(key) {
+        return none
+    }
+    return some(m[key].copy())
+}
+
+// The string in the field `key` of `m`, or none.
+fn text(m: JavaHashMap<String, Tag>, key: str) -> String? {
+    return match field(m, key) {
+        some(Tag.Str(s)) => some(s.copy()),
+        _ => none,
+    }
+}
+
+// The float in the field `key` of `m`, 0 where there's none.
+fn float_in(m: JavaHashMap<String, Tag>, key: str) -> f32 {
+    let t = field(m, key) else return 0.0f32
+    return t.number_float() ?? 0.0f32
+}
+
+// `level_based` of the field `key` of `m`, 0 where there's none.
+fn level_in(m: JavaHashMap<String, Tag>, key: str, level: i32) -> f32 {
+    let t = field(m, key) else return 0.0f32
+    return level_based(t, level)
+}
+
+// `LevelBasedValue.calculate` of `value` at `level`, in floats: a number is a constant, and the
+// rest by their `type`. One that doesn't read is 0.
+fn level_based(value: Tag, level: i32) -> f32 {
+    if let n = value.number_float() {
+        return n
+    }
+    let Tag.Compound(m) = value else return 0.0f32
+    let named = text(m, "type") else return 0.0f32
+    let kind = match Identifier.parse(named) {
+        ok(i) => i.path.copy(),
+        err(_) => return 0.0f32,
+    }
+    if kind == "constant" {
+        return float_in(m, "value")
+    }
+    if kind == "linear" {
+        return float_in(m, "base") + float_in(m, "per_level_above_first") * f32.nearest(level - 1)
+    }
+    if kind == "levels_squared" {
+        return f32.nearest(level.wrapping_mul(level)) + float_in(m, "added")
+    }
+    if kind == "clamped" {
+        let v = level_in(m, "value", level)
+        let least = float_in(m, "min")
+        let most = float_in(m, "max")
+        if v < least {
+            return least
+        }
+        return if v > most { most } else { v }
+    }
+    if kind == "fraction" {
+        let denominator = level_in(m, "denominator", level)
+        if denominator == 0.0f32 {
+            return 0.0f32
+        }
+        return level_in(m, "numerator", level) / denominator
+    }
+    if kind == "exponent" {
+        return f32.nearest(pow(f64(level_in(m, "base", level)), f64(level_in(m, "power", level))))
+    }
+    if kind == "lookup" {
+        if let t = field(m, "values") {
+            if let values = t.doubles() {
+                if level >= 1 and usize.wrap(level) <= values.len() {
+                    return f32.nearest(values[usize.wrap(level - 1)])
+                }
+            }
+        }
+        return level_in(m, "fallback", level)
+    }
+    return 0.0f32
+}
+
+// Whether `stack` is broken, `isBroken`: damageable, with `max_damage` and `damage` and not
+// `unbreakable`, and its damage, kept from 0 to its most, at its most.
+fn broken(stack: Tag, items: ItemCodecs) -> bool {
+    let most = match items.component(stack, String("minecraft:max_damage")) {
+        some(Tag.Int(n)) => n,
+        _ => return false,
+    }
+    if items.component(stack, String("minecraft:unbreakable")) != none {
+        return false
+    }
+    let damage = match items.component(stack, String("minecraft:damage")) {
+        some(Tag.Int(n)) => n,
+        _ => return false,
+    }
+    let kept = if damage < 0 { 0 } else if damage > most { most } else { damage }
+    return kept >= most
+}
+
+/// The modifiers `stack` gives in the slot `slot`, as `ItemStack.forEachModifier` gives them,
+/// each with its attribute: its `attribute_modifiers`' for a group the slot's in, in their
+/// order, then each of its enchantments' `attributes` effects where the enchantment's `slots`
+/// have the slot, its ID with `/` and the slot's name after it, as
+/// `EnchantmentAttributeEffect.getModifier` names it. An entry whose attribute a player hasn't,
+/// or that doesn't read, gives nothing.
+pub fn stack_modifiers(stack: Tag, slot: usize, items: ItemCodecs) -> List<(u32, Modifier)> {
+    var out = List<(u32, Modifier)>()
+    if let found = items.component(stack, String("minecraft:attribute_modifiers")) {
+        let Tag.List(entries) = found else return out
+        for e in entries {
+            let Tag.Compound(m) = e else continue
+            let group = text(m, "slot") ?? String("any")
+            if not group_has(group, slot) {
+                continue
+            }
+            let named = text(m, "type") else continue
+            let attribute = attribute_id(named) else continue
+            let modifier = read_modifier(e) else continue
+            out.push((attribute, modifier))
+        }
+    }
+    let slot_name = slot_names()[slot].copy()
+    for (level, definition) in items.enchantments(stack) {
+        if not definition.contains("effects") or not definition.contains("slots") {
+            continue
+        }
+        var matching = false
+        match definition["slots"] {
+            Tag.List(groups) => {
+                for g in groups {
+                    match g {
+                        Tag.Str(s) => {
+                            if group_has(s.copy(), slot) {
+                                matching = true
+                            }
+                        },
+                        _ => {},
+                    }
+                }
+            },
+            Tag.Str(s) => {
+                matching = group_has(s.copy(), slot)
+            },
+            _ => {},
+        }
+        if not matching {
+            continue
+        }
+        let Tag.Compound(effects) = definition["effects"] else continue
+        if not effects.contains("minecraft:attributes") {
+            continue
+        }
+        let Tag.List(list) = effects["minecraft:attributes"] else continue
+        for t in list {
+            let Tag.Compound(m) = t else continue
+            let named = text(m, "attribute") else continue
+            let attribute = attribute_id(named) else continue
+            let given = text(m, "id") else continue
+            let id = match Identifier.parse(given) {
+                ok(i) => i,
+                err(_) => continue,
+            }
+            let op = text(m, "operation") else continue
+            var operation = -1
+            let names = operation_names()
+            for i in 0..names.len() {
+                if names[i] == op {
+                    operation = i32.wrap(i)
+                }
+            }
+            if operation < 0 {
+                continue
+            }
+            let amount = f64(level_in(m, "amount", level))
+            let suffixed = Identifier { namespace: id.namespace.copy(), path: "{id.path}/{slot_name}" }
+            out.push((attribute, Modifier { id: suffixed, amount: amount, operation: operation }))
+        }
+    }
+    return out
+}
+
+/// What the player's attributes make of their equipment changing, as `detectEquipmentUpdates`
+/// makes it once a tick: `worn` is what they wore and held as it last looked, as
+/// `lastEquipmentItems` keeps it, and `now` what they do now, each by `EquipmentSlot`, the main
+/// hand being the hotbar slot they hold. For each slot whose stack doesn't match, the old one's
+/// modifiers are taken off, then, for each, the new one's put on, unless it's broken; then the
+/// slot's kept as it is now. Says whether the hands swapped, `handleHandSwap`, which the players
+/// who can see them would be told of.
+pub fn equip(attributes: mut Attributes, worn: mut List<Tag?>, now: List<Tag?>, items: ItemCodecs) -> bool {
+    var changed = List<usize>()
+    for slot in 0..worn.len() {
+        if same_stack(worn[slot].copy(), now[slot].copy()) {
+            continue
+        }
+        changed.push(slot)
+        if let previous = worn[slot].copy() {
+            for (a, m) in stack_modifiers(previous, slot, items) {
+                attributes.take_off(a, m.id)
+            }
+        }
+    }
+    for slot in changed {
+        let current = now[slot].copy() else continue
+        if broken(current, items) {
+            continue
+        }
+        for (a, m) in stack_modifiers(current, slot, items) {
+            attributes.replace(a, m)
+        }
+    }
+    let swapped = changed.len() >= 2 and changed[0] == 0 and changed[1] == 1 and same_stack(now[0].copy(), worn[1].copy()) and same_stack(now[1].copy(), worn[0].copy())
+    for slot in changed {
+        worn[slot] = now[slot].copy()
+    }
+    return swapped
+}
+
+/// `ServerPlayer.updatePlayerAttributes`: the creative interaction ranges, `creative_mode_block_range`
+/// and `creative_mode_entity_range`, on in creative mode and off otherwise; and the waypoint
+/// range a crouching player's transmits from, off, since Calcite doesn't know they crouch.
+pub fn update_player(attributes: mut Attributes, creative: bool) {
+    let block = attribute_id(String("block_interaction_range")) ?? 0
+    let entity = attribute_id(String("entity_interaction_range")) ?? 0
+    let waypoint = attribute_id(String("waypoint_transmit_range")) ?? 0
+    let block_range = Modifier.named("creative_mode_block_range", 0.5, ADD_VALUE)
+    let entity_range = Modifier.named("creative_mode_entity_range", 2.0, ADD_VALUE)
+    if creative {
+        attributes.update(block, block_range)
+        attributes.update(entity, entity_range)
+    } else {
+        attributes.take_off(block, block_range.id)
+        attributes.take_off(entity, entity_range.id)
+    }
+    attributes.take_off(waypoint, Identifier { namespace: "minecraft", path: "waypoint_transmit_range_crouch" })
+}
+
+/// `LivingEntity.setSprinting`: the sprinting speed modifier, `sprinting`, taken off, and on
+/// again while sprinting.
+pub fn sprint(attributes: mut Attributes, sprinting: bool) {
+    let speed = attribute_id(String("movement_speed")) ?? 0
+    let fast = Modifier.named("sprinting", f64(0.3f32), ADD_MULTIPLIED_TOTAL)
+    attributes.take_off(speed, fast.id)
+    if sprinting {
+        attributes.replace(speed, fast)
+    }
+}

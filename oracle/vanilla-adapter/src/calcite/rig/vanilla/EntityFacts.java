@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.Bootstrap;
 import net.minecraft.tags.TagKey;
@@ -34,6 +35,10 @@ import net.minecraft.world.entity.MobCategory;
 import net.minecraft.world.entity.SpawnPlacementType;
 import net.minecraft.world.entity.SpawnPlacementTypes;
 import net.minecraft.world.entity.SpawnPlacements;
+import net.minecraft.world.entity.ai.attributes.Attribute;
+import net.minecraft.world.entity.ai.attributes.AttributeSupplier;
+import net.minecraft.world.entity.ai.attributes.DefaultAttributes;
+import net.minecraft.world.entity.ai.attributes.RangedAttribute;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
@@ -56,6 +61,10 @@ import net.minecraft.world.phys.AABB;
  * them, each group a bit. {@code isValidSpawn} reads the state's sturdy top, its light and the
  * type, not data packs, so it's the same for every world. What reads tags, as {@code
  * isBlockDangerous} does, Calcite works out with the world's tags.
+ *
+ * <p>For each attribute, in ID order: its default, the range {@code sanitizeValue} keeps it in, and
+ * whether it's synced to clients; and the attributes a player has, from {@code DefaultAttributes},
+ * each with its base, in ID order (CAL-137).
  */
 final class EntityFacts {
     private EntityFacts() {}
@@ -144,7 +153,35 @@ final class EntityFacts {
             }
             json.append(id == 0 ? "" : ", ").append(bits);
         }
-        json.append("]\n}\n");
+        json.append("],\n  \"attributes\": [");
+        int a = 0;
+        for (Attribute attribute : BuiltInRegistries.ATTRIBUTE) {
+            if (BuiltInRegistries.ATTRIBUTE.getId(attribute) != a) {
+                throw new IllegalStateException("attribute " + a + " is out of order");
+            }
+            if (!(attribute instanceof RangedAttribute ranged)) {
+                throw new IllegalStateException(BuiltInRegistries.ATTRIBUTE.getKey(attribute) + " isn't a ranged attribute");
+            }
+            json.append(a == 0 ? "\n    " : ",\n    ");
+            json.append("{\"id\": \"").append(BuiltInRegistries.ATTRIBUTE.getKey(attribute)).append("\"");
+            json.append(", \"default\": ").append(attribute.getDefaultValue());
+            json.append(", \"min\": ").append(ranged.getMinValue());
+            json.append(", \"max\": ").append(ranged.getMaxValue());
+            json.append(", \"synced\": ").append(attribute.isClientSyncable()).append("}");
+            a++;
+        }
+        json.append("\n  ],\n  \"player_attributes\": [");
+        AttributeSupplier player = DefaultAttributes.getSupplier(EntityTypes.PLAYER);
+        boolean first = true;
+        for (int id = 0; id < BuiltInRegistries.ATTRIBUTE.size(); id++) {
+            Holder<Attribute> holder = BuiltInRegistries.ATTRIBUTE.get(id).orElseThrow();
+            if (player.hasAttribute(holder)) {
+                json.append(first ? "\n    " : ",\n    ");
+                json.append("{\"id\": \"").append(holder.getRegisteredName()).append("\", \"base\": ").append(player.getBaseValue(holder)).append("}");
+                first = false;
+            }
+        }
+        json.append("\n  ]\n}\n");
         Files.writeString(Path.of(args[0]), json, StandardCharsets.UTF_8);
     }
 

@@ -51,7 +51,11 @@ CHANGES = {"play/block_update", "play/section_blocks_update", "play/light_update
 # PacketCheck lists the first three. A chunk's heightmaps are a HashMap, from `Collectors.toMap`,
 # keyed by an enum, which hashes by identity, so vanilla writes them in another order each run;
 # the client reads them into an EnumMap.
-UNORDERED = {"configuration/update_tags", "play/update_tags", "play/set_time", "play/level_chunk_with_light"}
+# An entity's attributes come from `AttributeMap`'s set of those that changed, or of them all,
+# which go by the instances' identity hashes, so vanilla sends them in another order each run;
+# they're compared by their attributes' names (D375).
+UNORDERED = {"configuration/update_tags", "play/update_tags", "play/set_time", "play/level_chunk_with_light", "play/update_attributes"}
+SORTED = {"play/update_attributes": ("attributes", "attribute")}
 # Fields vanilla draws afresh each run, which can't match: the session ID the server draws as it
 # starts, which every login gets; the time on a chat message without a signature, which is the
 # server's clock as it reads the message; and a sound's seed, which `Level.playSound` draws from
@@ -106,6 +110,9 @@ def load(path):
         value = r.get("value")
         if kind in DRAWN:
             value = without(value, DRAWN[kind])
+        if kind in SORTED and isinstance(value, dict):
+            field_name, key = SORTED[kind]
+            value = dict(value, **{field_name: sorted(value.get(field_name, []), key=lambda e: str(e.get(key)))})
         if kind in LIT:
             value = under_world_empty(value)
         if kind in CLOCK:
