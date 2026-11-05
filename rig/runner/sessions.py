@@ -68,8 +68,12 @@ BASE = {
 }
 SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # Scenarios only the configurations that name them run: `watch`, where the bot joins and stays put
-# a fixed number of game ticks, for a world that never goes quiet (src/rig/session.calx).
-OTHER_SCENARIOS = ["watch"]
+# a fixed number of game ticks, for a world that never goes quiet, and `creative`, where it sets
+# slots of its inventory as the creative menu does (src/rig/session.calx).
+OTHER_SCENARIOS = ["watch", "creative"]
+# What the bot's saved data is compared by, after a configuration that gives it some: what's in
+# its inventory and on it, the slot it holds and its game mode (CAL-135).
+PLAYER_KEYS = ("Inventory", "equipment", "SelectedItemSlot", "playerGameType")
 # The world the round trip has vanilla make and save (rig/runner/roundtrip.py), from the seed
 # `calcite` with real terrain, its chunks full from -6 to 5 around the origin.
 SAVED_WORLD = CALCITE / "build" / "rig" / "roundtrip" / "vanilla" / "world"
@@ -96,10 +100,57 @@ class Config:
     rules: tuple = ()
     # The fixture `world` is, which is built from its commands if it isn't, or none.
     fixture: str | None = None
+    # The bot's saved data, which both servers read as it joins, or none for a player new to the
+    # world.
+    player: dict | None = None
+
+
+def stack(item, count=1, components=None):
+    """A stack as `ItemStack.CODEC` writes it."""
+    out = {"id": f"minecraft:{item}", "count": nbt.Int(count)}
+    if components:
+        out["components"] = components
+    return out
+
+
+def slotted(slot, item, count=1, components=None):
+    return dict({"Slot": nbt.Byte(slot)}, **stack(item, count, components))
+
+
+# The bot's data in `inventory`: in creative mode, on the flat world's ground at the spawn, holding
+# the hotbar's second slot, with stacks in the hotbar, the inventory's own slots and the offhand,
+# armor, and components of the kinds the stream codecs send: a number, enchantments, a name, a
+# potion, a color, and one taken away (CAL-135).
+INVENTORY = {
+    "DataVersion": nbt.Int(5023),
+    "Pos": nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-60.0), nbt.Double(0.5)]),
+    "Rotation": nbt.List(nbt.FLOAT, [nbt.Float(0.0), nbt.Float(0.0)]),
+    "Dimension": "minecraft:overworld",
+    "playerGameType": nbt.Int(1),
+    "SelectedItemSlot": nbt.Int(1),
+    "Inventory": nbt.List(nbt.COMPOUND, [
+        slotted(0, "stone", 64),
+        slotted(1, "diamond_sword", 1, {"minecraft:damage": nbt.Int(5),
+                                         "minecraft:enchantments": {"minecraft:sharpness": nbt.Int(3)}}),
+        slotted(2, "potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:swiftness"}}),
+        slotted(8, "bread", 7, {"!minecraft:food": {}}),
+        slotted(9, "oak_log", 10, {"minecraft:custom_name": "Logs"}),
+        slotted(35, "shield"),
+    ]),
+    "equipment": {
+        "head": stack("diamond_helmet"),
+        "chest": stack("elytra", 1, {"minecraft:damage": nbt.Int(10)}),
+        "feet": stack("leather_boots", 1, {"minecraft:dyed_color": nbt.Int(0x3366CC)}),
+        "offhand": stack("torch", 32),
+    },
+}
 
 
 CONFIGS = {
     "compressed": Config({}),
+    # The bot joins with a saved inventory, which each server sends with the inventory menu's
+    # slots, then joins again and sets creative slots; what each saves of it is compared (CAL-135).
+    "inventory": Config({}, scenarios=("join", "creative"), player=INVENTORY),
     "uncompressed": Config({"network-compression-threshold": "-1"}),
     # A saved world, whose chunks both servers read and light (CAL-76). A view of 3 sends the
     # chunks from -4 to 4, which vanilla lights with their neighbours, all of them full in the
@@ -231,6 +282,8 @@ def prepare(folder, config, port, vanilla):
             level = nbt.read(folder / "world" / "level.dat")
             level["Data"]["spawn"]["pos"] = nbt.IntArray(c.spawn)
             nbt.write(folder / "world" / "level.dat", level)
+    if c.player is not None:
+        nbt.write(folder / "world" / "players" / "data" / f"{offline_uuid(BOT)}.dat", c.player)
     rules = folder / "world" / "data" / "minecraft" / "game_rules.dat"
     if rules.is_file():
         saved = nbt.read(rules)
@@ -325,6 +378,31 @@ def record(config, side, argv, bot, scenarios):
         server.stop()
 
 
+def typed(value):
+    """A tag with its type, for comparing saved data whose numbers' types matter."""
+    if isinstance(value, dict):
+        return {k: typed(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return (type(value).__name__, getattr(value, "kind", None), [typed(v) for v in value])
+    return (type(value).__name__, value)
+
+
+def compare_saved(config):
+    """Whether both servers saved the bot's PLAYER_KEYS the same, printing what differs."""
+    saved = {}
+    for side in ("vanilla", "calcite"):
+        path = SESSIONS / config / side / "world" / "players" / "data" / f"{offline_uuid(BOT)}.dat"
+        if not path.is_file():
+            print(f"saved player   differs  [{config}] {side} saved no data for the bot")
+            return False
+        saved[side] = nbt.read(path)
+    differ = [k for k in PLAYER_KEYS if typed(saved["vanilla"].get(k)) != typed(saved["calcite"].get(k))]
+    print(f"saved player   {'PASS' if not differ else 'differs'}    {len(PLAYER_KEYS) - len(differ)} match, {len(differ)} differ")
+    for k in differ:
+        print(f"  [{config}] {k}:\n      vanilla: {saved['vanilla'].get(k)}\n      calcite: {saved['calcite'].get(k)}")
+    return not differ
+
+
 def dump(a, files):
     """Runs SessionDump on the recorded sessions, which writes a .jsonl beside each."""
     argv = a["argv"][:-1] + ["calcite.rig.vanilla.SessionDump"] + [str(f) for f in files]
@@ -371,7 +449,8 @@ def main():
         sys.exit("sessions: no configuration has those scenarios")
     dump(a, files)
     report = sessiondiff.run(SESSIONS, configs, scenarios, CALCITE / "rig" / "differences", show=args.show, complete=complete)
-    return 0 if report.passed else 1
+    saved = all([compare_saved(c) for c in configs if CONFIGS[c].player is not None and scenarios[c]])
+    return 0 if report.passed and saved else 1
 
 
 if __name__ == "__main__":
