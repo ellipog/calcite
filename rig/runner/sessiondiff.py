@@ -58,7 +58,10 @@ CHANGES = {"play/block_update", "play/section_blocks_update", "play/light_update
 # set `Set.copyOf` of item holders, which do too, so vanilla writes both in another order each run;
 # the client reads them into a map and sets, and SessionDump sorts them. The stonecutter's recipes
 # are a list, whose order the values keep (D385).
-UNORDERED = {"configuration/update_tags", "play/update_tags", "play/set_time", "play/level_chunk_with_light", "play/update_attributes", "play/update_recipes"}
+# The login's levels are `levelKeys()`, a LinkedHashMap's keys put in as `createLevels` goes
+# through the dimensions registry's `entrySet`, a HashMap's by `ResourceKey`, which hashes by
+# identity, so after the overworld the Nether and the End come in either order (CAL-147).
+UNORDERED = {"configuration/update_tags", "play/update_tags", "play/set_time", "play/level_chunk_with_light", "play/update_attributes", "play/update_recipes", "play/login"}
 SORTED = {"play/update_attributes": ("attributes", "attribute")}
 # Fields vanilla draws afresh each run, which can't match: the session ID the server draws as it
 # starts, which every login gets; the time on a chat message without a signature, which is the

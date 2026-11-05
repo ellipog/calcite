@@ -160,6 +160,24 @@ INVENTORY = {
 # rather than the creative menu's (CAL-136).
 CLICKS = dict(INVENTORY, playerGameType=nbt.Int(0))
 
+# The bot's data in `crafts`: in survival mode, holding nothing, with three oak logs in the
+# inventory's first slot, four honey bottles in its fourth, paper in its fifth and gunpowder in its
+# sixth, which it crafts with in its inventory's grid (CAL-147).
+CRAFTS = {
+    "DataVersion": nbt.Int(5023),
+    "Pos": nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-60.0), nbt.Double(0.5)]),
+    "Rotation": nbt.List(nbt.FLOAT, [nbt.Float(0.0), nbt.Float(0.0)]),
+    "Dimension": "minecraft:overworld",
+    "playerGameType": nbt.Int(0),
+    "SelectedItemSlot": nbt.Int(0),
+    "Inventory": nbt.List(nbt.COMPOUND, [
+        slotted(9, "oak_log", 3),
+        slotted(12, "honey_bottle", 4),
+        slotted(13, "paper"),
+        slotted(14, "gunpowder"),
+    ]),
+}
+
 # The bot's data in `dig`: in survival mode, by the spawn, holding a wooden shovel, with shears, a
 # golden pickaxe one use from breaking and a diamond sword in the hotbar, and torches in its
 # offhand (D376).
@@ -353,6 +371,12 @@ CONFIGS = {
     # chest under stone won't open (CAL-144).
     "use_containers": Config({}, view=3, scenarios=("use-containers",), world=FIXTURES / "containers" / "world",
                              fixture="containers", rules=DIG_RULES, player=USE_CONTAINERS),
+    # The bot, in survival mode, crafts in its inventory menu's grid: planks, a button, sticks
+    # shift-clicked, a rocket swapped out with a hotbar key and a honey block, its bottles left;
+    # what each server sends back, and what each saves of it, is compared (CAL-147). The crafting
+    # fixture's world, as the dig one's rules have it, has no mobs to tell of.
+    "crafts": Config({}, view=3, scenarios=("crafts",), world=FIXTURES / "crafting" / "world", fixture="crafting",
+                     rules=DIG_RULES, player=CRAFTS),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
