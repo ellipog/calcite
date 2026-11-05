@@ -71,8 +71,10 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # a fixed number of game ticks, for a world that never goes quiet; `creative`, where it sets slots
 # of its inventory as the creative menu does; `clicks`, where it clicks in its inventory menu;
 # `dig` and `dig-creative`, where it digs blocks; `place` and `place-creative`, where it places
-# them; and `use`, where it uses them (src/rig/session.calx).
-OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use"]
+# them; `use`, where it uses them; and `use-items` and `use-books`, where it uses items on them
+# (src/rig/session.calx).
+OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
+                   "use-books"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -210,6 +212,34 @@ PLACE = {
 PLACE_CREATIVE = dict(PLACE, playerGameType=nbt.Int(1), Inventory=nbt.List(nbt.COMPOUND, []), equipment={})
 # In `use`: in survival mode, with nothing in its hands (D379).
 USE = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, []), equipment={})
+# In `use_items`: in survival mode, hungry, at 10 food, holding seeds, a cake, saplings, candles, a
+# water bucket, bottles, a dyed helmet, banners with two patterns and buckets (CAL-142).
+USE_ITEMS = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "wheat_seeds", 4),
+    slotted(1, "cake"),
+    slotted(2, "oak_sapling", 2),
+    slotted(3, "red_candle", 2),
+    slotted(4, "water_bucket"),
+    slotted(5, "glass_bottle", 3),
+    slotted(6, "leather_helmet", 1, {"minecraft:dyed_color": nbt.Int(0x3366CC)}),
+    slotted(7, "white_banner", 2, {"minecraft:banner_patterns": nbt.List(nbt.COMPOUND, [
+        {"pattern": "minecraft:stripe_top", "color": "red"},
+        {"pattern": "minecraft:cross", "color": "blue"},
+    ])}),
+    slotted(8, "bucket", 2),
+]), equipment={}, foodLevel=nbt.Int(10))
+# In `use_books`: in survival mode, holding a book and quill, two books, an enchanted book, stone and
+# dirt, with its sixth slot empty (CAL-142).
+USE_BOOKS = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "writable_book"),
+    slotted(1, "book", 2),
+    slotted(2, "enchanted_book"),
+    slotted(3, "stone", 3),
+    slotted(4, "dirt"),
+]), equipment={})
+# The use_items rules: the dig configurations', and no natural regeneration, so the bot's food stays
+# where the cake it eats puts it (CAL-142).
+USE_ITEMS_RULES = DIG_RULES + (("minecraft:natural_health_regeneration", nbt.Byte(0)),)
 
 
 CONFIGS = {
@@ -298,6 +328,15 @@ CONFIGS = {
     # bell, a daylight detector and redstone dust (D379).
     "use": Config({}, view=3, scenarios=("use",), world=FIXTURES / "use" / "world",
                   fixture="use", rules=DIG_RULES, player=USE),
+    # The bot, in survival mode and hungry, uses items on the use_items fixture's blocks: seeds and
+    # a cake in a composter, a sapling in a flower pot and back, a candle put out, a candle on a
+    # cake, which it eats, and cauldrons with buckets, bottles, a dyed helmet and banners (CAL-142).
+    "use_items": Config({}, view=3, scenarios=("use-items",), world=FIXTURES / "use_items" / "world",
+                        fixture="use_items", rules=USE_ITEMS_RULES, player=USE_ITEMS),
+    # The bot, in survival mode, puts a book on the use_items fixture's lectern, books in its
+    # chiseled bookshelf and takes one back, and stone in its decorated pot (CAL-142).
+    "use_books": Config({}, view=3, scenarios=("use-books",), world=FIXTURES / "use_items" / "world",
+                        fixture="use_items", rules=USE_ITEMS_RULES, player=USE_BOOKS),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
