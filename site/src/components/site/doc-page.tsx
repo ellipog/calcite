@@ -17,7 +17,7 @@ function Settings() {
 		<div className="mb-6 overflow-x-auto">
 			<Table
 				stack
-				className="text-[15px] leading-[1.45] sm:min-w-[560px] [&_td]:align-top"
+				className="text-[15px] leading-[1.45] sm:min-w-[560px] [&_tbody>tr>*]:align-top"
 				columns={[{ label: 'Setting' }, { label: 'Default' }, { label: 'What it does' }]}
 				rows={calciteSettings().map((s) => [
 					<code key="n" className="font-mono text-[0.9em] font-medium whitespace-nowrap">

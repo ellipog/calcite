@@ -20,7 +20,8 @@ const lines = [
 	'     --ring diagonal halves for the focus ring and work under way (8px); --ring-p in paper',
 	"     --check2 a 50% bar (4px), --tail a tooltip's point (10px 6px), --chevron (10px 8px),",
 	'     --plus and --minus (10px); --solid is plain ink, for layering with the rest.',
-	'   The tint utilities: tint-{6..88} and tint-100, tint-paper-{6,12,25,50}, tint4-{6..75}. */',
+	'   The tint utilities: tint-{6..88} and tint-100, tint-paper-{6,12,25,50}, tint4-{6..75}, and',
+	'   tile-ring. Each also sets --tile, its tile, which march-8 and march-16 draw moving. */',
 	'',
 	':root {',
 	'\t--solid: linear-gradient(var(--color-ink), var(--color-ink));',
@@ -28,13 +29,14 @@ const lines = [
 	'}',
 	'',
 ];
+const tint = (name: string, n: string, size: number) => `@utility ${name} {\n\t--tile: var(--${n});\n\tbackground-image: var(--${n});\n\tbackground-size: ${size}px ${size}px;\n}`;
 for (const [n] of tiles) {
 	let m;
-	if ((m = /^t(\d+)$/.exec(n))) lines.push(`@utility tint-${m[1]} {\n\tbackground-image: var(--${n});\n\tbackground-size: 16px 16px;\n}`);
-	else if ((m = /^tp(\d+)$/.exec(n))) lines.push(`@utility tint-paper-${m[1]} {\n\tbackground-image: var(--${n});\n\tbackground-size: 16px 16px;\n}`);
-	else if ((m = /^q(\d+)$/.exec(n))) lines.push(`@utility tint4-${m[1]} {\n\tbackground-image: var(--${n});\n\tbackground-size: 8px 8px;\n}`);
+	if ((m = /^t(\d+)$/.exec(n))) lines.push(tint(`tint-${m[1]}`, n, 16));
+	else if ((m = /^tp(\d+)$/.exec(n))) lines.push(tint(`tint-paper-${m[1]}`, n, 16));
+	else if ((m = /^q(\d+)$/.exec(n))) lines.push(tint(`tint4-${m[1]}`, n, 8));
 }
-lines.push('@utility tint-100 {\n\tbackground-color: var(--color-ink);\n}', '');
+lines.push(tint('tile-ring', 'ring', 8), '@utility tint-100 {\n\tbackground-color: var(--color-ink);\n}', '');
 writeFileSync('src/styles/tiles.css', lines.join('\n'));
 writeFileSync('src/app/icon.svg', markSVG(16, { paper: PAPER, size: 32 }) + '\n');
 const m16 = markBits(16);

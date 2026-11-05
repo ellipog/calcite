@@ -108,26 +108,31 @@ export function Stats({ items, bleed, className }: { items: Stat[]; bleed?: bool
 
 export type PhaseState = 'done' | 'now' | 'next';
 
-/** The plan's phases as a row of cells: solid when passed, marching while in progress, dotted ahead. */
+/** The plan's phases as a row of cells: solid when passed, marching while in progress, dotted ahead.
+ *  Each link's name is its visible words with what the cell shows, "Phase 06, Simulation: in
+ *  progress", so it holds the number a reader sees and can say to voice control. */
 export function PhaseStrip({ phases, className }: { phases: { n: number; builds: string; state: PhaseState }[]; className?: string }) {
 	return (
 		<ol className={cn('grid grid-cols-5 gap-px md:grid-cols-10', className)}>
 			{phases.map((p) => (
 				<li key={p.n} className="grid content-start gap-2.5">
-					<Link href={`/roadmap#phase-${p.n}`} className="group grid gap-2.5" aria-label={`Phase ${p.n}, ${p.builds}: ${p.state === 'done' ? 'passed' : p.state === 'now' ? 'in progress' : 'to come'}`}>
+					<Link href={`/roadmap#phase-${p.n}`} className="group grid gap-2.5">
 						<i
 							aria-hidden
 							className={cn(
 								'block h-10 border border-ink xl:h-16',
 								p.state === 'done' && 'bg-ink',
-								p.state === 'now' && 'animate-march16 tint-38 motion-reduce:animate-none',
+								p.state === 'now' && 'tint-38 march-16',
 								p.state === 'next' && 'border-dotted',
 								'group-hover:[border-style:solid]',
 							)}
 						/>
 						<span className="font-mono text-[11px] leading-[1.35] xl:text-xs">
+							<span className="sr-only">Phase </span>
 							<b className="font-medium">{String(p.n).padStart(2, '0')}</b>
-							<span className="block pr-2 group-hover:underline group-hover:decoration-2 group-hover:underline-offset-2 max-md:hidden">{p.builds}</span>
+							<span className="sr-only">, </span>
+							<span className="block pr-2 group-hover:underline group-hover:decoration-2 group-hover:underline-offset-2 max-md:sr-only">{p.builds}</span>
+							<span className="sr-only">: {p.state === 'done' ? 'passed' : p.state === 'now' ? 'in progress' : 'to come'}</span>
 						</span>
 					</Link>
 				</li>

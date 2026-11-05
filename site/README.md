@@ -125,6 +125,22 @@ The public pages span the window. Their content sits in a frame up to 1920 px wi
 
 The docs, being for reading, keep the old 1200 px frame, as do the internal pages: an element with `data-frame="narrow"` sets `--frame` and `--side` again for everything in it. The header and footer still span the window there.
 
+### Speed
+
+PageSpeed Insights gave the home page 100 for performance on desktop and 99 on mobile on 2026-11-05, and 100 for accessibility, best practices and SEO on both. Lighthouse 13.6 run locally on the production build gives the same. What it still points out, and why it stays:
+
+- **Render-blocking CSS.** The stylesheet is one file, about 15 KB compressed. Next's experimental `inlineCss` would put it in the HTML instead, but three times over, once as `<style>` and twice in the RSC payload, so 104 KB of HTML became 328 KB. On Lighthouse's mobile run the first paint then came 120 ms later and blocking time went from 24 to 123 ms, so it's off (`next.config.ts`).
+- **Legacy JavaScript, 14 KiB.** Next's own polyfill module, which every app gets. It checks for each feature before adding it, so a current browser runs none of it.
+- **Unused JavaScript, 28 KiB.** In React and Next's shared chunk.
+- **A long task about 3 s in.** React hydrating the page, about 25 ms on a fast desktop CPU.
+- **Two non-composited animations, on mobile.** The marches (`march-8` and `march-16` in `globals.css`) are the work-under-way patterns on the phase in progress and the "running" tag. Where a CSS pixel is a whole number of the screen's pixels, as at 100% and 200%, a march slides a `::before` with a transform, which the compositor runs without painting. Elsewhere, as at 125%, 150% or Lighthouse's emulated 175% phone, the compositor resamples that layer and the dots blur: up to 78% of a cell's pixels came out neither ink nor paper. So there the background moves instead, as it always did, painted on the main thread. `MarchWatch` (`src/components/ui/march-watch.tsx`) holds every march still while it's off screen, so a phase strip far down the page doesn't have the page painted 12 times a second.
+
+Bricolage Grotesque is loaded with its weight and optical-size axes only. The type is never condensed, and the width axis was 54 KB of the 131 KB font file.
+
+The panels of `Tabs` dissolve in only when picked, not as the page loads.
+
+Every page also sends `Strict-Transport-Security` for the domain and its subdomains, `Cross-Origin-Opener-Policy: same-origin`, and a content security policy that allows no plugins, no `<base>`, forms only to this site and no framing. It doesn't restrict scripts: that would take a nonce on each of Next's inline scripts, which makes every page dynamic. HSTS isn't marked `preload`, since getting on browsers' preload list is a separate request that's hard to undo.
+
 ## Deploying
 
 The site is built to deploy on Vercel, but any host that runs Next.js 16 works. On Vercel:

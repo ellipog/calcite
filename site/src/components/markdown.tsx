@@ -151,7 +151,7 @@ function Blocks({ blocks, ctx, tight }: { blocks: Block[]; ctx: Ctx; tight?: boo
 					<div key={k} className="mb-6 overflow-x-auto">
 						<Table
 							stack
-								className="text-[15px] leading-[1.45] sm:min-w-[520px] [&_td]:align-top"
+								className="text-[15px] leading-[1.45] sm:min-w-[520px] [&_tbody>tr>*]:align-top"
 							columns={b.head.map((h, j) => ({ label: plain(h), num: b.align[j] === 'r' }))}
 							rows={b.rows.map((r) => r.map((c, j) => <Runs key={j} c={c} ctx={ctx} />))}
 						/>

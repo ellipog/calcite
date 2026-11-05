@@ -4,13 +4,16 @@ import { useId, useRef, useState, type ReactNode } from 'react';
 import { cn } from '@/lib/cn';
 
 // A dotted rule; the chosen tab's line fills in through the matrix and its panel dissolves in.
+// The first panel is simply there as the page loads; only a panel picked after that dissolves.
 // Arrow keys, Home and End move between tabs.
 export function Tabs({ label, tabs, className }: { label: string; tabs: { title: string; content: ReactNode }[]; className?: string }) {
 	const [on, setOn] = useState(0);
+	const [picked, setPicked] = useState(false);
 	const id = useId(), refs = useRef<(HTMLButtonElement | null)[]>([]);
 	const pick = (i: number, focus = false) => {
 		const j = (i + tabs.length) % tabs.length;
 		setOn(j);
+		if (j !== on) setPicked(true);
 		if (focus) refs.current[j]?.focus();
 	};
 	return (
@@ -46,7 +49,7 @@ export function Tabs({ label, tabs, className }: { label: string; tabs: { title:
 				))}
 			</div>
 			{tabs.map((t, i) => (
-				<div key={t.title} role="tabpanel" id={`${id}-p${i}`} aria-labelledby={`${id}-t${i}`} hidden={i !== on} className="animate-dis-in pt-4">
+				<div key={t.title} role="tabpanel" id={`${id}-p${i}`} aria-labelledby={`${id}-t${i}`} hidden={i !== on} className={cn('pt-4', picked && 'animate-dis-in')}>
 					{t.content}
 				</div>
 			))}

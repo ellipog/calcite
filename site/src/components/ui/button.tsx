@@ -29,7 +29,7 @@ export function buttonClass({ variant = 'primary', size = 'md', busy = false, cl
 				: 'enabled:hover:border-solid enabled:hover:bg-ink enabled:hover:text-paper [a&]:hover:border-solid [a&]:hover:bg-ink [a&]:hover:text-paper'),
 		'enabled:active:translate-y-px',
 		'disabled:cursor-not-allowed disabled:border-dotted disabled:bg-transparent disabled:text-ink disabled:tint-6',
-		busy && (variant === 'primary' ? 'cursor-progress tint-paper-12 animate-march16' : 'cursor-progress tint-12 animate-march16'),
+		busy && (variant === 'primary' ? 'cursor-progress tint-paper-12 march-16' : 'cursor-progress tint-12 march-16'),
 		className,
 	);
 }

@@ -6,7 +6,7 @@ import { cn } from '@/lib/cn';
 export function Tag({ status = 'planned', children }: { status?: 'done' | 'running' | 'planned'; children: ReactNode }) {
 	return (
 		<span className="inline-flex items-center gap-[7px] rule px-[9px] py-1.5 font-mono text-xs leading-none whitespace-nowrap">
-			<i className={cn('size-2.5 flex-none border border-ink', status === 'done' && 'bg-ink', status === 'running' && 'animate-march bg-(image:--ring) bg-size-[8px_8px]')} aria-hidden />
+			<i className={cn('size-2.5 flex-none border border-ink', status === 'done' && 'bg-ink', status === 'running' && 'tile-ring march-8')} aria-hidden />
 			{children}
 		</span>
 	);
@@ -58,11 +58,11 @@ export function Table({ columns, rows, strong, stack, className }: { columns: Co
 			stack && j === last && 'max-sm:pb-3',
 		);
 	return (
-		<table className={cn('w-full border-collapse text-[15px] [&_tbody_tr:hover>td]:[border-bottom-style:solid]', stack && 'max-sm:block', className)}>
+		<table className={cn('w-full border-collapse text-[15px] [&_tbody_tr:hover>*]:[border-bottom-style:solid]', stack && 'max-sm:block', className)}>
 			<thead className={cn(stack && 'max-sm:sr-only')}>
 				<tr>
 					{columns.map((c, j) => (
-						<th key={c.label || j} className={cn(cell(c, j, true), 'label font-normal')}>
+						<th key={c.label || j} scope="col" className={cn(cell(c, j, true), 'label font-normal')}>
 							{c.label}
 						</th>
 					))}
@@ -71,12 +71,16 @@ export function Table({ columns, rows, strong, stack, className }: { columns: Co
 			<tbody className={cn(stack && 'max-sm:block')}>
 				{rows.map((r, i) => (
 					<tr key={i} className={cn(i === strong && 'font-bold', stack && 'max-sm:block max-sm:rule-b')}>
-						{r.map((v, j) => (
-							<td key={j} className={cell(columns[j], j)}>
-								{stack && j > 0 && j < last && columns[j].label && <span className="label mr-2 sm:hidden">{columns[j].label}</span>}
-								{v}
-							</td>
-						))}
+						{/* the first cell names the row, so a screen reader can say which row a number is in */}
+						{r.map((v, j) => {
+							const Cell = j === 0 ? 'th' : 'td';
+							return (
+								<Cell key={j} scope={j === 0 ? 'row' : undefined} className={cn(cell(columns[j], j), j === 0 && 'font-[inherit]')}>
+									{stack && j > 0 && j < last && columns[j].label && <span className="label mr-2 sm:hidden">{columns[j].label}</span>}
+									{v}
+								</Cell>
+							);
+						})}
 					</tr>
 				))}
 			</tbody>
