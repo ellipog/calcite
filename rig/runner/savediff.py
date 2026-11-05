@@ -9,6 +9,11 @@ in, so states are compared block by block, not as bytes; a block entity is compa
 position, as a compound, and the ticks as sets, since each server keeps them in its own order.
 What each saves of when it saved, `LastUpdate`, and how long players were near, `InhabitedTime`,
 aren't compared: the bot's steps land on different game times on the two servers.
+
+The entity chunks, in `entities/`, are compared too (CAL-148): each chunk's entities in the order
+it saved them, by their UUIDs, and each entity's tags, but those that tell when the server
+stopped, `ENTITY_TIMING`: an item's age, and its motion, which a still item gathers as it falls
+0.04 a tick between the moves it makes every 4 ticks.
 """
 
 import struct
@@ -23,12 +28,15 @@ import nbt  # noqa: E402
 # The chunk keys that are compared, each on its own: what isn't here, and isn't left out below, is
 # compared as it is.
 LEFT_OUT = {"LastUpdate", "InhabitedTime", "xPos", "zPos", "yPos", "DataVersion"}
+# An entity's tags that tell when the server stopped (CAL-148).
+ENTITY_TIMING = {"Age", "Motion"}
 
 
-def chunks(world, dimension="minecraft/overworld"):
-    """Each chunk the world's region files of `dimension` hold, by its position, as a compound."""
+def chunks(world, dimension="minecraft/overworld", folder="region"):
+    """Each chunk the world's region files of `dimension` hold, by its position, as a compound:
+    its blocks', or, with `folder` "entities", its entities'."""
     out = {}
-    for region in sorted((Path(world) / "dimensions" / dimension / "region").glob("r.*.*.mca")):
+    for region in sorted((Path(world) / "dimensions" / dimension / folder).glob("r.*.*.mca")):
         data = region.read_bytes()
         if len(data) < 8192:
             continue
@@ -133,6 +141,33 @@ def compare(vanilla_world, calcite_world, area, show=20):
                     lines.append(f"chunk {cx}, {cz}: only {'vanilla' if a is not None else 'Calcite'} saved it")
                 continue
             lines += [f"chunk {cx}, {cz}: {d}" for d in chunk_differences(cx, cz, a, b, show)]
+    return lines + entity_differences(vanilla_world, calcite_world, area)
+
+
+def uuid_of(entity):
+    """An entity's UUID, its four ints, as a tuple."""
+    return tuple(entity.get("UUID", ()))
+
+
+def entity_differences(vanilla_world, calcite_world, area):
+    """The differences between the entity chunks in `area` as each world saved them (CAL-148)."""
+    v, c = chunks(vanilla_world, folder="entities"), chunks(calcite_world, folder="entities")
+    lines = []
+    x0, z0, x1, z1 = area
+    for cx in range(x0, x1 + 1):
+        for cz in range(z0, z1 + 1):
+            a = v.get((cx, cz), {}).get("Entities", [])
+            b = c.get((cx, cz), {}).get("Entities", [])
+            if [uuid_of(e) for e in a] != [uuid_of(e) for e in b]:
+                lines.append(f"entities {cx}, {cz}: {len(a)} of vanilla's, {[e.get('id') for e in a]}, vs {len(b)} of Calcite's, {[e.get('id') for e in b]}")
+                continue
+            for ea, eb in zip(a, b):
+                keys = (set(ea) | set(eb)) - ENTITY_TIMING
+                for key in sorted(keys):
+                    if ea.get(key) != eb.get(key):
+                        lines.append(f"entities {cx}, {cz}: {ea.get('id')} {key}: {ea.get(key)!r:.200} vs {eb.get(key)!r:.200}")
+                if list(ea) != list(eb):
+                    lines.append(f"entities {cx}, {cz}: {ea.get('id')}'s tags in another order: {list(ea)} vs {list(eb)}")
     return lines
 
 

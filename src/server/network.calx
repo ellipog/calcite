@@ -49,11 +49,15 @@ import server.pregen.{Choice, Run, Shape, Task as PregenTask, blocks, saved_data
 import server.sending.{Outbox, Sending}
 import server.status.{ServerStatus}
 import server.play.{World, WorldState, display_name, level_random_seed}
+import server.entity_io.{EntityDone, EntityJobs}
 import server.saving.{Save, Saving}
 import std.crypto.{RsaKey, RsaPublicKey}
 import std.net.{Conn, Event, NetError, Address, Ip}
 import std.time.{Timestamp}
+import storage.entities.{EntityChunk, logger as entity_logger, write_entities}
 import storage.level.{LevelData, Spawn, data_version_or}
+import storage.region.{Compression, unpack}
+import storage.regions.{ChunkRead, read_root}
 import storage.players.{PlayerFiles, SavedPosition, saved_position}
 import storage.world_gen.{world_gen_id}
 import world.border.{Border, BorderSettings, saved_id as border_id}
@@ -436,10 +440,60 @@ struct Player {
 // A level's item entities and its entities' trackers (CAL-148): the items, as `world.entities`
 // keeps them; each entity's tracker in `ChunkMap.entityMap`'s order, by its ID, `true` for a
 // player's, whose own data `track_players` sends; and each item's tracker.
+//
+// And its entity chunks, as `PersistentEntitySectionManager` keeps them: the chunks that are
+// accessible, `chunkVisibility` other than hidden; those whose entities were read, `true`, or are
+// asked for, `false`, `chunkLoadStatuses`, a chunk that's in neither being fresh; those to unload
+// once they can be saved, `chunksToUnload`; those known to have no entities,
+// `EntityStorage.emptyChunks`; what was read of each, waiting for the level's tick to come in,
+// `loadingInbox`; the entities read that Calcite doesn't have yet, by the IDs below 0 their places
+// in the items' sections have, saved again as they were read, and the last of those IDs; the
+// thread that reads and writes them; and whether the server's stopping, and the thread's been
+// told to close.
 struct LevelEntities {
     items: Entities = Entities()
     tracked: OpenHashMap<i32, bool> = OpenHashMap<i32, bool>()
     trackers: Map<i32, ItemTracker> = Map<i32, ItemTracker>()
+    visible: OpenHashSet<i64> = OpenHashSet<i64>()
+    loads: OpenHashMap<i64, bool> = OpenHashMap<i64, bool>()
+    to_unload: OpenHashSet<i64> = OpenHashSet<i64>()
+    empty: OpenHashSet<i64> = OpenHashSet<i64>()
+    inbox: List<ReadEntities> = List<ReadEntities>()
+    kept: Map<i32, Tag> = Map<i32, Tag>()
+    last_kept: i32 = 0
+    jobs: EntityJobs? = none
+    stopping: bool = false
+    saved_all: bool = false
+    closed: bool = false
+}
+
+// Where a kept entity was saved, its `Pos`, as `Entity.load` reads it, or the origin, which places
+// it in its section as `addEntity` does.
+fn kept_place(tag: Tag) -> (f64, f64, f64) {
+    let Tag.Compound(m) = tag else return (0.0, 0.0, 0.0)
+    if not m.contains("Pos") {
+        return (0.0, 0.0, 0.0)
+    }
+    let Tag.List(pos) = m["Pos"] else return (0.0, 0.0, 0.0)
+    if pos.len() != 3 {
+        return (0.0, 0.0, 0.0)
+    }
+    let x = pos[0].number_double() ?? 0.0
+    let y = pos[1].number_double() ?? 0.0
+    let z = pos[2].number_double() ?? 0.0
+    return (x, y, z)
+}
+
+// What was read of an entity chunk, as `loadEntities` makes it: its entities in the order they
+// were saved, the items made and the rest's tags, which Calcite keeps as they were.
+struct ReadEntities {
+    pos: ChunkPos
+    entities: List<ReadEntity>
+}
+
+enum ReadEntity {
+    Item(ItemEntity)
+    Kept(Tag)
 }
 
 // A command, or a game mode picked with F3 and F4, from the player in a slot, which runs once
@@ -540,6 +594,9 @@ pub struct Network {
     // ticks until the next autosave, as `ticksUntilAutosave`.
     level_data: LevelData? = none
     world_gen: Tag? = none
+    // Whether, replaying, the entity chunks come from the log, as the recording opened its
+    // `entities` folders (CAL-148).
+    entities_logged: bool = false
     // The commands waiting for their players' connections, and how many players have joined.
     queued: Deque<Queued> = Deque<Queued>()
     joins: u64 = 0
@@ -852,6 +909,17 @@ impl Network {
         if let s = self.saving {
             n += s.away()
         }
+        // Each level's entity chunks, until they're saved and their thread's closed (CAL-148).
+        for slot in self.entities {
+            if let es = slot {
+                if es.stopping and not es.closed {
+                    n += 1
+                }
+                if let jobs = es.jobs {
+                    n += jobs.closing()
+                }
+            }
+        }
         return n
     }
 
@@ -1052,6 +1120,15 @@ impl Network {
                 self.level_lines()
                 self.levels[d].dispatch()
             },
+            Input.Entities(d, pos, io, got) => {
+                if d >= self.levels.len() or not self.entity_chunk_read(d, pos, io, got) {
+                    self.link.diverged("the entities' IO thread read entity chunk {pos.x}, {pos.z} of dimension {d}, which the server didn't ask for")
+                    return true
+                }
+                if self.halted {
+                    self.stop_entities(d)
+                }
+            },
         }
         return true
     }
@@ -1154,6 +1231,11 @@ impl Network {
             let id = self.world.dims[d].id.to_string()
             self.logs.push(Entry.info("Saving chunks for level 'ServerLevel[{self.level_name}]'/{id}").calcite(Look.Quiet))
             self.levels[d].close_chunks()
+            // Then its entities, `entityManager.saveAll` (CAL-148).
+            var es = self.take_entities(d)
+            es.stopping = true
+            self.put_entities(d, es)
+            self.stop_entities(d)
         }
         self.save_level()
         self.flush()
@@ -1166,6 +1248,8 @@ impl Network {
         self.save_players()
         for d in 0..self.levels.len() {
             self.levels[d].save_eagerly(i64.wrap(self.now / 1000000), true)
+            // Then its entities, `entityManager.autoSave` (CAL-148).
+            self.save_entity_chunks(d)
         }
         self.save_level()
         if self.pregen_touched {
@@ -1394,6 +1478,7 @@ impl Network {
             Event.Woken => {
                 self.sent()
                 self.chunks_read()
+                self.entities_read()
                 self.light_done()
                 self.saves_done()
                 self.flush()
@@ -1542,8 +1627,9 @@ impl Network {
     // tick of its environment's attributes; its border, then its weather, if it can have any;
     // its sky's light, as `updateSkyBrightness` sets it (D313); its time, the Overworld's, as
     // `tickTime` moves the game time on; then its chunks, as its `ServerChunkCache.tick` runs
-    // them, with the custom spawners (D314). Sleep, block and fluid ticks, raids, block events
-    // and entities come with what they tick.
+    // them, with the custom spawners (D314); its block events, entities and block entities; and
+    // last its entity chunks, loaded, unloaded and saved (CAL-148). Sleep and raids come with
+    // what they tick.
     fn tick_level(mut self, d: usize) {
         // The world's jukebox songs, for its jukeboxes to play, once its registries are read
         // (CAL-143).
@@ -1626,6 +1712,8 @@ impl Network {
         self.tick_players(d)
         self.levels[d].tick_block_entities()
         self.send_level_events(d)
+        // `entityManager.tick` (CAL-148).
+        self.tick_entity_chunks(d)
     }
 
     // `ChunkMap.tick`'s trackers, in its map's order (CAL-148): each one whose entity's in another
@@ -2921,7 +3009,10 @@ impl Network {
         // the place is ready once they're full, which in a flat world, or one whose chunks are
         // read before the tick, is the first tick, as soon as vanilla's can be. If the ticket
         // runs out first, as it can 20 ticks after its own chunk is ready, those not full yet
-        // are let go, and the place is ready then, as vanilla's future for them is done.
+        // are let go, and the place is ready then, as vanilla's future for them is done. And
+        // once the entities of those full are in, which vanilla's `Ready.spawn` waits for,
+        // `waitForEntities`, before it makes the player, so they come before the player does,
+        // with the IDs before theirs (CAL-148).
         if is(con.task, Task.PrepareSpawn) {
             if con.prepare.awaiting {
                 if self.spawn_pending {
@@ -2942,7 +3033,7 @@ impl Network {
                     self.level_lines()
                     self.levels[d].dispatch()
                 }
-                if self.levels[d].around_done(chunk, SPAWN_RADIUS) {
+                if self.levels[d].around_done(chunk, SPAWN_RADIUS) and self.entities_around(d, chunk, SPAWN_RADIUS) {
                     con.prepare.ready = true
                     con.task = none
                     self.next_task(mut con)
@@ -4653,6 +4744,448 @@ impl Network {
         self.add_item(d, e, some(con.player.entity_id))
         // The pairing with `con`, who's out of the connections.
         self.item_sees(d, id, mut con)
+    }
+
+    /// Reads and writes each dimension's entity chunks in its folder in `folders`, in the world's
+    /// order, each on a thread of its own that starts with its first chunk (CAL-148). Replaying,
+    /// there's no folder, and `folders` is empty: the chunks the recording read come from its log,
+    /// if it opened its folders, which the link says. Without either, as a test's world, there's
+    /// nothing saved, and nothing's saved.
+    pub fn open_entities(mut self, folders: List<String>) {
+        var opened = false
+        for d in 0..folders.len() {
+            if d >= self.world.dims.len() {
+                break
+            }
+            var compression = Compression.Deflate
+            if let c = self.world.dims[d].context {
+                compression = c.compression
+            }
+            match self.link.waker() {
+                ok(waker) => {
+                    var es = self.take_entities(d)
+                    es.jobs = some(EntityJobs.new(folders[d].copy(), compression, waker))
+                    self.put_entities(d, es)
+                    opened = true
+                },
+                err(_) => {
+                    self.logs.push(Entry.error("Can't read the world's entities: there's nothing to wake the server's poll with"))
+                    break
+                },
+            }
+        }
+        self.entities_logged = self.link.entity_folders(opened) and self.link.replaying()
+    }
+
+    // Takes in what each dimension's entities' IO thread has done, recording what it read, as
+    // the server's loop hands it over (CAL-148).
+    fn entities_read(mut self) {
+        for d in 0..self.entities.len() {
+            var es = self.entities[d].take() else continue
+            var done = Deque<EntityDone>()
+            if let held = es.jobs.take() {
+                var jobs = held
+                done = jobs.take_done()
+                es.jobs = some(jobs)
+            }
+            self.entities[d] = some(es)
+            while let x = done.pop_first() {
+                match x {
+                    EntityDone.Read(pos, io, got) => {
+                        self.link.entities_read(d, pos, io, got)
+                        _ = self.entity_chunk_read(d, pos, io, got)
+                        if self.halted {
+                            self.stop_entities(d)
+                        }
+                    },
+                    EntityDone.Wrote(lines) => {
+                        self.link.saved(lines)
+                        for e in lines {
+                            self.logs.push(e.copy())
+                        }
+                    },
+                    EntityDone.Closed(lines) => {
+                        // As the server stops, after the last read taken in.
+                        for e in lines {
+                            self.logs.push(e.copy())
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    // What the entities' IO thread read of the entity chunk at `pos` of the level `d`, with what
+    // it logged, `io`, made into its entities as `loadEntities` makes them, to come in at the
+    // level's next tick (CAL-148): none for a chunk that isn't there, which is known to have none;
+    // each `minecraft:item` an item, as `world.item_entity` loads it, with the next entity ID, and
+    // the rest kept as they were, but those with no type, which vanilla skips. A read that
+    // failed logs vanilla's lines, and the chunk waits for its entities ever after, as vanilla's
+    // does. `false` if the chunk's entities weren't asked for.
+    fn entity_chunk_read(mut self, d: usize, pos: ChunkPos, io: List<Entry>, got: ChunkRead) -> bool {
+        let k = pos.pack()
+        let es = self.take_entities(d)
+        let asked = es.loads.contains(k) and not es.loads[k]
+        self.put_entities(d, es)
+        if not asked {
+            return false
+        }
+        for e in io {
+            self.logs.push(e.copy())
+        }
+        var lines = List<Entry>()
+        var root: Tag? = none
+        var failed: String? = none
+        match got {
+            ChunkRead.Absent => {},
+            ChunkRead.Stored(stored) => match unpack(pos, stored, mut lines) {
+                ok(some(bytes)) => match read_root(bytes) {
+                    ok(tag) => root = some(tag),
+                    err(e) => failed = some("{e.exception}: {e.message}"),
+                },
+                ok(none) => {},
+                err(e) => failed = some("{e.exception}: {e.message}"),
+            },
+            ChunkRead.Failed(e) => failed = some("{e.exception}: {e.message}"),
+        }
+        if let why = failed {
+            for e in lines {
+                self.logs.push(e.copy())
+            }
+            self.logs.push(Entry.error("Failed to load entity chunk [{pos.x}, {pos.z}]: {why}"))
+            self.logs.push(Entry.error("Failed to read chunk [{pos.x}, {pos.z}]: {why}"))
+            return true
+        }
+        var entities = List<ReadEntity>()
+        var nothing = true
+        var compound: JavaHashMap<String, Tag>? = none
+        match root {
+            some(Tag.Compound(m)) => compound = some(m.copy()),
+            _ => {},
+        }
+        if let m = compound {
+            nothing = false
+            let chunk = EntityChunk.read(pos, m, mut lines)
+            let codecs_ready = self.items_ready()
+            for saved in chunk.entities {
+                var type_id = String()
+                if saved.tag.contains("id") {
+                    if let Tag.Str(name) = saved.tag["id"] {
+                        type_id = name.copy()
+                    }
+                }
+                if type_id.is_empty() {
+                    lines.push(Entry.warn(String("Skipping Entity with id [invalid]")))
+                    continue
+                }
+                if type_id != "minecraft:item" or not codecs_ready {
+                    entities.push(ReadEntity.Kept(Tag.Compound(saved.tag.copy())))
+                    continue
+                }
+                var stack: Tag? = none
+                if saved.tag.contains("Item") {
+                    if let codecs = self.items {
+                        stack = codecs.stack(saved.tag["Item"], true)
+                    }
+                }
+                self.entity_ids += 1
+                let id = self.entity_ids
+                let seed = self.entity_seed(id)
+                if let e = ItemEntity.loaded(id, seed, saved.tag, stack, mut lines) {
+                    entities.push(ReadEntity.Item(e))
+                }
+            }
+            if let line = chunk.problems.close(entity_logger()) {
+                lines.push(line)
+            }
+        }
+        for e in lines {
+            self.logs.push(e.copy())
+        }
+        var after = self.take_entities(d)
+        if nothing {
+            after.empty.insert(k)
+        }
+        after.inbox.push(ReadEntities { pos: pos, entities: entities })
+        self.put_entities(d, after)
+        return true
+    }
+
+    // Asks for the entities of the chunk at `pos` of the level `d`, `requestChunkLoad`: from its
+    // thread, or, replaying a recording that read them, from the log; with neither, nothing's
+    // saved, so it has none.
+    fn ask_entities(mut self, d: usize, pos: ChunkPos) {
+        let k = pos.pack()
+        var es = self.take_entities(d)
+        es.loads.insert(k, false)
+        if let held = es.jobs.take() {
+            var jobs = held
+            jobs.read(pos)
+            es.jobs = some(jobs)
+        } else if not self.entities_logged {
+            es.empty.insert(k)
+            es.inbox.push(ReadEntities { pos: pos, entities: List<ReadEntity>() })
+        }
+        self.put_entities(d, es)
+    }
+
+    // `PersistentEntitySectionManager.tick` for the level `d`, as `ServerLevel.tick` ends with it
+    // (CAL-148): first the chunks that came to be accessible, `updateChunkStatus`, whose entities
+    // are asked for if they're fresh, and those that stopped being, to unload; then the entities
+    // read come in, `processPendingLoads`; then each chunk to unload that's still not accessible
+    // is saved, and its items go, `processUnloads`.
+    fn tick_entity_chunks(mut self, d: usize) {
+        self.entity_visibility(d)
+        _ = self.take_in_entities(d)
+        let es = self.take_entities(d)
+        var keys = List<i64>()
+        for k in es.to_unload {
+            keys.push(k)
+        }
+        self.put_entities(d, es)
+        for k in keys {
+            let now = self.take_entities(d)
+            let visible = now.visible.contains(k)
+            self.put_entities(d, now)
+            if visible or self.unload_entity_chunk(d, k) {
+                var after = self.take_entities(d)
+                after.to_unload.remove(k)
+                self.put_entities(d, after)
+            }
+        }
+    }
+
+    // `updateChunkStatus` for each chunk of the level `d` that came to be full or stopped being,
+    // as `onFullChunkStatusChange` tells it: one that came to be is accessible, and its entities
+    // are asked for if it's fresh; one that stopped being is to unload (CAL-148).
+    fn entity_visibility(mut self, d: usize) {
+        let changes = self.levels[d].take_full_changes()
+        for (pos, full) in changes {
+            let k = pos.pack()
+            var es = self.take_entities(d)
+            let fresh = not es.loads.contains(k)
+            if full {
+                es.visible.insert(k)
+                es.to_unload.remove(k)
+            } else {
+                es.visible.remove(k)
+                es.to_unload.insert(k)
+            }
+            self.put_entities(d, es)
+            if full and fresh {
+                self.ask_entities(d, pos)
+            }
+        }
+    }
+
+    // Whether the entities of each full chunk within `radius` of `center` in the level `d` are in,
+    // `areEntitiesLoaded`, as `waitForEntities` waits for them, taking in what's been read first,
+    // `processPendingLoads`, once the chunks that came to be full have theirs asked for (CAL-148).
+    fn entities_around(mut self, d: usize, center: ChunkPos, radius: i32) -> bool {
+        self.entity_visibility(d)
+        _ = self.take_in_entities(d)
+        let es = self.take_entities(d)
+        var all = true
+        for x in center.x - radius..center.x + radius + 1 {
+            for z in center.z - radius..center.z + radius + 1 {
+                let pos = ChunkPos { x: x, z: z }
+                if not self.levels[d].full(pos) {
+                    continue
+                }
+                let k = pos.pack()
+                if not es.loads.contains(k) or not es.loads[k] {
+                    all = false
+                }
+            }
+        }
+        self.put_entities(d, es)
+        return all
+    }
+
+    // `processPendingLoads`: each chunk read comes in, in the order it was read, each entity in the
+    // order it was saved, `addEntity`: an item last in the tick list and paired with the players
+    // that see it, and the rest kept to save again, with a place in their sections; then it's
+    // read. The chunks that came in.
+    fn take_in_entities(mut self, d: usize) -> List<i64> {
+        var es = self.take_entities(d)
+        if es.inbox.is_empty() {
+            self.put_entities(d, es)
+            return List<i64>()
+        }
+        let inbox = es.inbox
+        es.inbox = List<ReadEntities>()
+        self.put_entities(d, es)
+        var came = List<i64>()
+        for chunk in inbox {
+            let k = chunk.pos.pack()
+            for each in chunk.entities {
+                if let ReadEntity.Kept(tag) = each {
+                    var now = self.take_entities(d)
+                    now.last_kept -= 1
+                    let id = now.last_kept
+                    let (x, y, z) = kept_place(tag)
+                    now.items.place_kept(id, x, y, z)
+                    now.kept.insert(id, tag.copy())
+                    self.put_entities(d, now)
+                    continue
+                }
+                match each {
+                    ReadEntity.Item(e) => self.add_item(d, e.copy(), none),
+                    ReadEntity.Kept(_) => {},
+                }
+            }
+            var after = self.take_entities(d)
+            after.loads.insert(k, true)
+            self.put_entities(d, after)
+            came.push(k)
+        }
+        return came
+    }
+
+    // `storeChunkSections` for the chunk at `k` of the level `d`: its entities in its sections'
+    // order, each item as `saveAsPassenger` saves it and each kept as it was read,
+    // `EntityStorage.storeEntities`; none, if its entities were read, clears it, unless it's known
+    // to have none. A chunk whose entities are asked for can't be saved yet, nor one with entities
+    // whose entities weren't read, which are asked for. Those saved, by ID, or `none` if it wasn't.
+    fn store_entity_chunk(mut self, d: usize, k: i64) -> List<i32>? {
+        var es = self.take_entities(d)
+        let fresh = not es.loads.contains(k)
+        if not fresh and not es.loads[k] {
+            self.put_entities(d, es)
+            return none
+        }
+        let pos = ChunkPos { x: i32.wrap(k), z: i32.wrap(k >> 32) }
+        let ids = es.items.in_chunk(pos)
+        var tags = List<Tag>()
+        for id in ids {
+            if id < 0 {
+                if es.kept.contains(id) {
+                    tags.push(es.kept[id].copy())
+                }
+            } else {
+                tags.push(es.items.item(id).saved())
+            }
+        }
+        if tags.is_empty() {
+            if not fresh and not es.empty.contains(k) {
+                es.empty.insert(k)
+                if let held = es.jobs.take() {
+                    var jobs = held
+                    jobs.write(pos, none)
+                    es.jobs = some(jobs)
+                }
+            }
+            self.put_entities(d, es)
+            return some(ids)
+        }
+        if fresh {
+            self.put_entities(d, es)
+            self.ask_entities(d, pos)
+            return none
+        }
+        es.empty.remove(k)
+        if let held = es.jobs.take() {
+            var jobs = held
+            jobs.write(pos, write_entities(pos, some(tags)))
+            es.jobs = some(jobs)
+        }
+        self.put_entities(d, es)
+        return some(ids)
+    }
+
+    // `processChunkUnload` of the chunk at `k` of the level `d`: its entities saved, then its
+    // items gone from the level, `unloadEntity`, and from those who saw them, as their trackers
+    // go, and the kept let go of; `false` if it can't be saved yet.
+    fn unload_entity_chunk(mut self, d: usize, k: i64) -> bool {
+        let ids = self.store_entity_chunk(d, k) else return false
+        var es = self.take_entities(d)
+        for id in ids {
+            if id < 0 {
+                es.items.remove_kept(id)
+                _ = es.kept.remove(id)
+                continue
+            }
+            es.items.remove(id)
+            _ = es.items.take_gone()
+            self.item_gone(mut es, id)
+        }
+        _ = es.loads.remove(k)
+        self.put_entities(d, es)
+        return true
+    }
+
+    // `autoSave` of the level `d`'s entities (CAL-148): each chunk with items, and each whose
+    // entities were read, saved, or unloaded where it isn't accessible.
+    fn save_entity_chunks(mut self, d: usize) {
+        let es = self.take_entities(d)
+        var keys = List<i64>()
+        var seen = Set<i64>()
+        for pos in es.items.chunks() {
+            let k = pos.pack()
+            seen.insert(k)
+            keys.push(k)
+        }
+        for (k, done) in es.loads {
+            if done and not seen.contains(k) {
+                keys.push(k)
+            }
+        }
+        self.put_entities(d, es)
+        for k in keys {
+            let now = self.take_entities(d)
+            let visible = now.visible.contains(k)
+            self.put_entities(d, now)
+            if visible {
+                _ = self.store_entity_chunk(d, k)
+            } else if self.unload_entity_chunk(d, k) {
+                var after = self.take_entities(d)
+                after.to_unload.remove(k)
+                self.put_entities(d, after)
+            }
+        }
+    }
+
+    // `saveAll` of the level `d`'s entities as the server stops (CAL-148): what's been read comes
+    // in, and every chunk's saved, as `autoSave` saves them; those asked for are saved as they're
+    // read. Once nothing's asked for, their thread writes what it holds and closes.
+    fn stop_entities(mut self, d: usize) {
+        var es = self.take_entities(d)
+        if es.closed {
+            self.put_entities(d, es)
+            return
+        }
+        let first = not es.saved_all
+        es.saved_all = true
+        self.put_entities(d, es)
+        let came = self.take_in_entities(d)
+        if first {
+            self.save_entity_chunks(d)
+        } else {
+            for k in came {
+                let now = self.take_entities(d)
+                let visible = now.visible.contains(k)
+                self.put_entities(d, now)
+                if visible {
+                    _ = self.store_entity_chunk(d, k)
+                } else {
+                    _ = self.unload_entity_chunk(d, k)
+                }
+            }
+        }
+        var after = self.take_entities(d)
+        var away: usize = 0
+        if let jobs = after.jobs {
+            away = jobs.reads_away()
+        }
+        if away == 0 {
+            after.closed = true
+            if let held = after.jobs.take() {
+                var jobs = held
+                jobs.close()
+                after.jobs = some(jobs)
+            }
+        }
+        self.put_entities(d, after)
     }
 
     // `addFreshEntity` of the item `e` in the level `d` (CAL-148): last in its tick list, after

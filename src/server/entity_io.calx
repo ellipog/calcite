@@ -1,0 +1,225 @@
+/// Reading and writing a dimension's entity chunks, its `entities` folder, off the tick thread, as
+/// vanilla's `EntityStorage` reads and writes them through an `IOWorker` (CAL-148).
+///
+/// One thread owns the folder's region files. It reads what a file holds of a chunk as it's
+/// asked, and hands it back with what it logged, waking the poll; the tick thread makes the
+/// entities of it, as what the IO thread reads is the server's input, which the link records and
+/// a replay hands over in the same order. What it's to write, the NBT `storage.entities` makes
+/// of a chunk's entities or none for a chunk with none, it encodes and holds until nothing else
+/// is asked, or there are `WRITE_BATCH`, and writes together; a read of a chunk held to write
+/// writes it first, so it reads what was saved, as `IOWorker` reads its pending writes. Closing
+/// writes what's held and closes the files.
+module server.entity_io
+
+import nbt.tag.{Tag}
+import server.chunk_jobs.{io_thread}
+import server.log.{Entry}
+import std.net.{Waker}
+import std.thread.{Task}
+import std.time.{Timestamp}
+import storage.region.{Compression}
+import storage.regions.{ChunkRead, RegionStorage, encode_tag}
+import world.pos.{ChunkPos}
+import worldgen.references.{chunk_key}
+
+// The most chunks the thread holds to write together.
+const WRITE_BATCH: usize = 64
+
+// What the thread's asked: a chunk to read, a chunk's NBT to write, or none to clear it, and to
+// close the files.
+enum Ask {
+    Read(ChunkPos)
+    Write(ChunkPos, Tag?)
+    Close
+}
+
+/// What the thread hands back.
+pub enum EntityDone {
+    /// What it read of the chunk, with what it logged.
+    Read(ChunkPos, List<Entry>, ChunkRead)
+    /// What writing logged, which it hands back only if it logged something.
+    Wrote(List<Entry>)
+    /// That it's closed the files, with what closing logged.
+    Closed(List<Entry>)
+}
+
+struct EntityIoThread {
+    storage: RegionStorage
+    compression: Compression
+    asks: Receiver<Ask>
+    done: Sender<EntityDone>
+    waker: Waker
+}
+
+impl Task for EntityIoThread {
+    fn run(own self) {
+        var asks = self.asks
+        var storage = self.storage
+        var done = self.done
+        var writes = List<(ChunkPos, List<u8>?)>()
+        var pending = Set<i64>()
+        var closed = false
+        loop {
+            var got = asks.next()
+            if got == none {
+                if not writes.is_empty() {
+                    write_out(mut storage, mut writes, mut pending, mut done, self.waker)
+                    continue
+                }
+                got = asks.wait()
+            }
+            let ask = got else return
+            match ask {
+                Ask.Read(pos) => {
+                    if pending.contains(chunk_key(pos.x, pos.z)) {
+                        write_out(mut storage, mut writes, mut pending, mut done, self.waker)
+                    }
+                    var logged = List<Entry>()
+                    let read = storage.read_chunk(pos, mut logged)
+                    var lines = List<Entry>()
+                    on_io(logged, mut lines)
+                    done.send(EntityDone.Read(pos, lines, read))
+                    self.waker.wake()
+                },
+                Ask.Write(pos, tag) => {
+                    if not closed {
+                        let bytes: List<u8>? = match tag {
+                            some(t) => some(encode_tag(t, self.compression)),
+                            none => none,
+                        }
+                        pending.insert(chunk_key(pos.x, pos.z))
+                        writes.push((pos, bytes))
+                        if writes.len() >= WRITE_BATCH {
+                            write_out(mut storage, mut writes, mut pending, mut done, self.waker)
+                        }
+                    }
+                },
+                Ask.Close => {
+                    if not writes.is_empty() {
+                        write_out(mut storage, mut writes, mut pending, mut done, self.waker)
+                    }
+                    var logged = List<Entry>()
+                    match storage.close() {
+                        ok => {},
+                        err(e) => logged.push(Entry.error("Failed to close the entity region files: {e}")),
+                    }
+                    var lines = List<Entry>()
+                    on_io(logged, mut lines)
+                    closed = true
+                    done.send(EntityDone.Closed(lines))
+                    self.waker.wake()
+                },
+            }
+        }
+    }
+}
+
+// Writes the chunks held, each that fails logging vanilla's `Failed to store entity chunk` line.
+fn write_out(storage: mut RegionStorage, writes: mut List<(ChunkPos, List<u8>?)>, pending: mut Set<i64>, done: mut Sender<EntityDone>, waker: Waker) {
+    var logged = List<Entry>()
+    let now = i32.wrap(unsafe { Timestamp.now() }.unix_ms / 1000)
+    match storage.write(writes, now, mut logged) {
+        ok => {},
+        err(e) => {
+            for w in writes {
+                logged.push(Entry.error("Failed to store entity chunk [{w.0.x}, {w.0.z}]: {e}"))
+            }
+        },
+    }
+    writes.clear()
+    pending.clear()
+    if logged.is_empty() {
+        return
+    }
+    var lines = List<Entry>()
+    on_io(logged, mut lines)
+    done.send(EntityDone.Wrote(lines))
+    waker.wake()
+}
+
+// What the thread logged, on vanilla's IO thread.
+fn on_io(from: List<Entry>, to: mut List<Entry>) {
+    for e in from {
+        to.push(e.copy().on(io_thread()))
+    }
+}
+
+/// A dimension's entity chunks' thread, and the queues to and from it, which starts with the first
+/// thing asked.
+pub struct EntityJobs {
+    storage: RegionStorage?
+    compression: Compression
+    waker: Waker
+    asks: Receiver<Ask>
+    to_asks: Sender<Ask>
+    done: Receiver<EntityDone>
+    to_done: Sender<EntityDone>
+    // How many reads are asked for and not back, and whether the thread's closing the files.
+    away: usize = 0
+    closing_away: usize = 0
+}
+
+impl EntityJobs {
+    /// The jobs for the entity chunks in `folder`, written with `compression`, which wake the
+    /// server's poll with `waker` as each is done.
+    pub fn new(folder: String, compression: Compression, waker: Waker) -> EntityJobs {
+        let asks = Receiver<Ask>()
+        let to_asks = asks.sender()
+        let done = Receiver<EntityDone>()
+        let to_done = done.sender()
+        return EntityJobs { storage: some(RegionStorage.new(folder, false)), compression: compression, waker: waker, asks: asks, to_asks: to_asks, done: done, to_done: to_done }
+    }
+
+    /// Asks for what's saved of the chunk at `pos`.
+    pub fn read(mut self, pos: ChunkPos) {
+        self.start()
+        self.to_asks.send(Ask.Read(pos))
+        self.away += 1
+    }
+
+    /// Writes `tag` as the chunk at `pos`, or clears it if it's `none`.
+    pub fn write(mut self, pos: ChunkPos, tag: own Tag?) {
+        self.start()
+        self.to_asks.send(Ask.Write(pos, tag))
+    }
+
+    /// Has the thread, if it's started, write what it holds and close the files, as the server
+    /// stops; `closing` counts it until it has.
+    pub fn close(mut self) {
+        if self.storage != none {
+            return
+        }
+        self.to_asks.send(Ask.Close)
+        self.closing_away += 1
+    }
+
+    /// Whether the thread is still closing the files.
+    pub fn closing(self) -> usize {
+        return self.closing_away
+    }
+
+    /// How many reads are asked for and not back.
+    pub fn reads_away(self) -> usize {
+        return self.away
+    }
+
+    /// What's come back since this was last asked, in the order it came.
+    pub fn take_done(mut self) -> Deque<EntityDone> {
+        var back = Deque<EntityDone>()
+        while let d = self.done.next() {
+            match d {
+                EntityDone.Read(_, _, _) => self.away -= 1,
+                EntityDone.Wrote(_) => {},
+                EntityDone.Closed(_) => self.closing_away -= 1,
+            }
+            back.push_last(d)
+        }
+        return back
+    }
+
+    // Starts the thread, if it hasn't.
+    fn start(mut self) {
+        let storage = self.storage.take() else return
+        _ = unsafe { Thread.spawn(EntityIoThread { storage: storage, compression: self.compression, asks: self.asks.share(), done: self.to_done.share(), waker: self.waker }) }
+    }
+}

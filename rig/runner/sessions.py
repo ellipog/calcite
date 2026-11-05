@@ -73,10 +73,11 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # of its inventory as the creative menu does; `clicks`, where it clicks in its inventory menu;
 # `dig` and `dig-creative`, where it digs blocks; `place` and `place-creative`, where it places
 # them; `use`, where it uses them; `use-items` and `use-books`, where it uses items on them; and
-# `use-containers`, where it opens containers and clicks in them; and `items`, where it drops,
-# throws and picks up items (src/rig/session.calx).
+# `use-containers`, where it opens containers and clicks in them; `items`, where it drops,
+# throws and picks up items; and `items-saved`, where it picks up items saved in the world
+# (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
-                   "use-books", "use-containers", "items"]
+                   "use-books", "use-containers", "items", "items-saved"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -400,6 +401,10 @@ CONFIGS = {
     # item's moves as the clock has it.
     "items": Config({}, view=3, scenarios=("items",), world=FIXTURES / "items" / "world", fixture="items",
                      rules=DIG_RULES, player=ITEMS),
+    # The bot, in survival mode, joins a world with items saved in it, which both servers load, and
+    # walks over them, picking up those it may; each server saves the rest again (CAL-148).
+    "items_saved": Config({}, view=3, scenarios=("items-saved",), world=FIXTURES / "items_saved" / "world",
+                           fixture="items_saved", rules=DIG_RULES, player=ITEMS),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
