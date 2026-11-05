@@ -70,7 +70,7 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # Scenarios only the configurations that name them run: `watch`, where the bot joins and stays put
 # a fixed number of game ticks, for a world that never goes quiet, and `creative`, where it sets
 # slots of its inventory as the creative menu does (src/rig/session.calx).
-OTHER_SCENARIOS = ["watch", "creative"]
+OTHER_SCENARIOS = ["watch", "creative", "clicks"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135).
 PLAYER_KEYS = ("Inventory", "equipment", "SelectedItemSlot", "playerGameType")
@@ -146,11 +146,19 @@ INVENTORY = {
 }
 
 
+# The bot's data in `clicks`: `inventory`'s, in survival mode, where clicks are the inventory's own,
+# rather than the creative menu's (CAL-136).
+CLICKS = dict(INVENTORY, playerGameType=nbt.Int(0))
+
+
 CONFIGS = {
     "compressed": Config({}),
     # The bot joins with a saved inventory, which each server sends with the inventory menu's
     # slots, then joins again and sets creative slots; what each saves of it is compared (CAL-135).
     "inventory": Config({}, scenarios=("join", "creative"), player=INVENTORY),
+    # The bot, in survival with the same inventory, clicks in its inventory menu; what each server
+    # sends back, and what each saves of it, is compared (CAL-136).
+    "clicks": Config({}, scenarios=("clicks",), player=CLICKS),
     "uncompressed": Config({"network-compression-threshold": "-1"}),
     # A saved world, whose chunks both servers read and light (CAL-76). A view of 3 sends the
     # chunks from -4 to 4, which vanilla lights with their neighbours, all of them full in the

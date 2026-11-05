@@ -22,14 +22,15 @@ import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{DATA_VERSION, PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
-import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundBlockEvent, ClientboundLevelEvent, ClientboundSound, ClientboundLightUpdate, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, ServerboundSetCreativeModeSlot, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
+import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundContainerSetSlot, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundBlockEvent, ClientboundLevelEvent, ClientboundSound, ClientboundLightUpdate, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetCursorItem, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetPlayerInventory, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, ServerboundContainerClick, ServerboundSetCreativeModeSlot, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
-import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
+import protocol.wire.{DecodeError, Reader, Writer, Wire, Packet, write_packet}
 import random.legacy.{LegacyRandom}
 import registry.builtin.{builtin_entries, builtin_names}
 import registry.codec.{same}
 import registry.components.{ItemCodecs}
+import registry.registries.{Registries}
 import registry.streams.{Streams}
 import random.source.{shuffle}
 import random.taped.{TapedRandom}
@@ -64,6 +65,7 @@ import world.flat.{MIN_Y, SECTIONS, SURFACE_Y}
 import worldgen.providers.{GenContext, IntProvider}
 import worldgen.survive.{Env}
 import world.inventory.{Inventory, MENU_SLOTS}
+import world.menu.{Clicker, Effect, HashedStack, Menu, OUTSIDE, put_by_player}
 import world.item.{ItemStack, SentStack}
 import world.modes.{Difficulty, GameType, PreviousGameType}
 import world.pos.{BlockPos, ChunkPos}
@@ -357,8 +359,10 @@ struct Player {
     // slots are sent, as `AbstractContainerMenu.incrementStateId` counts it.
     selected: i32 = 0
     menu_state: i32 = 0
-    // What's in their inventory and on them (D372).
+    // What's in their inventory and on them (D372), and their inventory menu's cursor and what
+    // the server knows of their client's slots (D374).
     inventory: Inventory = Inventory()
+    menu: Menu = Menu()
 }
 
 // A command, or a game mode picked with F3 and F4, from the player in a slot, which runs once
@@ -3026,22 +3030,165 @@ impl Network {
     fn send_inventory(mut self, con: mut Connection) {
         con.player.menu_state = (con.player.menu_state + 1) & 32767
         var slots = List<SentStack>()
-        let ready = self.items_ready()
         for n in 0..MENU_SLOTS {
-            var sent = SentStack.empty()
-            if ready {
-                if let stack = con.player.inventory.menu_slot(n) {
-                    if let streams = self.streams {
-                        if let r = self.world.registries {
-                            sent = ItemStack.from_saved(stack).sent(streams, r.value)
-                        }
-                    }
+            slots.push(self.sent_stack(con.player.inventory.menu_slot(n)))
+        }
+        let carried = self.sent_stack(con.player.menu.carried)
+        // The client has it all now, as `RemoteSlot.force` takes it (D374).
+        con.player.menu.sent_all(con.player.inventory)
+        let state = con.player.menu_state
+        self.send(mut con, ClientboundContainerSetContent { container_id: 0, state_id: state, items: slots, carried: carried }, State.Play)
+    }
+
+    // A stack as `ItemStack.CODEC` writes it, as a packet sends it, or nothing in a world
+    // without its registries.
+    fn sent_stack(mut self, stack: Tag?) -> SentStack {
+        if not self.items_ready() {
+            return SentStack.empty()
+        }
+        if let given = stack {
+            if let streams = self.streams {
+                if let r = self.world.registries {
+                    return ItemStack.from_saved(given).sent(streams, r.value)
                 }
             }
-            slots.push(sent)
         }
-        let state = con.player.menu_state
-        self.send(mut con, ClientboundContainerSetContent { container_id: 0, state_id: state, items: slots, carried: SentStack.empty() }, State.Play)
+        return SentStack.empty()
+    }
+
+    // `broadcastChanges` of the player's inventory menu, as `ServerPlayer.tick` and each click
+    // run it: each slot the client hasn't got, sent as `container_set_slot` with the menu's next
+    // state ID, then the cursor's, as `set_cursor_item` (D374).
+    fn broadcast_menu(mut self, con: mut Connection) {
+        if not self.items_ready() {
+            return
+        }
+        let taken = self.items.take() else return
+        let changes = con.player.menu.changes(con.player.inventory, taken)
+        self.items = some(taken)
+        for (slot, stack) in changes {
+            let sent = self.sent_stack(stack)
+            if slot < 0 {
+                self.send(mut con, ClientboundSetCursorItem { stack: sent }, State.Play)
+            } else {
+                con.player.menu_state = (con.player.menu_state + 1) & 32767
+                let state = con.player.menu_state
+                self.send(mut con, ClientboundContainerSetSlot { container_id: 0, state_id: state, slot: i16.wrap(slot), stack: sent }, State.Play)
+            }
+        }
+    }
+
+    // What a click or a close did beyond the menu's slots, in the order it happened (D374): the
+    // crafting grid's result, which is nothing until Calcite has recipes, taken as the client's
+    // and sent, as `slotChangedCraftingGrid` sends it; an equip sound; a stack put back in the
+    // inventory, sent as `placeItemBackInInventory` sends it; and a stack vanilla would drop,
+    // which needs item entities.
+    fn menu_effects(mut self, con: mut Connection, fx: List<Effect>) {
+        for e in fx {
+            match e {
+                Effect.Grid => {
+                    con.player.menu.set_remote(0, none)
+                    con.player.menu_state = (con.player.menu_state + 1) & 32767
+                    let state = con.player.menu_state
+                    self.send(mut con, ClientboundContainerSetSlot { container_id: 0, state_id: state, slot: 0i16, stack: SentStack.empty() }, State.Play)
+                },
+                Effect.Equip(worn, old, stack) => self.equip_sound(con, worn, old, stack),
+                Effect.Placed(slot, stack) => {
+                    let sent = self.sent_stack(stack)
+                    self.send(mut con, ClientboundSetPlayerInventory { slot: i32.wrap(slot), stack: sent }, State.Play)
+                },
+                Effect.Dropped(stack) => {
+                    self.logs.push(Entry.warn("{player_name(con)} would have dropped {stack.to_snbt()}, which needs item entities Calcite doesn't have yet"))
+                },
+            }
+        }
+    }
+
+    // `handleContainerClick` on the player's inventory menu, container 0 (D374). The slots the
+    // client says changed and what its cursor carries are read first, as the packet's codec
+    // reads them, which stops the connection where they don't read. A spectator is sent the
+    // whole menu again. A slot that isn't one is let be. Otherwise the click runs with remote
+    // updates held, the client's word is taken for the slots it says changed and for its
+    // cursor, and then what it hasn't got is sent, or all of it where its state wasn't the
+    // menu's. A click vanilla throws on is logged as `onPacketError` logs it, and leaves remote
+    // updates held, as vanilla leaves them, until the next click.
+    fn container_click(mut self, con: mut Connection, c: ServerboundContainerClick) -> bool {
+        if not self.items_ready() {
+            return true
+        }
+        let packet = String("serverbound/minecraft:container_click")
+        let (items_n, types_n) = match self.world.registries {
+            some(r) => (builtin_size(r.value, "item"), builtin_size(r.value, "data_component_type")),
+            none => return true,
+        }
+        var rd = Reader.new(c.rest.copy())
+        let click = match read_click(mut rd, items_n, types_n) {
+            ok(k) => k,
+            err(e) => {
+                self.fault(mut con, decode_exception("Failed to decode packet '{packet}': {e.message}"))
+                return false
+            },
+        }
+        if rd.left() != 0 {
+            self.fault(mut con, decode_exception("Packet play/{packet} (ServerboundContainerClickPacket) was larger than I expected, found {rd.left()} bytes extra whilst reading packet {packet}"))
+            return false
+        }
+        if c.container_id != 0 {
+            return true
+        }
+        if con.player.mode == GameType.Spectator {
+            self.send_inventory(mut con)
+            return true
+        }
+        let slot = i32(c.slot)
+        if slot != -1 and slot != OUTSIDE and slot >= i32.wrap(MENU_SLOTS) {
+            return true
+        }
+        let resync = c.state_id != con.player.menu_state
+        // `ContainerInput.BY_ID`, whose IDs out of range are `PICKUP`'s.
+        let input = if c.input >= 0 and c.input <= 6 { c.input } else { 0 }
+        let who = clicker(con)
+        let taken = self.items.take() else return true
+        var menu = con.player.menu.copy()
+        menu.suppress()
+        var fx = List<Effect>()
+        let done = menu.click(mut con.player.inventory, taken, who, slot, i32(c.button), input, mut fx)
+        con.player.menu = menu
+        self.items = some(taken)
+        self.menu_effects(mut con, fx)
+        if not done {
+            self.suppress(click_text(c, click, input), String("net.minecraft.ReportedException: Container click"))
+            return true
+        }
+        for i in 0..click.slots.len() {
+            con.player.menu.receive(click.slots[i], click.stacks[i])
+        }
+        con.player.menu.receive_carried(click.carried)
+        con.player.menu.resume()
+        if resync {
+            // `broadcastFullState`.
+            self.send_inventory(mut con)
+        } else {
+            self.broadcast_menu(mut con)
+        }
+        return true
+    }
+
+    // `doCloseContainer`, as `handleContainerClose` runs it whatever container the client names,
+    // and as the player leaves a dimension: the inventory menu's `removed`, which puts what the
+    // cursor carries and the crafting grid back in the inventory (D374).
+    fn close_menu(mut self, con: mut Connection) {
+        if not self.items_ready() {
+            return
+        }
+        let who = clicker(con)
+        let taken = self.items.take() else return
+        var menu = con.player.menu.copy()
+        var fx = List<Effect>()
+        menu.close(mut con.player.inventory, taken, who, mut fx)
+        con.player.menu = menu
+        self.items = some(taken)
+        self.menu_effects(mut con, fx)
     }
 
     // Whether players' items can be read and sent: the item codecs and their streams, made the
@@ -3108,15 +3255,15 @@ impl Network {
         }
         let slot = i32(c.slot)
         if slot >= 1 and slot <= 45 and valid_data {
+            // `setByPlayer`, which the armor's slots and the offhand's call `onEquipItem` in, and
+            // the crafting grid tells the menu of; then the client has it, and what it hasn't is
+            // sent (D374).
             let n = usize.wrap(slot)
-            // The armor's slots and the offhand's are `ArmorSlot`s and the offhand's own, whose
-            // `setByPlayer` calls `onEquipItem` first.
-            let worn = if n == 5 { "head" } else if n == 6 { "chest" } else if n == 7 { "legs" } else if n == 8 { "feet" } else if n == 45 { "offhand" } else { "" }
-            if worn != "" {
-                let old = con.player.inventory.menu_slot(n)
-                self.equip_sound(con, worn, old, stack)
-            }
-            con.player.inventory.set_menu_slot(n, stack)
+            var fx = List<Effect>()
+            put_by_player(mut con.player.inventory, n, stack, mut fx)
+            self.menu_effects(mut con, fx)
+            con.player.menu.set_remote(n, stack)
+            self.broadcast_menu(mut con)
         }
         return true
     }
@@ -3127,7 +3274,7 @@ impl Network {
     // `item.armor.equip_generic` where it has none, at the player, among the players' sounds, 7.
     // An equip sound given in full rather than by its ID, and the game event the change makes,
     // which sculk hears, Calcite doesn't have yet.
-    fn equip_sound(mut self, con: Connection, worn: str, old: Tag?, stack: Tag?) {
+    fn equip_sound(mut self, con: Connection, worn: String, old: Tag?, stack: Tag?) {
         let given = stack else return
         if let was = old {
             if same_item_components(was, given) {
@@ -3147,7 +3294,7 @@ impl Network {
             Tag.Str(s) => s.copy(),
             _ => return,
         }
-        if equippable_slot != String(worn) {
+        if equippable_slot != worn {
             return
         }
         var sound = String("item.armor.equip_generic")
@@ -3187,6 +3334,9 @@ impl Network {
         self.drop_view(mut con)
         self.levels[from].remove_player(ChunkPos { x: con.player.section_x, z: con.player.section_z }, con.player.entity_id)
         self.levels[from].forget_player(con.player.entity_id)
+        // `Player.remove` closes the inventory menu, which puts what the cursor carries and the
+        // crafting grid back in the inventory, for a player changing dimension (D374).
+        self.close_menu(mut con)
         con.player.dim = to
         self.teleport(mut con, x, y, z, y_rot, x_rot)
         self.enter_level(mut con)
@@ -3325,6 +3475,8 @@ impl Network {
         _ = self.keep_alive(mut con, now)
         con.player.chat_spam.tick()
         con.player.command_spam.tick()
+        // `ServerPlayer.tick`'s `broadcastChanges` (D374).
+        self.broadcast_menu(mut con)
     }
 
     // Sends the player the chunks due this tick that are ready, as `sendNextChunks` does, in as
@@ -3457,6 +3609,11 @@ impl Network {
                 return true
             },
             PlayIn.SetCreativeModeSlot(c) => return self.creative_slot(mut con, c),
+            PlayIn.ContainerClick(c) => return self.container_click(mut con, c),
+            PlayIn.ContainerClose(_) => {
+                self.close_menu(mut con)
+                return true
+            },
             PlayIn.KeepAlive(k) => return self.answer_keep_alive(mut con, k, now),
             PlayIn.MovePlayerPos(m) => return self.moved(mut con, true, m.x, m.y, m.z, false, 0.0, 0.0),
             PlayIn.MovePlayerPosRot(m) => return self.moved(mut con, true, m.x, m.y, m.z, true, m.y_rot, m.x_rot),
@@ -4839,6 +4996,91 @@ fn player_tag(player: Player, id: Uuid, dimension: own String) -> JavaHashMap<St
     abilities.insert(String("walkSpeed"), Tag.float(a.walking_speed))
     data.insert(String("abilities"), Tag.Compound(abilities))
     return data
+}
+
+// What a click needs of the player: infinite materials, creative mode and the slot they hold.
+fn clicker(con: Connection) -> Clicker {
+    return Clicker { infinite: con.player.abilities.instabuild, creative: con.player.mode == GameType.Creative, selected: con.player.selected }
+}
+
+// How many entries the built-in registry `name` has.
+fn builtin_size(r: Registries, name: str) -> usize {
+    let b = r.find_builtin(String(name)) else return 0
+    return r.builtin[b].entries.len()
+}
+
+// A click's slots the client says changed and what its cursor carries, as
+// `ServerboundContainerClickPacket` reads them after its fields.
+struct Click {
+    slots: List<i32> = List<i32>()
+    stacks: List<HashedStack> = List<HashedStack>()
+    carried: HashedStack = HashedStack()
+}
+
+// `SLOTS_STREAM_CODEC`, at most 128 slots, each a short and a `HashedStack`, read into a hash
+// map, where a slot given twice has the later stack; then the cursor's `HashedStack`.
+fn read_click(rd: mut Reader, items: usize, types: usize) -> Click ! DecodeError {
+    let n = try rd.varint()
+    if n > 128 {
+        fail DecodeError { message: "io.netty.handler.codec.DecoderException: {n} elements exceeded max size of: 128" }
+    }
+    if n < 0 {
+        fail DecodeError { message: String("java.lang.IllegalArgumentException: The expected number of elements must be nonnegative") }
+    }
+    var click = Click()
+    for _ in 0..usize.wrap(n) {
+        let slot = i32(try rd.i16())
+        let h = try HashedStack.read(mut rd, items, types)
+        var found = false
+        for i in 0..click.slots.len() {
+            if click.slots[i] == slot {
+                click.stacks[i] = h.copy()
+                found = true
+            }
+        }
+        if not found {
+            click.slots.push(slot)
+            click.stacks.push(h)
+        }
+    }
+    click.carried = try HashedStack.read(mut rd, items, types)
+    return click
+}
+
+// The click packet as its record's `toString` writes it, as `onPacketError` logs it, with each
+// hashed stack by its item's and types' network IDs.
+fn click_text(c: ServerboundContainerClick, click: Click, input: i32) -> String {
+    let names = ["PICKUP", "QUICK_MOVE", "SWAP", "CLONE", "THROW", "QUICK_CRAFT", "PICKUP_ALL"]
+    var slots = List<String>()
+    for i in 0..click.slots.len() {
+        slots.push("{click.slots[i]}={hashed_text(click.stacks[i])}")
+    }
+    return "ServerboundContainerClickPacket[containerId={c.container_id}, stateId={c.state_id}, slotNum={c.slot}, buttonNum={c.button}, containerInput={names[usize.wrap(input)]}, changedSlots=\{{comma_list(slots)}\}, carriedItem={hashed_text(click.carried)}]"
+}
+
+// The parts, with ", " between them, as a Java collection's `toString` writes its elements.
+fn comma_list(parts: List<String>) -> String {
+    var out = String()
+    for i in 0..parts.len() {
+        if i > 0 {
+            out.push_str(", ")
+        }
+        out.push_str(parts[i])
+    }
+    return out
+}
+
+fn hashed_text(h: HashedStack) -> String {
+    let item = h.item else return String("<empty>")
+    var added = List<String>()
+    for i in 0..h.types.len() {
+        added.push("{h.types[i]}={h.hashes[i]}")
+    }
+    var removed = List<String>()
+    for t in h.removed {
+        removed.push("{t}")
+    }
+    return "ActualItem[item={item}, count={h.count}, components=HashedPatchMap[addedComponents=\{{comma_list(added)}\}, removedComponents=[{comma_list(removed)}]]]"
 }
 
 // `SoundSource.PLAYERS`'s ordinal, which a player's own sounds are played among.

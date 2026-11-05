@@ -1,0 +1,1125 @@
+/// The inventory menu, as vanilla's `InventoryMenu` and the `AbstractContainerMenu` under it run
+/// it for a player: what a click does to its 46 slots and to the stack the cursor carries, as
+/// `doClick` does it, and what the server knows of the client's slots, as
+/// `RemoteSlot.Synchronized` knows it, the stack the server last sent or the hash of the one the
+/// client says it has, so only what the client hasn't got is sent again. Each stack is as
+/// `ItemStack.CODEC` writes it, or nothing, as `world.inventory` keeps them (CAL-136).
+///
+/// What vanilla throws out as an item, a stack dropped outside the menu, `THROW`, and what
+/// doesn't fit back in the inventory, needs item entities, which Calcite doesn't have yet: a
+/// throw is left undone, so the client is sent its stack back, and what doesn't fit is gone, as
+/// `Effect.Dropped` says. A bundle's own clicks, `overrideStackedOnOther`, wait for bundles.
+module world.menu
+
+import nbt.tag.{Tag}
+import protocol.wire.{DecodeError, Reader}
+import registry.codec.{same}
+import registry.components.{ItemCodecs}
+import world.inventory.{Inventory, MENU_SLOTS}
+
+/// `ContainerInput`'s IDs: what kind of click it is.
+pub const PICKUP: i32 = 0
+pub const QUICK_MOVE: i32 = 1
+pub const SWAP: i32 = 2
+pub const CLONE: i32 = 3
+pub const THROW: i32 = 4
+pub const QUICK_CRAFT: i32 = 5
+pub const PICKUP_ALL: i32 = 6
+
+/// `AbstractContainerMenu.SLOT_CLICKED_OUTSIDE`: a click outside the menu.
+pub const OUTSIDE: i32 = -999
+
+// `HashedPatchMap.STREAM_CODEC`'s most components set and taken away.
+const MAX_HASHED: i32 = 256
+
+/// A stack as the client says it has it, vanilla's `HashedStack`: its item, its count, and each
+/// component its patch sets, by its type, with its value's hash, as `HashOps.CRC32C_INSTANCE`
+/// hashes it, and each type its patch takes away. Made with `HashedStack()`, it's
+/// `HashedStack.EMPTY`.
+pub struct HashedStack {
+    /// The item's network ID, `none` for nothing.
+    pub item: i32? = none
+    pub count: i32 = 0
+    /// Each component type the patch sets, by its network ID, and in `hashes`, its value's hash.
+    pub types: List<i32> = List<i32>()
+    pub hashes: List<i32> = List<i32>()
+    /// Each component type the patch takes away.
+    pub removed: List<i32> = List<i32>()
+}
+
+impl HashedStack {
+    /// `HashedStack.STREAM_CODEC`: whether there's a stack, then its item, its count, and its
+    /// `HashedPatchMap`, the types it sets with their hashes, then those it takes away, at most
+    /// 256 of each, read into a hash map and a hash set, so a type given twice is there once, the
+    /// later hash in place of the earlier. `items` and `types` are how many items and component
+    /// types there are: an ID past them throws, as `byIdOrThrow` does.
+    pub fn read(rd: mut Reader, items: usize, types: usize) -> HashedStack ! DecodeError {
+        if not try rd.bool() {
+            return HashedStack()
+        }
+        let item = try rd.varint()
+        try known(item, items)
+        let count = try rd.varint()
+        var h = HashedStack { item: some(item), count: count }
+        let given = try hashed_count(mut rd)
+        for _ in 0..given {
+            let t = try rd.varint()
+            try known(t, types)
+            let hash = try rd.i32()
+            var found = false
+            for i in 0..h.types.len() {
+                if h.types[i] == t {
+                    h.hashes[i] = hash
+                    found = true
+                }
+            }
+            if not found {
+                h.types.push(t)
+                h.hashes.push(hash)
+            }
+        }
+        let taken = try hashed_count(mut rd)
+        for _ in 0..taken {
+            let t = try rd.varint()
+            try known(t, types)
+            if not has_i32(h.removed, t) {
+                h.removed.push(t)
+            }
+        }
+        return h
+    }
+
+    /// `matches`: whether `stack` is the stack this says, its count, its item and its patch, the
+    /// same types taken away and each component set hashing the same, with `items`' codecs.
+    pub fn matches(self, stack: Tag?, items: ItemCodecs) -> bool {
+        let want = self.item else return stack == none
+        var item = items.builtin_id("item", String("minecraft:air")) ?? 0
+        var count = 0
+        var patch = JavaHashMap<String, Tag>()
+        if let t = stack {
+            let Tag.Compound(m) = t else return false
+            item = match m["id"] {
+                Tag.Str(s) => items.builtin_id("item", s.copy()) ?? -1,
+                _ => -1,
+            }
+            count = count_of(stack)
+            if m.contains("components") {
+                match m["components"] {
+                    Tag.Compound(p) => patch = p.copy(),
+                    _ => {},
+                }
+            }
+        }
+        if self.count != count or want != item {
+            return false
+        }
+        var removed: usize = 0
+        var added: usize = 0
+        for (k, _) in patch {
+            if k.starts_with("!") {
+                let t = items.builtin_id("data_component_type", k[1..].copy()) else return false
+                if not has_i32(self.removed, t) {
+                    return false
+                }
+                removed += 1
+            } else {
+                added += 1
+            }
+        }
+        if removed != self.removed.len() or added != self.types.len() {
+            return false
+        }
+        for (k, v) in patch {
+            if k.starts_with("!") {
+                continue
+            }
+            let t = items.builtin_id("data_component_type", k.copy()) else return false
+            var expected: i32? = none
+            for i in 0..self.types.len() {
+                if self.types[i] == t {
+                    expected = some(self.hashes[i])
+                }
+            }
+            let e = expected else return false
+            if items.component_hash(k.copy(), v) != e {
+                return false
+            }
+        }
+        return true
+    }
+}
+
+/// What the server knows of one of the client's slots, or of what its cursor carries, as
+/// `RemoteSlot.Synchronized` knows it.
+pub enum Remote {
+    /// Nothing yet, which matches no stack.
+    Unknown
+    /// `force`: the stack the server sent, or nothing.
+    Sent(Tag?)
+    /// `receive`: the hash of the stack the client says it has.
+    Hashed(HashedStack)
+}
+
+/// What a click or a close does beyond the menu's slots, in the order it happens, for the
+/// network to carry out.
+pub enum Effect {
+    /// The crafting grid changed, so `slotChangedCraftingGrid` sets the result, which is nothing
+    /// until Calcite has recipes, takes it as the client's, and sends it, slot 0, with the next
+    /// state ID.
+    Grid
+    /// `onEquipItem`: the equipment slot, by its codec's name, the stack that was there and the
+    /// one put there, for the equip sound.
+    Equip(String, Tag?, Tag?)
+    /// `placeItemBackInInventory` put some of a stack in the inventory's slot, by the
+    /// inventory's own index, which is sent as `ClientboundSetPlayerInventoryPacket` with what
+    /// the slot has once it's there.
+    Placed(usize, Tag?)
+    /// A stack vanilla would drop at the player's feet, which needs item entities.
+    Dropped(Tag)
+}
+
+/// What a click needs of the player clicking.
+pub struct Clicker {
+    /// `hasInfiniteMaterials`, as creative mode has.
+    pub infinite: bool = false
+    /// `isCreative`.
+    pub creative: bool = false
+    /// The hotbar slot they hold, which a stack put back in the inventory goes to first.
+    pub selected: i32 = 0
+}
+
+/// The inventory menu's state beyond its slots, which `world.inventory` keeps.
+pub struct Menu {
+    /// The stack the cursor carries, `getCarried`.
+    pub carried: Tag? = none
+    remote: List<Remote> = List<Remote>()
+    /// The cursor's, `none` for `Remote.Unknown`.
+    remote_carried: Remote? = none
+    /// Whether the client has been sent the whole menu, before which there's no client to send
+    /// changes to, as there's no `synchronizer`.
+    synced: bool = false
+    /// `suppressRemoteUpdates`, which a click holds while it's handled, and which stays where
+    /// the click throws, until the next click resumes it.
+    suppressed: bool = false
+    quickcraft_status: i32 = 0
+    quickcraft_type: i32 = -1
+    quickcraft_slots: List<usize> = List<usize>()
+}
+
+impl Menu {
+    /// `sendAllDataToRemote`, as far as the client goes: it's sent every slot of `inv` and what
+    /// the cursor carries, which the server takes as the client's.
+    pub fn sent_all(mut self, inv: Inventory) {
+        self.remote = List<Remote>()
+        for n in 0..MENU_SLOTS {
+            self.remote.push(Remote.Sent(get(inv, n)))
+        }
+        self.remote_carried = some(Remote.Sent(self.carried.copy()))
+        self.synced = true
+    }
+
+    /// `setRemoteSlot`: the client has `stack` in slot `n`, as the server sent it or put it.
+    pub fn set_remote(mut self, n: usize, stack: Tag?) {
+        self.fill_remote()
+        if n < MENU_SLOTS {
+            self.remote[n] = Remote.Sent(stack.copy())
+        }
+    }
+
+    /// `setRemoteSlotUnsafe`: the client says slot `n` has the stack `h` hashes, where `n` is one.
+    pub fn receive(mut self, n: i32, h: HashedStack) {
+        self.fill_remote()
+        if n >= 0 and usize.wrap(n) < MENU_SLOTS {
+            self.remote[usize.wrap(n)] = Remote.Hashed(h.copy())
+        }
+    }
+
+    /// `setRemoteCarried`: the client says its cursor carries the stack `h` hashes.
+    pub fn receive_carried(mut self, h: HashedStack) {
+        self.remote_carried = some(Remote.Hashed(h.copy()))
+    }
+
+    /// `suppressRemoteUpdates`.
+    pub fn suppress(mut self) {
+        self.suppressed = true
+    }
+
+    /// `resumeRemoteUpdates`.
+    pub fn resume(mut self) {
+        self.suppressed = false
+    }
+
+    /// `broadcastChanges`, as far as the client goes: each slot of `inv` the client hasn't got,
+    /// then what the cursor carries, by slot, -1 for the cursor, with the stack, which the
+    /// server sends and from then takes as the client's. Nothing while remote updates are held.
+    pub fn changes(mut self, inv: Inventory, items: ItemCodecs) -> List<(i32, Tag?)> {
+        var out = List<(i32, Tag?)>()
+        if self.suppressed or not self.synced {
+            return out
+        }
+        self.fill_remote()
+        for n in 0..MENU_SLOTS {
+            let current = get(inv, n)
+            let state = knows(self.remote[n], current, items)
+            if state == NO {
+                self.remote[n] = Remote.Sent(current.copy())
+                out.push((i32.wrap(n), current))
+            } else if state == LEARNED {
+                self.remote[n] = Remote.Sent(current)
+            }
+        }
+        let carried = self.carried.copy()
+        let state = match self.remote_carried {
+            some(r) => knows(r, carried, items),
+            none => NO,
+        }
+        if state == NO {
+            self.remote_carried = some(Remote.Sent(carried.copy()))
+            out.push((-1, carried))
+        } else if state == LEARNED {
+            self.remote_carried = some(Remote.Sent(carried))
+        }
+        return out
+    }
+
+    /// `clicked`: what the client's click on slot `slot` with `button`, of the kind `input`,
+    /// does to `inv` and the cursor, as `doClick` does it for the inventory menu, with what else
+    /// it does in `fx`. `false` where vanilla throws, as it does for a swap or a drag onto a slot
+    /// under 0, having changed nothing. `slot` is one `isValidSlotIndex` lets through.
+    pub fn click(mut self, inv: mut Inventory, items: ItemCodecs, who: Clicker, slot: i32, button: i32, input: i32, fx: mut List<Effect>) -> bool {
+        if input == QUICK_CRAFT {
+            let expected = self.quickcraft_status
+            self.quickcraft_status = button & 3
+            if (expected != 1 or self.quickcraft_status != 2) and expected != self.quickcraft_status {
+                self.reset_quickcraft()
+            } else if self.carried == none {
+                self.reset_quickcraft()
+            } else if self.quickcraft_status == 0 {
+                self.quickcraft_type = (button >> 2) & 3
+                if self.quickcraft_type == 0 or self.quickcraft_type == 1 or (self.quickcraft_type == 2 and who.infinite) {
+                    self.quickcraft_status = 1
+                    self.quickcraft_slots = List<usize>()
+                } else {
+                    self.reset_quickcraft()
+                }
+            } else if self.quickcraft_status == 1 {
+                if slot < 0 {
+                    return false
+                }
+                let n = usize.wrap(slot)
+                let c = self.carried.copy() ?? Tag.End
+                if quick_replaces(get(inv, n), c, items) and may_place(n, c, items) and (self.quickcraft_type == 2 or count_of(self.carried) > i32.wrap(self.quickcraft_slots.len())) {
+                    if not has_usize(self.quickcraft_slots, n) {
+                        self.quickcraft_slots.push(n)
+                    }
+                }
+            } else if self.quickcraft_status == 2 {
+                if not self.quickcraft_slots.is_empty() {
+                    if self.quickcraft_slots.len() == 1 {
+                        let only = self.quickcraft_slots[0]
+                        let kind = self.quickcraft_type
+                        self.reset_quickcraft()
+                        return self.click(mut inv, items, who, i32.wrap(only), kind, PICKUP, mut fx)
+                    }
+                    let source = self.carried.copy() ?? Tag.End
+                    var remaining = count_of(self.carried)
+                    let size = i32.wrap(self.quickcraft_slots.len())
+                    for n in self.quickcraft_slots.copy() {
+                        if quick_replaces(get(inv, n), source, items) and may_place(n, source, items) and (self.quickcraft_type == 2 or count_of(self.carried) >= size) {
+                            let carry = count_of(get(inv, n))
+                            let max = min(items.max_stack_size(source), max_for(n, source, items))
+                            let placed = min(place_count(size, self.quickcraft_type, source, items) + carry, max)
+                            remaining -= placed - carry
+                            let was = get(inv, n)
+                            set_by_player(mut inv, n, with_count(source, placed), was, mut fx)
+                        }
+                    }
+                    self.carried = with_count(source, remaining)
+                }
+                self.reset_quickcraft()
+            } else {
+                self.reset_quickcraft()
+            }
+            return true
+        }
+        if self.quickcraft_status != 0 {
+            self.reset_quickcraft()
+            return true
+        }
+        if (input == PICKUP or input == QUICK_MOVE) and (button == 0 or button == 1) {
+            let primary = button == 0
+            if slot == OUTSIDE {
+                // The cursor's stack, or one of it, thrown out as an item: left for item
+                // entities, so the client gets it back.
+                return true
+            }
+            if slot < 0 {
+                return true
+            }
+            let n = usize.wrap(slot)
+            if input == QUICK_MOVE {
+                if not may_pickup(inv, n, items, who) {
+                    return true
+                }
+                var clicked = quick_move(mut inv, n, items, mut fx)
+                while clicked != none and same_item(get(inv, n), clicked) {
+                    clicked = quick_move(mut inv, n, items, mut fx)
+                }
+                return true
+            }
+            let clicked = get(inv, n)
+            let carried = self.carried.copy()
+            if clicked == none {
+                if let c = carried {
+                    let amount = if primary { count_of(carried) } else { 1 }
+                    self.carried = safe_insert(mut inv, n, c, amount, items, mut fx)
+                }
+            } else if may_pickup(inv, n, items, who) {
+                match carried {
+                    none => {
+                        let amount = if primary { count_of(clicked) } else { (count_of(clicked) + 1) / 2 }
+                        if let taken = try_remove(mut inv, n, amount, i32.MAX, items, who, mut fx) {
+                            self.carried = some(taken)
+                        }
+                    },
+                    some(c) => {
+                        if may_place(n, c, items) {
+                            if same_components(clicked, carried) {
+                                let amount = if primary { count_of(carried) } else { 1 }
+                                self.carried = safe_insert(mut inv, n, c, amount, items, mut fx)
+                            } else if count_of(carried) <= max_for(n, c, items) {
+                                self.carried = clicked.copy()
+                                set_by_player(mut inv, n, carried, clicked, mut fx)
+                            }
+                        } else if same_components(clicked, carried) {
+                            let room = items.max_stack_size(c) - count_of(carried)
+                            if let taken = try_remove(mut inv, n, count_of(clicked), room, items, who, mut fx) {
+                                self.carried = with_count(c, count_of(carried) + count_of(some(taken)))
+                            }
+                        }
+                    },
+                }
+            }
+            return true
+        }
+        if input == SWAP and ((button >= 0 and button < 9) or button == 40) {
+            if slot < 0 {
+                return false
+            }
+            let n = usize.wrap(slot)
+            let from = menu_of(usize.wrap(button))
+            let source = get(inv, from)
+            let target = get(inv, n)
+            if source == none and target == none {
+                return true
+            }
+            if source == none {
+                if may_pickup(inv, n, items, who) {
+                    inv.set_menu_slot(from, target.copy())
+                    let was = get(inv, n)
+                    set_by_player(mut inv, n, none, was, mut fx)
+                }
+            } else if target == none {
+                let s = source.copy() ?? Tag.End
+                if may_place(n, s, items) {
+                    let max = max_for(n, s, items)
+                    if count_of(source) > max {
+                        inv.set_menu_slot(from, with_count(s, count_of(source) - max))
+                        set_by_player(mut inv, n, with_count(s, max), none, mut fx)
+                    } else {
+                        inv.set_menu_slot(from, none)
+                        set_by_player(mut inv, n, source, none, mut fx)
+                    }
+                }
+            } else {
+                let s = source.copy() ?? Tag.End
+                if may_pickup(inv, n, items, who) and may_place(n, s, items) {
+                    let max = max_for(n, s, items)
+                    if count_of(source) > max {
+                        inv.set_menu_slot(from, with_count(s, count_of(source) - max))
+                        set_by_player(mut inv, n, with_count(s, max), target, mut fx)
+                        let t = target.copy() ?? Tag.End
+                        if let left = add(mut inv, -1, t, items, who) {
+                            fx.push(Effect.Dropped(left))
+                        }
+                    } else {
+                        inv.set_menu_slot(from, target.copy())
+                        set_by_player(mut inv, n, source, target, mut fx)
+                    }
+                }
+            }
+            return true
+        }
+        if input == CLONE and who.infinite and self.carried == none and slot >= 0 {
+            let n = usize.wrap(slot)
+            if let s = get(inv, n) {
+                self.carried = with_count(s, items.max_stack_size(s))
+            }
+            return true
+        }
+        if input == THROW {
+            // Thrown out as an item: left for item entities, so the client gets it back.
+            return true
+        }
+        if input == PICKUP_ALL and slot >= 0 {
+            let n = usize.wrap(slot)
+            let c0 = self.carried.copy() else return true
+            if get(inv, n) != none and may_pickup(inv, n, items, who) {
+                return true
+            }
+            let start = if button == 0 { 0 } else { i32.wrap(MENU_SLOTS) - 1 }
+            let step = if button == 0 { 1 } else { -1 }
+            let max = items.max_stack_size(c0)
+            for pass in 0..2 {
+                var i = start
+                while i >= 0 and i < i32.wrap(MENU_SLOTS) and count_of(self.carried) < max {
+                    let m = usize.wrap(i)
+                    let here = get(inv, m)
+                    // `canTakeItemForPickAll`: not from the crafting result.
+                    if here != none and m != 0 and quick_replaces(here, c0, items) and may_pickup(inv, m, items, who) {
+                        let h = here.copy() ?? Tag.End
+                        if pass != 0 or count_of(here) != items.max_stack_size(h) {
+                            let room = max - count_of(self.carried)
+                            if let taken = try_remove(mut inv, m, count_of(here), room, items, who, mut fx) {
+                                self.carried = with_count(c0, count_of(self.carried) + count_of(some(taken)))
+                            }
+                        }
+                    }
+                    i += step
+                }
+            }
+            return true
+        }
+        return true
+    }
+
+    /// `InventoryMenu.removed`, as the player closes it: what the cursor carries, then each stack
+    /// in the crafting grid, put back in `inv` as `placeItemBackInInventory` puts them, with what
+    /// that sends in `fx`.
+    pub fn close(mut self, inv: mut Inventory, items: ItemCodecs, who: Clicker, fx: mut List<Effect>) {
+        if let c = self.carried.take() {
+            place_back(mut inv, c, items, who, mut fx)
+        }
+        for n in 1..5 {
+            let slot = usize.wrap(n)
+            // `removeItemNoUpdate`, which doesn't tell the menu.
+            let s = get(inv, slot)
+            inv.set_menu_slot(slot, none)
+            if let stack = s {
+                place_back(mut inv, stack, items, who, mut fx)
+            }
+        }
+    }
+
+    fn reset_quickcraft(mut self) {
+        self.quickcraft_status = 0
+        self.quickcraft_slots = List<usize>()
+    }
+
+    fn fill_remote(mut self) {
+        while self.remote.len() < MENU_SLOTS {
+            self.remote.push(Remote.Unknown)
+        }
+    }
+}
+
+// What `knows` finds: the remote slot doesn't match; it does; or it does by the hash the client
+// sent, so the server now has the stack.
+const NO: i32 = 0
+const YES: i32 = 1
+const LEARNED: i32 = 2
+
+/// `setByPlayer` on the menu's slot `n`, as a creative player's slot is set: `stack` put there,
+/// with what that does in `fx`.
+pub fn put_by_player(inv: mut Inventory, n: usize, stack: Tag?, fx: mut List<Effect>) {
+    let was = get(inv, n)
+    set_by_player(mut inv, n, stack, was, mut fx)
+}
+
+// `RemoteSlot.Synchronized.matches`.
+fn knows(remote: Remote, local: Tag?, items: ItemCodecs) -> i32 {
+    return match remote {
+        Remote.Unknown => NO,
+        Remote.Sent(s) => if same_stack(s, local) { YES } else { NO },
+        Remote.Hashed(h) => if h.matches(local, items) { LEARNED } else { NO },
+    }
+}
+
+// `InventoryMenu.quickMoveStack`, a shift-click on slot `n`: the stack there, as it was, where
+// some of it moved, else nothing.
+fn quick_move(inv: mut Inventory, n: usize, items: ItemCodecs, fx: mut List<Effect>) -> Tag? {
+    let original = get(inv, n) else return none
+    let worn = equipment_slot_for(original, items)
+    var stack: Tag? = some(original.copy())
+    var moved = false
+    if n == 0 {
+        moved = move_to(mut inv, mut stack, 9, 45, true, items, mut fx)
+    } else if n >= 1 and n < 9 {
+        moved = move_to(mut inv, mut stack, 9, 45, false, items, mut fx)
+    } else if armor_index(worn) >= 0 and get(inv, usize.wrap(8 - armor_index(worn))) == none {
+        let pos = usize.wrap(8 - armor_index(worn))
+        moved = move_to(mut inv, mut stack, pos, pos + 1, false, items, mut fx)
+    } else if worn == "offhand" and get(inv, 45) == none {
+        moved = move_to(mut inv, mut stack, 45, 46, false, items, mut fx)
+    } else if n >= 9 and n < 36 {
+        moved = move_to(mut inv, mut stack, 36, 45, false, items, mut fx)
+    } else if n >= 36 and n < 45 {
+        moved = move_to(mut inv, mut stack, 9, 36, false, items, mut fx)
+    } else {
+        moved = move_to(mut inv, mut stack, 9, 45, false, items, mut fx)
+    }
+    if not moved {
+        return none
+    }
+    if stack == none {
+        set_by_player(mut inv, n, none, some(original.copy()), mut fx)
+    } else {
+        // What's left stays in the slot, shrunk where it is, which tells no one.
+        inv.set_menu_slot(n, stack.copy())
+    }
+    if count_of(stack) == count_of(some(original.copy())) {
+        return none
+    }
+    return some(original)
+}
+
+// `moveItemStackTo`: `stack` moved into the slots from `start` to before `end`, from the last
+// where `backwards`: onto stacks of it first, where it stacks, then into the first empty slot
+// that takes it. Whether anything moved.
+fn move_to(inv: mut Inventory, stack: mut Tag?, start: usize, end: usize, backwards: bool, items: ItemCodecs, fx: mut List<Effect>) -> bool {
+    var changed = false
+    let first = i32.wrap(start)
+    let last = i32.wrap(end)
+    var dest = if backwards { last - 1 } else { first }
+    if stackable(stack, items) {
+        while stack != none and within(dest, first, last, backwards) {
+            let d = usize.wrap(dest)
+            let target = get(inv, d)
+            if target != none and same_components(stack, target) {
+                let t = target.copy() ?? Tag.End
+                let total = count_of(target) + count_of(stack)
+                let max = max_for(d, t, items)
+                if total <= max {
+                    stack = none
+                    inv.set_menu_slot(d, with_count(t, total))
+                    changed = true
+                } else if count_of(target) < max {
+                    let s = stack.copy() ?? Tag.End
+                    stack = with_count(s, count_of(stack) - (max - count_of(target)))
+                    inv.set_menu_slot(d, with_count(t, max))
+                    changed = true
+                }
+            }
+            dest += if backwards { -1 } else { 1 }
+        }
+    }
+    if stack != none {
+        dest = if backwards { last - 1 } else { first }
+        while within(dest, first, last, backwards) {
+            let d = usize.wrap(dest)
+            let s = stack.copy() ?? Tag.End
+            if get(inv, d) == none and may_place(d, s, items) {
+                let max = max_for(d, s, items)
+                let take = min(count_of(stack), max)
+                let left = count_of(stack) - take
+                stack = with_count(s, left)
+                set_by_player(mut inv, d, with_count(s, take), none, mut fx)
+                changed = true
+                break
+            }
+            dest += if backwards { -1 } else { 1 }
+        }
+    }
+    return changed
+}
+
+// Whether `dest` is still in the slots from `first` to before `last`, going down where `backwards`.
+fn within(dest: i32, first: i32, last: i32, backwards: bool) -> bool {
+    return if backwards { dest >= first } else { dest < last }
+}
+
+// `Slot.safeInsert`: as much of `stack` as `amount`, as the slot takes, put in slot `n`, onto
+// what's there where it's the same. What's left of `stack`.
+fn safe_insert(inv: mut Inventory, n: usize, stack: Tag, amount: i32, items: ItemCodecs, fx: mut List<Effect>) -> Tag? {
+    if not may_place(n, stack, items) {
+        return some(stack.copy())
+    }
+    let here = get(inv, n)
+    let given = some(stack.copy())
+    let moved = min(min(amount, count_of(given)), max_for(n, stack, items) - count_of(here))
+    if moved <= 0 {
+        return given
+    }
+    if here == none {
+        set_by_player(mut inv, n, with_count(stack, moved), none, mut fx)
+        return with_count(stack, count_of(given) - moved)
+    }
+    if same_components(here, given) {
+        let h = here.copy() ?? Tag.End
+        // The slot's stack grows where it is, so it's its own previous stack.
+        let grown = with_count(h, count_of(here) + moved)
+        set_by_player(mut inv, n, grown.copy(), grown, mut fx)
+        return with_count(stack, count_of(given) - moved)
+    }
+    return given
+}
+
+// `Slot.tryRemove`: up to `amount`, and no more than `max`, taken from slot `n`, where the
+// player may, or nothing.
+fn try_remove(inv: mut Inventory, n: usize, amount: i32, max: i32, items: ItemCodecs, who: Clicker, fx: mut List<Effect>) -> Tag? {
+    if not may_pickup(inv, n, items, who) {
+        return none
+    }
+    let here = get(inv, n)
+    let modifiable = match here {
+        some(h) => may_place(n, h, items),
+        none => n >= 9 or (n >= 1 and n <= 4),
+    }
+    if not modifiable and max < count_of(here) {
+        return none
+    }
+    let taken = remove(mut inv, n, min(amount, max), mut fx) else return none
+    if get(inv, n) == none {
+        set_by_player(mut inv, n, none, some(taken.copy()), mut fx)
+    }
+    return some(taken)
+}
+
+// `Slot.remove`: up to `amount` split from slot `n`'s stack, which the crafting grid tells the
+// menu of.
+fn remove(inv: mut Inventory, n: usize, amount: i32, fx: mut List<Effect>) -> Tag? {
+    if n == 0 or amount <= 0 {
+        return none
+    }
+    let s = get(inv, n) else return none
+    let here = some(s.copy())
+    let take = min(amount, count_of(here))
+    inv.set_menu_slot(n, with_count(s, count_of(here) - take))
+    if n >= 1 and n <= 4 {
+        fx.push(Effect.Grid)
+    }
+    return with_count(s, take)
+}
+
+// `setByPlayer(stack, was)`: the armor's slots and the offhand's tell the player first, as
+// `onEquipItem`; then `set`.
+fn set_by_player(inv: mut Inventory, n: usize, stack: Tag?, was: Tag?, fx: mut List<Effect>) {
+    let worn = worn_name(n)
+    if worn != "" {
+        fx.push(Effect.Equip(String(worn), was.copy(), stack.copy()))
+    }
+    set(mut inv, n, stack, mut fx)
+}
+
+// `Slot.set`: the container's `setItem`, which the crafting grid tells the menu of. The result
+// slot holds nothing until Calcite has recipes.
+fn set(inv: mut Inventory, n: usize, stack: Tag?, fx: mut List<Effect>) {
+    if n == 0 {
+        return
+    }
+    inv.set_menu_slot(n, stack.copy())
+    if n >= 1 and n <= 4 {
+        fx.push(Effect.Grid)
+    }
+}
+
+// `Inventory.placeItemBackInInventory`: `stack` put back, onto a stack of it with room, the held
+// one and the offhand's first, else in the first empty slot, each part sent; what has nowhere to
+// go would be dropped.
+fn place_back(inv: mut Inventory, stack: Tag, items: ItemCodecs, who: Clicker, fx: mut List<Effect>) {
+    var left: Tag? = some(stack.copy())
+    while left != none {
+        let s = left.copy() ?? Tag.End
+        var slot = room_for(inv, s, items, who)
+        if slot < 0 {
+            slot = free_slot(inv)
+        }
+        if slot < 0 {
+            fx.push(Effect.Dropped(s))
+            return
+        }
+        let i = usize.wrap(slot)
+        let space = items.max_stack_size(s) - count_of(get(inv, menu_of(i)))
+        let part = min(space, count_of(left))
+        left = with_count(s, count_of(left) - part)
+        let piece = with_count(s, part) ?? Tag.End
+        if add(mut inv, slot, piece, items, who) == none {
+            fx.push(Effect.Placed(i, get(inv, menu_of(i))))
+        }
+    }
+}
+
+// `Inventory.add(slot, stack)`, the inventory's own index or -1 for anywhere: what of `stack`
+// isn't added, `none` where it all is, or, as vanilla's `false`, where none of it is, all of it.
+fn add(inv: mut Inventory, slot: i32, stack: Tag, items: ItemCodecs, who: Clicker) -> Tag? {
+    let given = some(stack.copy())
+    if damaged(stack, items) {
+        var at = slot
+        if at == -1 {
+            at = free_slot(inv)
+        }
+        if at >= 0 {
+            inv.set_menu_slot(menu_of(usize.wrap(at)), given)
+            return none
+        }
+        if who.infinite {
+            return none
+        }
+        return given
+    }
+    var left = count_of(given)
+    var going = true
+    while going {
+        let last = left
+        left = if slot == -1 { add_anywhere(mut inv, stack, left, items, who) } else { add_resource(mut inv, usize.wrap(slot), stack, left, items) }
+        going = left > 0 and left < last
+    }
+    if left == count_of(given) and who.infinite {
+        return none
+    }
+    if left == 0 {
+        return none
+    }
+    if left < count_of(given) {
+        // Some went in, so vanilla's `add` says it did; the rest stays in the stack it was given.
+        return with_count(stack, left)
+    }
+    return given
+}
+
+// `Inventory.addResource(stack)`: onto a stack of it with room, else into the first empty slot.
+// How many of `count` are left.
+fn add_anywhere(inv: mut Inventory, stack: Tag, count: i32, items: ItemCodecs, who: Clicker) -> i32 {
+    var slot = room_for(inv, stack, items, who)
+    if slot < 0 {
+        slot = free_slot(inv)
+    }
+    if slot < 0 {
+        return count
+    }
+    return add_resource(mut inv, usize.wrap(slot), stack, count, items)
+}
+
+// `Inventory.addResource(slot, stack)`: as many of `count` as fit put in the inventory's slot
+// `slot`. How many are left.
+fn add_resource(inv: mut Inventory, slot: usize, stack: Tag, count: i32, items: ItemCodecs) -> i32 {
+    let m = menu_of(slot)
+    let here = get(inv, m)
+    let base = here.copy() ?? stack.copy()
+    let max = min(99, items.max_stack_size(base))
+    let room = max - count_of(here)
+    let moved = min(count, room)
+    if moved <= 0 {
+        return count
+    }
+    inv.set_menu_slot(m, with_count(base, count_of(here) + moved))
+    return count - moved
+}
+
+// `getSlotWithRemainingSpace`: the inventory's slot, by its own index, with a stack `stack`
+// stacks onto with room: the held one, the offhand's, then the rest in order; else -1.
+fn room_for(inv: Inventory, stack: Tag, items: ItemCodecs, who: Clicker) -> i32 {
+    let given = some(stack.copy())
+    if who.selected >= 0 and who.selected < 9 and has_room(get(inv, menu_of(usize.wrap(who.selected))), given, items) {
+        return who.selected
+    }
+    if has_room(get(inv, 45), given, items) {
+        return 40
+    }
+    for i in 0..36 {
+        if has_room(get(inv, menu_of(usize.wrap(i))), given, items) {
+            return i
+        }
+    }
+    return -1
+}
+
+// `hasRemainingSpaceForItem`.
+fn has_room(here: Tag?, stack: Tag?, items: ItemCodecs) -> bool {
+    let h = here else return false
+    return same_components(here, stack) and stackable(here, items) and count_of(here) < min(99, items.max_stack_size(h))
+}
+
+// `getFreeSlot`: the first empty slot of the inventory's 36, or -1.
+fn free_slot(inv: Inventory) -> i32 {
+    for i in 0..36 {
+        if get(inv, menu_of(usize.wrap(i))) == none {
+            return i
+        }
+    }
+    return -1
+}
+
+// The inventory menu's slot for the inventory's own slot `i`: the hotbar's 9, the 27, the armor
+// from the feet, 36 to 39, and the offhand, 40.
+fn menu_of(i: usize) -> usize {
+    if i < 9 {
+        return 36 + i
+    }
+    if i < 36 {
+        return i
+    }
+    if i == 36 {
+        return 8
+    }
+    if i == 37 {
+        return 7
+    }
+    if i == 38 {
+        return 6
+    }
+    if i == 39 {
+        return 5
+    }
+    return 45
+}
+
+fn get(inv: Inventory, n: usize) -> Tag? {
+    if n == 0 {
+        return none
+    }
+    return inv.menu_slot(n)
+}
+
+// `Slot.mayPlace`: nothing in the result; armor only where it's equippable there; anything else
+// anywhere else.
+fn may_place(n: usize, stack: Tag, items: ItemCodecs) -> bool {
+    if n == 0 {
+        return false
+    }
+    let worn = worn_name(n)
+    if n >= 5 and n <= 8 {
+        return equippable_in(stack, worn, items)
+    }
+    return true
+}
+
+// `ArmorSlot.mayPickup`: not armor with the curse of binding, `prevent_armor_change`, out of
+// creative mode.
+fn may_pickup(inv: Inventory, n: usize, items: ItemCodecs, who: Clicker) -> bool {
+    if n >= 5 and n <= 8 and not who.creative {
+        if let s = get(inv, n) {
+            if items.has_enchantment_effect(s, String("minecraft:prevent_armor_change")) {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+// `LivingEntity.isEquippableInSlot` for a player: `equippable` in the slot `worn`, where it
+// lets a player wear it.
+fn equippable_in(stack: Tag, worn: str, items: ItemCodecs) -> bool {
+    let found = items.component(stack, String("minecraft:equippable")) else return false
+    let Tag.Compound(e) = found else return false
+    if not e.contains("slot") {
+        return false
+    }
+    let slot = match e["slot"] {
+        Tag.Str(s) => s.copy(),
+        _ => return false,
+    }
+    if slot != String(worn) {
+        return false
+    }
+    if not e.contains("allowed_entities") {
+        return true
+    }
+    return items.entity_allowed(e["allowed_entities"], String("minecraft:player"))
+}
+
+// `getEquipmentSlotForItem` for a player: its `equippable`'s slot, else the main hand.
+fn equipment_slot_for(stack: Tag, items: ItemCodecs) -> String {
+    if let found = items.component(stack, String("minecraft:equippable")) {
+        match found {
+            Tag.Compound(e) => {
+                if e.contains("slot") {
+                    match e["slot"] {
+                        Tag.Str(s) => return s.copy(),
+                        _ => {},
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+    return String("mainhand")
+}
+
+// `EquipmentSlot.getIndex` of a worn slot, the feet 0 to the head 3, or -1 for another.
+fn armor_index(worn: String) -> i32 {
+    return if worn == "feet" { 0 } else if worn == "legs" { 1 } else if worn == "chest" { 2 } else if worn == "head" { 3 } else { -1 }
+}
+
+// The equipment slot the menu's slot `n` is, by its codec's name, or empty.
+fn worn_name(n: usize) -> str {
+    return if n == 5 { "head" } else if n == 6 { "chest" } else if n == 7 { "legs" } else if n == 8 { "feet" } else if n == 45 { "offhand" } else { "" }
+}
+
+// `Slot.getMaxStackSize(stack)`: the armor's slots hold one, the rest 99, and no slot more than
+// the stack stacks to.
+fn max_for(n: usize, stack: Tag, items: ItemCodecs) -> i32 {
+    let slot_max = if n >= 5 and n <= 8 { 1 } else { 99 }
+    return min(slot_max, items.max_stack_size(stack))
+}
+
+// `canItemQuickReplace(slot, stack, true)`: an empty slot, or one with the same stack, no more
+// than it stacks to.
+fn quick_replaces(here: Tag?, stack: Tag, items: ItemCodecs) -> bool {
+    if here == none {
+        return true
+    }
+    let given = some(stack.copy())
+    return same_components(given, here) and count_of(here) <= items.max_stack_size(stack)
+}
+
+// `getQuickCraftPlaceCount`.
+fn place_count(slots: i32, kind: i32, stack: Tag, items: ItemCodecs) -> i32 {
+    let given = some(stack.copy())
+    if kind == 0 {
+        return count_of(given) / slots
+    }
+    if kind == 1 {
+        return 1
+    }
+    if kind == 2 {
+        return items.max_stack_size(stack)
+    }
+    return count_of(given)
+}
+
+// `isStackable`: more than one to a stack, and not a damaged one.
+fn stackable(stack: Tag?, items: ItemCodecs) -> bool {
+    let s = stack else return false
+    return items.max_stack_size(s) > 1 and not damaged(s, items)
+}
+
+// `isDamaged`: damageable, `max_damage` and `damage` and not `unbreakable`, with damage.
+fn damaged(stack: Tag, items: ItemCodecs) -> bool {
+    let max = match items.component(stack, String("minecraft:max_damage")) {
+        some(Tag.Int(n)) => n,
+        _ => return false,
+    }
+    if items.component(stack, String("minecraft:unbreakable")) != none {
+        return false
+    }
+    let damage = match items.component(stack, String("minecraft:damage")) {
+        some(Tag.Int(n)) => n,
+        _ => return false,
+    }
+    return min(greater(damage, 0), max) > 0
+}
+
+/// A stack's count, 0 for nothing, 1 where `ItemStack.CODEC` wrote none.
+pub fn count_of(stack: Tag?) -> i32 {
+    let s = stack else return 0
+    let Tag.Compound(m) = s else return 0
+    if not m.contains("count") {
+        return 1
+    }
+    return match m["count"] {
+        Tag.Int(n) => n,
+        _ => 1,
+    }
+}
+
+// `copyWithCount`: `stack` with `n` of it, nothing for none.
+fn with_count(stack: Tag, n: i32) -> Tag? {
+    if n <= 0 {
+        return none
+    }
+    let Tag.Compound(m) = stack else return none
+    var out = m.copy()
+    out.insert(String("count"), Tag.Int(n))
+    return some(Tag.Compound(out))
+}
+
+// `ItemStack.isSameItem`: the same item, nothing being air.
+fn same_item(a: Tag?, b: Tag?) -> bool {
+    return item_of(a) == item_of(b)
+}
+
+// `ItemStack.isSameItemSameComponents`: the same item with the same components.
+fn same_components(a: Tag?, b: Tag?) -> bool {
+    if not same_item(a, b) {
+        return false
+    }
+    return same(components_of(a), components_of(b))
+}
+
+// `ItemStack.matches`: the same count too.
+fn same_stack(a: Tag?, b: Tag?) -> bool {
+    if a == none and b == none {
+        return true
+    }
+    return count_of(a) == count_of(b) and same_components(a, b)
+}
+
+fn item_of(stack: Tag?) -> String {
+    let s = stack else return String("minecraft:air")
+    let Tag.Compound(m) = s else return String("minecraft:air")
+    return match m["id"] {
+        Tag.Str(i) => i.copy(),
+        _ => String("minecraft:air"),
+    }
+}
+
+fn components_of(stack: Tag?) -> Tag {
+    if let s = stack {
+        match s {
+            Tag.Compound(m) => {
+                if m.contains("components") {
+                    return m["components"].copy()
+                }
+            },
+            _ => {},
+        }
+    }
+    return Tag.Compound(JavaHashMap<String, Tag>())
+}
+
+// A count off the network, as `ByteBufCodecs.readCount` reads it for a hash map or a hash set:
+// more than 256 throws, and so does fewer than none, as `HashMap`'s constructor does.
+fn hashed_count(rd: mut Reader) -> usize ! DecodeError {
+    let n = try rd.varint()
+    if n > MAX_HASHED {
+        fail DecodeError { message: "io.netty.handler.codec.DecoderException: {n} elements exceeded max size of: {MAX_HASHED}" }
+    }
+    if n < 0 {
+        fail DecodeError { message: "java.lang.IllegalArgumentException: Illegal initial capacity: {n}" }
+    }
+    return usize.wrap(n)
+}
+
+// `byIdOrThrow`: an ID of one of `n` entries.
+fn known(id: i32, n: usize) ! DecodeError {
+    if id < 0 or usize.wrap(id) >= n {
+        fail DecodeError { message: "java.lang.IllegalArgumentException: No value with id {id}" }
+    }
+}
+
+fn has_i32(list: List<i32>, v: i32) -> bool {
+    for x in list {
+        if x == v {
+            return true
+        }
+    }
+    return false
+}
+
+fn has_usize(list: List<usize>, v: usize) -> bool {
+    for x in list {
+        if x == v {
+            return true
+        }
+    }
+    return false
+}
+
+fn min(a: i32, b: i32) -> i32 {
+    return if a < b { a } else { b }
+}
+
+fn greater(a: i32, b: i32) -> i32 {
+    return if a > b { a } else { b }
+}

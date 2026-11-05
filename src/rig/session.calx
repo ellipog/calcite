@@ -23,6 +23,12 @@
 ///   mode, sets slots of its inventory menu as the creative menu does: stacks put in, armor put
 ///   on, slots emptied, a stack with a component set and one with a component taken away, a slot
 ///   that isn't one and a stack too big, which a server lets be; then it leaves (CAL-135).
+/// - `clicks`: as `join`, but once its view's loaded, the bot, in survival mode, clicks in its
+///   inventory menu, each click in a step of its own named for it, with the menu's state as the
+///   server last sent it and the slots a client would say the click changed, by their stacks'
+///   hashes: stacks picked up, put down, halved, merged, shift-clicked, swapped with a hotbar key,
+///   put in the crafting grid and on and off the head, a click whose cursor it gets wrong, one
+///   from a state that's gone, and a drag; then it closes the menu and leaves (CAL-136).
 ///
 /// OUT gets each packet in the order it came: its state's number, as vanilla's
 /// `ConnectionProtocol` orders them from handshake at 0, its length as 4 bytes, big-endian, then
@@ -33,6 +39,7 @@
 /// keep-alives, which vanilla sends on a clock, so both servers' steps hold the same packets.
 module rig.session
 
+import hash.ops.{hash_map, hash_string}
 import java.uuid.{Uuid}
 import pack.resources.{KnownPack}
 import protocol.chat.{LastSeenUpdate, ServerboundChat, ServerboundChatCommand}
@@ -42,7 +49,7 @@ import protocol.configuration.{ServerboundFinishConfiguration, ServerboundSelect
 import protocol.handshake.{ClientIntent, ClientIntention}
 import protocol.ids.{PROTOCOL_VERSION, packet_names}
 import protocol.login.{ServerboundHello, ServerboundLoginAcknowledged}
-import protocol.play.{ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundPlayerLoaded, ServerboundSetCreativeModeSlot, ON_GROUND}
+import protocol.play.{ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundContainerClick, ServerboundContainerClose, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundPlayerLoaded, ServerboundSetCreativeModeSlot, ON_GROUND}
 import protocol.state.{State, Bound}
 import protocol.status.{ServerboundPingRequest, ServerboundStatusRequest}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
@@ -110,6 +117,8 @@ enum Phase {
     Command
     // Setting creative slots, in `creative`.
     Creative
+    // Clicking in the inventory menu, in `clicks`.
+    Clicks
     // It has closed the connection.
     Leave
 }
@@ -136,6 +145,9 @@ struct Bot {
     done: bool = false
     // In `watch`, the game time at the join, from the first `set_time`, or -1 before it.
     joined_at: i64 = -1
+    // The inventory menu's state, as the server last sent it, and in `clicks`, the click it's at.
+    menu_state: i32 = 0
+    click_at: usize = 0
 }
 
 impl Bot {
@@ -255,6 +267,11 @@ impl Bot {
                         let moved = packet(ServerboundMovePlayerPosRot { x: self.x, y: self.y, z: self.z, y_rot: 0.0, x_rot: 0.0, flags: ON_GROUND }, State.Play)
                         self.send(net, moved)
                         self.placed = true
+                    } else if name == "container_set_content" or name == "container_set_slot" {
+                        // A client's menu takes the state the server sends with its slots.
+                        if r.varint()! == 0 {
+                            self.menu_state = r.varint()!
+                        }
                     } else if name == "level_chunk_with_light" {
                         self.chunks += 1
                     } else if name == "chunk_batch_finished" {
@@ -274,6 +291,28 @@ impl Bot {
                 },
                 _ => {},
             }
+        }
+    }
+
+    // The click `click_at` of `clicks`, in a step of its own: each of its packets, a click from the
+    // menu's state, or from 0 where it's stale, or a close.
+    fn click(mut self, net: Net, now: u64) {
+        let c = clicks()[self.click_at].copy()
+        self.step(c.name.copy(), now)
+        for p in c.packets {
+            if p.close {
+                self.send(net, packet(ServerboundContainerClose { container_id: 0 }, State.Play))
+                continue
+            }
+            var rest = Writer.new()
+            rest.varint(i32.wrap(p.changed.len()))
+            for (slot, stack) in p.changed {
+                rest.i16(slot)
+                rest.raw(stack)
+            }
+            rest.raw(p.carried)
+            let state = if p.stale { 0 } else { self.menu_state }
+            self.send(net, packet(ServerboundContainerClick { container_id: 0, state_id: state, slot: p.slot, button: p.button, input: p.input, rest: rest.into_bytes() }, State.Play))
         }
     }
 
@@ -302,7 +341,11 @@ impl Bot {
                     self.loaded = true
                     self.send(net, packet(ServerboundPlayerLoaded {}, State.Play))
                 }
-                if self.loaded and settled and self.scenario == "creative" {
+                if self.loaded and settled and self.scenario == "clicks" {
+                    self.phase = Phase.Clicks
+                    self.click_at = 0
+                    self.click(net, now)
+                } else if self.loaded and settled and self.scenario == "creative" {
                     self.phase = Phase.Creative
                     self.step(String("creative"), now)
                     for (slot, stack) in creative_slots() {
@@ -340,6 +383,20 @@ impl Bot {
                     net.close(self.conn)
                     self.closed = true
                     self.done = true
+                }
+            },
+            Phase.Clicks => {
+                if settled {
+                    self.click_at += 1
+                    if self.click_at < clicks().len() {
+                        self.click(net, now)
+                    } else {
+                        self.phase = Phase.Leave
+                        self.step(String("leave"), now)
+                        net.close(self.conn)
+                        self.closed = true
+                        self.done = true
+                    }
                 }
             },
             Phase.Creative => {
@@ -401,6 +458,98 @@ fn untrusted(item: str, count: i32, damage: i32?, removed: List<String>) -> List
     return w.into_bytes()
 }
 
+// A click of `clicks`: its step's name and its packets.
+struct Click {
+    name: String
+    packets: List<Pressed>
+}
+
+// One packet of a click: a container click on `slot` with `button`, of the kind `input`, with
+// the slots a client says it changed and what its cursor then carries, each a `HashedStack`; from
+// a stale state where `stale`; or a close where `close`.
+struct Pressed {
+    slot: i16 = 0
+    button: i8 = 0
+    input: i32 = 0
+    changed: List<(i16, List<u8>)> = List<(i16, List<u8>)>()
+    carried: List<u8> = List<u8>()
+    stale: bool = false
+    close: bool = false
+}
+
+// `HashedStack.STREAM_CODEC`: nothing, or an item, its count, the components its patch sets, by
+// type, without its namespace, with their values' hashes, as `HashOps` hashes them, and those it
+// takes away.
+fn hashed(item: str, count: i32, set: List<(String, u32)>, removed: List<String>) -> List<u8> {
+    var w = Writer.new()
+    if count <= 0 {
+        w.u8(0)
+        return w.into_bytes()
+    }
+    w.u8(1)
+    w.varint(builtin_id(String("item"), String(item)))
+    w.varint(count)
+    w.varint(i32.wrap(set.len()))
+    for (t, h) in set {
+        w.varint(builtin_id(String("data_component_type"), t.copy()))
+        w.i32(i32.wrap(h))
+    }
+    w.varint(i32.wrap(removed.len()))
+    for t in removed {
+        w.varint(builtin_id(String("data_component_type"), t.copy()))
+    }
+    return w.into_bytes()
+}
+
+fn plain(item: str, count: i32) -> List<u8> {
+    return hashed(item, count, [], [])
+}
+
+fn nothing() -> List<u8> {
+    return plain("air", 0)
+}
+
+fn press(slot: i16, button: i8, input: i32, changed: own List<(i16, List<u8>)>, carried: own List<u8>) -> Pressed {
+    return Pressed { slot: slot, button: button, input: input, changed: changed, carried: carried }
+}
+
+// What `clicks` does, click by click, from the `clicks` configuration's inventory: stone in the
+// hotbar's first slot, logs named `Logs` in the inventory's first, a potion in the hotbar's third,
+// bread without `food` in its last, and a diamond helmet on. Each lists the slots a vanilla client
+// would say changed, but `wrong-cursor`, whose cursor is one stone too many, which the server
+// corrects; `stale` is from state 0, so the server sends it all again.
+fn clicks() -> List<Click> {
+    let logs = hashed("oak_log", 10, [(String("custom_name"), hash_string(String("Logs")))], [])
+    let potion = hashed("potion", 1, [(String("potion_contents"), hash_map([(hash_string(String("potion")), hash_string(String("minecraft:swiftness")))]))], [])
+    let bread = hashed("bread", 7, [], [String("food")])
+    return [
+        Click { name: "pick-up", packets: [press(36i16, 0i8, 0, [(36i16, nothing())], plain("stone", 64))] },
+        Click { name: "put-down", packets: [press(40i16, 0i8, 0, [(40i16, plain("stone", 64))], nothing())] },
+        Click { name: "pick-half", packets: [press(40i16, 1i8, 0, [(40i16, plain("stone", 32))], plain("stone", 32))] },
+        Click { name: "put-one", packets: [press(41i16, 1i8, 0, [(41i16, plain("stone", 1))], plain("stone", 31))] },
+        Click { name: "merge", packets: [press(40i16, 0i8, 0, [(40i16, plain("stone", 63))], nothing())] },
+        Click { name: "shift-click", packets: [press(9i16, 0i8, 1, [(9i16, nothing()), (36i16, logs.copy())], nothing())] },
+        Click { name: "hotbar-key", packets: [press(20i16, 2i8, 2, [(38i16, nothing()), (20i16, potion.copy())], nothing())] },
+        Click { name: "wrong-cursor", packets: [press(41i16, 0i8, 0, [(41i16, nothing())], plain("stone", 2))] },
+        Click { name: "put-back", packets: [press(42i16, 0i8, 0, [(42i16, plain("stone", 1))], nothing())] },
+        Click { name: "pick-bread", packets: [press(44i16, 0i8, 0, [(44i16, nothing())], bread.copy())] },
+        Click { name: "into-grid", packets: [press(1i16, 0i8, 0, [(1i16, bread.copy())], nothing())] },
+        Click { name: "helmet-off", packets: [press(5i16, 0i8, 1, [(5i16, nothing()), (9i16, plain("diamond_helmet", 1))], nothing())] },
+        Click { name: "helmet-on", packets: [press(9i16, 0i8, 1, [(9i16, nothing()), (5i16, plain("diamond_helmet", 1))], nothing())] },
+        Click { name: "stale", packets: [Pressed { slot: 42i16, button: 0i8, input: 0, changed: [(42i16, nothing())], carried: plain("stone", 1), stale: true }] },
+        Click { name: "put-back-again", packets: [press(42i16, 0i8, 0, [(42i16, plain("stone", 1))], nothing())] },
+        Click { name: "pick-for-drag", packets: [press(40i16, 0i8, 0, [(40i16, nothing())], plain("stone", 63))] },
+        Click { name: "drag", packets: [
+            press(-999i16, 0i8, 5, [], plain("stone", 63)),
+            press(41i16, 1i8, 5, [], plain("stone", 63)),
+            press(43i16, 1i8, 5, [], plain("stone", 63)),
+            press(39i16, 1i8, 5, [], plain("stone", 63)),
+            press(-999i16, 2i8, 5, [(41i16, plain("stone", 21)), (43i16, plain("stone", 21)), (39i16, plain("stone", 21))], nothing()),
+        ] },
+        Click { name: "close", packets: [Pressed { close: true }] },
+    ]
+}
+
 // What `creative` sets, slot by slot of the inventory menu: stone into the hotbar, leggings on,
 // the inventory's logs out, dirt into the crafting result, which isn't a slot it may set, two
 // swords in one slot, a pickaxe with damage, bread that can't be eaten, and the offhand emptied.
@@ -425,7 +574,7 @@ fn main() {
     let port = u16.wrap(number(given[0]))
     let view_chunks = u64(in_view_count(i32.wrap(number(given[1]))))
     let scenario = given[2].copy()
-    if scenario != "status" and scenario != "outdated" and scenario != "bad-name" and scenario != "stranger" and scenario != "join" and scenario != "watch" and scenario != "creative" {
+    if scenario != "status" and scenario != "outdated" and scenario != "bad-name" and scenario != "stranger" and scenario != "join" and scenario != "watch" and scenario != "creative" and scenario != "clicks" {
         panic("session: what's the scenario {scenario}?")
     }
     let net = Net.new()!
