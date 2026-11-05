@@ -810,7 +810,7 @@ Input `{"id": type, "snbt": text}`: `type` is a block entity type's ID, and `tex
 
 The output is `{"snbt": s}`, `s` what `saveCustomOnly` writes, as `CompoundTag.toString` writes it, its keys sorted.
 
-Calcite answers `unimplemented` for what it doesn't load yet: an item with components outside a book, a stack of more than one where its stack size decides, a jigsaw with no joint, whose joint is its facing's, and the other parts named in D286.
+Calcite reads the items with vanilla's codecs, against the vanilla data pack's registries, with the items' default components bound (D367). It answers `unimplemented` for what it doesn't load yet: a jigsaw with no joint, whose joint is its facing's, and the other parts named in D286.
 
 ### `environment` (v1)
 

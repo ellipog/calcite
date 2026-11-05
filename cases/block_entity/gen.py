@@ -249,6 +249,77 @@ def cases():
         "front:{id:\"minecraft:brick\",components:5}}}")
     add("jukebox-bad-count", "jukebox", "{RecordItem:{id:\"minecraft:music_disc_cat\",count:0},ticks_since_song_started:7L}")
     add("jukebox-components", "jukebox", "{RecordItem:{id:\"minecraft:music_disc_cat\",count:1,components:{}},ticks_since_song_started:3}")
+
+    # Items through vanilla's codecs (D367): a container's as `ContainerHelper` loads them into its
+    # slots and saves them in their order, each `ItemStackWithSlot.CODEC`, and each other item
+    # `ItemStack.CODEC` or `ItemStackTemplate.CODEC`, with its components.
+    named = "{\"minecraft:custom_name\":\"Named\"}"
+    add("chest-items-unsorted", "chest", "{Items:[{Slot:5b,id:\"minecraft:stone\",count:2},{Slot:0b,id:\"minecraft:dirt\",count:1},"
+        "{Slot:3b,id:\"minecraft:apple\",count:7}]}")
+    add("chest-items-same-slot", "chest", "{Items:[{Slot:2b,id:\"minecraft:stone\",count:2},{Slot:2b,id:\"minecraft:dirt\",count:5}]}")
+    add("chest-items-out-of-range", "chest", "{Items:[{Slot:27b,id:\"minecraft:stone\",count:1},{Slot:-1b,id:\"minecraft:dirt\",count:1},"
+        "{Slot:26b,id:\"minecraft:apple\",count:1},{Slot:283,id:\"minecraft:bread\",count:1},{Slot:1.9f,id:\"minecraft:egg\",count:1}]}")
+    add("chest-items-no-slot", "chest", "{Items:[{id:\"minecraft:stone\",count:3},{Slot:4b,id:\"minecraft:dirt\",count:1}]}")
+    add("chest-items-bad", "chest", "{Items:[{Slot:0b,id:\"minecraft:air\",count:1},{Slot:1b,id:\"minecraft:not_an_item\",count:1},5,"
+        "{Slot:\"x\",id:\"minecraft:stone\",count:2},{Slot:3b,id:\"minecraft:dirt\",count:0},{Slot:4b,id:\"minecraft:apple\",count:200},"
+        "{Slot:5b,id:\"stick\",count:1b},{Slot:6b,count:1},{Slot:7b,id:\"minecraft:egg\",count:3,components:5}]}")
+    add("chest-items-components", "chest", "{Items:[{Slot:0b,id:\"minecraft:diamond_sword\",count:1,components:{\"minecraft:damage\":0}},"
+        "{Slot:1b,id:\"minecraft:diamond_sword\",count:1,components:{\"minecraft:damage\":7,\"minecraft:custom_name\":{text:\"Edge\",color:\"red\"}}},"
+        "{Slot:2b,id:\"minecraft:stone\",count:1,components:{\"!minecraft:max_stack_size\":{},\"!minecraft:food\":{}}},"
+        "{Slot:3b,id:\"minecraft:apple\",count:1,components:{\"minecraft:max_stack_size\":64,\"minecraft:rarity\":\"epic\"}},"
+        "{Slot:4b,id:\"minecraft:stone\",count:1,components:{\"minecraft:not_a_component\":1}}]}")
+    add("chest-items-nested", "chest", "{Items:[{Slot:0b,id:\"minecraft:shulker_box\",count:1,components:{\"minecraft:container\":["
+        "{slot:0,item:{id:\"minecraft:diamond_sword\",count:1,components:{\"minecraft:damage\":0,\"minecraft:custom_name\":\"In\"}}},"
+        "{slot:3,item:{id:\"minecraft:apple\",count:2,components:{\"minecraft:max_stack_size\":64}}}]}},"
+        "{Slot:1b,id:\"minecraft:bundle\",count:1,components:{\"minecraft:bundle_contents\":[{id:\"minecraft:stone\",count:3,"
+        "components:{\"minecraft:rarity\":\"common\"}}]}}]}")
+    add("chest-items-not-list", "chest", "{Items:{Slot:0b,id:\"minecraft:stone\",count:1}}")
+    add("chest-items-list-of-lists", "chest", "{Items:[[{Slot:0b,id:\"minecraft:stone\",count:1}]]}")
+    add("trapped-chest-items", "trapped_chest", "{Items:[{Slot:9b,id:\"minecraft:gold_ingot\",count:4}]}")
+    add("barrel-items", "barrel", "{Items:[{Slot:26b,id:\"minecraft:cod\",count:16},{Slot:1b,id:\"minecraft:salmon\",count:2}]}")
+    add("shulker-empty", "shulker_box", "{}")
+    add("shulker-no-items", "shulker_box", "{Items:[]}")
+    add("shulker-bad-items", "shulker_box", "{Items:[{Slot:30b,id:\"minecraft:stone\",count:1},{Slot:0b,id:\"minecraft:air\",count:1}]}")
+    add("shulker-loot", "shulker_box", "{LootTable:\"minecraft:chests/end_city_treasure\"}")
+    add("hopper-slot-past", "hopper", "{Items:[{Slot:4b,id:\"minecraft:stone\",count:1},{Slot:5b,id:\"minecraft:dirt\",count:1}]}")
+    add("dispenser-slot-past", "dispenser", "{Items:[{Slot:8b,id:\"minecraft:arrow\",count:1},{Slot:9b,id:\"minecraft:arrow\",count:2}]}")
+    add("dropper-items", "dropper", "{Items:[{Slot:3b,id:\"minecraft:stone\",count:5},{Slot:0b,id:\"minecraft:dirt\",count:1}]}")
+    add("crafter-items", "crafter", "{Items:[{Slot:8b,id:\"minecraft:stick\",count:1},{Slot:9b,id:\"minecraft:stick\",count:1}]}")
+    add("furnace-slot-past", "furnace", "{Items:[{Slot:2b,id:\"minecraft:iron_ingot\",count:3},{Slot:3b,id:\"minecraft:coal\",count:1}]}")
+    add("smoker-items", "smoker", "{Items:[{Slot:1b,id:\"minecraft:coal\",count:2},{Slot:0b,id:\"minecraft:beef\",count:1}]}")
+    add("campfire-slot-past", "campfire", "{Items:[{Slot:3b,id:\"minecraft:beef\",count:1},{Slot:4b,id:\"minecraft:cod\",count:1}]}")
+    add("brewing-slot-past", "brewing_stand", "{Items:[{Slot:4b,id:\"minecraft:blaze_powder\",count:1},{Slot:5b,id:\"minecraft:potion\",count:1}]}")
+    add("chiseled-bookshelf-slot-past", "chiseled_bookshelf", "{Items:[{Slot:5b,id:\"minecraft:book\",count:1},{Slot:6b,id:\"minecraft:book\",count:1}]}")
+    add("shelf-slot-past", "shelf", "{Items:[{Slot:2b,id:\"minecraft:book\",count:1},{Slot:3b,id:\"minecraft:book\",count:1}]}")
+    add("chiseled-bookshelf-named-book", "chiseled_bookshelf", "{Items:[{Slot:0b,id:\"minecraft:enchanted_book\",count:1,"
+        "components:{\"minecraft:stored_enchantments\":{\"minecraft:mending\":1}}}]}")
+    add("pot-item-components", "decorated_pot", "{item:{id:\"minecraft:emerald\",count:3,components:" + named + "}}")
+    add("pot-item-air", "decorated_pot", "{item:{id:\"minecraft:air\",count:1}}")
+    add("pot-item-bad-count", "decorated_pot", "{item:{id:\"minecraft:emerald\",count:500}}")
+    add("pot-item-not-compound", "decorated_pot", "{item:\"minecraft:emerald\"}")
+    add("pot-loot-and-item", "decorated_pot", "{LootTable:\"minecraft:pots/trial_chambers/corridor\",item:{id:\"minecraft:emerald\",count:1}}")
+    add("pot-sherds-components", "decorated_pot", "{sherds:{back:{id:\"minecraft:brick\",components:" + named + "},"
+        "front:{id:\"minecraft:angler_pottery_sherd\",count:1,components:{\"!minecraft:rarity\":{}}}}}")
+    add("brushable-item", "brushable_block", "{item:{id:\"minecraft:emerald\",count:1}}")
+    add("brushable-item-components", "brushable_block", "{item:{id:\"minecraft:diamond\",count:2,components:" + named + "},hit_direction:2}")
+    add("brushable-loot-and-item", "brushable_block", "{LootTable:\"minecraft:archaeology/desert_pyramid\",item:{id:\"minecraft:emerald\",count:1}}")
+    add("jukebox-stone-with-song", "jukebox", "{RecordItem:{id:\"minecraft:stone\",count:1,components:{\"minecraft:jukebox_playable\":"
+        "\"minecraft:cat\"}},ticks_since_song_started:40L}")
+    add("jukebox-disc-without-song", "jukebox", "{RecordItem:{id:\"minecraft:music_disc_cat\",count:1,components:{\"!minecraft:jukebox_playable\":{}}},"
+        "ticks_since_song_started:40L}")
+    add("jukebox-disc-named", "jukebox", "{RecordItem:{id:\"minecraft:music_disc_13\",count:1,components:" + named + "},ticks_since_song_started:9L}")
+    add("jukebox-two-discs", "jukebox", "{RecordItem:{id:\"minecraft:music_disc_cat\",count:2},ticks_since_song_started:5L}")
+    add("lectern-stone", "lectern", "{Page:3,Book:{id:\"minecraft:stone\",count:1}}")
+    add("lectern-not-an-item", "lectern", "{Page:3,Book:{id:\"minecraft:not_an_item\",count:1}}")
+    add("lectern-book-named", "lectern", "{Page:0,Book:" + item("minecraft:written_book", 1,
+        "{\"minecraft:written_book_content\":{title:\"T\",author:\"A\",pages:[\"a\",\"b\"]},\"minecraft:custom_name\":\"Mine\"}") + "}")
+    add("lectern-writable-default", "lectern", "{Page:2,Book:" + item("minecraft:writable_book", 1,
+        "{\"minecraft:writable_book_content\":{}}") + "}")
+    add("lectern-stone-with-pages", "lectern", "{Page:1,Book:" + item("minecraft:stone", 1,
+        "{\"minecraft:writable_book_content\":{pages:[\"x\",\"y\",\"z\"]}}") + "}")
+    add("vault-key-components", "vault", "{config:{key_item:{id:\"minecraft:trial_key\",count:1,components:" + named + "}}}")
+    add("vault-key-air", "vault", "{config:{key_item:{id:\"minecraft:air\",count:1}}}")
+    add("vault-key-bad-count", "vault", "{config:{key_item:{id:\"minecraft:trial_key\",count:500}}}")
     return out
 
 
