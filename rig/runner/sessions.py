@@ -69,9 +69,10 @@ BASE = {
 SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # Scenarios only the configurations that name them run: `watch`, where the bot joins and stays put
 # a fixed number of game ticks, for a world that never goes quiet; `creative`, where it sets slots
-# of its inventory as the creative menu does; `clicks`, where it clicks in its inventory menu; and
-# `dig` and `dig-creative`, where it digs blocks (src/rig/session.calx).
-OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative"]
+# of its inventory as the creative menu does; `clicks`, where it clicks in its inventory menu;
+# `dig` and `dig-creative`, where it digs blocks; and `place` and `place-creative`, where it places
+# them (src/rig/session.calx).
+OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -176,9 +177,37 @@ DIG = {
 }
 # The same, in creative mode, in `dig_creative`.
 DIG_CREATIVE = dict(DIG, playerGameType=nbt.Int(1))
-# What the dig configurations' worlds are, and the rules they're run with: no drops, which come
-# with item entities, and no natural spawning, as `terrain` (D376).
-DIG_RULES = (("minecraft:block_drops", nbt.Byte(0)), ("minecraft:spawn_mobs", nbt.Byte(0)))
+# What the dig and place configurations' worlds are, and the rules they're run with: no drops,
+# which come with item entities, and no natural spawning, as `terrain` (D376); and no random ticks,
+# since grass by a block placed or broken turns to dirt, or dirt to grass, on a tick that falls in
+# a different step on each server (D378).
+DIG_RULES = (("minecraft:block_drops", nbt.Byte(0)), ("minecraft:spawn_mobs", nbt.Byte(0)),
+             ("minecraft:random_tick_speed", nbt.Int(0)))
+# The bot's data in `place`: in survival mode at the spawn, facing south, holding the first of the
+# hotbar's stone, oak stairs, slabs, logs, doors, a red bed, torches, oak fences and a furnace, with
+# cobblestone in its offhand (D378).
+PLACE = {
+    "DataVersion": nbt.Int(5023),
+    "Pos": nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-60.0), nbt.Double(0.5)]),
+    "Rotation": nbt.List(nbt.FLOAT, [nbt.Float(0.0), nbt.Float(0.0)]),
+    "Dimension": "minecraft:overworld",
+    "playerGameType": nbt.Int(0),
+    "SelectedItemSlot": nbt.Int(0),
+    "Inventory": nbt.List(nbt.COMPOUND, [
+        slotted(0, "stone", 64),
+        slotted(1, "oak_stairs", 8),
+        slotted(2, "oak_slab", 8),
+        slotted(3, "oak_log", 8),
+        slotted(4, "oak_door", 4),
+        slotted(5, "red_bed"),
+        slotted(6, "torch", 8),
+        slotted(7, "oak_fence", 8),
+        slotted(8, "furnace"),
+    ]),
+    "equipment": {"offhand": stack("cobblestone", 16)},
+}
+# In `place_creative`: in creative mode, with nothing, given each block's item as it goes.
+PLACE_CREATIVE = dict(PLACE, playerGameType=nbt.Int(1), Inventory=nbt.List(nbt.COMPOUND, []), equipment={})
 
 
 CONFIGS = {
@@ -252,6 +281,16 @@ CONFIGS = {
     # (D376).
     "dig_creative": Config({}, view=3, scenarios=("dig-creative",), world=FIXTURES / "dig" / "world",
                            fixture="dig", rules=DIG_RULES, player=DIG_CREATIVE),
+    # The bot, in survival mode, places blocks by the place fixture's: on the ground, where it
+    # stands, in short grass, from its offhand, on a lectern that takes the use; stairs, slabs, a
+    # log, a door, a bed, torches, fences and a furnace, each as it looks; out of reach and hit far
+    # from the block (D378).
+    "place": Config({}, view=3, scenarios=("place",), world=FIXTURES / "place" / "world",
+                    fixture="place", rules=DIG_RULES, player=PLACE),
+    # The bot, in creative mode, places blocks given it: turned as it looks, joined to their
+    # neighbours, on a side or falling to the floor, powered, and with block entities (D378).
+    "place_creative": Config({}, view=3, scenarios=("place-creative",), world=FIXTURES / "place" / "world",
+                             fixture="place", rules=DIG_RULES, player=PLACE_CREATIVE),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.

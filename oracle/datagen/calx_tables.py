@@ -488,6 +488,57 @@ def block_facts_module(index, flags):
             fn, "classes", [where[c] if c else none for c in flags[fn]],
             [f"/// The class whose `{method}` each block runs, by its index in `class_names`, in block ID order",
              "/// (CAL-123)."])
+    for fn, method in [("placement_classes", "getStateForPlacement"), ("replace_classes", "canBeReplaced(BlockPlaceContext)"),
+                       ("placed_by_classes", "setPlacedBy"), ("use_item_classes", "useItemOn"),
+                       ("use_classes", "useWithoutItem")]:
+        lines += number_list(
+            fn, "classes", [where[c] if c else none for c in flags[fn]],
+            [f"/// The class whose `{method}` each block runs, by its index in `class_names`, in block ID order",
+             "/// (CAL-139)."])
+    block_items = flags["block_items"]
+    kinds = sorted({k for _, _, k, _, _ in block_items})
+    lines += [
+        "/// The classes block items are, by name, sorted (CAL-139).",
+        "pub fn block_item_kind_names() -> List<str> {",
+        "    return [",
+    ]
+    lines += [f'        "{k}",' for k in kinds]
+    lines += ["    ]", "}", ""]
+    lines += number_list(
+        "block_items", "items", [v for item, block, kind, _, _ in block_items for v in (item, block, kinds.index(kind))],
+        ["/// Each block item, `BlockItem`, by its ID in the item registry, followed by its block's ID and its",
+         "/// class's index in `block_item_kind_names`: three numbers an item, in item ID order (CAL-139)."])
+    walls = [(item, wall, attach) for item, _, _, wall, attach in block_items if wall >= 0]
+    lines += number_list(
+        "wall_block_items", "items", [v for each in walls for v in each],
+        ["/// Each `StandingAndWallBlockItem`, by item ID, followed by its wall block's ID and the 3D data",
+         "/// value of its `attachmentDirection`: three numbers an item (CAL-139)."])
+    lines += number_list(
+        "items_of_blocks", "items", flags["items_of_blocks"],
+        ["/// Each block's item, `asItem`, by its ID in the item registry, air's 0 for none, in block ID",
+         "/// order (CAL-139)."])
+    sounds = flags["place_sounds"]
+    lines += [
+        "/// The sounds blocks are placed with, by the sound event's name, each with the volume and pitch",
+        "/// of its sound type in `place_sound_volumes` and `place_sound_pitches` (CAL-139).",
+        "pub fn place_sound_names() -> List<str> {",
+        "    return [",
+    ]
+    lines += [f'        "{name}",' for name, _, _ in sounds]
+    lines += ["    ]", "}", ""]
+    for fn, at, what in [("place_sound_volumes", 1, "volume"), ("place_sound_pitches", 2, "pitch")]:
+        values = [calx_float(v[at]) for v in sounds]
+        lines += [
+            f"/// Each of `place_sound_names`' sound type's {what}, `SoundType.get{what.capitalize()}` (CAL-139).",
+            f"pub fn {fn}() -> List<f32> {{",
+            "    let values: List<f32> = [",
+        ]
+        lines += ["        " + ", ".join(values[i:i + 16]) + "," for i in range(0, len(values), 16)]
+        lines += ["    ]", "    return values", "}", ""]
+    if len(flags["state_place_sounds"]) != flags["states"]:
+        raise ValueError("block_flags.json hasn't a place sound for each state")
+    lines += ["/// Each state's place sound, by its index in `place_sound_names`, in state ID order (CAL-139)."]
+    lines += encoded_table("state_place_sounds", "sounds", flags["state_place_sounds"])
     stacks = flags["item_stack_sizes"]
     lines += [
         "/// The items whose default `max_stack_size` isn't 64, by name, in item ID order (CAL-123).",

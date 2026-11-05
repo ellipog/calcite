@@ -228,6 +228,14 @@ final class BlockFlags {
         // and `getAnalogOutputSignal` it runs (CAL-123).
         StringBuilder hasAnalog = new StringBuilder();
         StringBuilder analog = new StringBuilder();
+        // What placing a block and using one ask of it (CAL-139): the class whose
+        // `getStateForPlacement`, `canBeReplaced` for a placement, `setPlacedBy`, `useItemOn` and
+        // `useWithoutItem` it runs.
+        StringBuilder placement = new StringBuilder();
+        StringBuilder replace = new StringBuilder();
+        StringBuilder placedBy = new StringBuilder();
+        StringBuilder useItem = new StringBuilder();
+        StringBuilder useWithout = new StringBuilder();
         // `FireBlock.canBurn`: the blocks fire's ignite odds are above 0 for; and each block with
         // either of fire's odds above 0, with its ignite odds and its burn odds (D339).
         StringBuilder flammable = new StringBuilder();
@@ -375,6 +383,20 @@ final class BlockFlags {
                     BlockPos.class, Direction.class);
             hasAnalog.append(id == 0 ? "\"" : ", \"").append(ha).append("\"");
             analog.append(id == 0 ? "\"" : ", \"").append(ga).append("\"");
+            String gp = declaring(type, "getStateForPlacement", net.minecraft.world.item.context.BlockPlaceContext.class);
+            String cr = declaring(type, "canBeReplaced", BlockState.class, net.minecraft.world.item.context.BlockPlaceContext.class);
+            String pb = declaring(type, "setPlacedBy", net.minecraft.world.level.Level.class, BlockPos.class, BlockState.class,
+                    net.minecraft.world.entity.LivingEntity.class, net.minecraft.world.item.ItemStack.class);
+            String ui = declaring(type, "useItemOn", net.minecraft.world.item.ItemStack.class, BlockState.class,
+                    net.minecraft.world.level.Level.class, BlockPos.class, net.minecraft.world.entity.player.Player.class,
+                    net.minecraft.world.InteractionHand.class, net.minecraft.world.phys.BlockHitResult.class);
+            String uw = declaring(type, "useWithoutItem", BlockState.class, net.minecraft.world.level.Level.class, BlockPos.class,
+                    net.minecraft.world.entity.player.Player.class, net.minecraft.world.phys.BlockHitResult.class);
+            placement.append(id == 0 ? "\"" : ", \"").append(gp).append("\"");
+            replace.append(id == 0 ? "\"" : ", \"").append(cr).append("\"");
+            placedBy.append(id == 0 ? "\"" : ", \"").append(pb).append("\"");
+            useItem.append(id == 0 ? "\"" : ", \"").append(ui).append("\"");
+            useWithout.append(id == 0 ? "\"" : ", \"").append(uw).append("\"");
             Block block = BuiltInRegistries.BLOCK.byId(id);
             int instrument = block.defaultBlockState().instrument().ordinal();
             for (BlockState each : block.getStateDefinition().getPossibleStates()) {
@@ -403,6 +425,53 @@ final class BlockFlags {
                 stacks.append(stacks.isEmpty() ? "[\"" : ", [\"").append(BuiltInRegistries.ITEM.getKey(item)).append("\", ")
                         .append(most).append("]");
             }
+        }
+        // Each block item (CAL-139): its ID, its block's, its class's name, and, for a
+        // `StandingAndWallBlockItem`, its wall block's ID and `attachmentDirection`'s 3D data value,
+        // else -1 and -1; then each block's item, `asItem`, by ID, air's 0 for none.
+        StringBuilder blockItems = new StringBuilder();
+        java.lang.reflect.Field wallField = net.minecraft.world.item.StandingAndWallBlockItem.class.getDeclaredField("wallBlock");
+        wallField.setAccessible(true);
+        java.lang.reflect.Field attachField = net.minecraft.world.item.StandingAndWallBlockItem.class.getDeclaredField("attachmentDirection");
+        attachField.setAccessible(true);
+        for (net.minecraft.world.item.Item item : BuiltInRegistries.ITEM) {
+            if (!(item instanceof net.minecraft.world.item.BlockItem blockItem)) {
+                continue;
+            }
+            Class<?> kind = item.getClass();
+            while (kind.isAnonymousClass()) {
+                kind = kind.getSuperclass();
+            }
+            int wall = -1;
+            int attach = -1;
+            if (item instanceof net.minecraft.world.item.StandingAndWallBlockItem) {
+                wall = BuiltInRegistries.BLOCK.getId((Block) wallField.get(item));
+                attach = ((Direction) attachField.get(item)).get3DDataValue();
+            }
+            blockItems.append(blockItems.isEmpty() ? "[" : ", [").append(BuiltInRegistries.ITEM.getId(item)).append(", ")
+                    .append(BuiltInRegistries.BLOCK.getId(blockItem.getBlock())).append(", \"").append(kind.getSimpleName())
+                    .append("\", ").append(wall).append(", ").append(attach).append("]");
+        }
+        StringBuilder itemsOfBlocks = new StringBuilder();
+        for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
+            itemsOfBlocks.append(id == 0 ? "" : ", ").append(BuiltInRegistries.ITEM.getId(BuiltInRegistries.BLOCK.byId(id).asItem()));
+        }
+        // Each state's sound type's place sound, by the sound event's name, with its volume and
+        // pitch, which `BlockItem.place` plays (CAL-139): the different ones, then each state's
+        // index into them, in state ID order.
+        StringBuilder soundTypes = new StringBuilder();
+        StringBuilder stateSounds = new StringBuilder();
+        Map<String, Integer> soundIndex = new HashMap<>();
+        for (int id = 0; id < count; id++) {
+            net.minecraft.world.level.block.SoundType type = Block.BLOCK_STATE_REGISTRY.byId(id).getSoundType();
+            String key = "\"" + type.getPlaceSound().location().getPath() + "\", " + type.getVolume() + ", " + type.getPitch();
+            Integer at = soundIndex.get(key);
+            if (at == null) {
+                at = soundIndex.size();
+                soundIndex.put(key, at);
+                soundTypes.append(soundTypes.isEmpty() ? "[" : ", [").append(key).append("]");
+            }
+            stateSounds.append(id == 0 ? "" : ", ").append(at);
         }
         // Each block with a block entity and its type, as `BlockEntityType.isValid` names it.
         StringBuilder blockEntities = new StringBuilder();
@@ -440,6 +509,15 @@ final class BlockFlags {
         json.append("  \"signal_source_classes\": [").append(signalSource).append("],\n");
         json.append("  \"has_analog_classes\": [").append(hasAnalog).append("],\n");
         json.append("  \"analog_classes\": [").append(analog).append("],\n");
+        json.append("  \"placement_classes\": [").append(placement).append("],\n");
+        json.append("  \"replace_classes\": [").append(replace).append("],\n");
+        json.append("  \"placed_by_classes\": [").append(placedBy).append("],\n");
+        json.append("  \"use_item_classes\": [").append(useItem).append("],\n");
+        json.append("  \"use_classes\": [").append(useWithout).append("],\n");
+        json.append("  \"block_items\": [").append(blockItems).append("],\n");
+        json.append("  \"items_of_blocks\": [").append(itemsOfBlocks).append("],\n");
+        json.append("  \"place_sounds\": [").append(soundTypes).append("],\n");
+        json.append("  \"state_place_sounds\": [").append(stateSounds).append("],\n");
         json.append("  \"item_stack_sizes\": [").append(stacks).append("],\n");
         json.append("  \"push_reactions\": [").append(pushReactions).append("],\n");
         json.append("  \"unbreakable_blocks\": [").append(unbreakable).append("],\n");
