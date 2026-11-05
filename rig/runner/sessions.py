@@ -73,9 +73,10 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # of its inventory as the creative menu does; `clicks`, where it clicks in its inventory menu;
 # `dig` and `dig-creative`, where it digs blocks; `place` and `place-creative`, where it places
 # them; `use`, where it uses them; `use-items` and `use-books`, where it uses items on them; and
-# `use-containers`, where it opens containers and clicks in them (src/rig/session.calx).
+# `use-containers`, where it opens containers and clicks in them; and `items`, where it drops,
+# throws and picks up items (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
-                   "use-books", "use-containers"]
+                   "use-books", "use-containers", "items"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -268,6 +269,14 @@ USE_CONTAINERS = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, [
     slotted(0, "stone", 10),
     slotted(1, "dirt", 2),
 ]), equipment={})
+# In `items`: in survival mode, holding stone, with dirt and an iron sword in the hotbar and oak logs
+# in the inventory's first slot, which it drops and throws, then picks up (CAL-148).
+ITEMS = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "stone", 64),
+    slotted(1, "dirt", 10),
+    slotted(2, "iron_sword"),
+    slotted(9, "oak_log", 5),
+]), equipment={})
 # The use_items rules: the dig configurations', and no natural regeneration, so the bot's food stays
 # where the cake it eats puts it (CAL-142).
 USE_ITEMS_RULES = DIG_RULES + (("minecraft:natural_health_regeneration", nbt.Byte(0)),)
@@ -384,6 +393,13 @@ CONFIGS = {
     # rules have it, has no mobs to tell of.
     "crafts": Config({}, view=3, scenarios=("crafts",), world=FIXTURES / "crafting" / "world", fixture="crafting",
                      rules=DIG_RULES, player=CRAFTS),
+    # The bot, in survival mode, drops stacks it holds and throws them out of its inventory menu
+    # and with the throw key, onto the items fixture's grass, ice and water, where they fall,
+    # slide, float and merge, then walks over them and picks them up (CAL-148). Each item's packets
+    # are compared in the order it was sent them, apart from the steps, whose ends fall between an
+    # item's moves as the clock has it.
+    "items": Config({}, view=3, scenarios=("items",), world=FIXTURES / "items" / "world", fixture="items",
+                     rules=DIG_RULES, player=ITEMS),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
@@ -442,7 +458,10 @@ def vanilla_argv(a, tape=False):
     argv = a["argv"]
     cp = argv[argv.index("-cp") + 1]
     agent = f"-javaagent:{a['agent']}=seed={LEVEL_RANDOM_SEED}" + (f",tape=tape.txt,reseed={RESEED}" if tape else "")
-    return [argv[0], "-Xmx2G", "-Dfile.encoding=UTF-8", agent, "-cp", cp, "net.minecraft.server.Main", "--nogui"]
+    # Math.sin and Math.cos as StrictMath's, which Calcite's are, where HotSpot's intrinsics can
+    # differ in the last bit: a dropped item's motion turns through them (CAL-148).
+    strict = ["-XX:+UnlockDiagnosticVMOptions", "-XX:-UseLibmIntrinsic"]
+    return [argv[0], "-Xmx2G", "-Dfile.encoding=UTF-8", *strict, agent, "-cp", cp, "net.minecraft.server.Main", "--nogui"]
 
 
 def prepare(folder, config, port, vanilla):

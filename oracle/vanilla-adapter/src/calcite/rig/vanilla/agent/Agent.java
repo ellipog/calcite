@@ -31,6 +31,8 @@ import java.security.ProtectionDomain;
  * (D316).
  * {@code LegacyRandomSource.next}, which every draw of a level's random comes down to, hands
  * {@link Tape#drew} each value it returns, which writes those of a level's random to the tape.
+ * {@code Entity}'s constructor, as it returns, hands the entity to {@link Entities#made}, which
+ * seeds its random from the seed and its ID (CAL-148).
  *
  * <p>This class names no game class, so loading it loads none: {@code ServerLevel} and
  * {@code LegacyRandomSource} must load after the transformer is in place to be changed.
@@ -38,6 +40,7 @@ import java.security.ProtectionDomain;
 public final class Agent {
     private static final String LEVEL = "net/minecraft/server/level/ServerLevel";
     private static final String LEGACY = "net/minecraft/world/level/levelgen/LegacyRandomSource";
+    private static final String ENTITY = "net/minecraft/world/entity/Entity";
 
     private Agent() {
     }
@@ -71,14 +74,14 @@ public final class Agent {
     private static final class Transformer implements ClassFileTransformer {
         @Override
         public byte[] transform(ClassLoader loader, String name, Class<?> redefined, ProtectionDomain domain, byte[] bytes) {
-            if (!LEVEL.equals(name) && !LEGACY.equals(name)) {
+            if (!LEVEL.equals(name) && !LEGACY.equals(name) && !ENTITY.equals(name)) {
                 return null;
             }
             try {
                 ClassLoader from = loader != null ? loader : ClassLoader.getSystemClassLoader();
                 ClassFile cf = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(
                         ClassHierarchyResolver.defaultResolver().orElse(ClassHierarchyResolver.ofResourceParsing(from))));
-                return LEVEL.equals(name) ? level(cf, bytes) : legacy(cf, bytes);
+                return LEVEL.equals(name) ? level(cf, bytes) : ENTITY.equals(name) ? entity(cf, bytes) : legacy(cf, bytes);
             } catch (Throwable t) {
                 // A transformer's exception is swallowed by the JVM, and the class loads unchanged,
                 // so the run would go on unseeded: stop it instead.
@@ -124,6 +127,23 @@ public final class Agent {
             }
         };
         return cf.transformClass(cf.parse(bytes), both);
+    }
+
+    // Entity's constructor hands the entity to Entities.made before it returns, once it's given
+    // the entity its ID, which its field initializers only mark as unassigned; nothing after
+    // draws from its random until a subclass's constructor does.
+    private static byte[] entity(ClassFile cf, byte[] bytes) {
+        MethodTypeDesc withEntity = MethodTypeDesc.of(ConstantDescs.CD_void, ClassDesc.ofInternalName(ENTITY));
+        ClassDesc entities = ClassDesc.of("calcite.rig.vanilla.agent.Entities");
+        CodeTransform made = (b, e) -> {
+            if (e instanceof ReturnInstruction) {
+                b.aload(0);
+                b.invokestatic(entities, "made", withEntity);
+            }
+            b.with(e);
+        };
+        return cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
+                m -> m.methodName().equalsString("<init>"), made));
     }
 
     // LegacyRandomSource.next(int) hands each value it returns, itself and the bits to Tape.drew.

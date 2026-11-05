@@ -1,0 +1,282 @@
+/// What players are told of an item entity, as vanilla's `ServerEntity` and `ChunkMap.TrackedEntity`
+/// tell them (CAL-148): `add_entity` and its data as it comes into a player's view, then, each tick
+/// its tracker runs, its motion where it changed, its moves in 4096ths of a block from where it was
+/// last sent, or the whole of where it is where those won't do, and its stack where it changed.
+///
+/// An item's tracker runs every 20 ticks, `updateInterval`, sooner where its motion changed enough
+/// or its stack did, and sends where it is every 60 ticks if it hasn't moved; it tracks its
+/// motion, `trackDeltas`, so sends that whenever it changed by more than a little. Where it is goes
+/// whole, `ClientboundEntityPositionSyncPacket`, as it lands or leaves the ground, after 400 ticks
+/// of moves, where a move's too big for a short, and where it hit something and the 4096ths would
+/// leave it a little off across, `isFullPrecisionEncodingRequired`.
+module world.item_tracker
+
+import nbt.tag.{Tag}
+import protocol.wire.{Writer}
+import world.item_entity.{ItemEntity}
+
+/// How many ticks an item's tracker waits between runs, `EntityType.ITEM`'s `updateInterval`, and
+/// how far it's seen, `clientTrackingRange`, in chunks.
+pub const UPDATE_INTERVAL: i32 = 20
+pub const TRACKING_RANGE: i32 = 6
+
+/// What a tracker sends the players that see its item, in the order it sends them.
+pub enum Sent {
+    /// `ClientboundSetEntityMotionPacket`.
+    Motion(f64, f64, f64)
+    /// `ClientboundMoveEntityPacket.Pos`: the move, and whether it's on the ground.
+    Pos(i16, i16, i16, bool)
+    /// `ClientboundMoveEntityPacket.PosRot`.
+    PosRot(i16, i16, i16, i8, i8, bool)
+    /// `ClientboundMoveEntityPacket.Rot`.
+    Rot(i8, i8, bool)
+    /// `ClientboundEntityPositionSyncPacket`: where it is, its yaw and pitch, and whether it's on
+    /// the ground.
+    Sync(f64, f64, f64, f32, f32, bool)
+    /// `ClientboundSetEntityDataPacket` of its stack, `DATA_ITEM`.
+    Data(Tag)
+}
+
+/// An item's tracker.
+pub struct ItemTracker {
+    /// The item's ID.
+    pub id: i32
+    // Where its moves are counted from, `positionCodec`'s base; the motion, yaw and pitch last
+    // sent; how many times it's run, `tickCount`, and moved since it last sent where it was whole,
+    // `teleportDelay`; whether it was on the ground when that was sent, `wasOnGround`.
+    base_x: f64
+    base_y: f64
+    base_z: f64
+    sent_vx: f64
+    sent_vy: f64
+    sent_vz: f64
+    sent_y_rot: i8
+    sent_x_rot: i8
+    tick_count: i32 = 0
+    teleport_delay: i32 = 0
+    was_on_ground: bool
+    /// Its stack as its data was last sent, `trackedDataValues`, which a player coming to see it
+    /// is sent.
+    pub stack: Tag
+    /// The section it was in at its last look, `lastSectionPos`.
+    pub section: (i32, i32, i32)
+    /// The players that see it, by their entity IDs, `seenBy`.
+    pub seen_by: List<i32> = List<i32>()
+}
+
+impl ItemTracker {
+    /// The tracker of `e` as it's made, as `ChunkMap.addEntity` makes it.
+    pub fn new(e: ItemEntity) -> ItemTracker {
+        return ItemTracker {
+            id: e.id,
+            base_x: e.x,
+            base_y: e.y,
+            base_z: e.z,
+            sent_vx: e.vx,
+            sent_vy: e.vy,
+            sent_vz: e.vz,
+            sent_y_rot: pack_degrees(e.y_rot),
+            sent_x_rot: pack_degrees(e.x_rot),
+            was_on_ground: e.on_ground,
+            stack: e.stack.copy(),
+            section: section_of(e),
+        }
+    }
+
+    /// What `add_entity` says of `e` after its ID, as `ClientboundAddEntityPacket` writes it from
+    /// its tracker: its UUID, its type `item_type`, where its moves are counted from, the motion
+    /// last sent, its pitch, yaw and head's yaw, and 0 data.
+    pub fn add_entity_body(self, e: ItemEntity, item_type: i32) -> List<u8> {
+        var w = Writer.new()
+        let (most, least) = e.uuid
+        w.i64(most)
+        w.i64(least)
+        w.varint(item_type)
+        w.f64(self.base_x)
+        w.f64(self.base_y)
+        w.f64(self.base_z)
+        lp_vec3(mut w, self.sent_vx, self.sent_vy, self.sent_vz)
+        w.i8(pack_degrees(unpack_degrees(self.sent_x_rot)))
+        w.i8(pack_degrees(unpack_degrees(self.sent_y_rot)))
+        w.i8(pack_degrees(0.0f32))
+        w.varint(0)
+        return w.into_bytes()
+    }
+
+    /// `ServerEntity.sendChanges` for `e`: what its players are sent this run, to `out`.
+    pub fn send_changes(mut self, e: mut ItemEntity, out: mut List<Sent>) {
+        if e.sync_position {
+            self.tick_count = self.tick_count / UPDATE_INTERVAL * UPDATE_INTERVAL + UPDATE_INTERVAL
+            e.sync_position = false
+        }
+        if e.needs_sync or self.tick_count % UPDATE_INTERVAL == 0 or e.stack_changed {
+            let y_rot = pack_degrees(e.y_rot)
+            let x_rot = pack_degrees(e.x_rot)
+            let turned = (i32(y_rot) - i32(self.sent_y_rot)).abs() >= 1 or (i32(x_rot) - i32(self.sent_x_rot)).abs() >= 1
+            self.teleport_delay += 1
+            let dx = e.x - self.base_x
+            let dy = e.y - self.base_y
+            let dz = e.z - self.base_z
+            let changed = dx * dx + dy * dy + dz * dz >= f64(7.6293945e-6f32)
+            let send_position = changed or self.tick_count % 60 == 0
+            // The motion, `trackDelta`'s, where it changed by more than 1.0E-7, or to none.
+            let mx = e.vx - self.sent_vx
+            let my = e.vy - self.sent_vy
+            let mz = e.vz - self.sent_vz
+            let diff = mx * mx + my * my + mz * mz
+            let still = e.vx * e.vx + e.vy * e.vy + e.vz * e.vz == 0.0
+            // `createMovePacket` comes first, though the motion's sent before what it makes.
+            var moved = List<Sent>()
+            var has_position = false
+            var has_rotation = false
+            if self.teleport_delay > 400 or self.was_on_ground != e.on_ground {
+                self.was_on_ground = e.on_ground
+                self.teleport_delay = 0
+                moved.push(Sent.Sync(e.x, e.y, e.z, e.y_rot, e.x_rot, e.on_ground))
+                has_position = true
+                has_rotation = true
+            } else if send_position {
+                let xa = round(e.x * 4096.0) - round(self.base_x * 4096.0)
+                let ya = round(e.y * 4096.0) - round(self.base_y * 4096.0)
+                let za = round(e.z * 4096.0) - round(self.base_z * 4096.0)
+                let big = xa < -32768 or xa > 32767 or ya < -32768 or ya > 32767 or za < -32768 or za > 32767
+                if big or full_precision(e, xa, za) {
+                    moved.push(Sent.Sync(e.x, e.y, e.z, e.y_rot, e.x_rot, e.on_ground))
+                    has_rotation = true
+                } else if turned {
+                    moved.push(Sent.PosRot(i16.wrap(xa), i16.wrap(ya), i16.wrap(za), y_rot, x_rot, e.on_ground))
+                    has_rotation = true
+                } else {
+                    moved.push(Sent.Pos(i16.wrap(xa), i16.wrap(ya), i16.wrap(za), e.on_ground))
+                }
+                has_position = true
+            } else if turned {
+                moved.push(Sent.Rot(y_rot, x_rot, e.on_ground))
+                has_rotation = true
+            }
+            if diff > 1.0e-7 or (diff > 0.0 and still) {
+                self.sent_vx = e.vx
+                self.sent_vy = e.vy
+                self.sent_vz = e.vz
+                out.push(Sent.Motion(e.vx, e.vy, e.vz))
+            }
+            for m in moved {
+                out.push(m.copy())
+            }
+            // `sendDirtyEntityData`.
+            if e.stack_changed {
+                e.stack_changed = false
+                self.stack = e.stack.copy()
+                out.push(Sent.Data(e.stack.copy()))
+            }
+            if has_position {
+                self.base_x = e.x
+                self.base_y = e.y
+                self.base_z = e.z
+            }
+            if has_rotation {
+                self.sent_y_rot = y_rot
+                self.sent_x_rot = x_rot
+            }
+            e.needs_sync = false
+        }
+        self.tick_count += 1
+    }
+}
+
+// `isFullPrecisionEncodingRequired` for an item: where it hit something and the 4096ths of a move
+// across would leave it a little off.
+fn full_precision(e: ItemEntity, xa: i64, za: i64) -> bool {
+    if e.vertical_collision and ((xa != 0 and loss(e.x) != 0.0) or (za != 0 and loss(e.z) != 0.0)) {
+        return true
+    }
+    if e.horizontal_collision and ((xa != 0 and loss(e.z) != 0.0) or (za != 0 and loss(e.x) != 0.0)) {
+        return true
+    }
+    return false
+}
+
+// `VecDeltaCodec.encodingPrecisionLoss`.
+fn loss(d: f64) -> f64 {
+    return f64.nearest(round(d * 4096.0)) / 4096.0 - d
+}
+
+/// The section the item's in, `SectionPos.of`.
+pub fn section_of(e: ItemEntity) -> (i32, i32, i32) {
+    return (i32.saturate(e.x.floor()) >> 4, i32.saturate(e.y.floor()) >> 4, i32.saturate(e.z.floor()) >> 4)
+}
+
+/// `Mth.packDegrees`: an angle in 256ths of a turn, a byte.
+pub fn pack_degrees(angle: f32) -> i8 {
+    return i8.wrap(i32.saturate(f64(angle * 256.0f32 / 360.0f32).floor()))
+}
+
+/// `Mth.unpackDegrees`.
+pub fn unpack_degrees(b: i8) -> f32 {
+    return f32.nearest(i32(b)) * 360.0f32 / 256.0f32
+}
+
+/// `LpVec3.write`: a motion in a byte if it's nothing, else six or more: each axis in 15 bits of
+/// its share of the largest, rounded up, which takes the lowest two bits and, past 3, a varint
+/// more.
+pub fn lp_vec3(w: mut Writer, x0: f64, y0: f64, z0: f64) {
+    let x = sanitize(x0)
+    let y = sanitize(y0)
+    let z = sanitize(z0)
+    let most = max(x.abs(), max(y.abs(), z.abs()))
+    if most < 3.051944088384301e-5 {
+        w.u8(0u8)
+        return
+    }
+    let scale = i64.saturate(most.ceil())
+    let partial = (scale & 3) != scale
+    let markers = if partial { (scale & 3) | 4 } else { scale }
+    let xn = pack(x / f64.nearest(scale)) << 3
+    let yn = pack(y / f64.nearest(scale)) << 18
+    let zn = pack(z / f64.nearest(scale)) << 33
+    let buffer = markers | xn | yn | zn
+    w.u8(u8.wrap(buffer))
+    w.u8(u8.wrap(buffer >> 8))
+    w.i32(i32.wrap(buffer >> 16))
+    if partial {
+        w.varint(i32.wrap(scale >> 2))
+    }
+}
+
+/// The motion as `lp_vec3` writes it, on its own.
+pub fn lp_vec3_bytes(x: f64, y: f64, z: f64) -> List<u8> {
+    var w = Writer.new()
+    lp_vec3(mut w, x, y, z)
+    return w.into_bytes()
+}
+
+fn sanitize(v: f64) -> f64 {
+    if v.is_nan() {
+        return 0.0
+    }
+    if v < -1.7179869183e10 {
+        return -1.7179869183e10
+    }
+    if v > 1.7179869183e10 {
+        return 1.7179869183e10
+    }
+    return v
+}
+
+fn pack(v: f64) -> i64 {
+    return round((v * 0.5 + 0.5) * 32766.0)
+}
+
+fn max(a: f64, b: f64) -> f64 {
+    return if a > b { a } else { b }
+}
+
+// `Math.round`: the nearest long, halves up, 0 for NaN.
+fn round(v: f64) -> i64 {
+    if v.is_nan() {
+        return 0
+    }
+    let f = v.floor()
+    let r = if v - f >= 0.5 { f + 1.0 } else { f }
+    return i64.saturate(r)
+}

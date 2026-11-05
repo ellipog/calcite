@@ -279,6 +279,33 @@ class Sessions(unittest.TestCase):
         report, _ = self.compare(vanilla, calcite)
         self.assertEqual([(f.key, f.what) for f in report.findings], [("session:join/join/level_chunk_with_light", "chunk (2, 0) differs")])
 
+    def test_entities(self):
+        # An item's packets are lined up by its ID across the steps (CAL-148): its moves may fall
+        # in another step, its data among its moves elsewhere, and one side may send it a few
+        # more moves before it goes; but a move that differs, or data only one side sends, is
+        # found. The bot's own data stays in its step.
+        def motion(x):
+            return self.packet("play", "set_entity_motion", {"id": 2, "movement": {"x": x}}, f"m{x}")
+
+        add = self.packet("play", "add_entity", {"id": 2, "uuid": "u"}, "a")
+        data = self.packet("play", "set_entity_data", {"id": 2, "packedItems": [1]}, "d")
+        mine = self.packet("play", "set_entity_data", {"id": 1, "packedItems": [0]}, "e")
+        gone = self.packet("play", "remove_entities", {"entityIds": [2]}, "r")
+        login = self.packet("play", "login", {"playerId": 1})
+        vanilla = [{"mark": "step join"}, login, mine, add, motion(1), data, motion(2), {"mark": "step two"},
+                   motion(3), gone]
+        calcite = [{"mark": "step join"}, login, mine, add, motion(1), motion(2), {"mark": "step two"}, data,
+                   motion(3), motion(4), motion(5), gone]
+        report, _ = self.compare(vanilla, calcite)
+        self.assertFalse(report.findings)
+        wrong = [dict(r) for r in calcite]
+        wrong[5] = motion(9)
+        report, _ = self.compare(vanilla, wrong)
+        self.assertEqual([f.key for f in report.findings], ["session:join/<entity>/set_entity_motion"])
+        twice = calcite[:8] + [data] + calcite[8:]
+        report, _ = self.compare(vanilla, twice)
+        self.assertEqual([f.key for f in report.findings], ["session:join/<entity>/set_entity_data"])
+
     def test_differences_and_masks(self):
         vanilla = [
             {"mark": "step login"},

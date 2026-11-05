@@ -21,6 +21,16 @@ line first, since when or in what order they come depends on timing rather than 
   `block_entity_data` each block change brings, which comes as its tick does (D350).
 - **What isn't a packet.** The bot's mark that the server closed the connection is lined up
   like a packet, as `<closed>`.
+- **Entities.** What an entity other than the bot is sent comes on its own clock, from the tick
+  it came in, as its tracker runs every so many ticks, so a step that ends a second after the bot
+  last heard anything else ends between two of them where the clock has it. Each entity's
+  packets, `ENTITY`, are lined up across the session instead, by its ID (CAL-148): what it is,
+  `STATE`, its coming, its data, its going and its pickup, in the order it was sent them; and
+  apart from those, its moves, in theirs. Two entities that came in different ticks, which is as
+  the bot's packets fell between the server's ticks, meet, merge or are picked up a tick or two
+  apart on each server, so where an entity's state comes among its moves, and how many moves it's
+  sent before it goes, isn't the server's to fix: one side's moves may go on past the other's by
+  as many as `MORE_MOVES`.
 
 Fields vanilla draws afresh each run (`DRAWN`) are left out of both sides' values. And the sky's
 light under the world is read as vanilla's light leaves it either way (CAL-122): the section below
@@ -43,6 +53,15 @@ from dataclasses import dataclass, field
 import differences as registry
 
 CLOCK = {"play/set_time", "play/keep_alive", "configuration/keep_alive"}
+# What's lined up by entity rather than by step (CAL-148), and the fields each names the entity in.
+ENTITY = {"play/add_entity", "play/set_entity_data", "play/set_entity_motion", "play/move_entity_pos",
+          "play/move_entity_pos_rot", "play/move_entity_rot", "play/entity_position_sync",
+          "play/remove_entities", "play/take_item_entity"}
+ENTITY_IDS = ("entityId", "id", "itemId")
+STATE = {"play/add_entity", "play/set_entity_data", "play/remove_entities", "play/take_item_entity"}
+# How many more moves one side's entity may be sent before it goes, or the bot leaves: three of
+# an item's tracker's runs, each its motion and where it is.
+MORE_MOVES = 6
 # The fields of a clock packet that hold the time.
 CLOCK_TIMES = {"gameTime", "totalTicks", "id"}
 CHUNKS = {"play/chunk_batch_start", "play/chunk_batch_finished", "play/level_chunk_with_light"}
@@ -93,6 +112,8 @@ class Entry:
 class Step:
     name: str
     entries: list = field(default_factory=list)
+    # Each entity's packets in the step, by its ID, but the bot's, in the order they came.
+    entities: dict = field(default_factory=dict)
     clock: dict = field(default_factory=dict)
     chunks: dict = field(default_factory=dict)
     batches: int = 0
@@ -100,9 +121,23 @@ class Step:
     changes: list = field(default_factory=list)
 
 
+def entity_of(kind, value):
+    """The entity a packet of `ENTITY` is for, or None."""
+    if not isinstance(value, dict):
+        return None
+    if kind == "play/remove_entities":
+        ids = value.get("entityIds")
+        return ids[0] if isinstance(ids, list) and len(ids) == 1 else None
+    for name in ENTITY_IDS:
+        if isinstance(value.get(name), int):
+            return value[name]
+    return None
+
+
 def load(path):
     """A session's steps, from SessionDump's .jsonl."""
     steps = [Step("start")]
+    me = None
     for line in path.read_text(encoding="utf-8").splitlines():
         r = json.loads(line)
         step = steps[-1]
@@ -138,8 +173,15 @@ def load(path):
         if kind in CHANGES:
             step.changes.append(Entry(kind, value, r["sha256"], r.get("error", "")))
             continue
+        if kind == "play/login" and isinstance(value, dict):
+            me = value.get("playerId")
+        if kind in ENTITY:
+            who = entity_of(kind, value)
+            if who is not None and who != me:
+                step.entities.setdefault(who, []).append(Entry(kind, value, r["sha256"], r.get("error", "")))
+                continue
         step.entries.append(Entry(kind, value, r["sha256"], r.get("error", "")))
-    return [s for s in steps if s.name != "start" or s.entries or s.changes]
+    return [s for s in steps if s.name != "start" or s.entries or s.changes or s.entities]
 
 
 def without(value, names):
@@ -387,7 +429,55 @@ class Report:
     passed: bool
 
 
+def streams(steps):
+    """Each entity's packets across the session, by its ID, each with the place of its step."""
+    out = {}
+    for n, s in enumerate(steps):
+        for who, es in s.entities.items():
+            out.setdefault(who, []).extend((n, e) for e in es)
+    return out
+
+
+def compare_entities(vanilla_steps, calcite_steps, scenario, findings, counts):
+    """Each entity's packets, in the order it was sent them, apart from the steps (CAL-148): a
+    packet that differs, or one side's going on past the other's before the last steps."""
+    tally = counts.setdefault("play", {"match": 0, "differ": 0})
+    va, ca = streams(vanilla_steps), streams(calcite_steps)
+    names_v = [s.name for s in vanilla_steps]
+    names_c = [s.name for s in calcite_steps]
+
+    def found(who, kind, what, detail=()):
+        findings.append(Finding(f"session:{scenario}/<entity>/{kind.split('/', 1)[-1]}", "play", f"entity {who}: {what}", list(detail)))
+        tally["differ"] += 1
+
+    def line_up(who, a, b, more):
+        m = difflib.SequenceMatcher(a=[e.kind for _, e in a], b=[e.kind for _, e in b], autojunk=False)
+        ops = m.get_opcodes()
+        for k, (op, i1, i2, j1, j2) in enumerate(ops):
+            if op == "equal":
+                for (_, x), (_, y) in zip(a[i1:i2], b[j1:j2]):
+                    problem = compare_entries(x, y)
+                    if problem:
+                        found(who, x.kind, "differs", problem)
+                    else:
+                        tally["match"] += 1
+                continue
+            # One side's moves going on past the other's, a few of them, as it went later.
+            if k == len(ops) - 1 and op in ("delete", "insert") and max(i2 - i1, j2 - j1) <= more:
+                continue
+            for n, x in a[i1:i2]:
+                found(who, x.kind, f"only vanilla sends it, in {names_v[n]}")
+            for n, y in b[j1:j2]:
+                found(who, y.kind, f"only Calcite sends it, in {names_c[n]}")
+
+    for who in sorted(set(va) | set(ca)):
+        a, b = va.get(who, []), ca.get(who, [])
+        line_up(who, [p for p in a if p[1].kind in STATE], [p for p in b if p[1].kind in STATE], 0)
+        line_up(who, [p for p in a if p[1].kind not in STATE], [p for p in b if p[1].kind not in STATE], MORE_MOVES)
+
+
 def compare(vanilla_steps, calcite_steps, scenario, findings, counts):
+    compare_entities(vanilla_steps, calcite_steps, scenario, findings, counts)
     by_name = {s.name: s for s in calcite_steps}
     for va in vanilla_steps:
         ca = by_name.get(va.name)
