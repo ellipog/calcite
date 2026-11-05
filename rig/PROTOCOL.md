@@ -828,7 +828,7 @@ Input `{"from": f, "value": text, "to": t}`. `f` is `json`, for `text` a stack a
 
 The output is `{"empty": e}`, `e` whether the stack is empty, with the blob, or, where it doesn't read, `{"error": message, "partial": p}`, `p` whether the codec had a partial value. A stream that doesn't read gives `{"error": exception}`, its `toString`, and one with bytes left over says how many in `left`. An empty stack has no NBT, and one the codec can't write gives `{"write_error": message}`.
 
-Calcite answers `unimplemented` for a stack with a component type whose stream codec it doesn't have yet, read from `wire` or written to it (CAL-77, D364).
+Calcite has every component type's stream codec (CAL-77, D364, D365).
 
 ## Adding a probe
 

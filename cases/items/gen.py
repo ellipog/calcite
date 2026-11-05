@@ -2,7 +2,7 @@
 `ItemStack.CODEC`, from a data pack's JSON, or from SNBT through `NbtOps`, as a save's are, or
 with `ItemStack.OPTIONAL_STREAM_CODEC` from the network, and written to NBT or the network, with
 the vanilla data pack's registries and the items' default components bound, as a server has them
-(CAL-77, D362, D363, D364). The `from-wire` cases are vanilla's own bytes for the `to-wire` ones,
+(CAL-77, D362, D363, D364, D365). The `from-wire` cases are vanilla's own bytes for the `to-wire` ones,
 taken from the goldens once they're recorded, so a new one needs recording twice.
 
     py -I cases/items/gen.py
@@ -10,6 +10,7 @@ taken from the goldens once they're recorded, so a new one needs recording twice
 
 import base64
 import json
+import struct
 import sys
 from pathlib import Path
 
@@ -251,10 +252,17 @@ def cases():
     for name, components in packs.BAD_COMPONENTS.items():
         nbt(f"bad-{name}", snbt({"id": "minecraft:paper", "components": components}))
 
-    # Every JSON stack sent over the network with `ItemStack.OPTIONAL_STREAM_CODEC` (D364).
+    # Every JSON stack sent over the network with `ItemStack.OPTIONAL_STREAM_CODEC` (D364), with
+    # one enchantment where it has more: vanilla holds them in a hash map keyed by holders, whose
+    # hash is their identity, so it sends several in an order that changes from run to run (D365).
     for c in list(out):
         if c["input"]["from"] == "json" and c["input"]["to"] == "nbt":
-            out.append({"id": f"to-wire-{c['id']}", "input": dict(c["input"], to="wire")})
+            text = c["input"]["value"]
+            value = json.loads(text)
+            single = one_enchantment(value)
+            if single != value:
+                text = json.dumps(single)
+            out.append({"id": f"to-wire-{c['id']}", "input": dict(c["input"], to="wire", value=text)})
 
     # Stacks off the network, made by hand: empty ones, air, what doesn't read, and patches that
     # applying them to the item's defaults changes.
@@ -289,6 +297,66 @@ def cases():
     wire("rarity-epic", [1] + paper + [1, 0, 12, 3])
     wire("lore-too-many", [1] + paper + [1, 0, 11] + varint(257))
 
+    # The other types' stream codecs (D365): enums' IDs out of range, wrapped, clamped or not
+    # there; tags and entries; stacks inside stacks and their patches; sets and maps read into
+    # hash maps; both sides of an either; and what the decoders throw.
+    potion, bundle, head, sign, crossbow = varint(1271), varint(1153), varint(1386), varint(1102), varint(1491)
+
+    def one(item, kind, data):
+        return [1] + item + [1, 0] + varint(kind) + data
+
+    lines = []
+    for ch in "abcd":
+        lines += [8, 0, 1, ord(ch)]
+    uuid = list(range(1, 17))
+    wire("horse-wrapped", one(paper, 108, varint(-1)))
+    wire("horse-far", one(paper, 108, varint(1000)))
+    wire("salmon-clamped", one(paper, 93, varint(7)))
+    wire("rabbit-evil", one(paper, 99, varint(99)))
+    wire("rabbit-unknown", one(paper, 99, varint(50)))
+    wire("fish-betty", one(paper, 95, varint(1025)))
+    wire("fish-unknown", one(paper, 95, varint(2)))
+    wire("tag-unknown", one(paper, 33, [0] + utf("minecraft:nope")))
+    wire("tag-known", one(paper, 33, [0] + utf("minecraft:repairs_iron_armor")))
+    wire("holders-none", one(paper, 33, [1]))
+    wire("holders-negative", one(paper, 33, varint(-5)))
+    wire("holders-two", one(paper, 33, [3] + stone + paper))
+    wire("bundle-count-zero", one(bundle, 52, [1] + stone + [0, 0, 0]))
+    wire("bundle-air", one(bundle, 52, [1, 0, 1, 0, 0]))
+    wire("bundle-count-negative", one(bundle, 52, [1] + stone + varint(-3) + [0, 0]))
+    wire("bundle-patch-negative", one(bundle, 52, [1] + stone + [1] + varint(-1) + [0]))
+    wire("bundle-patched", one(bundle, 52, [1] + stone + [1, 3, 1, 3, 5, 11, 1, 8, 0, 1, 120, 3, 7, 0]))
+    wire("patch-negative", [1] + stone + varint(-1) + [0])
+    wire("patch-negative-removed", [1] + apple + varint(-1) + [1, 23])
+    wire("block-state", one(paper, 78, [3] + utf("waterlogged") + utf("false") + utf("facing") + utf("north") + utf("lit") + utf("true")))
+    wire("block-state-twice", one(paper, 78, [2] + utf("lit") + utf("true") + utf("lit") + utf("false")))
+    wire("tooltip-twice", one(paper, 18, [0, 3, 3, 11, 3]))
+    wire("profile-whole", one(head, 72, [1] + uuid + utf("Alex") + [1] + utf("textures") + utf("v") + [1] + utf("s") + [0, 0, 0, 1, 1]))
+    wire("profile-part", one(head, 72, [0, 1] + utf("Al") + [1] + uuid + [0, 0, 0, 0, 0]))
+    wire("profile-name", one(head, 72, [0, 1] + utf("Steve") + [0, 0, 0, 0, 0, 0]))
+    wire("profile-long-name", one(head, 72, [0, 1] + utf("A" * 17) + [0, 0, 0, 0, 0, 0]))
+    wire("sign-filtered-same", one(sign, 118, lines + [1] + lines + [0, 0]))
+    wire("potion-hidden", one(potion, 53, [0, 0, 1, 0, 1, 20, 0, 1, 1, 1, 2, 40, 0, 1, 1, 0, 0]))
+    wire("potion-amplifier-big", one(potion, 53, [0, 0, 1, 0] + varint(300) + [20, 0, 1, 1, 0, 0]))
+    wire("consume-unknown", one(paper, 24, [0x3F, 0xCC, 0xCC, 0xCD, 1, 0] + utf("w:s") + [0, 1, 1, 99]))
+    wire("consume-direct-sound", one(paper, 24, [0x3F, 0xCC, 0xCC, 0xCD, 2, 0] + utf("w:s") + [1, 0x41, 0x20, 0, 0, 1, 0]))
+    wire("entity-data", one(paper, 60, [11, 10, 8, 0, 2] + list(b"id") + [0, 3] + list(b"w:x") + [3, 0, 1] + list(b"x") + [0, 0, 0, 5, 0]))
+    wire("custom-data-not-compound", one(paper, 0, [8, 0, 1, 120]))
+    wire("can-break-state", one(paper, 15, [1, 1, 2, 1, 1, 1] + utf("facing") + [1] + utf("north") + [0, 0, 0]))
+    wire("can-break-tests", one(paper, 15, [1, 0, 0, 0, 1, 3, 5, 1, 1, 0, 10, 0]))
+    wire("attribute-override", one(paper, 16, [1, 1] + utf("w:a") + list(struct.pack(">d", 2.0)) + [0, 0, 2, 8, 0, 1, 88]))
+    wire("map-post-processing", one(paper, 50, [1]))
+    wire("creative-slot-lock", one(paper, 20, []))
+    wire("charged-too-many", one(crossbow, 51, varint(1025)))
+    wire("lore-negative", one(paper, 11, varint(-1)))
+    wire("lore-bad-text", one(paper, 11, [1, 3, 0, 0, 0, 5]))
+    wire("tooltip-negative", one(paper, 18, [0] + varint(-1)))
+    wire("block-state-negative", one(paper, 78, varint(-1)))
+    wire("enchantments-negative", one(paper, 13, varint(-1)))
+    wire("profile-properties-negative", one(head, 72, [0, 0, 0] + varint(-1) + [0, 0, 0, 0]))
+    wire("container-empty-last", one(varint(656), 77, [3, 0, 1, 1, 1, 0, 0, 0]))
+    wire("fireworks-flight-big", one(paper, 71, varint(300) + [0]))
+
     # Vanilla's own bytes for each stack above, read back, from the goldens where they've been
     # recorded, else as the case file had them.
     out.extend(from_vanilla(out))
@@ -304,6 +372,25 @@ def varint(n):
             return data
         data.append((n & 0x7F) | 0x80)
         n >>= 7
+
+
+def utf(text):
+    """`text` as `ByteBufCodecs.STRING_UTF8` sends it: its length in bytes, then its UTF-8."""
+    data = text.encode("utf-8")
+    return varint(len(data)) + list(data)
+
+
+def one_enchantment(value):
+    """The stack `value` with only the first of its enchantments and stored enchantments."""
+    if not isinstance(value, dict) or not isinstance(value.get("components"), dict):
+        return value
+    components = {}
+    for k, v in value["components"].items():
+        if k.removeprefix("minecraft:") in ("enchantments", "stored_enchantments") and isinstance(v, dict) and len(v) > 1:
+            first = next(iter(v))
+            v = {first: v[first]}
+        components[k] = v
+    return dict(value, components=components)
 
 
 def from_vanilla(cases):
