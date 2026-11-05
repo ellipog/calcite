@@ -267,6 +267,11 @@ final class BlockFlags {
         // properties, so every state of a block has the same; that's checked.
         StringBuilder pushReactions = new StringBuilder();
         StringBuilder unbreakable = new StringBuilder();
+        // Each block's destroy speed, `getDestroySpeed`, and the blocks that need the right tool
+        // for their drops, `requiresCorrectToolForDrops`, which digging reads (CAL-138). Each state
+        // copies them from its block's properties too; that's checked.
+        StringBuilder destroySpeeds = new StringBuilder();
+        StringBuilder needsTool = new StringBuilder();
         // The sounds a block that a signal opens or presses plays, on and off (CAL-124): a door's,
         // a trapdoor's and a button's and a pressure plate's from its `BlockSetType`, a fence gate's
         // from its `WoodType`, each by the sound event's name.
@@ -298,6 +303,17 @@ final class BlockFlags {
             pushReactions.append(id == 0 ? "" : ", ").append(reaction);
             if (fixed) {
                 unbreakable.append(unbreakable.isEmpty() ? "" : ", ").append(id);
+            }
+            float speed = first.getDestroySpeed(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+            boolean tool = first.requiresCorrectToolForDrops();
+            for (BlockState s : block.getStateDefinition().getPossibleStates()) {
+                if (Float.compare(s.getDestroySpeed(EmptyBlockGetter.INSTANCE, BlockPos.ZERO), speed) != 0 || s.requiresCorrectToolForDrops() != tool) {
+                    throw new IllegalStateException("BlockFlags: the states of " + BuiltInRegistries.BLOCK.getKey(block) + " differ in how they're dug");
+                }
+            }
+            destroySpeeds.append(id == 0 ? "" : ", ").append(speed);
+            if (tool) {
+                needsTool.append(needsTool.isEmpty() ? "" : ", ").append(id);
             }
         }
         for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
@@ -427,6 +443,8 @@ final class BlockFlags {
         json.append("  \"item_stack_sizes\": [").append(stacks).append("],\n");
         json.append("  \"push_reactions\": [").append(pushReactions).append("],\n");
         json.append("  \"unbreakable_blocks\": [").append(unbreakable).append("],\n");
+        json.append("  \"destroy_speeds\": [").append(destroySpeeds).append("],\n");
+        json.append("  \"needs_tool_blocks\": [").append(needsTool).append("],\n");
         json.append("  \"toggle_sounds\": [").append(toggles).append("],\n");
         json.append("  \"button_ticks\": [").append(buttonTicks).append("],\n");
         json.append("  \"plate_weights\": [").append(plateWeights).append("],\n");

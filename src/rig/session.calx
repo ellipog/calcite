@@ -29,6 +29,15 @@
 ///   hashes: stacks picked up, put down, halved, merged, shift-clicked, swapped with a hotbar key,
 ///   put in the crafting grid and on and off the head, a click whose cursor it gets wrong, one
 ///   from a state that's gone, and a drag; then it closes the menu and leaves (CAL-136).
+/// - `dig`: as `join`, but once its view's loaded, the bot, in survival mode, digs the dig
+///   fixture's blocks, each in a step of its own named for it, as a client's player actions say,
+///   each with the next sequence number: the ground under spawn protection; the ground started and
+///   stopped at once, so the server digs it the rest of the way; started and aborted, started then
+///   another started, aborted elsewhere, stopped elsewhere, and out of reach; a tripwire cut with
+///   shears; the dirt under the first with a pickaxe that breaks as it does; and its hands
+///   swapped; then it leaves (D376).
+/// - `dig-creative`: as `dig`, in creative mode: the ground, a bed's foot, a door's top, tall
+///   grass's top and a command block broken, then the ground with a sword, which doesn't (D376).
 ///
 /// OUT gets each packet in the order it came: its state's number, as vanilla's
 /// `ConnectionProtocol` orders them from handshake at 0, its length as 4 bytes, big-endian, then
@@ -49,7 +58,7 @@ import protocol.configuration.{ServerboundFinishConfiguration, ServerboundSelect
 import protocol.handshake.{ClientIntent, ClientIntention}
 import protocol.ids.{PROTOCOL_VERSION, packet_names}
 import protocol.login.{ServerboundHello, ServerboundLoginAcknowledged}
-import protocol.play.{ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundContainerClick, ServerboundContainerClose, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundPlayerLoaded, ServerboundSetCreativeModeSlot, ON_GROUND}
+import protocol.play.{ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundContainerClick, ServerboundContainerClose, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundPlayerAction, ServerboundPlayerLoaded, ServerboundSetCarriedItem, ServerboundSetCreativeModeSlot, ON_GROUND}
 import protocol.state.{State, Bound}
 import protocol.status.{ServerboundPingRequest, ServerboundStatusRequest}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
@@ -60,6 +69,7 @@ import std.env.{args}
 import std.fs.{write}
 import std.net.{Net, Conn, Event}
 import std.time.{Instant}
+import world.pos.{BlockPos}
 
 const TICK_NS: u64 = 50000000
 const MS: u64 = 1000000
@@ -119,6 +129,8 @@ enum Phase {
     Creative
     // Clicking in the inventory menu, in `clicks`.
     Clicks
+    // Digging blocks, in `dig` and `dig-creative`.
+    Dig
     // It has closed the connection.
     Leave
 }
@@ -148,6 +160,8 @@ struct Bot {
     // The inventory menu's state, as the server last sent it, and in `clicks`, the click it's at.
     menu_state: i32 = 0
     click_at: usize = 0
+    // In `dig` and `dig-creative`, the step it's at.
+    dig_at: usize = 0
 }
 
 impl Bot {
@@ -316,6 +330,18 @@ impl Bot {
         }
     }
 
+    // The step `dig_at` of `dig` or `dig-creative`, in a step of its own: each of its packets.
+    fn dig(mut self, net: Net, now: u64) {
+        let d = digs(self.scenario == "dig-creative")[self.dig_at].copy()
+        self.step(d.name.copy(), now)
+        for p in d.packets {
+            match p {
+                Dug.Action(action, x, y, z, direction, sequence) => self.send(net, packet(ServerboundPlayerAction { action: action, pos: BlockPos { x: x, y: y, z: z }, direction: u8.wrap(direction), sequence: sequence }, State.Play)),
+                Dug.Hold(slot) => self.send(net, packet(ServerboundSetCarriedItem { slot: slot }, State.Play)),
+            }
+        }
+    }
+
     // A tick of the client's: the next block of the walk, and the step's end once the server
     // has settled.
     fn tick(mut self, net: Net, now: u64, view_chunks: u64) {
@@ -341,7 +367,11 @@ impl Bot {
                     self.loaded = true
                     self.send(net, packet(ServerboundPlayerLoaded {}, State.Play))
                 }
-                if self.loaded and settled and self.scenario == "clicks" {
+                if self.loaded and settled and (self.scenario == "dig" or self.scenario == "dig-creative") {
+                    self.phase = Phase.Dig
+                    self.dig_at = 0
+                    self.dig(net, now)
+                } else if self.loaded and settled and self.scenario == "clicks" {
                     self.phase = Phase.Clicks
                     self.click_at = 0
                     self.click(net, now)
@@ -390,6 +420,20 @@ impl Bot {
                     self.click_at += 1
                     if self.click_at < clicks().len() {
                         self.click(net, now)
+                    } else {
+                        self.phase = Phase.Leave
+                        self.step(String("leave"), now)
+                        net.close(self.conn)
+                        self.closed = true
+                        self.done = true
+                    }
+                }
+            },
+            Phase.Dig => {
+                if settled {
+                    self.dig_at += 1
+                    if self.dig_at < digs(self.scenario == "dig-creative").len() {
+                        self.dig(net, now)
                     } else {
                         self.phase = Phase.Leave
                         self.step(String("leave"), now)
@@ -550,6 +594,64 @@ fn clicks() -> List<Click> {
     ]
 }
 
+// A packet of a step of `dig`'s: a player action, by its place in `Action`'s order, on the block
+// at x, y, z, from the face with the 3D data value given, with its sequence number; or the hotbar
+// slot to hold.
+enum Dug {
+    Action(i32, i32, i32, i32, i32, i32)
+    Hold(i16)
+}
+
+// A step of `dig`'s: its name and its packets.
+struct Dig {
+    name: String
+    packets: List<Dug>
+}
+
+// `START_DESTROY_BLOCK`, `ABORT_DESTROY_BLOCK` and `STOP_DESTROY_BLOCK` on the block at x, y, z,
+// from above, with the sequence number `n`.
+fn starting(x: i32, y: i32, z: i32, n: i32) -> Dug {
+    return Dug.Action(0, x, y, z, 1, n)
+}
+
+fn aborting(x: i32, y: i32, z: i32, n: i32) -> Dug {
+    return Dug.Action(2, x, y, z, 1, n)
+}
+
+fn stopping(x: i32, y: i32, z: i32, n: i32) -> Dug {
+    return Dug.Action(3, x, y, z, 1, n)
+}
+
+// What `dig` does, step by step, from the `dig` configuration's inventory, with its sequence
+// numbers counting up as a client's do, on the dig fixture: its ground is grass at y -61, under
+// spawn protection a block around the spawn, with a bed's foot at 3, -60, 1, an oak door at 3, -60,
+// 3, tall grass at 3, -60, 5, a command block at 5, -60, 1 and a tripwire at 5, -60, 3. In
+// `dig-creative`, what a player who builds instantly breaks.
+fn digs(creative: bool) -> List<Dig> {
+    if creative {
+        return [
+            Dig { name: "break-ground", packets: [starting(2, -61, 0, 1)] },
+            Dig { name: "break-bed", packets: [starting(3, -60, 1, 2)] },
+            Dig { name: "break-door-top", packets: [starting(3, -59, 3, 3)] },
+            Dig { name: "break-tall-grass-top", packets: [starting(3, -59, 5, 4)] },
+            Dig { name: "command-block", packets: [starting(5, -60, 1, 5)] },
+            Dig { name: "sword", packets: [Dug.Hold(3i16), starting(2, -61, 2, 6)] },
+        ]
+    }
+    return [
+        Dig { name: "protected", packets: [starting(1, -61, 0, 1)] },
+        Dig { name: "dig-through", packets: [starting(2, -61, 0, 2), stopping(2, -61, 0, 3)] },
+        Dig { name: "abort", packets: [starting(2, -61, 2, 4), aborting(2, -61, 2, 5)] },
+        Dig { name: "switch", packets: [starting(2, -61, 2, 6), starting(3, -61, 2, 7), aborting(3, -61, 2, 8)] },
+        Dig { name: "abort-elsewhere", packets: [starting(2, -61, 2, 9), aborting(3, -61, 2, 10)] },
+        Dig { name: "stop-elsewhere", packets: [starting(2, -61, 2, 11), stopping(3, -61, 2, 12), aborting(2, -61, 2, 13)] },
+        Dig { name: "out-of-reach", packets: [starting(12, -61, 0, 14)] },
+        Dig { name: "shears", packets: [Dug.Hold(1i16), starting(5, -60, 3, 15)] },
+        Dig { name: "break-tool", packets: [Dug.Hold(2i16), starting(2, -62, 0, 16), stopping(2, -62, 0, 17)] },
+        Dig { name: "swap", packets: [Dug.Hold(0i16), Dug.Action(7, 0, 0, 0, 0, 0)] },
+    ]
+}
+
 // What `creative` sets, slot by slot of the inventory menu: stone into the hotbar, leggings on,
 // the inventory's logs out, dirt into the crafting result, which isn't a slot it may set, two
 // swords in one slot, a pickaxe with damage, bread that can't be eaten, and the offhand emptied.
@@ -574,7 +676,7 @@ fn main() {
     let port = u16.wrap(number(given[0]))
     let view_chunks = u64(in_view_count(i32.wrap(number(given[1]))))
     let scenario = given[2].copy()
-    if scenario != "status" and scenario != "outdated" and scenario != "bad-name" and scenario != "stranger" and scenario != "join" and scenario != "watch" and scenario != "creative" and scenario != "clicks" {
+    if scenario != "status" and scenario != "outdated" and scenario != "bad-name" and scenario != "stranger" and scenario != "join" and scenario != "watch" and scenario != "creative" and scenario != "clicks" and scenario != "dig" and scenario != "dig-creative" {
         panic("session: what's the scenario {scenario}?")
     }
     let net = Net.new()!

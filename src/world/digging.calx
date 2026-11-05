@@ -1,0 +1,683 @@
+/// What digging a block reads, as vanilla's player and its tools work it out (D376): the held
+/// stack's `tool`, its speed and whether it's right for a block's drops, by its rules' blocks;
+/// the player's dig speed, `Player.getDestroySpeed`, from it and their attributes; how far a
+/// tick takes the block, `getDestroyProgress`; and the damage a stack takes as it digs,
+/// `processDurabilityChange`, with its enchantments' `item_damage` effects, such as unbreaking.
+module world.digging
+
+import nbt.tag.{Tag}
+import random.source.{RandomSource}
+import registry.components.{ItemCodecs}
+import resources.identifier.{Identifier}
+import world.attributes.{Attributes, attribute_id}
+import world.block_facts.{destroy_speeds, needs_tool_blocks}
+import world.block_level.{BlockLevel, destroy_block, remove_block}
+import world.block_updates.{play_note}
+import world.level_writer.{UPDATE_LIMIT}
+import world.pistons.{fitting_base}
+import worldgen.access.{BlockAccess}
+import worldgen.facts.{DOWN, FULL, Facts, WATER_FLUID, opposite, step_x, step_y, step_z}
+import worldgen.interval.{Thrown}
+import worldgen.survive.{Env, facing_of}
+
+/// `ServerboundPlayerActionPacket.Action`, by its place in its order.
+pub const START_DESTROY_BLOCK: i32 = 0
+pub const CHANGE_DESTROY_DIRECTION: i32 = 1
+pub const ABORT_DESTROY_BLOCK: i32 = 2
+pub const STOP_DESTROY_BLOCK: i32 = 3
+pub const DROP_ALL_ITEMS: i32 = 4
+pub const DROP_ITEM: i32 = 5
+pub const RELEASE_USE_ITEM: i32 = 6
+pub const SWAP_ITEM_WITH_OFFHAND: i32 = 7
+pub const STAB: i32 = 8
+/// How many actions there are.
+pub const ACTIONS: i32 = 9
+
+/// The level events a block being dug shows, `PARTICLES_DESTROY_PROGRESS` most ticks and
+/// `PARTICLES_AND_SOUND_DESTROY_PROGRESS` every fourth, and one broken,
+/// `PARTICLES_AND_SOUND_DESTROY_BLOCK`.
+pub const DESTROY_PROGRESS: i32 = 2019
+pub const DESTROY_PROGRESS_SOUND: i32 = 2020
+pub const DESTROY_BLOCK: i32 = 2001
+/// The level event a fire put out shows, `SOUND_EXTINGUISH_FIRE`.
+pub const FIRE_EXTINGUISH: i32 = 1009
+
+/// What a player's game mode keeps of the block they dig, as `ServerPlayerGameMode` keeps it:
+/// its ticks, `gameTicks`; the block being dug, `isDestroyingBlock`, from the tick
+/// `destroyProgressStart`, at `destroyPos`, from the face `destroyDirection`, by its 3D data
+/// value; one let go before it was dug far enough, which breaks once it is, `hasDelayedDestroy`,
+/// at `delayedDestroyPos`, with `delayedTickStart`; and the stage the others were last sent,
+/// `lastSentState`. Made with `Digging()`, it's as a player's new game mode has it.
+pub struct Digging {
+    pub ticks: i32 = 0
+    pub destroying: bool = false
+    pub start: i32 = 0
+    pub x: i32 = 0
+    pub y: i32 = 0
+    pub z: i32 = 0
+    pub direction: i32 = 0
+    pub delayed: bool = false
+    pub delayed_x: i32 = 0
+    pub delayed_y: i32 = 0
+    pub delayed_z: i32 = 0
+    pub delayed_start: i32 = 0
+    pub last_sent: i32 = -1
+}
+
+/// `Player.isWithinBlockInteractionRange(pos, 1)`: whether the block at `x`, `y`, `z` is nearer
+/// the eyes of a player standing at `px`, `py`, `pz`, 1.62 up, than their
+/// `block_interaction_range` and 1 more, as the block's box is from them. Other poses' eyes come
+/// with the poses.
+pub fn in_reach(attributes: Attributes, px: f64, py: f64, pz: f64, x: i32, y: i32, z: i32) -> bool {
+    let range = attributes.value(attribute_id(String("block_interaction_range")) ?? 0) + 1.0
+    let eye = py + 1.62
+    let dx = (f64(x) - px).max(px - f64(x + 1)).max(0.0)
+    let dy = (f64(y) - eye).max(eye - f64(y + 1)).max(0.0)
+    let dz = (f64(z) - pz).max(pz - f64(z + 1)).max(0.0)
+    return dx * dx + dy * dy + dz * dz < range * range
+}
+
+/// `isEyeInFluid(WATER)`, as `EntityFluidInteraction.update` finds it for a player standing at
+/// `x`, `y`, `z`, their box 0.6 across and 1.8 up, 0.001 in each way, and their eyes 1.62 up:
+/// water in their eyes' column, in a block their box reaches, its top, `getHeight`, at their box's
+/// foot or above, that their eyes are between the bottom of and its top as the camera has it,
+/// `getHeightForCamera`, a source under a block sturdy below full to its top. A block whose chunk
+/// isn't full throws.
+pub fn eye_in_water<L: BlockAccess>(f: Facts, level: L, x: f64, y: f64, z: f64) -> bool ! Thrown {
+    let min_y = y + 0.001
+    let max_y = y + 1.8 - 0.001
+    let eye = y + 1.62
+    let bx = i32.saturate(x.floor())
+    let bz = i32.saturate(z.floor())
+    let y0 = i32.saturate(min_y.floor())
+    let y1 = i32.saturate(max_y.ceil()) - 1
+    for by in y0..y1 + 1 {
+        let state = try level.state(f, bx, by, bz)
+        if not f.is_water(state) {
+            continue
+        }
+        let bottom = f64(by)
+        let above = try level.state(f, bx, by + 1, bz)
+        // `hasSameFluidAbove`, else `getOwnHeight`, its amount over 9.
+        let height = if f.is_water(above) { 1.0 } else { f64(f32.nearest(f.fluid_amount(state)) / 9.0f32) }
+        if bottom + height < min_y or eye < bottom {
+            continue
+        }
+        let camera = if f.is_source(state) and f.sturdy(above, DOWN, FULL) { 1.0 } else { height }
+        if eye <= bottom + camera {
+            return true
+        }
+    }
+    return false
+}
+
+/// `ItemStack.canBreakBlockInAdventureMode`: whether the held stack's `can_break`, one block
+/// predicate or a list of them, has one whose `blocks` has `block`. A predicate that reads more
+/// than the block, its state, block entity or components, is told of in `missing` and doesn't.
+pub fn may_break_in_adventure(held: Tag?, block: i32, items: ItemCodecs, missing: mut List<String>) -> bool {
+    let stack = held.copy() else return false
+    let given = items.component(stack, String("minecraft:can_break")) else return false
+    var predicates = List<Tag>()
+    match given {
+        Tag.List(list) => {
+            for p in list {
+                predicates.push(p.copy())
+            }
+        },
+        t => predicates.push(t.copy()),
+    }
+    for p in predicates {
+        let Tag.Compound(m) = p else continue
+        var whole = true
+        for (k, _) in m {
+            if k != "blocks" {
+                whole = false
+            }
+        }
+        if not whole {
+            missing.push(String("Adventure mode predicates on a block's state, block entity or components"))
+            continue
+        }
+        let blocks = field(m, "blocks") else return true
+        if items.holder_set_has("block", blocks, block) {
+            return true
+        }
+    }
+    return false
+}
+
+/// Java's `(int)` of a float: toward 0, NaN as 0, and kept in an int's range.
+pub fn java_int(v: f32) -> i32 {
+    if v != v {
+        return 0
+    }
+    let whole = if v >= 0.0f32 { f64(v).floor() } else { f64(v).ceil() }
+    return i32.saturate(whole)
+}
+
+/// The field `key` of `m`, or none.
+fn field(m: JavaHashMap<String, Tag>, key: str) -> Tag? {
+    if not m.contains(key) {
+        return none
+    }
+    return some(m[key].copy())
+}
+
+/// The held stack's `tool`, as its patch or item gives it, or none.
+fn tool_of(held: Tag?, items: ItemCodecs) -> JavaHashMap<String, Tag>? {
+    let stack = held.copy() else return none
+    return match items.component(stack, String("minecraft:tool")) {
+        some(Tag.Compound(m)) => some(m.copy()),
+        _ => none,
+    }
+}
+
+/// `Item.getDestroySpeed`: the speed of the first of the held stack's `tool` rules whose
+/// blocks have `block` and which gives a speed, or the tool's default, 1 without one.
+pub fn mining_speed(held: Tag?, block: i32, items: ItemCodecs) -> f32 {
+    let tool = tool_of(held, items) else return 1.0f32
+    match field(tool, "rules") {
+        some(Tag.List(rules)) => {
+            for rule in rules {
+                let Tag.Compound(m) = rule else continue
+                let speed = field(m, "speed") else continue
+                let blocks = field(m, "blocks") else continue
+                if items.holder_set_has("block", blocks, block) {
+                    return speed.number_float() ?? 1.0f32
+                }
+            }
+        },
+        _ => {},
+    }
+    let default = field(tool, "default_mining_speed") else return 1.0f32
+    return default.number_float() ?? 1.0f32
+}
+
+/// `Item.isCorrectToolForDrops`: what the first of the held stack's `tool` rules whose blocks
+/// have `block` and which says says, false where none does or there's no tool.
+pub fn correct_for_drops(held: Tag?, block: i32, items: ItemCodecs) -> bool {
+    let tool = tool_of(held, items) else return false
+    let r = field(tool, "rules") else return false
+    let Tag.List(rules) = r else return false
+    for rule in rules {
+        let Tag.Compound(m) = rule else continue
+        let says = field(m, "correct_for_drops") else continue
+        let blocks = field(m, "blocks") else continue
+        if items.holder_set_has("block", blocks, block) {
+            return says.number_bool() ?? false
+        }
+    }
+    return false
+}
+
+/// Whether `block` drops nothing unless dug with the right tool, `requiresCorrectToolForDrops`.
+pub fn needs_tool(block: i32) -> bool {
+    for b in needs_tool_blocks() {
+        if i32.wrap(b) == block {
+            return true
+        }
+    }
+    return false
+}
+
+/// `Player.hasCorrectToolForDrops`: `block` needs no tool, or the held stack's right for it.
+pub fn has_correct_tool(held: Tag?, block: i32, items: ItemCodecs) -> bool {
+    return not needs_tool(block) or correct_for_drops(held, block, items)
+}
+
+/// `Item.canDestroyBlock`: a `tool` that can't break blocks in creative mode can't for a player
+/// who builds instantly.
+pub fn can_destroy(held: Tag?, items: ItemCodecs, instabuild: bool) -> bool {
+    let tool = tool_of(held, items) else return true
+    let can = match field(tool, "can_destroy_blocks_in_creative") {
+        some(t) => t.number_bool() ?? true,
+        none => true,
+    }
+    return can or not instabuild
+}
+
+/// The held stack's `tool`'s `damage_per_block`, 1 by default, or none without a tool, which
+/// `Item.mineBlock` reads.
+pub fn damage_per_block(held: Tag?, items: ItemCodecs) -> i32? {
+    let tool = tool_of(held, items) else return none
+    let given = field(tool, "damage_per_block") else return some(1)
+    return some(given.number_int() ?? 1)
+}
+
+/// `block`'s destroy speed, `getDestroySpeed`, -1 for one that can't be broken.
+pub fn destroy_speed(block: i32) -> f32 {
+    let speeds = destroy_speeds()
+    if block < 0 or usize.wrap(block) >= speeds.len() {
+        return 0.0f32
+    }
+    return speeds[usize.wrap(block)]
+}
+
+/// `Player.getDestroySpeed`: the held stack's speed on `block`, `mining_efficiency` added where
+/// that's past 1, times `block_break_speed`, times `submerged_mining_speed` with the player's eyes
+/// in water, which asks for its instance, and a fifth off the ground. Haste, the conduit's power
+/// and mining fatigue come with effects.
+pub fn player_speed(held: Tag?, block: i32, items: ItemCodecs, attributes: mut Attributes, in_water: bool, on_ground: bool) -> f32 {
+    var speed = mining_speed(held, block, items)
+    if speed > 1.0f32 {
+        speed += f32.nearest(attributes.value(attribute_id(String("mining_efficiency")) ?? 0))
+    }
+    speed *= f32.nearest(attributes.value(attribute_id(String("block_break_speed")) ?? 0))
+    if in_water {
+        let submerged = attribute_id(String("submerged_mining_speed")) ?? 0
+        _ = attributes.instance(submerged)
+        speed *= f32.nearest(attributes.value(submerged))
+    }
+    if not on_ground {
+        speed /= 5.0f32
+    }
+    return speed
+}
+
+/// `BlockBehaviour.getDestroyProgress`: how far a tick of digging takes `block`, the player's
+/// speed over its destroy speed, over 30 with the right tool or 100 without; 0 for one that
+/// can't be broken.
+pub fn destroy_progress(held: Tag?, block: i32, items: ItemCodecs, attributes: mut Attributes, in_water: bool, on_ground: bool) -> f32 {
+    let destroy = destroy_speed(block)
+    if destroy == -1.0f32 {
+        return 0.0f32
+    }
+    let modifier = if has_correct_tool(held, block, items) { 30.0f32 } else { 100.0f32 }
+    return player_speed(held, block, items, mut attributes, in_water, on_ground) / destroy / modifier
+}
+
+// Whether the loot condition `c`, of an enchantment effect's `requirements`, holds for the
+// stack `stack` an item context has as its tool: `match_tool`, by its predicate's `items`,
+// `inverted`, `all_of` and `any_of`. A condition or predicate field of another kind doesn't
+// hold, which only vanilla's own enchantments' effects never meet.
+fn holds(c: Tag, stack: Tag, items: ItemCodecs) -> bool {
+    let Tag.Compound(m) = c else return false
+    let named = match field(m, "type") {
+        some(Tag.Str(s)) => s.copy(),
+        _ => match field(m, "condition") {
+            some(Tag.Str(s)) => s.copy(),
+            _ => return false,
+        },
+    }
+    let kind = match Identifier.parse(named) {
+        ok(i) => i.path.copy(),
+        err(_) => return false,
+    }
+    if kind == "inverted" {
+        let term = field(m, "term") else return false
+        return not holds(term, stack, items)
+    }
+    if kind == "all_of" or kind == "any_of" {
+        let t = field(m, "terms") else return kind == "all_of"
+        let Tag.List(terms) = t else return false
+        for each in terms {
+            let h = holds(each, stack, items)
+            if kind == "all_of" and not h {
+                return false
+            }
+            if kind == "any_of" and h {
+                return true
+            }
+        }
+        return kind == "all_of"
+    }
+    if kind == "match_tool" {
+        let p = field(m, "predicate") else return true
+        let Tag.Compound(predicate) = p else return false
+        for (k, _) in predicate {
+            if k != "items" {
+                return false
+            }
+        }
+        let set = field(predicate, "items") else return true
+        let id = match stack {
+            Tag.Compound(s) => match field(s, "id") {
+                some(Tag.Str(i)) => i.copy(),
+                _ => return false,
+            },
+            _ => return false,
+        }
+        let n = items.builtin_id("item", id) else return false
+        return items.holder_set_has("item", set, n)
+    }
+    return false
+}
+
+// `LevelBasedValue.calculate` of `value` at `level`, as `world.attributes` works it out, for an
+// effect's chance.
+fn chance_of(value: Tag, level: i32) -> f32 {
+    if let n = value.number_float() {
+        return n
+    }
+    let Tag.Compound(m) = value else return 0.0f32
+    let named = match field(m, "type") {
+        some(Tag.Str(s)) => s.copy(),
+        _ => return 0.0f32,
+    }
+    let kind = match Identifier.parse(named) {
+        ok(i) => i.path.copy(),
+        err(_) => return 0.0f32,
+    }
+    if kind == "constant" {
+        return match field(m, "value") {
+            some(t) => t.number_float() ?? 0.0f32,
+            none => 0.0f32,
+        }
+    }
+    if kind == "linear" {
+        let base = match field(m, "base") {
+            some(t) => t.number_float() ?? 0.0f32,
+            none => 0.0f32,
+        }
+        let per = match field(m, "per_level_above_first") {
+            some(t) => t.number_float() ?? 0.0f32,
+            none => 0.0f32,
+        }
+        return base + per * f32.nearest(level - 1)
+    }
+    if kind == "fraction" {
+        let denominator = match field(m, "denominator") {
+            some(t) => chance_of(t, level),
+            none => 0.0f32,
+        }
+        if denominator == 0.0f32 {
+            return 0.0f32
+        }
+        let numerator = match field(m, "numerator") {
+            some(t) => chance_of(t, level),
+            none => 0.0f32,
+        }
+        return numerator / denominator
+    }
+    if kind == "levels_squared" {
+        let added = match field(m, "added") {
+            some(t) => t.number_float() ?? 0.0f32,
+            none => 0.0f32,
+        }
+        return f32.nearest(level.wrapping_mul(level)) + added
+    }
+    return 0.0f32
+}
+
+/// `ItemStack.processDurabilityChange`: the damage `amount` comes to on `stack`, none for one
+/// that isn't damageable or a player with infinite materials, and otherwise, where it's more
+/// than 0, as its enchantments' `item_damage` effects make it, each whose requirements hold, in
+/// order: `remove_binomial` takes away each point of it at its chance, a float drawn from the
+/// level's random for each, as unbreaking does, `add`, `multiply` and `set` as they say.
+pub fn durability_change<R: RandomSource>(stack: Tag, amount: i32, items: ItemCodecs, infinite: bool, random: mut R) -> i32 {
+    if items.component(stack, String("minecraft:max_damage")) == none or items.component(stack, String("minecraft:unbreakable")) != none or items.component(stack, String("minecraft:damage")) == none {
+        return 0
+    }
+    if infinite {
+        return 0
+    }
+    if amount <= 0 {
+        return amount
+    }
+    var value = f32.nearest(amount)
+    for (level, definition) in items.enchantments(stack) {
+        let e = field(definition, "effects") else continue
+        let Tag.Compound(effects) = e else continue
+        let d = field(effects, "minecraft:item_damage") else continue
+        let Tag.List(list) = d else continue
+        for each in list {
+            let Tag.Compound(m) = each else continue
+            if let r = field(m, "requirements") {
+                if not holds(r, stack, items) {
+                    continue
+                }
+            }
+            let effect = field(m, "effect") else continue
+            value = value_effect(effect, level, value, mut random)
+        }
+    }
+    return java_int(value)
+}
+
+// `EnchantmentValueEffect.process` of `effect` at `level` on `n`.
+fn value_effect<R: RandomSource>(effect: Tag, level: i32, n: f32, random: mut R) -> f32 {
+    let Tag.Compound(m) = effect else return n
+    let named = match field(m, "type") {
+        some(Tag.Str(s)) => s.copy(),
+        _ => return n,
+    }
+    let kind = match Identifier.parse(named) {
+        ok(i) => i.path.copy(),
+        err(_) => return n,
+    }
+    if kind == "remove_binomial" {
+        let p = match field(m, "chance") {
+            some(t) => chance_of(t, level),
+            none => 0.0f32,
+        }
+        var drop = 0
+        if not (n <= 128.0f32) and not (n * p < 20.0f32) and not (n * (1.0f32 - p) < 20.0f32) {
+            let miu = f64(n * p).floor()
+            let sigma = f64(n * p * (1.0f32 - p)).sqrt()
+            let rounded = (miu + random.next_gaussian() * sigma + 0.5).floor()
+            drop = i32.saturate(rounded)
+            if drop < 0 {
+                drop = 0
+            }
+            if drop > java_int(n) {
+                drop = java_int(n)
+            }
+        } else {
+            var y = 0
+            while f32.nearest(y) < n {
+                if random.next_float() < p {
+                    drop += 1
+                }
+                y += 1
+            }
+        }
+        return n - f32.nearest(drop)
+    }
+    let amount = match field(m, "value") {
+        some(t) => chance_of(t, level),
+        none => 0.0f32,
+    }
+    if kind == "add" {
+        return n + amount
+    }
+    if kind == "multiply" {
+        return n * amount
+    }
+    if kind == "set" {
+        return amount
+    }
+    return n
+}
+
+/// `ServerPlayerGameMode.destroyBlock`, from `playerWillDestroy` to `Block.destroy`, of the block
+/// `state` at `x`, `y`, `z`, broken by the player `player`, holding `held`, who builds instantly
+/// and so drops nothing if `instabuild`, with the right tool for its drops if `correct`: what the
+/// block does first, as its class's `playerWillDestroy` has it, then it's set to the fluid it
+/// held with flags 3, `removeBlock`, and, if that changed it, what its class's `destroy` does.
+/// Whether it changed, and the state it was taken to be. What isn't in Calcite yet is told of.
+pub fn break_block<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mut L, state: u32, x: i32, y: i32, z: i32, player: i32, held: Tag?, instabuild: bool, correct: bool) -> (bool, u32) ! Thrown {
+    let Env { facts: f, .. } = e
+    let adjusted = try will_destroy(e, mut level, state, x, y, z, player, held, instabuild, correct)
+    let changed = try remove_block(f, mut level, x, y, z)
+    if changed and f.is_a(f.block(state), "MovingPistonBlock") {
+        // `MovingPistonBlock.destroy`: the extended piston behind it is removed too.
+        let back = opposite(try facing_of(f, adjusted))
+        let (bx, by, bz) = (x + step_x(back), y + step_y(back), z + step_z(back))
+        let base = try level.state(f, bx, by, bz)
+        if f.is_a(f.block(base), "PistonBaseBlock") and f.get_bool(base, "extended") {
+            _ = try remove_block(f, mut level, bx, by, bz)
+        }
+    }
+    return (changed, adjusted)
+}
+
+// `playerWillDestroy` of the block `state`, as its class has it, then as `Block`'s: its
+// particles, a level event for all but the player, `spawnDestroyByEntityParticles`. The piglins
+// it angers come with entities, and its game event with what hears it, sculk sensors. A fire
+// puts itself out, 1009, for all; a bed's foot broken by a player who builds instantly takes its
+// head with it, and a door's or tall plant's top so takes its bottom, which neither drops, as
+// does a door's dug with the wrong tool; a tall plant's top otherwise drops what it does; and a
+// piston's head so broken takes its piston with it. A tripwire cut with shears is disarmed
+// first, with flags 260. Unstable TNT, a decorated pot, a shulker box, a beehive and a creaking
+// heart come with entities and block entities.
+fn will_destroy<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mut L, state: u32, x: i32, y: i32, z: i32, player: i32, held: Tag?, instabuild: bool, correct: bool) -> u32 ! Thrown {
+    let Env { facts: f, .. } = e
+    let block = f.block(state)
+    if f.is_a(block, "BaseFireBlock") {
+        level.level_event(FIRE_EXTINGUISH, x, y, z, 0)
+    } else if f.is_a(block, "AbstractBedBlock") {
+        if instabuild and (f.get_name(state, "part") ?? String()) == "foot" {
+            let facing = try facing_of(f, state)
+            let (hx, hz) = (x + step_x(facing), z + step_z(facing))
+            let head = try level.state(f, hx, y, hz)
+            if f.block(head) == block and (f.get_name(head, "part") ?? String()) == "head" {
+                _ = level.set_block_limited(hx, y, hz, f.ids.air_state, 35, UPDATE_LIMIT)
+                level.level_event_from(player, DESTROY_BLOCK, hx, y, hz, i32.wrap(head))
+            }
+        }
+    } else if f.is_a(block, "DoorBlock") {
+        if instabuild or not correct {
+            try keep_bottom(f, mut level, state, x, y, z, player)
+        }
+    } else if f.is_a(block, "DoublePlantBlock") {
+        if instabuild {
+            try keep_bottom(f, mut level, state, x, y, z, player)
+        } else {
+            level.unimplemented(String("What a broken block drops"))
+        }
+    } else if f.is_a(block, "PistonHeadBlock") {
+        if instabuild {
+            let back = opposite(try facing_of(f, state))
+            let (bx, by, bz) = (x + step_x(back), y + step_y(back), z + step_z(back))
+            if try fitting_base(f, state, try level.state(f, bx, by, bz)) {
+                _ = try destroy_block(e, mut level, bx, by, bz, false, UPDATE_LIMIT)
+            }
+        }
+    } else if f.is_a(block, "TripWireBlock") {
+        if item_id(held) == "minecraft:shears" {
+            _ = level.set_block_limited(x, y, z, try f.with_bool(state, "disarmed", true), 260, UPDATE_LIMIT)
+        }
+    } else if f.is_a(block, "TntBlock") {
+        if not instabuild and f.get_bool(state, "unstable") {
+            level.unimplemented(String("Unstable TNT primed as a player breaks it"))
+        }
+    } else if f.is_a(block, "DecoratedPotBlock") or f.is_a(block, "ShulkerBoxBlock") or f.is_a(block, "BeehiveBlock") or f.is_a(block, "CreakingHeartBlock") {
+        level.unimplemented("What a {f.class_name(block)} does as a player breaks it")
+    }
+    level.level_event_from(player, DESTROY_BLOCK, x, y, z, i32.wrap(state))
+    return state
+}
+
+// `DoublePlantBlock.preventDropFromBottomPart`: the top of a tall block broken takes the bottom
+// under it, set to water if it held a source of it or else air, with flags 35, so it drops
+// nothing, with its particles for all but the player.
+fn keep_bottom<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32, player: i32) ! Thrown {
+    if (f.get_name(state, "half") ?? String()) != "upper" {
+        return
+    }
+    let bottom = try level.state(f, x, y - 1, z)
+    if f.block(bottom) != f.block(state) or (f.get_name(bottom, "half") ?? String()) != "lower" {
+        return
+    }
+    let left = if f.fluid(bottom) == WATER_FLUID { f.default_state(f.ids.water) } else { f.ids.air_state }
+    _ = level.set_block_limited(x, y - 1, z, left, 35, UPDATE_LIMIT)
+    level.level_event_from(player, DESTROY_BLOCK, x, y - 1, z, i32.wrap(bottom))
+}
+
+// The item of the stack `held`, as `minecraft:shears`, or empty for none.
+fn item_id(held: Tag?) -> String {
+    let stack = held.copy() else return String()
+    let Tag.Compound(m) = stack else return String()
+    return match field(m, "id") {
+        some(Tag.Str(s)) => s.copy(),
+        _ => String(),
+    }
+}
+
+/// `BlockBehaviour.attack` of the block `state` at `x`, `y`, `z`, as its class has it, as a
+/// player starts to dig it: a note block plays, as a block event, where its instrument's a head's
+/// or nothing's on it, and redstone ore lights, with flags 3. The stats they count come with
+/// stats, and a dragon egg's teleport with its particles.
+pub fn attack<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+    let block = f.block(state)
+    if f.is_a(block, "NoteBlock") {
+        try play_note(f, mut level, state, x, y, z)
+    } else if f.is_a(block, "RedStoneOreBlock") {
+        if not f.get_bool(state, "lit") {
+            _ = level.set_block_limited(x, y, z, try f.with_bool(state, "lit", true), 3, UPDATE_LIMIT)
+        }
+    } else if f.is_a(block, "DragonEggBlock") {
+        level.unimplemented(String("A dragon egg teleporting as it's hit"))
+    }
+}
+
+/// Whether the block's a `GameMasterBlock`, which only a player who builds instantly with
+/// permission level 2 may break: a command block, structure block, jigsaw, or test block.
+pub fn game_master(f: Facts, block: u32) -> bool {
+    let kinds: List<str> = ["CommandBlock", "StructureBlock", "JigsawBlock", "TestBlock", "TestInstanceBlock"]
+    for k in kinds {
+        if f.is_a(block, String(k)) {
+            return true
+        }
+    }
+    return false
+}
+
+/// `ItemStack.setDamageValue`: `stack` with `damage`, kept from 0 to its `max_damage`, in its
+/// patch, or out of it where that's its item's own, as `PatchedDataComponentMap.set` leaves it.
+pub fn with_damage(stack: Tag, damage: i32, items: ItemCodecs) -> Tag {
+    let most = match items.component(stack, String("minecraft:max_damage")) {
+        some(t) => t.number_int() ?? 0,
+        none => 0,
+    }
+    let kept = damage.max(0).min(most)
+    let Tag.Compound(m) = stack else return stack.copy()
+    var out = m.copy()
+    var patch = match field(out, "components") {
+        some(Tag.Compound(p)) => p.copy(),
+        _ => JavaHashMap<String, Tag>(),
+    }
+    var bare = out.copy()
+    _ = bare.remove(String("components"))
+    let item_damage = match items.component(Tag.Compound(bare), String("minecraft:damage")) {
+        some(t) => t.number_int(),
+        none => none,
+    }
+    if item_damage == some(kept) {
+        _ = patch.remove(String("minecraft:damage"))
+    } else {
+        patch.insert(String("minecraft:damage"), Tag.Int(kept))
+    }
+    if patch.is_empty() {
+        _ = out.remove(String("components"))
+    } else {
+        out.insert(String("components"), Tag.Compound(patch))
+    }
+    return Tag.Compound(out)
+}
+
+/// `stack` with `n` fewer of it, as `shrink` leaves it, or nothing once none's left.
+pub fn shrunk(stack: Tag, n: i32) -> Tag? {
+    let Tag.Compound(m) = stack else return none
+    let count = match field(m, "count") {
+        some(Tag.Int(c)) => c,
+        _ => 1,
+    }
+    if count - n <= 0 {
+        return none
+    }
+    var out = m.copy()
+    out.insert(String("count"), Tag.Int(count - n))
+    return some(Tag.Compound(out))
+}
+
+/// `Item.mineBlock`'s damage, as a tool takes it digging the block `state` broken: its
+/// `damage_per_block`, where that's more than 0 and the block's destroy speed isn't 0, or, for
+/// shears, `ShearsItem`'s, where the block isn't fire. None for a stack without a tool, which
+/// counts no use.
+pub fn mining_damage(held: Tag?, f: Facts, state: u32, items: ItemCodecs) -> i32? {
+    let damage = damage_per_block(held, items) else return none
+    let block = f.block(state)
+    let fits = if item_id(held) == "minecraft:shears" { not f.tag(String("minecraft:fire")).contains(block) } else { destroy_speed(i32.wrap(block)) != 0.0f32 }
+    return some(if fits and damage > 0 { damage } else { 0 })
+}

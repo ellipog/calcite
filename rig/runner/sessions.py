@@ -68,9 +68,10 @@ BASE = {
 }
 SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # Scenarios only the configurations that name them run: `watch`, where the bot joins and stays put
-# a fixed number of game ticks, for a world that never goes quiet, and `creative`, where it sets
-# slots of its inventory as the creative menu does (src/rig/session.calx).
-OTHER_SCENARIOS = ["watch", "creative", "clicks"]
+# a fixed number of game ticks, for a world that never goes quiet; `creative`, where it sets slots
+# of its inventory as the creative menu does; `clicks`, where it clicks in its inventory menu; and
+# `dig` and `dig-creative`, where it digs blocks (src/rig/session.calx).
+OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -106,6 +107,8 @@ class Config:
     # The bot's saved data, which both servers read as it joins, or none for a player new to the
     # world.
     player: dict | None = None
+    # The names of the players in ops.json, at level 4, none of them the bot (D376).
+    ops: tuple = ()
 
 
 def stack(item, count=1, components=None):
@@ -152,6 +155,30 @@ INVENTORY = {
 # The bot's data in `clicks`: `inventory`'s, in survival mode, where clicks are the inventory's own,
 # rather than the creative menu's (CAL-136).
 CLICKS = dict(INVENTORY, playerGameType=nbt.Int(0))
+
+# The bot's data in `dig`: in survival mode, by the spawn, holding a wooden shovel, with shears, a
+# golden pickaxe one use from breaking and a diamond sword in the hotbar, and torches in its
+# offhand (D376).
+DIG = {
+    "DataVersion": nbt.Int(5023),
+    "Pos": nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-60.0), nbt.Double(0.5)]),
+    "Rotation": nbt.List(nbt.FLOAT, [nbt.Float(0.0), nbt.Float(0.0)]),
+    "Dimension": "minecraft:overworld",
+    "playerGameType": nbt.Int(0),
+    "SelectedItemSlot": nbt.Int(0),
+    "Inventory": nbt.List(nbt.COMPOUND, [
+        slotted(0, "wooden_shovel"),
+        slotted(1, "shears"),
+        slotted(2, "golden_pickaxe", 1, {"minecraft:damage": nbt.Int(31)}),
+        slotted(3, "diamond_sword"),
+    ]),
+    "equipment": {"offhand": stack("torch", 32)},
+}
+# The same, in creative mode, in `dig_creative`.
+DIG_CREATIVE = dict(DIG, playerGameType=nbt.Int(1))
+# What the dig configurations' worlds are, and the rules they're run with: no drops, which come
+# with item entities, and no natural spawning, as `terrain` (D376).
+DIG_RULES = (("minecraft:block_drops", nbt.Byte(0)), ("minecraft:spawn_mobs", nbt.Byte(0)))
 
 
 CONFIGS = {
@@ -214,6 +241,17 @@ CONFIGS = {
     # tickers with nothing to do (CAL-130); watched, as `redstone`.
     "tickers": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "tickers" / "world",
                       fixture="tickers", rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # The bot, in survival mode, digs the dig fixture's ground: under spawn protection, which an op
+    # who isn't it has a block around the spawn under; through, let go too soon so it's dug the
+    # rest of the way; stopped, switched, aborted elsewhere, out of reach; a tripwire cut with
+    # shears; a pickaxe broken; and its hands swapped (D376).
+    "dig": Config({"spawn-protection": "1"}, view=3, scenarios=("dig",), world=FIXTURES / "dig" / "world",
+                  fixture="dig", rules=DIG_RULES, player=DIG, ops=("Op",)),
+    # The bot, in creative mode, breaks the dig fixture's blocks: the ground, a bed's foot, a
+    # door's and tall grass's tops, a command block it may not, and the ground with a sword
+    # (D376).
+    "dig_creative": Config({}, view=3, scenarios=("dig-creative",), world=FIXTURES / "dig" / "world",
+                           fixture="dig", rules=DIG_RULES, player=DIG_CREATIVE),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
@@ -307,6 +345,9 @@ def prepare(folder, config, port, vanilla):
     (folder / "server.properties").write_text("".join(f"{k}={v}\n" for k, v in props.items()), encoding="utf-8")
     listed = [{"uuid": offline_uuid(BOT), "name": BOT}]
     (folder / "whitelist.json").write_text(json.dumps(listed, indent=2) + "\n", encoding="utf-8")
+    if c.ops:
+        ops = [{"uuid": offline_uuid(n), "name": n, "level": 4, "bypassesPlayerLimit": False} for n in c.ops]
+        (folder / "ops.json").write_text(json.dumps(ops, indent=2) + "\n", encoding="utf-8")
     if vanilla:
         # Elliot accepted Mojang's EULA for the rig's own scratch servers (CAL-42).
         (folder / "eula.txt").write_text("eula=true\n", encoding="utf-8")

@@ -22,7 +22,7 @@ import protocol.handshake.{ClientIntent, ClientIntention, HandshakeIn}
 import protocol.ids.{DATA_VERSION, PROTOCOL_VERSION, game_version}
 import protocol.legacy.{Legacy, classify, response}
 import protocol.login.{ClientboundCustomQuery, ClientboundHello, ClientboundLoginDisconnect, ClientboundLoginCompression, ClientboundLoginFinished, LoginIn, ServerboundCustomQueryAnswer, ServerboundHello, ServerboundKey}
-import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundContainerSetSlot, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundBlockEvent, ClientboundLevelEvent, ClientboundSound, ClientboundLightUpdate, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetCursorItem, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetPlayerInventory, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateAttributes, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SentAttribute, SentModifier, ServerboundContainerClick, ServerboundSetCreativeModeSlot, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
+import protocol.play.{Abilities, UPDATE_LATENCY, BookRecipes, BookTab, ClientboundBlockChangedAck, ClientboundBlockDestruction, ClientboundBlockUpdate, ClientboundChangeDifficulty, ClientboundChunkBatchFinished, ClientboundChunkBatchStart, ClientboundContainerSetContent, ClientboundContainerSetSlot, ClientboundEntityEvent, ClientboundForgetLevelChunk, ClientboundGameEvent, ClientboundBlockEvent, ClientboundLevelEvent, ClientboundSound, ClientboundLightUpdate, ClientboundLogin, ClientboundPlayerAbilities, ClientboundPlayerInfoRemove, ClientboundPlayerInfoUpdate, ClientboundPlayerPosition, ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSectionBlocksUpdate, ClientboundServerData, ClientboundSetChunkCacheCenter, ClientboundSetCursorItem, ClientboundSetDefaultSpawnPosition, ClientboundSetHeldSlot, ClientboundSetPlayerInventory, ClientboundSetTime, ClientboundSystemChat, ClientboundTickingState, ClientboundTickingStep, ClientboundUpdateAttributes, ClientboundUpdateRecipes, GlobalPos, INITIALIZE_CHAT, KEEP_ALL_DATA, LEVEL_CHUNKS_LOAD_START, PlayIn, PlayerEntry, PlayerInfo, SentAttribute, SentModifier, ServerboundContainerClick, ServerboundPlayerAction, ServerboundSetCreativeModeSlot, SpawnInfo, StonecutterRecipes, UPDATE_GAME_MODE}
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{DecodeError, Reader, Writer, Wire, Packet, write_packet}
@@ -63,8 +63,10 @@ import world.tickets.{saved_id as tickets_id}
 import world.weather.{WeatherLevels, advance as advance_weather, joining as weather_joining, saved_id as weather_id}
 import world.flat.{MIN_Y, SECTIONS, SURFACE_Y}
 import worldgen.providers.{GenContext, IntProvider}
+import worldgen.facts.{Facts}
 import worldgen.survive.{Env}
-import world.attributes.{Attributes, Snapshot, attribute_id, equip, sprint, unworn, update_player}
+import world.attributes.{Attributes, Snapshot, attribute_id, broken, equip, sprint, stack_modifiers, unworn, update_player}
+import world.digging.{ABORT_DESTROY_BLOCK, ACTIONS, CHANGE_DESTROY_DIRECTION, DESTROY_PROGRESS, DESTROY_PROGRESS_SOUND, DROP_ALL_ITEMS, DROP_ITEM, Digging, RELEASE_USE_ITEM, STAB, START_DESTROY_BLOCK, STOP_DESTROY_BLOCK, SWAP_ITEM_WITH_OFFHAND, attack, break_block, can_destroy, destroy_progress, durability_change, eye_in_water, game_master, has_correct_tool, in_reach, java_int, may_break_in_adventure, mining_damage, shrunk, with_damage}
 import world.inventory.{Inventory, MENU_SLOTS}
 import world.menu.{Clicker, Effect, HashedStack, Menu, OUTSIDE, put_by_player}
 import world.item.{ItemStack, SentStack}
@@ -367,13 +369,19 @@ struct Player {
     // Their attributes, what they wore and held as it last looked, `lastEquipmentItems`, and
     // whether their data was saved before 26.3, whose `attributes` are written back as they
     // were (D375). Their entity's tracker's ticks in the level they're in, `ServerEntity`'s
-    // `tickCount`, and whether they joined this tick, so tick from the next, as a player who
-    // joins between vanilla's ticks does.
+    // `tickCount`.
     attributes: Attributes = Attributes()
     worn: List<Tag?> = List<Tag?>()
     old_attributes: bool = false
     tracked: i32 = 0
-    fresh: bool = false
+    // Whether they're on the ground, as the last move let through said, `onGround`, and whether
+    // their eyes were in water as their last tick found them; the block they dig, as their game
+    // mode keeps it; and the last of their block changes to ack, `ackBlockChangesUpTo`, -1 for
+    // none (D376).
+    on_ground: bool = false
+    eye_in_water: bool = false
+    digging: Digging = Digging()
+    ack: i32 = -1
 }
 
 // A command, or a game mode picked with F3 and F4, from the player in a slot, which runs once
@@ -1516,6 +1524,7 @@ impl Network {
         self.levels[d].run_block_events()
         self.levels[d].handling = false
         self.send_level_events(d)
+        self.tick_players(d)
         self.levels[d].tick_block_entities()
         self.send_level_events(d)
     }
@@ -1570,30 +1579,63 @@ impl Network {
     fn send_level_events(mut self, d: usize) {
         let heard = self.levels[d].take_heard()
         for h in heard {
-            let (packet, x, y, z, range) = match h {
-                Heard.Event(e) => (encode_play(ClientboundLevelEvent { kind: e.kind, pos: BlockPos { x: e.x, y: e.y, z: e.z }, data: e.data, global: false }), f64(e.x), f64(e.y), f64(e.z), 64.0),
-                Heard.Block(e) => (encode_play(ClientboundBlockEvent { pos: BlockPos { x: e.x, y: e.y, z: e.z }, b0: u8.wrap(e.b0), b1: u8.wrap(e.b1), block: i32.wrap(e.block) }), f64(e.x), f64(e.y), f64(e.z), 64.0),
-                Heard.Sound(s) => {
-                    let id = self.sound_id(s.sound)
-                    let range = if s.volume > 1.0f32 { 16.0 * f64(s.volume) } else { 16.0 }
-                    (encode_play(ClientboundSound { sound: id + 1, source: s.source, x: i32.saturate(s.x * 8.0), y: i32.saturate(s.y * 8.0), z: i32.saturate(s.z * 8.0), volume: s.volume, pitch: s.pitch, seed: s.seed }), s.x, s.y, s.z, range)
-                },
+            let (packet, x, y, z, range, except) = self.heard_packet(h)
+            for i in 0..self.connections.len() {
+                if not self.playing(i) {
+                    continue
+                }
+                var other = self.connections[i].take() else continue
+                self.hear(mut other, d, packet, x, y, z, range, except)
+                self.connections[i] = some(other)
+            }
+        }
+    }
+
+    // `send_level_events`, while the player `con` is taken out of the connections to be handled
+    // or to tick, as what they set off is sent at once: to them too (D376).
+    fn send_level_events_with(mut self, d: usize, con: mut Connection) {
+        let heard = self.levels[d].take_heard()
+        for h in heard {
+            let (packet, x, y, z, range, except) = self.heard_packet(h)
+            if not con.closing and con.phase == Phase.Play {
+                self.hear(mut con, d, packet, x, y, z, range, except)
             }
             for i in 0..self.connections.len() {
                 if not self.playing(i) {
                     continue
                 }
                 var other = self.connections[i].take() else continue
-                if other.player.dim == d {
-                    let dx = x - other.player.x
-                    let dy = y - other.player.y
-                    let dz = z - other.player.z
-                    if dx * dx + dy * dy + dz * dz < range * range {
-                        self.send_bytes(mut other, packet.copy())
-                    }
-                }
+                self.hear(mut other, d, packet, x, y, z, range, except)
                 self.connections[i] = some(other)
             }
+        }
+    }
+
+    // What the players near enough are sent of `h`: its packet, where it is, how near they're
+    // to be, and the player not sent it, by their entity, -1 for none (D376).
+    fn heard_packet(mut self, h: Heard) -> (List<u8>, f64, f64, f64, f64, i32) {
+        return match h {
+            Heard.Event(e) => (encode_play(ClientboundLevelEvent { kind: e.kind, pos: BlockPos { x: e.x, y: e.y, z: e.z }, data: e.data, global: false }), f64(e.x), f64(e.y), f64(e.z), 64.0, e.except),
+            Heard.Block(e) => (encode_play(ClientboundBlockEvent { pos: BlockPos { x: e.x, y: e.y, z: e.z }, b0: u8.wrap(e.b0), b1: u8.wrap(e.b1), block: i32.wrap(e.block) }), f64(e.x), f64(e.y), f64(e.z), 64.0, -1),
+            Heard.Sound(s) => {
+                let id = self.sound_id(s.sound)
+                let range = if s.volume > 1.0f32 { 16.0 * f64(s.volume) } else { 16.0 }
+                (encode_play(ClientboundSound { sound: id + 1, source: s.source, x: i32.saturate(s.x * 8.0), y: i32.saturate(s.y * 8.0), z: i32.saturate(s.z * 8.0), volume: s.volume, pitch: s.pitch, seed: s.seed }), s.x, s.y, s.z, range, -1)
+            },
+        }
+    }
+
+    // Sends the player `con` `packet` if they're in the level `d`, aren't `except`, and are
+    // nearer `x`, `y`, `z` than `range`, as `PlayerList.broadcast` sends it.
+    fn hear(mut self, con: mut Connection, d: usize, packet: List<u8>, x: f64, y: f64, z: f64, range: f64, except: i32) {
+        if con.player.dim != d or con.player.entity_id == except {
+            return
+        }
+        let dx = x - con.player.x
+        let dy = y - con.player.y
+        let dz = z - con.player.z
+        if dx * dx + dy * dy + dz * dz < range * range {
+            self.send_bytes(mut con, packet.copy())
         }
     }
 
@@ -2976,7 +3018,7 @@ impl Network {
         }
         kept.update(mode)
         self.joins += 1
-        con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam, data: saved_data, mode: mode, previous_mode: previous, abilities: kept, level: self.access.level(profile.id), joined: self.joins, sender: ChunkSender.with_rate(self.world.settings.chunk_send_cap, self.world.settings.chunk_send_multiplier, self.world.settings.chunk_send_boost), dim: con.prepare.dim, selected: selected, inventory: inventory, attributes: attributes, worn: unworn(), old_attributes: old_attributes, fresh: true }
+        con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam, data: saved_data, mode: mode, previous_mode: previous, abilities: kept, level: self.access.level(profile.id), joined: self.joins, sender: ChunkSender.with_rate(self.world.settings.chunk_send_cap, self.world.settings.chunk_send_multiplier, self.world.settings.chunk_send_boost), dim: con.prepare.dim, selected: selected, inventory: inventory, attributes: attributes, worn: unworn(), old_attributes: old_attributes }
         self.logs.push(Entry.info("{profile.name}[{con.address}] logged in with entity id {id} at ({con.player.x}, {con.player.y}, {con.player.z})").calcite(Look.Join(joined_words(profile.name, con.address))))
         let spawn = self.spawn_info(con.player.dim, mode, previous)
         let secure = self.enforces_secure_chat()
@@ -3513,28 +3555,54 @@ impl Network {
         }
     }
 
-    // A player's tick at `now`, as the play listener's `tick`: a keep-alive if one is due, then
-    // the spam counts go down.
+    // A player's tick at `now`, as the play listener's `tick`: their block changes acked, up to
+    // the last they asked to be (D376), then their own tick, `doTick`, then a keep-alive if one
+    // is due, then the spam counts go down.
     fn tick_play(mut self, con: mut Connection, now: u64) {
         con.player.tick_count += 1
+        if con.player.ack > -1 {
+            let sequence = con.player.ack
+            self.send(mut con, ClientboundBlockChangedAck { sequence: sequence }, State.Play)
+            con.player.ack = -1
+        }
+        self.do_tick(mut con)
         _ = self.keep_alive(mut con, now)
         con.player.chat_spam.tick()
         con.player.command_spam.tick()
-        // `ServerPlayer.tick`'s `broadcastChanges` (D374).
-        self.broadcast_menu(mut con)
-        self.tick_attributes(mut con)
     }
 
-    // What the player's tick does to their attributes (D375): `updatePlayerAttributes`, then
-    // `detectEquipmentUpdates`, their main hand the hotbar slot they hold, then `aiStep`'s
-    // `removeFrost`, which asks for their movement speed. A player who joined this tick starts
-    // from the next.
-    fn tick_attributes(mut self, con: mut Connection) {
-        if con.player.fresh {
-            con.player.fresh = false
-            return
+    // The players of the level `d`'s own ticks, `ServerPlayer.tick`, as its entities tick, in the
+    // order they came into it, of what Calcite has so far: their game mode's, as they dig (D376),
+    // what that sets off sent at once; their menu's changes sent, `broadcastChanges` (D374); and
+    // the attributes their mode gives them, `updatePlayerAttributes` (D375).
+    fn tick_players(mut self, d: usize) {
+        var order = List<(u64, usize)>()
+        for slot in 0..self.connections.len() {
+            if self.playing(slot) {
+                if let c = self.connections[slot] {
+                    if c.player.dim == d {
+                        order.push((c.player.entered, slot))
+                    }
+                }
+            }
         }
-        update_player(mut con.player.attributes, con.player.mode == GameType.Creative)
+        order.sort()
+        for (_, slot) in order {
+            var con = self.connections[slot].take() else continue
+            self.tick_game_mode(mut con)
+            self.send_level_events_with(d, mut con)
+            self.broadcast_menu(mut con)
+            update_player(mut con.player.attributes, con.player.mode == GameType.Creative)
+            self.connections[slot] = some(con)
+        }
+    }
+
+    // What the player's own tick, `doTick`, does so far: `baseTick`'s fluids, whether their eyes
+    // are in water (D376); `detectEquipmentUpdates`, their main hand the hotbar slot they hold;
+    // then `aiStep`'s `removeFrost`, which asks for their movement speed (D375).
+    fn do_tick(mut self, con: mut Connection) {
+        let wet = self.eyes_in_water(con)
+        con.player.eye_in_water = wet
         if self.items_ready() {
             if let items = self.items {
                 var now = List<Tag?>()
@@ -3546,6 +3614,476 @@ impl Network {
             }
         }
         _ = con.player.attributes.instance(attribute_id(String("movement_speed")) ?? 0)
+    }
+
+    // `isEyeInFluid(WATER)` for the player as they are now, as `world.digging` finds it, or not
+    // where their level hasn't the block facts or the blocks around them aren't full (D376).
+    fn eyes_in_water(self, con: Connection) -> bool {
+        let d = con.player.dim
+        let shared = self.levels[d].shared_env() else return false
+        return match eye_in_water(shared.value.facts, self.levels[d], con.player.x, con.player.y, con.player.z) {
+            ok(w) => w,
+            err(_) => false,
+        }
+    }
+
+    // `handlePlayerAction` (D376): an action past `Action`'s last stops the connection, as
+    // `readEnum` does. A spectator doesn't swap their hands or drop what they hold. Dropping
+    // takes one or the whole stack from the hotbar slot they hold, the client's word taken for
+    // what's left, as it's done the same, and what's dropped is lost until item entities come;
+    // letting go of what they use waits for using items, and a stab, for entities. The four of
+    // digging go to `block_break_action`, then the sequence number's acked as the connection next
+    // ticks, the most of those asked; one below 0 throws, which is logged, after the action's
+    // done. What it set off is sent at once.
+    fn player_action(mut self, con: mut Connection, a: ServerboundPlayerAction) -> bool {
+        if a.action < 0 or a.action >= ACTIONS {
+            self.fault(mut con, decode_exception("Failed to decode packet 'serverbound/minecraft:player_action': Index {a.action} out of bounds for length {ACTIONS}"))
+            return false
+        }
+        let spectator = con.player.mode == GameType.Spectator
+        let d = con.player.dim
+        if a.action == STAB {
+            var stabs = false
+            if not spectator and self.items_ready() {
+                if let items = self.items {
+                    if let held = con.player.inventory.selected(con.player.selected) {
+                        stabs = items.component(held, String("minecraft:piercing_weapon")) != none
+                    }
+                }
+            }
+            if stabs {
+                self.levels[d].unimplemented(String("Stabbing with a piercing weapon"))
+            }
+            return true
+        }
+        if a.action == SWAP_ITEM_WITH_OFFHAND {
+            if not spectator {
+                self.swap_hands(mut con)
+            }
+            return true
+        }
+        if a.action == DROP_ITEM or a.action == DROP_ALL_ITEMS {
+            if not spectator {
+                self.drop_held(mut con, a.action == DROP_ALL_ITEMS)
+            }
+            return true
+        }
+        if a.action == RELEASE_USE_ITEM {
+            return true
+        }
+        let direction = i32(a.direction) % 6
+        self.block_break_action(mut con, a.pos.x, a.pos.y, a.pos.z, a.action, direction)
+        if a.sequence < 0 {
+            self.suppress("net.minecraft.network.protocol.game.ServerboundPlayerActionPacket", "java.lang.IllegalArgumentException: Expected packet sequence nr >= 0")
+        } else if a.sequence > con.player.ack {
+            con.player.ack = a.sequence
+        }
+        self.send_level_events_with(d, mut con)
+        return true
+    }
+
+    // `SWAP_ITEM_WITH_OFFHAND`: what's in the player's offhand set to what they hold, then what
+    // they hold to what was in it, each as `setItemSlot` sets it, which tells them as an
+    // `onEquipItem` (D376). The client's sent both slots as the menu's changes next go.
+    fn swap_hands(mut self, con: mut Connection) {
+        let slot = usize.wrap(36 + con.player.selected)
+        let main = con.player.inventory.menu_slot(slot)
+        let off = con.player.inventory.menu_slot(45)
+        con.player.inventory.set_menu_slot(45, main.copy())
+        self.equip_sound(con, String("offhand"), off.copy(), main.copy())
+        con.player.inventory.set_menu_slot(slot, off.copy())
+        self.equip_sound(con, String("mainhand"), main, off)
+    }
+
+    // `ServerPlayer.drop(all)`: one of what the player holds taken, or all of it, and the menu's
+    // remote slot set to what's left, since their client took it too (D376). What's dropped
+    // needs item entities, so it's logged and lost.
+    fn drop_held(mut self, con: mut Connection, all: bool) {
+        let slot = usize.wrap(36 + con.player.selected)
+        let held = con.player.inventory.menu_slot(slot) else return
+        let count = count_of(held)
+        let take = if all { count } else { 1 }
+        let left = shrunk(held, take)
+        con.player.inventory.set_menu_slot(slot, left.copy())
+        con.player.menu.set_remote(slot, left)
+        let dropped = shrunk(held, count - take) else return
+        self.logs.push(Entry.warn("{player_name(con)} would have dropped {dropped.to_snbt()}, which needs item entities Calcite doesn't have yet"))
+    }
+
+    // `ServerPlayerGameMode.handleBlockBreakAction` (D376), the player digging the block at `x`,
+    // `y`, `z` from the face `direction`: out of reach, nothing is done, but an abort of the
+    // block they dig; above the world, they're sent the block again. Starting: under spawn
+    // protection they're told so, and outside the border sent the block again; a player who
+    // builds instantly breaks it at once; one whose mode keeps them from it is sent the block
+    // again. Otherwise the block's hit, as `attack`, and if it's not air and a tick digs it
+    // through it breaks; if not, a block they were digging is sent them again, and this is the
+    // one they dig, its stage sent the others. Changing the face only changes it. Stopping on
+    // the block dug, if not air, breaks it where it's dug 0.7 of the way, its cracks taken off,
+    // or keeps digging it till it's through, unless one's kept already. Aborting stops.
+    fn block_break_action(mut self, con: mut Connection, x: i32, y: i32, z: i32, action: i32, direction: i32) {
+        let d = con.player.dim
+        let shared = self.levels[d].shared_env() else return
+        let Env { facts: f, .. } = shared.value
+        if not in_reach(con.player.attributes, con.player.x, con.player.y, con.player.z, x, y, z) {
+            if con.player.digging.destroying and action == ABORT_DESTROY_BLOCK {
+                self.abort_destroy(mut con, x, y, z)
+            }
+            return
+        }
+        if y > self.world.dims[d].min_y + self.world.dims[d].height - 1 {
+            self.send_block(mut con, f, x, y, z)
+            return
+        }
+        if action == START_DESTROY_BLOCK {
+            if self.spawn_protected(con, d, x, z) {
+                let text = Component.translatable("build.spawn_protection", [Component.literal("{x}, {y}, {z}")]).colored("red")
+                self.send(mut con, ClientboundSystemChat { content: text, overlay: true }, State.Play)
+                return
+            }
+            // `mayInteract`: not under spawn protection, and inside the border.
+            if not self.world.dims[d].border.within(f64(x), f64(z)) {
+                self.send_block(mut con, f, x, y, z)
+                return
+            }
+            if con.player.abilities.instabuild {
+                self.destroy_and_ack(mut con, x, y, z)
+                return
+            }
+            let state = self.block_at(d, f, x, y, z) else return
+            if self.restricted(con, f, state) {
+                self.send_block(mut con, f, x, y, z)
+                return
+            }
+            con.player.digging.start = con.player.digging.ticks
+            var progress = 1.0f32
+            if not f.is_air(state) {
+                self.hit_block(con, f, state, x, y, z)
+                progress = self.dig_progress(mut con, f, state)
+            }
+            if not f.is_air(state) and progress >= 1.0f32 {
+                self.destroy_and_ack(mut con, x, y, z)
+                return
+            }
+            if con.player.digging.destroying {
+                let (ox, oy, oz) = (con.player.digging.x, con.player.digging.y, con.player.digging.z)
+                self.send_block(mut con, f, ox, oy, oz)
+            }
+            con.player.digging.destroying = true
+            con.player.digging.x = x
+            con.player.digging.y = y
+            con.player.digging.z = z
+            con.player.digging.direction = direction
+            let stage = java_int(progress * 10.0f32)
+            self.destruction(d, con.player.entity_id, x, y, z, stage)
+            con.player.digging.last_sent = stage
+        } else if action == CHANGE_DESTROY_DIRECTION {
+            con.player.digging.direction = direction
+        } else if action == STOP_DESTROY_BLOCK {
+            if x != con.player.digging.x or y != con.player.digging.y or z != con.player.digging.z {
+                return
+            }
+            let spent = con.player.digging.ticks - con.player.digging.start
+            let state = self.block_at(d, f, x, y, z) else return
+            if f.is_air(state) {
+                return
+            }
+            if self.dig_progress(mut con, f, state) * f32.nearest(spent + 1) >= 0.7f32 {
+                con.player.digging.destroying = false
+                self.destruction(d, con.player.entity_id, x, y, z, -1)
+                self.destroy_and_ack(mut con, x, y, z)
+                return
+            }
+            if not con.player.digging.delayed {
+                con.player.digging.destroying = false
+                con.player.digging.delayed = true
+                con.player.digging.delayed_x = x
+                con.player.digging.delayed_y = y
+                con.player.digging.delayed_z = z
+                con.player.digging.delayed_start = con.player.digging.start
+            }
+        } else if action == ABORT_DESTROY_BLOCK {
+            self.abort_destroy(mut con, x, y, z)
+        }
+    }
+
+    // `abortDestroyBlock`: the player stops digging; where it's not the block they dug, that's
+    // warned of and its cracks taken off, and then this one's are (D376).
+    fn abort_destroy(mut self, con: mut Connection, x: i32, y: i32, z: i32) {
+        con.player.digging.destroying = false
+        let d = con.player.dim
+        let (ox, oy, oz) = (con.player.digging.x, con.player.digging.y, con.player.digging.z)
+        if ox != x or oy != y or oz != z {
+            self.logs.push(Entry.warn("Mismatch in destroy block pos: BlockPos\{x={ox}, y={oy}, z={oz}\} BlockPos\{x={x}, y={y}, z={z}\}"))
+            self.destruction(d, con.player.entity_id, ox, oy, oz, -1)
+        }
+        self.destruction(d, con.player.entity_id, x, y, z, -1)
+    }
+
+    // `destroyAndAck`: the block broken, or, where it isn't, sent the player again (D376).
+    fn destroy_and_ack(mut self, con: mut Connection, x: i32, y: i32, z: i32) {
+        if self.destroy_block(mut con, x, y, z) {
+            return
+        }
+        let d = con.player.dim
+        let shared = self.levels[d].shared_env() else return
+        self.send_block(mut con, shared.value.facts, x, y, z)
+    }
+
+    // The block at `x`, `y`, `z` sent the player as it is, `ClientboundBlockUpdatePacket`, unless
+    // its chunk isn't full, which is told of (D376).
+    fn send_block(mut self, con: mut Connection, f: Facts, x: i32, y: i32, z: i32) {
+        let state = self.block_at(con.player.dim, f, x, y, z) else return
+        self.send(mut con, ClientboundBlockUpdate { pos: BlockPos { x: x, y: y, z: z }, state: i32.wrap(state) }, State.Play)
+    }
+
+    // The block at `x`, `y`, `z` in the level `d`, or none where its chunk isn't full, which is
+    // told of, as vanilla would load it (D376).
+    fn block_at(mut self, d: usize, f: Facts, x: i32, y: i32, z: i32) -> u32? {
+        return match self.levels[d].state(f, x, y, z) {
+            ok(s) => some(s),
+            err(thrown) => {
+                self.levels[d].unimplemented(thrown.message)
+                none
+            },
+        }
+    }
+
+    // `DedicatedServer.isUnderSpawnProtection` (D376): in the dimension players spawn in, while
+    // there are operators and the player isn't one, within `spawn-protection` of the spawn,
+    // across or along.
+    fn spawn_protected(self, con: Connection, d: usize, x: i32, z: i32) -> bool {
+        let here = self.world.dims[d].id.copy()
+        if self.respawn.dimension.namespace != here.namespace or self.respawn.dimension.path != here.path {
+            return false
+        }
+        if not self.access.has_ops() {
+            return false
+        }
+        if let p = con.profile {
+            if self.access.is_op(p.id) {
+                return false
+            }
+        }
+        let radius = self.world.settings.spawn_protection
+        if radius <= 0 {
+            return false
+        }
+        let dist = (x - self.respawn.pos.x).abs().max((z - self.respawn.pos.z).abs())
+        return dist <= radius
+    }
+
+    // `Player.blockActionRestricted` (D376): a spectator may not dig, nor a player in adventure
+    // mode, who may not build, unless what they hold may break the block `state`, `can_break`.
+    fn restricted(mut self, con: Connection, f: Facts, state: u32) -> bool {
+        if con.player.mode == GameType.Spectator {
+            return true
+        }
+        if con.player.mode != GameType.Adventure or con.player.abilities.may_build {
+            return false
+        }
+        if not self.items_ready() {
+            return true
+        }
+        let held = con.player.inventory.selected(con.player.selected)
+        var missing = List<String>()
+        var may = false
+        if let items = self.items {
+            may = may_break_in_adventure(held, i32.wrap(f.block(state)), items, mut missing)
+        }
+        for m in missing {
+            self.levels[con.player.dim].unimplemented(m)
+        }
+        return not may
+    }
+
+    // A block the player starts to dig hit (D376): their main hand's enchantments' `hit_block`
+    // effects, which wait for enchantments' effects, then the block's own, `attack`.
+    fn hit_block(mut self, con: Connection, f: Facts, state: u32, x: i32, y: i32, z: i32) {
+        let d = con.player.dim
+        var effects = false
+        if self.items_ready() {
+            if let items = self.items {
+                if let held = con.player.inventory.selected(con.player.selected) {
+                    effects = items.has_enchantment_effect(held, String("minecraft:hit_block"))
+                }
+            }
+        }
+        if effects {
+            self.levels[d].unimplemented(String("Enchantments' hit_block effects"))
+        }
+        match attack(f, mut self.levels[d], state, x, y, z) {
+            ok => {},
+            err(thrown) => self.levels[d].unimplemented(thrown.message),
+        }
+    }
+
+    // `getDestroyProgress` of the block `state` for the player as they are now (D376).
+    fn dig_progress(mut self, con: mut Connection, f: Facts, state: u32) -> f32 {
+        if not self.items_ready() {
+            return 0.0f32
+        }
+        let held = con.player.inventory.selected(con.player.selected)
+        if let items = self.items {
+            return destroy_progress(held, i32.wrap(f.block(state)), items, mut con.player.attributes, con.player.eye_in_water, con.player.on_ground)
+        }
+        return 0.0f32
+    }
+
+    // `incrementDestroyProgress` (D376): how far the block `state` is dug, `spent` ticks and one
+    // on, its stage sent the others as it changes.
+    fn increment_destroy(mut self, con: mut Connection, f: Facts, state: u32, x: i32, y: i32, z: i32, spent: i32) -> f32 {
+        let progress = self.dig_progress(mut con, f, state) * f32.nearest(spent + 1)
+        let stage = java_int(progress * 10.0f32)
+        if stage != con.player.digging.last_sent {
+            self.destruction(con.player.dim, con.player.entity_id, x, y, z, stage)
+            con.player.digging.last_sent = stage
+        }
+        return progress
+    }
+
+    // `ServerLevel.destroyBlockProgress` (D376): how far the player `id` has dug the block at `x`,
+    // `y`, `z`, sent each other player in the level `d` nearer than 32 blocks to its corner.
+    fn destruction(mut self, d: usize, id: i32, x: i32, y: i32, z: i32, stage: i32) {
+        let packet = encode_play(ClientboundBlockDestruction { entity_id: id, pos: BlockPos { x: x, y: y, z: z }, progress: u8.wrap(stage) })
+        for i in 0..self.connections.len() {
+            if not self.playing(i) {
+                continue
+            }
+            var other = self.connections[i].take() else continue
+            if other.player.dim == d and other.player.entity_id != id {
+                let dx = f64(x) - other.player.x
+                let dy = f64(y) - other.player.y
+                let dz = f64(z) - other.player.z
+                if dx * dx + dy * dy + dz * dz < 1024.0 {
+                    self.send_bytes(mut other, packet.copy())
+                }
+            }
+            self.connections[i] = some(other)
+        }
+    }
+
+    // `ServerPlayerGameMode.tick` (D376): its ticks go on; a block let go too soon is dug on and
+    // broken once it's through, unless it's gone; and a block being dug is dug on, its stage sent
+    // the others as it changes, with its particles for all, and a sound every fourth tick, or,
+    // gone, its cracks taken off.
+    fn tick_game_mode(mut self, con: mut Connection) {
+        con.player.digging.ticks += 1
+        let d = con.player.dim
+        let shared = self.levels[d].shared_env() else return
+        let Env { facts: f, .. } = shared.value
+        if con.player.digging.delayed {
+            let (x, y, z) = (con.player.digging.delayed_x, con.player.digging.delayed_y, con.player.digging.delayed_z)
+            let state = self.block_at(d, f, x, y, z) else return
+            if f.is_air(state) {
+                con.player.digging.delayed = false
+                return
+            }
+            let start = con.player.digging.delayed_start
+            if self.increment_destroy(mut con, f, state, x, y, z, start) >= 1.0f32 {
+                con.player.digging.delayed = false
+                _ = self.destroy_block(mut con, x, y, z)
+            }
+        } else if con.player.digging.destroying {
+            let (x, y, z) = (con.player.digging.x, con.player.digging.y, con.player.digging.z)
+            let state = self.block_at(d, f, x, y, z) else return
+            if f.is_air(state) {
+                self.destruction(d, con.player.entity_id, x, y, z, -1)
+                con.player.digging.last_sent = -1
+                con.player.digging.destroying = false
+                return
+            }
+            let spent = con.player.digging.ticks - con.player.digging.start
+            let event = if spent % 4 == 0 { DESTROY_PROGRESS_SOUND } else { DESTROY_PROGRESS }
+            _ = self.increment_destroy(mut con, f, state, x, y, z, spent)
+            self.levels[d].level_event(event, x, y, z, con.player.digging.direction)
+        }
+    }
+
+    // `ServerPlayerGameMode.destroyBlock` (D376): whether the player broke the block at `x`, `y`,
+    // `z`. Not where what they hold can't break blocks as they build instantly, as a sword; a
+    // game master block is sent its players again unless they build instantly with permission
+    // level 2; nor where their mode keeps them from it. Then the block goes, as `world.digging`'s
+    // `break_block` has it. A player who builds instantly drops nothing; another's tool takes its
+    // damage, `mineBlock`, and, with the right tool for it, what the block drops, its stat and
+    // the exhaustion, `playerDestroy`, come with item entities, stats and hunger.
+    fn destroy_block(mut self, con: mut Connection, x: i32, y: i32, z: i32) -> bool {
+        if not self.items_ready() {
+            return false
+        }
+        let d = con.player.dim
+        let shared = self.levels[d].shared_env() else return false
+        let Env { facts: f, .. } = shared.value
+        let state = self.block_at(d, f, x, y, z) else return false
+        let held = con.player.inventory.selected(con.player.selected)
+        let instabuild = con.player.abilities.instabuild
+        let block = f.block(state)
+        var correct = false
+        if let items = self.items {
+            if not can_destroy(held, items, instabuild) {
+                return false
+            }
+            correct = has_correct_tool(held, i32.wrap(block), items)
+        }
+        if game_master(f, block) and not (instabuild and con.player.level >= GAMEMASTERS) {
+            self.levels[d].block_updated(x, y, z)
+            return false
+        }
+        if self.restricted(con, f, state) {
+            return false
+        }
+        let (changed, adjusted) = match break_block(shared.value, mut self.levels[d], state, x, y, z, con.player.entity_id, held, instabuild, correct) {
+            ok(r) => r,
+            err(thrown) => {
+                self.levels[d].unimplemented(thrown.message)
+                return false
+            },
+        }
+        if instabuild {
+            return true
+        }
+        self.mine_block(mut con, f, adjusted)
+        if changed and correct {
+            self.levels[d].unimplemented(String("What a block a player breaks drops, with the stat and exhaustion it counts"))
+            if f.is_a(f.block(adjusted), "IceBlock") {
+                self.levels[d].unimplemented(String("Ice melting as a player breaks it"))
+            }
+        }
+        return true
+    }
+
+    // `ItemStack.mineBlock` (D376): the held stack's tool takes the damage digging the block
+    // `state` gives it, `hurtAndBreak`, as its enchantments and the level's random make it, and
+    // breaks once it's taken all it can, one of it gone and the player told, with its modifiers
+    // taken off, `onEquippedItemBroken`. The use it counts comes with stats, and the trigger it
+    // sets off with advancements.
+    fn mine_block(mut self, con: mut Connection, f: Facts, state: u32) {
+        let slot = usize.wrap(36 + con.player.selected)
+        let held = con.player.inventory.menu_slot(slot)
+        let stack = held.copy() else return
+        let d = con.player.dim
+        let taken = self.items.take() else return
+        let amount = mining_damage(held, f, state, taken) ?? 0
+        if amount > 0 {
+            let change = durability_change(stack, amount, taken, con.player.abilities.instabuild, mut self.levels[d])
+            if change != 0 {
+                let now = match taken.component(stack, String("minecraft:damage")) {
+                    some(t) => t.number_int() ?? 0,
+                    none => 0,
+                }
+                let damaged = with_damage(stack, now + change, taken)
+                if broken(damaged, taken) {
+                    con.player.inventory.set_menu_slot(slot, shrunk(damaged, 1))
+                    let id = con.player.entity_id
+                    self.send(mut con, ClientboundEntityEvent { entity_id: id, event: 47i8 }, State.Play)
+                    for (a, m) in stack_modifiers(damaged, 0, taken) {
+                        con.player.attributes.take_off(a, m.id)
+                    }
+                } else {
+                    con.player.inventory.set_menu_slot(slot, some(damaged))
+                }
+            }
+        }
+        self.items = some(taken)
     }
 
     // Sends the player the chunks due this tick that are ready, as `sendNextChunks` does, in as
@@ -3697,10 +4235,11 @@ impl Network {
                 return true
             },
             PlayIn.KeepAlive(k) => return self.answer_keep_alive(mut con, k, now),
-            PlayIn.MovePlayerPos(m) => return self.moved(mut con, true, m.x, m.y, m.z, false, 0.0, 0.0),
-            PlayIn.MovePlayerPosRot(m) => return self.moved(mut con, true, m.x, m.y, m.z, true, m.y_rot, m.x_rot),
-            PlayIn.MovePlayerRot(m) => return self.moved(mut con, false, 0.0, 0.0, 0.0, true, m.y_rot, m.x_rot),
-            PlayIn.MovePlayerStatusOnly(_) => return self.moved(mut con, false, 0.0, 0.0, 0.0, false, 0.0, 0.0),
+            PlayIn.MovePlayerPos(m) => return self.moved(mut con, true, m.x, m.y, m.z, false, 0.0, 0.0, m.flags),
+            PlayIn.MovePlayerPosRot(m) => return self.moved(mut con, true, m.x, m.y, m.z, true, m.y_rot, m.x_rot, m.flags),
+            PlayIn.MovePlayerRot(m) => return self.moved(mut con, false, 0.0, 0.0, 0.0, true, m.y_rot, m.x_rot, m.flags),
+            PlayIn.MovePlayerStatusOnly(m) => return self.moved(mut con, false, 0.0, 0.0, 0.0, false, 0.0, 0.0, m.flags),
+            PlayIn.PlayerAction(a) => return self.player_action(mut con, a),
         }
     }
 
@@ -4681,9 +5220,10 @@ impl Network {
 
     // A move, as `handleMovePlayer`: a value that isn't a number ends the connection, as do two
     // positions in one of the client's ticks. Until the client accepts the last teleport, a
-    // move only turns the player, and the teleport goes again once a second has passed.
-    // Calcite doesn't yet check moves against the world, as vanilla does.
-    fn moved(mut self, con: mut Connection, has_pos: bool, x: f64, y: f64, z: f64, has_rot: bool, y_rot: f32, x_rot: f32) -> bool {
+    // move only turns the player, and the teleport goes again once a second has passed. One let
+    // through says whether they're on the ground, the first of its `flags` (D376). Calcite
+    // doesn't yet check moves against the world, as vanilla does.
+    fn moved(mut self, con: mut Connection, has_pos: bool, x: f64, y: f64, z: f64, has_rot: bool, y_rot: f32, x_rot: f32, flags: u8) -> bool {
         if invalid(x, y, z, y_rot, x_rot) {
             self.disconnect(mut con, Component.translatable("multiplayer.disconnect.invalid_player_movement", []))
             return false
@@ -4710,6 +5250,8 @@ impl Network {
         let to_y = if has_pos { y } else { con.player.y }
         let to_z = if has_pos { z } else { con.player.z }
         self.move_player(mut con, to_x, to_y, to_z, to_y_rot, to_x_rot)
+        // `setOnGroundWithMovement`, as the move's let through (D376).
+        con.player.on_ground = flags & 1 != 0
         return true
     }
 

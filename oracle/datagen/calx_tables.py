@@ -505,6 +505,19 @@ def block_facts_module(index, flags):
     lines += number_list(
         "unbreakable_blocks", "blocks", flags["unbreakable_blocks"],
         ["/// The blocks whose destroy speed is -1, which a piston can't move, by ID (CAL-125)."])
+    speeds = [calx_float(v) for v in flags["destroy_speeds"]]
+    lines += [
+        "/// Each block's destroy speed, `getDestroySpeed`, in block ID order, -1 for one that can't be",
+        "/// broken (D376).",
+        "pub fn destroy_speeds() -> List<f32> {",
+        "    let speeds: List<f32> = [",
+    ]
+    lines += ["        " + ", ".join(speeds[i:i + 16]) + "," for i in range(0, len(speeds), 16)]
+    lines += ["    ]", "    return speeds", "}", ""]
+    lines += number_list(
+        "needs_tool_blocks", "blocks", flags["needs_tool_blocks"],
+        ["/// The blocks that drop nothing unless dug with the right tool, `requiresCorrectToolForDrops`,",
+         "/// by ID (D376)."])
     toggles = flags["toggle_sounds"]
     lines += number_list(
         "toggle_sound_blocks", "blocks", [b for b, _, _ in toggles],
