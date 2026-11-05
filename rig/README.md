@@ -272,6 +272,8 @@ The `tickers` configuration loads [`tickers.txt`](fixtures/tickers.txt)'s world,
 
 The `dig` and `dig_creative` configurations load [`dig.txt`](fixtures/dig.txt)'s world, on the flat world's grass by the spawn, and dig it (D376): a red bed facing east, an oak door, tall grass, a command block and a tripwire, each within a survival player's reach of the spawn. Their game rules turn drops off, which come with item entities, and natural spawning, as `terrain`'s, and random ticks (D378), since grass by a block broken or placed turns to dirt, or dirt to grass, on a tick that falls in a different step on each server.
 
+The `use` configuration loads [`use.txt`](fixtures/use.txt)'s world and uses its blocks by hand (D379): an oak door and an iron one, a trapdoor, a fence gate facing the spawn, a lever and a stone button each beside a lamp, a repeater, a comparator, a note block, a bell on the floor, a daylight detector and redstone dust beside stone. The bot is in survival with nothing in its hands, and its rules are the dig configurations'.
+
 The `place` and `place_creative` configurations load [`place.txt`](fixtures/place.txt)'s world and place blocks on it (D378): short grass, which a block placed in it replaces; a lectern, which takes a use with no book; and a water source in the ground, which a slab placed in it holds. In survival the bot holds stone, stairs, slabs, logs, doors, a bed, torches, fences and a furnace, with cobblestone in its offhand; in creative it holds nothing and is given each block's item. Their rules are the dig configurations'.
 
 ## The round trip

@@ -70,9 +70,9 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # Scenarios only the configurations that name them run: `watch`, where the bot joins and stays put
 # a fixed number of game ticks, for a world that never goes quiet; `creative`, where it sets slots
 # of its inventory as the creative menu does; `clicks`, where it clicks in its inventory menu;
-# `dig` and `dig-creative`, where it digs blocks; and `place` and `place-creative`, where it places
-# them (src/rig/session.calx).
-OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative"]
+# `dig` and `dig-creative`, where it digs blocks; `place` and `place-creative`, where it places
+# them; and `use`, where it uses them (src/rig/session.calx).
+OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -208,6 +208,8 @@ PLACE = {
 }
 # In `place_creative`: in creative mode, with nothing, given each block's item as it goes.
 PLACE_CREATIVE = dict(PLACE, playerGameType=nbt.Int(1), Inventory=nbt.List(nbt.COMPOUND, []), equipment={})
+# In `use`: in survival mode, with nothing in its hands (D379).
+USE = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, []), equipment={})
 
 
 CONFIGS = {
@@ -291,6 +293,11 @@ CONFIGS = {
     # neighbours, on a side or falling to the floor, powered, and with block entities (D378).
     "place_creative": Config({}, view=3, scenarios=("place-creative",), world=FIXTURES / "place" / "world",
                              fixture="place", rules=DIG_RULES, player=PLACE_CREATIVE),
+    # The bot, in survival mode with empty hands, uses the use fixture's blocks: doors, a trapdoor,
+    # a fence gate, a lever and a button lighting lamps, a repeater, a comparator, a note block, a
+    # bell, a daylight detector and redstone dust (D379).
+    "use": Config({}, view=3, scenarios=("use",), world=FIXTURES / "use" / "world",
+                  fixture="use", rules=DIG_RULES, player=USE),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
