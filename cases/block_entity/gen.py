@@ -320,6 +320,37 @@ def cases():
     add("vault-key-components", "vault", "{config:{key_item:{id:\"minecraft:trial_key\",count:1,components:" + named + "}}}")
     add("vault-key-air", "vault", "{config:{key_item:{id:\"minecraft:air\",count:1}}}")
     add("vault-key-bad-count", "vault", "{config:{key_item:{id:\"minecraft:trial_key\",count:500}}}")
+    # Names and sign text read with `ComponentSerialization.CODEC`: every kind of contents, what's
+    # read in part, and what doesn't read, which is left out (D370).
+    add("chest-name-keybind", "chest", "{CustomName:{keybind:\"key.inventory\",color:\"gold\"}}")
+    add("chest-name-bad", "chest", "{CustomName:5}")
+    add("chest-name-bad-color", "chest", "{CustomName:{text:\"Loot\",color:\"nope\"}}")
+    add("chest-name-no-contents", "chest", "{CustomName:{color:\"red\"}}")
+    add("chest-name-list", "chest", "{CustomName:[\"a\",{text:\"b\",bold:1b}]}")
+    add("barrel-name-typed", "barrel", "{CustomName:{type:\"translatable\",translate:\"container.barrel\",with:[1b,\"x\"]}}")
+    add("barrel-name-bad-arg", "barrel", "{CustomName:{type:\"translatable\",translate:\"k\",with:[{a:1}]}}")
+    add("banner-name-object", "banner", "{CustomName:{object:\"atlas\",sprite:\"block/stone\"}}")
+    add("beacon-name-score", "beacon", "{CustomName:{score:{name:\"*\",objective:\"o\"}},Levels:1}")
+    add("enchanting-table-name-nbt", "enchanting_table", "{CustomName:{nbt:\"a.b\",storage:\"x:y\",interpret:1b}}")
+    add("enchanting-table-name-bad-path", "enchanting_table", "{CustomName:{type:\"nbt\",nbt:\"a..b\",storage:\"x\"}}")
+    add("sign-contents", "sign", "{front_text:{messages:[{keybind:\"key.jump\"},{selector:\"@p\"},{score:{name:\"@s\",objective:\"o\"}},"
+        "{nbt:\"Pos\",entity:\"@s\",separator:\"/\"}],color:\"green\",has_glowing_text:1b}}")
+    add("sign-object-lines", "sign", "{front_text:{messages:[{sprite:\"item/apple\"},{player:{name:\"Steve\"},hat:0b},\"\",\"\"]}}")
+    add("sign-click-command", "sign", "{front_text:{messages:[{text:\"Go\",click_event:{action:\"run_command\",command:\"/say hi\"}},\"\",\"\",\"\"]}}")
+    add("sign-bad-style-line", "sign", "{front_text:{messages:[{text:\"a\",color:\"nope\"},\"b\",\"c\",\"d\"]}}")
+    add("sign-bad-contents-line", "sign", "{front_text:{messages:[{type:\"keybind\"},\"b\",\"c\",\"d\"]}}")
+    add("sign-filtered-other-contents", "sign", "{front_text:{messages:[\"a\",\"b\",\"c\",\"d\"],filtered_messages:[{keybind:\"k\"},\"b\",\"c\",\"d\"]}}")
+    add("sign-filtered-bad-line", "sign", "{front_text:{messages:[\"a\",\"b\",\"c\",\"d\"],filtered_messages:[5,\"b\",\"c\",\"d\"]}}")
+    add("sign-hover-item", "hanging_sign", "{back_text:{messages:[{text:\"i\",hover_event:{action:\"show_item\",id:\"minecraft:stone\",count:2}},\"\",\"\",\"\"]}}")
+    add("sign-text-not-compound", "sign", "{front_text:\"x\",back_text:[1]}")
+    add("skull-profile-string", "skull", "{profile:\"Alex\"}")
+    add("skull-profile-bad", "skull", "{profile:{name:\"bad name!\"}}")
+    add("skull-sound-bad", "skull", "{note_block_sound:\"Not Valid\"}")
+    add("skull-sound-number", "skull", "{note_block_sound:5}")
+    add("skull-name", "skull", "{custom_name:{text:\"Head\",italic:0b}}")
+    add("skull-name-bad", "skull", "{custom_name:{type:\"nope\"}}")
+    add("command-block-output-styled", "command_block", "{Command:\"x\",LastOutput:{text:\"[12:00] ok\",color:\"gray\"},TrackOutput:1b}")
+    add("command-block-output-bad", "command_block", "{Command:\"x\",LastOutput:{bold:\"x\"},TrackOutput:1b,CustomName:{keybind:\"a\"}}")
     return out
 
 
