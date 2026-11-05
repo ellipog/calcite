@@ -522,13 +522,23 @@ def block_facts_module(index, flags):
          "/// order (CAL-139)."])
     sounds = flags["place_sounds"]
     lines += [
-        "/// The sounds blocks are placed with, by the sound event's name, each with the volume and pitch",
-        "/// of its sound type in `place_sound_volumes` and `place_sound_pitches` (CAL-139).",
+        "/// The sound types of blocks, by the sound event each is placed with, its name, each with its",
+        "/// volume and pitch in `place_sound_volumes` and `place_sound_pitches` (CAL-139), and its step and",
+        "/// fall sounds in `step_sound_names` and `fall_sound_names` (CAL-155).",
         "pub fn place_sound_names() -> List<str> {",
         "    return [",
     ]
-    lines += [f'        "{name}",' for name, _, _ in sounds]
+    lines += [f'        "{v[0]}",' for v in sounds]
     lines += ["    ]", "}", ""]
+    for fn, at, what in [("step_sound_names", 3, "step"), ("fall_sound_names", 4, "fall")]:
+        lines += [
+            f"/// Each of `place_sound_names`' sound type's {what} sound, `SoundType.get{what.capitalize()}Sound`, by",
+            "/// the sound event's name (CAL-155).",
+            f"pub fn {fn}() -> List<str> {{",
+            "    return [",
+        ]
+        lines += [f'        "{v[at]}",' for v in sounds]
+        lines += ["    ]", "}", ""]
     for fn, at, what in [("place_sound_volumes", 1, "volume"), ("place_sound_pitches", 2, "pitch")]:
         values = [calx_float(v[at]) for v in sounds]
         lines += [
@@ -540,7 +550,7 @@ def block_facts_module(index, flags):
         lines += ["    ]", "    return values", "}", ""]
     if len(flags["state_place_sounds"]) != flags["states"]:
         raise ValueError("block_flags.json hasn't a place sound for each state")
-    lines += ["/// Each state's place sound, by its index in `place_sound_names`, in state ID order (CAL-139)."]
+    lines += ["/// Each state's sound type, by its index in `place_sound_names`, in state ID order (CAL-139)."]
     lines += encoded_table("state_place_sounds", "sounds", flags["state_place_sounds"])
     stacks = flags["item_stack_sizes"]
     lines += [
@@ -1260,7 +1270,7 @@ def movement_module(index, flags):
                 cases.append(c)
             others += 1
     for f in factors:
-        if len(f) != 5:
+        if len(f) != 6:
             raise ValueError(f"a block's movement factors are {len(f)} numbers")
     for c in cases:
         if len(c) != 10 or not 0 <= c[0] < len(boxes) or not 0 <= c[1] < 3:
@@ -1293,16 +1303,17 @@ def movement_module(index, flags):
     ]
     lines += shape_lines(shapes, palette, single, pairs, chunks, starts, coords)
     lines += [
-        "/// Each block whose friction, speed factor, jump factor or bounce isn't the default, 0.6, 1, 1",
-        "/// and 0, in block ID order.",
+        "/// Each block whose friction, speed factor, jump factor, bounce or fall distance reduction isn't",
+        "/// the default, 0.6, 1, 1, 0 and 0, in block ID order.",
         "pub fn factor_blocks() -> List<u32> {",
         "    return [",
         numbers([f[0] for f in factors]),
         "    ]",
         "}",
         "",
-        "/// Each of `factor_blocks`' friction, speed factor, jump factor and bounce, four `f32`s' bits",
-        "/// each, `getFriction`, `getSpeedFactor`, `getJumpFactor` and `getBounceRestitution`.",
+        "/// Each of `factor_blocks`' friction, speed factor, jump factor, bounce and fall distance",
+        "/// reduction, five `f32`s' bits each, `getFriction`, `getSpeedFactor`, `getJumpFactor`,",
+        "/// `getBounceRestitution` and `getFallDistanceReduction` (CAL-155).",
         "pub fn factors() -> List<u32> {",
         "    return [",
         numbers([bits(v) for f in factors for v in f[1:]], 8),
@@ -1354,7 +1365,7 @@ def calx_double(v):
 
 def attribute_lines(facts):
     """world.entity_facts' attributes: each one's default, range and whether it's synced, in ID
-    order, and the player's, with their bases (CAL-137)."""
+    order, and the player's, with their bases (CAL-137); and every living type's (CAL-155)."""
     attributes = facts["attributes"]
     ids = {a["id"]: i for i, a in enumerate(attributes)}
     player = facts["player_attributes"]
@@ -1364,6 +1375,11 @@ def attribute_lines(facts):
 
     def doubles(values):
         return ", ".join(calx_double(v) for v in values)
+
+    living = facts["type_attributes"]
+    starts = [0]
+    for t in living:
+        starts.append(starts[-1] + len(t["attributes"]))
 
     names = ", ".join('"' + a["id"].removeprefix("minecraft:") + '"' for a in attributes)
     return [
@@ -1403,6 +1419,30 @@ def attribute_lines(facts):
         "/// The bases of `player_attributes`, in the same order.",
         "pub fn player_attribute_bases() -> List<f64> {",
         f"    return [{doubles(a['base'] for a in player)}]",
+        "}",
+        "",
+        "/// The living types, `DefaultAttributes`' with a supplier, by type ID, in ID order.",
+        "pub fn living_types() -> List<u32> {",
+        "    let living: List<u32> = [" + ", ".join(str(t["type"]) for t in living) + "]",
+        "    return living",
+        "}",
+        "",
+        "/// Where each of `living_types`' attributes start in `living_attributes`, and where the last's",
+        "/// end.",
+        "pub fn living_attribute_starts() -> List<u32> {",
+        "    let starts: List<u32> = [" + ", ".join(str(v) for v in starts) + "]",
+        "    return starts",
+        "}",
+        "",
+        "/// Each living type's attributes, by ID, in ID order, as `DefaultAttributes` supplies them.",
+        "pub fn living_attributes() -> List<u32> {",
+        "    let had: List<u32> = [" + ", ".join(str(a) for t in living for a, _ in t["attributes"]) + "]",
+        "    return had",
+        "}",
+        "",
+        "/// The bases of `living_attributes`, in the same order.",
+        "pub fn living_attribute_bases() -> List<f64> {",
+        f"    return [{doubles(b for t in living for _, b in t['attributes'])}]",
         "}",
     ]
 

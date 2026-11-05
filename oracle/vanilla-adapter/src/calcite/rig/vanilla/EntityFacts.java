@@ -181,6 +181,29 @@ final class EntityFacts {
                 first = false;
             }
         }
+        // Every living type's attributes, as `DefaultAttributes` supplies them, by the type's ID and
+        // each attribute's, with its base, in ID order (CAL-155).
+        json.append("\n  ],\n  \"type_attributes\": [");
+        first = true;
+        for (EntityType<?> type : BuiltInRegistries.ENTITY_TYPE) {
+            if (!DefaultAttributes.hasSupplier(type)) {
+                continue;
+            }
+            @SuppressWarnings("unchecked")
+            AttributeSupplier supplier = DefaultAttributes.getSupplier((EntityType<? extends net.minecraft.world.entity.LivingEntity>) type);
+            json.append(first ? "\n    " : ",\n    ");
+            json.append("{\"type\": ").append(BuiltInRegistries.ENTITY_TYPE.getId(type)).append(", \"attributes\": [");
+            boolean any = false;
+            for (int id = 0; id < BuiltInRegistries.ATTRIBUTE.size(); id++) {
+                Holder<Attribute> holder = BuiltInRegistries.ATTRIBUTE.get(id).orElseThrow();
+                if (supplier.hasAttribute(holder)) {
+                    json.append(any ? ", [" : "[").append(id).append(", ").append(supplier.getBaseValue(holder)).append("]");
+                    any = true;
+                }
+            }
+            json.append("]}");
+            first = false;
+        }
         json.append("\n  ]\n}\n");
         Files.writeString(Path.of(args[0]), json, StandardCharsets.UTF_8);
     }

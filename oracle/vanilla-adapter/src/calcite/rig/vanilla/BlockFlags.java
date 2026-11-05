@@ -503,14 +503,16 @@ final class BlockFlags {
             itemsOfBlocks.append(id == 0 ? "" : ", ").append(BuiltInRegistries.ITEM.getId(BuiltInRegistries.BLOCK.byId(id).asItem()));
         }
         // Each state's sound type's place sound, by the sound event's name, with its volume and
-        // pitch, which `BlockItem.place` plays (CAL-139): the different ones, then each state's
+        // pitch, which `BlockItem.place` plays (CAL-139), and its step and fall sounds, which an
+        // entity walking and landing on it plays (CAL-155): the different ones, then each state's
         // index into them, in state ID order.
         StringBuilder soundTypes = new StringBuilder();
         StringBuilder stateSounds = new StringBuilder();
         Map<String, Integer> soundIndex = new HashMap<>();
         for (int id = 0; id < count; id++) {
             net.minecraft.world.level.block.SoundType type = Block.BLOCK_STATE_REGISTRY.byId(id).getSoundType();
-            String key = "\"" + type.getPlaceSound().location().getPath() + "\", " + type.getVolume() + ", " + type.getPitch();
+            String key = "\"" + type.getPlaceSound().location().getPath() + "\", " + type.getVolume() + ", " + type.getPitch()
+                    + ", \"" + type.getStepSound().location().getPath() + "\", \"" + type.getFallSound().location().getPath() + "\"";
             Integer at = soundIndex.get(key);
             if (at == null) {
                 at = soundIndex.size();
@@ -912,21 +914,23 @@ final class BlockFlags {
     }
 
     /**
-     * Each block whose friction, speed factor, jump factor or bounce isn't the default, 0.6, 1, 1
-     * and 0: its ID and the four floats' bits, as {@code Entity.move} reads them.
+     * Each block whose friction, speed factor, jump factor, bounce or fall distance reduction isn't
+     * the default, 0.6, 1, 1, 0 and 0: its ID and the five floats' bits, as {@code Entity.move}
+     * and {@code Block.fallOn} read them.
      */
     private static String movementFactors() {
         StringBuilder out = new StringBuilder();
         for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
             Block block = BuiltInRegistries.BLOCK.byId(id);
             if (block.getFriction() == 0.6F && block.getSpeedFactor() == 1.0F && block.getJumpFactor() == 1.0F
-                    && block.getBounceRestitution() == 0.0F) {
+                    && block.getBounceRestitution() == 0.0F && block.getFallDistanceReduction() == 0.0F) {
                 continue;
             }
             out.append(out.isEmpty() ? "[" : ", [").append(id).append(", ").append(Float.floatToIntBits(block.getFriction()))
                     .append(", ").append(Float.floatToIntBits(block.getSpeedFactor())).append(", ")
                     .append(Float.floatToIntBits(block.getJumpFactor())).append(", ")
-                    .append(Float.floatToIntBits(block.getBounceRestitution())).append("]");
+                    .append(Float.floatToIntBits(block.getBounceRestitution())).append(", ")
+                    .append(Float.floatToIntBits(block.getFallDistanceReduction())).append("]");
         }
         return out.toString();
     }
