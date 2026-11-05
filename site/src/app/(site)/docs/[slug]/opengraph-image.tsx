@@ -1,15 +1,19 @@
 import { card, CARD } from '@/lib/og-card';
 import { docs } from '@/lib/repo';
 
-// Each page of the docs has its card, its title over the world, and alt text naming the page.
+// Each page of the docs has its card, its title over the world. The cards are made as the site
+// builds, one for each page generateStaticParams names, and no other slug is served: the docs are
+// read from the repo outside site/, which Vercel has as it builds but not as it serves. So the alt
+// text is the same for every page. generateImageMetadata would give each its own, but with it Next
+// leaves the slug to request time, where the card can't read its page and answers 500 (CAL-171).
+
+export const alt = "A page of Calcite's docs, its title over the world";
+export const size = CARD;
+export const contentType = 'image/png';
+export const dynamicParams = false;
 
 export function generateStaticParams() {
 	return docs().map((d) => ({ slug: d.slug }));
-}
-
-export function generateImageMetadata({ params }: { params: { slug: string } }) {
-	const d = docs().find((x) => x.slug === params.slug);
-	return [{ id: 'card', alt: `${d?.title ?? 'A page'}, from Calcite's docs`, size: CARD, contentType: 'image/png' }];
 }
 
 export default async function Image({ params }: { params: Promise<{ slug: string }> }) {
