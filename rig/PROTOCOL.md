@@ -828,7 +828,7 @@ Input `{"from": f, "value": text, "to": t}`. `f` is `json`, for `text` a stack a
 
 The output is `{"empty": e}`, `e` whether the stack is empty, with the blob, or, where it doesn't read, `{"error": message, "partial": p}`, `p` whether the codec had a partial value. A stream that doesn't read gives `{"error": exception}`, its `toString`, and one with bytes left over says how many in `left`. An empty stack has no NBT, and one the codec can't write gives `{"write_error": message}`.
 
-Calcite has every component type's stream codec (CAL-77, D364, D365).
+Calcite has every component type's stream codec (CAL-77, D364, D365), and reads a stack from `wire` and writes it to `wire` as `world.item` reads and sends a packet's (D366).
 
 ## Adding a probe
 
