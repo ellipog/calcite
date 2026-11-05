@@ -302,8 +302,32 @@ final class BlockFlags {
         // Each block whose loot table, `getLootTable`, isn't `blocks/<its name>`, with it, or null
         // for one that has none (CAL-153).
         StringBuilder lootTables = new StringBuilder();
+        // Each block that drops experience from its own `xpRange`, a `DropExperienceBlock`'s or a
+        // `SculkCatalystBlock`'s, with whether it's a constant, which draws nothing, or uniform,
+        // and its least and most (CAL-154).
+        StringBuilder xpRanges = new StringBuilder();
         for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
             Block block = BuiltInRegistries.BLOCK.byId(id);
+            if (block instanceof net.minecraft.world.level.block.DropExperienceBlock
+                    || block instanceof net.minecraft.world.level.block.SculkCatalystBlock) {
+                Object range = fieldOf(block, "xpRange");
+                String kind;
+                int least;
+                int most;
+                if (range instanceof net.minecraft.util.valueproviders.ConstantInt c) {
+                    kind = "constant";
+                    least = c.value();
+                    most = c.value();
+                } else if (range instanceof net.minecraft.util.valueproviders.UniformInt u) {
+                    kind = "uniform";
+                    least = u.minInclusive();
+                    most = u.maxInclusive();
+                } else {
+                    throw new IllegalStateException("an xp range Calcite doesn't know: " + range);
+                }
+                xpRanges.append(xpRanges.isEmpty() ? "" : ", ").append("[").append(id).append(", \"").append(kind)
+                        .append("\", ").append(least).append(", ").append(most).append("]");
+            }
             java.util.Optional<net.minecraft.resources.ResourceKey<net.minecraft.world.level.storage.loot.LootTable>> table = block.getLootTable();
             String usual = BuiltInRegistries.BLOCK.getKey(block).withPrefix("blocks/").toString();
             if (table.isEmpty()) {
@@ -549,6 +573,7 @@ final class BlockFlags {
         json.append("  \"button_ticks\": [").append(buttonTicks).append("],\n");
         json.append("  \"plate_weights\": [").append(plateWeights).append("],\n");
         json.append("  \"loot_tables\": [").append(lootTables).append("],\n");
+        json.append("  \"xp_ranges\": [").append(xpRanges).append("],\n");
         json.append("  \"flammable_blocks\": [").append(flammable).append("],\n");
         json.append("  \"fire_odds\": [").append(fireOdds).append("],\n");
         json.append("  \"waterloggable_blocks\": [").append(waterloggable).append("],\n");

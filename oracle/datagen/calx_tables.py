@@ -584,6 +584,20 @@ def block_facts_module(index, flags):
     ]
     lines += [f'        "{t or ""}",' for _, t in tables]
     lines += ["    ]", "}", ""]
+    ranges = flags["xp_ranges"]
+    lines += number_list(
+        "xp_range_blocks", "blocks", [r[0] for r in ranges],
+        ["/// The blocks that drop experience from their own `xpRange`, a `DropExperienceBlock`'s or a",
+         "/// `SculkCatalystBlock`'s, by ID, whose `xp_range_uniform`, `xp_range_least` and",
+         "/// `xp_range_most` give theirs in their order (CAL-154)."])
+    lines += number_list(
+        "xp_range_uniform", "uniform", [1 if r[1] == "uniform" else 0 for r in ranges],
+        ["/// For each of `xp_range_blocks` in their order, 1 where its range is a `UniformInt`, which",
+         "/// draws, 0 where it's a `ConstantInt`, which doesn't (CAL-154)."])
+    for fn, at, what in [("xp_range_least", 2, "least"), ("xp_range_most", 3, "most")]:
+        lines += number_list(
+            fn, what, [r[at] for r in ranges],
+            [f"/// For each of `xp_range_blocks` in their order, the {what} experience it drops (CAL-154)."])
     toggles = flags["toggle_sounds"]
     lines += number_list(
         "toggle_sound_blocks", "blocks", [b for b, _, _ in toggles],

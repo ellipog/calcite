@@ -42,7 +42,7 @@ import server.chunks.{ChunkSender, Spiral, chunks_held, column}
 import server.commands.{Failure, GAMEMASTERS, OWNERS, Parsed, PregenCommand, Targets, failure_context, parse, tree}
 import server.configuration.{Configuration}
 import server.layout.{Layout, Placed}
-import server.level.{ChunkPacket, Heard, Level, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
+import server.level.{ChunkPacket, Dropped, Heard, Level, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
 import server.link.{FileRead, Input, Link, Report}
 import server.log.{Entry, Look}
 import server.pregen.{Choice, Run, Shape, Task as PregenTask, blocks, saved_data as pregen_data, saved_id as pregen_saved_id}
@@ -64,7 +64,9 @@ import world.border.{Border, BorderSettings, saved_id as border_id}
 import world.clocks.{saved_id as clocks_id}
 import world.collision.{Aabb, CollisionStates, eye_height, pose_box}
 import world.entities.{Entities}
-import world.item_entity.{ItemEntity, ItemFacts, ItemSound}
+import world.body.{Body, BodyFacts, EntitySound}
+import world.experience_orb.{ExperienceOrb, Follower}
+import world.item_entity.{ItemEntity}
 import world.loot.{Loot}
 import world.item_tracker.{ItemTracker, Sent, TRACKING_RANGE, lp_vec3_bytes, section_of}
 import world.movement.{MovementStates}
@@ -84,12 +86,12 @@ import world.level_writer.{UPDATE_LIMIT}
 import world.pistons.{check_if_extend}
 import world.placing.{PlaceFacts, Placement, bucket_stack, can_be_replaced, component_of, has_components, placement_state, stack_item}
 import world.attributes.{Attributes, Snapshot, attribute_id, broken, equip, sprint, stack_modifiers, unworn, update_player}
-import world.entity_data.{CROUCHING, CROUCHING_FLAG, EntityData, HEALTH, MAIN_HAND, MODE_CUSTOMISATION, POSE_ID, SHARED_FLAGS, STANDING, SWIMMING, Value, player_data}
+import world.entity_data.{CROUCHING, CROUCHING_FLAG, EntityData, HEALTH, MAIN_HAND, MODE_CUSTOMISATION, POSE_ID, SCORE, SHARED_FLAGS, STANDING, SWIMMING, Value, player_data}
 import world.player_status.{Status, read_status, tick_food, tick_regeneration, write_status}
-import world.digging.{ABORT_DESTROY_BLOCK, ACTIONS, CHANGE_DESTROY_DIRECTION, DESTROY_PROGRESS, DESTROY_PROGRESS_SOUND, DROP_ALL_ITEMS, DROP_ITEM, Digging, RELEASE_USE_ITEM, STAB, START_DESTROY_BLOCK, STOP_DESTROY_BLOCK, SWAP_ITEM_WITH_OFFHAND, attack, break_block, can_destroy, destroy_progress, durability_change, eye_in_water, game_master, has_correct_tool, in_reach, java_int, within_range, may_break_in_adventure, may_use_in_adventure, mining_damage, shrunk, with_damage}
+import world.digging.{ABORT_DESTROY_BLOCK, ACTIONS, CHANGE_DESTROY_DIRECTION, DESTROY_PROGRESS, DESTROY_PROGRESS_SOUND, DROP_ALL_ITEMS, DROP_ITEM, Digging, RELEASE_USE_ITEM, STAB, START_DESTROY_BLOCK, STOP_DESTROY_BLOCK, SWAP_ITEM_WITH_OFFHAND, attack, break_block, can_destroy, destroy_progress, durability_change, eye_in_water, game_master, has_correct_tool, in_reach, java_int, within_range, may_break_in_adventure, may_use_in_adventure, mining_damage, shrunk, with_damage, enchanted_value, is_damaged, mends_in}
 import world.block_level.{update_output_signal}
 import world.containers.{Opening, items_of, opening, put_items, start_open, stop_open}
-import world.inventory.{EnderChest, Inventory, MENU_SLOTS}
+import world.inventory.{EnderChest, Inventory, MENU_SLOTS, equipment_names}
 import world.menu.{CRAFTING_MENU, Clicker, Effect, HashedStack, INVENTORY_MENU, Menu, OUTSIDE, Slots, add_item, contains_like, pick_up, put_by_player, stack_in}
 import world.item.{ItemStack, SentStack}
 import world.modes.{Difficulty, GameType, PreviousGameType}
@@ -443,6 +445,10 @@ struct Player {
     // Their entity's random, seeded as they joined, which the motion of what they drop draws
     // from, and the section their entity's tracker last saw them in, `lastSectionPos` (CAL-148).
     random: LegacyRandom? = none
+    // The ticks till they may take another orb, `takeXpDelay`, and the tick they last levelled up
+    // to a fifth level with its sound, `lastLevelUpTime` (CAL-154).
+    take_xp_delay: i32 = 0
+    last_level_up: i32 = 0
     tracker_x: i32 = 0
     tracker_y: i32 = 0
     tracker_z: i32 = 0
@@ -462,7 +468,7 @@ struct Player {
 // thread that reads and writes them; and whether the server's stopping, and the thread's been
 // told to close.
 struct LevelEntities {
-    items: Entities = Entities()
+    list: Entities = Entities()
     tracked: OpenHashMap<i32, bool> = OpenHashMap<i32, bool>()
     trackers: Map<i32, ItemTracker> = Map<i32, ItemTracker>()
     visible: OpenHashSet<i64> = OpenHashSet<i64>()
@@ -476,6 +482,54 @@ struct LevelEntities {
     stopping: bool = false
     saved_all: bool = false
     closed: bool = false
+}
+
+// An orb's data as `ClientboundSetEntityDataPacket` packs it: its value, `DATA_VALUE`, 8, of the
+// int serializer, 1 (CAL-154).
+fn orb_data(value: i32) -> List<u8> {
+    var w = Writer.new()
+    w.u8(8u8)
+    w.varint(1)
+    w.varint(value)
+    w.u8(255u8)
+    return w.into_bytes()
+}
+
+// What the player has in the equipment slot `slot`, `getItemBySlot`: the main hand the hotbar
+// slot they hold.
+fn worn_in(con: Connection, slot: usize) -> Tag? {
+    if slot == 0 {
+        return con.player.inventory.selected(con.player.selected)
+    }
+    if slot >= con.player.inventory.equipment.len() {
+        return none
+    }
+    return con.player.inventory.equipment[slot].copy()
+}
+
+// Puts `stack` in the equipment slot `slot`, `setItemSlot`.
+fn set_worn(con: mut Connection, slot: usize, stack: own Tag) {
+    if slot == 0 {
+        let held = usize.wrap(con.player.selected)
+        if held < con.player.inventory.items.len() {
+            con.player.inventory.items[held] = some(stack)
+        }
+        return
+    }
+    if slot < con.player.inventory.equipment.len() {
+        con.player.inventory.equipment[slot] = some(stack)
+    }
+}
+
+// `getXpNeededForNextLevel`: what the level after `level` needs, the sums an int's.
+fn xp_needed(level: i32) -> i32 {
+    if level >= 30 {
+        return 112i32.wrapping_add((level - 30).wrapping_mul(9))
+    }
+    if level >= 15 {
+        return 37i32.wrapping_add((level - 15).wrapping_mul(5))
+    }
+    return 7i32.wrapping_add(level.wrapping_mul(2))
 }
 
 // Where a kept entity was saved, its `Pos`, as `Entity.load` reads it, or the origin, which places
@@ -496,7 +550,7 @@ fn kept_place(tag: Tag) -> (f64, f64, f64) {
 }
 
 // What was read of an entity chunk, as `loadEntities` makes it: its entities in the order they
-// were saved, the items made and the rest's tags, which Calcite keeps as they were.
+// were saved, the items and orbs made and the rest's tags, which Calcite keeps as they were.
 struct ReadEntities {
     pos: ChunkPos
     entities: List<ReadEntity>
@@ -504,6 +558,7 @@ struct ReadEntities {
 
 enum ReadEntity {
     Item(ItemEntity)
+    Orb(ExperienceOrb)
     Kept(Tag)
 }
 
@@ -705,7 +760,7 @@ pub struct Network {
     // seeds (CAL-148).
     entities: List<LevelEntities?> = List<LevelEntities?>()
     movement: MovementStates? = none
-    item_facts: ItemFacts? = none
+    item_facts: BodyFacts? = none
     entity_base: i64? = none
     entity_seeds: i64 = 0
 }
@@ -1883,7 +1938,12 @@ impl Network {
     // see it.
     fn track_item(mut self, d: usize, id: i32) {
         var es = self.take_entities(d)
-        let lent = es.items.lend(id)
+        if es.list.is_orb(id) {
+            self.put_entities(d, es)
+            self.track_orb(d, id)
+            return
+        }
+        let lent = es.list.lend(id)
         let kept = es.trackers.remove(id)
         self.put_entities(d, es)
         var e = lent else {
@@ -1898,7 +1958,7 @@ impl Network {
             self.give_item_back(d, e, none)
             return
         }
-        let now = section_of(e)
+        let now = section_of(e.body)
         let (sx, sy, sz) = now
         let (ox, oy, oz) = tr.section
         let moved = sx != ox or sy != oy or sz != oz
@@ -1910,9 +1970,11 @@ impl Network {
                 self.connections[slot] = some(con)
             }
         }
-        if moved or e.needs_sync or self.levels[d].entity_ticking(ChunkPos { x: sx, z: sz }) {
+        if moved or e.body.needs_sync or self.levels[d].entity_ticking(ChunkPos { x: sx, z: sz }) {
             var out = List<Sent>()
-            tr.send_changes(mut e, mut out)
+            let changed: Tag? = if e.stack_changed { some(e.stack.copy()) } else { none }
+            e.stack_changed = false
+            tr.send_changes(mut e.body, changed, mut out)
             for s in out {
                 let packet = self.sent_packet(id, s)
                 self.send_to_seen(tr.seen_by, packet)
@@ -1921,13 +1983,61 @@ impl Network {
         self.give_item_back(d, e, some(tr))
     }
 
+    // An orb's tracker, as an item's runs: an orb's value never changes, so it sends none.
+    fn track_orb(mut self, d: usize, id: i32) {
+        var es = self.take_entities(d)
+        let lent = es.list.lend_orb(id)
+        let kept = es.trackers.remove(id)
+        self.put_entities(d, es)
+        var o = lent else {
+            if let t = kept {
+                var back = self.take_entities(d)
+                back.trackers.insert(id, t)
+                self.put_entities(d, back)
+            }
+            return
+        }
+        var tr = kept else {
+            var back = self.take_entities(d)
+            back.list.give_back_orb(o)
+            self.put_entities(d, back)
+            return
+        }
+        let now = section_of(o.body)
+        let (sx, sy, sz) = now
+        let (ox, oy, oz) = tr.section
+        let moved = sx != ox or sy != oy or sz != oz
+        if moved {
+            tr.section = now
+            for slot in self.level_slots(d) {
+                var con = self.connections[slot].take() else continue
+                self.orb_seen(mut tr, o, mut con)
+                self.connections[slot] = some(con)
+            }
+        }
+        if moved or o.body.needs_sync or self.levels[d].entity_ticking(ChunkPos { x: sx, z: sz }) {
+            var out = List<Sent>()
+            let changed: Tag? = if o.value_changed { some(Tag.Int(o.value)) } else { none }
+            o.value_changed = false
+            tr.send_changes(mut o.body, changed, mut out)
+            for s in out {
+                let packet = self.sent_packet(id, s)
+                self.send_to_seen(tr.seen_by, packet)
+            }
+        }
+        var es2 = self.take_entities(d)
+        es2.trackers.insert(id, tr)
+        es2.list.give_back_orb(o)
+        self.put_entities(d, es2)
+    }
+
     // Puts an item `track_item` took out back, with its tracker.
     fn give_item_back(mut self, d: usize, e: own ItemEntity, tr: own ItemTracker?) {
         var es = self.take_entities(d)
         if let t = tr {
-            es.trackers.insert(e.id, t)
+            es.trackers.insert(e.body.id, t)
         }
-        es.items.give_back(e)
+        es.list.give_back(e)
         self.put_entities(d, es)
     }
 
@@ -4172,12 +4282,37 @@ impl Network {
     // ticks, added as `addFreshEntity` adds them (CAL-153).
     fn make_drops(mut self, d: usize) {
         for dropped in self.levels[d].take_dropped() {
-            self.entity_ids += 1
-            let id = self.entity_ids
-            let seed = self.entity_seed(id)
-            var e = ItemEntity.new(id, seed, dropped.x, dropped.y, dropped.z, dropped.stack.copy())
-            e.pickup_delay = 10
-            self.add_item(d, e, none)
+            _ = self.make_drop(d, dropped.copy(), none)
+        }
+    }
+
+    // One thing level `d` dropped made, seen by its players but `except`: an item, with its
+    // default pickup delay; or an orb, `tryMergeToExisting` into the first there that can take
+    // it, else made (CAL-154). The id of what was made, or none where it merged.
+    fn make_drop(mut self, d: usize, dropped: own Dropped, except: i32?) -> i32? {
+        match dropped {
+            Dropped.Item(x, y, z, stack) => {
+                self.entity_ids += 1
+                let id = self.entity_ids
+                let seed = self.entity_seed(id)
+                var e = ItemEntity.new(id, seed, x, y, z, stack)
+                e.pickup_delay = 10
+                self.add_item(d, e, except)
+                return some(id)
+            },
+            Dropped.Orb(x, y, z, value, pick) => {
+                var es = self.take_entities(d)
+                let merged = es.list.merge_award(x, y, z, value, pick)
+                self.put_entities(d, es)
+                if merged {
+                    return none
+                }
+                self.entity_ids += 1
+                let id = self.entity_ids
+                let seed = self.entity_seed(id)
+                self.add_orb(d, ExperienceOrb.new(id, seed, x, y, z, value), except)
+                return some(id)
+            },
         }
     }
 
@@ -4186,14 +4321,9 @@ impl Network {
     fn make_drops_for(mut self, con: mut Connection) {
         for d in 0..self.levels.len() {
             for dropped in self.levels[d].take_dropped() {
-                self.entity_ids += 1
-                let id = self.entity_ids
-                let seed = self.entity_seed(id)
-                var e = ItemEntity.new(id, seed, dropped.x, dropped.y, dropped.z, dropped.stack.copy())
-                e.pickup_delay = 10
-                self.add_item(d, e, some(con.player.entity_id))
+                let made = self.make_drop(d, dropped.copy(), some(con.player.entity_id)) else continue
                 if con.player.dim == d {
-                    self.item_sees(d, id, mut con)
+                    self.item_sees(d, made, mut con)
                 }
             }
         }
@@ -4589,13 +4719,13 @@ impl Network {
     // Starts the tick of the level `d`'s items (CAL-148).
     fn begin_items(mut self, d: usize) {
         var es = self.take_entities(d)
-        es.items.begin_tick()
+        es.list.begin_tick()
         self.put_entities(d, es)
     }
 
     fn end_items(mut self, d: usize) {
         var es = self.take_entities(d)
-        es.items.end_tick()
+        es.list.end_tick()
         self.put_entities(d, es)
     }
 
@@ -4609,7 +4739,7 @@ impl Network {
             self.movement = some(MovementStates.new(f))
         }
         if self.item_facts == none {
-            self.item_facts = some(ItemFacts.new(f))
+            self.item_facts = some(BodyFacts.new(f))
         }
         if not self.items_ready() {
             return
@@ -4626,16 +4756,17 @@ impl Network {
         }
         let min_y = self.world.dims[d].min_y
         let fast = self.levels[d].fast_lava
+        let players = self.followers(d)
         var es = self.take_entities(d)
         var going = true
         while going {
-            var sounds = List<ItemSound>()
-            going = es.items.tick_next(before, f, m, t, codecs, self.levels[d], min_y, fast, mut sounds)
+            var sounds = List<EntitySound>()
+            going = es.list.tick_next(before, f, m, t, codecs, self.levels[d], min_y, fast, players, mut sounds)
             if not going {
                 break
             }
-            let after = es.items.gone_after.copy()
-            let gone = es.items.take_gone()
+            let after = es.list.gone_after.copy()
+            let gone = es.list.take_gone()
             var k = 0usize
             for g in 0..gone.len() {
                 while k < after[g] and k < sounds.len() {
@@ -4657,8 +4788,39 @@ impl Network {
         self.item_facts = some(t)
     }
 
+    // The players of the level `d` an orb may follow, in `ServerLevel.players()`'s order, the
+    // order they came into it (CAL-154).
+    fn followers(self, d: usize) -> List<Follower> {
+        var order = List<(u64, usize)>()
+        for slot in 0..self.connections.len() {
+            if self.playing(slot) {
+                if let c = self.connections[slot] {
+                    if c.player.dim == d {
+                        order.push((c.player.entered, slot))
+                    }
+                }
+            }
+        }
+        order.sort()
+        var out = List<Follower>()
+        for (_, slot) in order {
+            let c = self.connections[slot] else continue
+            let pose = c.player.entity_data.number(POSE_ID)
+            out.push(Follower {
+                id: c.player.entity_id,
+                x: c.player.x,
+                y: c.player.y,
+                z: c.player.z,
+                eyes: f32.nearest(eye_height(pose)),
+                spectator: c.player.mode == GameType.Spectator,
+                dead: c.player.entity_data.float(HEALTH) <= 0.0f32,
+            })
+        }
+        return out
+    }
+
     // An item's sound, from the neutral source, as `Entity.playSound` plays it.
-    fn play_item_sound(mut self, d: usize, s: ItemSound) {
+    fn play_item_sound(mut self, d: usize, s: EntitySound) {
         self.levels[d].play_sound_from_source(s.sound.copy(), s.x, s.y, s.z, 6, s.volume, s.pitch)
     }
 
@@ -4704,8 +4866,8 @@ impl Network {
         return out
     }
 
-    // `ChunkMap.move`'s look, for each item of the player's level in the trackers' order, at
-    // whether they see it.
+    // `ChunkMap.move`'s look, for each item and orb of the player's level in the trackers' order,
+    // at whether they see it.
     fn items_see(mut self, con: mut Connection) {
         let d = con.player.dim
         var es = self.take_entities(d)
@@ -4717,9 +4879,12 @@ impl Network {
         }
         for id in ids {
             var tr = es.trackers.remove(id) else continue
-            if let e = es.items.lend(id) {
+            if let e = es.list.lend(id) {
                 self.item_seen(mut tr, e, mut con)
-                es.items.give_back(e)
+                es.list.give_back(e)
+            } else if let o = es.list.lend_orb(id) {
+                self.orb_seen(mut tr, o, mut con)
+                es.list.give_back_orb(o)
             }
             es.trackers.insert(id, tr)
         }
@@ -4731,9 +4896,12 @@ impl Network {
         var es = self.take_entities(d)
         if let kept = es.trackers.remove(id) {
             var tr = kept
-            if let e = es.items.lend(id) {
+            if let e = es.list.lend(id) {
                 self.item_seen(mut tr, e, mut con)
-                es.items.give_back(e)
+                es.list.give_back(e)
+            } else if let o = es.list.lend_orb(id) {
+                self.orb_seen(mut tr, o, mut con)
+                es.list.give_back_orb(o)
             }
             es.trackers.insert(id, tr)
         }
@@ -4745,14 +4913,29 @@ impl Network {
     // one their client has; coming to see it, they're sent it, `addPairing`, and ceasing to,
     // told it's gone, `removePairing`.
     fn item_seen(mut self, tr: mut ItemTracker, e: ItemEntity, con: mut Connection) {
+        if self.comes_to_see(mut tr, e.body, mut con) {
+            self.pair_item(mut con, tr, e)
+        }
+    }
+
+    // The same for an orb (CAL-154), whose tracking range is an item's.
+    fn orb_seen(mut self, tr: mut ItemTracker, o: ExperienceOrb, con: mut Connection) {
+        if self.comes_to_see(mut tr, o.body, mut con) {
+            self.pair_orb(mut con, tr, o)
+        }
+    }
+
+    // `updatePlayer`'s look for the entity of `b`: whether the player comes to see it now, for
+    // the caller to pair it; one who ceases to is told it's gone.
+    fn comes_to_see(mut self, tr: mut ItemTracker, b: Body, con: mut Connection) -> bool {
         if con.closing or con.phase != Phase.Play {
-            return
+            return false
         }
         let pid = con.player.entity_id
-        let dx = con.player.x - e.x
-        let dz = con.player.z - e.z
+        let dx = con.player.x - b.x
+        let dz = con.player.z - b.z
         let range = f64(min(TRACKING_RANGE * 16, con.player.view * 16))
-        let chunk = ChunkPos.containing(e.x, e.z)
+        let chunk = ChunkPos.containing(b.x, b.z)
         let visible = dx * dx + dz * dz <= range * range and con.player.sender.has(chunk)
         var at: usize? = none
         for i in 0..tr.seen_by.len() {
@@ -4763,33 +4946,52 @@ impl Network {
         if visible {
             if at == none {
                 tr.seen_by.push(pid)
-                self.pair_item(mut con, tr, e)
+                return true
             }
         } else if let i = at {
             _ = tr.seen_by.swap_remove(i)
-            self.send(mut con, ClientboundRemoveEntities { entity_ids: [e.id] }, State.Play)
+            self.send(mut con, ClientboundRemoveEntities { entity_ids: [b.id] }, State.Play)
         }
+        return false
     }
 
     // `addPairing`: the item as a bundle, `add_entity` from its tracker and its stack as its data
     // was last sent, `trackedDataValues`.
     fn pair_item(mut self, con: mut Connection, tr: ItemTracker, e: ItemEntity) {
         let item_type = self.item_type()
-        let body = tr.add_entity_body(e, item_type)
-        let data = self.item_data(tr.stack)
+        let body = tr.add_entity_body(e.body, item_type)
+        let data = self.item_data(tr.data)
         self.send(mut con, ClientboundBundleDelimiter {}, State.Play)
-        self.send(mut con, ClientboundAddEntity { entity_id: e.id, body: body }, State.Play)
-        self.send(mut con, ClientboundSetEntityData { entity_id: e.id, items: data }, State.Play)
+        self.send(mut con, ClientboundAddEntity { entity_id: e.body.id, body: body }, State.Play)
+        self.send(mut con, ClientboundSetEntityData { entity_id: e.body.id, items: data }, State.Play)
+        self.send(mut con, ClientboundBundleDelimiter {}, State.Play)
+    }
+
+    // `addPairing` of an orb: its `add_entity` from its tracker, then its value, unless it's the
+    // default, 0, which `getNonDefaultValues` leaves out (CAL-154).
+    fn pair_orb(mut self, con: mut Connection, tr: ItemTracker, o: ExperienceOrb) {
+        let orb_type = self.entity_type("minecraft:experience_orb")
+        let body = tr.add_entity_body(o.body, orb_type)
+        self.send(mut con, ClientboundBundleDelimiter {}, State.Play)
+        self.send(mut con, ClientboundAddEntity { entity_id: o.body.id, body: body }, State.Play)
+        if o.value != 0 {
+            self.send(mut con, ClientboundSetEntityData { entity_id: o.body.id, items: orb_data(o.value) }, State.Play)
+        }
         self.send(mut con, ClientboundBundleDelimiter {}, State.Play)
     }
 
     // The item entity type's ID in the `entity_type` registry.
     fn item_type(mut self) -> i32 {
+        return self.entity_type("minecraft:item")
+    }
+
+    // The entity type `name`'s ID in the `entity_type` registry.
+    fn entity_type(mut self, name: str) -> i32 {
         if not self.items_ready() {
             return 0
         }
         let codecs = self.items.take() else return 0
-        let id = codecs.builtin_id("entity_type", String("minecraft:item")) ?? 0
+        let id = codecs.builtin_id("entity_type", String(name)) ?? 0
         self.items = some(codecs)
         return id
     }
@@ -4806,8 +5008,12 @@ impl Network {
         return w.into_bytes()
     }
 
-    // What an item's tracker sends, as its packet.
+    // What an item's or orb's tracker sends, as its packet: an orb's data its value, an int, and an
+    // item's its stack.
     fn sent_packet(mut self, id: i32, s: Sent) -> List<u8> {
+        if let Sent.Data(Tag.Int(value)) = s {
+            return encode_play(ClientboundSetEntityData { entity_id: id, items: orb_data(value) })
+        }
         if let Sent.Data(stack) = s {
             let data = self.item_data(stack)
             return encode_play(ClientboundSetEntityData { entity_id: id, items: data })
@@ -4936,11 +5142,11 @@ impl Network {
         let cos_y = table_cos(f64(p.y_rot * rad))
         let dir = random.next_float() * 6.2831855f32
         let pow2 = 0.02f32 * random.next_float()
-        e.vx = f64(-sin_y * cos_x * 0.3f32) + strict_cos(f64(dir)) * f64(pow2)
+        e.body.vx = f64(-sin_y * cos_x * 0.3f32) + strict_cos(f64(dir)) * f64(pow2)
         let a = random.next_float()
         let b = random.next_float()
-        e.vy = f64(-sin_x * 0.3f32 + 0.1f32 + (a - b) * 0.1f32)
-        e.vz = f64(cos_y * cos_x * 0.3f32) + strict_sin(f64(dir)) * f64(pow2)
+        e.body.vy = f64(-sin_x * 0.3f32 + 0.1f32 + (a - b) * 0.1f32)
+        e.body.vz = f64(cos_y * cos_x * 0.3f32) + strict_sin(f64(dir)) * f64(pow2)
         return some(e)
     }
 
@@ -4956,7 +5162,7 @@ impl Network {
         let made = self.made_drop(con.player, mut random, thrower, stack, thrown)
         con.player.random = some(random)
         let e = made else return
-        let id = e.id
+        let id = e.body.id
         let d = con.player.dim
         self.add_item(d, e, some(con.player.entity_id))
         // The pairing with `con`, who's out of the connections.
@@ -5093,6 +5299,15 @@ impl Network {
                 }
                 if type_id.is_empty() {
                     lines.push(Entry.warn(String("Skipping Entity with id [invalid]")))
+                    continue
+                }
+                if type_id == "minecraft:experience_orb" {
+                    self.entity_ids += 1
+                    let id = self.entity_ids
+                    let seed = self.entity_seed(id)
+                    if let o = ExperienceOrb.loaded(id, seed, saved.tag, mut lines) {
+                        entities.push(ReadEntity.Orb(o))
+                    }
                     continue
                 }
                 if type_id != "minecraft:item" or not codecs_ready {
@@ -5241,13 +5456,14 @@ impl Network {
                     now.last_kept -= 1
                     let id = now.last_kept
                     let (x, y, z) = kept_place(tag)
-                    now.items.place_kept(id, x, y, z)
+                    now.list.place_kept(id, x, y, z)
                     now.kept.insert(id, tag.copy())
                     self.put_entities(d, now)
                     continue
                 }
                 match each {
                     ReadEntity.Item(e) => self.add_item(d, e.copy(), none),
+                    ReadEntity.Orb(o) => self.add_orb(d, o.copy(), none),
                     ReadEntity.Kept(_) => {},
                 }
             }
@@ -5272,7 +5488,7 @@ impl Network {
             return none
         }
         let pos = ChunkPos { x: i32.wrap(k), z: i32.wrap(k >> 32) }
-        let ids = es.items.in_chunk(pos)
+        let ids = es.list.in_chunk(pos)
         var tags = List<Tag>()
         for id in ids {
             if id < 0 {
@@ -5280,7 +5496,7 @@ impl Network {
                     tags.push(es.kept[id].copy())
                 }
             } else {
-                tags.push(es.items.item(id).saved())
+                tags.push(es.list.saved(id))
             }
         }
         if tags.is_empty() {
@@ -5318,12 +5534,12 @@ impl Network {
         var es = self.take_entities(d)
         for id in ids {
             if id < 0 {
-                es.items.remove_kept(id)
+                es.list.remove_kept(id)
                 _ = es.kept.remove(id)
                 continue
             }
-            es.items.remove(id)
-            _ = es.items.take_gone()
+            es.list.remove(id)
+            _ = es.list.take_gone()
             self.item_gone(mut es, id)
         }
         _ = es.loads.remove(k)
@@ -5337,7 +5553,7 @@ impl Network {
         let es = self.take_entities(d)
         var keys = List<i64>()
         var seen = Set<i64>()
-        for pos in es.items.chunks() {
+        for pos in es.list.chunks() {
             let k = pos.pack()
             seen.insert(k)
             keys.push(k)
@@ -5412,9 +5628,9 @@ impl Network {
     fn add_item(mut self, d: usize, e: own ItemEntity, except: i32?) {
         self.entries += 1
         var item = e
-        item.entered = self.entries
-        let id = item.id
-        var tr = ItemTracker.new(item)
+        item.body.entered = self.entries
+        let id = item.body.id
+        var tr = ItemTracker.new(item.body, item.stack.copy())
         for slot in self.level_slots(d) {
             var con = self.connections[slot].take() else continue
             if except != some(con.player.entity_id) {
@@ -5425,23 +5641,210 @@ impl Network {
         var es = self.take_entities(d)
         es.tracked.insert(id, false)
         es.trackers.insert(id, tr)
-        es.items.add(item)
+        es.list.add(item)
         self.put_entities(d, es)
     }
 
-    // `Player.aiStep`'s pickup (CAL-148): each item whose box meets the player's, a block bigger
-    // across and half a block up and down, in the order `getEntities` finds them, that isn't gone
-    // is touched, `playerTouch`.
+    // `addFreshEntity` of the orb `o` in the level `d`, as `add_item` adds an item (CAL-154).
+    fn add_orb(mut self, d: usize, o: own ExperienceOrb, except: i32?) {
+        self.entries += 1
+        var orb = o
+        orb.body.entered = self.entries
+        let id = orb.body.id
+        var tr = ItemTracker.new(orb.body, Tag.Int(orb.value))
+        for slot in self.level_slots(d) {
+            var con = self.connections[slot].take() else continue
+            if except != some(con.player.entity_id) {
+                self.orb_seen(mut tr, orb, mut con)
+            }
+            self.connections[slot] = some(con)
+        }
+        var es = self.take_entities(d)
+        es.tracked.insert(id, false)
+        es.trackers.insert(id, tr)
+        es.list.add_orb(orb)
+        self.put_entities(d, es)
+    }
+
+    // `Player.aiStep`'s pickup (CAL-148): each entity whose box meets the player's, a block bigger
+    // across and half a block up and down, in the order `getEntities` finds them: each item that
+    // isn't gone touched, `playerTouch`, in turn, and then one of the orbs, the player's random's
+    // pick, `Util.getRandom` (CAL-154).
     fn pick_up_items(mut self, con: mut Connection) {
         let d = con.player.dim
         let b = pose_box(con.player.entity_data.number(POSE_ID), con.player.x, con.player.y, con.player.z)
         let area = Aabb { min_x: b.min_x - 1.0, min_y: b.min_y - 0.5, min_z: b.min_z - 1.0, max_x: b.max_x + 1.0, max_y: b.max_y + 0.5, max_z: b.max_z + 1.0 }
         let es = self.take_entities(d)
-        let found = es.items.find(area, -1)
+        let found = es.list.find_any(area, -1)
+        var orbs = List<i32>()
+        for id in found {
+            if es.list.is_orb(id) {
+                orbs.push(id)
+            }
+        }
         self.put_entities(d, es)
         for id in found {
-            self.touch_item(mut con, id)
+            if not orbs.contains(id) {
+                self.touch_item(mut con, id)
+            }
         }
+        if orbs.is_empty() {
+            return
+        }
+        var random = con.player.random.take() ?? LegacyRandom.new(self.entity_seed(con.player.entity_id))
+        let pick = random.next_int_below(i32.wrap(orbs.len()))
+        con.player.random = some(random)
+        self.touch_orb(mut con, orbs[usize.wrap(pick)])
+    }
+
+    // `ExperienceOrb.playerTouch` (CAL-154): a player who may take an orb now takes one, `take`,
+    // and may take the next in 2 ticks; its value mends what they have on with mending first,
+    // `repairPlayerItems`, and what's left of it is theirs, `giveExperiencePoints`; the orb goes
+    // once it's none left.
+    fn touch_orb(mut self, con: mut Connection, id: i32) {
+        if con.player.take_xp_delay != 0 {
+            return
+        }
+        let d = con.player.dim
+        var es = self.take_entities(d)
+        var o = es.list.lend_orb(id) else {
+            self.put_entities(d, es)
+            return
+        }
+        con.player.take_xp_delay = 2
+        let pid = con.player.entity_id
+        if not o.body.removed and es.trackers.contains(id) {
+            let seen = es.trackers[id].seen_by.copy()
+            self.send_to_seen_with(seen, encode_play(ClientboundTakeItemEntity { item_id: id, collector_id: pid, amount: 1 }), mut con)
+        }
+        let value = o.value
+        o.count -= 1
+        let gone = o.count == 0
+        if gone {
+            o.body.removed = true
+        }
+        es.list.give_back_orb(o)
+        if gone {
+            es.list.remove(id)
+            _ = es.list.take_gone()
+            _ = es.tracked.remove(id)
+            if let tr = es.trackers.remove(id) {
+                self.send_to_seen_with(tr.seen_by, encode_play(ClientboundRemoveEntities { entity_ids: [id] }), mut con)
+            }
+        }
+        self.put_entities(d, es)
+        let left = self.repair_with_xp(mut con, value)
+        if left > 0 {
+            self.give_experience(mut con, left)
+        }
+    }
+
+    // `repairPlayerItems`: one of what the player has on that's damaged and has an enchantment
+    // that mends it with its slot, the player's random's pick, `getRandomItemWith`, mended by
+    // as much as `amount` gives it, `modifyDurabilityToRepairFromXp`, as far as it's damaged, and
+    // what's left of `amount` mending the next; what's left after, none once one's mended.
+    fn repair_with_xp(mut self, con: mut Connection, amount: i32) -> i32 {
+        if not self.items_ready() {
+            return amount
+        }
+        let items = self.items.take() else return amount
+        let names = equipment_names()
+        var picks = List<usize>()
+        for slot in 0..names.len() {
+            let stack = worn_in(con, slot) else continue
+            if not is_damaged(stack, items) {
+                continue
+            }
+            for (_, definition) in items.enchantments(stack) {
+                if mends_in(definition, names[slot]) {
+                    picks.push(slot)
+                }
+            }
+        }
+        if picks.is_empty() {
+            self.items = some(items)
+            return amount
+        }
+        var random = con.player.random.take() ?? LegacyRandom.new(self.entity_seed(con.player.entity_id))
+        let at = picks[usize.wrap(random.next_int_below(i32.wrap(picks.len())))]
+        let stack = worn_in(con, at) ?? Tag.End
+        var level_random = self.levels[con.player.dim].lend_random()
+        let to_repair = enchanted_value(stack, "minecraft:repair_with_xp", amount, items, mut level_random).max(0)
+        self.levels[con.player.dim].give_back_random(level_random)
+        con.player.random = some(random)
+        let damage = match items.component(stack, String("minecraft:damage")) {
+            some(t) => t.number_int() ?? 0,
+            none => 0,
+        }
+        let repair = if to_repair < damage { to_repair } else { damage }
+        let mended = with_damage(stack, damage - repair, items)
+        set_worn(mut con, at, mended)
+        self.items = some(items)
+        if repair > 0 and to_repair > 0 {
+            let remaining = amount - repair.wrapping_mul(amount) / to_repair
+            if remaining > 0 {
+                return self.repair_with_xp(mut con, remaining)
+            }
+        }
+        return 0
+    }
+
+    // `Player.giveExperiencePoints`, as `ServerPlayer` has it (CAL-154): their score up by
+    // `points`, their progress to the next level up by its share of what that level needs, their
+    // total up, kept from 0 up, and each level the progress makes whole given,
+    // `giveExperienceLevels`, the sound of each fifth level played but once in 100 ticks; their
+    // experience sent again.
+    fn give_experience(mut self, con: mut Connection, points: i32) {
+        if points == 0 {
+            return
+        }
+        let score = con.player.entity_data.number(SCORE)
+        con.player.entity_data.set(SCORE, Value.Number(score.wrapping_add(points)))
+        con.player.status.xp_progress = con.player.status.xp_progress + f32.nearest(points) / f32.nearest(xp_needed(con.player.status.xp_level))
+        // `Mth.clamp(totalExperience + i, 0, MAX_VALUE)`, the sum an int's.
+        let total = con.player.status.xp_total.wrapping_add(points)
+        con.player.status.xp_total = if total < 0 { 0 } else { total }
+        while con.player.status.xp_progress < 0.0f32 {
+            let p = con.player.status.xp_progress * f32.nearest(xp_needed(con.player.status.xp_level))
+            if con.player.status.xp_level > 0 {
+                self.give_levels(mut con, -1)
+                con.player.status.xp_progress = 1.0f32 + p / f32.nearest(xp_needed(con.player.status.xp_level))
+            } else {
+                self.give_levels(mut con, -1)
+                con.player.status.xp_progress = 0.0f32
+            }
+        }
+        while con.player.status.xp_progress >= 1.0f32 {
+            con.player.status.xp_progress = (con.player.status.xp_progress - 1.0f32) * f32.nearest(xp_needed(con.player.status.xp_level))
+            self.give_levels(mut con, 1)
+            con.player.status.xp_progress = con.player.status.xp_progress / f32.nearest(xp_needed(con.player.status.xp_level))
+        }
+        // `lastSentExp = -1`.
+        con.player.status.sent_xp = -1
+    }
+
+    // `giveExperienceLevels`: `levels` more, from 0 up, the level-up sound where it's gone up to
+    // a fifth level and it's been 100 ticks since it last played, at the player, from their
+    // source, louder to level 30.
+    fn give_levels(mut self, con: mut Connection, levels: i32) {
+        if levels == 0 {
+            return
+        }
+        // `IntMath.saturatedAdd`.
+        let sum = i64(con.player.status.xp_level) + i64(levels)
+        con.player.status.xp_level = if sum > 2147483647 { 2147483647 } else if sum < -2147483648 { -2147483648 } else { i32.wrap(sum) }
+        if con.player.status.xp_level < 0 {
+            con.player.status.xp_level = 0
+            con.player.status.xp_progress = 0.0f32
+            con.player.status.xp_total = 0
+        }
+        let at = con.player.status.xp_level
+        if levels > 0 and at % 5 == 0 and f32.nearest(con.player.last_level_up) < f32.nearest(con.player.tick_count) - 100.0f32 {
+            let loud = if at > 30 { 1.0f32 } else { f32.nearest(at) / 30.0f32 }
+            self.levels[con.player.dim].play_sound_from_source(String("minecraft:entity.player.levelup"), con.player.x, con.player.y, con.player.z, 7, loud * 0.75f32, 1.0f32)
+            con.player.last_level_up = con.player.tick_count
+        }
+        con.player.status.sent_xp = -1
     }
 
     // `ItemEntity.playerTouch`: an item that may be picked up, and is for them if it's for
@@ -5454,7 +5857,7 @@ impl Network {
             return
         }
         var es = self.take_entities(d)
-        var e = es.items.lend(id) else {
+        var e = es.list.lend(id) else {
             self.put_entities(d, es)
             return
         }
@@ -5463,13 +5866,13 @@ impl Network {
             me = some((p.id.most, p.id.least))
         }
         let mine = e.target == none or e.target == me
-        if e.removed or e.pickup_delay != 0 or not mine {
-            es.items.give_back(e)
+        if e.body.removed or e.pickup_delay != 0 or not mine {
+            es.list.give_back(e)
             self.put_entities(d, es)
             return
         }
         let codecs = self.items.take() else {
-            es.items.give_back(e)
+            es.list.give_back(e)
             self.put_entities(d, es)
             return
         }
@@ -5478,7 +5881,7 @@ impl Network {
         let (left, added) = pick_up(mut con.player.inventory, e.stack, codecs, who)
         self.items = some(codecs)
         if not added {
-            es.items.give_back(e)
+            es.list.give_back(e)
             self.put_entities(d, es)
             return
         }
@@ -5488,15 +5891,15 @@ impl Network {
             self.send_to_seen_with(seen, encode_play(ClientboundTakeItemEntity { item_id: id, collector_id: pid, amount: org }), mut con)
         }
         if left <= 0 {
-            es.items.remove(id)
-            _ = es.items.take_gone()
+            es.list.remove(id)
+            _ = es.list.take_gone()
             _ = es.tracked.remove(id)
             if let tr = es.trackers.remove(id) {
                 self.send_to_seen_with(tr.seen_by, encode_play(ClientboundRemoveEntities { entity_ids: [id] }), mut con)
             }
         } else {
             e.stack = shrunk(e.stack, org - left) ?? e.stack.copy()
-            es.items.give_back(e)
+            es.list.give_back(e)
         }
         self.put_entities(d, es)
     }
@@ -5508,6 +5911,10 @@ impl Network {
     // health, food and experience sent where they changed; and last their pose, `updatePlayerPose`
     // (CAL-141).
     fn do_tick(mut self, con: mut Connection) {
+        // `Player.tick`'s `takeXpDelay` (CAL-154).
+        if con.player.take_xp_delay > 0 {
+            con.player.take_xp_delay -= 1
+        }
         let wet = self.eyes_in_water(con)
         con.player.eye_in_water = wet
         if self.items_ready() {

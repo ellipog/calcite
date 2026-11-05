@@ -1,0 +1,699 @@
+/// What every entity in a level has and does, as vanilla's `Entity` has it (CAL-154): its network
+/// ID, its random and the UUID drawn from it, where it is and was, its motion, angles and size,
+/// what it stands on and hit, its fall, the fluids it's in, and what it's saved with that Calcite
+/// doesn't run yet; and moving as `Entity.move` moves it, against the blocks' shapes
+/// (`world.movement`), standing on the block below it and bouncing as that block makes it, pushed
+/// out of a block it's stuck in, `moveTowardsClosestSpace`, and in and out of fluids, which push
+/// it with their currents (`world.currents`). An item entity (`world.item_entity`) and an
+/// experience orb (`world.experience_orb`) each have one.
+///
+/// It's saved as `Entity.saveWithoutId` saves it, `save_into`, and read as `Entity.load` reads it,
+/// `load_from`, in the order vanilla puts each, which its compound's order follows.
+module world.body
+
+import nbt.tag.{Tag}
+import random.legacy.{LegacyRandom}
+import server.log.{Entry}
+import world.collision.{Aabb, CollisionBlocks}
+import world.currents.{FlowFacts, fluids_seen, push}
+import world.movement.{Mover, MovementStates, collide_with, moved, swept}
+import worldgen.facts.{BlockSet, EAST, Facts, NORTH, SOUTH, UP, WEST, step_x, step_y, step_z}
+
+/// A sound an entity played, `Entity.playSound`, where it was: an item's splash as it came into
+/// water. Its source is the entity's, `getSoundSource`.
+pub struct EntitySound {
+    pub sound: String
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    pub volume: f32
+    pub pitch: f32
+}
+
+/// What an entity's move reads of blocks besides their shapes: the water and bubble column
+/// blocks, the fences, walls and fence gates it stands on top of, the blocks that don't bounce,
+/// and what fluids flow by.
+pub struct BodyFacts {
+    pub water: u32
+    pub bubble_column: u32
+    pub fences: BlockSet
+    pub walls: BlockSet
+    pub no_bounce: BlockSet
+    pub flow: FlowFacts
+}
+
+impl BodyFacts {
+    /// As `f` has them, its tags those its level loaded.
+    pub fn new(f: Facts) -> BodyFacts {
+        let water = f.block_named(String("minecraft:water")) else panic("no water block")
+        let column = f.block_named(String("minecraft:bubble_column")) else panic("no bubble column block")
+        return BodyFacts {
+            water: water,
+            bubble_column: column,
+            fences: f.tag_or_empty(String("minecraft:fences")),
+            walls: f.tag_or_empty(String("minecraft:walls")),
+            no_bounce: f.tag_or_empty(String("minecraft:suppresses_bounce")),
+            flow: FlowFacts.new(f),
+        }
+    }
+}
+
+/// An entity's body.
+pub struct Body {
+    /// Its network ID and UUID, most then least significant bits.
+    pub id: i32
+    pub uuid: (i64, i64)
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    /// Where it was as its tick began, `xo`, `yo` and `zo`.
+    pub xo: f64 = 0.0
+    pub yo: f64 = 0.0
+    pub zo: f64 = 0.0
+    pub vx: f64 = 0.0
+    pub vy: f64 = 0.0
+    pub vz: f64 = 0.0
+    pub y_rot: f32 = 0.0f32
+    pub x_rot: f32 = 0.0f32
+    /// Its type's size, `EntityDimensions`, its eyes' height, and how fast it falls,
+    /// `getDefaultGravity`.
+    pub width: f32
+    pub height: f32
+    pub eyes: f32
+    pub gravity: f64
+    pub on_ground: bool = false
+    pub horizontal_collision: bool = false
+    pub vertical_collision: bool = false
+    pub vertical_below: bool = false
+    /// The block it stands on, `mainSupportingBlockPos`, and whether it stood on none when it
+    /// last landed, `onGroundNoBlocks`.
+    pub support: (i32, i32, i32)? = none
+    pub no_blocks: bool = false
+    pub fall: f64 = 0.0
+    pub tick_count: i32 = 0
+    /// Whether it was in water at its last look, `wasTouchingWater`, how deep it was in water and
+    /// in lava, and whether its eyes were in water.
+    pub in_water: bool = false
+    pub water: f64 = 0.0
+    pub lava: f64 = 0.0
+    pub water_eyes: bool = false
+    pub first_tick: bool = true
+    pub no_gravity: bool = false
+    pub no_physics: bool = false
+    /// Whether its tracker's to send its motion and place now, `needsSync`, and its place,
+    /// `syncPosition`, as after a bounce.
+    pub needs_sync: bool = false
+    pub sync_position: bool = false
+    pub removed: bool = false
+    /// When it came into its level, which places it in the tick list among the players there.
+    pub entered: u64 = 0
+    /// What `Entity` saves that Calcite doesn't run yet: its fire, `remainingFireTicks`, its air,
+    /// whether it can't be hurt, its portal cooldown, which counts down; and the rest it was
+    /// loaded with, by the keys it's saved under, as it's saved (CAL-148).
+    pub fire: i32 = 0
+    pub air: i32 = 300
+    pub invulnerable: bool = false
+    pub portal_cooldown: i32 = 0
+    pub extras: JavaHashMap<String, Tag> = JavaHashMap<String, Tag>()
+    /// Its own random, `Entity.random`.
+    pub random: LegacyRandom
+}
+
+impl Body {
+    /// A body at x, y, z of a type `width` across and `height` high, its eyes `eyes` up, falling
+    /// `gravity` a tick, with its own random seeded `seed`, as `Entity`'s constructor makes it: its
+    /// random first, then its UUID drawn from it, `Mth.createInsecureUUID`.
+    pub fn made(id: i32, seed: i64, x: f64, y: f64, z: f64, width: f32, height: f32, eyes: f32, gravity: f64) -> Body {
+        var random = LegacyRandom.new(seed)
+        let most = (random.next_long() & -61441) | 16384
+        let least = (random.next_long() & 4611686018427387903) | i64.MIN
+        return Body { id: id, uuid: (most, least), x: x, y: y, z: z, xo: x, yo: y, zo: z, width: width, height: height, eyes: eyes, gravity: gravity, random: random }
+    }
+
+    /// Its box, `EntityDimensions.makeBoundingBox`, floats.
+    pub fn bounding_box(self) -> Aabb {
+        let half = f64(self.width / 2.0f32)
+        return Aabb { min_x: self.x - half, min_y: self.y, min_z: self.z - half, max_x: self.x + half, max_y: self.y + f64(self.height), max_z: self.z + half }
+    }
+
+    /// Whether it's in lava, `isInLava`: not on its first tick.
+    pub fn in_lava(self) -> bool {
+        return not self.first_tick and self.lava > 0.0
+    }
+
+    /// `getGravity`: none where it has no gravity.
+    pub fn gravity_now(self) -> f64 {
+        return if self.no_gravity { 0.0 } else { self.gravity }
+    }
+
+    /// What its collisions see of it, `EntityCollisionContext`.
+    pub fn mover(self) -> Mover {
+        return Mover { y: self.y, fall: self.fall }
+    }
+
+    /// The block it's in, `blockPosition`.
+    pub fn block(self) -> (i32, i32, i32) {
+        return (i32.saturate(self.x.floor()), i32.saturate(self.y.floor()), i32.saturate(self.z.floor()))
+    }
+
+    /// `Entity.updateFluidInteraction`: the fluids it's in and whether its eyes are in water, its
+    /// fall forgotten in water, a splash as it comes into it where it `splashes`, then the
+    /// currents' pushes; whether it's in any fluid.
+    pub fn update_fluids<B: CollisionBlocks>(mut self, f: Facts, t: BodyFacts, blocks: B, fast_lava: bool, splashes: bool, sounds: mut List<EntitySound>) -> bool {
+        let eyes = (i32.saturate(self.x.floor()), self.y + f64(self.eyes), i32.saturate(self.z.floor()))
+        let r = fluids_seen(f, t.flow, blocks, self.bounding_box(), false, some(eyes))
+        self.water = r.water
+        self.lava = r.lava
+        self.water_eyes = r.water_eyes
+        let wet = r.water > 0.0
+        if wet {
+            self.fall = 0.0
+            if not self.in_water and not self.first_tick and splashes {
+                self.splash(mut sounds)
+            }
+        }
+        self.in_water = wet
+        if wet {
+            let (x, y, z) = push(r.water_current, 0.014, false, self.vx, self.vy, self.vz)
+            self.vx = x
+            self.vy = y
+            self.vz = z
+        }
+        if r.lava > 0.0 {
+            let scale = if fast_lava { 0.007 } else { 0.0023333333333333335 }
+            let (x, y, z) = push(r.lava_current, scale, false, self.vx, self.vy, self.vz)
+            self.vx = x
+            self.vy = y
+            self.vz = z
+        }
+        return r.any
+    }
+
+    // `doWaterSplashEffect`: the splash's sound, as loud as it's moving, and its random's draws
+    // for the bubbles and splashes, `1.0F + width * 20.0F` of each, three draws a bubble and two a
+    // splash, which a server sends nothing of.
+    fn splash(mut self, sounds: mut List<EntitySound>) {
+        let fast = (self.vx * self.vx * f64(0.2f32) + self.vy * self.vy + self.vz * self.vz * f64(0.2f32)).sqrt()
+        let loud = f32.nearest(fast) * 0.2f32
+        let volume = if loud < 1.0f32 { loud } else { 1.0f32 }
+        let a = self.random.next_float()
+        let b = self.random.next_float()
+        let pitch = 1.0f32 + (a - b) * 0.4f32
+        sounds.push(EntitySound { sound: String("minecraft:entity.generic.splash"), x: self.x, y: self.y, z: self.z, volume: volume, pitch: pitch })
+        let n = i32.saturate(f64(1.0f32 + self.width * 20.0f32))
+        for _ in 0..n * 3 {
+            _ = self.random.next_double()
+        }
+        for _ in 0..n * 2 {
+            _ = self.random.next_double()
+        }
+    }
+
+    /// `moveTowardsClosestSpace`: pushed out of the block at x, y, z toward its nearest side that
+    /// isn't a whole block, north, south, west, east or up, up if they all are, at 0.1 to 0.3.
+    pub fn closest_space<B: CollisionBlocks>(mut self, f: Facts, blocks: B, x: f64, y: f64, z: f64) {
+        let px = i32.saturate(x.floor())
+        let py = i32.saturate(y.floor())
+        let pz = i32.saturate(z.floor())
+        let dx = x - f64(px)
+        let dy = y - f64(py)
+        let dz = z - f64(pz)
+        var best = UP
+        var closest = f64.MAX
+        let sides: List<i32> = [NORTH, SOUTH, WEST, EAST, UP]
+        for d in sides {
+            let state = blocks.collision_state(px + step_x(d), py + step_y(d), pz + step_z(d)) ?? 0
+            if f.collision_full_block(state) {
+                continue
+            }
+            let along = if d == WEST or d == EAST { dx } else if d == UP { dy } else { dz }
+            let toward = if d == SOUTH or d == EAST or d == UP { 1.0 - along } else { along }
+            if toward < closest {
+                closest = toward
+                best = d
+            }
+        }
+        let speed = self.random.next_float() * 0.2f32 + 0.1f32
+        let step = if best == SOUTH or best == EAST or best == UP { 1.0f32 } else { -1.0f32 }
+        let sx = self.vx * 0.75
+        let sy = self.vy * 0.75
+        let sz = self.vz * 0.75
+        let out = f64(step * speed)
+        if best == WEST or best == EAST {
+            self.vx = out
+            self.vy = sy
+            self.vz = sz
+        } else if best == UP {
+            self.vx = sx
+            self.vy = out
+            self.vz = sz
+        } else {
+            self.vx = sx
+            self.vy = sy
+            self.vz = out
+        }
+    }
+
+    /// `Entity.move` by dx, dy, dz, for itself: through blocks with no physics, else as far as
+    /// their shapes let it, then whether it hit anything and stands on a block, its fall, its
+    /// bounce off what it hit, and the speed factor of the block it's in or on.
+    pub fn move_by<B: CollisionBlocks>(mut self, f: Facts, m: MovementStates, t: BodyFacts, blocks: B, dx: f64, dy: f64, dz: f64) {
+        if self.no_physics {
+            self.x = self.x + dx
+            self.y = self.y + dy
+            self.z = self.z + dz
+            self.horizontal_collision = false
+            self.vertical_collision = false
+            self.vertical_below = false
+            return
+        }
+        var mx = dx
+        var my = dy
+        var mz = dz
+        let asked = dx * dx + dy * dy + dz * dz
+        if asked != 0.0 {
+            let b = self.bounding_box()
+            let c = m.colliders(f, blocks, swept(b, dx, dy, dz), self.mover())
+            let (cx, cy, cz) = collide_with(c, b, dx, dy, dz)
+            mx = cx
+            my = cy
+            mz = cz
+        }
+        let length = mx * mx + my * my + mz * mz
+        if length > 1.0e-7 or asked - length < 1.0e-7 {
+            self.x = self.x + mx
+            self.y = self.y + my
+            self.z = self.z + mz
+        }
+        let x_hit = not equal(dx, mx)
+        let z_hit = not equal(dz, mz)
+        self.horizontal_collision = x_hit or z_hit
+        let vertically = dy.abs() > 0.0
+        // Its own side, the server's, has the say, `isLocalInstanceAuthoritative`.
+        self.vertical_collision = dy != my
+        self.vertical_below = self.vertical_collision and dy < 0.0
+        let below = self.vertical_below
+        self.set_on_ground(f, m, blocks, below, mx, mz)
+        let (ex, ey, ez) = self.on_pos(f, t, blocks, 0.2f32)
+        let effect = blocks.collision_state(ex, ey, ez) ?? 0
+        // `checkFallDamage`; a block's `fallOn` isn't in Calcite.
+        if not self.in_water and my < 0.0 {
+            self.fall = self.fall - f64(f32.nearest(my))
+        }
+        if self.on_ground {
+            self.fall = 0.0
+        }
+        if self.removed {
+            return
+        }
+        if (vertically and self.vertical_collision) or self.horizontal_collision {
+            self.restitute(f, m, t, effect, x_hit, z_hit, my)
+        }
+        let speed = f64(self.speed_factor(f, m, t, blocks))
+        self.vx = self.vx * speed
+        self.vy = self.vy * 1.0
+        self.vz = self.vz * speed
+    }
+
+    // `setOnGroundWithMovement`, `checkSupportingBlock`: on the ground if it hit something going
+    // down, and then standing on the nearest block just below its box's bottom, or below where it
+    // came across from if there's none and it had one.
+    fn set_on_ground<B: CollisionBlocks>(mut self, f: Facts, m: MovementStates, blocks: B, ground: bool, mx: f64, mz: f64) {
+        self.on_ground = ground
+        if not ground {
+            self.no_blocks = false
+            self.support = none
+            return
+        }
+        let b = self.bounding_box()
+        let test = Aabb { min_x: b.min_x, min_y: b.min_y - 1.0e-6, min_z: b.min_z, max_x: b.max_x, max_y: b.min_y, max_z: b.max_z }
+        var found = self.supporting(f, m, blocks, test)
+        if found != none or self.no_blocks {
+            self.support = found
+        } else {
+            found = self.supporting(f, m, blocks, moved(test, -mx, 0.0, -mz))
+            self.support = found
+        }
+        self.no_blocks = found == none
+    }
+
+    // `findSupportingBlock`: of the blocks whose shapes meet `test`, the one whose middle is
+    // nearest, the greatest by y, z and x of those as near.
+    fn supporting<B: CollisionBlocks>(self, f: Facts, m: MovementStates, blocks: B, test: Aabb) -> (i32, i32, i32)? {
+        let c = m.colliders(f, blocks, test, self.mover())
+        var best: (i32, i32, i32)? = none
+        var nearest = f64.MAX
+        for (x, y, z) in c.at {
+            let dx = f64(x) + 0.5 - self.x
+            let dy = f64(y) + 0.5 - self.y
+            let dz = f64(z) + 0.5 - self.z
+            let d = dx * dx + dy * dy + dz * dz
+            var take = d < nearest
+            if not take and d == nearest {
+                take = match best {
+                    some(b) => before(b, (x, y, z)),
+                    none => true,
+                }
+            }
+            if take {
+                best = some((x, y, z))
+                nearest = d
+            }
+        }
+        return best
+    }
+
+    /// `getOnPos`: the block it stands on, at `offset` below its feet unless that's a fence's,
+    /// wall's or fence gate's top it stands on; or the block that far below it where it stands on
+    /// none.
+    pub fn on_pos<B: CollisionBlocks>(self, f: Facts, t: BodyFacts, blocks: B, offset: f32) -> (i32, i32, i32) {
+        let below = i32.saturate((self.y - f64(offset)).floor())
+        if let s = self.support {
+            let (sx, sy, sz) = s
+            if not (offset > 1.0e-5f32) {
+                return (sx, sy, sz)
+            }
+            let state = blocks.collision_state(sx, sy, sz) ?? 0
+            let fence = f.in_set(state, t.fences)
+            let wall = f.in_set(state, t.walls)
+            let gate = f.is_a(f.block(state), String("FenceGateBlock"))
+            if (not (f64(offset) <= 0.5) or not fence) and not wall and not gate {
+                return (sx, below, sz)
+            }
+            return (sx, sy, sz)
+        }
+        return (i32.saturate(self.x.floor()), below, i32.saturate(self.z.floor()))
+    }
+
+    // `restituteMovementAfterCollisions`: it doesn't bounce off a wall, its motion across into
+    // it gone; and coming down onto a block, it bounces as high as the block's bounce, 0.8 of it
+    // for what isn't alive, unless it was hardly falling or the block doesn't bounce.
+    fn restitute(mut self, f: Facts, m: MovementStates, t: BodyFacts, effect: u32, x_hit: bool, z_hit: bool, my: f64) {
+        var restitution = 0.0
+        let cx = self.vx
+        let cy = self.vy
+        let cz = self.vz
+        var bx = cx
+        var by = cy
+        var bz = cz
+        if x_hit {
+            bx = -cx * restitution
+        }
+        if z_hit {
+            bz = -cz * restitution
+        }
+        var bounced = restitution > 0.0 and (x_hit or z_hit)
+        if self.vertical_collision {
+            let gravity = self.gravity_now()
+            if self.vertical_below {
+                let block = f.block(effect)
+                if not (-cy <= gravity) and not f.in_set(effect, t.no_bounce) {
+                    let bounce = f64(m.bounce(block) * 0.8f32)
+                    restitution = if restitution > bounce { restitution } else { bounce }
+                } else {
+                    restitution = 0.0
+                }
+            }
+            var compensation = 0.0
+            var drag = 1.0
+            if restitution > 0.0 {
+                let portion = my / cy
+                compensation = portion * gravity
+                drag = 1.0 + portion * (f64(0.98f32) - 1.0)
+                bounced = true
+            }
+            by = (compensation - cy) * drag * restitution
+        }
+        if bounced {
+            // `bounceOn` and the `BOUNCE` game event aren't in Calcite; its place is sent.
+            self.sync_position = true
+        }
+        self.vx = bx
+        self.vy = by
+        self.vz = bz
+    }
+
+    // `getBlockSpeedFactor`: the block it's in's, unless that's 1 and it isn't water or a bubble
+    // column, then the block under it's.
+    fn speed_factor<B: CollisionBlocks>(self, f: Facts, m: MovementStates, t: BodyFacts, blocks: B) -> f32 {
+        let here = f.block(blocks.collision_state(i32.saturate(self.x.floor()), i32.saturate(self.y.floor()), i32.saturate(self.z.floor())) ?? 0)
+        let speed = m.speed_factor(here)
+        if here == t.water or here == t.bubble_column {
+            return speed
+        }
+        if f64(speed) == 1.0 {
+            let (bx, by, bz) = self.on_pos(f, t, blocks, 0.999999f32)
+            return m.speed_factor(f.block(blocks.collision_state(bx, by, bz) ?? 0))
+        }
+        return speed
+    }
+
+    /// What `saveAsPassenger` saves of it before its type's own, put in the order vanilla puts it
+    /// (CAL-148): its type `kind`; `Entity.saveWithoutId`'s place, motion, angles, fall, fire, air,
+    /// ground, invulnerability, portal cooldown and UUID, with what it was loaded with of the rest
+    /// where vanilla puts it, and `NoGravity` if it has none.
+    pub fn save_into(self, t: mut JavaHashMap<String, Tag>, kind: str) {
+        t.insert(String("id"), Tag.Str(String(kind)))
+        t.insert(String("Pos"), Tag.List([Tag.Double(self.x), Tag.Double(self.y), Tag.Double(self.z)]))
+        t.insert(String("Motion"), Tag.List([Tag.Double(self.vx), Tag.Double(self.vy), Tag.Double(self.vz)]))
+        t.insert(String("Rotation"), Tag.List([Tag.Float(self.y_rot), Tag.Float(self.x_rot)]))
+        t.insert(String("fall_distance"), Tag.Double(self.fall))
+        t.insert(String("Fire"), Tag.Short(i16.wrap(self.fire)))
+        t.insert(String("Air"), Tag.Short(i16.wrap(self.air)))
+        t.insert(String("OnGround"), flag(self.on_ground))
+        t.insert(String("Invulnerable"), flag(self.invulnerable))
+        t.insert(String("PortalCooldown"), Tag.Int(self.portal_cooldown))
+        self.put_extra(mut t, "invulnerable_time")
+        t.insert(String("UUID"), uuid_tag(self.uuid))
+        self.put_extra(mut t, "CustomName")
+        self.put_extra(mut t, "CustomNameVisible")
+        self.put_extra(mut t, "Silent")
+        if self.no_gravity {
+            t.insert(String("NoGravity"), Tag.Byte(1i8))
+        }
+        self.put_extra(mut t, "Glowing")
+        self.put_extra(mut t, "TicksFrozen")
+        self.put_extra(mut t, "HasVisualFire")
+        self.put_extra(mut t, "Tags")
+        self.put_extra(mut t, "data")
+    }
+
+    fn put_extra(self, t: mut JavaHashMap<String, Tag>, key: str) {
+        if self.extras.contains(key) {
+            t.insert(String(key), self.extras[key].copy())
+        }
+    }
+
+    /// Reads `tag` into it as `Entity.load` reads it, before its type's own (CAL-148): its place,
+    /// clamped to the world's reach, its motion, none on an axis past 10, its angles, the pitch
+    /// within a right angle, and the rest, each as `ValueInput` reads a number, with vanilla's
+    /// defaults; its UUID where it reads as one. It needs syncing, as `load` has it. False where
+    /// it's somewhere that isn't a number, which vanilla's load throws on, logged in `lines` as
+    /// `loadStaticEntity` logs it.
+    pub fn load_from(mut self, tag: JavaHashMap<String, Tag>, lines: mut List<Entry>) -> bool {
+        let zero: List<f64> = [0.0, 0.0, 0.0]
+        let level: List<f32> = [0.0f32, 0.0f32]
+        let pos = doubles(tag, "Pos", 3) ?? zero.copy()
+        let motion = doubles(tag, "Motion", 3) ?? zero.copy()
+        let angles = floats(tag, "Rotation") ?? level.copy()
+        self.vx = if motion[0].abs() > 10.0 { 0.0 } else { motion[0] }
+        self.vy = if motion[1].abs() > 10.0 { 0.0 } else { motion[1] }
+        self.vz = if motion[2].abs() > 10.0 { 0.0 } else { motion[2] }
+        self.needs_sync = true
+        self.x = clamp(pos[0], -3.0000512e7, 3.0000512e7)
+        self.y = clamp(pos[1], -2.0e7, 2.0e7)
+        self.z = clamp(pos[2], -3.0000512e7, 3.0000512e7)
+        if finite(f64(angles[0])) {
+            self.y_rot = angles[0]
+        }
+        if finite(f64(angles[1])) {
+            self.x_rot = clamp_pitch(angles[1] % 360.0f32)
+        }
+        self.xo = self.x
+        self.yo = self.y
+        self.zo = self.z
+        self.fall = number(tag, "fall_distance") ?? 0.0
+        self.fire = i32(short_or(tag, "Fire", 0i16))
+        self.air = int_or(tag, "Air", 300)
+        self.on_ground = bool_or(tag, "OnGround")
+        self.invulnerable = bool_or(tag, "Invulnerable")
+        let invulnerable_time = int_or(tag, "invulnerable_time", 0)
+        self.portal_cooldown = int_or(tag, "PortalCooldown", 0)
+        if let u = uuid_of(tag, "UUID") {
+            self.uuid = u
+        }
+        if not (finite(self.x) and finite(self.y) and finite(self.z)) {
+            lines.push(Entry.warn(String("Exception loading entity: net.minecraft.ReportedException: Loading entity NBT")))
+            return false
+        }
+        self.y_rot = self.y_rot % 360.0f32
+        // What it keeps to save as it was: those vanilla saves only where they're set, as it
+        // saves them.
+        if invulnerable_time > 0 {
+            self.extras.insert(String("invulnerable_time"), Tag.Int(invulnerable_time))
+        }
+        if tag.contains("CustomName") {
+            self.extras.insert(String("CustomName"), tag["CustomName"].copy())
+        }
+        for key in ["CustomNameVisible", "Silent", "Glowing", "HasVisualFire"] {
+            if bool_or(tag, key) {
+                self.extras.insert(String(key), Tag.Byte(1i8))
+            }
+        }
+        self.no_gravity = bool_or(tag, "NoGravity")
+        let frozen = int_or(tag, "TicksFrozen", 0)
+        if frozen > 0 {
+            self.extras.insert(String("TicksFrozen"), Tag.Int(frozen))
+        }
+        for key in ["Tags", "data"] {
+            if tag.contains(key) {
+                self.extras.insert(String(key), tag[key].copy())
+            }
+        }
+        return true
+    }
+}
+
+// `Mth.equal`: closer than 1.0E-5F.
+fn equal(a: f64, b: f64) -> bool {
+    return (b - a).abs() < f64(1.0e-5f32)
+}
+
+// `BlockPos.compareTo(b) < 0`: `a` comes before `b` by y, then z, then x.
+fn before(a: (i32, i32, i32), b: (i32, i32, i32)) -> bool {
+    let (ax, ay, az) = a
+    let (bx, by, bz) = b
+    if ay != by {
+        return ay < by
+    }
+    if az != bz {
+        return az < bz
+    }
+    return ax < bx
+}
+
+// A boolean as `putBoolean` saves it.
+fn flag(b: bool) -> Tag {
+    return Tag.Byte(if b { 1i8 } else { 0i8 })
+}
+
+/// A UUID as `UUIDUtil.CODEC` saves it, four ints, most significant first.
+pub fn uuid_tag(u: (i64, i64)) -> Tag {
+    let (most, least) = u
+    return Tag.IntArray([i32.wrap(most >> 32), i32.wrap(most), i32.wrap(least >> 32), i32.wrap(least)])
+}
+
+/// The UUID saved as `key`, as `UUIDUtil.CODEC` reads it: four ints, an int array or a list of
+/// numbers.
+pub fn uuid_of(tag: JavaHashMap<String, Tag>, key: str) -> (i64, i64)? {
+    if not tag.contains(key) {
+        return none
+    }
+    var ints = List<i32>()
+    match tag[key] {
+        Tag.IntArray(v) => {
+            for i in v {
+                ints.push(i)
+            }
+        },
+        Tag.List(items) => {
+            for item in items {
+                let i = item.number_int() else return none
+                ints.push(i)
+            }
+        },
+        _ => return none,
+    }
+    if ints.len() != 4 {
+        return none
+    }
+    let most = (i64(ints[0]) << 32) | (i64(ints[1]) & 4294967295)
+    let least = (i64(ints[2]) << 32) | (i64(ints[3]) & 4294967295)
+    return some((most, least))
+}
+
+// The `n` numbers saved as `key`, as `Vec3.CODEC` reads them, or none.
+fn doubles(tag: JavaHashMap<String, Tag>, key: str, n: usize) -> List<f64>? {
+    if not tag.contains(key) {
+        return none
+    }
+    let Tag.List(items) = tag[key] else return none
+    if items.len() != n {
+        return none
+    }
+    var out = List<f64>()
+    for item in items {
+        let v = item.number_double() else return none
+        out.push(v)
+    }
+    return some(out)
+}
+
+// The two angles saved as `key`, as `Vec2.CODEC` reads them, or none.
+fn floats(tag: JavaHashMap<String, Tag>, key: str) -> List<f32>? {
+    if not tag.contains(key) {
+        return none
+    }
+    let Tag.List(items) = tag[key] else return none
+    if items.len() != 2 {
+        return none
+    }
+    var out = List<f32>()
+    for item in items {
+        let v = item.number_float() else return none
+        out.push(v)
+    }
+    return some(out)
+}
+
+// The number saved as `key`, as `getDoubleOr` reads it.
+fn number(tag: JavaHashMap<String, Tag>, key: str) -> f64? {
+    if not tag.contains(key) {
+        return none
+    }
+    return tag[key].number_double()
+}
+
+/// The number saved as `key`, as `getShortOr`, `getIntOr` and `getBooleanOr` read it.
+pub fn short_or(tag: JavaHashMap<String, Tag>, key: str, fallback: i16) -> i16 {
+    if not tag.contains(key) {
+        return fallback
+    }
+    return tag[key].short_value() ?? fallback
+}
+
+pub fn int_or(tag: JavaHashMap<String, Tag>, key: str, fallback: i32) -> i32 {
+    if not tag.contains(key) {
+        return fallback
+    }
+    return tag[key].int_value() ?? fallback
+}
+
+pub fn bool_or(tag: JavaHashMap<String, Tag>, key: str) -> bool {
+    if not tag.contains(key) {
+        return false
+    }
+    let b = tag[key].byte_value() else return false
+    return b != 0i8
+}
+
+// Whether `v` is neither infinite nor NaN, `Double.isFinite`.
+fn finite(v: f64) -> bool {
+    return v - v == 0.0
+}
+
+// `Mth.clamp` of a double.
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    if v < lo {
+        return lo
+    }
+    return if v > hi { hi } else { v }
+}
+
+// `Math.clamp(xRot, -90, 90)`.
+fn clamp_pitch(v: f32) -> f32 {
+    if v < -90.0f32 {
+        return -90.0f32
+    }
+    return if v > 90.0f32 { 90.0f32 } else { v }
+}
