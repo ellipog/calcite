@@ -18,6 +18,9 @@ IDs the protocol needs, which every compatible server encodes:
   the boxes of each, from the same file (CAL-75).
 - `world.fluid_faces`: the faces a fluid sees of each block state, which two cover a face between
   them, and the boxes of the states vanilla offsets by their position, from the same file (D327).
+- `world.movement_shapes`: each block state's collision shape as an entity moves against it, the
+  boxes of each, the blocks' friction, speed, jump and bounce, and vanilla's own collide cases,
+  from the same file (CAL-148).
 - `world.entity_facts`: what natural spawning asks of each entity type and block state, from
   entity_facts.json, which oracle/datagen/entity_facts.py writes beside the tables (D317).
 """
@@ -1072,16 +1075,19 @@ def fluid_faces_module(index, flags):
     return "\n".join(lines)
 
 
-def collision_module(index, flags):
-    """The text of src/world/collision_shapes.calx."""
-    shapes = flags["collision"]
-    boxes = flags["collision_boxes"]
+def shape_table(flags, key, boxes_key):
+    """A table of shapes from block_flags.json: each state's shape by `key`, each shape's boxes by
+    `boxes_key`, checked, as what the modules' `state_shapes`, `shape_starts` and `shape_boxes`
+    are made of: the palette, how many of it take one character, how many characters start a
+    pair, the lines of characters, where each shape's boxes start, and the boxes' coordinates."""
+    shapes = flags[key]
+    boxes = flags[boxes_key]
     if len(shapes) != flags["states"]:
-        raise ValueError(f"block_flags.json has {len(shapes)} states' collision shapes for {flags['states']} states")
+        raise ValueError(f"block_flags.json has {len(shapes)} states' {key} shapes for {flags['states']} states")
     if not all(0 <= s < len(boxes) for s in shapes):
-        raise ValueError("a state's collision shape isn't one of the table's")
+        raise ValueError(f"a state's {key} shape isn't one of the table's")
     if boxes[0] != [] or boxes[1] != [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]]:
-        raise ValueError("collision shape 0 isn't empty, or 1 isn't the whole block")
+        raise ValueError(f"{key} shape 0 isn't empty, or 1 isn't the whole block")
     coords = []
     starts = []
     for shape in boxes:
@@ -1119,27 +1125,17 @@ def collision_module(index, flags):
         if len(chunks[-1]) + len(c) > LINE:
             chunks.append("")
         chunks[-1] += c
+    return palette, single, pairs, chunks, starts, coords
+
+
+def shape_lines(shapes, palette, single, pairs, chunks, starts, coords):
+    """The lines of a shapes module's `state_shapes`, `shape_starts` and `shape_boxes`."""
 
     def numbers(values, per=24):
         rows = [", ".join(str(v) for v in values[i:i + per]) for i in range(0, len(values), per)]
         return ",\n".join(f"        {r}" for r in rows)
 
     lines = [
-        f"/// Each of vanilla {index['game_version']}'s block states' collision shapes, as the spawn finder sees them:",
-        "/// `getCollisionShape` with an empty context that collides with fluids, so a liquid is a whole",
-        "/// block. A state vanilla offsets by its position, as bamboo, has the shape it has before it's",
-        "/// offset. Written by oracle/datagen/calx_tables.py from block_flags.json (CAL-75): don't edit it.",
-        "///",
-        "/// The shapes are numbered, 0 the empty one and 1 the whole block, and each is a list of boxes,",
-        "/// as `toAabbs` gives them.",
-        "module world.collision_shapes",
-        "",
-        "/// How many 32nds of a block a box's coordinate is from, and above, `BOX_FLOOR`.",
-        f"pub const BOX_UNIT: i32 = {BOX_UNIT}",
-        f"pub const BOX_FLOOR: i32 = {BOX_FLOOR}",
-        "/// How many different shapes there are.",
-        f"pub const SHAPES: u32 = {len(boxes)}",
-        "",
         "/// Each state's shape, in state ID order.",
         "pub fn state_shapes() -> List<u16> {",
         f"    // The shapes, the commonest first, and an index into them for each state, a character",
@@ -1188,6 +1184,112 @@ def collision_module(index, flags):
         "pub fn shape_boxes() -> List<u8> {",
         "    return [",
         numbers(coords),
+        "    ]",
+        "}",
+        "",
+    ]
+    return lines
+
+
+def collision_module(index, flags):
+    """The text of src/world/collision_shapes.calx."""
+    shapes = flags["collision"]
+    boxes = flags["collision_boxes"]
+    palette, single, pairs, chunks, starts, coords = shape_table(flags, "collision", "collision_boxes")
+    lines = [
+        f"/// Each of vanilla {index['game_version']}'s block states' collision shapes, as the spawn finder sees them:",
+        "/// `getCollisionShape` with an empty context that collides with fluids, so a liquid is a whole",
+        "/// block. A state vanilla offsets by its position, as bamboo, has the shape it has before it's",
+        "/// offset. Written by oracle/datagen/calx_tables.py from block_flags.json (CAL-75): don't edit it.",
+        "///",
+        "/// The shapes are numbered, 0 the empty one and 1 the whole block, and each is a list of boxes,",
+        "/// as `toAabbs` gives them.",
+        "module world.collision_shapes",
+        "",
+        "/// How many 32nds of a block a box's coordinate is from, and above, `BOX_FLOOR`.",
+        f"pub const BOX_UNIT: i32 = {BOX_UNIT}",
+        f"pub const BOX_FLOOR: i32 = {BOX_FLOOR}",
+        "/// How many different shapes there are.",
+        f"pub const SHAPES: u32 = {len(boxes)}",
+        "",
+    ]
+    lines += shape_lines(shapes, palette, single, pairs, chunks, starts, coords)
+    return "\n".join(lines)
+
+
+def movement_module(index, flags):
+    """The text of src/world/movement_shapes.calx."""
+    shapes = flags["movement"]
+    boxes = flags["movement_boxes"]
+    palette, single, pairs, chunks, starts, coords = shape_table(flags, "movement", "movement_boxes")
+    factors = flags["movement_factors"]
+    # Every case vanilla stopped short, and one in eight of the others, to keep the module small.
+    cases = []
+    others = 0
+    for c in flags["movement_cases"]:
+        if c[8] != c[9]:
+            cases.append(c)
+        else:
+            if others % 8 == 0:
+                cases.append(c)
+            others += 1
+    for f in factors:
+        if len(f) != 5:
+            raise ValueError(f"a block's movement factors are {len(f)} numbers")
+    for c in cases:
+        if len(c) != 10 or not 0 <= c[0] < len(boxes) or not 0 <= c[1] < 3:
+            raise ValueError(f"a collide case isn't a shape, an axis and eight doubles: {c}")
+
+    def numbers(values, per=24):
+        rows = [", ".join(str(v) for v in values[i:i + per]) for i in range(0, len(values), per)]
+        return ",\n".join(f"        {r}" for r in rows)
+
+    def bits(v):
+        return v & 0xFFFFFFFF
+
+    lines = [
+        f"/// Each of vanilla {index['game_version']}'s block states' collision shapes as an entity moves against them:",
+        "/// `getCollisionShape` with an empty context, so a liquid has none, and a state vanilla offsets",
+        "/// by its position, as bamboo, has the shape it has before it's offset. Scaffolding's and powder",
+        "/// snow's shapes, which go by the entity, and a moving piston's and a shulker box's, which go by",
+        "/// their block entities, are the empty context's here. Then each block whose friction, speed",
+        "/// factor, jump factor or bounce isn't the default, and cases of vanilla's own",
+        "/// `VoxelShape.collide`. Written by oracle/datagen/calx_tables.py from block_flags.json",
+        "/// (CAL-148): don't edit it.",
+        "///",
+        "/// The shapes are numbered, 0 the empty one and 1 the whole block, and each is a list of boxes,",
+        "/// as `toAabbs` gives them, in `world.collision_shapes`' units.",
+        "module world.movement_shapes",
+        "",
+        "/// How many different shapes there are.",
+        f"pub const SHAPES: u32 = {len(boxes)}",
+        "",
+    ]
+    lines += shape_lines(shapes, palette, single, pairs, chunks, starts, coords)
+    lines += [
+        "/// Each block whose friction, speed factor, jump factor or bounce isn't the default, 0.6, 1, 1",
+        "/// and 0, in block ID order.",
+        "pub fn factor_blocks() -> List<u32> {",
+        "    return [",
+        numbers([f[0] for f in factors]),
+        "    ]",
+        "}",
+        "",
+        "/// Each of `factor_blocks`' friction, speed factor, jump factor and bounce, four `f32`s' bits",
+        "/// each, `getFriction`, `getSpeedFactor`, `getJumpFactor` and `getBounceRestitution`.",
+        "pub fn factors() -> List<u32> {",
+        "    return [",
+        numbers([bits(v) for f in factors for v in f[1:]], 8),
+        "    ]",
+        "}",
+        "",
+        "/// What vanilla's `VoxelShape.collide` gave boxes near each shape that don't overlap it, ten",
+        "/// numbers each: the shape, the axis, x 0, y 1 and z 2, then the bits of the `f64`s of the",
+        "/// box, min x, y, z then max x, y, z, the distance asked and the distance given. Every case",
+        "/// it stopped short, and one in eight of those it didn't. For Calcite's tests.",
+        "pub fn collide_cases() -> List<i64> {",
+        "    return [",
+        numbers([v for c in cases for v in c], 10),
         "    ]",
         "}",
         "",
@@ -1507,6 +1609,7 @@ def outputs(tables, version=VERSION):
         CALCITE / "src" / "world" / "light_faces.calx": light_faces_module(index, flags),
         CALCITE / "src" / "world" / "collision_shapes.calx": collision_module(index, flags),
         CALCITE / "src" / "world" / "fluid_faces.calx": fluid_faces_module(index, flags),
+        CALCITE / "src" / "world" / "movement_shapes.calx": movement_module(index, flags),
         CALCITE / "src" / "world" / "entity_facts.calx": entity_facts_module(index, entities),
         CALCITE / "src" / "world" / "item_defaults.calx": item_defaults_module(items),
     }

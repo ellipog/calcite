@@ -66,6 +66,14 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  * says what vanilla does or this fails; the cases where a state's moving changes the answer are
  * written for Calcite's own test.
  *
+ * <p>And each state's collision shape as an entity moves against it (CAL-148): {@code
+ * getCollisionShape} with an empty context, so a liquid has none, before vanilla offsets it by its
+ * position, numbered as the others are, with the boxes of each; each block whose friction, speed
+ * factor, jump factor or bounce isn't the default, as {@code Entity.move} reads them; and cases of
+ * vanilla's own {@code VoxelShape.collide}, for each of those shapes, of boxes near it that don't
+ * overlap it, as an entity's box doesn't while it has physics, moved along an axis, for Calcite's
+ * test.
+ *
  * <p>Every value is fixed when the states are made, before any data pack loads, so the table is
  * the same for every world.
  */
@@ -115,12 +123,14 @@ final class BlockFlags {
         int count = Block.BLOCK_STATE_REGISTRY.size();
         Faces faces = new Faces();
         Faces collisions = new Faces();
+        Faces movements = new Faces();
         Faces fluidFaces = new Faces();
         int[][] fluidFaceIds = new int[count][Direction.values().length];
         StringBuilder fluid = new StringBuilder();
         StringBuilder json = new StringBuilder();
         StringBuilder light = new StringBuilder();
         StringBuilder collision = new StringBuilder();
+        StringBuilder movement = new StringBuilder();
         StringBuilder facts = new StringBuilder();
         // The states whose shape is a full block where their collision shape isn't, or the other
         // way round: what `Block.isShapeFullBlock(getShape)` says, as an exception to
@@ -148,6 +158,7 @@ final class BlockFlags {
             }
             light.append("]");
             collision.append(id == 0 ? "" : ", ").append(collisions.id(collisionShape(state)));
+            movement.append(id == 0 ? "" : ", ").append(movements.id(fluidShape(state)));
             VoxelShape walls = fluidShape(state);
             fluid.append(id == 0 ? "[" : ", [");
             for (Direction direction : Direction.values()) {
@@ -543,6 +554,11 @@ final class BlockFlags {
         json.append(",\n  \"collision\": [").append(collision).append("],\n");
         json.append("  \"collision_boxes\": ");
         boxes(json, collisions);
+        json.append(",\n  \"movement\": [").append(movement).append("],\n");
+        json.append("  \"movement_boxes\": ");
+        boxes(json, movements);
+        json.append(",\n  \"movement_factors\": [").append(movementFactors()).append("],\n");
+        json.append("  \"movement_cases\": [").append(movementCases(movements)).append("]");
         json.append(",\n  \"face_occludes\": [");
         for (int i = 0; i < faces.shapes.size(); i++) {
             json.append(i == 0 ? "[" : ", [");
@@ -856,6 +872,88 @@ final class BlockFlags {
                 + " of the cases written where moving changes the answer, in "
                 + (System.nanoTime() - started) / 1000000 + " ms");
         return moving;
+    }
+
+    /**
+     * Each block whose friction, speed factor, jump factor or bounce isn't the default, 0.6, 1, 1
+     * and 0: its ID and the four floats' bits, as {@code Entity.move} reads them.
+     */
+    private static String movementFactors() {
+        StringBuilder out = new StringBuilder();
+        for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
+            Block block = BuiltInRegistries.BLOCK.byId(id);
+            if (block.getFriction() == 0.6F && block.getSpeedFactor() == 1.0F && block.getJumpFactor() == 1.0F
+                    && block.getBounceRestitution() == 0.0F) {
+                continue;
+            }
+            out.append(out.isEmpty() ? "[" : ", [").append(id).append(", ").append(Float.floatToIntBits(block.getFriction()))
+                    .append(", ").append(Float.floatToIntBits(block.getSpeedFactor())).append(", ")
+                    .append(Float.floatToIntBits(block.getJumpFactor())).append(", ")
+                    .append(Float.floatToIntBits(block.getBounceRestitution())).append("]");
+        }
+        return out.toString();
+    }
+
+    /**
+     * Cases of vanilla's {@code VoxelShape.collide}, for Calcite's test: for each shape entities move
+     * against, up to 8 boxes near it, an item's, a player's or a block's size, that don't overlap
+     * it by more than {@code 1.0E-7}, as an entity's box doesn't while it has physics, half of them
+     * resting against one of its boxes' faces, each moved along an axis by up to a block and a half
+     * either way. Each is the shape, the axis, then the box's six coordinates, the distance asked and
+     * the distance vanilla gives, as doubles' bits. The same seed makes the same cases each run.
+     */
+    private static String movementCases(Faces shapes) {
+        StringBuilder out = new StringBuilder();
+        java.util.Random random = new java.util.Random(148L);
+        double[] widths = {0.25, 0.6, 1.0};
+        double[] heights = {0.25, 1.8, 1.0};
+        int total = 0;
+        int moved = 0;
+        for (int s = 0; s < shapes.shapes.size(); s++) {
+            VoxelShape shape = shapes.shapes.get(s);
+            List<AABB> parts = shape.toAabbs();
+            int written = 0;
+            for (int tries = 0; tries < 400 && written < 8; tries++) {
+                int size = random.nextInt(3);
+                double w = widths[size];
+                double h = heights[size];
+                double x = random.nextDouble() * 3.0 - 1.0 - w / 2;
+                double y = random.nextDouble() * 3.0 - 1.0 - h / 2;
+                double z = random.nextDouble() * 3.0 - 1.0 - w / 2;
+                Direction.Axis axis = Direction.Axis.values()[random.nextInt(3)];
+                if (!parts.isEmpty() && written % 2 == 0) {
+                    // Against a face of one of its boxes, along the axis it'll move on.
+                    AABB part = parts.get(random.nextInt(parts.size()));
+                    boolean low = random.nextBoolean();
+                    double length = axis == Direction.Axis.Y ? h : w;
+                    double at = low ? part.min(axis) - length : part.max(axis);
+                    if (axis == Direction.Axis.X) {
+                        x = at;
+                    } else if (axis == Direction.Axis.Y) {
+                        y = at;
+                    } else {
+                        z = at;
+                    }
+                }
+                AABB box = new AABB(x, y, z, x + w, y + h, z + w);
+                if (Shapes.joinIsNotEmpty(shape, Shapes.create(box.deflate(1.0E-7)), net.minecraft.world.phys.shapes.BooleanOp.AND)) {
+                    continue;
+                }
+                double distance = random.nextDouble() * 3.0 - 1.5;
+                double given = shape.collide(axis, box, distance);
+                out.append(out.isEmpty() ? "[" : ", [").append(s).append(", ").append(axis.ordinal());
+                for (double v : new double[] {box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ, distance, given}) {
+                    out.append(", ").append(Double.doubleToLongBits(v));
+                }
+                out.append("]");
+                written++;
+                total++;
+                moved += given != distance ? 1 : 0;
+            }
+        }
+        System.err.println("BlockFlags: " + total + " collide cases over " + shapes.shapes.size() + " movement shapes, "
+                + moved + " of them stopped short");
+        return out.toString();
     }
 
     /** Each shape's boxes, as a list of lists of six numbers. */

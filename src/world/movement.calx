@@ -1,0 +1,492 @@
+/// How entities move against blocks, as vanilla's `Entity.move` collides them (CAL-148): the
+/// blocks' shapes near a moving box, as `BlockCollisions` gives them, how far the box gets along
+/// each axis before it meets one, `Shapes.collide`, in `Entity.collideWithShapes`' order; and each
+/// block's friction, speed factor, jump factor and bounce.
+///
+/// Each state's shape is its collision shape as an entity sees it (`world.movement_shapes`). A
+/// liquid has none, as `LiquidBlock` gives none to an entity that can't stand on fluids, and no
+/// entity Calcite moves can. Bamboo, pointed dripstone and sulfur spikes are offset by where they
+/// are, as `getOffset` says. Scaffolding is whole for an entity above its top that isn't going
+/// down, and otherwise has only its bottom's slab, for one above its bottom, if it's unstable,
+/// as `ScaffoldingBlock` says. Powder snow has a box 0.9 tall for an entity that has fallen more
+/// than 2.5 blocks and none otherwise, as for every entity but a falling block and those that walk
+/// on it. A moving piston's shape, which comes from its block entity, and an open shulker box's
+/// lid aren't here: a moving piston has none, and a shulker box is shut.
+///
+/// The blocks gone through are those within one of the box, as `Cursor3D` gives them, x fastest,
+/// then y, then z: those it's in, those beside them on one face only if their shape can reach out
+/// of their block, and none on an edge or a corner, as only moving pistons are checked there. A
+/// block whose chunk isn't loaded full isn't one. A whole block is kept if it overlaps the box by
+/// more than nothing; any other shape if one of its boxes overlaps it by more than 1.0E-7 on every
+/// axis, as `Shapes.joinIsNotEmpty`'s merger takes coordinates closer than that for one.
+///
+/// `VoxelShape.collide` goes over a shape's grid of cells; here a shape is its boxes, which gives
+/// the same distance for a box that doesn't overlap the shape, as an entity's doesn't while it has
+/// physics: the nearest box ahead stops it, of those the moving box overlaps on the other two
+/// axes, as `findIndex` rounds them, by more than 1.0E-7 one way and at least it the other, unless
+/// that box is more than 1.0E-7 behind. Calcite's test checks vanilla's own cases.
+///
+/// Other entities' shapes, as a boat's, and the world border aren't among the shapes yet.
+module world.movement
+
+import world.block_flags.{LARGE_COLLISION, OFFSET}
+import world.collision.{Aabb, CollisionBlocks}
+import world.collision_shapes.{BOX_FLOOR, BOX_UNIT}
+import world.movement_shapes.{factor_blocks, factors, shape_boxes, shape_starts, state_shapes}
+import worldgen.facts.{Facts}
+
+/// The axes, as `Direction.Axis` numbers them.
+pub const AXIS_X: i32 = 0
+pub const AXIS_Y: i32 = 1
+pub const AXIS_Z: i32 = 2
+
+// The states whose shape isn't just their table's: those offset by where they are, scaffolding,
+// stable or not, and powder snow.
+const PLAIN: u8 = 0
+const MOVED: u8 = 1
+const SCAFFOLD: u8 = 2
+const SCAFFOLD_UNSTABLE: u8 = 3
+const POWDER_SNOW: u8 = 4
+
+/// What an entity is as its collisions see it, vanilla's `EntityCollisionContext`: how high its
+/// feet are, `getY`, how far it has fallen, `fallDistance`, and whether it's going down, as a
+/// player crouching is.
+pub struct Mover {
+    pub y: f64
+    pub fall: f64
+    pub descending: bool = false
+}
+
+/// The shapes near a moving box, each moved to where it is, in the order `BlockCollisions` gives
+/// them: their boxes, and where each shape's end among them.
+pub struct Colliders {
+    pub boxes: List<Aabb>
+    pub ends: List<usize>
+}
+
+impl Colliders {
+    /// No shapes.
+    pub fn new() -> Colliders {
+        return Colliders { boxes: List<Aabb>(), ends: List<usize>() }
+    }
+
+    /// Whether there are none.
+    pub fn is_empty(self) -> bool {
+        return self.ends.is_empty()
+    }
+
+    /// How many there are.
+    pub fn len(self) -> usize {
+        return self.ends.len()
+    }
+
+    /// Adds a shape of one box.
+    pub fn add_box(mut self, b: Aabb) {
+        self.boxes.push(b)
+        self.ends.push(self.boxes.len())
+    }
+}
+
+/// What entities moving see of each block state and block.
+pub struct MovementStates {
+    // Each state's shape, and what kind of state it is.
+    shapes: List<u16>
+    kinds: List<u8>
+    // Where each shape's boxes start in `boxes`, in boxes, and the boxes, six coordinates each.
+    starts: List<u16>
+    boxes: List<u8>
+    // Where each block whose friction, speed factor, jump factor or bounce isn't the default has
+    // them in `factors`, four each.
+    factor_at: Map<u32, usize>
+    factors: List<f32>
+}
+
+impl MovementStates {
+    /// Every state's shape and every block's factors, the kinds of state as `f` says.
+    pub fn new(f: Facts) -> MovementStates {
+        let shapes = state_shapes()
+        let scaffolding = f.block_named("minecraft:scaffolding") else panic("no scaffolding block")
+        let powder_snow = f.block_named("minecraft:powder_snow") else panic("no powder snow block")
+        var kinds = List<u8>()
+        kinds.reserve(shapes.len())
+        for s in 0..shapes.len() {
+            let state = u32.wrap(s)
+            let block = f.block(state)
+            if block == scaffolding {
+                let distance = f.get_int(state, "distance") ?? 0
+                kinds.push(if distance != 0 and f.get_bool(state, "bottom") { SCAFFOLD_UNSTABLE } else { SCAFFOLD })
+            } else if block == powder_snow {
+                kinds.push(POWDER_SNOW)
+            } else if f.flags(state) & OFFSET != 0 and shapes[s] != 0 {
+                kinds.push(MOVED)
+            } else {
+                kinds.push(PLAIN)
+            }
+        }
+        var factor_at = Map<u32, usize>()
+        let blocks = factor_blocks()
+        for i in 0..blocks.len() {
+            factor_at.insert(blocks[i], i * 4)
+        }
+        var values = List<f32>()
+        for bits in factors() {
+            values.push(f32.from_bits(bits))
+        }
+        return MovementStates { shapes: shapes, kinds: kinds, starts: shape_starts(), boxes: shape_boxes(), factor_at: factor_at, factors: values }
+    }
+
+    /// The block's friction, `getFriction`: 0.6 but for ice and the like.
+    pub fn friction(self, block: u32) -> f32 {
+        return self.factor(block, 0, 0.6f32)
+    }
+
+    /// The block's speed factor, `getSpeedFactor`: 1 but for soul sand, honey and the like.
+    pub fn speed_factor(self, block: u32) -> f32 {
+        return self.factor(block, 1, 1.0f32)
+    }
+
+    /// The block's jump factor, `getJumpFactor`: 1 but for honey and the like.
+    pub fn jump_factor(self, block: u32) -> f32 {
+        return self.factor(block, 2, 1.0f32)
+    }
+
+    /// How much of its speed an entity falling on the block keeps going up, `getBounceRestitution`:
+    /// 0 but for beds and slime.
+    pub fn bounce(self, block: u32) -> f32 {
+        return self.factor(block, 3, 0.0f32)
+    }
+
+    fn factor(self, block: u32, at: usize, normal: f32) -> f32 {
+        if self.factor_at.contains(block) {
+            return self.factors[self.factor_at[block] + at]
+        }
+        return normal
+    }
+
+    /// The boxes of the shape `shape`, where its block's least corner is 0, 0, 0. For tests.
+    pub fn boxes_of(self, shape: u32) -> List<Aabb> {
+        var out = List<Aabb>()
+        let s = usize(shape)
+        for i in usize(self.starts[s])..usize(self.starts[s + 1]) {
+            let at = i * 6
+            out.push(Aabb {
+                min_x: self.coordinate(at),
+                min_y: self.coordinate(at + 1),
+                min_z: self.coordinate(at + 2),
+                max_x: self.coordinate(at + 3),
+                max_y: self.coordinate(at + 4),
+                max_z: self.coordinate(at + 5),
+            })
+        }
+        return out
+    }
+
+    /// The shapes of `blocks` near `b`, the box an entity sweeps as it moves, as `BlockCollisions`
+    /// gives them for `mover`.
+    pub fn colliders<B: CollisionBlocks>(self, f: Facts, blocks: B, b: Aabb, mover: Mover) -> Colliders {
+        var out = Colliders.new()
+        // `Shapes.create` makes nothing of a box thinner than 1.0E-7, which meets no shape but a
+        // whole block.
+        let sized = not (b.max_x - b.min_x < 1.0e-7) and not (b.max_y - b.min_y < 1.0e-7) and not (b.max_z - b.min_z < 1.0e-7)
+        let x0 = i32.saturate((b.min_x - 1.0e-7).floor()) - 1
+        let x1 = i32.saturate((b.max_x + 1.0e-7).floor()) + 1
+        let y0 = i32.saturate((b.min_y - 1.0e-7).floor()) - 1
+        let y1 = i32.saturate((b.max_y + 1.0e-7).floor()) + 1
+        let z0 = i32.saturate((b.min_z - 1.0e-7).floor()) - 1
+        let z1 = i32.saturate((b.max_z + 1.0e-7).floor()) + 1
+        for z in z0..=z1 {
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    var edges = 0
+                    if x == x0 or x == x1 {
+                        edges += 1
+                    }
+                    if y == y0 or y == y1 {
+                        edges += 1
+                    }
+                    if z == z0 or z == z1 {
+                        edges += 1
+                    }
+                    if edges >= 2 {
+                        continue
+                    }
+                    let state = blocks.collision_state(x, y, z) else continue
+                    if edges == 1 and f.flags(state) & LARGE_COLLISION == 0 {
+                        continue
+                    }
+                    self.add_shape(f, mut out, state, x, y, z, b, mover, sized)
+                }
+            }
+        }
+        return out
+    }
+
+    // Adds the state's shape at x, y, z to `out` if it has one and meets `b`, as `BlockCollisions`
+    // keeps it.
+    fn add_shape(self, f: Facts, out: mut Colliders, state: u32, x: i32, y: i32, z: i32, b: Aabb, mover: Mover, sized: bool) {
+        let kind = self.kinds[usize(state)]
+        let shape = usize(self.shapes[usize(state)])
+        let fx = f64(x)
+        let fy = f64(y)
+        let fz = f64(z)
+        if kind == PLAIN {
+            if shape == 0 {
+                return
+            }
+            if shape == 1 {
+                // `Shapes.block()`, kept where it overlaps the box by more than nothing.
+                if b.intersects(fx, fy, fz, fx + 1.0, fy + 1.0, fz + 1.0) {
+                    out.add_box(Aabb { min_x: fx, min_y: fy, min_z: fz, max_x: fx + 1.0, max_y: fy + 1.0, max_z: fz + 1.0 })
+                }
+                return
+            }
+            self.add_boxes(mut out, shape, 0.0, 0.0, 0.0, fx, fy, fz, b, sized)
+            return
+        }
+        if kind == MOVED {
+            let (ox, oy, oz) = f.offset(state, x, z)
+            self.add_boxes(mut out, shape, ox, oy, oz, fx, fy, fz, b, sized)
+            return
+        }
+        if kind == SCAFFOLD or kind == SCAFFOLD_UNSTABLE {
+            // `isAbove`: the entity's feet more than 1.0E-5F below the shape's top.
+            if mover.y > fy + 1.0 - f64(1.0e-5f32) and not mover.descending {
+                self.add_boxes(mut out, shape, 0.0, 0.0, 0.0, fx, fy, fz, b, sized)
+            } else if kind == SCAFFOLD_UNSTABLE and mover.y > fy + 0.0 - f64(1.0e-5f32) {
+                // `SHAPE_UNSTABLE_BOTTOM`, `Block.column(16, 0, 2)`.
+                let slab = Aabb { min_x: fx, min_y: fy, min_z: fz, max_x: 1.0 + fx, max_y: 0.125 + fy, max_z: 1.0 + fz }
+                if sized and meets(slab, b) {
+                    out.add_box(slab)
+                }
+            }
+            return
+        }
+        if kind == POWDER_SNOW and mover.fall > 2.5 {
+            // `FALLING_COLLISION_SHAPE`, `Shapes.box(0, 0, 0, 1, 0.9F, 1)`.
+            let snow = Aabb { min_x: fx, min_y: fy, min_z: fz, max_x: 1.0 + fx, max_y: f64(0.9f32) + fy, max_z: 1.0 + fz }
+            if sized and meets(snow, b) {
+                out.add_box(snow)
+            }
+        }
+    }
+
+    // Adds the shape `shape`, offset by ox, oy, oz and then moved to x, y, z as `VoxelShape.move`
+    // adds each, to `out` if one of its boxes meets `b`.
+    fn add_boxes(self, out: mut Colliders, shape: usize, ox: f64, oy: f64, oz: f64, x: f64, y: f64, z: f64, b: Aabb, sized: bool) {
+        if not sized {
+            return
+        }
+        let first = out.boxes.len()
+        var met = false
+        for i in usize(self.starts[shape])..usize(self.starts[shape + 1]) {
+            let at = i * 6
+            let part = Aabb {
+                min_x: (self.coordinate(at) + ox) + x,
+                min_y: (self.coordinate(at + 1) + oy) + y,
+                min_z: (self.coordinate(at + 2) + oz) + z,
+                max_x: (self.coordinate(at + 3) + ox) + x,
+                max_y: (self.coordinate(at + 4) + oy) + y,
+                max_z: (self.coordinate(at + 5) + oz) + z,
+            }
+            if not met and meets(part, b) {
+                met = true
+            }
+            out.boxes.push(part)
+        }
+        if met {
+            out.ends.push(out.boxes.len())
+        } else {
+            out.boxes.truncate(first)
+        }
+    }
+
+    // A box's coordinate, in blocks from its block's least corner: a 32nd, so exactly vanilla's.
+    fn coordinate(self, at: usize) -> f64 {
+        return f64(i32(self.boxes[at]) + BOX_FLOOR) / f64(BOX_UNIT)
+    }
+}
+
+// Whether `a` overlaps `b` by more than 1.0E-7 on every axis.
+fn meets(a: Aabb, b: Aabb) -> bool {
+    return overlap(a.min_x, a.max_x, b.min_x, b.max_x) and overlap(a.min_y, a.max_y, b.min_y, b.max_y) and overlap(a.min_z, a.max_z, b.min_z, b.max_z)
+}
+
+fn overlap(a0: f64, a1: f64, b0: f64, b1: f64) -> bool {
+    let low = if a0 > b0 { a0 } else { b0 }
+    let high = if a1 < b1 { a1 } else { b1 }
+    return high - low > 1.0e-7
+}
+
+/// How far `b` moves by dx, dy, dz among the shapes `c`, `Entity.collideWithShapes`: along y
+/// first, then along whichever of x and z it moves less on, then the other, each from where the
+/// last left it, as `Direction.axisStepOrder` says. With no shapes at all it moves the whole way.
+pub fn collide_with(c: Colliders, b: Aabb, dx: f64, dy: f64, dz: f64) -> (f64, f64, f64) {
+    if c.is_empty() {
+        return (dx, dy, dz)
+    }
+    var rx = 0.0
+    var ry = 0.0
+    var rz = 0.0
+    if dy != 0.0 {
+        ry = collide_along(c, AXIS_Y, moved(b, rx, ry, rz), dy)
+    }
+    if dx.abs() < dz.abs() {
+        if dz != 0.0 {
+            rz = collide_along(c, AXIS_Z, moved(b, rx, ry, rz), dz)
+        }
+        if dx != 0.0 {
+            rx = collide_along(c, AXIS_X, moved(b, rx, ry, rz), dx)
+        }
+    } else {
+        if dx != 0.0 {
+            rx = collide_along(c, AXIS_X, moved(b, rx, ry, rz), dx)
+        }
+        if dz != 0.0 {
+            rz = collide_along(c, AXIS_Z, moved(b, rx, ry, rz), dz)
+        }
+    }
+    return (rx, ry, rz)
+}
+
+/// The box moved by x, y, z, `AABB.move`.
+pub fn moved(b: Aabb, x: f64, y: f64, z: f64) -> Aabb {
+    return Aabb { min_x: b.min_x + x, min_y: b.min_y + y, min_z: b.min_z + z, max_x: b.max_x + x, max_y: b.max_y + y, max_z: b.max_z + z }
+}
+
+/// The box stretched by x, y, z toward where it moves, `AABB.expandTowards`: the box it sweeps.
+pub fn swept(b: Aabb, x: f64, y: f64, z: f64) -> Aabb {
+    var out = Aabb { min_x: b.min_x, min_y: b.min_y, min_z: b.min_z, max_x: b.max_x, max_y: b.max_y, max_z: b.max_z }
+    if x < 0.0 {
+        out.min_x += x
+    } else if x > 0.0 {
+        out.max_x += x
+    }
+    if y < 0.0 {
+        out.min_y += y
+    } else if y > 0.0 {
+        out.max_y += y
+    }
+    if z < 0.0 {
+        out.min_z += z
+    } else if z > 0.0 {
+        out.max_z += z
+    }
+    return out
+}
+
+/// How far `b` moves along `axis` by `distance` among the shapes `c`, `Shapes.collide`: each in
+/// turn cuts it short, and once it's less than 1.0E-7 either way it's nothing.
+pub fn collide_along(c: Colliders, axis: i32, b: Aabb, distance: f64) -> f64 {
+    var d = distance
+    var start: usize = 0
+    for stop in c.ends {
+        if d.abs() < 1.0e-7 {
+            return 0.0
+        }
+        d = collide_shape(c.boxes, start, stop, axis, b, d)
+        start = stop
+    }
+    return d
+}
+
+/// How far `b` moves along `axis` by `distance` against the shape of `boxes` from `from` to `to`,
+/// `VoxelShape.collide`, for a box that doesn't overlap it: as far as the nearest of its boxes
+/// ahead that `b` overlaps on the other two axes.
+pub fn collide_shape(boxes: List<Aabb>, from: usize, to: usize, axis: i32, b: Aabb, distance: f64) -> f64 {
+    if from == to {
+        return distance
+    }
+    if distance.abs() < 1.0e-7 {
+        return 0.0
+    }
+    let low = lo(b, axis)
+    let high = hi(b, axis)
+    let p = (axis + 1) % 3
+    let q = (axis + 2) % 3
+    var found = false
+    var nearest = 0.0
+    if distance > 0.0 {
+        for i in from..to {
+            if not across(boxes, i, p, b) or not across(boxes, i, q, b) {
+                continue
+            }
+            let start = box_lo(boxes, i, axis)
+            if start > high - 1.0e-7 and (not found or start < nearest) {
+                nearest = start
+                found = true
+            }
+        }
+        if found {
+            let gap = nearest - high
+            if gap >= -1.0e-7 and gap < distance {
+                return gap
+            }
+        }
+        return distance
+    }
+    if distance < 0.0 {
+        for i in from..to {
+            if not across(boxes, i, p, b) or not across(boxes, i, q, b) {
+                continue
+            }
+            let stop = box_hi(boxes, i, axis)
+            if stop <= low + 1.0e-7 and (not found or stop > nearest) {
+                nearest = stop
+                found = true
+            }
+        }
+        if found {
+            let gap = nearest - low
+            if gap <= 1.0e-7 and gap > distance {
+                return gap
+            }
+        }
+    }
+    return distance
+}
+
+// Whether box `i` of `boxes` is within `b` on `axis` as `VoxelShape.collideX` counts its cells:
+// one of them starts at least 1.0E-7 below `b`'s top and ends more than it above `b`'s bottom.
+fn across(boxes: List<Aabb>, i: usize, axis: i32, b: Aabb) -> bool {
+    return box_lo(boxes, i, axis) <= hi(b, axis) - 1.0e-7 and box_hi(boxes, i, axis) > lo(b, axis) + 1.0e-7
+}
+
+fn box_lo(boxes: List<Aabb>, i: usize, axis: i32) -> f64 {
+    if axis == AXIS_X {
+        return boxes[i].min_x
+    }
+    if axis == AXIS_Y {
+        return boxes[i].min_y
+    }
+    return boxes[i].min_z
+}
+
+fn box_hi(boxes: List<Aabb>, i: usize, axis: i32) -> f64 {
+    if axis == AXIS_X {
+        return boxes[i].max_x
+    }
+    if axis == AXIS_Y {
+        return boxes[i].max_y
+    }
+    return boxes[i].max_z
+}
+
+fn lo(b: Aabb, axis: i32) -> f64 {
+    if axis == AXIS_X {
+        return b.min_x
+    }
+    if axis == AXIS_Y {
+        return b.min_y
+    }
+    return b.min_z
+}
+
+fn hi(b: Aabb, axis: i32) -> f64 {
+    if axis == AXIS_X {
+        return b.max_x
+    }
+    if axis == AXIS_Y {
+        return b.max_y
+    }
+    return b.max_z
+}
