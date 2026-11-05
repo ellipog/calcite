@@ -1,5 +1,6 @@
 """Writes cases/text/contents.json: the text probe's cases for every kind of contents, typed
-and fuzzy, and the errors of each, beside the hand-written basic.json (D368).
+and fuzzy, and the errors of each, and text that isn't JSON, beside the hand-written basic.json
+(D368, D369).
 
     py -I cases/text/gen.py
 """
@@ -113,8 +114,59 @@ S = [
     ("click-custom-payload", '{text:"a",click_event:{action:"custom",id:"x:y",payload:[B;1,2]}}'),
 ]
 
+# Text that isn't JSON, or is only as Gson's lenient reader takes it, for its messages: what's
+# wrong, the line and column, and the path (D369).
+G = [
+    ("eof-empty-object", '{'),
+    ("eof-array", '['),
+    ("eof-after-value", '["a"'),
+    ("eof-nested-index", '["a",["b"'),
+    ("eof-after-comma", '["a",'),
+    ("eof-name", '{"a":1,'),
+    ("eof-colon", '{"a"'),
+    ("eof-deep-path", '{"a":{"b":[1,2,{"c":'),
+    ("unterminated-object", '{"a":1 "b":2}'),
+    ("unterminated-array", '["a" "b"]'),
+    ("expected-name-close", '{"a":1,}'),
+    ("expected-name-comma", '{,}'),
+    ("expected-name-colon", '{"a":1, :2}'),
+    ("expected-colon", '{"a" 1}'),
+    ("unexpected-value-object", '{"a":,}'),
+    ("unexpected-value-top", ','),
+    ("expected-value", '{"a":}'),
+    ("unterminated-string", '{"text":"abc'),
+    ("unterminated-escape", '"abc\\'),
+    ("unterminated-unicode", '"\\u12'),
+    ("malformed-unicode", '"\\u12xy"'),
+    ("invalid-escape", '"\\q"'),
+    ("unterminated-comment", '{/* x'),
+    ("comments", '/* c */ {"text":"a" // d\n, # e\n"bold":true}'),
+    ("trailing-data", '{"text":"a"} x'),
+    ("trailing-comment", '"a" // c'),
+    ("trailing-hash", '"a" #'),
+    ("trailing-slash", '"a" /'),
+    ("trailing-space", '"a"   \n\t'),
+    ("multiline", '{\n  "text": "a",\n  "bold": tru e\n}'),
+    ("multiline-crlf", '{\r\n"text":\r\n'),
+    ("newline-in-string", '"a\nb'),
+    ("escaped-newline", '"a\\\nb'),
+    ("bom", '﻿{"text":'),
+    ("nesting-limit", '[' * 256 + ']' * 256),
+    ("nesting-at-limit", '[' * 255 + '"a"' + ']' * 255),
+    ("lenient-semicolons", '["a";"b"]'),
+    ("lenient-equals", "{text=>'a';bold='true'}"),
+    ("lenient-empty-slots", '["a",,"b",]'),
+    ("lenient-prefix", ')]}\'\n{"text":"a"}'),
+    ("empty", ''),
+    ("only-space", '   '),
+    ("null-then-more", 'null x'),
+    ("number-then-letter", '5x'),
+    ("keyword-capitals", 'TRUE'),
+]
+
 cases = [{"id": f"json-{name}", "input": {"json": json.dumps(value, ensure_ascii=False, separators=(",", ":"))}} for name, value in J]
 cases += [{"id": f"snbt-{name}", "input": {"snbt": text}} for name, text in S]
+cases += [{"id": f"gson-{name}", "input": {"json": text}} for name, text in G]
 lines = ['{', '  "probe": "text",', '  "probe_version": 1,', '  "cases": [']
 for i, c in enumerate(cases):
     lines.append("    " + json.dumps(c, ensure_ascii=False) + ("," if i + 1 < len(cases) else ""))
