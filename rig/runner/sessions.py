@@ -71,15 +71,15 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # a fixed number of game ticks, for a world that never goes quiet; `creative`, where it sets slots
 # of its inventory as the creative menu does; `clicks`, where it clicks in its inventory menu;
 # `dig` and `dig-creative`, where it digs blocks; `place` and `place-creative`, where it places
-# them; `use`, where it uses them; and `use-items` and `use-books`, where it uses items on them
-# (src/rig/session.calx).
+# them; `use`, where it uses them; `use-items` and `use-books`, where it uses items on them; and
+# `use-containers`, where it opens containers and clicks in them (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
-                   "use-books"]
+                   "use-books", "use-containers"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
-# their IDs (D375).
-PLAYER_KEYS = ("Inventory", "equipment", "SelectedItemSlot", "playerGameType", "attributes")
+# their IDs (D375); and its ender chest's items (CAL-144).
+PLAYER_KEYS = ("Inventory", "equipment", "SelectedItemSlot", "playerGameType", "attributes", "EnderItems")
 SORTED_KEYS = {"attributes": "id"}
 # The world the round trip has vanilla make and save (rig/runner/roundtrip.py), from the seed
 # `calcite` with real terrain, its chunks full from -6 to 5 around the origin.
@@ -239,6 +239,12 @@ USE_BOOKS = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, [
     slotted(4, "dirt"),
     slotted(6, "music_disc_cat"),
 ]), equipment={})
+# In `use_containers`: in survival mode, holding stone, with dirt in its hotbar's second slot
+# (CAL-144).
+USE_CONTAINERS = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "stone", 10),
+    slotted(1, "dirt", 2),
+]), equipment={})
 # The use_items rules: the dig configurations', and no natural regeneration, so the bot's food stays
 # where the cake it eats puts it (CAL-142).
 USE_ITEMS_RULES = DIG_RULES + (("minecraft:natural_health_regeneration", nbt.Byte(0)),)
@@ -340,6 +346,12 @@ CONFIGS = {
     # a record in its jukebox and swaps stacks on its shelves (CAL-143).
     "use_books": Config({}, view=3, scenarios=("use-books",), world=FIXTURES / "use_items" / "world",
                         fixture="use_items", rules=USE_ITEMS_RULES, player=USE_BOOKS),
+    # The bot, in survival mode, opens the containers fixture's chest, large chest, trapped chest,
+    # barrel, ender chest, shulker box, dispenser and hopper, each in a step of its own, clicks
+    # stacks in and out of them and closes them; opens a chest with the hopper open; and finds a
+    # chest under stone won't open (CAL-144).
+    "use_containers": Config({}, view=3, scenarios=("use-containers",), world=FIXTURES / "containers" / "world",
+                             fixture="containers", rules=DIG_RULES, player=USE_CONTAINERS),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
