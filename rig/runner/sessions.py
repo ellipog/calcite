@@ -210,6 +210,8 @@ DIG_CREATIVE = dict(DIG, playerGameType=nbt.Int(1))
 # a different step on each server (D378).
 DIG_RULES = (("minecraft:block_drops", nbt.Byte(0)), ("minecraft:spawn_mobs", nbt.Byte(0)),
              ("minecraft:random_tick_speed", nbt.Int(0)))
+# The same with drops on, in `dig_drops` (CAL-153).
+DIG_DROP_RULES = DIG_RULES[1:]
 # The bot's data in `place`: in survival mode at the spawn, facing south, holding the first of the
 # hotbar's stone, oak stairs, slabs, logs, doors, a red bed, torches, oak fences and a furnace, with
 # cobblestone in its offhand (D378).
@@ -349,6 +351,10 @@ CONFIGS = {
     # shears; a pickaxe broken; and its hands swapped (D376).
     "dig": Config({"spawn-protection": "1"}, view=3, scenarios=("dig",), world=FIXTURES / "dig" / "world",
                   fixture="dig", rules=DIG_RULES, player=DIG, ops=("Op",)),
+    # The same with drops on (CAL-153): what each block the bot breaks drops, from its loot table
+    # and random sequence, popped as items, which it picks up as it comes by them.
+    "dig_drops": Config({"spawn-protection": "1"}, view=3, scenarios=("dig",), world=FIXTURES / "dig" / "world",
+                        fixture="dig", rules=DIG_DROP_RULES, player=DIG, ops=("Op",)),
     # The bot, in creative mode, breaks the dig fixture's blocks: the ground, a bed's foot, a
     # door's and tall grass's tops, a command block it may not, and the ground with a sword
     # (D376).
