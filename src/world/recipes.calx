@@ -1,0 +1,337 @@
+/// The server's recipes, as vanilla's `RecipeManager` holds them once its resources load
+/// (CAL-146): each recipe of the `recipe` registry, in its order, with what its codec read, and
+/// what `finalizeRecipeLoading` makes of them for clients: the property sets, the items a
+/// furnace, a smithing table or a brewing stand takes in each of its slots, and the stonecutter's
+/// recipes, each input and what it makes, which `update_recipes` sends every player as they join.
+/// A recipe that isn't special and has an ingredient of no items, an empty tag's, is left out of
+/// them, with vanilla's warning. Every item is taken to be enabled, as Calcite has no features
+/// that turn items off.
+module world.recipes
+
+import json.tree.{Json}
+import nbt.tag.{Accounter, Tag, read_any}
+import protocol.wire.{DecodeError, Reader, Wire, Writer}
+import registry.registries.{Registries}
+import registry.registry.{Registry}
+import registry.streams.{Streams, network_id}
+import resources.identifier.{Identifier}
+import server.log.{Entry}
+
+/// A recipe: its ID, the serializer its `type` names, and its value as its codec read it.
+pub struct Recipe {
+    pub id: Identifier
+    pub kind: String
+    pub value: Tag
+}
+
+/// The recipes, and what clients are sent of them.
+pub struct Recipes {
+    pub all: List<Recipe> = List<Recipe>()
+    /// Each property set's key and its items' network IDs, in order, as
+    /// `getSynchronizedItemProperties` gives them.
+    pub item_sets: List<(Identifier, List<i32>)> = List<(Identifier, List<i32>)>()
+    /// The stonecutter's recipes, as `update_recipes` sends them.
+    pub stonecutter: Stonecutting = Stonecutting()
+}
+
+/// The stonecutter's recipes, vanilla's `SelectableRecipe.SingleInputSet`, written with the
+/// registries as `SingleInputSet.noRecipeCodec` writes them: how many, then each input as
+/// `Ingredient.CONTENTS_STREAM_CODEC` writes it and what it makes as a `SlotDisplay`. A
+/// packet's `Wire` has no registries, so `Recipes.of` writes them. Nothing written is none.
+pub struct Stonecutting {
+    bytes: List<u8> = List<u8>()
+    // Why they couldn't be written, an item or a slot display the registries don't have, which
+    // only a broken build gives, and which stops the packet as an encoder's exception does.
+    problem: String? = none
+}
+
+/// The stonecutter's recipes as a packet holds them. Ones there are can only be read with the
+/// registries, which a packet's `Wire` hasn't, so only none read.
+impl Wire for Stonecutting {
+    fn read(r: mut Reader) -> Stonecutting ! DecodeError {
+        if try r.varint() != 0 {
+            fail DecodeError { message: String("the stonecutter's recipes are read with the registries") }
+        }
+        return Stonecutting()
+    }
+
+    fn write(self, w: mut Writer) {
+        if let p = self.problem {
+            w.refuse(p.copy())
+            return
+        }
+        if self.bytes.is_empty() {
+            w.varint(0)
+            return
+        }
+        w.raw(self.bytes)
+    }
+}
+
+impl Recipes {
+    /// The recipes of `r`'s `recipe` registry, and what clients are sent of them, written with
+    /// `streams`, with a warning in `logs` for each left out for an ingredient of no items.
+    pub fn of(r: Registries, streams: Streams, logs: mut List<Entry>) -> Recipes {
+        let at = r.find_reloadable(String("recipe")) else return Recipes()
+        let i = r.find_builtin(String("item")) else return Recipes()
+        return made(r.reloadable[at], r.builtin[i], r, streams, mut logs)
+    }
+}
+
+// The recipes of `registry`, with what clients are sent of them, against the item registry
+// `items`.
+fn made(registry: Registry, items: Registry, r: Registries, streams: Streams, logs: mut List<Entry>) -> Recipes {
+    var out = Recipes()
+    for k in 0..registry.entries.len() {
+        if k >= registry.contents.len() {
+            break
+        }
+        var pos: usize = 0
+        var accounter = Accounter.unlimited()
+        let value = match read_any(registry.contents[k], mut pos, mut accounter) {
+            ok(v) => v,
+            err(_) => continue,
+        }
+        let kind = text(field(value, "type"))
+        out.all.push(Recipe { id: registry.entries[k].copy(), kind: kind, value: value })
+    }
+    // The property sets' ingredients, by set, in `RECIPE_PROPERTY_SETS`' order, and the
+    // stonecutter's recipes, from each recipe that can be placed, in the registry's order.
+    let keys: List<String> = ["smithing_base", "smithing_template", "smithing_addition", "furnace_input", "blast_furnace_input", "smoker_input", "campfire_input", "brewing_input", "brewing_reagent"]
+    var sets = List<List<i32>>()
+    for _ in keys {
+        sets.push(List<i32>())
+    }
+    var cut = Writer.new()
+    var cuts: i32 = 0
+    var entries = Writer.new()
+    for recipe in out.all {
+        if not special(recipe.kind) and not placeable(recipe, items) {
+            logs.push(Entry.warn("Recipe {recipe.id.to_string()} can't be placed due to empty ingredients and will be ignored"))
+            continue
+        }
+        for s in 0..keys.len() {
+            let input = property_input(recipe, keys[s]) else continue
+            for id in item_ids(input, items) {
+                sets[s].push(id)
+            }
+        }
+        if recipe.kind == "minecraft:stonecutting" {
+            write_ingredient(field(recipe.value, "ingredient"), items, mut entries)
+            write_display(field(recipe.value, "result"), streams, r, mut entries)
+            cuts += 1
+        }
+    }
+    for s in 0..keys.len() {
+        out.item_sets.push((Identifier { namespace: "minecraft", path: keys[s].copy() }, distinct(sets[s])))
+    }
+    cut.varint(cuts)
+    let problem = entries.problem()
+    cut.raw(entries.into_bytes())
+    out.stonecutter = Stonecutting { bytes: cut.into_bytes(), problem: problem }
+    return out
+}
+
+// Whether the recipe of the serializer `kind` is special, as `Recipe.isSpecial` has it: a
+// `CustomRecipe`'s or a brewing recipe's, which the recipe book doesn't show and which needn't be
+// placeable.
+fn special(kind: String) -> bool {
+    return kind.starts_with("minecraft:crafting_special_") or kind == "minecraft:crafting_decorated_pot" or kind == "minecraft:brewing"
+}
+
+// Whether each of the ingredients a recipe's `PlacementInfo` has holds an item: a shaped
+// recipe's key's, a shapeless one's list's, and the other kinds' named ones.
+fn placeable(recipe: Recipe, items: Registry) -> bool {
+    if recipe.kind == "minecraft:crafting_shaped" {
+        match field(recipe.value, "key") {
+            Tag.Compound(key) => {
+                for (_, ingredient) in key {
+                    if item_ids(ingredient, items).is_empty() {
+                        return false
+                    }
+                }
+            },
+            _ => {},
+        }
+        return true
+    }
+    if recipe.kind == "minecraft:crafting_shapeless" {
+        match field(recipe.value, "ingredients") {
+            Tag.List(list) => {
+                for ingredient in list {
+                    if item_ids(ingredient, items).is_empty() {
+                        return false
+                    }
+                }
+            },
+            _ => {},
+        }
+        return true
+    }
+    for name in ["ingredient", "input", "material", "target", "dye", "source", "template", "base", "addition"] {
+        let ingredient = field(recipe.value, name)
+        match ingredient {
+            Tag.End => {},
+            _ => {
+                if item_ids(ingredient, items).is_empty() {
+                    return false
+                }
+            },
+        }
+    }
+    return true
+}
+
+// The ingredient of `recipe` that goes in the property set `key`, if it gives one, as each of
+// `RECIPE_PROPERTY_SETS`' extractors finds it.
+fn property_input(recipe: Recipe, key: String) -> Tag? {
+    let smithing = recipe.kind == "minecraft:smithing_transform" or recipe.kind == "minecraft:smithing_trim"
+    let input = if key == "smithing_base" and smithing {
+        field(recipe.value, "base")
+    } else if key == "smithing_template" and smithing {
+        field(recipe.value, "template")
+    } else if key == "smithing_addition" and smithing {
+        field(recipe.value, "addition")
+    } else if key == "furnace_input" and recipe.kind == "minecraft:smelting" {
+        field(recipe.value, "ingredient")
+    } else if key == "blast_furnace_input" and recipe.kind == "minecraft:blasting" {
+        field(recipe.value, "ingredient")
+    } else if key == "smoker_input" and recipe.kind == "minecraft:smoking" {
+        field(recipe.value, "ingredient")
+    } else if key == "campfire_input" and recipe.kind == "minecraft:campfire_cooking" {
+        field(recipe.value, "ingredient")
+    } else if key == "brewing_input" and recipe.kind == "minecraft:brewing" {
+        field(field(recipe.value, "input"), "item")
+    } else if key == "brewing_reagent" and recipe.kind == "minecraft:brewing" {
+        field(field(recipe.value, "reagent"), "item")
+    } else {
+        Tag.End
+    }
+    return match input {
+        Tag.End => none,
+        _ => some(input),
+    }
+}
+
+/// The network IDs of the items the ingredient `ingredient` holds, as its codec writes it: a tag
+/// of items as `#` and its ID, an item's ID, or a list of them, in their order.
+pub fn item_ids(ingredient: Tag, items: Registry) -> List<i32> {
+    var out = List<i32>()
+    match ingredient {
+        Tag.Str(s) => {
+            if s.starts_with("#") {
+                if let id = parsed(s[1..]) {
+                    return items.tag_ids(id)
+                }
+            } else if let id = parsed(s) {
+                if let n = items.id(id) {
+                    out.push(n)
+                }
+            }
+        },
+        Tag.List(list) => {
+            for one in list {
+                for n in item_ids(one, items) {
+                    out.push(n)
+                }
+            }
+        },
+        _ => {},
+    }
+    return out
+}
+
+// The identifier `s`, or `none` where it isn't one.
+fn parsed(s: String) -> Identifier? {
+    return match Identifier.parse(s) {
+        ok(id) => some(id),
+        err(_) => none,
+    }
+}
+
+// `ids` each once, in order of their IDs, as a set of them, which `Set.copyOf` makes, has no
+// order to keep.
+fn distinct(ids: List<i32>) -> List<i32> {
+    var sorted = ids.copy()
+    sorted.sort()
+    var out = List<i32>()
+    for n in sorted {
+        if out.is_empty() or out[out.len() - 1] != n {
+            out.push(n)
+        }
+    }
+    return out
+}
+
+// The ingredient `ingredient` as `Ingredient.CONTENTS_STREAM_CODEC` writes it, a holder set of
+// items: 0 and a tag's ID, or how many items there are plus one and each's network ID.
+fn write_ingredient(ingredient: Tag, items: Registry, w: mut Writer) {
+    match ingredient {
+        Tag.Str(s) => {
+            if s.starts_with("#") {
+                w.varint(0)
+                w.string(s[1..], 32767)
+                return
+            }
+        },
+        _ => {},
+    }
+    let ids = item_ids(ingredient, items)
+    w.varint(i32.wrap(ids.len()) + 1)
+    for n in ids {
+        w.varint(n)
+    }
+}
+
+// What a stonecutter makes, the template `result`, as `SlotDisplay.STREAM_CODEC` writes an
+// `ItemStackSlotDisplay`: the slot display type's network ID, then the template as
+// `ItemStackTemplate.STREAM_CODEC` writes it, its item, its count and its patch.
+fn write_display(result: Tag, streams: Streams, r: Registries, w: mut Writer) {
+    let display = network_id(r, String("minecraft:slot_display"), String("minecraft:item_stack")) else {
+        w.refuse(String("no slot display minecraft:item_stack"))
+        return
+    }
+    w.varint(display)
+    let item = text(field(result, "id"))
+    let item_id = network_id(r, String("minecraft:item"), item.copy()) else {
+        w.refuse("no item {item}")
+        return
+    }
+    w.varint(item_id)
+    let count = match field(result, "count") {
+        Tag.Int(n) => n,
+        _ => 1,
+    }
+    w.varint(count)
+    var components = List<(String, Tag, Json)>()
+    match field(result, "components") {
+        Tag.Compound(patch) => {
+            for (k, v) in patch {
+                components.push((k.copy(), v.copy(), Json.Null))
+            }
+        },
+        _ => {},
+    }
+    streams.write_patch(components, r, mut w)
+}
+
+// The field `key` of the compound `value`, or `Tag.End` where it has none.
+fn field(value: Tag, key: str) -> Tag {
+    match value {
+        Tag.Compound(m) => {
+            if m.contains(String(key)) {
+                return m[String(key)].copy()
+            }
+        },
+        _ => {},
+    }
+    return Tag.End
+}
+
+// The text of the string tag `t`, or nothing.
+fn text(t: Tag) -> String {
+    return match t {
+        Tag.Str(s) => s.copy(),
+        _ => String(),
+    }
+}

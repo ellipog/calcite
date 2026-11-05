@@ -54,7 +54,11 @@ CHANGES = {"play/block_update", "play/section_blocks_update", "play/light_update
 # An entity's attributes come from `AttributeMap`'s set of those that changed, or of them all,
 # which go by the instances' identity hashes, so vanilla sends them in another order each run;
 # they're compared by their attributes' names (D375).
-UNORDERED = {"configuration/update_tags", "play/update_tags", "play/set_time", "play/level_chunk_with_light", "play/update_attributes"}
+# The recipes' property sets are a HashMap keyed by `ResourceKey`s, which hash by identity, each
+# set `Set.copyOf` of item holders, which do too, so vanilla writes both in another order each run;
+# the client reads them into a map and sets, and SessionDump sorts them. The stonecutter's recipes
+# are a list, whose order the values keep (D385).
+UNORDERED = {"configuration/update_tags", "play/update_tags", "play/set_time", "play/level_chunk_with_light", "play/update_attributes", "play/update_recipes"}
 SORTED = {"play/update_attributes": ("attributes", "attribute")}
 # Fields vanilla draws afresh each run, which can't match: the session ID the server draws as it
 # starts, which every login gets; the time on a chat message without a signature, which is the
