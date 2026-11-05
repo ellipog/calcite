@@ -161,8 +161,9 @@ INVENTORY = {
 CLICKS = dict(INVENTORY, playerGameType=nbt.Int(0))
 
 # The bot's data in `crafts`: in survival mode, holding nothing, with three oak logs in the
-# inventory's first slot, four honey bottles in its fourth, paper in its fifth and gunpowder in its
-# sixth, which it crafts with in its inventory's grid (CAL-147).
+# inventory's first slot, four honey bottles in its fourth, paper in its fifth, gunpowder in its
+# sixth, iron ingots in its seventh, sticks in its eighth and cobblestone in its ninth, which it
+# crafts with in its inventory's grid and at the fixture's crafting table (CAL-147).
 CRAFTS = {
     "DataVersion": nbt.Int(5023),
     "Pos": nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-60.0), nbt.Double(0.5)]),
@@ -175,6 +176,9 @@ CRAFTS = {
         slotted(12, "honey_bottle", 4),
         slotted(13, "paper"),
         slotted(14, "gunpowder"),
+        slotted(15, "iron_ingot", 3),
+        slotted(16, "stick", 2),
+        slotted(17, "cobblestone", 8),
     ]),
 }
 
@@ -373,8 +377,11 @@ CONFIGS = {
                              fixture="containers", rules=DIG_RULES, player=USE_CONTAINERS),
     # The bot, in survival mode, crafts in its inventory menu's grid: planks, a button, sticks
     # shift-clicked, a rocket swapped out with a hotbar key and a honey block, its bottles left;
-    # what each server sends back, and what each saves of it, is compared (CAL-147). The crafting
-    # fixture's world, as the dig one's rules have it, has no mobs to tell of.
+    # then at the crafting fixture's table: a pickaxe shift-clicked out, cobblestone dragged across
+    # for slabs shift-clicked out twice over, and logs shift-clicked into the grid, which closing
+    # puts back. What each server sends back, and
+    # what each saves of it, is compared (CAL-147). The crafting fixture's world, as the dig one's
+    # rules have it, has no mobs to tell of.
     "crafts": Config({}, view=3, scenarios=("crafts",), world=FIXTURES / "crafting" / "world", fixture="crafting",
                      rules=DIG_RULES, player=CRAFTS),
 }
