@@ -41,6 +41,7 @@ sys.path.insert(0, str(HERE))
 from launch import find_calx  # noqa: E402
 import nbt  # noqa: E402
 import sessiondiff  # noqa: E402
+import savediff  # noqa: E402
 import tapediff  # noqa: E402
 
 PLATFORM = "windows" if os.name == "nt" else "linux"
@@ -561,6 +562,21 @@ def compare_saved(config):
     return not differ
 
 
+# The chunks of a fixture's world whose saves are compared, as savediff.py compares them: those
+# the fixtures are built in, around the spawn, from -1, -1 to 0, 0 (CAL-145).
+FIXTURE_CHUNKS = (-1, -1, 0, 0)
+
+
+def compare_chunks(config, show):
+    """Prints what differs in what both servers saved of a fixture configuration's chunks, each
+    block's state, block entity, tick, heightmap and light (CAL-145). Reported, not gated."""
+    lines = savediff.compare(SESSIONS / config / "vanilla" / "world", SESSIONS / config / "calcite" / "world",
+                             FIXTURE_CHUNKS, show)
+    print(f"saved chunks   {'PASS' if not lines else 'differs'}    {len(lines)} differ")
+    for line in lines[:show]:
+        print(f"  [{config}] {line[:400]}")
+
+
 def dump(a, files):
     """Runs SessionDump on the recorded sessions, which writes a .jsonl beside each."""
     argv = a["argv"][:-1] + ["calcite.rig.vanilla.SessionDump"] + [str(f) for f in files]
@@ -608,6 +624,9 @@ def main():
     dump(a, files)
     report = sessiondiff.run(SESSIONS, configs, scenarios, CALCITE / "rig" / "differences", show=args.show, complete=complete)
     saved = all([compare_saved(c) for c in configs if CONFIGS[c].player is not None and scenarios[c]])
+    for c in configs:
+        if CONFIGS[c].fixture is not None and scenarios[c]:
+            compare_chunks(c, args.show)
     return 0 if report.passed and saved else 1
 
 

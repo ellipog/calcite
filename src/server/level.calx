@@ -62,7 +62,7 @@ import server.chunks.{Chunks, Next}
 import server.light_service.{LIGHT_ASKS, LightAsk, LightBody, LightDone, LightService, LightThread}
 import server.log.{Entry}
 import server.pregen.{Holds}
-import storage.chunk.{RestStore, SavedTick}
+import storage.chunk.{ChunkRest, PackedRest, RestStore, SavedTick}
 import storage.regions.{ChunkRead, region_of}
 import world.chunk.{AIR_STATE, BlockStates, Chunk, MOTION_BLOCKING}
 import world.collision.{CollisionBlocks, CollisionStates}
@@ -117,6 +117,11 @@ const LIGHT_BORDER: i32 = 34
 // The most block or fluid ticks a level runs in a tick, as `ServerLevel.tick` has its
 // `LevelTicks` run.
 const MOST_TICKS: usize = 65536
+// The most chunks changed in play saved in a tick, `CHUNK_SAVED_EAGERLY_PER_TICK`, and how long
+// after one's saved it may be again, in milliseconds, `EAGER_CHUNK_SAVE_COOLDOWN_IN_MILLIS`
+// (CAL-145).
+const EAGER_SAVES: usize = 20
+const EAGER_COOLDOWN_MS: i64 = 10000
 
 // A chunk the world has, or is reading.
 enum Body {
@@ -135,9 +140,12 @@ enum Body {
 // is its own copy in `live`, made from the one it came as, shared or flat, as a block was first
 // set, which what reads it reads first; it's taken out as it is now (D321). A chunk whose block
 // entities a block set has changed since it came has its map of them in `block_entities`, in
-// place of those its rest saved, which they go back into as it's taken out (CAL-115).
+// place of those its rest saved, which they go back into as it's taken out (CAL-115). A flat
+// chunk with blocks set in it is taken out whole, with a rest of its own, of `sections`, to be
+// saved (CAL-145).
 struct Columns {
     slots: OpenHashMap<i64, Body> = OpenHashMap<i64, Body>()
+    sections: usize = 0
     flat: FlatChunk? = none
     rests: RestStore = RestStore()
     live: OpenHashMap<i64, Chunk> = OpenHashMap<i64, Chunk>()
@@ -213,7 +221,16 @@ impl Columns {
                 return some(Body.Saved(saved))
             },
             Body.Loading => return some(Body.Loading),
-            Body.Flat => return some(Body.Flat),
+            Body.Flat => {
+                // A flat chunk with blocks set in it is all there is of it, saved as it is now,
+                // with the block entities it has, as vanilla saves every chunk it made (CAL-145).
+                let c = changed else return some(Body.Flat)
+                var r = rest ?? PackedRest.of(ChunkRest.empty(self.sections))
+                if let m = entities {
+                    r = r.with_block_entities(saved_block_entities(m))
+                }
+                return some(Body.Saved(SavedChunk { chunk: c.into_shared(), sources: none, sky: [], block: [], lighted: false, whole: true, rest: some(r) }))
+            },
         }
     }
 
@@ -492,6 +509,15 @@ pub struct Level {
     // saved, or changed by a run since they were lit. Each is saved as it unloads, and as the
     // server stops, as vanilla saves a chunk it's marked unsaved (D258).
     unsaved: OpenHashSet<i64> = OpenHashSet<i64>()
+    // The chunks changed in play since they were saved, oldest first, which `save_eagerly`
+    // saves, and when each may next be, by the server's clock in milliseconds, 10 seconds after
+    // it last was, as `chunksToEagerlySave` and `nextChunkSaveTime` have them (CAL-145).
+    eager: OpenHashSet<i64> = OpenHashSet<i64>()
+    eager_order: Deque<i64> = Deque<i64>()
+    next_save: OpenHashMap<i64, i64> = OpenHashMap<i64, i64>()
+    // Each held chunk's inhabited time, where it isn't 0: as it was saved, and a tick more each
+    // tick mobs may spawn in it, `incrementInhabitedTime` (CAL-145).
+    inhabited: OpenHashMap<i64, i64> = OpenHashMap<i64, i64>()
     lines: List<Entry> = List<Entry>()
     // The player whose sender asks next, for their far chunks.
     serving: i32 = 0
@@ -709,6 +735,7 @@ impl Level {
     pub fn set_bounds(mut self, min_y: i32, height: i32, zoom_seed: i64) {
         self.min_section = min_y >> 4
         self.sections = height >> 4
+        self.columns.sections = usize.wrap(self.sections)
         self.zoom_seed = zoom_seed
     }
 
@@ -785,6 +812,7 @@ impl Level {
         self.opened = true
         self.min_section = context.min_section
         self.sections = context.sections
+        self.columns.sections = usize.wrap(context.sections)
         var flat: FlatChunk? = none
         if let f = self.columns.flat {
             flat = some(f.copy())
@@ -1596,9 +1624,7 @@ impl Level {
         }
         tags.insert("progress", Tag.Float(m.progress_o))
         self.columns.block_entities[k].insert(pos, Tag.Compound(tags))
-        if self.whole(k) {
-            self.unsaved.insert(k)
-        }
+        self.touched(k)
     }
 
     // The block entities the chunk at `k` was saved with, ticking once it's full, as
@@ -2797,6 +2823,7 @@ impl Level {
                 self.forget_light(k, save)
             }
         }
+        _ = self.inhabited.remove(k)
     }
 
     // The chunk at `k` unloads, or the server stops, as `gone`, with `ticks`, its block and fluid
@@ -2808,19 +2835,19 @@ impl Level {
             return none
         }
         self.unsaved.remove(k)
-        if self.gen == none {
-            return none
-        }
+        self.eager.remove(k)
+        _ = self.next_save.remove(k)
         match gone {
             Body.Saved(s) => {
                 let SavedChunk { chunk: chunk, whole: whole, rest: rest, .. } = s
                 if whole {
                     let r = rest else return none
+                    let inhabited = self.inhabited.get(k) ?? 0
                     if let t = ticks {
                         let (block, fluid) = t
-                        return some(Whole { chunk: chunk, rest: r.with_ticks(block, fluid) })
+                        return some(Whole { chunk: chunk, rest: r.with_ticks(block, fluid), last_update: self.game_time, inhabited: inhabited })
                     }
-                    return some(Whole { chunk: chunk, rest: r })
+                    return some(Whole { chunk: chunk, rest: r, last_update: self.game_time, inhabited: inhabited })
                 }
             },
             _ => {},
@@ -2869,6 +2896,130 @@ impl Level {
     }
 
     // Whether the chunk at `k` is held whole, so it can be saved from what's held (D258).
+    // Whether the chunk at `k` is saved as it changes: one held whole, or a flat one with blocks
+    // set in it, which Calcite holds all of (CAL-145).
+    fn saves_whole(self, k: i64) -> bool {
+        if not self.columns.slots.contains(k) {
+            return false
+        }
+        return match self.columns.slots[k] {
+            Body.Saved(s) => s.whole,
+            Body.Flat => self.columns.live.contains(k),
+            Body.Loading => false,
+        }
+    }
+
+    /// Whether the chunk at `pos` is to be saved, as `isUnsaved` says.
+    pub fn is_unsaved(self, pos: ChunkPos) -> bool {
+        return self.unsaved.contains(pos.pack())
+    }
+
+    // The chunk at `k` changed in play, a block set in it or a block entity changed: it's
+    // unsaved, as `markUnsaved` marks it, and to be saved soon, as its `UnsavedListener` has
+    // `saveChunksEagerly` save it (CAL-145).
+    fn touched(mut self, k: i64) {
+        if not self.saves_whole(k) {
+            return
+        }
+        self.unsaved.insert(k)
+        if not self.eager.contains(k) {
+            self.eager.insert(k)
+            self.eager_order.push_last(k)
+        }
+    }
+
+    /// Saves the chunks changed in play, as `saveChunksEagerly` saves them after the unloads,
+    /// oldest first, up to 20, each no sooner than 10 seconds after it last was, `now` being the
+    /// server's clock in milliseconds; or, at an autosave, `all`, every one, as `saveAllChunks`
+    /// saves them with those times cleared (CAL-145). Each is saved as it is, with its light, and
+    /// stays. Chunks the generator made, or whose light alone changed, are saved as they unload
+    /// and as the server stops, not here: they'd be made or lit again the same (D258).
+    pub fn save_eagerly(mut self, now: i64, all: bool) {
+        if not self.opened or self.eager_order.is_empty() {
+            return
+        }
+        if all {
+            self.next_save.clear()
+        }
+        var saved: usize = 0
+        var left = Deque<i64>()
+        while let k = self.eager_order.pop_first() {
+            if not self.eager.contains(k) {
+                continue
+            }
+            if not all and saved >= EAGER_SAVES {
+                left.push_last(k)
+                continue
+            }
+            if not self.unsaved.contains(k) or not self.saves_whole(k) {
+                self.eager.remove(k)
+                continue
+            }
+            if now < (self.next_save.get(k) ?? -1) {
+                left.push_last(k)
+                continue
+            }
+            self.eager.remove(k)
+            let whole = self.snapshot(k) else continue
+            self.unsaved.remove(k)
+            self.next_save.insert(k, now + EAGER_COOLDOWN_MS)
+            self.save_lit(k, whole, false)
+            saved += 1
+        }
+        self.eager_order = left
+    }
+
+    // The chunk at `k` as it's saved now it's held whole, with its rest as it is: its block
+    // entities, and its ticks if it's full; none if it isn't (CAL-145).
+    fn snapshot(self, k: i64) -> Whole? {
+        if not self.columns.slots.contains(k) {
+            return none
+        }
+        var chunk: Shared<Chunk>? = none
+        if self.columns.live.contains(k) {
+            chunk = some(Shared(self.columns.live[k].copy()))
+        }
+        var rest = self.columns.rests.copied(k)
+        match self.columns.slots[k] {
+            Body.Saved(s) => {
+                if not s.whole {
+                    return none
+                }
+                if chunk == none {
+                    chunk = some(s.chunk.copy())
+                }
+            },
+            Body.Flat => {
+                if rest == none {
+                    rest = some(PackedRest.of(ChunkRest.empty(self.columns.sections)))
+                }
+            },
+            Body.Loading => return none,
+        }
+        let c = chunk else return none
+        var r = rest else return none
+        if self.columns.block_entities.contains(k) {
+            r = r.with_block_entities(saved_block_entities(self.columns.block_entities[k].copy()))
+        }
+        if let t = self.ticks_now(k) {
+            let (block, fluid) = t
+            r = r.with_ticks(block, fluid)
+        }
+        return some(Whole { chunk: c, rest: r, last_update: self.game_time, inhabited: self.inhabited.get(k) ?? 0 })
+    }
+
+    /// The chunk at `pos` had a tick where mobs may spawn in it, `incrementInhabitedTime`, which
+    /// its save keeps (CAL-145).
+    pub fn inhabit(mut self, pos: ChunkPos) {
+        let k = pos.pack()
+        self.inhabited.insert(k, (self.inhabited.get(k) ?? 0) + 1)
+    }
+
+    /// How many ticks the chunk at `pos` has been where mobs may spawn, `getInhabitedTime`.
+    pub fn inhabited_time(self, pos: ChunkPos) -> i64 {
+        return self.inhabited.get(pos.pack()) ?? 0
+    }
+
     fn whole(self, k: i64) -> bool {
         if not self.columns.slots.contains(k) {
             return false
@@ -2893,6 +3044,11 @@ impl Level {
                 // What the generator made isn't on the disk until it's let go of (D258).
                 if saved.fresh and saved.whole {
                     self.unsaved.insert(k)
+                }
+                if saved.inhabited != 0 {
+                    self.inhabited.insert(k, saved.inhabited)
+                } else {
+                    _ = self.inhabited.remove(k)
                 }
                 if not self.lighting {
                     self.columns.put(k, Body.Saved(saved))
@@ -3433,9 +3589,7 @@ impl BlockLevel for Level {
         let set = self.columns.live[k].set_block(t, x & 15, y, z & 15, state)
         self.table = some(t)
         let old = set else return false
-        if self.whole(k) {
-            self.unsaved.insert(k)
-        }
+        self.touched(k)
         _ = self.packets.remove(k)
         if self.lighting {
             self.send_light(LightAsk.Block { k: k, x: x, y: y, z: z, state: state })
@@ -3612,9 +3766,7 @@ impl BlockLevel for Level {
         }
         tags.insert("OutputSignal", Tag.Int(output))
         self.columns.block_entities[k].insert(pos, Tag.Compound(tags))
-        if self.whole(k) {
-            self.unsaved.insert(k)
-        }
+        self.touched(k)
     }
 
     fn forget_toggles(mut self) {
@@ -3812,9 +3964,7 @@ impl BlockLevel for Level {
         let k = pos.chunk().pack()
         self.columns.own_block_entities(k)
         self.columns.block_entities[k].insert(pos, moving_tag(f, pos, m))
-        if self.whole(k) {
-            self.unsaved.insert(k)
-        }
+        self.touched(k)
         self.motions.insert(pos.pack(), m)
         if self.ticker_ids.contains(pos.pack()) {
             self.ticker_kinds.insert(pos.pack(), PISTON_TICKER)
@@ -3872,9 +4022,7 @@ impl BlockLevel for Level {
         }
         tags.insert(String(key), value)
         self.columns.block_entities[k].insert(pos, Tag.Compound(tags))
-        if self.whole(k) {
-            self.unsaved.insert(k)
-        }
+        self.touched(k)
     }
 
     fn send_block_updated(mut self, x: i32, y: i32, z: i32) {
@@ -3897,9 +4045,7 @@ impl BlockLevel for Level {
         }
         _ = tags.remove(String(key))
         self.columns.block_entities[k].insert(pos, Tag.Compound(tags))
-        if self.whole(k) {
-            self.unsaved.insert(k)
-        }
+        self.touched(k)
     }
 
     fn after_removal_of(mut self, old: u32, x: i32, y: i32, z: i32, moved: bool) {
