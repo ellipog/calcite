@@ -275,6 +275,10 @@ struct Connection {
     average_received: f32 = 0.0
     // Where the player joins, as the spawn task works it out.
     prepare: Prepare = Prepare()
+    // Whether the packet that ends configuration waits for the next tick, so what came after it
+    // isn't read until it's run, as vanilla's `ProtocolSwapHandler` stops reading till the play
+    // protocol is set up (CAL-150).
+    held: bool = false
 }
 
 // Where a joining player goes, as vanilla's `PrepareSpawnTask` works it out: the search for the
@@ -496,6 +500,36 @@ enum ReadEntity {
     Kept(Tag)
 }
 
+// A configuration or play packet that waits for the next tick, with the connection it came on
+// (CAL-150).
+struct Scheduled {
+    conn: Conn
+    packet: Inbound
+}
+
+enum Inbound {
+    Configuration(ConfigurationIn)
+    Play(PlayIn)
+}
+
+// A creative slot's stack as it's read: nothing to read it by, a component whose stream Calcite
+// doesn't read yet, why it doesn't read, or the stack and whether its count is no more than its
+// item stacks to.
+enum CreativeStack {
+    Unready
+    Unread(String)
+    Fault(String)
+    Read(Tag?, bool)
+}
+
+// A container click's slots and cursor as they're read: nothing to read them by, why they don't
+// read, or the click.
+enum ClickRead {
+    Unready
+    Fault(String)
+    Read(Click)
+}
+
 // A command, or a game mode picked with F3 and F4, from the player in a slot, which runs once
 // their connection is back in its slot (D239).
 enum Queued {
@@ -599,6 +633,9 @@ pub struct Network {
     entities_logged: bool = false
     // The commands waiting for their players' connections, and how many players have joined.
     queued: Deque<Queued> = Deque<Queued>()
+    // The configuration and play packets that wait for the next tick, in the order they came on
+    // every connection, as `PacketProcessor` holds them (CAL-150).
+    scheduled: Deque<Scheduled> = Deque<Scheduled>()
     joins: u64 = 0
     // How many times a player has come into a level, which orders each level's players.
     entries: u64 = 0
@@ -1527,7 +1564,8 @@ impl Network {
     /// One server tick, at `now` nanoseconds on the caller's clock, as vanilla's `tickServer`
     /// runs it (CAL-105), once the checks with the session server that are done have been acted
     /// on and Mojang's services fetched from as they're due: until the chunks the saved tickets
-    /// load are full, nothing ticks (D319); a server that's had no players for
+    /// load are full, nothing ticks (D319); then the packets held for the tick run, as
+    /// `processPacketsAndTick` runs them first (CAL-150); a server that's had no players for
     /// `pause-when-empty-seconds` ticks only its connections, until someone joins; else the tick
     /// is `tick_children`'s, then the status is rebuilt if it's 5 seconds old, and the autosave
     /// counts down.
@@ -1541,6 +1579,7 @@ impl Network {
             self.flush()
             return
         }
+        self.run_scheduled(now)
         if self.paused() {
             self.tick_connections(now)
             self.dispatch_all()
@@ -2485,10 +2524,20 @@ impl Network {
                 }
             }
         }
-        // A frame or packet that can't be read closes the connection. In the handshake and status
-        // vanilla can't send the reason, since neither state has a disconnect packet, and logs
-        // it only at debug level, so it's dropped there. Later the client is told.
+        return self.decode(mut con, now)
+    }
+
+    // Reads the packets that have come on the connection, each handled as it's read or held for
+    // the next tick, up to one that ends configuration, after which nothing's read until it's
+    // run (CAL-150). False when it's to close. A frame or packet that can't be read closes the
+    // connection. In the handshake and status vanilla can't send the reason, since neither state
+    // has a disconnect packet, and logs it only at debug level, so it's dropped there. Later the
+    // client is told.
+    fn decode(mut self, con: mut Connection, now: u64) -> bool {
         loop {
+            if con.held {
+                return true
+            }
             let body = match con.codec.next() {
                 ok(some(b)) => b,
                 ok(none) => return true,
@@ -2560,7 +2609,12 @@ impl Network {
                     },
                 }
                 con.received += 1
-                return self.configuration_packet(mut con, p, now)
+                if not on_server_thread_configuration(p) {
+                    return self.configuration_packet(mut con, p, now)
+                }
+                con.held = ends_configuration(p)
+                self.scheduled.push_last(Scheduled { conn: Conn.from_id(con.conn.id()), packet: Inbound.Configuration(p) })
+                return true
             },
             Phase.Play => {
                 // A packet Calcite doesn't read yet is skipped whole.
@@ -2577,7 +2631,16 @@ impl Network {
                     },
                 }
                 con.received += 1
-                return self.play_packet(mut con, p, now)
+                if not on_server_thread_play(p) {
+                    return self.play_packet(mut con, p, now)
+                }
+                // What its codec checks as it's read stops the connection now, not as it'd run.
+                if let fault = self.unreadable(p) {
+                    self.fault(mut con, decode_exception(fault))
+                    return false
+                }
+                self.scheduled.push_last(Scheduled { conn: Conn.from_id(con.conn.id()), packet: Inbound.Play(p) })
+                return true
             },
         }
     }
@@ -3302,8 +3365,8 @@ impl Network {
     // `handleConfigurationFinished` switches to play and `PlayerList.placeNewPlayer` places
     // them, in its order: the world and what they may do in it, the recipes and commands, the
     // join message for the others, their place, the server's description, the tab list, the
-    // world's border, time and spawn, then their view of the world, whose chunks go from the
-    // next tick, and their inventory.
+    // world's border, time and spawn, then their view of the world, whose chunks go as the
+    // tick it's run in ticks the connections, and their inventory.
     fn join(mut self, con: mut Connection) {
         con.outbound = State.Play
         con.phase = Phase.Play
@@ -3611,25 +3674,13 @@ impl Network {
     // menu's. A click vanilla throws on is logged as `onPacketError` logs it, and leaves remote
     // updates held, as vanilla leaves them, until the next click.
     fn container_click(mut self, con: mut Connection, c: ServerboundContainerClick) -> bool {
-        if not self.items_ready() {
-            return true
-        }
-        let packet = String("serverbound/minecraft:container_click")
-        let (items_n, types_n) = match self.world.registries {
-            some(r) => (builtin_size(r.value, "item"), builtin_size(r.value, "data_component_type")),
-            none => return true,
-        }
-        var rd = Reader.new(c.rest.copy())
-        let click = match read_click(mut rd, items_n, types_n) {
-            ok(k) => k,
-            err(e) => {
-                self.fault(mut con, decode_exception("Failed to decode packet '{packet}': {e.message}"))
+        let click = match self.click_of(c) {
+            ClickRead.Unready => return true,
+            ClickRead.Fault(f) => {
+                self.fault(mut con, decode_exception(f))
                 return false
             },
-        }
-        if rd.left() != 0 {
-            self.fault(mut con, decode_exception("Packet play/{packet} (ServerboundContainerClickPacket) was larger than I expected, found {rd.left()} bytes extra whilst reading packet {packet}"))
-            return false
+            ClickRead.Read(k) => k,
         }
         if con.player.container != none {
             return self.container_menu_click(mut con, c, click)
@@ -4034,6 +4085,63 @@ impl Network {
         return true
     }
 
+    // A click's slots and what its cursor carries, read as the packet's codec reads them.
+    fn click_of(mut self, c: ServerboundContainerClick) -> ClickRead {
+        if not self.items_ready() {
+            return ClickRead.Unready
+        }
+        let packet = String("serverbound/minecraft:container_click")
+        let (items_n, types_n) = match self.world.registries {
+            some(r) => (builtin_size(r.value, "item"), builtin_size(r.value, "data_component_type")),
+            none => return ClickRead.Unready,
+        }
+        var rd = Reader.new(c.rest.copy())
+        let click = match read_click(mut rd, items_n, types_n) {
+            ok(k) => k,
+            err(e) => return ClickRead.Fault("Failed to decode packet '{packet}': {e.message}"),
+        }
+        if rd.left() != 0 {
+            return ClickRead.Fault("Packet play/{packet} (ServerboundContainerClickPacket) was larger than I expected, found {rd.left()} bytes extra whilst reading packet {packet}")
+        }
+        return ClickRead.Read(click)
+    }
+
+    // A creative slot's stack, read as the packet's codec reads it.
+    fn creative_stack(mut self, c: ServerboundSetCreativeModeSlot) -> CreativeStack {
+        if not self.items_ready() {
+            return CreativeStack.Unready
+        }
+        let packet = String("serverbound/minecraft:set_creative_mode_slot")
+        var rd = Reader.new(c.stack.copy())
+        let taken = self.items.take() else return CreativeStack.Unready
+        var items = taken
+        let streams = self.streams.take() ?? Streams.new()
+        var out = CreativeStack.Unready
+        match items.read_untrusted(mut rd, streams) {
+            ok(t) => {
+                if rd.left() != 0 {
+                    out = CreativeStack.Fault("Packet play/{packet} (ServerboundSetCreativeModeSlotPacket) was larger than I expected, found {rd.left()} bytes extra whilst reading packet {packet}")
+                } else {
+                    var valid = true
+                    if let s = t {
+                        valid = count_of(s) <= items.max_stack_size(s)
+                    }
+                    out = CreativeStack.Read(t, valid)
+                }
+            },
+            err(e) => {
+                if e.message.starts_with("Calcite reads the stream of ") {
+                    out = CreativeStack.Unread(e.message.copy())
+                } else {
+                    out = CreativeStack.Fault("Failed to decode packet '{packet}': {e.message}")
+                }
+            },
+        }
+        self.items = some(items)
+        self.streams = some(streams)
+        return out
+    }
+
     // `handleSetCreativeModeSlot`, its stack read first as the packet's codec reads it, which
     // stops the connection where it doesn't read: a player with infinite materials puts a stack
     // in a slot of their inventory menu, from 1 to 45, where it's no more than its item stacks
@@ -4041,42 +4149,22 @@ impl Network {
     // yet, so it's gone. A stack with a component whose stream Calcite doesn't read yet is let
     // be, with a warning.
     fn creative_slot(mut self, con: mut Connection, c: ServerboundSetCreativeModeSlot) -> bool {
-        if not self.items_ready() {
-            return true
-        }
-        let packet = String("serverbound/minecraft:set_creative_mode_slot")
-        var rd = Reader.new(c.stack.copy())
-        let taken = self.items.take() else return true
-        var items = taken
-        let streams = self.streams.take() ?? Streams.new()
         var stack: Tag? = none
-        var fault: String? = none
-        match items.read_untrusted(mut rd, streams) {
-            ok(t) => {
-                if rd.left() != 0 {
-                    fault = some("Packet play/{packet} (ServerboundSetCreativeModeSlotPacket) was larger than I expected, found {rd.left()} bytes extra whilst reading packet {packet}")
-                }
-                stack = t
-            },
-            err(e) => {
-                if e.message.starts_with("Calcite reads the stream of ") {
-                    self.logs.push(Entry.warn("{player_name(con)} set a creative slot to a stack {e.message}"))
-                    self.items = some(items)
-                    self.streams = some(streams)
-                    return true
-                }
-                fault = some("Failed to decode packet '{packet}': {e.message}")
-            },
-        }
         var valid_data = true
-        if let t = stack {
-            valid_data = count_of(t) <= items.max_stack_size(t)
-        }
-        self.items = some(items)
-        self.streams = some(streams)
-        if let f = fault {
-            self.fault(mut con, decode_exception(f))
-            return false
+        match self.creative_stack(c) {
+            CreativeStack.Unready => return true,
+            CreativeStack.Unread(why) => {
+                self.logs.push(Entry.warn("{player_name(con)} set a creative slot to a stack {why}"))
+                return true
+            },
+            CreativeStack.Fault(f) => {
+                self.fault(mut con, decode_exception(f))
+                return false
+            },
+            CreativeStack.Read(t, valid) => {
+                stack = t
+                valid_data = valid
+            },
         }
         if not con.player.abilities.instabuild {
             return true
@@ -6732,6 +6820,74 @@ impl Network {
         return self.spam(mut con, true)
     }
 
+    // `processQueuedPackets`, as `processPacketsAndTick` starts each tick with it: the
+    // configuration and play packets vanilla hands its server thread,
+    // `ensureRunningOnSameThread`, run in the order they came, whichever connection they came on,
+    // at the tick's time, each flushed as it's handled, since the tick hasn't held flushing yet.
+    // One whose connection's gone or closing is dropped, as `shouldHandleMessage` drops it. Once
+    // the one that ends configuration has the player join, what came after it is read, and what
+    // of that waits for the server thread runs in this drain too, after the rest (CAL-150).
+    fn run_scheduled(mut self, now: u64) {
+        while let s = self.scheduled.pop_first() {
+            let id = s.conn.id()
+            let slot = s.conn.slot()
+            if slot >= self.connections.len() {
+                continue
+            }
+            var con = self.connections[slot].take() else continue
+            if con.conn.id() != id or con.closing {
+                self.connections[slot] = some(con)
+                continue
+            }
+            var open = match s.packet {
+                Inbound.Configuration(p) => self.configuration_packet(mut con, p, now),
+                Inbound.Play(p) => self.play_packet(mut con, p, now),
+            }
+            // A join lets what came after it be read; an end of configuration that failed leaves
+            // the connection reading nothing, as vanilla's never gets its play protocol.
+            if open and con.held and con.phase == Phase.Play {
+                con.held = false
+                open = self.decode(mut con, now)
+            }
+            if not open {
+                self.close(mut con)
+            }
+            self.connections[slot] = some(con)
+            self.run_queued()
+            self.flush()
+        }
+    }
+
+    // Why a play packet doesn't read, as its codec checks it before vanilla hands it to the
+    // server thread: an action past its kind's last, and a click's or a creative slot's items
+    // (CAL-150).
+    fn unreadable(mut self, p: PlayIn) -> String? {
+        match p {
+            PlayIn.PlayerAction(a) => {
+                if a.action < 0 or a.action >= ACTIONS {
+                    return some("Failed to decode packet 'serverbound/minecraft:player_action': Index {a.action} out of bounds for length {ACTIONS}")
+                }
+            },
+            PlayIn.PlayerCommand(c) => {
+                if c.action < 0 or c.action > 6 {
+                    return some("Failed to decode packet 'serverbound/minecraft:player_command': Index {c.action} out of bounds for length 7")
+                }
+            },
+            PlayIn.ContainerClick(c) => {
+                if let ClickRead.Fault(f) = self.click_of(c) {
+                    return some(f)
+                }
+            },
+            PlayIn.SetCreativeModeSlot(c) => {
+                if let CreativeStack.Fault(f) = self.creative_stack(c) {
+                    return some(f)
+                }
+            },
+            _ => {},
+        }
+        return none
+    }
+
     // Runs what was queued while the players' connections were out of their slots.
     fn run_queued(mut self) {
         while let q = self.queued.pop_first() {
@@ -8422,6 +8578,47 @@ fn user(con: Connection) -> String {
 
 // The exception vanilla's pipeline throws for what Calcite's reader couldn't read, as Java's
 // `toString` writes it, from the reader's message, which is vanilla's own.
+// Whether vanilla's configuration listener hands `p` to the server thread to run as the next tick
+// starts, `ensureRunningOnSameThread`: the known packs, the end of configuration, a resource
+// pack's answer and a custom click action. The client's information, the code of conduct, the
+// keep-alive, pongs, plugin channels and cookies it handles as they're read (CAL-150).
+fn on_server_thread_configuration(p: ConfigurationIn) -> bool {
+    return match p {
+        ConfigurationIn.SelectKnownPacks(_) => true,
+        ConfigurationIn.FinishConfiguration(_) => true,
+        ConfigurationIn.ResourcePack(_) => true,
+        ConfigurationIn.CustomClickAction(_) => true,
+        _ => false,
+    }
+}
+
+// Whether `p` ends configuration, after which vanilla reads nothing more until it's run, as its
+// `ProtocolSwapHandler` stops reading till the play protocol is set up (CAL-150).
+fn ends_configuration(p: ConfigurationIn) -> bool {
+    return match p {
+        ConfigurationIn.FinishConfiguration(_) => true,
+        _ => false,
+    }
+}
+
+// Whether vanilla's game listener hands `p` to the server thread to run as the next tick starts:
+// all but chat and commands, which it checks as they're read and runs as tasks of their own
+// between ticks, chat's acknowledgements, the keep-alive, pongs, plugin channels and cookies
+// (CAL-150).
+fn on_server_thread_play(p: PlayIn) -> bool {
+    return match p {
+        PlayIn.Chat(_) => false,
+        PlayIn.ChatAck(_) => false,
+        PlayIn.ChatCommand(_) => false,
+        PlayIn.ChatCommandSigned(_) => false,
+        PlayIn.KeepAlive(_) => false,
+        PlayIn.Pong(_) => false,
+        PlayIn.CustomPayload(_) => false,
+        PlayIn.CookieResponse(_) => false,
+        _ => true,
+    }
+}
+
 fn decode_exception(message: String) -> String {
     if message == "length wider than 21-bit" or message == "Frame length cannot be zero" {
         return "io.netty.handler.codec.CorruptedFrameException: {message}"
