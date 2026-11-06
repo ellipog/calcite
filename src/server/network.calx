@@ -75,7 +75,7 @@ import world.mob.{CHICKEN, COW, CREEPER, DONKEY, ENDERMAN, HORSE, INTERACT_SERVE
 import world.variants.{MobFacts}
 import world.loot.{Loot, LootEntity, LootParams, random_sequence, roll_table}
 import world.item_tracker.{Tracker, Sent, delta_bytes, lp_vec3_bytes, path_bytes, section_of}
-import world.movement.{MovementStates, Mover}
+import world.movement.{MovementStates, Mover, meets}
 import math.mth.{table_cos, table_sin}
 import std.java.math.{cos as strict_cos, sin as strict_sin}
 import random.xoroshiro.{mix_stafford13}
@@ -500,6 +500,17 @@ struct Player {
     last_hurt: f32 = 0.0
     load_timer: i32 = 60
     support_sent: i32 = 0
+    // Where the player was as their tick began, `firstGoodX`, and where the server last took
+    // them, `lastGoodX`; how many moves they've sent, `receivedMovePacketCount`, and had sent as
+    // their last tick ended, `knownMovePacketCount`; and whether their client has them floating,
+    // `clientIsFloating`, and for how many ticks, `aboveGroundTickCount` (D420); none kept of
+    // where they are till it first is.
+    first_good: (f64, f64, f64)? = none
+    last_good: (f64, f64, f64)? = none
+    move_packets: i32 = 0
+    known_packets: i32 = 0
+    floating: bool = false
+    floating_ticks: i32 = 0
     tracker_x: i32 = 0
     tracker_y: i32 = 0
     tracker_z: i32 = 0
@@ -1036,7 +1047,7 @@ impl Network {
     /// as `applyInitialSettings` sets it up, each level's random is seeded, and each level that
     /// can have weather has its rain and thunder as `prepareWeather` sets them.
     pub fn set_world_state(mut self, state: own WorldState) {
-        let WorldState { weather: weather, clocks: clocks, borders: given_borders, advance_time: advance_time, advance_weather: weather_on, pause_when_empty: pause_when_empty, max_world_size: max_world_size, max_chained: max_chained, water_source_conversion: water_converts, lava_source_conversion: lava_converts, seeds: given_seeds, spawn_rules: spawn_rules, random_tick_speed: random_tick_speed, fire_spread_radius: fire_spread_radius, max_snow: max_snow, natural_regeneration: natural_regeneration, cramming: cramming, trader: trader, trader_seed: trader_seed, tickets: given_tickets, sequences: sequences, block_drops: block_drops, mob_griefing: mob_griefing, mob_drops: mob_drops, damage_rules: damage_rules } = state
+        let WorldState { weather: weather, clocks: clocks, borders: given_borders, advance_time: advance_time, advance_weather: weather_on, pause_when_empty: pause_when_empty, max_world_size: max_world_size, max_chained: max_chained, water_source_conversion: water_converts, lava_source_conversion: lava_converts, seeds: given_seeds, spawn_rules: spawn_rules, random_tick_speed: random_tick_speed, fire_spread_radius: fire_spread_radius, max_snow: max_snow, natural_regeneration: natural_regeneration, cramming: cramming, trader: trader, trader_seed: trader_seed, tickets: given_tickets, sequences: sequences, block_drops: block_drops, mob_griefing: mob_griefing, mob_drops: mob_drops, damage_rules: damage_rules, movement_check: movement_check, allow_flight: allow_flight } = state
         var borders = given_borders
         var seeds = given_seeds
         self.world.weather = weather
@@ -1054,6 +1065,8 @@ impl Network {
         self.world.mob_griefing = mob_griefing
         self.world.mob_drops = mob_drops
         self.world.damage_rules = damage_rules
+        self.world.movement_check = movement_check
+        self.world.allow_flight = allow_flight
         var tickets = given_tickets
         self.world.spawners = Spawners.new(trader_seed, trader)
         self.pause_when_empty = pause_when_empty
@@ -4084,6 +4097,9 @@ impl Network {
         self.send(mut con, ClientboundRecipeBookAdd { recipes: BookRecipes {}, replace: true }, State.Play)
         self.broadcast_system(Component.translatable("multiplayer.player.joined", [display_name(profile)]).colored("yellow"), Look.Quiet)
         let (px, py, pz) = (con.player.x, con.player.y, con.player.z)
+        // Where they are kept from the start, as their first tick, which comes before their
+        // client's accept, keeps them (D420).
+        reset_position(mut con)
         self.teleport(mut con, px, py, pz, y_rot, x_rot)
         if not con.transferred {
             let data = ClientboundServerData { motd: self.status.status.description.copy(), icon: self.status.status.favicon.copy() }
@@ -4929,6 +4945,7 @@ impl Network {
         let from = con.player.dim
         if from == to {
             self.teleport(mut con, x, y, z, y_rot, x_rot)
+            reset_position(mut con)
             self.track(mut con, false)
             return
         }
@@ -4956,6 +4973,7 @@ impl Network {
         self.close_container(mut con)
         con.player.dim = to
         self.teleport(mut con, x, y, z, y_rot, x_rot)
+        reset_position(mut con)
         self.enter_level(mut con)
         // The new level tracks them afresh, from its next tick (D375).
         con.player.tracked = 0
@@ -4984,9 +5002,12 @@ impl Network {
         }
     }
 
-    // Puts the player at a place, which the client is to accept before it moves on its own, as
-    // the play listener's `teleport`.
+    // Puts the player at a place, their motion none (D420), which the client is to accept before
+    // it moves on its own, as the play listener's `teleport`.
     fn teleport(mut self, con: mut Connection, x: f64, y: f64, z: f64, y_rot: f32, x_rot: f32) {
+        con.player.vx = 0.0
+        con.player.vy = 0.0
+        con.player.vz = 0.0
         con.player.awaiting_time = con.player.tick_count
         con.player.teleport_id += 1
         if con.player.teleport_id == 2147483647 {
@@ -5092,8 +5113,10 @@ impl Network {
     }
 
     // A player's tick at `now`, as the play listener's `tick`: their block changes acked, up to
-    // the last they asked to be (D376), then their own tick, `doTick`, then a keep-alive if one
-    // is due, then the spam counts go down.
+    // the last they asked to be (D376); then, as `tickPlayer` runs it, where they are kept,
+    // `resetPosition`, their own tick, `doTick`, their moves so far counted and their floating
+    // looked at, which may kick them, ending the tick (D420); then a keep-alive if one is due,
+    // then the spam counts go down.
     fn tick_play(mut self, con: mut Connection, now: u64) {
         con.player.tick_count += 1
         if con.player.ack > -1 {
@@ -5101,7 +5124,12 @@ impl Network {
             self.send(mut con, ClientboundBlockChangedAck { sequence: sequence }, State.Play)
             con.player.ack = -1
         }
+        reset_position(mut con)
         self.do_tick(mut con)
+        con.player.known_packets = con.player.move_packets
+        if self.kick_floating(mut con) {
+            return
+        }
         _ = self.keep_alive(mut con, now)
         con.player.chat_spam.tick()
         con.player.command_spam.tick()
@@ -8183,8 +8211,12 @@ impl Network {
                         self.disconnect(mut con, Component.translatable("multiplayer.disconnect.invalid_player_movement", []))
                         return false
                     }
+                    // Where they were sent, `absSnapTo`, which the teleport put them at
+                    // already, the last place the server took with it; then the accept taken
+                    // as a move, off the ground and into nothing across (D420).
                     con.player.awaiting = false
-                    self.move_player(mut con, a.x, a.y, a.z, a.y_rot, a.x_rot)
+                    con.player.last_good = some((con.player.x, con.player.y, con.player.z))
+                    return self.position_change(mut con, a.x, a.y, a.z, a.y_rot, a.x_rot, false, false)
                 }
                 return true
             },
@@ -9934,9 +9966,9 @@ impl Network {
     // A move, as `handleMovePlayer`: a value that isn't a number ends the connection, as do two
     // positions in one of the client's ticks. Until the client accepts the last teleport, a
     // move only turns the player, and the teleport goes again once a second has passed. One let
-    // through says whether they're on the ground, the first of its `flags` (D376), then is what
-    // their fall goes by, `player_moved` (D418). Calcite doesn't yet check moves against the
-    // world, as vanilla does.
+    // through says whether they're on the ground, the first of its `flags` (D376), and is taken
+    // as vanilla's server takes it, `position_change` (D420). Before their first tick, where
+    // they are is kept, `resetPosition`.
     fn moved(mut self, con: mut Connection, has_pos: bool, x: f64, y: f64, z: f64, has_rot: bool, y_rot: f32, x_rot: f32, flags: u8) -> bool {
         if invalid(x, y, z, y_rot, x_rot) {
             self.disconnect(mut con, Component.translatable("multiplayer.disconnect.invalid_player_movement", []))
@@ -9949,6 +9981,9 @@ impl Network {
             }
             con.player.position_this_tick = true
         }
+        if con.player.tick_count == 0 {
+            reset_position(mut con)
+        }
         let to_y_rot = if has_rot { y_rot } else { con.player.y_rot }
         let to_x_rot = if has_rot { x_rot } else { con.player.x_rot }
         if con.player.awaiting {
@@ -9960,37 +9995,178 @@ impl Network {
             con.player.x_rot = clamp_f32(wrap_degrees(to_x_rot), -90.0, 90.0) % 360.0
             return true
         }
-        let to_x = clamp_f64(if has_pos { x } else { con.player.x }, -30000000.0, 30000000.0)
-        let to_y = clamp_f64(if has_pos { y } else { con.player.y }, -20000000.0, 20000000.0)
-        let to_z = clamp_f64(if has_pos { z } else { con.player.z }, -30000000.0, 30000000.0)
-        let (from_x, from_y, from_z) = (con.player.x, con.player.y, con.player.z)
-        let ground = flags & 1 != 0
-        // Their jump, the blocks under them sent again and the server's own move of them, as
-        // `handlePlayerPositionChange` runs them (D419); then where the client said, `absSnapTo`,
-        // and on the ground and into something across as it said, `setOnGroundWithMovement`
-        // (D376, D419).
-        self.client_move(mut con, to_x - from_x, to_y - from_y, to_z - from_z, ground)
-        self.move_player(mut con, to_x, to_y, to_z, to_y_rot, to_x_rot)
+        let to_x = if has_pos { x } else { con.player.x }
+        let to_y = if has_pos { y } else { con.player.y }
+        let to_z = if has_pos { z } else { con.player.z }
+        return self.position_change(mut con, to_x, to_y, to_z, to_y_rot, to_x_rot, flags & 1 != 0, flags & 2 != 0)
+    }
+
+    // `handlePlayerPositionChange` (D420): a move of the player's client to x, y, z turned `y_rot`
+    // and `x_rot`, on the ground or not, `ground`, and into something across or not, `horizontal`.
+    // Unless their moves aren't checked, `player_movement_check`, one further from where their
+    // tick began than their motion goes and 10 blocks more for each move since their last tick
+    // ended, five at most, is too quick, `moved too quickly`, and they're sent back where they
+    // are. Else the server moves them itself from where it last took them, `client_move`; where
+    // that leaves them more than a quarter of a block across from where the client said, out of
+    // creative and spectator, the move's wrong, `moved wrongly`. Then, unless they're a
+    // spectator, a wrong move from where nothing was in their way, or one into a block their box
+    // didn't meet before, `isEntityCollidingWithAnythingNew`, sends them back where they were,
+    // their fall checked as they stand; else they're where the client said, `absSnapTo`,
+    // floating where their client didn't have them going down and the server found nothing
+    // under them, nor any block around, and they may not fly, `clientIsFloating`, on the ground
+    // and into something across as the client said, `setOnGroundWithMovement` (D376, D419), and
+    // their fall and exhaustion as `player_moved` has them, the move what came to their known
+    // movement (D417), and where the server takes them. Sleeping and riding wait for beds and
+    // vehicles, an impulse's grace time for what gives one.
+    fn position_change(mut self, con: mut Connection, x: f64, y: f64, z: f64, y_rot: f32, x_rot: f32, ground: bool, horizontal: bool) -> bool {
+        let tx = clamp_f64(x, -30000000.0, 30000000.0)
+        let ty = clamp_f64(y, -20000000.0, 20000000.0)
+        let tz = clamp_f64(z, -30000000.0, 30000000.0)
+        let (sx, sy, sz) = (con.player.x, con.player.y, con.player.z)
+        let (fx, fy, fz) = con.player.first_good ?? (sx, sy, sz)
+        let (xd, yd, zd) = (tx - fx, ty - fy, tz - fz)
+        let expected = con.player.vx * con.player.vx + con.player.vy * con.player.vy + con.player.vz * con.player.vz
+        con.player.move_packets += 1
+        var packets = con.player.move_packets - con.player.known_packets
+        if packets > 5 {
+            packets = 1
+        }
+        let name = con.name.copy() ?? String()
+        if self.world.movement_check and xd * xd + yd * yd + zd * zd - expected > 100.0 * f64(packets) {
+            self.logs.push(Entry.warn("{name} moved too quickly! {xd},{yd},{zd}"))
+            let (pyr, pxr) = (con.player.y_rot, con.player.x_rot)
+            self.teleport(mut con, sx, sy, sz, pyr, pxr)
+            return true
+        }
+        let old = pose_box(con.player.entity_data.number(POSE_ID), sx, sy, sz)
+        let (lx, ly, lz) = con.player.last_good ?? (sx, sy, sz)
+        let dy = ty - ly
+        let stands = con.player.vertical_below
+        self.client_move(mut con, tx - lx, dy, tz - lz, ground)
+        let (wx, wz) = (tx - con.player.x, tz - con.player.z)
+        let mode = con.player.mode
+        let spectator = mode == GameType.Spectator
+        let wrong = wx * wx + wz * wz > 0.0625 and mode != GameType.Creative and not spectator
+        if wrong {
+            self.logs.push(Entry.warn("{name} moved wrongly!"))
+        }
+        if not spectator and ((wrong and self.box_free(con, old)) or self.meets_new(con, old, tx, ty, tz)) {
+            self.teleport(mut con, sx, sy, sz, wrap_degrees(y_rot), wrap_degrees(x_rot))
+            self.player_moved(mut con, sx, sy, sz, ground, false)
+            return true
+        }
+        self.move_player(mut con, tx, ty, tz, y_rot, x_rot)
+        con.player.floating = dy >= -0.03125 and not stands and not spectator and not self.world.allow_flight and not con.player.abilities.may_fly and self.no_blocks_around(con)
         con.player.on_ground = ground
-        con.player.horizontal_collision = flags & 2 != 0
-        self.player_moved(mut con, from_x, from_y, from_z, ground)
-        // `handlePlayerKnownMovement`: what the move came to (D417).
-        con.player.known_x = con.player.x - from_x
-        con.player.known_y = con.player.y - from_y
-        con.player.known_z = con.player.z - from_z
+        con.player.horizontal_collision = horizontal
+        self.player_moved(mut con, sx, sy, sz, ground, true)
+        con.player.known_x = con.player.x - sx
+        con.player.known_y = con.player.y - sy
+        con.player.known_z = con.player.z - sz
         con.player.moved_this_tick = true
+        con.player.last_good = some((con.player.x, con.player.y, con.player.z))
         return true
     }
 
-    // What a move let through from `fx`, `fy`, `fz`, the player on the ground after it or not,
-    // `ground`, does to their fall (D418): the block they stand on, `checkSupportingBlock`, found
-    // twice as `setOnGroundWithMovement` and `doCheckFallDamage` each find it; then, unless their
-    // box a block larger meets a chunk not loaded, `touchingUnloadedChunk`, their fall checked,
-    // `check_fall`; gone where they went up; and the move's exhaustion, `move_exhaustion`. Their
+    // `noCollision` for the player's box `b` (D420): whether no block's shape meets it, as their
+    // collisions see them now; free where the level hasn't its facts.
+    fn box_free(self, con: Connection, b: Aabb) -> bool {
+        let d = con.player.dim
+        let shared = self.levels[d].shared_env() else return true
+        let Env { facts: f, .. } = shared.value
+        if let m = self.movement {
+            let mover = Mover { y: con.player.y, fall: con.player.fall, descending: con.player.shift }
+            return m.colliders(f, self.levels[d], b, mover).is_empty()
+        }
+        return true
+    }
+
+    // `isEntityCollidingWithAnythingNew` (D420): whether a block's shape that the player's box at
+    // x, y, z, a hair smaller, meets, as their collisions saw them where they were, `old`'s foot,
+    // doesn't meet `old`, a hair smaller too, `getPreMoveCollisions`; none where the level hasn't
+    // its facts.
+    fn meets_new(self, con: Connection, old: Aabb, x: f64, y: f64, z: f64) -> bool {
+        let d = con.player.dim
+        let shared = self.levels[d].shared_env() else return false
+        let Env { facts: f, .. } = shared.value
+        if let m = self.movement {
+            let (px, py, pz) = (con.player.x, con.player.y, con.player.z)
+            let now = pose_box(con.player.entity_data.number(POSE_ID), px, py, pz)
+            let (ax, ay, az) = (x - px, y - py, z - pz)
+            let there = Aabb { min_x: now.min_x + ax, min_y: now.min_y + ay, min_z: now.min_z + az, max_x: now.max_x + ax, max_y: now.max_y + ay, max_z: now.max_z + az }
+            let was = old.deflate(f64(1.0e-5f32))
+            let mover = Mover { y: old.min_y, fall: con.player.fall, descending: con.player.shift }
+            let c = m.colliders(f, self.levels[d], there.deflate(f64(1.0e-5f32)), mover)
+            var start = 0usize
+            for end in c.ends {
+                var met = false
+                for i in start..end {
+                    if meets(c.boxes[i], was) {
+                        met = true
+                    }
+                }
+                if not met {
+                    return true
+                }
+                start = end
+            }
+        }
+        return false
+    }
+
+    // `noBlocksAround` (D420): whether every block from the player's box, a sixteenth larger each
+    // way and reaching 0.55 further down, is air, one not loaded counted as air; none where the
+    // level hasn't its facts.
+    fn no_blocks_around(self, con: Connection) -> bool {
+        let d = con.player.dim
+        let shared = self.levels[d].shared_env() else return false
+        let Env { facts: f, .. } = shared.value
+        let b = pose_box(con.player.entity_data.number(POSE_ID), con.player.x, con.player.y, con.player.z).inflate(0.0625, 0.0625, 0.0625)
+        let (x0, y0, z0) = (i32.saturate(b.min_x.floor()), i32.saturate((b.min_y - 0.55).floor()), i32.saturate(b.min_z.floor()))
+        let (x1, y1, z1) = (i32.saturate(b.max_x.floor()), i32.saturate(b.max_y.floor()), i32.saturate(b.max_z.floor()))
+        for by in y0..=y1 {
+            for bz in z0..=z1 {
+                for bx in x0..=x1 {
+                    if not f.is_air(self.levels[d].collision_state(bx, by, bz) ?? 0) {
+                        return false
+                    }
+                }
+            }
+        }
+        return true
+    }
+
+    // `tickPlayer`'s kick for floating (D420): a player whose client has them floating, not
+    // dying, is kicked once they've floated longer than they'd fall, `getMaximumFlyingTicks`, as
+    // vanilla logs, their connection closed; else they're not floating. Whether they were kicked.
+    // Sleeping and riding wait for beds and vehicles.
+    fn kick_floating(mut self, con: mut Connection) -> bool {
+        if con.player.floating and con.player.entity_data.float(HEALTH) > 0.0f32 {
+            con.player.floating_ticks += 1
+            if con.player.floating_ticks > most_floating(con) {
+                let name = con.name.copy() ?? String()
+                self.logs.push(Entry.warn("{name} was kicked for floating too long!"))
+                self.disconnect(mut con, Component.translatable("multiplayer.disconnect.flying", []))
+                self.close(mut con)
+                return true
+            }
+            return false
+        }
+        con.player.floating = false
+        con.player.floating_ticks = 0
+        return false
+    }
+
+    // What a move from `fx`, `fy`, `fz`, the player on the ground after it or not, `ground`,
+    // does to their fall (D418), `taken` or sent back (D420): the block they stand on,
+    // `checkSupportingBlock`, found as `setOnGroundWithMovement` finds it where the move was
+    // taken, then as `doCheckFallDamage` does; then, unless their box a block larger meets a
+    // chunk not loaded, `touchingUnloadedChunk`, their fall checked, `check_fall`; gone where
+    // they went up; and the move's exhaustion, `move_exhaustion`. Their
     // jump, and the slowing of the block they're on that `Entity.move` ends with, come with the
     // server's own move of them, `client_move` (D419). Nothing where the level hasn't its facts
     // or the living's aren't ready.
-    fn player_moved(mut self, con: mut Connection, fx: f64, fy: f64, fz: f64, ground: bool) {
+    fn player_moved(mut self, con: mut Connection, fx: f64, fy: f64, fz: f64, ground: bool, taken: bool) {
         let d = con.player.dim
         if not self.living_ready(d) {
             return
@@ -10003,16 +10179,18 @@ impl Network {
         let (dx, dy, dz) = (x - fx, y - fy, z - fz)
         let up = dy > 0.0
         let b = pose_box(con.player.entity_data.number(POSE_ID), x, y, z)
-        for _ in 0..2 {
+        let loaded = self.chunks_around(d, b.inflate(1.0, 1.0, 1.0))
+        var finds = if loaded { 1 } else { 0 }
+        if taken {
+            finds += 1
+        }
+        for _ in 0..finds {
             let mover = Mover { y: y, fall: con.player.fall, descending: con.player.shift }
             let found = support_of(f, m, self.levels[d], b, x, y, z, mover, ground, dx, dz, con.player.no_blocks)
             con.player.support = found
             con.player.no_blocks = ground and found == none
-            if not self.chunks_around(d, b.inflate(1.0, 1.0, 1.0)) {
-                break
-            }
         }
-        if self.chunks_around(d, b.inflate(1.0, 1.0, 1.0)) {
+        if loaded {
             self.check_fall(mut con, f, m, t, lf, dy, ground)
         }
         if up {
@@ -10032,17 +10210,24 @@ impl Network {
     // the server found them on nothing as it last moved them, `verticalCollisionBelow`, the blocks
     // under them sent again, `send_support`; then its own move of them, `player.move`, their body
     // moved as `Entity.move` moves it for `MoverType.PLAYER`, stopped by what they hit and slowed
-    // by the block they're on, before the client's move puts them where it said. Nothing where
-    // the level hasn't its facts or the living's aren't ready. Whether the move was too quick,
-    // wrong or into something new waits for CAL-181.
+    // by the block they're on, before the client's move puts them where it said. Where the level
+    // hasn't its facts or the living's aren't ready, the move takes them all the way, as nothing's
+    // in its way (D420).
     fn client_move(mut self, con: mut Connection, dx: f64, dy: f64, dz: f64, ground: bool) {
         let d = con.player.dim
         if not self.living_ready(d) {
+            uncollided(mut con, dx, dy, dz)
             return
         }
-        let shared = self.levels[d].shared_env() else return
+        let shared = self.levels[d].shared_env() else {
+            uncollided(mut con, dx, dy, dz)
+            return
+        }
         let Env { facts: f, .. } = shared.value
-        let lent = self.lend_moving(f) else return
+        let lent = self.lend_moving(f) else {
+            uncollided(mut con, dx, dy, dz)
+            return
+        }
         let (lf, m, t) = lent
         if con.player.on_ground and not ground and dy > 0.0 {
             self.jump(mut con, f, m, t)
@@ -10493,8 +10678,9 @@ impl Network {
         con.player.x = clamp_f64(x, -30000000.0, 30000000.0)
         con.player.y = clamp_f64(y, -20000000.0, 20000000.0)
         con.player.z = clamp_f64(z, -30000000.0, 30000000.0)
-        con.player.y_rot = wrap_degrees(y_rot)
-        con.player.x_rot = wrap_degrees(x_rot)
+        // `absSnapRotationTo`, up and down within a right angle (D420).
+        con.player.y_rot = wrap_degrees(y_rot) % 360.0
+        con.player.x_rot = clamp_f32(wrap_degrees(x_rot), -90.0, 90.0) % 360.0
         // `ChunkMap.move`: each item's tracker looks whether they see it now (CAL-148).
         self.items_see(mut con)
         // In another section, the player's tickets move with them, then their view, as
@@ -10985,6 +11171,31 @@ fn body_back(con: mut Connection, l: own Living) {
     con.player.no_blocks = l.body.no_blocks
     con.player.fall = l.body.fall
     con.player.body = some(l)
+}
+
+// Where a move by dx, dy, dz takes the player with nothing in its way (D420).
+fn uncollided(con: mut Connection, dx: f64, dy: f64, dz: f64) {
+    con.player.x = con.player.x + dx
+    con.player.y = con.player.y + dy
+    con.player.z = con.player.z + dz
+}
+
+// `resetPosition` (D420): where the player is kept as where their tick began and where the
+// server last took them.
+fn reset_position(con: mut Connection) {
+    con.player.first_good = some((con.player.x, con.player.y, con.player.z))
+    con.player.last_good = some((con.player.x, con.player.y, con.player.z))
+}
+
+// `getMaximumFlyingTicks` for the player (D420): with no gravity, never kicked; else 80 ticks,
+// more the less their gravity is than 0.08, rounded up.
+fn most_floating(con: Connection) -> i32 {
+    let gravity = con.player.attributes.value(attribute_id(String("gravity")) ?? 0)
+    if gravity < f64(1.0e-5f32) {
+        return i32.MAX
+    }
+    let modifier = 0.08 / gravity
+    return i32.saturate((80.0 * (if modifier > 1.0 { modifier } else { 1.0 })).ceil())
 }
 
 // Whether the player sprints, `isSprinting`, as their movement speed's sprinting modifier says

@@ -76,10 +76,11 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # `use-containers`, where it opens containers and clicks in them; `items`, where it drops,
 # throws and picks up items; `items-saved`, where it picks up items saved in the world; `orbs`,
 # where it breaks blocks that give experience; `feed`, where it feeds animals; `attack`, where it
-# hits and kills them; `sweep`, where it sweeps them with a sword; and `fall`, where it falls
-# (src/rig/session.calx).
+# hits and kills them; `sweep`, where it sweeps them with a sword; `fall`, where it falls; and
+# `checks`, where its moves are checked (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
-                   "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "fall"]
+                   "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "fall",
+                   "checks"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -317,6 +318,9 @@ FALL = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-30.0),
 # motion and its fall (D418).
 FALL_KEYS = ("Health", "AbsorptionAmount", "foodLevel", "foodSaturationLevel", "foodExhaustionLevel", "foodTickTimer",
              "Motion", "fall_distance")
+# The bot's data in `checks`: in survival mode at the spawn, facing east, its hands empty (D420).
+CHECKS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, []),
+              equipment={})
 # The bot's data in `night`: in creative mode at the spawn, so the monsters that spawn don't make
 # for it (CAL-156).
 NIGHT = {
@@ -488,6 +492,12 @@ CONFIGS = {
     "fall": Config({}, view=3, scenarios=("fall",), world=FIXTURES / "fall" / "world", fixture="fall",
                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                    player=FALL, keys=FALL_KEYS),
+    # The bot, in survival mode by the checks fixture's wall, by the server's clock: a move too
+    # quick, one through the wall and one into it, each of which the server sends it back from,
+    # then a float it's kicked for (D420).
+    "checks": Config({}, view=3, scenarios=("checks",), world=FIXTURES / "checks" / "world", fixture="checks",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                     player=CHECKS, keys=FALL_KEYS),
     # Armor stands by the spawn, which both servers load and tick (CAL-155): falling onto stone,
     # hay, honey and slime, sliding on ice, down a ladder and into water, and standing, small, a
     # marker, without gravity, posed and invisible; watched, as `redstone`.
