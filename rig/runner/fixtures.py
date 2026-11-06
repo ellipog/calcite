@@ -46,6 +46,7 @@ ANSWERS = {
     "setworldspawn": "Set the world spawn point",
     "summon": "Summoned new",
     "time": "Set minecraft:overworld to",
+    "difficulty": "The difficulty has been set to",
 }
 
 

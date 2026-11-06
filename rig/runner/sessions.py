@@ -289,6 +289,15 @@ ORBS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0
     slotted(0, "diamond_hoe", 1, {"minecraft:damage": nbt.Int(1),
                                   "minecraft:enchantments": {"minecraft:mending": nbt.Int(1)}}),
 ]), equipment={})
+# The bot's data in `night`: in creative mode at the spawn, so the monsters that spawn don't make
+# for it (CAL-156).
+NIGHT = {
+    "DataVersion": nbt.Int(5023),
+    "Pos": nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-63.0), nbt.Double(0.5)]),
+    "Rotation": nbt.List(nbt.FLOAT, [nbt.Float(0.0), nbt.Float(0.0)]),
+    "Dimension": "minecraft:overworld",
+    "playerGameType": nbt.Int(1),
+}
 # The use_items rules: the dig configurations', and no natural regeneration, so the bot's food stays
 # where the cake it eats puts it (CAL-142).
 USE_ITEMS_RULES = DIG_RULES + (("minecraft:natural_health_regeneration", nbt.Byte(0)),)
@@ -445,6 +454,12 @@ CONFIGS = {
     # with the farm animals; and three without AI that graze.
     "plains": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "plains" / "world", fixture="plains",
                      tape=True),
+    # Monsters (CAL-156): as `farm`, from dusk on the night fixture's birch forest, on normal,
+    # where monsters spawn every tick, finalized by the difficulty where each stands; the bot in
+    # creative, which they don't make for; and four without AI, a zombie, a skeleton with its bow,
+    # a creeper and a spider.
+    "night": Config({"difficulty": "normal"}, view=2, scenarios=("watch",), world=FIXTURES / "night" / "world",
+                    fixture="night", tape=True, player=NIGHT),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.

@@ -301,6 +301,8 @@ The `farm` configuration does the same with [`farm.txt`](fixtures/farm.txt)'s wo
 
 The `plains` configuration, at a view of 3, loads [`plains.txt`](fixtures/plains.txt)'s world: the flat world's own plains, with a grass floor at the world's bottom over chunks -2 to 2, and a tame horse, a foal and a donkey with a chest, without AI, which neigh, heal and graze as their own randoms say ([D402](../docs/decisions.md)). The plains' creatures, the farm animals with horses and donkeys, spawn there as in vanilla.
 
+The `night` configuration, at a view of 2, loads [`night.txt`](fixtures/night.txt)'s world: the farm fixture's ground all in birch forest at dusk, on normal, with the bot in creative at the spawn and a zombie, a skeleton, a creeper and a spider without AI. The sky darkens enough for monsters just after the levels are seeded again, and from there monsters spawn every tick, made, turned and finalized by the difficulty where each stands ([D404](../docs/decisions.md)). The fixture's slime chunks keep their bedrock floor, which nothing spawns on, as slimes hop about by their AI, which Calcite doesn't run yet. Vanilla's mobs walk and turn their heads by theirs, so their moves, head turns and walking out of view, and their places and turns as they're saved, differ until CAL-157 and CAL-158.
+
 ## The round trip
 
 ```sh
