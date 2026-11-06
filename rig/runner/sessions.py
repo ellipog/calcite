@@ -68,17 +68,18 @@ BASE = {
     "pause-when-empty-seconds": str(PAUSE),
 }
 SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
-# Scenarios only the configurations that name them run: `watch`, where the bot joins and stays put
-# a fixed number of game ticks, for a world that never goes quiet; `creative`, where it sets slots
-# of its inventory as the creative menu does; `clicks`, where it clicks in its inventory menu;
-# `dig` and `dig-creative`, where it digs blocks; `place` and `place-creative`, where it places
-# them; `use`, where it uses them; `use-items` and `use-books`, where it uses items on them; and
-# `use-containers`, where it opens containers and clicks in them; `items`, where it drops,
-# throws and picks up items; `items-saved`, where it picks up items saved in the world; `orbs`,
-# where it breaks blocks that give experience; `feed`, where it feeds animals; `attack`, where it
-# hits and kills them; `sweep`, where it sweeps them with a sword; `fall`, where it falls; and
-# `checks`, where its moves are checked (src/rig/session.calx).
-OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
+# Scenarios only the configurations that name them run: `watch`, where the bot joins and stays put a
+# fixed number of game ticks, for a world that never goes quiet; `watch-late`, the same but never
+# saying its client's loaded, so both servers take it as loaded 60 ticks on (D431); `creative`,
+# where it sets slots of its inventory as the creative menu does; `clicks`, where it clicks in its
+# inventory menu; `dig` and `dig-creative`, where it digs blocks; `place` and `place-creative`,
+# where it places them; `use`, where it uses them; `use-items` and `use-books`, where it uses items
+# on them; and `use-containers`, where it opens containers and clicks in them; `items`, where it
+# drops, throws and picks up items; `items-saved`, where it picks up items saved in the world;
+# `orbs`, where it breaks blocks that give experience; `feed`, where it feeds animals; `attack`,
+# where it hits and kills them; `sweep`, where it sweeps them with a sword; `fall`, where it falls;
+# and `checks`, where its moves are checked (src/rig/session.calx).
+OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "fall",
                    "checks"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
@@ -376,6 +377,17 @@ DEATH = dict(BURIED, Health=nbt.Float(2.0), XpLevel=nbt.Int(3), SelectedItemSlot
 # loses as it respawns, where it died, and how long it's been dead, none once it's back (D427,
 # D428).
 DEATH_KEYS = BURIED_KEYS + ("Health", "XpLevel", "LastDeathLocation", "DeathTime")
+# The bot's data in `magma`: in survival mode on the magma at the spawn, its hands empty, in iron
+# boots three wears from breaking, leather leggings with unbreaking, a netherite chestplate, which
+# fire doesn't wear, and a golden helmet (D431).
+MAGMA = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, []), equipment={
+    "feet": stack("iron_boots", 1, {"minecraft:damage": nbt.Int(192)}),
+    "legs": stack("leather_leggings", 1, {"minecraft:enchantments": {"minecraft:unbreaking": nbt.Int(3)}}),
+    "chest": stack("netherite_chestplate"),
+    "head": stack("golden_helmet"),
+})
+# What `magma` compares: `buried`'s, its burns starting as its client says it's loaded (D431).
+MAGMA_KEYS = BURIED_KEYS
 # The use_items rules: the dig configurations', and no natural regeneration, so the bot's food stays
 # where the cake it eats puts it (CAL-142).
 USE_ITEMS_RULES = DIG_RULES + (("minecraft:natural_health_regeneration", nbt.Byte(0)),)
@@ -584,6 +596,19 @@ CONFIGS = {
     # 2 to 4 of size 1 with what it was made of, which suffocate in turn (D430).
     "split": Config({"difficulty": "easy"}, view=2, scenarios=("watch",), world=FIXTURES / "split" / "world", fixture="split",
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
+    # The bot burning on magma in armor, which each burn wears but for the netherite chestplate, its
+    # boots breaking at the third, on hard (D431). It watches late, `watch-late`, so its burns start
+    # at the same game time on both servers, after its levels' randoms are seeded again, taped,
+    # and the draws for its armor's unbreaking fall among the chunks' shuffles each tick as they do.
+    "magma": Config({"difficulty": "hard"}, view=2, scenarios=("watch-late",), world=FIXTURES / "magma" / "world", fixture="magma",
+                    player=MAGMA, keys=MAGMA_KEYS, tape=True,
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
+    # Penned by the spawn, a cow burning on magma till it dies, a pig lighting redstone ore, the
+    # ore's particles drawn from the level's random, and a sheep slowed by slime blocks (D431),
+    # taped; without random ticks, which would put the ore out.
+    "stepped": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "stepped" / "world", fixture="stepped",
+                      player=USE, tape=True,
+                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
     # Four cows without AI with their eyes in stone, glass and farmland, inside its shape and above
     # it, the stone and the farmland's inside suffocating theirs till they die (D425); watched, as
     # `stands`, without random ticks, which would turn the farmland to dirt.
