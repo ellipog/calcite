@@ -140,6 +140,16 @@ final class BlockFlags {
         // than its face being full says, all of them or none: each state and its mask, a bit for
         // the post's test and then one for the north, east, south and west wall's.
         StringBuilder wallCover = new StringBuilder();
+        // The states whose suffocation isn't the default, `causes_suffocation` with a full collision
+        // shape, but their block's own, `Properties.isSuffocating`: never, always, or by their
+        // state or block entity, each state with what it says at the origin of an empty world,
+        // where a shulker box has none and so suffocates (D425). The default is one predicate,
+        // shared by every block that keeps it, so a state's own is any other.
+        StringBuilder suffocation = new StringBuilder();
+        java.lang.reflect.Field suffocatingField = BlockState.class.getSuperclass().getDeclaredField("isSuffocating");
+        suffocatingField.setAccessible(true);
+        Object defaultSuffocating = suffocatingField.get(net.minecraft.world.level.block.Blocks.STONE.defaultBlockState());
+        int ownSuffocation = 0;
         VoxelShape postTest = Block.column(2.0, 0.0, 16.0);
         Map<Direction, VoxelShape> wallTests = Shapes.rotateHorizontal(Block.boxZ(2.0, 16.0, 0.0, 9.0));
         VoxelShape[] coverTests = {postTest, wallTests.get(Direction.NORTH), wallTests.get(Direction.EAST),
@@ -183,6 +193,14 @@ final class BlockFlags {
             if (cover != (Block.isFaceFull(below, Direction.DOWN) ? 31 : 0)) {
                 wallCover.append(wallCover.isEmpty() ? "[" : ", [").append(id).append(", ").append(cover).append("]");
             }
+            if (suffocatingField.get(state) != defaultSuffocating) {
+                boolean suffocates = state.isSuffocating(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+                suffocation.append(suffocation.isEmpty() ? "[" : ", [").append(id).append(", ").append(suffocates ? 1 : 0).append("]");
+                ownSuffocation++;
+            }
+        }
+        if (ownSuffocation == 0 || ownSuffocation > 2000) {
+            throw new IllegalStateException(ownSuffocation + " states with their own suffocation: the default isn't shared");
         }
         StringBuilder poi = new StringBuilder();
         for (int id = 0; id < count; id++) {
@@ -582,6 +600,7 @@ final class BlockFlags {
         json.append("  \"liquid_containers\": [").append(containers).append("],\n");
         json.append("  \"dynamic_shape_blocks\": [").append(dynamic).append("],\n");
         json.append("  \"outline_differs\": [").append(outline).append("],\n");
+        json.append("  \"own_suffocation\": [").append(suffocation).append("],\n");
         json.append("  \"wall_cover\": [").append(wallCover).append("],\n");
         json.append("  \"instruments\": [").append(instruments).append("],\n");
         json.append("  \"instrument_names\": [").append(instrumentNames).append("],\n");

@@ -530,6 +530,11 @@ CONFIGS = {
     # its own tick till it dies, and its loot (D424); watched, as `stands`.
     "drown": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "drown" / "world", fixture="drown",
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # Four cows without AI with their eyes in stone, glass and farmland, inside its shape and above
+    # it, the stone and the farmland's inside suffocating theirs till they die (D425); watched, as
+    # `stands`, without random ticks, which would turn the farmland to dirt.
+    "walls": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "walls" / "world", fixture="walls",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.

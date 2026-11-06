@@ -663,6 +663,16 @@ def block_facts_module(index, flags):
     ]
     lines += ["        " + ", ".join(pairs[i:i + 24]) + "," for i in range(0, len(pairs), 24)]
     lines += ["    ]", "    return pairs", "}", ""]
+    pairs = [str(v) for pair in flags["own_suffocation"] for v in pair]
+    lines += [
+        "/// The states whose suffocation isn't the default, `causes_suffocation` with a full collision",
+        "/// shape, but their block's own, `Properties.isSuffocating`, each followed by 1 where they",
+        "/// suffocate and 0 where they don't: a shulker box's as it is with no block entity (D425).",
+        "pub fn own_suffocation() -> List<u32> {",
+        "    let pairs: List<u32> = [",
+    ]
+    lines += ["        " + ", ".join(pairs[i:i + 24]) + "," for i in range(0, len(pairs), 24)]
+    lines += ["    ]", "    return pairs", "}", ""]
     lines += [
         "/// The instruments a note block plays, by name, in `NoteBlockInstrument`'s order.",
         "pub fn instrument_names() -> List<str> {",
