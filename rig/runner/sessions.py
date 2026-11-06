@@ -609,12 +609,18 @@ CONFIGS = {
     "stepped": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "stepped" / "world", fixture="stepped",
                       player=USE, tape=True,
                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
-    # Penned by the spawn, a cow in fire, a pig in lava, a pig in soul fire, a chicken on a lit
-    # campfire, and a sheep already alight that panics to water, which puts it out (D434), taped;
-    # without random ticks, which would have the lava light what's by it.
+    # Penned by the spawn, a cow in soul fire, a pig in lava, a chicken on a lit campfire, and a
+    # sheep already alight that panics to water, which puts it out (D434), their drops burnt away
+    # (D435) and cooked (D436), taped; without random ticks, which would have the lava light what's
+    # by it.
     "burning": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "burning" / "world", fixture="burning",
                       player=USE, tape=True,
                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
+    # Zombies without AI at noon, on normal, which keeps them: one lit by the sun, one whose
+    # leather helmet's worn instead, one whose helmet breaks, one in water and one under stone,
+    # which don't burn (D437); taped, without natural spawning.
+    "daylight": Config({"difficulty": "normal"}, view=2, scenarios=("watch",), world=FIXTURES / "daylight" / "world",
+                       fixture="daylight", tape=True, rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
     # Four cows without AI with their eyes in stone, glass and farmland, inside its shape and above
     # it, the stone and the farmland's inside suffocating theirs till they die (D425); watched, as
     # `stands`, without random ticks, which would turn the farmland to dirt.
