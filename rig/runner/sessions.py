@@ -77,10 +77,11 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # on them; and `use-containers`, where it opens containers and clicks in them; `items`, where it
 # drops, throws and picks up items; `items-saved`, where it picks up items saved in the world;
 # `orbs`, where it breaks blocks that give experience; `feed`, where it feeds animals; `attack`,
-# where it hits and kills them; `sweep`, where it sweeps them with a sword; `fall`, where it falls;
-# and `checks`, where its moves are checked (src/rig/session.calx).
+# where it hits and kills them; `sweep`, where it sweeps them with a sword; `enchant`, where it hits
+# them with enchanted swords; `fall`, where it falls; and `checks`, where its moves are checked
+# (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
-                   "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "fall",
+                   "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "fall",
                    "checks"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
@@ -308,6 +309,14 @@ ATTACK = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0
 # (D417).
 SWEEP = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
     slotted(0, "iron_sword"),
+]), equipment={})
+# The bot's data in `enchant`: in survival mode at the spawn, facing east, holding an iron sword
+# with smite V, with a wooden sword with sharpness I and knockback II in the second slot and one
+# with fire aspect II in the third (D438).
+ENCHANT = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "iron_sword", 1, {"minecraft:enchantments": {"minecraft:smite": nbt.Int(5)}}),
+    slotted(1, "wooden_sword", 1, {"minecraft:enchantments": {"minecraft:sharpness": nbt.Int(1), "minecraft:knockback": nbt.Int(2)}}),
+    slotted(2, "wooden_sword", 1, {"minecraft:enchantments": {"minecraft:fire_aspect": nbt.Int(2)}}),
 ]), equipment={})
 # The bot's data in `fall`: in survival mode on the fall fixture's pillar, facing east, holding an
 # iron sword (D418).
@@ -544,6 +553,15 @@ CONFIGS = {
     "sweep": Config({}, view=3, scenarios=("sweep",), world=FIXTURES / "sweep" / "world", fixture="sweep",
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                     player=SWEEP),
+    # The bot, in survival mode with enchanted swords, hits the enchant fixture's cow, zombie and
+    # sheep by the server's clock, on normal, which keeps the zombie (D438): smite on the cow and
+    # the sheep its sweep reaches, which adds nothing; sharpness and knockback on the zombie; fire
+    # aspect on the sheep and the cow its sweep reaches, which burn to death, their meat cooked;
+    # and smite on the zombie, which kills it.
+    "enchant": Config({"difficulty": "normal"}, view=3, scenarios=("enchant",), world=FIXTURES / "enchant" / "world",
+                      fixture="enchant",
+                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                      player=ENCHANT),
     # The bot, in survival mode with an iron sword, falls onto the fall fixture's honey, into its
     # water, and from its basin to the ground, hitting the cow there as it falls, by the server's
     # clock: each fall's damage, its dust and the cow's critical hit (D418).
