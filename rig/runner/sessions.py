@@ -436,6 +436,11 @@ CONFIGS = {
     # taped, as their places are drawn from the levels' randoms, which line up once seeded again.
     "mooshrooms": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "mooshrooms" / "world",
                          fixture="mooshrooms", tape=True),
+    # The farm animals (CAL-156): as `mooshrooms`, in the farm fixture's birch forest and badlands
+    # on grass, sheep, pigs, chickens and cows of their biomes' variants; and five without AI, two
+    # chickens laying their eggs.
+    "farm": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "farm" / "world", fixture="farm",
+                   tape=True),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.

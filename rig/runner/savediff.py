@@ -12,8 +12,9 @@ aren't compared: the bot's steps land on different game times on the two servers
 
 The entity chunks, in `entities/`, are compared too (CAL-148): each chunk's entities in the order
 it saved them, by their UUIDs, and each entity's tags, but those that tell when the server
-stopped, `ENTITY_TIMING`: an item's age, and its motion, which a still item gathers as it falls
-0.04 a tick between the moves it makes every 4 ticks.
+stopped, `ENTITY_TIMING`: an item's or an ageable mob's age, and its motion, which a still item
+gathers as it falls 0.04 a tick between the moves it makes every 4 ticks; and a chicken's ticks
+until it lays, which count down a tick at a time (CAL-156).
 """
 
 import struct
@@ -29,7 +30,7 @@ import nbt  # noqa: E402
 # compared as it is.
 LEFT_OUT = {"LastUpdate", "InhabitedTime", "xPos", "zPos", "yPos", "DataVersion"}
 # An entity's tags that tell when the server stopped (CAL-148).
-ENTITY_TIMING = {"Age", "Motion"}
+ENTITY_TIMING = {"Age", "Motion", "EggLayTime"}
 
 
 def chunks(world, dimension="minecraft/overworld", folder="region"):

@@ -297,6 +297,8 @@ The `stands` configuration loads [`stands.txt`](fixtures/stands.txt)'s world, tw
 
 The `mooshrooms` configuration loads [`mooshrooms.txt`](fixtures/mooshrooms.txt)'s world, the flat world's chunks -2 to 2 made mushroom fields at its floor with mycelium at the world's bottom, and two mooshrooms without AI, a red one and a brown calf, and watches it with natural spawning on, at a view of 2, so those chunks' entities tick ([D400](../docs/decisions.md)). Where it spawns creatures, every 400 ticks, it spawns mooshrooms there, which both servers make, turn, finalize, count and track: the same pack, with the same IDs, UUIDs, places, turns, values and attributes. The two without AI moo at vanilla's ticks and pitches. Its places are drawn from the levels' randoms, which line up only once both are seeded again, so the configuration is always taped, `Config.tape`, whether or not `--tape` says so. Vanilla's mooshrooms then wander and look round, which Calcite's do once they have AI.
 
+The `farm` configuration does the same with [`farm.txt`](fixtures/farm.txt)'s world: birch forest to the west, whose creatures are the four farm animals, and badlands to the east, warm, whose armadillos never spawn on grass, over a grass floor at the world's bottom, with a moody cow, a big piglet, a brown sheep and two chickens soon to lay, all without AI ([D401](../docs/decisions.md)). Both servers spawn the same packs of sheep, pigs, chickens and cows, of their biomes' variants and colors, the same sound variants and the same eggs, a brown one from the warm chicken. A chicken's ticks until it lays count down to when the server stopped, as ages count up, so the saves' comparison leaves `EggLayTime` out with them.
+
 ## The round trip
 
 ```sh
