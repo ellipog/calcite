@@ -14,7 +14,8 @@ The entity chunks, in `entities/`, are compared too (CAL-148): each chunk's enti
 it saved them, by their UUIDs, and each entity's tags, but those that tell when the server
 stopped, `ENTITY_TIMING`: an item's or an ageable mob's age, and its motion, which a still item
 gathers as it falls 0.04 a tick between the moves it makes every 4 ticks; and a chicken's ticks
-until it lays, which count down a tick at a time (CAL-156).
+until it lays, which count down a tick at a time (CAL-156). A living entity's attributes are
+compared in any order, `UNORDERED`, as vanilla's order changes from run to run.
 """
 
 import struct
@@ -31,6 +32,10 @@ import nbt  # noqa: E402
 LEFT_OUT = {"LastUpdate", "InhabitedTime", "xPos", "zPos", "yPos", "DataVersion"}
 # An entity's tags that tell when the server stopped (CAL-148).
 ENTITY_TIMING = {"Age", "Motion", "EggLayTime"}
+# An entity's lists in an order no server keeps (CAL-156): a living entity's attributes, which
+# vanilla saves as its `AttributeMap`'s hash map of holders gives them, by identity hashes that
+# differ from run to run; compared as sets.
+UNORDERED = {"attributes"}
 
 
 def chunks(world, dimension="minecraft/overworld", folder="region"):
@@ -165,6 +170,10 @@ def entity_differences(vanilla_world, calcite_world, area):
             for ea, eb in zip(a, b):
                 keys = (set(ea) | set(eb)) - ENTITY_TIMING
                 for key in sorted(keys):
+                    if key in UNORDERED:
+                        if sorted(map(repr, ea.get(key, []))) != sorted(map(repr, eb.get(key, []))):
+                            lines.append(f"entities {cx}, {cz}: {ea.get('id')} {key}: {ea.get(key)!r:.200} vs {eb.get(key)!r:.200}")
+                        continue
                     if ea.get(key) != eb.get(key):
                         lines.append(f"entities {cx}, {cz}: {ea.get('id')} {key}: {ea.get(key)!r:.200} vs {eb.get(key)!r:.200}")
                 if list(ea) != list(eb):
