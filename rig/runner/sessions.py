@@ -76,9 +76,10 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # `use-containers`, where it opens containers and clicks in them; `items`, where it drops,
 # throws and picks up items; `items-saved`, where it picks up items saved in the world; `orbs`,
 # where it breaks blocks that give experience; `feed`, where it feeds animals; `attack`, where it
-# hits and kills them; and `sweep`, where it sweeps them with a sword (src/rig/session.calx).
+# hits and kills them; `sweep`, where it sweeps them with a sword; and `fall`, where it falls
+# (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
-                   "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep"]
+                   "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "fall"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -119,6 +120,8 @@ class Config:
     # Whether it's taped whether or not --tape says so, its levels' randoms seeded again at RESEED,
     # as what it compares lines up only from there, natural spawning's mobs (CAL-156).
     tape: bool = False
+    # What else of the bot's saved data is compared, past PLAYER_KEYS (D418).
+    keys: tuple = ()
 
 
 def stack(item, count=1, components=None):
@@ -304,6 +307,16 @@ ATTACK = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0
 SWEEP = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
     slotted(0, "iron_sword"),
 ]), equipment={})
+# The bot's data in `fall`: in survival mode on the fall fixture's pillar, facing east, holding an
+# iron sword (D418).
+FALL = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-30.0), nbt.Double(0.5)]),
+            Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
+                slotted(0, "iron_sword"),
+            ]), equipment={})
+# What `fall` compares of the bot's saved data besides: its health and absorption, its food, its
+# motion and its fall (D418).
+FALL_KEYS = ("Health", "AbsorptionAmount", "foodLevel", "foodSaturationLevel", "foodExhaustionLevel", "foodTickTimer",
+             "Motion", "fall_distance")
 # The bot's data in `night`: in creative mode at the spawn, so the monsters that spawn don't make
 # for it (CAL-156).
 NIGHT = {
@@ -469,6 +482,12 @@ CONFIGS = {
     "sweep": Config({}, view=3, scenarios=("sweep",), world=FIXTURES / "sweep" / "world", fixture="sweep",
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                     player=SWEEP),
+    # The bot, in survival mode with an iron sword, falls onto the fall fixture's honey, into its
+    # water, and from its basin to the ground, hitting the cow there as it falls, by the server's
+    # clock: each fall's damage, its dust and the cow's critical hit (D418).
+    "fall": Config({}, view=3, scenarios=("fall",), world=FIXTURES / "fall" / "world", fixture="fall",
+                   rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                   player=FALL, keys=FALL_KEYS),
     # Armor stands by the spawn, which both servers load and tick (CAL-155): falling onto stone,
     # hay, honey and slime, sliding on ice, down a ladder and into water, and standing, small, a
     # marker, without gravity, posed and invisible; watched, as `redstone`.
@@ -688,7 +707,8 @@ def typed(value):
 
 
 def compare_saved(config):
-    """Whether both servers saved the bot's PLAYER_KEYS the same, printing what differs."""
+    """Whether both servers saved the bot's PLAYER_KEYS and the configuration's own keys the same,
+    printing what differs."""
     saved = {}
     for side in ("vanilla", "calcite"):
         path = SESSIONS / config / side / "world" / "players" / "data" / f"{offline_uuid(BOT)}.dat"
@@ -702,8 +722,9 @@ def compare_saved(config):
             return sorted((typed(v) for v in value), key=repr)
         return typed(value)
 
-    differ = [k for k in PLAYER_KEYS if kept("vanilla", k) != kept("calcite", k)]
-    print(f"saved player   {'PASS' if not differ else 'differs'}    {len(PLAYER_KEYS) - len(differ)} match, {len(differ)} differ")
+    keys = PLAYER_KEYS + CONFIGS[config].keys
+    differ = [k for k in keys if kept("vanilla", k) != kept("calcite", k)]
+    print(f"saved player   {'PASS' if not differ else 'differs'}    {len(keys) - len(differ)} match, {len(differ)} differ")
     for k in differ:
         print(f"  [{config}] {k}:\n      vanilla: {saved['vanilla'].get(k)}\n      calcite: {saved['calcite'].get(k)}")
     return not differ
