@@ -330,6 +330,30 @@ NIGHT = {
     "Dimension": "minecraft:overworld",
     "playerGameType": nbt.Int(1),
 }
+# The bot's data in `choke`: in survival mode at the bottom of the choke fixture's water, out of
+# air, starving, its food's timer at 30, with 100 health, which it has room for (D426).
+CHOKE = {
+    "DataVersion": nbt.Int(5023),
+    "Pos": nbt.List(nbt.DOUBLE, [nbt.Double(4.5), nbt.Double(-60.0), nbt.Double(4.5)]),
+    "Rotation": nbt.List(nbt.FLOAT, [nbt.Float(0.0), nbt.Float(0.0)]),
+    "Dimension": "minecraft:overworld",
+    "playerGameType": nbt.Int(0),
+    "Air": nbt.Short(0),
+    "foodLevel": nbt.Int(0),
+    "foodSaturationLevel": nbt.Float(0.0),
+    "foodTickTimer": nbt.Int(30),
+    "Health": nbt.Float(100.0),
+    "attributes": nbt.List(nbt.COMPOUND, [{"id": "minecraft:max_health", "base": nbt.Double(100.0)}]),
+}
+# The same at the spawn, its eyes in the buried fixture's stone, its air and food full (D426).
+BURIED = dict(CHOKE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-60.0), nbt.Double(0.5)]),
+              Air=nbt.Short(300), foodLevel=nbt.Int(20), foodTickTimer=nbt.Int(0))
+# What `choke` compares of the bot's saved data besides: `fall`'s, and its air (D426).
+HURT_KEYS = FALL_KEYS + ("Air",)
+# What `buried` does: the same but its health. Its hurts start as its client says it's loaded, once
+# the bot has its chunks, which Calcite sends sooner, so its last hurt can fall either side of the
+# bot's leave, as its first's tick does (D426).
+BURIED_KEYS = tuple(k for k in HURT_KEYS if k != "Health")
 # The use_items rules: the dig configurations', and no natural regeneration, so the bot's food stays
 # where the cake it eats puts it (CAL-142).
 USE_ITEMS_RULES = DIG_RULES + (("minecraft:natural_health_regeneration", nbt.Byte(0)),)
@@ -535,6 +559,17 @@ CONFIGS = {
     # `stands`, without random ticks, which would turn the farmland to dirt.
     "walls": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "walls" / "world", fixture="walls",
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
+    # The bot at the bottom of water out of air, drowning, and starving, on hard, which starves to
+    # the end (D426); watched, without natural spawning.
+    "choke": Config({"difficulty": "hard"}, view=2, scenarios=("watch",), world=FIXTURES / "choke" / "world",
+                    fixture="choke", player=CHOKE, keys=HURT_KEYS, rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # The bot with its eyes in stone, hurt in a wall and healing from its food, on hard, whose healing
+    # goes from its first hurt, not from when its client loaded, as peaceful's would (D426); watched,
+    # without natural spawning or random ticks, whose places part as vanilla's chunks come in later
+    # (D315) and would turn the grass under the stone to dirt on one server only.
+    "buried": Config({"difficulty": "hard"}, view=2, scenarios=("watch",), world=FIXTURES / "buried" / "world", fixture="buried",
+                     player=BURIED, keys=BURIED_KEYS,
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
