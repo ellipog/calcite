@@ -454,12 +454,14 @@ CONFIGS = {
     # with the farm animals; and three without AI that graze.
     "plains": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "plains" / "world", fixture="plains",
                      tape=True),
-    # Monsters (CAL-156): as `farm`, from dusk on the night fixture's birch forest, on normal,
-    # where monsters spawn every tick, finalized by the difficulty where each stands; the bot in
-    # creative, which they don't make for; and four without AI, a zombie, a skeleton with its bow,
-    # a creeper and a spider.
+    # Monsters (CAL-156): as `farm`, from dusk on the night fixture's plains, on normal, where
+    # monsters spawn every tick, zombie horses among them, finalized by the difficulty where each
+    # stands; the bot in creative, which they don't make for; and four without AI, a zombie, a
+    # skeleton with its bow, a creeper and a spider. Without mob griefing, as an enderman takes a
+    # block by its AI, which Calcite doesn't run yet, and one carrying a block stays, so it isn't
+    # counted against the monsters' cap and vanilla's would spawn again where Calcite's are at it.
     "night": Config({"difficulty": "normal"}, view=2, scenarios=("watch",), world=FIXTURES / "night" / "world",
-                    fixture="night", tape=True, player=NIGHT),
+                    fixture="night", tape=True, player=NIGHT, rules=(("minecraft:mob_griefing", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
