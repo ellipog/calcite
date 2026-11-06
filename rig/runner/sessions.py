@@ -372,10 +372,10 @@ DEATH = dict(BURIED, Health=nbt.Float(2.0), XpLevel=nbt.Int(3), SelectedItemSlot
                  "feet": stack("leather_boots"),
                  "offhand": stack("torch", 32),
              })
-# What `death` compares: `buried`'s, its health, which is none once it's died, its levels, which it
-# keeps till it respawns, and where it died. How long it's been dead goes by when its client said it
-# loaded, as its hurts do.
-DEATH_KEYS = BURIED_KEYS + ("Health", "XpLevel", "LastDeathLocation")
+# What `death` compares: `buried`'s, its health, full once it's respawned, its levels, which it
+# loses as it respawns, where it died, and how long it's been dead, none once it's back (D427,
+# D428).
+DEATH_KEYS = BURIED_KEYS + ("Health", "XpLevel", "LastDeathLocation", "DeathTime")
 # The use_items rules: the dig configurations', and no natural regeneration, so the bot's food stays
 # where the cake it eats puts it (CAL-142).
 USE_ITEMS_RULES = DIG_RULES + (("minecraft:natural_health_regeneration", nbt.Byte(0)),)
@@ -594,10 +594,13 @@ CONFIGS = {
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
     # The same bot dying in the wall, its death told, what it carries and its experience dropped
     # around it, but what's cursed with vanishing, and taken out of its level 20 ticks after
-    # (D427).
-    "death": Config({"difficulty": "hard"}, view=2, scenarios=("watch",), world=FIXTURES / "buried" / "world", fixture="buried",
+    # (D427); then respawning, as it asks once it's out, on top of the stone at the spawn, where a
+    # respawn radius of 0 has both servers' search look, the chunks around forced, so what it
+    # dropped is loaded all along (D428).
+    "death": Config({"difficulty": "hard"}, view=2, scenarios=("watch",), world=FIXTURES / "death" / "world", fixture="death",
                     player=DEATH, keys=DEATH_KEYS,
-                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)),
+                           ("minecraft:respawn_radius", nbt.Int(0)))),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.

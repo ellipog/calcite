@@ -118,6 +118,8 @@ class Step:
     chunks: dict = field(default_factory=dict)
     batches: int = 0
     batched: int = 0
+    # The chunk packets sent, each, which a respawn sends again for the same places (D428).
+    sent: int = 0
     changes: list = field(default_factory=list)
 
 
@@ -168,6 +170,7 @@ def load(path):
             elif kind == "play/chunk_batch_finished":
                 step.batched += value.get("batchSize", 0)
             else:
+                step.sent += 1
                 step.chunks[(value.get("x"), value.get("z"))] = Entry(kind, without(value, {"x", "z"}), r["sha256"], r.get("error", ""))
             continue
         if kind in CHANGES:
@@ -386,9 +389,9 @@ def compare_changes(va, ca, found, tally):
 
 
 def compare_chunks(va, ca, found, tally):
-    if va.batched != len(va.chunks) or ca.batched != len(ca.chunks):
+    if va.batched != va.sent or ca.batched != ca.sent or va.sent != ca.sent:
         found("play/chunk_batch_finished", "a batch's size isn't the chunks it held",
-              [f"vanilla {va.batched} for {len(va.chunks)}, Calcite {ca.batched} for {len(ca.chunks)}"])
+              [f"vanilla {va.batched} for {va.sent}, Calcite {ca.batched} for {ca.sent}"])
     only_v = sorted(set(va.chunks) - set(ca.chunks))
     only_c = sorted(set(ca.chunks) - set(va.chunks))
     if only_v or only_c:

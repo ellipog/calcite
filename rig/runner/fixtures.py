@@ -47,6 +47,7 @@ ANSWERS = {
     "summon": "Summoned new",
     "time": "Set minecraft:overworld to",
     "difficulty": "The difficulty has been set to",
+    "forceload": "to be force loaded",
 }
 
 
@@ -135,6 +136,11 @@ def make(name, force=False):
         for line in typed:
             at = ask(server, line, ANSWERS[line.split()[0]], at)
         at = ask(server, "forceload remove all", "Unmarked all force loaded chunks", at)
+        # The fixture's own forced chunks, which the builder's took out with its own, kept in the
+        # world it saves (D428).
+        for line in typed:
+            if line.split()[0] == "forceload":
+                at = ask(server, line, ANSWERS["forceload"], at)
         at = ask(server, "save-all flush", "Saved the game", at)
     finally:
         server.stop()
