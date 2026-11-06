@@ -74,10 +74,11 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # `dig` and `dig-creative`, where it digs blocks; `place` and `place-creative`, where it places
 # them; `use`, where it uses them; `use-items` and `use-books`, where it uses items on them; and
 # `use-containers`, where it opens containers and clicks in them; `items`, where it drops,
-# throws and picks up items; `items-saved`, where it picks up items saved in the world; and
-# `orbs`, where it breaks blocks that give experience (src/rig/session.calx).
+# throws and picks up items; `items-saved`, where it picks up items saved in the world; `orbs`,
+# where it breaks blocks that give experience; `feed`, where it feeds animals; and `attack`, where
+# it hits and kills them (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
-                   "use-books", "use-containers", "items", "items-saved", "orbs"]
+                   "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -293,6 +294,11 @@ ORBS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0
 FEED = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
     slotted(0, "wheat", 16),
 ]), equipment={})
+# The bot's data in `attack`: in survival mode at the spawn, facing east, its hand empty, with a
+# stone axe in its hotbar's second slot (CAL-162).
+ATTACK = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(1, "stone_axe"),
+]), equipment={})
 # The bot's data in `night`: in creative mode at the spawn, so the monsters that spawn don't make
 # for it (CAL-156).
 NIGHT = {
@@ -445,6 +451,13 @@ CONFIGS = {
     "feed": Config({}, view=3, scenarios=("feed",), world=FIXTURES / "feed" / "world", fixture="feed",
                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                    player=FEED),
+    # The bot, in survival mode, hits the attack fixture's cows and sheep, each penned in a cell of
+    # its own, by the server's clock (D415): with its fist, then a stone axe, charged and not, its
+    # second hit in a tick shrugged off, till each dies, dropping its loot and orbs, the calf none;
+    # then hits an item, for which the server disconnects it (CAL-162, D416).
+    "attack": Config({}, view=3, scenarios=("attack",), world=FIXTURES / "attack" / "world", fixture="attack",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                     player=ATTACK),
     # Armor stands by the spawn, which both servers load and tick (CAL-155): falling onto stone,
     # hay, honey and slime, sliding on ice, down a ladder and into water, and standing, small, a
     # marker, without gravity, posed and invisible; watched, as `redstone`.
