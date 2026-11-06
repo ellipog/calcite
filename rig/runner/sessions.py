@@ -441,6 +441,10 @@ CONFIGS = {
     # chickens laying their eggs.
     "farm": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "farm" / "world", fixture="farm",
                    tape=True),
+    # Plains (CAL-156): as `farm`, on the plains fixture's grass, where horses and donkeys spawn
+    # with the farm animals; and three without AI that graze.
+    "plains": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "plains" / "world", fixture="plains",
+                     tape=True),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.

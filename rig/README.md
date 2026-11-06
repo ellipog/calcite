@@ -299,6 +299,8 @@ The `mooshrooms` configuration loads [`mooshrooms.txt`](fixtures/mooshrooms.txt)
 
 The `farm` configuration does the same with [`farm.txt`](fixtures/farm.txt)'s world: birch forest to the west, whose creatures are the four farm animals, and badlands to the east, warm, whose armadillos never spawn on grass, over a grass floor at the world's bottom, with a moody cow, a big piglet, a brown sheep and two chickens soon to lay, all without AI ([D401](../docs/decisions.md)). Both servers spawn the same packs of sheep, pigs, chickens and cows, of their biomes' variants and colors, the same sound variants and the same eggs, a brown one from the warm chicken. A chicken's ticks until it lays count down to when the server stopped, as ages count up, so the saves' comparison leaves `EggLayTime` out with them.
 
+The `plains` configuration, at a view of 3, loads [`plains.txt`](fixtures/plains.txt)'s world: the flat world's own plains, with a grass floor at the world's bottom over chunks -2 to 2, and a tame horse, a foal and a donkey with a chest, without AI, which neigh, heal and graze as their own randoms say ([D402](../docs/decisions.md)). The plains' creatures, the farm animals with horses and donkeys, spawn there as in vanilla.
+
 ## The round trip
 
 ```sh
