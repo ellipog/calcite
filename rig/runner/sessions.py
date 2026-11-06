@@ -75,10 +75,10 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # them; `use`, where it uses them; `use-items` and `use-books`, where it uses items on them; and
 # `use-containers`, where it opens containers and clicks in them; `items`, where it drops,
 # throws and picks up items; `items-saved`, where it picks up items saved in the world; `orbs`,
-# where it breaks blocks that give experience; `feed`, where it feeds animals; and `attack`, where
-# it hits and kills them (src/rig/session.calx).
+# where it breaks blocks that give experience; `feed`, where it feeds animals; `attack`, where it
+# hits and kills them; and `sweep`, where it sweeps them with a sword (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
-                   "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack"]
+                   "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -299,6 +299,11 @@ FEED = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0
 ATTACK = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
     slotted(1, "stone_axe"),
 ]), equipment={})
+# The bot's data in `sweep`: in survival mode at the spawn, facing east, holding an iron sword
+# (D417).
+SWEEP = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "iron_sword"),
+]), equipment={})
 # The bot's data in `night`: in creative mode at the spawn, so the monsters that spawn don't make
 # for it (CAL-156).
 NIGHT = {
@@ -458,6 +463,12 @@ CONFIGS = {
     "attack": Config({}, view=3, scenarios=("attack",), world=FIXTURES / "attack" / "world", fixture="attack",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                      player=ATTACK),
+    # The bot, in survival mode with an iron sword, hits the sweep fixture's cows and sheep, penned
+    # side by side, by the server's clock: its sweeps hurt and knock back the others, a hit as it
+    # sprints doesn't sweep and stops its sprint, till all are dead (D417).
+    "sweep": Config({}, view=3, scenarios=("sweep",), world=FIXTURES / "sweep" / "world", fixture="sweep",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                    player=SWEEP),
     # Armor stands by the spawn, which both servers load and tick (CAL-155): falling onto stone,
     # hay, honey and slime, sliding on ice, down a ladder and into water, and standing, small, a
     # marker, without gravity, posed and invisible; watched, as `redstone`.
