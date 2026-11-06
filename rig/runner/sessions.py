@@ -78,11 +78,12 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # drops, throws and picks up items; `items-saved`, where it picks up items saved in the world;
 # `orbs`, where it breaks blocks that give experience; `feed`, where it feeds animals; `attack`,
 # where it hits and kills them; `sweep`, where it sweeps them with a sword; `enchant`, where it hits
-# them with enchanted swords; `protect`, where it hits zombies in enchanted armor; `fall`, where it
-# falls; and `checks`, where its moves are checked (src/rig/session.calx).
+# them with enchanted swords; `protect`, where it hits zombies in enchanted armor; `stand-hits`,
+# where it hits armor stands; `fall`, where it falls; and `checks`, where its moves are checked
+# (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
-                   "checks"]
+                   "checks", "stand-hits"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -594,6 +595,16 @@ CONFIGS = {
                       fixture="protect",
                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                       player=SWEEP),
+    # The bot, in survival mode with `enchant`'s swords, hits the stand_hits fixture's armor stands
+    # by the server's clock (D441): Bob, named, shaken by a hit, again 30 ticks on, then broken by
+    # one 3 ticks after that, dropping his helmet and himself, named, the first sweep reaching the
+    # stand beside him and knocking it back; the stand to the north lit by fire aspect, which burns
+    # it to its breaking, its chestplate dropped; the invisible stand and the marker, which no hit
+    # hurts; while a stand in soul fire and one on a campfire burn to their breaking.
+    "stand-hits": Config({}, view=3, scenarios=("stand-hits",), world=FIXTURES / "stand_hits" / "world",
+                         fixture="stand_hits",
+                         rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                         player=ENCHANT),
     # The bot, in survival mode by the checks fixture's wall, by the server's clock: a move too
     # quick, one through the wall and one into it, each of which the server sends it back from,
     # then a float it's kicked for (D420).
