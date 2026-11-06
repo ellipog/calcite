@@ -78,10 +78,10 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # drops, throws and picks up items; `items-saved`, where it picks up items saved in the world;
 # `orbs`, where it breaks blocks that give experience; `feed`, where it feeds animals; `attack`,
 # where it hits and kills them; `sweep`, where it sweeps them with a sword; `enchant`, where it hits
-# them with enchanted swords; `fall`, where it falls; and `checks`, where its moves are checked
-# (src/rig/session.calx).
+# them with enchanted swords; `protect`, where it hits zombies in enchanted armor; `fall`, where it
+# falls; and `checks`, where its moves are checked (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
-                   "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "fall",
+                   "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
@@ -324,6 +324,12 @@ FALL = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-30.0),
             Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
                 slotted(0, "iron_sword"),
             ]), equipment={})
+# The bot's data in `fall-armored`: `fall`'s, in diamond boots with feather falling IV and an iron
+# chestplate with protection IV, which take their shares of its falls (D439).
+FALL_ARMORED = dict(FALL, equipment={
+    "feet": stack("diamond_boots", 1, {"minecraft:enchantments": {"minecraft:feather_falling": nbt.Int(4)}}),
+    "chest": stack("iron_chestplate", 1, {"minecraft:enchantments": {"minecraft:protection": nbt.Int(4)}}),
+})
 # What `fall` compares of the bot's saved data besides: its health and absorption, its food, its
 # motion and its fall (D418).
 FALL_KEYS = ("Health", "AbsorptionAmount", "foodLevel", "foodSaturationLevel", "foodExhaustionLevel", "foodTickTimer",
@@ -397,6 +403,13 @@ MAGMA = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, []), equipment={
 })
 # What `magma` compares: `buried`'s, its burns starting as its client says it's loaded (D431).
 MAGMA_KEYS = BURIED_KEYS
+# The bot's data in `magma-frost`: `magma`'s, its boots diamond with frost walker II, which make it
+# immune to the magma's burn; and in `magma-fireproof`, leather with fire protection IV, which take
+# their share of each burn (D439).
+MAGMA_FROST = dict(MAGMA, equipment=dict(MAGMA["equipment"], feet=stack("diamond_boots", 1, {
+    "minecraft:enchantments": {"minecraft:frost_walker": nbt.Int(2)}})))
+MAGMA_FIREPROOF = dict(MAGMA, equipment=dict(MAGMA["equipment"], feet=stack("leather_boots", 1, {
+    "minecraft:enchantments": {"minecraft:fire_protection": nbt.Int(4)}})))
 # The use_items rules: the dig configurations', and no natural regeneration, so the bot's food stays
 # where the cake it eats puts it (CAL-142).
 USE_ITEMS_RULES = DIG_RULES + (("minecraft:natural_health_regeneration", nbt.Byte(0)),)
@@ -568,6 +581,19 @@ CONFIGS = {
     "fall": Config({}, view=3, scenarios=("fall",), world=FIXTURES / "fall" / "world", fixture="fall",
                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                    player=FALL, keys=FALL_KEYS),
+    # `fall` in enchanted armor, feather falling and protection taking their shares of each fall
+    # (D439).
+    "fall-armored": Config({}, view=3, scenarios=("fall",), world=FIXTURES / "fall" / "world", fixture="fall",
+                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                           player=FALL_ARMORED, keys=FALL_KEYS),
+    # The bot, in survival mode with an iron sword, hits the protect fixture's zombies by the
+    # server's clock, on normal, which keeps them (D439): one in a diamond chestplate with
+    # protection IV, which takes its share of each hit; and one in diamond boots with frost walker
+    # II and one in a leather helmet with fire protection IV, which give nothing against a hit.
+    "protect": Config({"difficulty": "normal"}, view=3, scenarios=("protect",), world=FIXTURES / "protect" / "world",
+                      fixture="protect",
+                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                      player=SWEEP),
     # The bot, in survival mode by the checks fixture's wall, by the server's clock: a move too
     # quick, one through the wall and one into it, each of which the server sends it back from,
     # then a float it's kicked for (D420).
@@ -621,6 +647,14 @@ CONFIGS = {
     "magma": Config({"difficulty": "hard"}, view=2, scenarios=("watch-late",), world=FIXTURES / "magma" / "world", fixture="magma",
                     player=MAGMA, keys=MAGMA_KEYS, tape=True,
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
+    # `magma` in frost walker boots, immune to the burn, and in fire protection boots, which take
+    # their share of each (D439).
+    "magma-frost": Config({"difficulty": "hard"}, view=2, scenarios=("watch-late",), world=FIXTURES / "magma" / "world",
+                          fixture="magma", player=MAGMA_FROST, keys=MAGMA_KEYS, tape=True,
+                          rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
+    "magma-fireproof": Config({"difficulty": "hard"}, view=2, scenarios=("watch-late",), world=FIXTURES / "magma" / "world",
+                              fixture="magma", player=MAGMA_FIREPROOF, keys=MAGMA_KEYS, tape=True,
+                              rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
     # Penned by the spawn, a cow burning on magma till it dies, a pig lighting redstone ore, the
     # ore's particles drawn from the level's random, and a sheep slowed by slime blocks (D431),
     # taped; without random ticks, which would put the ore out.
