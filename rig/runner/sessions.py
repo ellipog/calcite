@@ -354,6 +354,28 @@ HURT_KEYS = FALL_KEYS + ("Air",)
 # the bot has its chunks, which Calcite sends sooner, so its last hurt can fall either side of the
 # bot's leave, as its first's tick does (D426).
 BURIED_KEYS = tuple(k for k in HURT_KEYS if k != "Health")
+# The bot's data in `death`: `buried`'s with 2 health, so the wall's second hurt kills it, stacks in
+# the hotbar, the inventory's own slots and the offhand, armor, a stack in the inventory and the
+# helmet cursed with vanishing, and 3 levels (D427).
+VANISHING = {"minecraft:enchantments": {"minecraft:vanishing_curse": nbt.Int(1)}}
+DEATH = dict(BURIED, Health=nbt.Float(2.0), XpLevel=nbt.Int(3), SelectedItemSlot=nbt.Int(4),
+             Inventory=nbt.List(nbt.COMPOUND, [
+                 slotted(0, "stone", 64),
+                 slotted(4, "diamond_sword", 1, {"minecraft:enchantments": {"minecraft:sharpness": nbt.Int(3)}}),
+                 slotted(9, "bread", 7),
+                 slotted(20, "golden_apple", 2, VANISHING),
+                 slotted(35, "oak_log", 10),
+             ]),
+             equipment={
+                 "head": stack("iron_helmet", 1, VANISHING),
+                 "chest": stack("leather_chestplate"),
+                 "feet": stack("leather_boots"),
+                 "offhand": stack("torch", 32),
+             })
+# What `death` compares: `buried`'s, its health, which is none once it's died, its levels, which it
+# keeps till it respawns, and where it died. How long it's been dead goes by when its client said it
+# loaded, as its hurts do.
+DEATH_KEYS = BURIED_KEYS + ("Health", "XpLevel", "LastDeathLocation")
 # The use_items rules: the dig configurations', and no natural regeneration, so the bot's food stays
 # where the cake it eats puts it (CAL-142).
 USE_ITEMS_RULES = DIG_RULES + (("minecraft:natural_health_regeneration", nbt.Byte(0)),)
@@ -570,6 +592,12 @@ CONFIGS = {
     "buried": Config({"difficulty": "hard"}, view=2, scenarios=("watch",), world=FIXTURES / "buried" / "world", fixture="buried",
                      player=BURIED, keys=BURIED_KEYS,
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
+    # The same bot dying in the wall, its death told, what it carries and its experience dropped
+    # around it, but what's cursed with vanishing, and taken out of its level 20 ticks after
+    # (D427).
+    "death": Config({"difficulty": "hard"}, view=2, scenarios=("watch",), world=FIXTURES / "buried" / "world", fixture="buried",
+                    player=DEATH, keys=DEATH_KEYS,
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
