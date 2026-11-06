@@ -1,0 +1,841 @@
+/// Finding a way for a mob that walks, as vanilla's `PathFinder` finds one with a
+/// `WalkNodeEvaluator` (CAL-157): A* from the mob's place toward its targets over `Node`s, each a
+/// place the mob may stand with its path type and malus, the open set `BinaryHeap`'s heap in its
+/// order, ties and all; a node's neighbours those `getNeighbors` accepts, each side's and then the
+/// diagonals', stepping up as far as the mob steps, jumping where its box fits and falling as far
+/// as it may; and the path to the target reached, or to the place nearest the targets where none
+/// is, `reconstructPath`.
+///
+/// The nodes are kept by `Node.createHash`, as vanilla's map keeps them, so two places that hash
+/// the same, 256 blocks apart, are one node, as in vanilla, though no search goes that far. Each
+/// place's type for the mob is worked out once a search, `getCachedPathType`, its blocks' read
+/// through the level's `PathTypeCache`.
+///
+/// The level is read as `PathNavigationRegion` reads it, a block whose chunk isn't loaded full air
+/// with no shape; its chunks reach 8 blocks past the farthest a path goes, so the search never
+/// reads beyond them. Other entities don't collide, as the region has none, and nor does the world
+/// border yet. A mob that stands on a fluid, a strider, and the amphibious, swimming and flying
+/// evaluators come later.
+module world.path_finder
+
+import world.collision.{Aabb, CollisionBlocks}
+import world.entity_facts.{COMPUTATION_LAND, PATH_BIG_MOBS_CLOSE_TO_DANGER, PATH_BLOCKED, PATH_DOOR_IRON_CLOSED, PATH_DOOR_OPEN, PATH_DOOR_WOOD_CLOSED, PATH_FENCE, PATH_OPEN, PATH_POWDER_SNOW, PATH_RAIL, PATH_STICKY_HONEY, PATH_TRAPDOOR, PATH_TYPE_COUNT, PATH_UNPASSABLE_RAIL, PATH_WALKABLE, PATH_WALKABLE_DOOR, PATH_WATER, path_maluses}
+import world.movement.{MovementStates, Mover, moved}
+import world.paths.{PathStates, PathTypeCache, state_at}
+import worldgen.facts.{Facts}
+
+/// What the search reads of the mob it's for, as vanilla reads it of a `Mob`: where it is and its
+/// box; its size, `getBbWidth` and `getBbHeight`; whether it's on the ground and in a fluid of
+/// `#entity_floatable`, `isInFloatableFluid`; how far it has fallen, which its collisions read;
+/// how high it steps, `maxUpStep`, and falls, `getMaxFallDistance`; its malus for each path type,
+/// `getPathfindingMalus`; and what its navigation lets it do: float, open doors, pass them and
+/// walk over fences.
+pub struct Seeker {
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    pub bounds: Aabb
+    pub width: f32
+    pub height: f32
+    pub on_ground: bool = false
+    pub floating: bool = false
+    pub fall: f64 = 0.0
+    pub step: f32 = 0.6f32
+    pub max_fall: i32 = 3
+    pub maluses: List<f32>
+    pub can_float: bool = false
+    pub can_open_doors: bool = false
+    pub can_pass_doors: bool = true
+    pub can_walk_over_fences: bool = false
+}
+
+/// Each path type's malus as `PathType` gives it, what a mob has but where its own
+/// `setPathfindingMalus` changes one.
+pub fn default_maluses() -> List<f32> {
+    return path_maluses()
+}
+
+/// A place the search reached, vanilla's `Node`: where it is, its type and malus, and whether the
+/// search is done with it.
+pub struct Node {
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub kind: u8 = PATH_BLOCKED
+    pub cost_malus: f32 = 0.0f32
+    pub closed: bool = false
+    pub walked: f32 = 0.0f32
+    // Where it is in the open set, -1 where it isn't; its cost so far, its guess of what's left,
+    // and the two; and the node the search came to it from.
+    heap_at: i32 = -1
+    g: f32 = 0.0f32
+    h: f32 = 0.0f32
+    f: f32 = 0.0f32
+    came_from: usize? = none
+}
+
+/// A path found, vanilla's `Path`: its nodes from the mob's place on, the next one it heads for,
+/// the target it was found for, how far its last node is from that, by `distanceManhattan`, and
+/// whether the target was reached.
+pub struct Path {
+    pub nodes: List<Node>
+    pub next: usize = 0
+    pub target: (i32, i32, i32)
+    pub dist_to_target: f32
+    pub reached: bool
+}
+
+// A target, vanilla's `Target`: where it is, the node nearest it by the search's guess, and
+// whether it's been reached.
+struct Target {
+    x: i32
+    y: i32
+    z: i32
+    best_h: f32 = f32.MAX
+    best: usize? = none
+    reached: bool = false
+}
+
+// The sides, as `Direction.Plane.HORIZONTAL` goes over them, north, east, south and west; each the
+// next's counterclockwise turn.
+fn step_x(d: i32) -> i32 {
+    return if d == 1 { 1 } else if d == 3 { -1 } else { 0 }
+}
+
+fn step_z(d: i32) -> i32 {
+    return if d == 0 { -1 } else if d == 2 { 1 } else { 0 }
+}
+
+// `Node.createHash`: 8 bits of y, 15 of x and 8 of z, the signs of x and z, which the map keeps
+// nodes by.
+fn node_hash(x: i32, y: i32, z: i32) -> i32 {
+    var v = (i64(y) & 0xFF) | ((i64(x) & 32767) << 8) | ((i64(z) & 32767) << 24)
+    if x < 0 {
+        v = v | 0x80000000
+    }
+    if z < 0 {
+        v = v | 32768
+    }
+    return i32.wrap(v)
+}
+
+// The place packed in a long, `BlockPos.asLong`, which a search's types are kept by.
+fn pack(x: i32, y: i32, z: i32) -> i64 {
+    return ((i64(x) & 0x3FFFFFF) << 38) | ((i64(z) & 0x3FFFFFF) << 12) | (i64(y) & 0xFFF)
+}
+
+// An int as a float, as Java converts it.
+fn float_of(v: i32) -> f32 {
+    return f32.nearest(f64(v))
+}
+
+// `Node.distanceTo`, in floats.
+fn distance(ax: i32, ay: i32, az: i32, bx: i32, by: i32, bz: i32) -> f32 {
+    let xd = float_of(bx - ax)
+    let yd = float_of(by - ay)
+    let zd = float_of(bz - az)
+    return f32.nearest(f64(xd * xd + yd * yd + zd * zd).sqrt())
+}
+
+// `Node.distanceManhattan`.
+fn manhattan(ax: i32, ay: i32, az: i32, bx: i32, by: i32, bz: i32) -> f32 {
+    return float_of((bx - ax).abs()) + float_of((by - ay).abs()) + float_of((bz - az).abs())
+}
+
+fn floor_of(v: f64) -> i32 {
+    return i32.saturate(v.floor())
+}
+
+// Whether a type is one a mob is partly stopped by, `doesBlockHavePartialCollision`.
+fn partial(t: u8) -> bool {
+    return t == PATH_FENCE or t == PATH_DOOR_WOOD_CLOSED or t == PATH_DOOR_IRON_CLOSED
+}
+
+/// `PathFinder.findPath`: the path for `mob` toward `targets` in a level whose least y is
+/// `min_y`, none where there are none, else the one to the target reached that has the fewest
+/// nodes, or, where none is reached, the one whose end is nearest its target and then has the
+/// fewest. A search visits fewer than `max_visited` times `multiplier` nodes and goes no farther
+/// than `max_length` from the mob, and a target is reached by a node within `reach` of it.
+/// `targets` are in the order vanilla's map of them goes over them, which for one is no matter.
+pub fn find_path<B: CollisionBlocks>(p: PathStates, m: MovementStates, f: Facts, blocks: B, cache: mut PathTypeCache, mob: own Seeker, min_y: i32, targets: List<(i32, i32, i32)>, max_length: f32, reach: i32, max_visited: i32, multiplier: f32) -> Path? {
+    if targets.is_empty() {
+        return none
+    }
+    var s = Search.new(f, p, mob, min_y)
+    return s.find(p, m, blocks, mut cache, targets, max_length, reach, max_visited, multiplier)
+}
+
+// A search: the mob, the nodes made so far by their hash, the types for the mob of the places
+// looked at, the open set, and the nodes each side gave the last node's neighbours.
+struct Search {
+    mob: Seeker
+    f: Facts
+    min_y: i32
+    floatable: u32
+    wide: i32
+    tall: i32
+    nodes: List<Node>
+    by_hash: Map<i32, usize>
+    mob_types: Map<i64, u8>
+    heap: List<usize>
+    size: usize
+    sides: List<usize?>
+}
+
+impl Search {
+    // `prepare`: the mob's size in blocks, `entityWidth` and `entityHeight`, and the fluids it
+    // floats in, a bit each.
+    fn new(f: Facts, p: PathStates, mob: own Seeker, min_y: i32) -> Search {
+        let wide = floor_of(f64(mob.width + 1.0f32))
+        let tall = floor_of(f64(mob.height + 1.0f32))
+        var sides = List<usize?>()
+        for _ in 0..4 {
+            sides.push(none)
+        }
+        return Search {
+            mob: mob,
+            f: f.copy(),
+            min_y: min_y,
+            floatable: p.floatable,
+            wide: wide,
+            tall: tall,
+            nodes: List<Node>(),
+            by_hash: Map<i32, usize>(),
+            mob_types: Map<i64, u8>(),
+            heap: List<usize>(),
+            size: 0,
+            sides: sides,
+        }
+    }
+
+    fn malus(self, t: u8) -> f32 {
+        return self.mob.maluses[usize(t)]
+    }
+
+    // `getNode`: the node of `x`, `y`, `z`, made if there's none of its hash.
+    fn node(mut self, x: i32, y: i32, z: i32) -> usize {
+        let h = node_hash(x, y, z)
+        if self.by_hash.contains(h) {
+            return self.by_hash[h]
+        }
+        self.nodes.push(Node { x: x, y: y, z: z })
+        let i = self.nodes.len() - 1
+        self.by_hash.insert(h, i)
+        return i
+    }
+
+    // `PathFinder.findPath`'s search, once the mob's node is found.
+    fn find<B: CollisionBlocks>(mut self, p: PathStates, m: MovementStates, blocks: B, cache: mut PathTypeCache, targets: List<(i32, i32, i32)>, max_length: f32, reach: i32, max_visited: i32, multiplier: f32) -> Path? {
+        let from = self.start(p, blocks, mut cache)
+        var ts = List<Target>()
+        for (x, y, z) in targets {
+            _ = self.node(x, y, z)
+            ts.push(Target { x: x, y: y, z: z })
+        }
+        self.nodes[from].g = 0.0f32
+        let first = self.best_h(from, mut ts)
+        self.nodes[from].h = first
+        self.nodes[from].f = first
+        self.size = 0
+        self.insert(from)
+        let fx = self.nodes[from].x
+        let fy = self.nodes[from].y
+        let fz = self.nodes[from].z
+        var count = 0
+        var reached = false
+        let most = i32.saturate(f64(float_of(max_visited) * multiplier))
+        while self.size > 0 {
+            count += 1
+            if count >= most {
+                break
+            }
+            let cur = self.pop()
+            self.nodes[cur].closed = true
+            let cx = self.nodes[cur].x
+            let cy = self.nodes[cur].y
+            let cz = self.nodes[cur].z
+            for i in 0..ts.len() {
+                if manhattan(cx, cy, cz, ts[i].x, ts[i].y, ts[i].z) <= float_of(reach) {
+                    ts[i].reached = true
+                    reached = true
+                }
+            }
+            if reached {
+                break
+            }
+            if distance(cx, cy, cz, fx, fy, fz) >= max_length {
+                continue
+            }
+            let around = self.neighbours(p, m, blocks, mut cache, cur)
+            for n in around {
+                let d = distance(cx, cy, cz, self.nodes[n].x, self.nodes[n].y, self.nodes[n].z)
+                self.nodes[n].walked = self.nodes[cur].walked + d
+                let tentative = self.nodes[cur].g + d + self.nodes[n].cost_malus
+                if self.nodes[n].walked < max_length and (self.nodes[n].heap_at < 0 or tentative < self.nodes[n].g) {
+                    self.nodes[n].came_from = some(cur)
+                    self.nodes[n].g = tentative
+                    let h = self.best_h(n, mut ts)
+                    self.nodes[n].h = h * 1.5f32
+                    let cost = self.nodes[n].g + self.nodes[n].h
+                    if self.nodes[n].heap_at >= 0 {
+                        self.change_cost(n, cost)
+                    } else {
+                        self.nodes[n].f = cost
+                        self.insert(n)
+                    }
+                }
+            }
+        }
+        var best: Path? = none
+        for t in ts {
+            if reached and not t.reached {
+                continue
+            }
+            let end = t.best else continue
+            let path = self.reconstruct(end, t.x, t.y, t.z, reached)
+            let better = if let b = best {
+                if reached {
+                    path.nodes.len() < b.nodes.len()
+                } else {
+                    path.dist_to_target < b.dist_to_target or (path.dist_to_target == b.dist_to_target and path.nodes.len() < b.nodes.len())
+                }
+            } else {
+                true
+            }
+            if better {
+                best = some(path)
+            }
+        }
+        return best
+    }
+
+    // `getBestH`: the least of the node's distances to the targets, each target keeping the node
+    // nearest it.
+    fn best_h(self, n: usize, ts: mut List<Target>) -> f32 {
+        var best = f32.MAX
+        let x = self.nodes[n].x
+        let y = self.nodes[n].y
+        let z = self.nodes[n].z
+        for i in 0..ts.len() {
+            let h = distance(x, y, z, ts[i].x, ts[i].y, ts[i].z)
+            if h < ts[i].best_h {
+                ts[i].best_h = h
+                ts[i].best = some(n)
+            }
+            if h < best {
+                best = h
+            }
+        }
+        return best
+    }
+
+    // `reconstructPath`: the nodes from the mob's to `end`, and its distance from the target.
+    fn reconstruct(self, end: usize, x: i32, y: i32, z: i32, reached: bool) -> Path {
+        var back = List<Node>()
+        var at = end
+        back.push(self.nodes[at])
+        loop {
+            let from = self.nodes[at].came_from else break
+            at = from
+            back.push(self.nodes[at])
+        }
+        var nodes = List<Node>()
+        var i = back.len()
+        while i > 0 {
+            i -= 1
+            nodes.push(back[i])
+        }
+        let last = nodes[nodes.len() - 1]
+        return Path { nodes: nodes, target: (x, y, z), dist_to_target: manhattan(last.x, last.y, last.z, x, y, z), reached: reached }
+    }
+
+    // `BinaryHeap.insert`.
+    fn insert(mut self, n: usize) {
+        let at = self.size
+        if at == self.heap.len() {
+            self.heap.push(n)
+        } else {
+            self.heap[at] = n
+        }
+        self.nodes[n].heap_at = i32.wrap(at)
+        self.size = at + 1
+        self.up_heap(at)
+    }
+
+    // `BinaryHeap.pop`.
+    fn pop(mut self) -> usize {
+        let popped = self.heap[0]
+        self.size -= 1
+        let last = self.heap[self.size]
+        self.heap[0] = last
+        if self.size > 0 {
+            self.down_heap(0)
+        }
+        self.nodes[popped].heap_at = -1
+        return popped
+    }
+
+    // `BinaryHeap.changeCost`.
+    fn change_cost(mut self, n: usize, cost: f32) {
+        let old = self.nodes[n].f
+        self.nodes[n].f = cost
+        let at = usize.wrap(self.nodes[n].heap_at)
+        if cost < old {
+            self.up_heap(at)
+        } else {
+            self.down_heap(at)
+        }
+    }
+
+    fn up_heap(mut self, idx: usize) {
+        let node = self.heap[idx]
+        let cost = self.nodes[node].f
+        var i = idx
+        while i > 0 {
+            let parent_at = (i - 1) / 2
+            let parent = self.heap[parent_at]
+            if not (cost < self.nodes[parent].f) {
+                break
+            }
+            self.heap[i] = parent
+            self.nodes[parent].heap_at = i32.wrap(i)
+            i = parent_at
+        }
+        self.heap[i] = node
+        self.nodes[node].heap_at = i32.wrap(i)
+    }
+
+    fn down_heap(mut self, idx: usize) {
+        let node = self.heap[idx]
+        let cost = self.nodes[node].f
+        var i = idx
+        loop {
+            let left_at = 1 + i * 2
+            let right_at = left_at + 1
+            if left_at >= self.size {
+                break
+            }
+            let left = self.heap[left_at]
+            let left_cost = self.nodes[left].f
+            var right_cost = f32.INFINITY
+            if right_at < self.size {
+                right_cost = self.nodes[self.heap[right_at]].f
+            }
+            if left_cost < right_cost {
+                if not (left_cost < cost) {
+                    break
+                }
+                self.heap[i] = left
+                self.nodes[left].heap_at = i32.wrap(i)
+                i = left_at
+            } else {
+                if not (right_cost < cost) {
+                    break
+                }
+                let right = self.heap[right_at]
+                self.heap[i] = right
+                self.nodes[right].heap_at = i32.wrap(i)
+                i = right_at
+            }
+        }
+        self.heap[i] = node
+        self.nodes[node].heap_at = i32.wrap(i)
+    }
+
+    // Whether the state's fluid is one the mob floats in.
+    fn floats(self, state: u32) -> bool {
+        return self.floatable & (1u32 << self.f.fluid(state)) != 0
+    }
+
+    // `getStart`: the mob's node, up out of a fluid it floats in, half a block up from where it
+    // stands, or where it'd land, at the corner of its box that it may start at where the middle
+    // isn't one.
+    fn start<B: CollisionBlocks>(mut self, p: PathStates, blocks: B, cache: mut PathTypeCache) -> usize {
+        let bx = floor_of(self.mob.x)
+        let bz = floor_of(self.mob.z)
+        var start_y = floor_of(self.mob.y)
+        var state = state_at(blocks, bx, start_y, bz)
+        if self.mob.can_float and self.mob.floating {
+            while self.floats(state) {
+                start_y += 1
+                state = state_at(blocks, bx, start_y, bz)
+            }
+            start_y -= 1
+        } else if self.mob.on_ground {
+            start_y = floor_of(self.mob.y + 0.5)
+        } else {
+            var y = floor_of(self.mob.y + 1.0)
+            while y > self.min_y {
+                start_y = y
+                y -= 1
+                let below = state_at(blocks, bx, y, bz)
+                if not self.f.is_air(below) and not p.pathfindable(below, COMPUTATION_LAND) {
+                    break
+                }
+            }
+        }
+        if not self.can_start_at(p, blocks, mut cache, bx, start_y, bz) {
+            let b = self.mob.bounds
+            let corners = [(b.min_x, b.min_z), (b.min_x, b.max_z), (b.max_x, b.min_z), (b.max_x, b.max_z)]
+            for (cx, cz) in corners {
+                let x = floor_of(cx)
+                let z = floor_of(cz)
+                if self.can_start_at(p, blocks, mut cache, x, start_y, z) {
+                    return self.start_node(p, blocks, mut cache, x, start_y, z)
+                }
+            }
+        }
+        return self.start_node(p, blocks, mut cache, bx, start_y, bz)
+    }
+
+    fn start_node<B: CollisionBlocks>(mut self, p: PathStates, blocks: B, cache: mut PathTypeCache, x: i32, y: i32, z: i32) -> usize {
+        let n = self.node(x, y, z)
+        let t = self.cached_type(p, blocks, mut cache, x, y, z)
+        self.nodes[n].kind = t
+        self.nodes[n].cost_malus = self.malus(t)
+        return n
+    }
+
+    fn can_start_at<B: CollisionBlocks>(mut self, p: PathStates, blocks: B, cache: mut PathTypeCache, x: i32, y: i32, z: i32) -> bool {
+        let t = self.cached_type(p, blocks, mut cache, x, y, z)
+        return t != PATH_OPEN and self.malus(t) >= 0.0f32
+    }
+
+    // `getCachedPathType`: the place's type for the mob, worked out once a search.
+    fn cached_type<B: CollisionBlocks>(mut self, p: PathStates, blocks: B, cache: mut PathTypeCache, x: i32, y: i32, z: i32) -> u8 {
+        let key = pack(x, y, z)
+        if self.mob_types.contains(key) {
+            return self.mob_types[key]
+        }
+        let t = self.type_of_mob(p, blocks, mut cache, x, y, z)
+        self.mob_types.insert(key, t)
+        return t
+    }
+
+    // `getPathTypeOfMob`: of the types of the blocks the mob's box takes up from the place, the
+    // one there is, a fence, a rail it can't pass, the first it can't go through, or the one it
+    // would rather not most, which for a wide mob is only near danger where the place itself
+    // costs less, and for another is open where the place is and the others cost nothing.
+    fn type_of_mob<B: CollisionBlocks>(self, p: PathStates, blocks: B, cache: mut PathTypeCache, x: i32, y: i32, z: i32) -> u8 {
+        let types = self.within_box(p, blocks, mut cache, x, y, z)
+        if types & (types - 1) == 0 {
+            for t in 0..PATH_TYPE_COUNT {
+                if types == 1u32 << u32.wrap(t) {
+                    return u8.wrap(t)
+                }
+            }
+        }
+        if types & (1u32 << u32(PATH_FENCE)) != 0 {
+            return PATH_FENCE
+        }
+        if types & (1u32 << u32(PATH_UNPASSABLE_RAIL)) != 0 {
+            return PATH_UNPASSABLE_RAIL
+        }
+        var best = PATH_BLOCKED
+        var best_malus = self.malus(PATH_BLOCKED)
+        for i in 0..PATH_TYPE_COUNT {
+            let t = u8.wrap(i)
+            if types & (1u32 << u32(t)) != 0 {
+                let m = self.malus(t)
+                if m < 0.0f32 {
+                    return t
+                }
+                if m >= best_malus {
+                    best_malus = m
+                    best = t
+                }
+            }
+        }
+        let here = p.at(blocks, mut cache, self.min_y, x, y, z)
+        if self.wide > 1 {
+            if self.malus(here) < best_malus and self.malus(PATH_BIG_MOBS_CLOSE_TO_DANGER) < best_malus {
+                return PATH_BIG_MOBS_CLOSE_TO_DANGER
+            }
+            return best
+        }
+        if here == PATH_OPEN and best != PATH_OPEN and best_malus == 0.0f32 {
+            return PATH_OPEN
+        }
+        return best
+    }
+
+    // `getPathTypeWithinMobBB`: the types of the blocks the mob's box takes up from the place, a
+    // bit each, a closed wooden door walkable where it opens and passes doors, an open one blocked
+    // where it doesn't pass them, and a rail it isn't on or over unpassable.
+    fn within_box<B: CollisionBlocks>(self, p: PathStates, blocks: B, cache: mut PathTypeCache, x: i32, y: i32, z: i32) -> u32 {
+        var types = 0u32
+        let mx = floor_of(self.mob.x)
+        let my = floor_of(self.mob.y)
+        let mz = floor_of(self.mob.z)
+        for dx in 0..self.wide {
+            for dy in 0..self.tall {
+                for dz in 0..self.wide {
+                    var t = p.at(blocks, mut cache, self.min_y, x + dx, y + dy, z + dz)
+                    let passes = self.mob.can_pass_doors
+                    if t == PATH_DOOR_WOOD_CLOSED and self.mob.can_open_doors and passes {
+                        t = PATH_WALKABLE_DOOR
+                    }
+                    if t == PATH_DOOR_OPEN and not passes {
+                        t = PATH_BLOCKED
+                    }
+                    if t == PATH_RAIL and p.at(blocks, mut cache, self.min_y, mx, my, mz) != PATH_RAIL and p.at(blocks, mut cache, self.min_y, mx, my - 1, mz) != PATH_RAIL {
+                        t = PATH_UNPASSABLE_RAIL
+                    }
+                    types = types | (1u32 << u32(t))
+                }
+            }
+        }
+        return types
+    }
+
+    // `getFloorLevel`: half up a block of a fluid the mob floats in, else the top of the block
+    // below.
+    fn floor_level<B: CollisionBlocks>(self, m: MovementStates, blocks: B, x: i32, y: i32, z: i32) -> f64 {
+        if self.mob.can_float and self.floats(state_at(blocks, x, y, z)) {
+            return f64(y) + 0.5
+        }
+        return floor_at(self.f, m, blocks, x, y, z)
+    }
+
+    // `getNeighbors`: the nodes each side accepts, then each diagonal's between two sides that
+    // let it, stepping up as far as the mob steps where the block above it doesn't stop it and
+    // it isn't on honey.
+    fn neighbours<B: CollisionBlocks>(mut self, p: PathStates, m: MovementStates, blocks: B, cache: mut PathTypeCache, cur: usize) -> List<usize> {
+        var out = List<usize>()
+        let cx = self.nodes[cur].x
+        let cy = self.nodes[cur].y
+        let cz = self.nodes[cur].z
+        var jump = 0
+        let above = self.cached_type(p, blocks, mut cache, cx, cy + 1, cz)
+        let here = self.cached_type(p, blocks, mut cache, cx, cy, cz)
+        if self.malus(above) >= 0.0f32 and here != PATH_STICKY_HONEY {
+            let up = if self.mob.step > 1.0f32 { self.mob.step } else { 1.0f32 }
+            jump = floor_of(f64(up))
+        }
+        let height = self.floor_level(m, blocks, cx, cy, cz)
+        for d in 0..4 {
+            let n = self.accepted(p, m, blocks, mut cache, cx + step_x(d), cy, cz + step_z(d), jump, height, d, here)
+            self.sides[usize.wrap(d)] = n
+            if let i = n {
+                if not self.nodes[i].closed and (self.nodes[i].cost_malus >= 0.0f32 or self.nodes[cur].cost_malus < 0.0f32) {
+                    out.push(i)
+                }
+            }
+        }
+        for d in 0..4 {
+            let second = (d + 1) % 4
+            if self.diagonal_between(cur, self.sides[usize.wrap(d)], self.sides[usize.wrap(second)]) {
+                let n = self.accepted(p, m, blocks, mut cache, cx + step_x(d) + step_x(second), cy, cz + step_z(d) + step_z(second), jump, height, d, here)
+                if let i = n {
+                    if not self.nodes[i].closed and self.nodes[i].kind != PATH_WALKABLE_DOOR and self.nodes[i].cost_malus >= 0.0f32 {
+                        out.push(i)
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    // `isDiagonalValid` of the sides' nodes: both there and no higher, neither a door the mob
+    // walks through, neither costly for a wide mob, and each lower or free, or between fence
+    // posts a thin mob passes.
+    fn diagonal_between(self, cur: usize, ew: usize?, ns: usize?) -> bool {
+        let e = ew else return false
+        let n = ns else return false
+        let c = self.nodes[cur]
+        let a = self.nodes[e]
+        let b = self.nodes[n]
+        if b.y > c.y or a.y > c.y {
+            return false
+        }
+        if a.kind == PATH_WALKABLE_DOOR or b.kind == PATH_WALKABLE_DOOR {
+            return false
+        }
+        if self.mob.width > 1.0f32 and (a.cost_malus > 0.0f32 or b.cost_malus > 0.0f32) {
+            return false
+        }
+        let posts = b.kind == PATH_FENCE and a.kind == PATH_FENCE and f64(self.mob.width) < 0.5
+        return (b.y < c.y or b.cost_malus >= 0.0f32 or posts) and (a.y < c.y or a.cost_malus >= 0.0f32 or posts)
+    }
+
+    // `findAcceptedNode`: the node the mob may stand at for the place, none where its floor is
+    // higher than the mob jumps from `height`; one up where it jumps, the bottom of water it
+    // sinks in, where it lands below an open place, or a closed node of a fence or door it can't
+    // get past.
+    fn accepted<B: CollisionBlocks>(mut self, p: PathStates, m: MovementStates, blocks: B, cache: mut PathTypeCache, x: i32, y: i32, z: i32, jump: i32, height: f64, d: i32, current: u8) -> usize? {
+        var best: usize? = none
+        let target_y = self.floor_level(m, blocks, x, y, z)
+        let jump_height = if f64(self.mob.step) > 1.125 { f64(self.mob.step) } else { 1.125 }
+        if target_y - height > jump_height {
+            return none
+        }
+        let t = self.cached_type(p, blocks, mut cache, x, y, z)
+        let cost = self.malus(t)
+        if cost >= 0.0f32 {
+            best = some(self.raise_cost(x, y, z, t, cost))
+        }
+        if partial(current) {
+            if let b = best {
+                if self.nodes[b].cost_malus >= 0.0f32 and not self.reaches(m, blocks, b) {
+                    best = none
+                }
+            }
+        }
+        if t == PATH_WALKABLE {
+            return best
+        }
+        let stopped = if let b = best { self.nodes[b].cost_malus < 0.0f32 } else { true }
+        if stopped and jump > 0 and (t != PATH_FENCE or self.mob.can_walk_over_fences) and t != PATH_UNPASSABLE_RAIL and t != PATH_TRAPDOOR and t != PATH_POWDER_SNOW {
+            return self.jump_on(p, m, blocks, mut cache, x, y, z, jump, height, d, current)
+        }
+        if t == PATH_WATER and not self.mob.can_float {
+            return self.below_water(p, blocks, mut cache, x, y, z, best)
+        }
+        if t == PATH_OPEN {
+            return some(self.ground_below(p, blocks, mut cache, x, y, z))
+        }
+        if partial(t) and best == none {
+            return some(self.closed_node(x, y, z, t))
+        }
+        return best
+    }
+
+    // `tryJumpOn`: the node accepted a block up, where its box fits over the block it jumps
+    // from, which a mob a block wide or more and a node that isn't open or walkable needn't.
+    fn jump_on<B: CollisionBlocks>(mut self, p: PathStates, m: MovementStates, blocks: B, cache: mut PathTypeCache, x: i32, y: i32, z: i32, jump: i32, height: f64, d: i32, current: u8) -> usize? {
+        let above = self.accepted(p, m, blocks, mut cache, x, y + 1, z, jump - 1, height, d, current) else return none
+        if self.mob.width >= 1.0f32 {
+            return some(above)
+        }
+        let kind = self.nodes[above].kind
+        if kind != PATH_OPEN and kind != PATH_WALKABLE {
+            return some(above)
+        }
+        let center_x = f64(x - step_x(d)) + 0.5
+        let center_z = f64(z - step_z(d)) + 0.5
+        let half = f64(self.mob.width) / 2.0
+        let low = self.floor_level(m, blocks, floor_of(center_x), y + 1, floor_of(center_z)) + 0.001
+        let ax = self.nodes[above].x
+        let ay = self.nodes[above].y
+        let az = self.nodes[above].z
+        let high = f64(self.mob.height) + self.floor_level(m, blocks, ax, ay, az) - 0.002
+        let grow = box_of(center_x - half, low, center_z - half, center_x + half, high, center_z + half)
+        if self.collides(m, blocks, grow) {
+            return none
+        }
+        return some(above)
+    }
+
+    // `tryFindFirstNonWaterBelow`: the lowest node of the water below the place, or `best`.
+    fn below_water<B: CollisionBlocks>(mut self, p: PathStates, blocks: B, cache: mut PathTypeCache, x: i32, y: i32, z: i32, best: usize?) -> usize? {
+        var b = best
+        var at = y - 1
+        while at > self.min_y {
+            let t = self.cached_type(p, blocks, mut cache, x, at, z)
+            if t != PATH_WATER {
+                return b
+            }
+            let cost = self.malus(t)
+            b = some(self.raise_cost(x, at, z, t, cost))
+            at -= 1
+        }
+        return b
+    }
+
+    // `tryFindFirstGroundNodeBelow`: the node the mob lands on below the place, blocked where it
+    // would fall farther than it may or lands on what stops it.
+    fn ground_below<B: CollisionBlocks>(mut self, p: PathStates, blocks: B, cache: mut PathTypeCache, x: i32, y: i32, z: i32) -> usize {
+        var at = y - 1
+        while at >= self.min_y {
+            if y - at > self.mob.max_fall {
+                return self.blocked_node(x, at, z)
+            }
+            let t = self.cached_type(p, blocks, mut cache, x, at, z)
+            let cost = self.malus(t)
+            if t != PATH_OPEN {
+                if cost >= 0.0f32 {
+                    return self.raise_cost(x, at, z, t, cost)
+                }
+                return self.blocked_node(x, at, z)
+            }
+            at -= 1
+        }
+        return self.blocked_node(x, y, z)
+    }
+
+    // `getNodeAndUpdateCostToMax`.
+    fn raise_cost(mut self, x: i32, y: i32, z: i32, t: u8, cost: f32) -> usize {
+        let n = self.node(x, y, z)
+        self.nodes[n].kind = t
+        if cost > self.nodes[n].cost_malus {
+            self.nodes[n].cost_malus = cost
+        }
+        return n
+    }
+
+    // `getBlockedNode`.
+    fn blocked_node(mut self, x: i32, y: i32, z: i32) -> usize {
+        let n = self.node(x, y, z)
+        self.nodes[n].kind = PATH_BLOCKED
+        self.nodes[n].cost_malus = -1.0f32
+        return n
+    }
+
+    // `getClosedNode`: closed, with the type's own malus.
+    fn closed_node(mut self, x: i32, y: i32, z: i32, t: u8) -> usize {
+        let n = self.node(x, y, z)
+        self.nodes[n].closed = true
+        self.nodes[n].kind = t
+        self.nodes[n].cost_malus = path_maluses()[usize(t)]
+        return n
+    }
+
+    // `canReachWithoutCollision`: whether the mob's box gets from where it is to the node's
+    // middle in steps of about its size without meeting a block.
+    fn reaches<B: CollisionBlocks>(self, m: MovementStates, blocks: B, n: usize) -> bool {
+        var b = self.mob.bounds
+        let xs = b.max_x - b.min_x
+        let ys = b.max_y - b.min_y
+        let zs = b.max_z - b.min_z
+        var dx = (f64(self.nodes[n].x) - self.mob.x) + xs / 2.0
+        var dy = (f64(self.nodes[n].y) - self.mob.y) + ys / 2.0
+        var dz = (f64(self.nodes[n].z) - self.mob.z) + zs / 2.0
+        let size = (xs + ys + zs) / 3.0
+        let steps = i32.saturate(((dx * dx + dy * dy + dz * dz).sqrt() / size).ceil())
+        let scale = f64(1.0f32 / float_of(steps))
+        dx = dx * scale
+        dy = dy * scale
+        dz = dz * scale
+        for _ in 0..steps {
+            b = moved(b, dx, dy, dz)
+            if self.collides(m, blocks, b) {
+                return false
+            }
+        }
+        return true
+    }
+
+    // `hasCollisions`: whether the box meets a block, as the mob's collisions see them.
+    fn collides<B: CollisionBlocks>(self, m: MovementStates, blocks: B, b: Aabb) -> bool {
+        return not m.colliders(self.f, blocks, b, Mover { y: self.mob.y, fall: self.mob.fall }).is_empty()
+    }
+}
+
+// A box from two corners, each axis's least first, as `AABB`'s constructor makes it.
+fn box_of(x0: f64, y0: f64, z0: f64, x1: f64, y1: f64, z1: f64) -> Aabb {
+    return Aabb {
+        min_x: if x0 < x1 { x0 } else { x1 },
+        min_y: if y0 < y1 { y0 } else { y1 },
+        min_z: if z0 < z1 { z0 } else { z1 },
+        max_x: if x0 > x1 { x0 } else { x1 },
+        max_y: if y0 > y1 { y0 } else { y1 },
+        max_z: if z0 > z1 { z0 } else { z1 },
+    }
+}
+
+/// `WalkNodeEvaluator.getFloorLevel` of a level: the top of the block below `x`, `y`, `z`, its
+/// collision shape's with an empty context, or the bottom of the place where it has none.
+pub fn floor_at<B: CollisionBlocks>(f: Facts, m: MovementStates, blocks: B, x: i32, y: i32, z: i32) -> f64 {
+    let below = state_at(blocks, x, y - 1, z)
+    return f64(y - 1) + (m.shape_top(f, below, x, z) ?? 0.0)
+}
