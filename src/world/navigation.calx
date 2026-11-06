@@ -1,0 +1,904 @@
+/// How a mob goes where it's told, as vanilla's `GroundPathNavigation` and a mob's controls take
+/// it (CAL-157): `Navigation`, its path, found toward a place on the surface there, followed node
+/// by node, cutting corners where it may, given up where it's stuck or slow, and found again when a
+/// block near it changes; `MoveControl`, the mob turned toward where its path's next node wants it
+/// and set walking at its speed, jumping where it must; `LookControl`, its head turned toward what
+/// it looks at or with its body; and `BodyRotation`, its body turned as it walks or toward its
+/// head. Each is what `Mob.serverAiStep` ticks, in its order: navigation, then the controls.
+///
+/// A level tells its mobs which blocks it sent again, `sendBlockUpdated`, in the order it sent
+/// them: each is forgotten by the level's `PathTypeCache`, and where its shape changed, the mobs
+/// whose paths go near it find them again. Vanilla does both as it sends the block; Calcite does
+/// them before the next entity ticks, in the order the mobs are in, which finds the same paths
+/// unless more blocks change near a mob between.
+///
+/// Not yet: a navigation that avoids the sun, `setAvoidSun`, which reads the sky; climbing,
+/// swimming, flying and amphibious navigations; and a mob riding another, whose malus it takes.
+module world.navigation
+
+import math.mth.{floor, table_atan2, table_cos, table_sin, wrap_degrees}
+import world.collision.{Aabb, CollisionBlocks}
+import world.entity_facts.{PATH_DAMAGING_IN_NEIGHBOR, PATH_FIRE_IN_NEIGHBOR, PATH_WALKABLE, PATH_WALKABLE_DOOR}
+import world.living.{Living, LivingFacts}
+import world.movement.{MovementStates}
+import world.path_finder.{Node, Path, Seeker, default_maluses, find_path, floor_at}
+import world.paths.{PathTypeCache, state_at}
+import worldgen.facts.{Facts}
+
+/// A block a level sent again, `sendBlockUpdated`: where, and the state it was and is.
+pub struct SentBlock {
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub old: u32
+    pub now: u32
+}
+
+/// What navigation reads of a mob's level besides its blocks: the game time, `getGameTime`, the
+/// highest y blocks are at, `getMaxY`, and the blocks it has sent again, its `SentLog`'s: the
+/// first it still has and how many it has sent in all, counted from its first, and each by that
+/// count.
+pub interface NavLevel {
+    fn level_time(self) -> i64
+    fn top_y(self) -> i32
+    fn sent_first(self) -> u64
+    fn sent_total(self) -> u64
+    fn sent_at(self, i: u64) -> SentBlock
+}
+
+/// The blocks a level has sent again, `sendBlockUpdated`, since it last let them go, each counted
+/// from the first it ever sent, so what reads them knows which it has read.
+pub struct SentLog {
+    blocks: List<SentBlock> = List<SentBlock>()
+    gone: u64 = 0
+}
+
+impl SentLog {
+    /// None yet.
+    pub fn new() -> SentLog {
+        return SentLog()
+    }
+
+    /// `b` sent.
+    pub fn push(mut self, b: SentBlock) {
+        self.blocks.push(b)
+    }
+
+    /// The count of the first it still has.
+    pub fn first(self) -> u64 {
+        return self.gone
+    }
+
+    /// How many it has had in all.
+    pub fn total(self) -> u64 {
+        return self.gone + u64(self.blocks.len())
+    }
+
+    /// The one counted `i`, which it still has.
+    pub fn at(self, i: u64) -> SentBlock {
+        return self.blocks[usize.wrap(i - self.gone)]
+    }
+
+    /// Those it has let go, the count going on.
+    pub fn clear(mut self) {
+        self.gone = self.total()
+        self.blocks.clear()
+    }
+}
+
+/// What navigation reads of its mob: where it is and its box, its size, whether it's on the
+/// ground, in water or lava, `isInLiquid`, and in a fluid it floats in; how far it has fallen; how
+/// high it steps, `maxUpStep`; its speed, `getSpeed`; and its follow range, which a path goes no
+/// farther than.
+pub struct Walker {
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    pub bounds: Aabb
+    pub width: f32
+    pub height: f32
+    pub eyes: f32
+    pub on_ground: bool
+    pub in_liquid: bool
+    pub floating: bool
+    pub fall: f64
+    pub step: f32
+    pub speed: f32
+    pub follow_range: f64
+    pub movement_speed: f64
+}
+
+/// What navigation and the controls read of the level besides its blocks and their facts,
+/// gathered for a tick: the least y, the highest y, the game time, and the fluids in
+/// `#entity_floatable`, a bit each by ID.
+pub struct NavFacts {
+    pub min_y: i32
+    pub top_y: i32
+    pub time: i64
+    pub floatable: u32
+}
+
+/// A mob's `GroundPathNavigation`: its path, if any, and what it's found for; its malus for each
+/// path type, `getPathfindingMalus`, which the mob's kind sets; what its evaluator lets it do,
+/// float, open and pass doors and walk over fences; whether it finds paths to targets below the
+/// surface; and how it follows, gives up and finds again.
+pub struct Navigation {
+    pub path: Path? = none
+    pub next: usize = 0
+    pub maluses: List<f32>
+    pub can_float: bool = false
+    pub can_open_doors: bool = false
+    pub can_pass_doors: bool = true
+    pub can_walk_over_fences: bool = false
+    pub below_surface: bool = false
+    pub stuck: bool = false
+    speed_modifier: f64 = 0.0
+    ticks: i32 = 0
+    last_recompute: i64 = 0
+    target: (i32, i32, i32)? = none
+    reach: i32 = 0
+    multiplier: f32 = 1.0f32
+    delayed: bool = false
+    timeout_x: i32 = 0
+    timeout_y: i32 = 0
+    timeout_z: i32 = 0
+    timeout_timer: i64 = 0
+    last_timeout_check: i64 = 0
+    timeout_limit: f64 = 0.0
+    waypoint: f32 = 0.5f32
+    last_stuck_check: i32 = 0
+    last_stuck_x: f64 = 0.0
+    last_stuck_y: f64 = 0.0
+    last_stuck_z: f64 = 0.0
+    required_length: f32 = 16.0f32
+    max_visited: i32
+}
+
+// A place, as `Vec3` holds one.
+struct Spot {
+    x: f64
+    y: f64
+    z: f64
+}
+
+fn spot_distance_sqr(a: Spot, b: Spot) -> f64 {
+    let dx = b.x - a.x
+    let dy = b.y - a.y
+    let dz = b.z - a.z
+    return dx * dx + dy * dy + dz * dz
+}
+
+// `Vec3.atBottomCenterOf`.
+fn bottom_center(x: i32, y: i32, z: i32) -> Spot {
+    return Spot { x: f64(x) + 0.5, y: f64(y), z: f64(z) + 0.5 }
+}
+
+// `Vec3.normalize`: none of it shorter than 1.0E-5F.
+fn normalize(v: Spot) -> Spot {
+    let d = (v.x * v.x + v.y * v.y + v.z * v.z).sqrt()
+    if d < f64(1.0e-5f32) {
+        return Spot { x: 0.0, y: 0.0, z: 0.0 }
+    }
+    return Spot { x: v.x / d, y: v.y / d, z: v.z / d }
+}
+
+impl Navigation {
+    /// A mob's, as its constructor makes it: as many nodes a search as 16 times the base of its
+    /// follow range, `createPathFinder`.
+    pub fn new(follow_base: f64) -> Navigation {
+        return Navigation { maluses: default_maluses(), max_visited: floor(follow_base * 16.0) }
+    }
+
+    /// `isDone`: whether it has no path, or has followed it to its end.
+    pub fn is_done(self) -> bool {
+        let p = self.path else return true
+        return self.next >= p.nodes.len()
+    }
+
+    /// `stop`.
+    pub fn stop(mut self) {
+        self.path = none
+    }
+
+    // `canUpdatePath`: on the ground or in a liquid.
+    fn can_update(w: Walker) -> bool {
+        return w.on_ground or w.in_liquid
+    }
+
+    // `getMaxPathLength`: its follow range, or the 16 it needs, whichever is more.
+    fn max_length(self, w: Walker) -> f32 {
+        let range = f32.nearest(w.follow_range)
+        return if range > self.required_length { range } else { self.required_length }
+    }
+
+    /// `moveTo(x, y, z, speedModifier)`: a path to the block there, reached within 1, followed at
+    /// `speed`; whether it has one to follow.
+    pub fn move_to<B: CollisionBlocks>(mut self, lf: LivingFacts, f: Facts, nf: NavFacts, m: MovementStates, blocks: B, cache: mut PathTypeCache, w: Walker, x: f64, y: f64, z: f64, speed: f64) -> bool {
+        let found = self.create_path(lf, f, nf, m, blocks, mut cache, w, floor(x), floor(y), floor(z), 1)
+        return self.move_along(lf, f, nf, blocks, w, found, speed)
+    }
+
+    // The next node, where there is one.
+    fn next_node(self) -> Node? {
+        let p = self.path else return none
+        if self.next >= p.nodes.len() {
+            return none
+        }
+        return some(p.nodes[self.next])
+    }
+
+    // `getNextEntityPos`, where there's a next node.
+    fn next_spot(self, width: f32) -> Spot? {
+        let n = self.next_node() else return none
+        let across = f64(i32.saturate(f64(width + 1.0f32))) * 0.5
+        return some(Spot { x: f64(n.x) + across, y: f64(n.y), z: f64(n.z) + across })
+    }
+
+    /// `moveTo(path, speedModifier)`: the path followed at `speed`, kept as it is where it's the
+    /// same as the one it has; whether there's any of it left to follow.
+    pub fn move_along<B: CollisionBlocks>(mut self, lf: LivingFacts, f: Facts, nf: NavFacts, blocks: B, w: Walker, found: own Path?, speed: f64) -> bool {
+        let given = found else {
+            self.path = none
+            return false
+        }
+        let same = if let p = self.path { same_nodes(p, given) } else { false }
+        if not same {
+            self.path = some(given)
+            self.next = 0
+        }
+        if self.is_done() {
+            return false
+        }
+        self.trim(lf, f, blocks)
+        let empty = if let p = self.path { p.nodes.is_empty() } else { true }
+        if empty {
+            return false
+        }
+        self.speed_modifier = speed
+        let at = self.temp_mob_pos(f, nf, blocks, w)
+        self.last_stuck_check = self.ticks
+        self.last_stuck_x = at.x
+        self.last_stuck_y = at.y
+        self.last_stuck_z = at.z
+        return true
+    }
+
+    /// `GroundPathNavigation.createPath(pos, reachRange)`: none where the block's chunk isn't
+    /// loaded, else a path to it, moved to the surface there unless it may find targets below it.
+    pub fn create_path<B: CollisionBlocks>(mut self, lf: LivingFacts, f: Facts, nf: NavFacts, m: MovementStates, blocks: B, cache: mut PathTypeCache, w: Walker, x: i32, y: i32, z: i32, reach: i32) -> Path? {
+        if blocks.collision_state(x, nf.min_y, z) == none {
+            return none
+        }
+        var ty = y
+        if not self.below_surface {
+            ty = surface_of(f, nf, blocks, x, y, z)
+        }
+        let length = self.max_length(w)
+        return self.create_paths(lf, f, nf, m, blocks, mut cache, w, [(x, ty, z)], reach, length)
+    }
+
+    // `PathNavigation.createPath(targets, ...)`: none where it's below the level or can't update
+    // its path, the one it has where that's unfinished and toward one of them, else the one
+    // found, which it keeps the target and reach of.
+    fn create_paths<B: CollisionBlocks>(mut self, lf: LivingFacts, f: Facts, nf: NavFacts, m: MovementStates, blocks: B, cache: mut PathTypeCache, w: Walker, targets: List<(i32, i32, i32)>, reach: i32, length: f32) -> Path? {
+        if targets.is_empty() or w.y < f64(nf.min_y) or not Navigation.can_update(w) {
+            return none
+        }
+        if not self.is_done() {
+            if let t = self.target {
+                for g in targets {
+                    if g == t {
+                        return self.path.copy()
+                    }
+                }
+            }
+        }
+        let seeker = Seeker {
+            x: w.x,
+            y: w.y,
+            z: w.z,
+            bounds: w.bounds,
+            width: w.width,
+            height: w.height,
+            on_ground: w.on_ground,
+            floating: w.floating,
+            fall: w.fall,
+            step: w.step,
+            max_fall: 3,
+            maluses: self.maluses.copy(),
+            can_float: self.can_float,
+            can_open_doors: self.can_open_doors,
+            can_pass_doors: self.can_pass_doors,
+            can_walk_over_fences: self.can_walk_over_fences,
+        }
+        let found = find_path(lf.paths, m, f, blocks, mut cache, seeker, nf.min_y, targets, length, reach, self.max_visited, self.multiplier)
+        if let p = found {
+            self.target = some(p.target)
+            self.reach = reach
+            self.reset_stuck_timeout()
+        }
+        return found
+    }
+
+    /// `tick`: its path found again where that waited, then followed where it may update it, or
+    /// passed where it's above its next node off the ground; the place the move control is to head
+    /// for then, its next node's on the ground there, with the speed, or none where it's done.
+    pub fn tick<B: CollisionBlocks>(mut self, lf: LivingFacts, f: Facts, nf: NavFacts, m: MovementStates, blocks: B, cache: mut PathTypeCache, w: Walker) -> (f64, f64, f64, f64)? {
+        self.ticks += 1
+        if self.delayed {
+            self.recompute(lf, f, nf, m, blocks, mut cache, w)
+        }
+        if self.is_done() {
+            return none
+        }
+        if Navigation.can_update(w) {
+            self.follow(f, nf, blocks, w)
+        } else if let pos = self.next_spot(w.width) {
+            let at = self.temp_mob_pos(f, nf, blocks, w)
+            if at.y > pos.y and not w.on_ground and floor(at.x) == floor(pos.x) and floor(at.z) == floor(pos.z) {
+                self.advance()
+            }
+        }
+        let target = self.next_spot(w.width) else return none
+        return some((target.x, ground_y(f, m, blocks, target), target.z, self.speed_modifier))
+    }
+
+    fn advance(mut self) {
+        self.next += 1
+    }
+
+    // `followThePath`: the next node passed where the mob is close enough to it, or may cut the
+    // corner toward the one after; then whether it's stuck.
+    fn follow<B: CollisionBlocks>(mut self, f: Facts, nf: NavFacts, blocks: B, w: Walker) {
+        let at = self.temp_mob_pos(f, nf, blocks, w)
+        self.waypoint = if w.width > 0.75f32 { w.width / 2.0f32 } else { 0.75f32 - w.width / 2.0f32 }
+        let n = self.next_node() else return
+        let xd = (w.x - (f64(n.x) + 0.5)).abs()
+        let yd = (w.y - f64(n.y)).abs()
+        let zd = (w.z - (f64(n.z) + 0.5)).abs()
+        let close = xd < f64(self.waypoint) and zd < f64(self.waypoint) and yd < 1.0
+        if close or (can_cut_corner(n.kind) and self.toward_next(at)) {
+            self.advance()
+        }
+        self.stuck_check(nf, at, w)
+    }
+
+    // `shouldTargetNextNodeInDirection`: whether the mob, within 2 of its next node, is closer to
+    // the one after or within its block, and heading past it.
+    fn toward_next(self, at: Spot) -> bool {
+        let p = self.path else return false
+        if self.next + 1 >= p.nodes.len() {
+            return false
+        }
+        let n = p.nodes[self.next]
+        let current = bottom_center(n.x, n.y, n.z)
+        if not (spot_distance_sqr(at, current) < 2.0 * 2.0) {
+            return false
+        }
+        let a = p.nodes[self.next + 1]
+        let next = bottom_center(a.x, a.y, a.z)
+        let to_current = Spot { x: current.x - at.x, y: current.y - at.y, z: current.z - at.z }
+        let to_next = Spot { x: next.x - at.x, y: next.y - at.y, z: next.z - at.z }
+        let current_sqr = to_current.x * to_current.x + to_current.y * to_current.y + to_current.z * to_current.z
+        let next_sqr = to_next.x * to_next.x + to_next.y * to_next.y + to_next.z * to_next.z
+        if not (next_sqr < current_sqr) and not (current_sqr < 0.5) {
+            return false
+        }
+        let md = normalize(to_current)
+        let pd = normalize(to_next)
+        return pd.x * md.x + pd.y * md.y + pd.z * md.z < 0.0
+    }
+
+    // `doStuckDetection`: stopped where it went less than a quarter of 100 ticks' walk in the last
+    // 100; and given up where it's taken three times as long as its speed should to reach its next
+    // node.
+    fn stuck_check(mut self, nf: NavFacts, at: Spot, w: Walker) {
+        if self.ticks - self.last_stuck_check > 100 {
+            let effective = if w.speed >= 1.0f32 { w.speed } else { w.speed * w.speed }
+            let threshold = effective * 100.0f32 * 0.25f32
+            let last = Spot { x: self.last_stuck_x, y: self.last_stuck_y, z: self.last_stuck_z }
+            if spot_distance_sqr(last, at) < f64(threshold * threshold) {
+                self.stuck = true
+                self.stop()
+            } else {
+                self.stuck = false
+            }
+            self.last_stuck_check = self.ticks
+            self.last_stuck_x = at.x
+            self.last_stuck_y = at.y
+            self.last_stuck_z = at.z
+        }
+        let n = self.next_node() else return
+        if n.x == self.timeout_x and n.y == self.timeout_y and n.z == self.timeout_z {
+            self.timeout_timer = self.timeout_timer + (nf.time - self.last_timeout_check)
+        } else {
+            self.timeout_x = n.x
+            self.timeout_y = n.y
+            self.timeout_z = n.z
+            let dist = spot_distance_sqr(at, bottom_center(n.x, n.y, n.z)).sqrt()
+            self.timeout_limit = if w.speed > 0.0f32 { dist / f64(w.speed) * 20.0 } else { 0.0 }
+        }
+        if self.timeout_limit > 0.0 and f64.nearest(self.timeout_timer) > self.timeout_limit * 3.0 {
+            self.reset_stuck_timeout()
+            self.stop()
+        }
+        self.last_timeout_check = nf.time
+    }
+
+    // `resetStuckTimeout`.
+    fn reset_stuck_timeout(mut self) {
+        self.timeout_x = 0
+        self.timeout_y = 0
+        self.timeout_z = 0
+        self.timeout_timer = 0
+        self.timeout_limit = 0.0
+        self.stuck = false
+    }
+
+    /// `recomputePath`: its path found again toward its target, at most once in 20 ticks and
+    /// where it may update it, else waiting to.
+    pub fn recompute<B: CollisionBlocks>(mut self, lf: LivingFacts, f: Facts, nf: NavFacts, m: MovementStates, blocks: B, cache: mut PathTypeCache, w: Walker) {
+        if nf.time - self.last_recompute <= 20 or not Navigation.can_update(w) {
+            self.delayed = true
+        } else if let t = self.target {
+            let (x, y, z) = t
+            self.path = none
+            let reach = self.reach
+            let found = self.create_path(lf, f, nf, m, blocks, mut cache, w, x, y, z, reach)
+            self.path = found
+            self.next = 0
+            self.last_recompute = nf.time
+            self.delayed = false
+        }
+    }
+
+    /// `shouldRecomputePath`: whether the block at `x`, `y`, `z` is nearer the middle of the mob
+    /// and its path's end than the nodes it has left, where it isn't waiting to find it again.
+    pub fn should_recompute(self, w: Walker, x: i32, y: i32, z: i32) -> bool {
+        if self.delayed {
+            return false
+        }
+        let p = self.path else return false
+        if self.next >= p.nodes.len() or p.nodes.is_empty() {
+            return false
+        }
+        let end = p.nodes[p.nodes.len() - 1]
+        let mx = (f64(end.x) + w.x) / 2.0
+        let my = (f64(end.y) + w.y) / 2.0
+        let mz = (f64(end.z) + w.z) / 2.0
+        let dx = f64(x) + 0.5 - mx
+        let dy = f64(y) + 0.5 - my
+        let dz = f64(z) + 0.5 - mz
+        let left = f64(i32.wrap(p.nodes.len()) - i32.wrap(self.next))
+        return dx * dx + dy * dy + dz * dz < left * left
+    }
+
+    // `trimPath`: a node in a cauldron moved up out of it, and the next with it where it isn't
+    // higher.
+    fn trim<B: CollisionBlocks>(mut self, lf: LivingFacts, f: Facts, blocks: B) {
+        let held = self.path.take() else return
+        var q = held
+        for i in 0..q.nodes.len() {
+            let n = q.nodes[i]
+            if f.in_set(state_at(blocks, n.x, n.y, n.z), lf.cauldrons) {
+                q.nodes[i] = n.moved_to(n.x, n.y + 1, n.z)
+                if i + 1 < q.nodes.len() {
+                    let next = q.nodes[i + 1]
+                    if n.y >= next.y {
+                        q.nodes[i + 1] = n.moved_to(next.x, n.y + 1, next.z)
+                    }
+                }
+            }
+        }
+        self.path = some(q)
+    }
+
+    // `GroundPathNavigation.getTempMobPos`: the mob's place at the top of a fluid it floats in, or
+    // half a block up.
+    fn temp_mob_pos<B: CollisionBlocks>(self, f: Facts, nf: NavFacts, blocks: B, w: Walker) -> Spot {
+        return Spot { x: w.x, y: f64(self.surface_y(f, nf, blocks, w)), z: w.z }
+    }
+
+    // `getSurfaceY`: the first block up out of a fluid the mob floats in, 16 at most, where it
+    // floats; else half a block up from its feet.
+    fn surface_y<B: CollisionBlocks>(self, f: Facts, nf: NavFacts, blocks: B, w: Walker) -> i32 {
+        if w.floating and self.can_float {
+            let bx = floor(w.x)
+            let bz = floor(w.z)
+            var surface = floor(w.y)
+            var state = state_at(blocks, bx, surface, bz)
+            var steps = 0
+            while nf.floatable & (1u32 << f.fluid(state)) != 0 {
+                surface += 1
+                state = state_at(blocks, bx, surface, bz)
+                steps += 1
+                if steps > 16 {
+                    return floor(w.y)
+                }
+            }
+            return surface
+        }
+        return floor(w.y + 0.5)
+    }
+}
+
+// `Path.sameAs`: the same nodes, by where they are.
+fn same_nodes(a: Path, b: Path) -> bool {
+    if a.nodes.len() != b.nodes.len() {
+        return false
+    }
+    for i in 0..a.nodes.len() {
+        if a.nodes[i].x != b.nodes[i].x or a.nodes[i].y != b.nodes[i].y or a.nodes[i].z != b.nodes[i].z {
+            return false
+        }
+    }
+    return true
+}
+
+// `canCutCorner`: past a node anywhere but beside fire or damage, or a door it walks through.
+fn can_cut_corner(t: u8) -> bool {
+    return t != PATH_FIRE_IN_NEIGHBOR and t != PATH_DAMAGING_IN_NEIGHBOR and t != PATH_WALKABLE_DOOR
+}
+
+// `getGroundY`: the place's own height over air, else its floor's.
+fn ground_y<B: CollisionBlocks>(f: Facts, m: MovementStates, blocks: B, target: Spot) -> f64 {
+    let x = i32.saturate(target.x.floor())
+    let y = i32.saturate(target.y.floor())
+    let z = i32.saturate(target.z.floor())
+    if f.is_air(state_at(blocks, x, y - 1, z)) {
+        return target.y
+    }
+    return floor_at(f, m, blocks, x, y, z)
+}
+
+// `findSurfacePosition`: an air block's place moved down onto what's below it, or up to the first
+// that isn't air where there's nothing below it; then up out of what's solid.
+fn surface_of<B: CollisionBlocks>(f: Facts, nf: NavFacts, blocks: B, x: i32, y: i32, z: i32) -> i32 {
+    var at = y
+    if f.is_air(state_at(blocks, x, y, z)) {
+        var down = y - 1
+        while down >= nf.min_y and f.is_air(state_at(blocks, x, down, z)) {
+            down -= 1
+        }
+        if down >= nf.min_y {
+            return down + 1
+        }
+        var up = y + 1
+        while up <= nf.top_y and f.is_air(state_at(blocks, x, up, z)) {
+            up += 1
+        }
+        at = up
+    }
+    if not f.is_solid(state_at(blocks, x, at, z)) {
+        return at
+    }
+    var up = at + 1
+    while up <= nf.top_y and f.is_solid(state_at(blocks, x, up, z)) {
+        up += 1
+    }
+    return up
+}
+
+/// The move control's operations, `MoveControl.Operation`: waiting, moving to a place, strafing
+/// and jumping.
+pub const MOVE_WAIT: i32 = 0
+pub const MOVE_TO: i32 = 1
+pub const MOVE_STRAFE: i32 = 2
+pub const MOVE_JUMPING: i32 = 3
+
+/// A mob's `MoveControl`: where it's wanted and how fast, how it strafes, and what it's doing.
+pub struct MoveControl {
+    pub wanted_x: f64 = 0.0
+    pub wanted_y: f64 = 0.0
+    pub wanted_z: f64 = 0.0
+    pub speed_modifier: f64 = 0.0
+    pub operation: i32 = MOVE_WAIT
+    strafe_forwards: f32 = 0.0f32
+    strafe_right: f32 = 0.0f32
+    /// A cube mob's, `CubeMobMoveControl`: the way it turns to, `yRot`, made from its turn as it's
+    /// made, which is 0 then, so 0; how long until it jumps again; and whether it's after
+    /// something.
+    pub cube_y_rot: f32 = 0.0f32
+    pub jump_delay: i32 = 0
+    pub aggressive: bool = false
+}
+
+// `(float) Math.PI`.
+fn float_pi() -> f64 {
+    return f64(f32.nearest(3.141592653589793))
+}
+
+impl MoveControl {
+    /// `hasWanted`.
+    pub fn has_wanted(self) -> bool {
+        return self.operation == MOVE_TO
+    }
+
+    /// `setWantedPosition`: moving there, unless it's jumping.
+    pub fn set_wanted(mut self, x: f64, y: f64, z: f64, speed: f64) {
+        self.wanted_x = x
+        self.wanted_y = y
+        self.wanted_z = z
+        self.speed_modifier = speed
+        if self.operation != MOVE_JUMPING {
+            self.operation = MOVE_TO
+        }
+    }
+
+    /// `strafe`.
+    pub fn strafe(mut self, forwards: f32, right: f32) {
+        self.operation = MOVE_STRAFE
+        self.strafe_forwards = forwards
+        self.strafe_right = right
+        self.speed_modifier = 0.25
+    }
+
+    /// `setWait`.
+    pub fn set_wait(mut self) {
+        self.operation = MOVE_WAIT
+    }
+
+    /// A cube mob's `setDirection`: the way it turns to, and whether it's after something.
+    pub fn set_direction(mut self, y_rot: f32, aggressive: bool) {
+        self.cube_y_rot = y_rot
+        self.aggressive = aggressive
+    }
+
+    /// A cube mob's `setWantedMovement`: moving, at `speed`.
+    pub fn set_wanted_movement(mut self, speed: f64) {
+        self.speed_modifier = speed
+        self.operation = MOVE_TO
+    }
+
+    /// A cube mob's `CubeMobMoveControl.tick`: turned toward its way, 90 degrees a tick at most,
+    /// its head and body with it; moving, on the ground it jumps once its delay's out, then 10 to
+    /// 29 ticks from its own random, `getJumpDelay`, a third of that where it's after something,
+    /// and otherwise stands still, and off the ground it keeps its speed; else it stands. Whether
+    /// it jumps, and whether it plays its jump sound then, which one of `size` over 0 does.
+    pub fn cube_tick(mut self, living: mut Living, w: Walker, size: i32) -> (bool, bool) {
+        living.body.y_rot = rotlerp(living.body.y_rot, self.cube_y_rot, 90.0f32)
+        living.y_head_rot = living.body.y_rot
+        living.y_body_rot = living.body.y_rot
+        if self.operation != MOVE_TO {
+            living.zza = 0.0f32
+            return (false, false)
+        }
+        self.operation = MOVE_WAIT
+        let speed = f32.nearest(self.speed_modifier * w.movement_speed)
+        living.speed = speed
+        living.zza = speed
+        if not w.on_ground {
+            return (false, false)
+        }
+        let due = self.jump_delay <= 0
+        self.jump_delay -= 1
+        if due {
+            self.jump_delay = living.body.random.next_int_below(20) + 10
+            if self.aggressive {
+                self.jump_delay = self.jump_delay / 3
+            }
+            return (true, size > 0)
+        }
+        living.xxa = 0.0f32
+        living.zza = 0.0f32
+        living.speed = 0.0f32
+        return (false, false)
+    }
+
+    /// `tick`: strafing, walking as told unless the block it'd strafe to isn't walkable; moving,
+    /// turned toward where it's wanted, 90 degrees a tick at most, and set walking at its speed,
+    /// `Mob.setSpeed`, jumping where that's higher than it steps and near, or where it's in a block
+    /// whose shape is above its feet that isn't a door or a fence; jumping, at its speed until it
+    /// lands or is in a liquid; else standing. Whether it jumps, `JumpControl.jump`.
+    pub fn tick<B: CollisionBlocks>(mut self, lf: LivingFacts, f: Facts, nf: NavFacts, m: MovementStates, blocks: B, cache: mut PathTypeCache, living: mut Living, w: Walker) -> bool {
+        if self.operation == MOVE_STRAFE {
+            let speed = f32.nearest(w.movement_speed)
+            let modified = f32.nearest(self.speed_modifier) * speed
+            var xa = self.strafe_forwards
+            var za = self.strafe_right
+            var dist = f32.nearest(f64(xa * xa + za * za).sqrt())
+            if dist < 1.0f32 {
+                dist = 1.0f32
+            }
+            dist = modified / dist
+            xa = xa * dist
+            za = za * dist
+            let turn = f64(living.body.y_rot * f32.nearest(3.141592653589793 / 180.0))
+            let sin = table_sin(turn)
+            let cos = table_cos(turn)
+            let dx = xa * cos - za * sin
+            let dz = za * cos + xa * sin
+            let px = floor(w.x + f64(dx))
+            let pz = floor(w.z + f64(dz))
+            if lf.paths.at(blocks, mut cache, nf.min_y, px, floor(w.y), pz) != PATH_WALKABLE {
+                self.strafe_forwards = 1.0f32
+                self.strafe_right = 0.0f32
+            }
+            living.speed = modified
+            living.zza = modified
+            living.zza = self.strafe_forwards
+            living.xxa = self.strafe_right
+            self.operation = MOVE_WAIT
+            return false
+        }
+        if self.operation == MOVE_TO {
+            self.operation = MOVE_WAIT
+            let xd = self.wanted_x - w.x
+            let zd = self.wanted_z - w.z
+            let yd = self.wanted_y - w.y
+            let dd = xd * xd + yd * yd + zd * zd
+            if dd < f64(2.5000003e-7f32) {
+                living.zza = 0.0f32
+                return false
+            }
+            let angle = table_atan2(zd, xd) ?? 0.0
+            let wanted_rot = f32.nearest(angle * 180.0 / float_pi()) - 90.0f32
+            living.body.y_rot = rotlerp(living.body.y_rot, wanted_rot, 90.0f32)
+            let speed = f32.nearest(self.speed_modifier * w.movement_speed)
+            living.speed = speed
+            living.zza = speed
+            let px = floor(w.x)
+            let py = floor(w.y)
+            let pz = floor(w.z)
+            let state = state_at(blocks, px, py, pz)
+            let wide = if w.width > 1.0f32 { w.width } else { 1.0f32 }
+            var jumps = yd > f64(w.step) and xd * xd + zd * zd < f64(wide)
+            if not jumps {
+                if let top = m.shape_top(f, state, px, pz) {
+                    jumps = w.y < top + f64(py) and not f.in_set(state, lf.doors) and not f.in_set(state, lf.fences)
+                }
+            }
+            if jumps {
+                self.operation = MOVE_JUMPING
+            }
+            return jumps
+        }
+        if self.operation == MOVE_JUMPING {
+            let speed = f32.nearest(self.speed_modifier * w.movement_speed)
+            living.speed = speed
+            living.zza = speed
+            if w.on_ground or w.in_liquid {
+                self.operation = MOVE_WAIT
+            }
+            return false
+        }
+        living.zza = 0.0f32
+        return false
+    }
+}
+
+// `MoveControl.rotlerp`: `a` turned toward `b` by `max` degrees at most, kept from 0 to 360.
+fn rotlerp(a: f32, b: f32, max: f32) -> f32 {
+    var diff = wrap_degrees(b - a)
+    if diff > max {
+        diff = max
+    }
+    if diff < -max {
+        diff = -max
+    }
+    var result = a + diff
+    if result < 0.0f32 {
+        result += 360.0f32
+    } else if result > 360.0f32 {
+        result -= 360.0f32
+    }
+    return result
+}
+
+// `Mth.clamp(float)`.
+fn clamp(v: f32, low: f32, high: f32) -> f32 {
+    if v < low {
+        return low
+    }
+    return if v < high { v } else { high }
+}
+
+// `Control.rotateTowards`: `from` turned toward `to` by `most` degrees at most.
+fn rotate_towards(from: f32, to: f32, most: f32) -> f32 {
+    return from + clamp(wrap_degrees(to - from), -most, most)
+}
+
+// `Mth.rotateIfNecessary`: `base` kept within `most` degrees of `target`.
+fn rotate_if_necessary(base: f32, target: f32, most: f32) -> f32 {
+    return target - clamp(wrap_degrees(target - base), -most, most)
+}
+
+/// How far a mob turns its head from its body, `getMaxHeadYRot`; how fast it turns it,
+/// `getHeadRotSpeed`; and how far it looks up and down, `getMaxHeadXRot`.
+pub const MAX_HEAD_Y_ROT: f32 = 75.0f32
+pub const HEAD_ROT_SPEED: f32 = 10.0f32
+pub const MAX_HEAD_X_ROT: f32 = 40.0f32
+
+/// A mob's `LookControl`: what it looks at, how fast it turns toward it, and for how long more.
+pub struct LookControl {
+    y_speed: f32 = 0.0f32
+    x_most: f32 = 0.0f32
+    cooldown: i32 = 0
+    wanted_x: f64 = 0.0
+    wanted_y: f64 = 0.0
+    wanted_z: f64 = 0.0
+}
+
+impl LookControl {
+    /// `setLookAt`: looking at `x`, `y`, `z` for 2 ticks, turning at `y_speed` and up or down to
+    /// `x_most`.
+    pub fn set_look_at(mut self, x: f64, y: f64, z: f64, y_speed: f32, x_most: f32) {
+        self.wanted_x = x
+        self.wanted_y = y
+        self.wanted_z = z
+        self.y_speed = y_speed
+        self.x_most = x_most
+        self.cooldown = 2
+    }
+
+    /// `isLookingAtTarget`.
+    pub fn looking(self) -> bool {
+        return self.cooldown > 0
+    }
+
+    /// `tick`: its pitch let go; its head turned toward what it looks at while it looks, else
+    /// toward its body, 10 degrees a tick; and kept within reach of its body while it's going
+    /// somewhere, `clampHeadRotationToBody`.
+    pub fn tick(mut self, living: mut Living, going: bool) {
+        living.body.x_rot = 0.0f32
+        if self.cooldown > 0 {
+            self.cooldown -= 1
+            let xd = self.wanted_x - living.body.x
+            let zd = self.wanted_z - living.body.z
+            if zd.abs() > f64(1.0e-5f32) or xd.abs() > f64(1.0e-5f32) {
+                let angle = table_atan2(zd, xd) ?? 0.0
+                let y_rot = f32.nearest(angle * 180.0 / float_pi()) - 90.0f32
+                living.y_head_rot = rotate_towards(living.y_head_rot, y_rot, self.y_speed)
+            }
+            let yd = self.wanted_y - (living.body.y + f64(living.body.eyes))
+            let sd = (xd * xd + zd * zd).sqrt()
+            if yd.abs() > f64(1.0e-5f32) or sd.abs() > f64(1.0e-5f32) {
+                let angle = table_atan2(yd, sd) ?? 0.0
+                let x_rot = f32.nearest(-(angle * 180.0 / float_pi()))
+                living.body.x_rot = rotate_towards(living.body.x_rot, x_rot, self.x_most)
+            }
+        } else {
+            living.y_head_rot = rotate_towards(living.y_head_rot, living.y_body_rot, 10.0f32)
+        }
+        if going {
+            living.y_head_rot = rotate_if_necessary(living.y_head_rot, living.y_body_rot, MAX_HEAD_Y_ROT)
+        }
+    }
+}
+
+/// A mob's `BodyRotationControl`: how long its head has kept still, and where.
+pub struct BodyRotation {
+    stable_time: i32 = 0
+    last_stable: f32 = 0.0f32
+}
+
+impl BodyRotation {
+    /// `clientTick`, which `Mob.tickHeadTurn` runs: its body turned to face its way and its head
+    /// kept near it while it moves; else, where it carries no mob, its body turned toward its head
+    /// once that's turned more than 15 degrees, and after 10 ticks of its head keeping still, more
+    /// over the next 10.
+    pub fn tick(mut self, living: mut Living) {
+        let xd = living.body.x - living.body.xo
+        let zd = living.body.z - living.body.zo
+        if xd * xd + zd * zd > f64(2.5000003e-7f32) {
+            living.y_body_rot = living.body.y_rot
+            living.y_head_rot = rotate_if_necessary(living.y_head_rot, living.y_body_rot, MAX_HEAD_Y_ROT)
+            self.last_stable = living.y_head_rot
+            self.stable_time = 0
+            return
+        }
+        if (living.y_head_rot - self.last_stable).abs() > 15.0f32 {
+            self.stable_time = 0
+            self.last_stable = living.y_head_rot
+            living.y_body_rot = rotate_if_necessary(living.y_body_rot, living.y_head_rot, MAX_HEAD_Y_ROT)
+        } else {
+            self.stable_time += 1
+            if self.stable_time > 10 {
+                let since = self.stable_time - 10
+                let fraction = clamp(f32.nearest(f64(since)) / 10.0f32, 0.0f32, 1.0f32)
+                let left = MAX_HEAD_Y_ROT * (1.0f32 - fraction)
+                living.y_body_rot = rotate_if_necessary(living.y_body_rot, living.y_head_rot, left)
+            }
+        }
+    }
+}
