@@ -10,10 +10,19 @@
 /// ground, in water or in lava, its spawn rule, and room for its box. Every draw is made from the
 /// level's random in vanilla's order.
 ///
-/// Where a place passes all of them, vanilla makes the mob, and Calcite, which has no mobs yet,
-/// stops there for the chunk's category, as vanilla stops where it can't make one. With no mobs,
-/// every category is under its caps and the spawn potential is nothing, so the checks that read
-/// them always pass.
+/// Where a place passes all of them, the mob is made, `getMobForSpawn`, by a `MobMaker`, and
+/// turned at random; where Calcite doesn't make its type yet, it stops there for the chunk's
+/// category, as vanilla stops where it can't make one (CAL-156). The mob is checked where it
+/// stands, `isValidPositionForMob`, finalized with its pack's group, `finalizeSpawn`, and added
+/// to the level; at the fourth at a place, its category's done there.
+///
+/// What spawns is held to each category's caps, `SpawnState`, counted from the level's mobs as
+/// the tick begins and those it spawns: the level's, its most a chunk over the chunks the natural
+/// spawn counter counts, for it to spawn at all this tick; and the local one, its most a chunk
+/// near some player near the chunk, for it to spawn in the chunk. The spawn potential,
+/// `PotentialCalculator`, isn't kept: no mob Calcite makes has a spawn cost in any biome, so it
+/// would hold only the costs of mobs Calcite keeps as they were read, which it leaves out, and
+/// the check that reads it passes.
 ///
 /// What spawns at a place is the biome's `minecraft:gameplay/natural_mob_spawns` over the
 /// dimension type's, as `ChunkGenerator.getMobsAt` reads it when no structure there spawns its
@@ -28,6 +37,7 @@ import resources.identifier.{Identifier}
 import world.chunk.{WORLD_SURFACE}
 import world.collision.{Aabb, CollisionBlocks, CollisionStates}
 import world.entity_facts.{AMBIENT, AXOLOTLS, CREATURE, FAR, FIRE_IMMUNE, IN_LAVA, IN_WATER, MISC, MONSTER, NO_RESTRICTIONS, PEACEFUL, SIGNAL_SOURCE, SUMMON, TypeFacts, UNDERGROUND_WATER_CREATURE, VALID_SPAWN_SHIFT, WATER_AMBIENT, WATER_CREATURE, categories, category_names, immune_tags, rules, state_spawn_facts, types}
+import world.mob.{MOOSHROOM, Mob, SpawnGroup, despawn_distance}
 import world.spawners.{SpawnerPlayer}
 import worldgen.facts.{BlockSet, Facts}
 import worldgen.interval.{Thrown}
@@ -181,6 +191,8 @@ pub enum Rule {
     SurfaceMonster
     /// `Animal.checkAnimalSpawnRules`.
     Animal
+    /// `MushroomCow.checkMushroomSpawnRules`.
+    Mushroom
     /// `Bat.checkBatSpawnRules`.
     Bat
     /// `Slime.checkSlimeSpawnRules`.
@@ -210,6 +222,9 @@ pub fn rule_of(name: String) -> Rule {
     }
     if name == "Animal.checkAnimalSpawnRules" {
         return Rule.Animal
+    }
+    if name == "MushroomCow.checkMushroomSpawnRules" {
+        return Rule.Mushroom
     }
     if name == "Bat.checkBatSpawnRules" {
         return Rule.Bat
@@ -242,7 +257,138 @@ pub interface SpawnLevel {
     fn light(self, sky: bool, x: i32, y: i32, z: i32) -> i32
     /// Whether the chunk's entities tick, `PersistentEntitySectionManager.canPositionTick`.
     fn entities_tick(self, chunk_x: i32, chunk_z: i32) -> bool
+    /// Whether players may be near the chunk for mobs to spawn, `hasPlayersNearby` as
+    /// `getPlayersCloseForSpawning` reads it, where they're looked for unless it's sure they
+    /// aren't.
+    fn players_near(mut self, chunk_x: i32, chunk_z: i32) -> bool
 }
+
+/// What natural spawning makes its mobs with (CAL-156).
+pub interface MobMaker {
+    /// `getMobForSpawn`: a new mob of the type `type_id` at x, y, z, its ID and its own random
+    /// taken as its constructor takes them; none where Calcite doesn't make the type yet.
+    fn make(mut self, type_id: i32, x: f64, y: f64, z: f64) -> Mob?
+    /// `isUnobstructed`: whether nothing that blocks building, `blocksBuilding`, isn't gone and
+    /// isn't a spectator has a box that meets `b`.
+    fn unobstructed(self, b: Aabb) -> bool
+    /// `addFreshEntityWithPassengers`: the mob in the level.
+    fn add(mut self, mob: own Mob)
+}
+
+/// What natural spawning counts of a level's mobs this tick, `SpawnState` (CAL-156): how many
+/// chunks the natural spawn counter counts; how many mobs the level has of each category, of
+/// those that needn't stay; and for each of its players, those in the chunks they're near,
+/// `LocalMobCapCalculator`. A player is near a chunk for spawning within 128 blocks of its
+/// middle, unless a spectator, where it may have players nearby.
+pub struct SpawnState {
+    pub chunks: i32
+    pub counts: List<i32>
+    players: List<SpawnerPlayer>
+    // The players near each chunk asked of, by `ChunkPos.pack`, as the tick has them; and each
+    // player's counts, none until one's counted near them.
+    near: Map<i64, List<usize>> = Map<i64, List<usize>>()
+    local: List<List<i32>?>
+}
+
+impl SpawnState {
+    /// None counted, for `chunks` chunks and the level's `players`, in its order.
+    pub fn new(chunks: i32, players: own List<SpawnerPlayer>) -> SpawnState {
+        var counts = List<i32>()
+        for _ in categories() {
+            counts.push(0)
+        }
+        var local = List<List<i32>?>()
+        for _ in players {
+            local.push(none)
+        }
+        return SpawnState { chunks: chunks, counts: counts, players: players, local: local }
+    }
+
+    /// `createState`'s count of a mob of `category` at x, z that needn't stay, in a loaded chunk:
+    /// one more of its category, and of it near each player near its chunk; none of `MISC`.
+    pub fn count<L: SpawnLevel>(mut self, level: mut L, category: i32, x: f64, z: f64) {
+        if category == MISC {
+            return
+        }
+        self.add_mob(mut level, category, x, z)
+    }
+
+    /// `afterSpawn`: the mob of `category` spawned at x, z counted.
+    pub fn after_spawn<L: SpawnLevel>(mut self, level: mut L, category: i32, x: f64, z: f64) {
+        self.add_mob(mut level, category, x, z)
+    }
+
+    // One more of `category`, and of it near each player near the chunk of x, z, `addMob`.
+    fn add_mob<L: SpawnLevel>(mut self, level: mut L, category: i32, x: f64, z: f64) {
+        let c = usize.wrap(category)
+        self.counts[c] += 1
+        let near = self.players_near(mut level, i32.saturate(x.floor()) >> 4, i32.saturate(z.floor()) >> 4)
+        for p in near {
+            var counts = List<i32>()
+            if let l = self.local[p] {
+                counts = l.copy()
+            } else {
+                for _ in categories() {
+                    counts.push(0)
+                }
+            }
+            counts[c] += 1
+            self.local[p] = some(counts)
+        }
+    }
+
+    /// Whether `category` may spawn at all this tick, `canSpawnForCategoryGlobal`: fewer of it
+    /// than its most a chunk over the chunks counted.
+    pub fn can_spawn_global(self, category: i32) -> bool {
+        return self.counts[usize.wrap(category)] < max_per_chunk(category) * self.chunks / 289
+    }
+
+    /// Whether `category` may spawn in the chunk, `canSpawnForCategoryLocal`: a player near it
+    /// has none counted, or fewer of it than its most a chunk.
+    pub fn can_spawn_local<L: SpawnLevel>(mut self, level: mut L, category: i32, chunk_x: i32, chunk_z: i32) -> bool {
+        let near = self.players_near(mut level, chunk_x, chunk_z)
+        for p in near {
+            if let l = self.local[p] {
+                if l[usize.wrap(category)] < max_per_chunk(category) {
+                    return true
+                }
+            } else {
+                return true
+            }
+        }
+        return false
+    }
+
+    // The players near the chunk for spawning, `getPlayersCloseForSpawning`, by their places in
+    // the level's order, kept for the tick as vanilla keeps them.
+    fn players_near<L: SpawnLevel>(mut self, level: mut L, chunk_x: i32, chunk_z: i32) -> List<usize> {
+        let k = (i64(chunk_z) << 32) | (i64(chunk_x) & 4294967295)
+        if self.near.contains(k) {
+            return self.near[k].copy()
+        }
+        var out = List<usize>()
+        if level.players_near(chunk_x, chunk_z) {
+            let mid_x = f64(chunk_x * 16 + 8)
+            let mid_z = f64(chunk_z * 16 + 8)
+            for i in 0..self.players.len() {
+                let p = self.players[i]
+                if p.spectator {
+                    continue
+                }
+                let dx = mid_x - p.x
+                let dz = mid_z - p.z
+                if dx * dx + dz * dz < 16384.0 {
+                    out.push(i)
+                }
+            }
+        }
+        self.near.insert(k, out.copy())
+        return out
+    }
+}
+
+/// How many mobs spawn at a place at most, `getMaxSpawnClusterSize`, of each kind Calcite makes.
+const MAX_CLUSTER: i32 = 4
 
 /// What natural spawning knows of the world's blocks and entity types, the same for every level.
 pub struct Natural {
@@ -257,6 +403,7 @@ pub struct Natural {
     fire: BlockSet
     campfires: BlockSet
     animals_on: BlockSet
+    mooshrooms_on: BlockSet
     bats_on: BlockSet
     // The tags types are immune to, in `immune_tags`' order.
     immune_sets: List<BlockSet>
@@ -268,6 +415,7 @@ pub struct Natural {
     cactus: u32
     powder_snow: u32
     water: u32
+    mycelium: u32
 }
 
 impl Natural {
@@ -290,6 +438,7 @@ impl Natural {
         let fire = facts.tag(String("minecraft:fire"))
         let campfires = facts.tag(String("minecraft:campfires"))
         let animals_on = facts.tag(String("minecraft:animals_spawnable_on"))
+        let mooshrooms_on = facts.tag(String("minecraft:mooshrooms_spawnable_on"))
         let bats_on = facts.tag(String("minecraft:bats_spawnable_on"))
         let lava = try block_id(facts, "minecraft:lava")
         let magma_block = try block_id(facts, "minecraft:magma_block")
@@ -299,6 +448,7 @@ impl Natural {
         let cactus = try block_id(facts, "minecraft:cactus")
         let powder_snow = try block_id(facts, "minecraft:powder_snow")
         let water = try block_id(facts, "minecraft:water")
+        let mycelium = try block_id(facts, "minecraft:mycelium")
         var liquid = List<bool>()
         for s in 0..facts.table.len() {
             liquid.push(facts.is_liquid(s))
@@ -314,6 +464,7 @@ impl Natural {
             fire: fire,
             campfires: campfires,
             animals_on: animals_on,
+            mooshrooms_on: mooshrooms_on,
             bats_on: bats_on,
             immune_sets: immune_sets,
             lava: lava,
@@ -324,7 +475,26 @@ impl Natural {
             cactus: cactus,
             powder_snow: powder_snow,
             water: water,
+            mycelium: mycelium,
         }
+    }
+
+    // `containsAnyLiquid`: whether a block from the one at the box's least corner to the one at
+    // its greatest has a fluid.
+    fn any_fluid<L: SpawnLevel>(self, level: L, b: Aabb) -> bool {
+        let x1 = i32.saturate(b.max_x.floor())
+        let y1 = i32.saturate(b.max_y.floor())
+        let z1 = i32.saturate(b.max_z.floor())
+        for x in i32.saturate(b.min_x.floor())..=x1 {
+            for y in i32.saturate(b.min_y.floor())..=y1 {
+                for z in i32.saturate(b.min_z.floor())..=z1 {
+                    if self.facts.fluid(level.spawn_state(x, y, z)) != 0 {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
     }
 
     // `isValidSpawn` of the state for the type: `BlockState.isValidSpawn`, by its group.
@@ -417,9 +587,11 @@ pub struct SpawnPlace {
     pub respawn: (i32, i32, i32)?
     /// The level's players, in the order `players()` has them.
     pub players: List<SpawnerPlayer>
-    /// The dimension type's `monster_spawn_light_level` and `monster_spawn_block_light_limit`.
+    /// The dimension type's `monster_spawn_light_level` and `monster_spawn_block_light_limit`, and
+    /// its `ambient_light`.
     pub light_test: IntProvider
     pub block_light_limit: i32
+    pub ambient_light: f32 = 0.0f32
     /// Each biome's `surface_slime_spawn_chance` this tick, by its ID.
     pub slime_chances: List<f32>
 }
@@ -429,11 +601,6 @@ impl SpawnPlace {
     fn within(self, x: f64, z: f64) -> bool {
         return x >= self.min_x and x < self.max_x and z >= self.min_z and z < self.max_z
     }
-}
-
-/// `MobCategory.getDespawnDistance`.
-fn despawn_distance(category: i32) -> i32 {
-    return if category == WATER_AMBIENT { 64 } else { 128 }
 }
 
 /// `MobCategory.isFriendly` and `isPersistent`, and `getMaxInstancesPerChunk`.
@@ -466,9 +633,8 @@ pub fn max_per_chunk(category: i32) -> i32 {
 
 /// The categories that may spawn this tick, `getFilteredSpawningCategories`: each but `MISC`, in
 /// order, that's friendly or `enemies` lets spawn, that isn't persistent or `persistent` lets
-/// spawn, and that's under its cap for the `chunks` the natural spawn counter counts. With no
-/// mobs, it's under its cap wherever its cap is above nothing.
-pub fn spawning_categories(enemies: bool, persistent_too: bool, chunks: i32) -> List<i32> {
+/// spawn, and that's under the level's cap for it, as `state` counts.
+pub fn spawning_categories(enemies: bool, persistent_too: bool, state: SpawnState) -> List<i32> {
     var out = List<i32>()
     for c in [MONSTER, CREATURE, AMBIENT, AXOLOTLS, UNDERGROUND_WATER_CREATURE, WATER_CREATURE, WATER_AMBIENT] {
         if not enemies and not friendly(c) {
@@ -477,7 +643,7 @@ pub fn spawning_categories(enemies: bool, persistent_too: bool, chunks: i32) -> 
         if not persistent_too and persistent(c) {
             continue
         }
-        if 0 < max_per_chunk(c) * chunks / 289 {
+        if state.can_spawn_global(c) {
             out.push(c)
         }
     }
@@ -491,17 +657,20 @@ fn ceil_float(f: f32) -> i32 {
 }
 
 /// `NaturalSpawner.spawnForChunk` for the chunk at `chunk_x`, `chunk_z`: each of `spawning` in
-/// turn, as `spawnCategoryForChunk` spawns it, drawing from `r`, the level's random.
-pub fn spawn_for_chunk<L: SpawnLevel + CollisionBlocks, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, chunk_x: i32, chunk_z: i32, spawning: List<i32>, r: mut T) ! Thrown {
+/// turn that's under its local cap there, as `state` counts, as `spawnCategoryForChunk` spawns
+/// it, drawing from `r`, the level's random, its mobs made by `maker`.
+pub fn spawn_for_chunk<L: SpawnLevel + CollisionBlocks, M: MobMaker, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, maker: mut M, state: mut SpawnState, chunk_x: i32, chunk_z: i32, spawning: List<i32>, r: mut T) ! Thrown {
     for c in spawning {
-        try spawn_category_for_chunk(n, mobs, place, mut level, chunk_x, chunk_z, c, mut r)
+        if state.can_spawn_local(mut level, c, chunk_x, chunk_z) {
+            try spawn_category_for_chunk(n, mobs, place, mut level, mut maker, mut state, chunk_x, chunk_z, c, mut r)
+        }
     }
 }
 
 // `spawnCategoryForChunk`: a place in the chunk, as `getRandomPosWithin` picks it, a column and
 // a height from the world's bottom up to one above the column's top. One at the bottom spawns
 // nothing.
-fn spawn_category_for_chunk<L: SpawnLevel + CollisionBlocks, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, chunk_x: i32, chunk_z: i32, category: i32, r: mut T) ! Thrown {
+fn spawn_category_for_chunk<L: SpawnLevel + CollisionBlocks, M: MobMaker, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, maker: mut M, state: mut SpawnState, chunk_x: i32, chunk_z: i32, category: i32, r: mut T) ! Thrown {
     let x = chunk_x * 16 + r.next_int_below(16)
     let z = chunk_z * 16 + r.next_int_below(16)
     let surface = level.surface(WORLD_SURFACE, x, z)
@@ -509,21 +678,24 @@ fn spawn_category_for_chunk<L: SpawnLevel + CollisionBlocks, T: RandomSource>(n:
     if y < place.min_y + 1 {
         return
     }
-    try spawn_category_for_position(n, mobs, place, mut level, chunk_x, chunk_z, category, x, y, z, mut r)
+    try spawn_category_for_position(n, mobs, place, mut level, mut maker, mut state, chunk_x, chunk_z, category, x, y, z, mut r)
 }
 
 // `spawnCategoryForPosition`: nothing in a block that conducts redstone. Then three packs, each
 // of up to four steps, each a random walk of up to five blocks on x and z from the place, the
 // first step's place picking the pack's mob and its size, which bounds the pack's steps from
-// there.
-fn spawn_category_for_position<L: SpawnLevel + CollisionBlocks, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, chunk_x: i32, chunk_z: i32, category: i32, x: i32, y: i32, z: i32, r: mut T) ! Thrown {
+// there. At each step whose place passes, its mob is made, turned, checked and finalized with
+// the pack's group, and added; at the fourth from the place, that's all.
+fn spawn_category_for_position<L: SpawnLevel + CollisionBlocks, M: MobMaker, T: RandomSource>(n: Natural, mobs: Mobs, place: SpawnPlace, level: mut L, maker: mut M, state: mut SpawnState, chunk_x: i32, chunk_z: i32, category: i32, x: i32, y: i32, z: i32, r: mut T) ! Thrown {
     if n.facts.redstone_conductor(level.spawn_state(x, y, z)) {
         return
     }
+    var cluster = 0
     for _ in 0..3 {
         var px = x
         var pz = z
         var data: Spawner? = none
+        var group: SpawnGroup? = none
         var size = ceil_float(r.next_float() * 4.0f32)
         var step = 0
         while step < size {
@@ -546,11 +718,56 @@ fn spawn_category_for_position<L: SpawnLevel + CollisionBlocks, T: RandomSource>
             if not try valid_position_for_type(n, mobs, place, mut level, category, spawner, px, y, pz, d, mut r) {
                 continue
             }
-            // The spawn potential, with no mobs, lets any spawn, and vanilla makes the mob here,
-            // which Calcite doesn't have.
-            return
+            // `extraTest`, `SpawnState.canSpawn`: the spawn potential, with nothing in it, lets
+            // any spawn.
+            var mob = maker.make(spawner.type_id, fx, f64(y), fz) else return
+            let turn = r.next_float() * 360.0f32
+            mob.living.snap_to(fx, f64(y), fz, turn, 0.0f32)
+            if not valid_position_for_mob(n, place, level, maker, mob, px, y, pz, d) {
+                continue
+            }
+            group = mob.finalize_spawn(group, mut r)
+            cluster += 1
+            let kind = mob.category
+            maker.add(mob)
+            state.after_spawn(mut level, kind, fx, fz)
+            if cluster >= MAX_CLUSTER {
+                return
+            }
         }
     }
+}
+
+// `isValidPositionForMob` of the mob at x, y, z, the nearest player `d` blocks squared away: none
+// past its category's despawn distance that would go there, `removeWhenFarAway`; then its spawn
+// rules, `checkSpawnRules`, a pathfinding mob's walk target's value where it stands no less than
+// 0; and its room, `checkSpawnObstruction`, no fluid in a block its box is in and nothing in its
+// box that blocks building.
+fn valid_position_for_mob<L: SpawnLevel, M: MobMaker>(n: Natural, place: SpawnPlace, level: L, maker: M, mob: Mob, x: i32, y: i32, z: i32, d: f64) -> bool {
+    let far = despawn_distance(mob.category)
+    if d > f64(far * far) and mob.removed_far_away(d) {
+        return false
+    }
+    if walk_target_value(n, place, level, mob.species, x, y, z) < 0.0f32 {
+        return false
+    }
+    let b = mob.living.body.bounding_box()
+    if n.any_fluid(level, b) {
+        return false
+    }
+    return maker.unobstructed(b)
+}
+
+// `getWalkTargetValue` of a mob of the kind `species` at x, y, z: a mooshroom's 10 on mycelium,
+// and otherwise what the light there gives, `getPathfindingCostFromLightLevels`, the light's
+// curve lerped to 1 by the dimension's ambient light, less a half.
+fn walk_target_value<L: SpawnLevel>(n: Natural, place: SpawnPlace, level: L, species: i32, x: i32, y: i32, z: i32) -> f32 {
+    if species == MOOSHROOM and n.facts.is(level.spawn_state(x, y - 1, z), n.mycelium) {
+        return 10.0f32
+    }
+    let v = f32.nearest(raw_brightness(level, x, y, z, place.sky_darken)) / 15.0f32
+    let curved = v / (4.0f32 - 3.0f32 * v)
+    return curved + place.ambient_light * (1.0f32 - curved) - 0.5f32
 }
 
 // The nearest player to the place that isn't a spectator, and their distance squared, as
@@ -723,6 +940,10 @@ fn spawn_rules<L: SpawnLevel, T: RandomSource>(n: Natural, mobs: Mobs, place: Sp
         Rule.Animal => {
             let bright = raw_brightness(level, x, y, z, 0) > 8
             n.facts.in_set(level.spawn_state(x, y - 1, z), n.animals_on) and bright
+        },
+        Rule.Mushroom => {
+            let bright = raw_brightness(level, x, y, z, 0) > 8
+            n.facts.in_set(level.spawn_state(x, y - 1, z), n.mooshrooms_on) and bright
         },
         Rule.Bat => bat_rules(n, place, level, t, x, y, z, mut r),
         Rule.Slime => try slime_rules(n, mobs, place, mut level, t, x, y, z, mut r),

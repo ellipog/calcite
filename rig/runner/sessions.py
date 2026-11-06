@@ -115,6 +115,9 @@ class Config:
     player: dict | None = None
     # The names of the players in ops.json, at level 4, none of them the bot (D376).
     ops: tuple = ()
+    # Whether it's taped whether or not --tape says so, its levels' randoms seeded again at RESEED,
+    # as what it compares lines up only from there, natural spawning's mobs (CAL-156).
+    tape: bool = False
 
 
 def stack(item, count=1, components=None):
@@ -427,6 +430,12 @@ CONFIGS = {
     # marker, without gravity, posed and invisible; watched, as `redstone`.
     "stands": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "stands" / "world", fixture="stands",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # Mooshrooms (CAL-156): with natural spawning on, creatures spawn every 400 ticks in the
+    # mooshrooms fixture's mushroom fields, chunks -2 to 2, which a view of 2 has their entities
+    # tick, as mooshrooms both servers make; and two without AI stand and moo; watched, and
+    # taped, as their places are drawn from the levels' randoms, which line up once seeded again.
+    "mooshrooms": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "mooshrooms" / "world",
+                         fixture="mooshrooms", tape=True),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
@@ -689,9 +698,10 @@ def main():
             if not scenarios[config]:
                 continue
             print(f"{config}:", flush=True)
-            record(config, "vanilla", vanilla_argv(a, args.tape), bot, scenarios[config])
-            record(config, "calcite", [str(server)] + (["--rng-tape", "tape.txt", "--rng-reseed", str(RESEED)] if args.tape else []), bot, scenarios[config])
-            if args.tape:
+            taped = args.tape or CONFIGS[config].tape
+            record(config, "vanilla", vanilla_argv(a, taped), bot, scenarios[config])
+            record(config, "calcite", [str(server)] + (["--rng-tape", "tape.txt", "--rng-reseed", str(RESEED)] if taped else []), bot, scenarios[config])
+            if taped:
                 print(f"{config}: the levels' draws, vanilla's against Calcite's (D312):", flush=True)
                 tapediff.compare(tapediff.read(SESSIONS / config / "vanilla" / "tape.txt"),
                                  tapediff.read(SESSIONS / config / "calcite" / "tape.txt"), args.show, RESEED + 1)

@@ -42,6 +42,7 @@ PROPERTIES = dict(sessions.BASE, **{"spawn-protection": "0", "pause-when-empty-s
 ANSWERS = {
     "setblock": "Changed the block",
     "fill": "Successfully filled",
+    "fillbiome": "biome entr",
     "setworldspawn": "Set the world spawn point",
     "summon": "Summoned new",
     "time": "Set minecraft:overworld to",
