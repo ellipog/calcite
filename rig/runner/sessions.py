@@ -576,6 +576,10 @@ CONFIGS = {
     # its own tick till it dies, and its loot (D424); watched, as `stands`.
     "drown": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "drown" / "world", fixture="drown",
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # Two such cows, one saved with a death loot seed of its own and one with a chicken's death loot
+    # table and a seed, each rolling its loot from a random of its seed as it drowns (D429).
+    "seeded": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "seeded" / "world", fixture="seeded",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
     # Four cows without AI with their eyes in stone, glass and farmland, inside its shape and above
     # it, the stone and the farmland's inside suffocating theirs till they die (D425); watched, as
     # `stands`, without random ticks, which would turn the farmland to dirt.
