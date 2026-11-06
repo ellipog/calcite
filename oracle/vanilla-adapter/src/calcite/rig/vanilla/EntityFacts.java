@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -42,6 +43,7 @@ import net.minecraft.world.entity.ai.attributes.RangedAttribute;
 import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.pathfinder.PathType;
 import net.minecraft.world.phys.AABB;
 
 /**
@@ -65,6 +67,11 @@ import net.minecraft.world.phys.AABB;
  * <p>For each attribute, in ID order: its default, the range {@code sanitizeValue} keeps it in, and
  * whether it's synced to clients; and the attributes a player has, from {@code DefaultAttributes},
  * each with its base, in ID order (CAL-137).
+ *
+ * <p>And what pathfinding reads of each block state, {@link PathFacts}' facts, with {@code
+ * PathType}'s names and maluses, what {@code getPathTypeFromState} gives each state once vanilla's
+ * tags are loaded, and those tags' blocks and fluids (CAL-157). The tags are loaded last, so
+ * nothing else written reads them.
  */
 final class EntityFacts {
     private EntityFacts() {}
@@ -105,6 +112,7 @@ final class EntityFacts {
         if (groups.size() > 30) {
             throw new IllegalStateException(groups.size() + " spawn groups, more than a state's bits hold");
         }
+        int[] paths = PathFacts.facts(states);
         StringBuilder json = new StringBuilder();
         json.append("{\n  \"game_version\": \"").append(SharedConstants.getCurrentVersion().name()).append("\",\n");
         json.append("  \"categories\": [");
@@ -204,7 +212,34 @@ final class EntityFacts {
             json.append("]}");
             first = false;
         }
-        json.append("\n  ]\n}\n");
+        json.append("\n  ],\n  \"path_type_names\": [");
+        for (PathType type : PathType.values()) {
+            json.append(type.ordinal() == 0 ? "\"" : ", \"").append(type.name()).append("\"");
+        }
+        json.append("],\n  \"path_maluses\": [");
+        for (PathType type : PathType.values()) {
+            json.append(type.ordinal() == 0 ? "" : ", ").append(type.getMalus());
+        }
+        json.append("],\n  \"paths\": [");
+        for (int id = 0; id < states; id++) {
+            json.append(id == 0 ? "" : ", ").append(paths[id]);
+        }
+        int[] vanilla = PathFacts.check(paths);
+        json.append("],\n  \"path_types\": [");
+        for (int id = 0; id < states; id++) {
+            json.append(id == 0 ? "" : ", ").append(vanilla[id]);
+        }
+        json.append("],\n  \"path_block_tags\": {");
+        int[][] blockTags = PathFacts.blockTags();
+        for (int i = 0; i < blockTags.length; i++) {
+            json.append(i == 0 ? "\n    \"" : ",\n    \"").append(PathFacts.BLOCK_TAGS.get(i).location()).append("\": ").append(Arrays.toString(blockTags[i]));
+        }
+        json.append("\n  },\n  \"path_fluid_tags\": {");
+        int[][] fluidTags = PathFacts.fluidTags();
+        for (int i = 0; i < fluidTags.length; i++) {
+            json.append(i == 0 ? "\n    \"" : ",\n    \"").append(PathFacts.FLUID_TAGS.get(i).location()).append("\": ").append(Arrays.toString(fluidTags[i]));
+        }
+        json.append("\n  }\n}\n");
         Files.writeString(Path.of(args[0]), json, StandardCharsets.UTF_8);
     }
 

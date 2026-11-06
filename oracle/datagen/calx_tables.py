@@ -1447,6 +1447,116 @@ def attribute_lines(facts):
     ]
 
 
+# What a state's path facts say `isPathfindable` gives, as calcite.rig.vanilla.PathFacts writes
+# them, and the classes they say it is (CAL-157).
+PATHFINDABLE = [
+    ("NEVER", "never"),
+    ("ALWAYS", "always"),
+    ("IN_WATER", "where its fluid is in `#water`"),
+    ("NOT_IN_LAVA", "where its fluid isn't in `#lava`"),
+]
+PATH_KINDS = [
+    ("OTHER", "none of the others"),
+    ("DOOR_OPEN", "a door, open"),
+    ("DOOR_BY_HAND", "a door, shut, of a kind opened by hand"),
+    ("DOOR_SHUT", "a door, shut, of a kind that isn't"),
+    ("RAIL", "a `BaseRailBlock`"),
+    ("LEAVES", "a `LeavesBlock`"),
+    ("GATE_SHUT", "a fence gate, shut"),
+]
+
+
+def path_lines(facts):
+    """world.entity_facts' path facts (CAL-157): `PathType`'s constants and maluses, each state's
+    path facts, and for the test what `getPathTypeFromState` gives each state with vanilla's tags,
+    and those tags."""
+    names = facts["path_type_names"]
+    maluses = facts["path_maluses"]
+    if len(names) != len(maluses):
+        raise ValueError("a malus for each path type")
+    for state, v in enumerate(facts["paths"]):
+        if v >> 6 >= len(PATH_KINDS):
+            raise ValueError(f"state {state}'s path facts {v:#x} have a class this script doesn't know")
+    if len(facts["paths"]) != len(facts["states"]) or len(facts["path_types"]) != len(facts["states"]):
+        raise ValueError("path facts and types for each state")
+    lines = [
+        "",
+        "/// `PathType`, in its order, what pathfinding makes of a block (CAL-157).",
+    ]
+    for i, name in enumerate(names):
+        lines.append(f"pub const PATH_{name}: u8 = {i}")
+    lines += [
+        "/// How many path types there are.",
+        f"pub const PATH_TYPE_COUNT: usize = {len(names)}",
+        "",
+        "/// The path types' names, in their order.",
+        "pub fn path_type_names() -> List<String> {",
+        "    return [" + ", ".join('"' + n + '"' for n in names) + "]",
+        "}",
+        "",
+        "/// Each path type's malus, `getMalus`, what a mob's `getPathfindingMalus` gives where it has",
+        "/// none of its own, in their order.",
+        "pub fn path_maluses() -> List<f32> {",
+        "    return [" + ", ".join(calx_float(m) for m in maluses) + "]",
+        "}",
+        "",
+        "/// What a state's path facts say `isPathfindable` gives for each `PathComputationType`, two bits",
+        "/// each from bit `2 * COMPUTATION_LAND`, `2 * COMPUTATION_WATER` and `2 * COMPUTATION_AIR`.",
+    ]
+    for i, (name, what) in enumerate(PATHFINDABLE):
+        lines += [f"/// It's pathfindable {what}.", f"pub const PATHFINDABLE_{name}: u32 = {i}"]
+    lines += [
+        "pub const COMPUTATION_LAND: u32 = 0",
+        "pub const COMPUTATION_WATER: u32 = 1",
+        "pub const COMPUTATION_AIR: u32 = 2",
+        "/// Where the class a state is, of those `getPathTypeFromState` asks about, is in its path facts,",
+        "/// and the classes.",
+        "pub const PATH_KIND_SHIFT: u32 = 6",
+    ]
+    for i, (name, what) in enumerate(PATH_KINDS):
+        lines += [f"/// It's {what}.", f"pub const PATH_KIND_{name}: u32 = {i}"]
+    lines += ["", "/// Each state's path facts, in state ID order."]
+    lines += encoded_table("state_path_facts", "facts", facts["paths"])
+    lines += [
+        "/// What `getPathTypeFromState` gives each state with vanilla's tags, in state ID order, for",
+        "/// test/paths.calx.",
+    ]
+    lines += encoded_table("vanilla_path_types", "paths", facts["path_types"])
+    block_tags = facts["path_block_tags"]
+    fluid_tags = facts["path_fluid_tags"]
+    lines += [
+        "/// The block tags `getPathTypeFromState` reads, and vanilla's blocks in each, by ID, for",
+        "/// test/paths.calx.",
+        "pub fn path_block_tag_names() -> List<String> {",
+        "    return [" + ", ".join('"' + n + '"' for n in block_tags) + "]",
+        "}",
+        "",
+        "pub fn path_block_tag_blocks() -> List<List<i32>> {",
+        "    let tags: List<List<i32>> = [",
+    ]
+    lines += ["        [" + ", ".join(str(b) for b in v) + "]," for v in block_tags.values()]
+    lines += [
+        "    ]",
+        "    return tags",
+        "}",
+        "",
+        "/// The fluid tags it reads, and vanilla's fluids in each, by ID, for test/paths.calx.",
+        "pub fn path_fluid_tag_names() -> List<String> {",
+        "    return [" + ", ".join('"' + n + '"' for n in fluid_tags) + "]",
+        "}",
+        "",
+        "pub fn path_fluid_tag_fluids() -> List<List<i32>> {",
+        "    let tags: List<List<i32>> = [",
+    ]
+    lines += ["        [" + ", ".join(str(b) for b in v) + "]," for v in fluid_tags.values()]
+    lines += [
+        "    ]",
+        "    return tags",
+        "}",
+    ]
+    return lines
+
+
 def entity_facts_module(index, facts):
     """The text of src/world/entity_facts.calx."""
     if facts["game_version"] != index["game_version"]:
@@ -1465,8 +1575,9 @@ def entity_facts_module(index, facts):
     serialized = ", ".join('"' + c.lower() + '"' for c in categories)
     lines = [
         f"/// What vanilla {index['game_version']}'s natural spawning asks of each entity type, in type ID order, and of each",
-        "/// block state, in state ID order, and each attribute and the player's (D375). Written by",
-        "/// oracle/datagen/calx_tables.py from entity_facts.json (D317): don't edit it.",
+        "/// block state, in state ID order, and each attribute and the player's (D375), and what",
+        "/// pathfinding reads of each state (D409). Written by oracle/datagen/calx_tables.py from",
+        "/// entity_facts.json (D317): don't edit it.",
         "module world.entity_facts",
         "",
         "/// The mob categories, in `MobCategory` order, which a type's `category` is a place in.",
@@ -1562,6 +1673,7 @@ def entity_facts_module(index, facts):
     ]
     lines += encoded_table("state_spawn_facts", "facts", facts["states"])
     lines += attribute_lines(facts)
+    lines += path_lines(facts)
     return "\n".join(lines)
 
 
