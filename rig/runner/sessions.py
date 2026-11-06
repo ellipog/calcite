@@ -289,6 +289,10 @@ ORBS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0
     slotted(0, "diamond_hoe", 1, {"minecraft:damage": nbt.Int(1),
                                   "minecraft:enchantments": {"minecraft:mending": nbt.Int(1)}}),
 ]), equipment={})
+# The bot's data in `feed`: in survival mode at the spawn, facing east, holding wheat (CAL-158).
+FEED = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "wheat", 16),
+]), equipment={})
 # The bot's data in `night`: in creative mode at the spawn, so the monsters that spawn don't make
 # for it (CAL-156).
 NIGHT = {
@@ -434,6 +438,13 @@ CONFIGS = {
     # and are picked up one a touch, mending the hoe first, the rest the bot's (CAL-154).
     "orbs": Config({}, view=3, scenarios=("orbs",), world=FIXTURES / "orbs" / "world", fixture="orbs",
                    rules=DIG_DROP_RULES, player=ORBS),
+    # The bot, in survival mode, feeds the feed fixture's penned cows, calf and sheep wheat by the
+    # server's clock (D415), and waits as the cows and the sheep breed, their orbs come to it and
+    # their babies grow; no natural spawning, and no advancement messages, as Calcite has no
+    # advancements yet (CAL-158).
+    "feed": Config({}, view=3, scenarios=("feed",), world=FIXTURES / "feed" / "world", fixture="feed",
+                   rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                   player=FEED),
     # Armor stands by the spawn, which both servers load and tick (CAL-155): falling onto stone,
     # hay, honey and slime, sliding on ice, down a ladder and into water, and standing, small, a
     # marker, without gravity, posed and invisible; watched, as `redstone`.

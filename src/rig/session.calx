@@ -88,6 +88,13 @@
 /// - `orbs`: as `use`, with a diamond hoe with mending: three sculk broken at once, each worth an
 ///   orb of 1, then a sculk catalyst dug through, worth 5, with steps that wait between, for the
 ///   orbs to follow it and be picked up (CAL-154).
+/// - `feed`: as `use`, holding wheat, feeding the feed fixture's animals by the order the server
+///   sent them, each use of an entity in a step of its own, timed by the server's clock, as the
+///   animals never settle: sent on the first `set_time` at or past its game time, which marks the
+///   step's start, so each comes between the same two ticks on both servers. The first cow, the
+///   second and the third, a calf and two grown, so the grown pair falls in love; both sheep; the
+///   first cow again; then a step, `breed`, from a game time too, while they breed, their orbs
+///   come to the bot and their babies grow, and it leaves at a game time (CAL-158, D415).
 ///
 /// OUT gets each packet in the order it came: its state's number, as vanilla's
 /// `ConnectionProtocol` orders them from handshake at 0, its length as 4 bytes, big-endian, then
@@ -109,7 +116,7 @@ import protocol.configuration.{ServerboundFinishConfiguration, ServerboundSelect
 import protocol.handshake.{ClientIntent, ClientIntention}
 import protocol.ids.{PROTOCOL_VERSION, packet_names}
 import protocol.login.{ServerboundHello, ServerboundLoginAcknowledged}
-import protocol.play.{ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundContainerClick, ServerboundContainerClose, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundPlayerAction, ServerboundPlayerInput, ServerboundPlayerLoaded, ServerboundSetCarriedItem, ServerboundSetCreativeModeSlot, ServerboundUseItemOn, ON_GROUND}
+import protocol.play.{ServerboundAcceptTeleportation, ServerboundChunkBatchReceived, ServerboundClientTickEnd, ServerboundContainerClick, ServerboundContainerClose, ServerboundInteract, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundPlayerAction, ServerboundPlayerInput, ServerboundPlayerLoaded, ServerboundSetCarriedItem, ServerboundSetCreativeModeSlot, ServerboundUseItemOn, ON_GROUND}
 import protocol.state.{State, Bound}
 import protocol.status.{ServerboundPingRequest, ServerboundStatusRequest}
 import protocol.wire.{Reader, Writer, Wire, Packet, write_packet}
@@ -218,6 +225,16 @@ struct Bot {
     // The moves a step is still to make, one a tick, as a client sends at most one position a
     // tick (CAL-148).
     moves: List<(f64, f64, f64)> = List<(f64, f64, f64)>()
+    // The cows and sheep the server sent, by their entity IDs, in the order it sent them, and the
+    // types they're sent as (CAL-158); the steps the server's clock times still to come, each its
+    // game time, its name and the feed it sends, a sheep's or a cow's and which, if any, in the
+    // order they come; and the game time the bot leaves at, -1 for none (D415).
+    cows: List<i32> = List<i32>()
+    sheep: List<i32> = List<i32>()
+    cow_type: i32 = -1
+    sheep_type: i32 = -1
+    timed: List<(i64, String, (bool, usize)?)> = List<(i64, String, (bool, usize)?)>()
+    leave_at: i64 = -1
 }
 
 impl Bot {
@@ -350,6 +367,39 @@ impl Bot {
                         self.chunks += 1
                     } else if name == "chunk_batch_finished" {
                         self.send(net, packet(ServerboundChunkBatchReceived { desired_chunks_per_tick: DESIRED }, State.Play))
+                    } else if name == "add_entity" {
+                        // `ClientboundAddEntityPacket`: its ID, its UUID, then its type.
+                        let entity = r.varint()!
+                        _ = r.i64()!
+                        _ = r.i64()!
+                        let kind = r.varint()!
+                        if kind == self.cow_type {
+                            self.cows.push(entity)
+                        } else if kind == self.sheep_type {
+                            self.sheep.push(entity)
+                        }
+                    } else if name == "set_time" and (not self.timed.is_empty() or self.leave_at >= 0) {
+                        // The steps due by the server's clock, each with its feed, then the leave
+                        // once they've come and it's due (D415).
+                        let time = r.i64()!
+                        while not self.timed.is_empty() and self.timed[0].0 <= time {
+                            let (_, step, fed) = self.timed.remove(0)
+                            self.step(step, now)
+                            match fed {
+                                some(f) => {
+                                    let (sheep, k) = f
+                                    self.feed(net, sheep, k)
+                                },
+                                none => {},
+                            }
+                        }
+                        if self.timed.is_empty() and self.leave_at >= 0 and time >= self.leave_at {
+                            self.step(String("leave"), now)
+                            net.close(self.conn)
+                            self.closed = true
+                            self.done = true
+                            return
+                        }
                     } else if name == "set_time" and self.scenario == "watch" {
                         let time = r.i64()!
                         if self.joined_at < 0 {
@@ -394,7 +444,10 @@ impl Bot {
     // own: each of its packets.
     fn dig(mut self, net: Net, now: u64) {
         let d = steps_of(self.scenario)[self.dig_at].copy()
-        self.step(d.name.copy(), now)
+        // A step whose packets the server's clock times has no name, as each of them marks its own.
+        if not d.name.is_empty() {
+            self.step(d.name.copy(), now)
+        }
         for p in d.packets {
             match p {
                 Dug.Action(action, x, y, z, direction, sequence) => self.send(net, packet(ServerboundPlayerAction { action: action, pos: BlockPos { x: x, y: y, z: z }, direction: u8.wrap(direction), sequence: sequence }, State.Play)),
@@ -417,7 +470,23 @@ impl Bot {
                 Dug.Close(id) => self.send(net, packet(ServerboundContainerClose { container_id: id }, State.Play)),
                 Dug.Command(text) => self.send(net, packet(ServerboundChatCommand { command: String(text) }, State.Play)),
                 Dug.Move(x, y, z) => self.moves.push((x, y, z)),
+                Dug.Feed(sheep, k, at, step) => self.timed.push((at, String(step), some((sheep, k)))),
+                Dug.Mark(at, step) => self.timed.push((at, String(step), none)),
+                Dug.Leave(at) => self.leave_at = at,
             }
+        }
+    }
+
+    // A use of the main hand's stack on the `k`th sheep the server sent, or the `k`th cow
+    // (CAL-158).
+    fn feed(mut self, net: Net, sheep: bool, k: usize) {
+        let ids = if sheep { self.sheep.copy() } else { self.cows.copy() }
+        if k < ids.len() {
+            var rest = List<u8>()
+            // Where on it the bot looks, `LpVec3`'s zero, then no sneaking.
+            rest.push(0u8)
+            rest.push(0u8)
+            self.send(net, packet(ServerboundInteract { entity_id: ids[k], hand: 0, rest: rest }, State.Play))
         }
     }
 
@@ -443,7 +512,7 @@ impl Bot {
             self.send(net, packet(ServerboundMovePlayerPos { x: x, y: y, z: z, flags: ON_GROUND }, State.Play))
             self.heard_at = now
         }
-        let settled = now - self.heard_at >= SETTLE
+        let settled = now - self.heard_at >= SETTLE and self.timed.is_empty() and self.leave_at < 0
         match self.phase {
             Phase.Before => {
                 if self.closed and settled {
@@ -791,6 +860,12 @@ enum Dug {
     Command(str)
     // A move to x, y, z on the ground, made in a tick of its own.
     Move(f64, f64, f64)
+    // A use of the main hand's stack on the `k`th sheep the server sent, or the `k`th cow, at a
+    // game time, in a step of the name given (CAL-158); a step of the name given at a game time;
+    // and the leave at a game time (D415).
+    Feed(bool, usize, i64, str)
+    Mark(i64, str)
+    Leave(i64)
 }
 
 // A step of `dig`'s: its name and its packets.
@@ -893,7 +968,31 @@ fn steps_of(scenario: String) -> List<Dig> {
     if scenario == "orbs" {
         return orb_breaks()
     }
+    if scenario == "feed" {
+        return feeds()
+    }
     return []
+}
+
+// What `feed` does on the `feed` fixture's world (CAL-158), at the spawn facing east with wheat,
+// by the server's clock, 40 ticks apart from game time 200, well after the join (D415): the cows
+// fed in the order the server sent them, a calf that grows older and two grown that fall in love,
+// whichever comes where; the sheep, which fall in love; the first cow again; then, from game time
+// 440, a step as each pair breeds, its orb comes to the bot and the babies follow their parents,
+// till the bot leaves at game time 720, each step within the step limit.
+fn feeds() -> List<Dig> {
+    return [
+        Dig { name: String(), packets: [
+            Dug.Feed(false, 0, 200, "feed-cow"),
+            Dug.Feed(false, 1, 240, "feed-cow-again"),
+            Dug.Feed(false, 2, 280, "feed-third-cow"),
+            Dug.Feed(true, 0, 320, "feed-sheep"),
+            Dug.Feed(true, 1, 360, "feed-sheep-again"),
+            Dug.Feed(false, 0, 400, "feed-cow-last"),
+            Dug.Mark(440, "breed"),
+            Dug.Leave(720),
+        ] },
+    ]
 }
 
 // What `orbs` does, step by step, on the `orbs` fixture's world (CAL-154), at the spawn facing east
@@ -1200,13 +1299,21 @@ fn main() {
     let port = u16.wrap(number(given[0]))
     let view_chunks = u64(in_view_count(i32.wrap(number(given[1]))))
     let scenario = given[2].copy()
-    if scenario != "status" and scenario != "outdated" and scenario != "bad-name" and scenario != "stranger" and scenario != "join" and scenario != "watch" and scenario != "creative" and scenario != "clicks" and scenario != "crafts" and scenario != "dig" and scenario != "dig-creative" and scenario != "place" and scenario != "place-creative" and scenario != "use" and scenario != "use-items" and scenario != "use-books" and scenario != "use-containers" and scenario != "items" and scenario != "items-saved" and scenario != "orbs" {
+    if scenario != "status" and scenario != "outdated" and scenario != "bad-name" and scenario != "stranger" and scenario != "join" and scenario != "watch" and scenario != "creative" and scenario != "clicks" and scenario != "crafts" and scenario != "dig" and scenario != "dig-creative" and scenario != "place" and scenario != "place-creative" and scenario != "use" and scenario != "use-items" and scenario != "use-books" and scenario != "use-containers" and scenario != "items" and scenario != "items-saved" and scenario != "orbs" and scenario != "feed" {
         panic("session: what's the scenario {scenario}?")
     }
     let net = Net.new()!
     let start = unsafe { Instant.now() }
     let conn = net.connect("127.0.0.1", port)!
     var bot = Bot { scenario: scenario, conn: conn, codec: Codec.new(), state: State.Handshake, out: Writer.new() }
+    let kinds = builtin_entries(6)
+    for i in 0..kinds.len() {
+        if kinds[i] == String("cow") {
+            bot.cow_type = i32.wrap(i)
+        } else if kinds[i] == String("sheep") {
+            bot.sheep_type = i32.wrap(i)
+        }
+    }
     bot.start(net, port)
     var next_tick: u64 = TICK_NS
     var events = List<Event>()
