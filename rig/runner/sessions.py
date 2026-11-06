@@ -526,6 +526,10 @@ CONFIGS = {
     # counted against the monsters' cap and vanilla's would spawn again where Calcite's are at it.
     "night": Config({"difficulty": "normal"}, view=2, scenarios=("watch",), world=FIXTURES / "night" / "world",
                     fixture="night", tape=True, player=NIGHT, rules=(("minecraft:mob_griefing", nbt.Byte(0)),)),
+    # A cow without AI sealed in a stone tank of water, its air nearly gone, which drowns, hurt in
+    # its own tick till it dies, and its loot (D424); watched, as `stands`.
+    "drown": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "drown" / "world", fixture="drown",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
