@@ -681,11 +681,13 @@ FIXTURE_CHUNKS = (-1, -1, 0, 0)
 
 def compare_chunks(config, show):
     """Prints what differs in what both servers saved of a fixture configuration's chunks, each
-    block's state, block entity, tick, heightmap and light (CAL-145). Reported, not gated."""
+    block's state, block entity, tick, heightmap and light (CAL-145). Reported, not gated. A
+    `show` of 0 shows them all, as it does the packets' (D407)."""
+    limit = show if show > 0 else 10 ** 9
     lines = savediff.compare(SESSIONS / config / "vanilla" / "world", SESSIONS / config / "calcite" / "world",
-                             FIXTURE_CHUNKS, show)
+                             FIXTURE_CHUNKS, limit)
     print(f"saved chunks   {'PASS' if not lines else 'differs'}    {len(lines)} differ")
-    for line in lines[:show]:
+    for line in lines[:limit]:
         print(f"  [{config}] {line[:400]}")
 
 
