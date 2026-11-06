@@ -580,6 +580,10 @@ CONFIGS = {
     # table and a seed, each rolling its loot from a random of its seed as it drowns (D429).
     "seeded": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "seeded" / "world", fixture="seeded",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
+    # A slime of size 2 without AI suffocating in stone, which splits as it's taken out dying into
+    # 2 to 4 of size 1 with what it was made of, which suffocate in turn (D430).
+    "split": Config({"difficulty": "easy"}, view=2, scenarios=("watch",), world=FIXTURES / "split" / "world", fixture="split",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)))),
     # Four cows without AI with their eyes in stone, glass and farmland, inside its shape and above
     # it, the stone and the farmland's inside suffocating theirs till they die (D425); watched, as
     # `stands`, without random ticks, which would turn the farmland to dirt.
