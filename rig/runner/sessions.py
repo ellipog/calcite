@@ -634,6 +634,14 @@ CONFIGS = {
                     player=DEATH, keys=DEATH_KEYS,
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)),
                            ("minecraft:respawn_radius", nbt.Int(0)))),
+    # The same on peaceful, watching late, so its hurts start at the same game time on both
+    # servers: peaceful heals it and fills its saturation every 20 of the player's own ticks,
+    # which its respawn counts from 0 again, `Entity.tickCount`, apart from its connection's
+    # (D433).
+    "death_peaceful": Config({"difficulty": "peaceful"}, view=2, scenarios=("watch-late",), world=FIXTURES / "death" / "world",
+                             fixture="death", player=DEATH, keys=DEATH_KEYS,
+                             rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)),
+                                    ("minecraft:respawn_radius", nbt.Int(0)))),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
