@@ -422,6 +422,11 @@ CONFIGS = {
     # and are picked up one a touch, mending the hoe first, the rest the bot's (CAL-154).
     "orbs": Config({}, view=3, scenarios=("orbs",), world=FIXTURES / "orbs" / "world", fixture="orbs",
                    rules=DIG_DROP_RULES, player=ORBS),
+    # Armor stands by the spawn, which both servers load and tick (CAL-155): falling onto stone,
+    # hay, honey and slime, sliding on ice, down a ladder and into water, and standing, small, a
+    # marker, without gravity, posed and invisible; watched, as `redstone`.
+    "stands": Config({}, view=3, scenarios=("watch",), world=FIXTURES / "stands" / "world", fixture="stands",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)),)),
 }
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.

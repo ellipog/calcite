@@ -293,6 +293,8 @@ The `items_saved` configuration loads [`items_saved.txt`](fixtures/items_saved.t
 
 The `orbs` configuration loads [`orbs.txt`](fixtures/orbs.txt)'s world, three sculk and a sculk catalyst east of the spawn, with the dig configurations' rules but drops on, and the bot in survival with a diamond hoe with mending ([D397](../docs/decisions.md)). Every orb's packets are vanilla's, byte for byte: its `add_entity` with its UUID and motion, its value as it's paired and again on its tracker's first run, its moves as it follows the bot, and its `take_item_entity` and `remove_entities` as the bot picks it up, one every 2 ticks. So are the hoe's slot as it's damaged and as mending repairs it, the bot's attributes as its hand changes, each `set_experience` and the score in its data, and the bot as both servers save it. The catalyst's orbs, 3, 1 and 1, are made as it breaks, before the hoe's damage is sent.
 
+The `stands` configuration loads [`stands.txt`](fixtures/stands.txt)'s world, twelve armor stands on a stone floor by the spawn, and watches it as `redstone` ([D399](../docs/decisions.md)): falling 10 blocks onto stone, a hay bale, a honey block and a slime block, which it bounces on; sliding east on ice; down a ladder; into a pool of water; and standing, small and turned, a marker, without gravity in the air, posed with its arms and no base plate, and invisible. Every stand's packets are vanilla's: its `add_entity`, values and attributes as it's paired, its speed's attribute as it first ticks, its motion, its moves along the path it took, `VecDelta.Stepped`, a step a bounce's, its syncs as it lands, its falls' and steps' sounds, the dust it throws up and the honey's entity event, each in its place.
+
 ## The round trip
 
 ```sh
