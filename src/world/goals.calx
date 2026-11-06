@@ -1,0 +1,574 @@
+/// Mobs' goals, as vanilla's `GoalSelector` keeps them (CAL-158): `GoalSelector`, the goals a mob
+/// has in the order its kind adds them, `ObjectLinkedOpenHashSet`'s, each with its priority, the
+/// controls it takes, `Goal.Flag`, whether it ticks every tick, whether it's running, and its own
+/// state, `Goal`; and which goal holds each control, `lockedFlags`, a goal that stops keeping its
+/// hold until the next tick's cleanup, as vanilla's does. The goals' workings are `world.mob`'s,
+/// as they read the whole mob; what they read of the world is here: `Sensing`, the targets a mob
+/// has seen or not this tick; `sees`, `hasLineOfSight`, through the blocks' collision shapes as
+/// the mob meets them, `clip` with `COLLIDER` and no fluid, which `BlockGetter.traverseBlocks`
+/// steps through and each shape `VoxelShape.clip`s; `nearest_player`, `getNearestPlayer` with a
+/// mob's `TargetingConditions` that aren't for combat; and the places `LandRandomPos` and
+/// `DefaultRandomPos` try, each drawn from the mob's random as `RandomPos` draws it, which the mob
+/// weighs by its walk target value.
+module world.goals
+
+import math.mth.{floor}
+import random.legacy.{LegacyRandom}
+import world.collision.{CollisionBlocks}
+import world.experience_orb.{Follower}
+import world.movement.{MovementStates, Mover}
+import world.paths.{PathStates, PathTypeCache, state_at}
+import worldgen.facts.{Facts}
+
+/// The controls a goal takes, `Goal.Flag`, a bit each, in the enum's order.
+pub const FLAG_MOVE: u32 = 1
+pub const FLAG_LOOK: u32 = 2
+pub const FLAG_JUMP: u32 = 4
+pub const FLAG_TARGET: u32 = 8
+
+/// The goals whose workings come later, by kind: `PanicGoal` and a horse's `MountPanicGoal`,
+/// which panic where a mob's hurt, freezing or on fire; `BreedGoal`, for one in love; `TemptGoal`,
+/// toward a player holding its food; `FollowParentGoal`, a baby's; and `RunAroundLikeCrazyGoal`, a
+/// horse's under a rider. None of them draws as it isn't used, so each is never used till then.
+pub const LATER_PANIC: i32 = 0
+pub const LATER_BREED: i32 = 1
+pub const LATER_TEMPT: i32 = 2
+pub const LATER_FOLLOW_PARENT: i32 = 3
+pub const LATER_RUN_AROUND: i32 = 4
+
+/// A goal's own state, by its kind.
+pub enum Goal {
+    /// `FloatGoal`.
+    Float(i32)
+    LookAround(LookAround)
+    LookAtPlayer(LookAtPlayer)
+    Stroll(Stroll)
+    EatBlock(EatBlock)
+    Stand(Stand)
+    /// One whose workings come later, by its `LATER_` kind.
+    Later(i32)
+}
+
+/// `RandomLookAroundGoal`'s: which way it looks, and for how long more.
+pub struct LookAround {
+    pub rel_x: f64 = 0.0
+    pub rel_z: f64 = 0.0
+    pub look_time: i32 = 0
+}
+
+/// `LookAtPlayerGoal`'s: the player it looks at, by ID; how far it looks, and how likely it is to
+/// start; for how long more.
+pub struct LookAtPlayer {
+    pub look_at: i32? = none
+    pub distance: f32
+    pub probability: f32 = 0.02f32
+    pub look_time: i32 = 0
+}
+
+/// `RandomStrollGoal`'s, and `WaterAvoidingRandomStrollGoal`'s where `water_avoiding`: where it's
+/// going and how fast; one in how many full ticks it starts, `interval`; whether it's told to,
+/// `forceTrigger`; and whether it rests once it's done nothing for 100 ticks.
+pub struct Stroll {
+    pub wanted_x: f64 = 0.0
+    pub wanted_y: f64 = 0.0
+    pub wanted_z: f64 = 0.0
+    pub speed: f64
+    pub interval: i32 = 120
+    pub force: bool = false
+    pub check_no_action: bool = true
+    pub water_avoiding: bool = true
+    pub probability: f32 = 0.001f32
+}
+
+/// `EatBlockGoal`'s: how long its eating has left, `eatAnimationTick`.
+pub struct EatBlock {
+    pub tick: i32 = 0
+}
+
+/// A horse's `RandomStandGoal`'s: its count toward standing, `nextStand`, below 0 at first.
+pub struct Stand {
+    pub next: i32
+}
+
+/// A goal as its selector keeps it, `WrappedGoal`.
+pub struct Wrapped {
+    pub priority: i32
+    pub flags: u32
+    pub every_tick: bool
+    pub running: bool = false
+    pub goal: Goal?
+}
+
+/// A mob's `GoalSelector`: its goals in the order they were added, which goal holds each control,
+/// by the goal's place, and the controls turned off, `disabledFlags`.
+pub struct GoalSelector {
+    entries: List<Wrapped> = List<Wrapped>()
+    move_holder: i32 = -1
+    look_holder: i32 = -1
+    jump_holder: i32 = -1
+    target_holder: i32 = -1
+    disabled: u32 = 0
+}
+
+/// `Goal.reducedTickDelay`: half, rounded up, as a goal that doesn't tick every tick counts.
+pub fn reduced_tick_delay(ticks: i32) -> i32 {
+    return (ticks + 1) / 2
+}
+
+impl GoalSelector {
+    /// None.
+    pub fn new() -> GoalSelector {
+        return GoalSelector()
+    }
+
+    /// `addGoal`, its flags and whether it ticks every tick, `requiresUpdateEveryTick`, as its
+    /// kind sets them.
+    pub fn add(mut self, priority: i32, flags: u32, every_tick: bool, goal: own Goal) {
+        self.entries.push(Wrapped { priority: priority, flags: flags, every_tick: every_tick, goal: some(goal) })
+    }
+
+    pub fn len(self) -> usize {
+        return self.entries.len()
+    }
+
+    pub fn running(self, i: usize) -> bool {
+        return self.entries[i].running
+    }
+
+    pub fn set_running(mut self, i: usize, on: bool) {
+        self.entries[i].running = on
+    }
+
+    pub fn every_tick(self, i: usize) -> bool {
+        return self.entries[i].every_tick
+    }
+
+    pub fn flags(self, i: usize) -> u32 {
+        return self.entries[i].flags
+    }
+
+    /// `goalContainsAnyFlags` of the controls turned off.
+    pub fn disabled_for(self, i: usize) -> bool {
+        return self.entries[i].flags & self.disabled != 0
+    }
+
+    /// `setControlFlag`.
+    pub fn set_control(mut self, flag: u32, enabled: bool) {
+        if enabled {
+            self.disabled = self.disabled & ~flag
+        } else {
+            self.disabled = self.disabled | flag
+        }
+    }
+
+    /// The goal that holds the control of bit `k`, 0 to 3, by its place, or -1 for none.
+    pub fn holder(self, k: i32) -> i32 {
+        if k == 0 {
+            return self.move_holder
+        }
+        if k == 1 {
+            return self.look_holder
+        }
+        if k == 2 {
+            return self.jump_holder
+        }
+        return self.target_holder
+    }
+
+    /// The control of bit `k` held by the goal at `i`.
+    pub fn lock(mut self, k: i32, i: usize) {
+        let at = i32.wrap(i)
+        if k == 0 {
+            self.move_holder = at
+        } else if k == 1 {
+            self.look_holder = at
+        } else if k == 2 {
+            self.jump_holder = at
+        } else {
+            self.target_holder = at
+        }
+    }
+
+    /// `goalCanBeReplacedForAllFlags`: whether each control the goal at `i` takes is held by none,
+    /// or by a goal of a greater priority number, running or not; every goal can be interrupted.
+    pub fn replaceable(self, i: usize) -> bool {
+        for k in 0..4 {
+            if self.entries[i].flags & (1u32 << u32.wrap(k)) != 0 {
+                let h = self.holder(k)
+                if h >= 0 and not (self.entries[i].priority < self.entries[usize.wrap(h)].priority) {
+                    return false
+                }
+            }
+        }
+        return true
+    }
+
+    /// `lockedFlags.entrySet().removeIf`: the holds of goals not running let go.
+    pub fn unlock_stopped(mut self) {
+        for k in 0..4 {
+            let h = self.holder(k)
+            if h >= 0 and not self.entries[usize.wrap(h)].running {
+                if k == 0 {
+                    self.move_holder = -1
+                } else if k == 1 {
+                    self.look_holder = -1
+                } else if k == 2 {
+                    self.jump_holder = -1
+                } else {
+                    self.target_holder = -1
+                }
+            }
+        }
+    }
+
+    /// The goal at `i`'s state, lent out to be worked on and given back with `put`.
+    pub fn take(mut self, i: usize) -> Goal? {
+        return self.entries[i].goal.take()
+    }
+
+    pub fn put(mut self, i: usize, g: own Goal) {
+        self.entries[i].goal = some(g)
+    }
+}
+
+/// A mob's `Sensing`: the entities it's found it can see this tick, and those it can't, by ID.
+pub struct Sensing {
+    seen: List<i32> = List<i32>()
+    unseen: List<i32> = List<i32>()
+}
+
+impl Sensing {
+    /// `tick`: nothing known.
+    pub fn clear(mut self) {
+        self.seen.clear()
+        self.unseen.clear()
+    }
+
+    /// Whether it's known to see `id` this tick, if it's known.
+    pub fn known(self, id: i32) -> bool? {
+        for s in self.seen {
+            if s == id {
+                return some(true)
+            }
+        }
+        for s in self.unseen {
+            if s == id {
+                return some(false)
+            }
+        }
+        return none
+    }
+
+    pub fn note(mut self, id: i32, seen: bool) {
+        if seen {
+            self.seen.push(id)
+        } else {
+            self.unseen.push(id)
+        }
+    }
+}
+
+/// `LivingEntity.hasLineOfSight` from eyes at fx, fy, fz to tx, ty, tz: none farther than 128,
+/// and none where `clip` with `COLLIDER` and no fluid hits a block's collision shape as `mover`
+/// meets it; a block not loaded is air.
+pub fn sees<B: CollisionBlocks>(m: MovementStates, f: Facts, blocks: B, mover: Mover, fx: f64, fy: f64, fz: f64, tx: f64, ty: f64, tz: f64) -> bool {
+    let dx = fx - tx
+    let dy = fy - ty
+    let dz = fz - tz
+    if (dx * dx + dy * dy + dz * dz).sqrt() > 128.0 {
+        return false
+    }
+    return not clips(m, f, blocks, mover, fx, fy, fz, tx, ty, tz)
+}
+
+// `BlockGetter.traverseBlocks` with `clip`'s step: each block the line from fx, fy, fz to tx,
+// ty, tz goes through, nudged 1.0E-7 inward at both ends, until one's shape clips it.
+fn clips<B: CollisionBlocks>(m: MovementStates, f: Facts, blocks: B, mover: Mover, fx: f64, fy: f64, fz: f64, tx: f64, ty: f64, tz: f64) -> bool {
+    if fx == tx and fy == ty and fz == tz {
+        return false
+    }
+    let to_x = tx + -1.0e-7 * (fx - tx)
+    let to_y = ty + -1.0e-7 * (fy - ty)
+    let to_z = tz + -1.0e-7 * (fz - tz)
+    let from_x = fx + -1.0e-7 * (tx - fx)
+    let from_y = fy + -1.0e-7 * (ty - fy)
+    let from_z = fz + -1.0e-7 * (tz - fz)
+    var bx = floor(from_x)
+    var by = floor(from_y)
+    var bz = floor(from_z)
+    if block_clips(m, f, blocks, mover, bx, by, bz, fx, fy, fz, tx, ty, tz) {
+        return true
+    }
+    let dx = to_x - from_x
+    let dy = to_y - from_y
+    let dz = to_z - from_z
+    let sx = sign(dx)
+    let sy = sign(dy)
+    let sz = sign(dz)
+    let delta_x = if sx == 0 { f64.MAX } else { f64(sx) / dx }
+    let delta_y = if sy == 0 { f64.MAX } else { f64(sy) / dy }
+    let delta_z = if sz == 0 { f64.MAX } else { f64(sz) / dz }
+    var t_x = delta_x * (if sx > 0 { 1.0 - frac(from_x) } else { frac(from_x) })
+    var t_y = delta_y * (if sy > 0 { 1.0 - frac(from_y) } else { frac(from_y) })
+    var t_z = delta_z * (if sz > 0 { 1.0 - frac(from_z) } else { frac(from_z) })
+    while t_x <= 1.0 or t_y <= 1.0 or t_z <= 1.0 {
+        if t_x < t_y {
+            if t_x < t_z {
+                bx += sx
+                t_x += delta_x
+            } else {
+                bz += sz
+                t_z += delta_z
+            }
+        } else if t_y < t_z {
+            by += sy
+            t_y += delta_y
+        } else {
+            bz += sz
+            t_z += delta_z
+        }
+        if block_clips(m, f, blocks, mover, bx, by, bz, fx, fy, fz, tx, ty, tz) {
+            return true
+        }
+    }
+    return false
+}
+
+// `Mth.sign`.
+fn sign(v: f64) -> i32 {
+    if v == 0.0 {
+        return 0
+    }
+    return if v > 0.0 { 1 } else { -1 }
+}
+
+// `Mth.frac`.
+fn frac(v: f64) -> f64 {
+    return v - v.floor()
+}
+
+// `VoxelShape.clip` of the block at x, y, z's collision shape: none for an empty shape or a line
+// shorter than 1.0E-7 squared; a hit where a thousandth along the line is inside it; else where the
+// line crosses one of its boxes' faces, `AABB.clip`.
+fn block_clips<B: CollisionBlocks>(m: MovementStates, f: Facts, blocks: B, mover: Mover, x: i32, y: i32, z: i32, fx: f64, fy: f64, fz: f64, tx: f64, ty: f64, tz: f64) -> bool {
+    let state = blocks.collision_state(x, y, z) else return false
+    let boxes = m.state_boxes(f, state, x, y, z, mover)
+    if boxes.is_empty() {
+        return false
+    }
+    let dx = tx - fx
+    let dy = ty - fy
+    let dz = tz - fz
+    if dx * dx + dy * dy + dz * dz < 1.0e-7 {
+        return false
+    }
+    let px = (fx + dx * 0.001) - f64(x)
+    let py = (fy + dy * 0.001) - f64(y)
+    let pz = (fz + dz * 0.001) - f64(z)
+    for b in boxes {
+        if b.min_x <= px and px < b.max_x and b.min_y <= py and py < b.max_y and b.min_z <= pz and pz < b.max_z {
+            return true
+        }
+    }
+    var scale = 1.0
+    var hit = false
+    for b in boxes {
+        let min_x = b.min_x + f64(x)
+        let min_y = b.min_y + f64(y)
+        let min_z = b.min_z + f64(z)
+        let max_x = b.max_x + f64(x)
+        let max_y = b.max_y + f64(y)
+        let max_z = b.max_z + f64(z)
+        if dx > 1.0e-7 {
+            if let s = clip_point(scale, dx, dy, dz, min_x, min_y, max_y, min_z, max_z, fx, fy, fz) {
+                scale = s
+                hit = true
+            }
+        } else if dx < -1.0e-7 {
+            if let s = clip_point(scale, dx, dy, dz, max_x, min_y, max_y, min_z, max_z, fx, fy, fz) {
+                scale = s
+                hit = true
+            }
+        }
+        if dy > 1.0e-7 {
+            if let s = clip_point(scale, dy, dz, dx, min_y, min_z, max_z, min_x, max_x, fy, fz, fx) {
+                scale = s
+                hit = true
+            }
+        } else if dy < -1.0e-7 {
+            if let s = clip_point(scale, dy, dz, dx, max_y, min_z, max_z, min_x, max_x, fy, fz, fx) {
+                scale = s
+                hit = true
+            }
+        }
+        if dz > 1.0e-7 {
+            if let s = clip_point(scale, dz, dx, dy, min_z, min_x, max_x, min_y, max_y, fz, fx, fy) {
+                scale = s
+                hit = true
+            }
+        } else if dz < -1.0e-7 {
+            if let s = clip_point(scale, dz, dx, dy, max_z, min_x, max_x, min_y, max_y, fz, fx, fy) {
+                scale = s
+                hit = true
+            }
+        }
+    }
+    return hit
+}
+
+// `AABB.clipPoint`: how far along the line it crosses the face at `point` of axis a, where that's
+// past its start, nearer than `scale`, and within the face's bounds but for 1.0E-7.
+fn clip_point(scale: f64, da: f64, db: f64, dc: f64, point: f64, min_b: f64, max_b: f64, min_c: f64, max_c: f64, from_a: f64, from_b: f64, from_c: f64) -> f64? {
+    let s = (point - from_a) / da
+    let pb = from_b + s * db
+    let pc = from_c + s * dc
+    if 0.0 < s and s < scale and min_b - 1.0e-7 < pb and pb < max_b + 1.0e-7 and min_c - 1.0e-7 < pc and pc < max_c + 1.0e-7 {
+        return some(s)
+    }
+    return none
+}
+
+/// What a mob that looks for a player is to them, as `TargetingConditions` for no combat test it:
+/// its ID, where its feet and eyes are, and how its collisions see it.
+pub struct Looker {
+    pub id: i32
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    pub eye_y: f64
+    pub mover: Mover
+}
+
+/// `getNearestPlayer(TargetingConditions, mob, x, eyeY, z)` with `forNonCombat().range(range)`:
+/// of `players`, in the level's order, those seen by anyone, alive and not spectating, within the
+/// range from the mob's feet, 0.8 of it for one crouching, `getVisibilityPercent`, but 2 at least,
+/// and in its sight, as `sensing` remembers it for the tick, the nearest to its eyes, the last of
+/// those as near.
+pub fn nearest_player<B: CollisionBlocks>(m: MovementStates, f: Facts, blocks: B, sensing: mut Sensing, who: Looker, players: List<Follower>, range: f64) -> i32? {
+    var best = -1.0
+    var found: i32? = none
+    for p in players {
+        if p.id == who.id or p.spectator or p.dead {
+            continue
+        }
+        let visibility = if p.discrete { 0.8 } else { 1.0 }
+        let seen_within = if range * visibility > 2.0 { range * visibility } else { 2.0 }
+        let fx = who.x - p.x
+        let fy = who.y - p.y
+        let fz = who.z - p.z
+        if fx * fx + fy * fy + fz * fz > seen_within * seen_within {
+            continue
+        }
+        var in_sight = false
+        if let k = sensing.known(p.id) {
+            in_sight = k
+        } else {
+            in_sight = sees(m, f, blocks, who.mover, who.x, who.eye_y, who.z, p.x, p.y + f64(p.eyes), p.z)
+            sensing.note(p.id, in_sight)
+        }
+        if not in_sight {
+            continue
+        }
+        let ex = p.x - who.x
+        let ey = p.y - who.eye_y
+        let ez = p.z - who.z
+        let d = ex * ex + ey * ey + ez * ez
+        if best == -1.0 or d < best {
+            best = d
+            found = some(p.id)
+        }
+    }
+    return found
+}
+
+/// What the places a mob may stroll to are tried against: where it is, and the least and highest
+/// y blocks are at.
+pub struct Wander {
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    pub min_y: i32
+    pub top_y: i32
+}
+
+// `RandomPos.generateRandomDirection`: up to `h` across and `v` up or down.
+fn random_direction(random: mut LegacyRandom, h: i32, v: i32) -> (i32, i32, i32) {
+    let x = random.next_int_below(2 * h + 1) - h
+    let y = random.next_int_below(2 * v + 1) - v
+    let z = random.next_int_below(2 * h + 1) - h
+    return (x, y, z)
+}
+
+// `RandomPos.generateRandomPosTowardDirection` for a mob with no home: the place that far from it.
+fn toward(w: Wander, d: (i32, i32, i32)) -> (i32, i32, i32) {
+    let (x, y, z) = d
+    return (floor(f64(x) + w.x), floor(f64(y) + w.y), floor(f64(z) + w.z))
+}
+
+// `isOutsideLimits` and `isNotStable`: within the build height, over a block solid to render.
+fn stable_within<B: CollisionBlocks>(f: Facts, blocks: B, w: Wander, x: i32, y: i32, z: i32) -> bool {
+    if y < w.min_y or y > w.top_y {
+        return false
+    }
+    return f.solid_render(state_at(blocks, x, y - 1, z))
+}
+
+// `GoalUtils.hasMalus`: whether the mob's malus for the place's static path type isn't 0.
+fn has_malus<B: CollisionBlocks>(p: PathStates, blocks: B, cache: mut PathTypeCache, maluses: List<f32>, w: Wander, x: i32, y: i32, z: i32) -> bool {
+    return maluses[usize(p.at(blocks, mut cache, w.min_y, x, y, z))] != 0.0f32
+}
+
+/// The 10 places `LandRandomPos.getPos` tries for a mob with no home, up to `h` across and `v` up
+/// or down: each toward a direction drawn from its random, within the build height and over a
+/// block solid to render, moved up out of what's solid, `movePosUpOutOfSolid`, but none in water
+/// or with a malus.
+pub fn land_tries<B: CollisionBlocks>(random: mut LegacyRandom, f: Facts, p: PathStates, blocks: B, cache: mut PathTypeCache, maluses: List<f32>, w: Wander, h: i32, v: i32) -> List<(i32, i32, i32)?> {
+    var out = List<(i32, i32, i32)?>()
+    for _ in 0..10 {
+        let d = random_direction(mut random, h, v)
+        let (x, y0, z) = toward(w, d)
+        if not stable_within(f, blocks, w, x, y0, z) {
+            out.push(none)
+            continue
+        }
+        var y = y0
+        if f.is_solid(state_at(blocks, x, y, z)) {
+            y += 1
+            while y <= w.top_y and f.is_solid(state_at(blocks, x, y, z)) {
+                y += 1
+            }
+        }
+        if f.is_water(state_at(blocks, x, y, z)) or has_malus(p, blocks, mut cache, maluses, w, x, y, z) {
+            out.push(none)
+        } else {
+            out.push(some((x, y, z)))
+        }
+    }
+    return out
+}
+
+/// The 10 places `DefaultRandomPos.getPos` tries for a mob with no home: as `land_tries`, but
+/// neither moved up nor kept from water.
+pub fn default_tries<B: CollisionBlocks>(random: mut LegacyRandom, f: Facts, p: PathStates, blocks: B, cache: mut PathTypeCache, maluses: List<f32>, w: Wander, h: i32, v: i32) -> List<(i32, i32, i32)?> {
+    var out = List<(i32, i32, i32)?>()
+    for _ in 0..10 {
+        let d = random_direction(mut random, h, v)
+        let (x, y, z) = toward(w, d)
+        if stable_within(f, blocks, w, x, y, z) and not has_malus(p, blocks, mut cache, maluses, w, x, y, z) {
+            out.push(some((x, y, z)))
+        } else {
+            out.push(none)
+        }
+    }
+    return out
+}
+
+/// What a sheep's eating does to the level, `EatBlockGoal.tick`'s, where mob griefing lets it:
+/// the block at x, y, z broken without its drops, `destroyBlock`, where `whole`; else the grass
+/// block there turned to dirt, its break shown, level event 2001.
+pub struct Grazed {
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub whole: bool
+}
