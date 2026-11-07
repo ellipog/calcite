@@ -79,11 +79,11 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # `orbs`, where it breaks blocks that give experience; `feed`, where it feeds animals; `attack`,
 # where it hits and kills them; `sweep`, where it sweeps them with a sword; `enchant`, where it hits
 # them with enchanted swords; `protect`, where it hits zombies in enchanted armor; `stand-hits`,
-# where it hits armor stands; `fall`, where it falls; and `checks`, where its moves are checked
-# (src/rig/session.calx).
+# where it hits armor stands; `thorns`, where it hits a zombie in thorns; `fall`, where it falls;
+# and `checks`, where its moves are checked (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
-                   "checks", "stand-hits"]
+                   "checks", "stand-hits", "thorns"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -310,6 +310,11 @@ ATTACK = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0
 # (D417).
 SWEEP = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
     slotted(0, "iron_sword"),
+]), equipment={})
+# The bot's data in `thorns`: in survival mode at the spawn, facing east, its hands empty, with
+# bread in its second slot, which its death drops (D442).
+THORNS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(1, "bread", 3),
 ]), equipment={})
 # The bot's data in `enchant`: in survival mode at the spawn, facing east, holding an iron sword
 # with smite V, with a wooden sword with sharpness I and knockback II in the second slot and one
@@ -605,6 +610,15 @@ CONFIGS = {
                          fixture="stand_hits",
                          rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                          player=ENCHANT),
+    # The bot, in survival mode with its hands empty, hits the thorns fixture's zombie by the
+    # server's clock, on normal, which keeps him (D442): his thorns hurt it back, knocking it back
+    # and bringing it into combat, which ends 300 of its ticks after; then they kill it, the
+    # message naming him, and it leaves dead.
+    "thorns": Config({"difficulty": "normal"}, view=3, scenarios=("thorns",), world=FIXTURES / "thorns" / "world",
+                     fixture="thorns",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                            ("minecraft:respawn_radius", nbt.Int(0))),
+                     player=THORNS),
     # The bot, in survival mode by the checks fixture's wall, by the server's clock: a move too
     # quick, one through the wall and one into it, each of which the server sends it back from,
     # then a float it's kicked for (D420).
