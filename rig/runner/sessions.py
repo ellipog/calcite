@@ -629,7 +629,7 @@ CONFIGS = {
     # The bot, in survival mode with its hands empty, hits the thorns fixture's zombie by the
     # server's clock, on normal, which keeps him (D442): his thorns hurt it back, knocking it back
     # and bringing it into combat, which ends 300 of its ticks after; then they kill it, the
-    # message naming him, and it leaves dead.
+    # message naming him and the sword with a custom name he holds (D448), and it leaves dead.
     "thorns": Config({"difficulty": "normal"}, view=3, scenarios=("thorns",), world=FIXTURES / "thorns" / "world",
                      fixture="thorns",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
