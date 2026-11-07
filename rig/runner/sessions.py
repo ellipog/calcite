@@ -86,11 +86,12 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # where it hits armor stands; `thorns`, where it hits a zombie in thorns; `fall`, where it falls;
 # `mace`, where it falls onto a zombie with a mace; `swim`, where it sprints and swims; `checks`,
 # where its moves are checked; `duel`, where it hits a second player, Mate, whom the same bot
-# runs, recording Mate's packets as `duel-mate`; `zombie`, where a zombie hunts it; and `arrows`,
-# where arrows fly by it and onto it (src/rig/session.calx).
+# runs, recording Mate's packets as `duel-mate`; `zombie`, where a zombie hunts it; `arrows`,
+# where arrows fly by it and onto it; and `skeleton`, where a skeleton shoots it or runs from the
+# sun (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
-                   "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows"]
+                   "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -694,6 +695,22 @@ CONFIGS = {
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
                      player=ARROWS),
+    # The bot, in survival mode with its hands empty, stands at the spawn, on normal at midnight,
+    # while Bones, the skeleton ten blocks east with his AI and a bow, takes it up as his target,
+    # draws, shoots it and strafes about it (CAL-159).
+    "skeleton": Config({"difficulty": "normal"}, view=3, scenarios=("skeleton",), world=FIXTURES / "skeleton" / "world",
+                       fixture="skeleton",
+                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                              ("minecraft:respawn_radius", nbt.Int(0))),
+                       player=THORNS),
+    # The bot, in creative mode with nothing, which no monster takes up, stands at the spawn, on
+    # normal at noon, while Sunny, the skeleton out in the sun with his AI, burns and runs for the
+    # shade under the stone roof by him, his paths kept out of the sun once he's in it (CAL-159).
+    "skeleton-sun": Config({"difficulty": "normal"}, view=3, scenarios=("skeleton",),
+                           world=FIXTURES / "skeleton-sun" / "world", fixture="skeleton-sun",
+                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                  ("minecraft:respawn_radius", nbt.Int(0))),
+                           player=PLACE_CREATIVE),
     # `thorns` with the bot holding an iron sword with unbreaking III: the hit whose thorns kill it
     # drops the sword, which the attack then wears, as vanilla's `postHurtEnemy` wears the stack
     # the drop holds, unbreaking drawing from the level's random (D450).
