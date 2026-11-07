@@ -80,11 +80,15 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # where it hits and kills them; `sweep`, where it sweeps them with a sword; `enchant`, where it hits
 # them with enchanted swords; `protect`, where it hits zombies in enchanted armor; `stand-hits`,
 # where it hits armor stands; `thorns`, where it hits a zombie in thorns; `fall`, where it falls;
-# `mace`, where it falls onto a zombie with a mace; `swim`, where it sprints and swims; and
-# `checks`, where its moves are checked (src/rig/session.calx).
+# `mace`, where it falls onto a zombie with a mace; `swim`, where it sprints and swims; `checks`,
+# where its moves are checked; and `duel`, where it hits a second player, Mate, whom the same bot
+# runs, recording Mate's packets as `duel-mate` (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
-                   "checks", "stand-hits", "thorns", "mace", "swim"]
+                   "checks", "stand-hits", "thorns", "mace", "swim", "duel"]
+# The scenario a second player's packets are recorded as, by the scenario the bot runs it in
+# (CAL-162).
+MATE_SCENARIOS = {"duel": "duel-mate"}
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -127,6 +131,9 @@ class Config:
     tape: bool = False
     # What else of the bot's saved data is compared, past PLAYER_KEYS (D418).
     keys: tuple = ()
+    # The second player's saved data, Mate's, whom the whitelist lets in with the bot, or none
+    # where there's none (CAL-162).
+    mate: dict | None = None
 
 
 def stack(item, count=1, components=None):
@@ -324,6 +331,15 @@ THORNS_SWORD = dict(THORNS, Health=nbt.Float(10.0), Inventory=nbt.List(nbt.COMPO
     slotted(0, "iron_sword", 1, {"minecraft:enchantments": {"minecraft:unbreaking": nbt.Int(3)}}),
     slotted(1, "bread", 3),
 ]))
+# The bot's data in `duel`: in survival mode at the spawn, facing east, an iron sword in its first
+# slot and nothing in its second; and Mate's, two blocks east of it, facing west, with nothing, at
+# 17 food, so it doesn't heal as it's hit (CAL-162).
+DUEL = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "iron_sword"),
+]), equipment={})
+DUEL_MATE = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(2.5), nbt.Double(-60.0), nbt.Double(0.5)]),
+                 Rotation=nbt.List(nbt.FLOAT, [nbt.Float(90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, []),
+                 equipment={}, foodLevel=nbt.Int(17))
 # The bot's data in `enchant`: in survival mode at the spawn, facing east, holding an iron sword
 # with smite V, with a wooden sword with sharpness I and knockback II in the second slot and one
 # with fire aspect II in the third (D438).
@@ -642,6 +658,14 @@ CONFIGS = {
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
                      player=THORNS),
+    # The bot, in survival with an iron sword, hits a second player, Mate, by the server's clock on
+    # the duel fixture's world, on normal, a sheep by Mate (CAL-162): a punch, a sword's hit whose
+    # sweep reaches the sheep, a hit on the sheep whose sweep reaches Mate, a sprint's knockback
+    # attack, then hits till Mate dies and one once it's respawned, and Mate leaves before the bot.
+    "duel": Config({"difficulty": "normal"}, view=3, scenarios=("duel",), world=FIXTURES / "duel" / "world", fixture="duel",
+                   rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                          ("minecraft:respawn_radius", nbt.Int(0))),
+                   player=DUEL, mate=DUEL_MATE),
     # `thorns` with the bot holding an iron sword with unbreaking III: the hit whose thorns kill it
     # drops the sword, which the attack then wears, as vanilla's `postHurtEnemy` wears the stack
     # the drop holds, unbreaking drawing from the level's random (D450).
@@ -780,6 +804,8 @@ CONFIGS = {
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
 BOT = "Bot"
+# The second player's name, whom a configuration with `mate` lists with the bot (CAL-162).
+MATE = "Mate"
 # Typed into vanilla's console once it's up, with what it answers. A player joins at a random
 # place within `respawn_radius` of the spawn, drawn from a thread-local random, which can't be
 # the same on both servers, so it's 0: on the spawn, or the ground there. Calcite reads it from
@@ -860,6 +886,8 @@ def prepare(folder, config, port, vanilla):
             nbt.write(folder / "world" / "level.dat", level)
     if c.player is not None:
         nbt.write(folder / "world" / "players" / "data" / f"{offline_uuid(BOT)}.dat", c.player)
+    if c.mate is not None:
+        nbt.write(folder / "world" / "players" / "data" / f"{offline_uuid(MATE)}.dat", c.mate)
     rules = folder / "world" / "data" / "minecraft" / "game_rules.dat"
     if rules.is_file():
         saved = nbt.read(rules)
@@ -871,6 +899,8 @@ def prepare(folder, config, port, vanilla):
         nbt.write(rules, {"data": {"minecraft:respawn_radius": nbt.Int(0)}, "DataVersion": nbt.Int(DATA_VERSION)})
     (folder / "server.properties").write_text("".join(f"{k}={v}\n" for k, v in props.items()), encoding="utf-8")
     listed = [{"uuid": offline_uuid(BOT), "name": BOT}]
+    if c.mate is not None:
+        listed.append({"uuid": offline_uuid(MATE), "name": MATE})
     (folder / "whitelist.json").write_text(json.dumps(listed, indent=2) + "\n", encoding="utf-8")
     if c.ops:
         ops = [{"uuid": offline_uuid(n), "name": n, "level": 4, "bypassesPlayerLimit": False} for n in c.ops]
@@ -948,8 +978,10 @@ def record(config, side, argv, bot, scenarios):
     try:
         for scenario in scenarios:
             out = folder / f"{scenario}.bin"
-            got = subprocess.run([str(bot), str(port), str(CONFIGS[config].view), scenario, str(out)], cwd=CALCITE,
-                                 capture_output=True, text=True, encoding="utf-8", timeout=120)
+            argv = [str(bot), str(port), str(CONFIGS[config].view), scenario, str(out)]
+            if scenario in MATE_SCENARIOS:
+                argv.append(str(folder / f"{MATE_SCENARIOS[scenario]}.bin"))
+            got = subprocess.run(argv, cwd=CALCITE, capture_output=True, text=True, encoding="utf-8", timeout=120)
             if got.returncode != 0:
                 sys.exit(f"sessions: the bot failed {scenario} against {side}:\n{got.stdout}{got.stderr}")
             print(f"  {side}: {scenario}: {got.stdout.strip()}", flush=True)
@@ -966,14 +998,15 @@ def typed(value):
     return (type(value).__name__, value)
 
 
-def compare_saved(config):
+def compare_saved(config, name=None):
     """Whether both servers saved the bot's PLAYER_KEYS and the configuration's own keys the same,
-    printing what differs."""
+    or the player `name`'s, printing what differs."""
+    name = name or BOT
     saved = {}
     for side in ("vanilla", "calcite"):
-        path = SESSIONS / config / side / "world" / "players" / "data" / f"{offline_uuid(BOT)}.dat"
+        path = SESSIONS / config / side / "world" / "players" / "data" / f"{offline_uuid(name)}.dat"
         if not path.is_file():
-            print(f"saved player   differs  [{config}] {side} saved no data for the bot")
+            print(f"saved player   differs  [{config}] {side} saved no data for {name}")
             return False
         saved[side] = nbt.read(path)
     def kept(side, k):
@@ -984,7 +1017,8 @@ def compare_saved(config):
 
     keys = PLAYER_KEYS + CONFIGS[config].keys
     differ = [k for k in keys if kept("vanilla", k) != kept("calcite", k)]
-    print(f"saved player   {'PASS' if not differ else 'differs'}    {len(keys) - len(differ)} match, {len(differ)} differ")
+    who = "" if name == BOT else f" ({name})"
+    print(f"saved player   {'PASS' if not differ else 'differs'}    {len(keys) - len(differ)} match, {len(differ)} differ{who}")
     for k in differ:
         print(f"  [{config}] {k}:\n      vanilla: {saved['vanilla'].get(k)}\n      calcite: {saved['calcite'].get(k)}")
     return not differ
@@ -1049,12 +1083,16 @@ def main():
                 print(f"{config}: the levels' draws, vanilla's against Calcite's (D312):", flush=True)
                 tapediff.compare(tapediff.read(SESSIONS / config / "vanilla" / "tape.txt"),
                                  tapediff.read(SESSIONS / config / "calcite" / "tape.txt"), args.show, RESEED + 1)
+    # What a second player recorded is compared as a scenario of its own (CAL-162).
+    for c in configs:
+        scenarios[c] = scenarios[c] + [MATE_SCENARIOS[s] for s in scenarios[c] if s in MATE_SCENARIOS]
     files = [SESSIONS / c / side / f"{s}.bin" for c in configs for side in ("vanilla", "calcite") for s in scenarios[c]]
     if not files:
         sys.exit("sessions: no configuration has those scenarios")
     dump(a, files)
     report = sessiondiff.run(SESSIONS, configs, scenarios, CALCITE / "rig" / "differences", show=args.show, complete=complete)
-    saved = all([compare_saved(c) for c in configs if CONFIGS[c].player is not None and scenarios[c]])
+    saved = all([compare_saved(c) for c in configs if CONFIGS[c].player is not None and scenarios[c]]
+                + [compare_saved(c, MATE) for c in configs if CONFIGS[c].mate is not None and scenarios[c]])
     for c in configs:
         if CONFIGS[c].fixture is not None and scenarios[c]:
             compare_chunks(c, args.show)
