@@ -97,7 +97,7 @@ import world.placing.{PlaceFacts, Placement, bucket_stack, can_be_replaced, comp
 import world.attributes.{Attributes, Snapshot, attribute_id, broken, equip, sprint, stack_modifiers, unworn, update_player}
 import world.entity_data.{ABSORPTION, AIR_SUPPLY, FALL_FLYING_FLAG, ON_FIRE_FLAG, TICKS_FROZEN, CROUCHING, CROUCHING_FLAG, EntityData, HEALTH, MAIN_HAND, MODE_CUSTOMISATION, POSE_ID, SCORE, SHARED_FLAGS, SILENT, SPRINTING_FLAG, STANDING, SWIMMING, SWIMMING_FLAG, Value, player_data}
 import world.player_status.{Status, read_status, set_health, tick_food, tick_regeneration, write_status}
-import world.digging.{ABORT_DESTROY_BLOCK, ACTIONS, CHANGE_DESTROY_DIRECTION, DESTROY_PROGRESS, DESTROY_PROGRESS_SOUND, DROP_ALL_ITEMS, DROP_ITEM, Digging, RELEASE_USE_ITEM, STAB, START_DESTROY_BLOCK, STOP_DESTROY_BLOCK, SWAP_ITEM_WITH_OFFHAND, attack, break_block, can_destroy, destroy_progress, durability_change, entity_in_reach, eye_in_water, game_master, has_correct_tool, in_reach, java_int, within_range, may_break_in_adventure, may_use_in_adventure, mining_damage, player_destroy, shrunk, with_damage, enchanted_value, is_damaged, mends_in}
+import world.digging.{ABORT_DESTROY_BLOCK, ACTIONS, CHANGE_DESTROY_DIRECTION, DESTROY_PROGRESS, DESTROY_PROGRESS_SOUND, DROP_ALL_ITEMS, DROP_ITEM, Digging, RELEASE_USE_ITEM, STAB, START_DESTROY_BLOCK, STOP_DESTROY_BLOCK, SWAP_ITEM_WITH_OFFHAND, attack, break_block, can_destroy, destroy_progress, durability_change, entity_in_reach, eye_in_water, game_master, has_correct_tool, in_reach, java_int, within_range, may_break_in_adventure, may_use_in_adventure, mining_damage, player_destroy, shrunk, emptied, with_damage, enchanted_value, is_damaged, mends_in}
 import world.block_level.{update_output_signal}
 import world.containers.{Opening, items_of, opening, put_items, start_open, stop_open}
 import world.inventory.{EnderChest, Inventory, MENU_SLOTS, equipment_names}
@@ -545,6 +545,11 @@ struct Player {
     // Whether they've asked to respawn and the server's waiting on where, which holds its tick
     // (D428).
     respawning: bool = false
+    // What their death took from their main hand, and the item it was dropped as, where it was,
+    // which the attack whose aftermath killed them wears after, as vanilla's `postHurtEnemy`
+    // wears the stack `Player.attack` took, the drop's by then (D450).
+    hand_taken: Tag? = none
+    hand_drop: i32? = none
     // Where the player was as their tick began, `firstGoodX`, and where the server last took
     // them, `lastGoodX`; how many moves they've sent, `receivedMovePacketCount`, and had sent as
     // their last tick ended, `knownMovePacketCount`; and whether their client has them floating,
@@ -8829,6 +8834,47 @@ impl Network {
         self.wear_worn(mut con, 0, amount)
     }
 
+    // `hurtAndBreak(amount, player, MAINHAND)` of `stack`, which the player's death took from their
+    // main hand in the attack that's wearing it, and dropped as the item `drop`, where it was
+    // (D450): the damage, as its enchantments and the level's random have it, `wear_worn`'s;
+    // where it breaks, it's shrunk to nothing and they're sent the main hand's break, event 47.
+    // The drop's stack is the one worn, as vanilla's holds the same stack, which changes without
+    // its `DATA_ITEM` being set: nothing's sent of it, but a player its tracker pairs with later
+    // is sent it as it is, and it's saved so; one shrunk to nothing goes at its next tick.
+    fn wear_taken(mut self, con: mut Connection, d: usize, stack: Tag, drop: i32?, amount: i32) {
+        if amount <= 0 {
+            return
+        }
+        let taken = self.items.take() else return
+        let change = durability_change(stack, amount, taken, con.player.abilities.instabuild, mut self.levels[d])
+        if change == 0 {
+            self.items = some(taken)
+            return
+        }
+        let now = match taken.component(stack, String("minecraft:damage")) {
+            some(t) => t.number_int() ?? 0,
+            none => 0,
+        }
+        var worn = with_damage(stack, now + change, taken)
+        if broken(worn, taken) {
+            worn = emptied(worn)
+            let me = con.player.entity_id
+            self.send(mut con, ClientboundEntityEvent { entity_id: me, event: 47i8 }, State.Play)
+        }
+        self.items = some(taken)
+        let id = drop else return
+        var es = self.take_entities(d)
+        if let lent = es.list.lend(id) {
+            var e = lent
+            e.stack = worn.copy()
+            es.list.give_back(e)
+            if es.trackers.contains(id) {
+                es.trackers[id].data = worn
+            }
+        }
+        self.put_entities(d, es)
+    }
+
     // `doHurtEquipment` of what the player wears in the equipment slots `slots`, in their order, by
     // `damage` of `source` (D431): where it's any, `(int) max(1, damage / 4)` of wear to each
     // that's equippable and worn by hurts, `Equippable.damageOnHurt`, and not resistant to the
@@ -9136,6 +9182,9 @@ impl Network {
         if not client_loaded(con) or con.player.mode == GameType.Spectator or not self.items_ready() {
             return true
         }
+        // What an earlier death took from their hand isn't this attack's (D450).
+        con.player.hand_taken = none
+        con.player.hand_drop = none
         let d = con.player.dim
         let id = p.entity_id
         if id == con.player.entity_id {
@@ -10085,13 +10134,25 @@ impl Network {
     // The end of `Player.attack` once what it did is seen, `s` in the level `d`, `dealt` taken
     // from what it hurt, whose middle is at `at`, as `follow_through` has it (D416): their weapon
     // worn, after a mace's smash forgets their fall, `MaceItem.postHurtEnemy` (D443), the damage
-    // indicator, and their exhaustion.
+    // indicator, and their exhaustion. A weapon their death took from their hand in the attack,
+    // its enchantments' or the target's armor's effects after it killing them, is worn where it
+    // went, `wear_taken` (D450).
     fn attack_after(mut self, con: mut Connection, d: usize, s: Struck, dealt: f32, at: (f64, f64, f64)) {
         if let n = s.per {
-            if stack_item(held_in(con, 0)) == "minecraft:mace" and can_smash(con) {
+            let taken = con.player.hand_taken.take()
+            let drop = con.player.hand_drop.take()
+            var weapon = held_in(con, 0)
+            if let t = taken {
+                weapon = some(t.copy())
+            }
+            if stack_item(weapon) == "minecraft:mace" and can_smash(con) {
                 con.player.fall = 0.0
             }
-            self.damage_held(mut con, n)
+            if let t = taken {
+                self.wear_taken(mut con, d, t, drop, n)
+            } else {
+                self.damage_held(mut con, n)
+            }
         }
         if dealt > 2.0f32 {
             let count = i32.saturate(f64(dealt) * 0.5)
@@ -10363,7 +10424,11 @@ impl Network {
                 continue
             }
             var con = self.connections[slot].take() else continue
-            if con.conn.id() != id or con.closing {
+            // Nothing's handled of a connection that's closing or that its client closed, as
+            // vanilla's `PacketProcessor` ignores a packet whose listener isn't accepting messages,
+            // `isAcceptingMessages` being `connection.isConnected()`: a client that sends and
+            // goes at once has what it sent dropped (D451).
+            if con.conn.id() != id or con.closing or con.gone {
                 self.connections[slot] = some(con)
                 continue
             }
@@ -12423,9 +12488,15 @@ impl Network {
     // stack of the 36 slots, then of the equipment, in `EquipmentSlot`'s order, dropped around
     // them, `createItemStackToDrop(stack, true, false)`, and taken out.
     fn drop_all(mut self, con: mut Connection) {
+        // What's taken from the main hand is kept, and the item it's dropped as, for the attack
+        // that may be wearing it (D450).
+        let hand = usize.wrap(con.player.selected)
         for i in 0..con.player.inventory.items.len() {
             if let s = con.player.inventory.items[i].copy() {
                 if self.vanishes(s) {
+                    if i == hand {
+                        con.player.hand_taken = some(s.copy())
+                    }
                     con.player.inventory.items[i] = none
                 }
             }
@@ -12438,8 +12509,13 @@ impl Network {
             }
         }
         var stacks = List<Tag>()
+        var hand_at: usize? = none
         for i in 0..con.player.inventory.items.len() {
             if let s = con.player.inventory.items[i].take() {
+                if i == hand {
+                    hand_at = some(stacks.len())
+                    con.player.hand_taken = some(s.copy())
+                }
                 stacks.push(s)
             }
         }
@@ -12449,12 +12525,15 @@ impl Network {
             }
         }
         let d = con.player.dim
-        for stack in stacks {
+        for n in 0..stacks.len() {
             var random = con.player.random.take() ?? LegacyRandom.new(self.entity_seed(con.player.entity_id))
-            let made = self.made_drop_around(con.player, mut random, stack.copy())
+            let made = self.made_drop_around(con.player, mut random, stacks[n].copy())
             con.player.random = some(random)
             let e = made else continue
             let id = e.body.id
+            if hand_at == some(n) {
+                con.player.hand_drop = some(id)
+            }
             self.add_item(d, e, some(con.player.entity_id))
             self.item_sees(d, id, mut con)
         }

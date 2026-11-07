@@ -317,6 +317,13 @@ SWEEP = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.
 THORNS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
     slotted(1, "bread", 3),
 ]), equipment={})
+# The bot's data in `thorns-sword`: `thorns`', holding an iron sword with unbreaking III, which its
+# death drops in the attack that wears it after (D450), on 10 health, so his thorns kill it while
+# it hits him with the sword rather than as it leaves.
+THORNS_SWORD = dict(THORNS, Health=nbt.Float(10.0), Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "iron_sword", 1, {"minecraft:enchantments": {"minecraft:unbreaking": nbt.Int(3)}}),
+    slotted(1, "bread", 3),
+]))
 # The bot's data in `enchant`: in survival mode at the spawn, facing east, holding an iron sword
 # with smite V, with a wooden sword with sharpness I and knockback II in the second slot and one
 # with fire aspect II in the third (D438).
@@ -635,6 +642,14 @@ CONFIGS = {
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
                      player=THORNS),
+    # `thorns` with the bot holding an iron sword with unbreaking III: the hit whose thorns kill it
+    # drops the sword, which the attack then wears, as vanilla's `postHurtEnemy` wears the stack
+    # the drop holds, unbreaking drawing from the level's random (D450).
+    "thorns-sword": Config({"difficulty": "normal"}, view=3, scenarios=("thorns",), world=FIXTURES / "thorns" / "world",
+                           fixture="thorns",
+                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                  ("minecraft:respawn_radius", nbt.Int(0))),
+                           player=THORNS_SWORD),
     # The bot, in survival mode with a mace, falls onto the mace fixture's column and from it to
     # the ground by the server's clock, on normal, which keeps the zombie, smashing as it falls
     # (D443): a heavy smash on him from seven blocks, which pushes the cow and the stand by him; a
