@@ -740,6 +740,14 @@ CONFIGS = {
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                   ("minecraft:respawn_radius", nbt.Int(0))),
                            player=PLACE_CREATIVE),
+    # The bot, in creative mode with nothing, which no monster takes up, stands at the spawn, on
+    # normal at midnight, while Hex, the witch six blocks east with her AI, strolls and looks about
+    # and at it, with no one to throw at and nothing to drink (CAL-159).
+    "witch": Config({"difficulty": "normal"}, view=3, scenarios=("skeleton",), world=FIXTURES / "witch" / "world",
+                    fixture="witch",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                           ("minecraft:respawn_radius", nbt.Int(0))),
+                    player=PLACE_CREATIVE),
     # `thorns` with the bot holding an iron sword with unbreaking III: the hit whose thorns kill it
     # drops the sword, which the attack then wears, as vanilla's `postHurtEnemy` wears the stack
     # the drop holds, unbreaking drawing from the level's random (D450).
