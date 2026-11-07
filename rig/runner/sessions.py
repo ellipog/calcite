@@ -80,11 +80,11 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # where it hits and kills them; `sweep`, where it sweeps them with a sword; `enchant`, where it hits
 # them with enchanted swords; `protect`, where it hits zombies in enchanted armor; `stand-hits`,
 # where it hits armor stands; `thorns`, where it hits a zombie in thorns; `fall`, where it falls;
-# `mace`, where it falls onto a zombie with a mace; and `checks`, where its moves are checked
-# (src/rig/session.calx).
+# `mace`, where it falls onto a zombie with a mace; `swim`, where it sprints and swims; and
+# `checks`, where its moves are checked (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
-                   "checks", "stand-hits", "thorns", "mace"]
+                   "checks", "stand-hits", "thorns", "mace", "swim"]
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -351,6 +351,11 @@ MACE = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-48.0),
 # it was given, and whether its next landing throws up a smash's dust (D443).
 MACE_KEYS = FALL_KEYS + ("current_impulse_context_reset_grace_time", "current_explosion_impact_pos",
                          "spawn_extra_particles_on_fall")
+# The bot's data in `swim`: in survival mode at the spawn, facing east and a little down, holding
+# eight loaves of bread (D444).
+SWIM = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(20.0)]), Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "bread", 8),
+]), equipment={})
 # The bot's data in `checks`: in survival mode at the spawn, facing east, its hands empty (D420).
 CHECKS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, []),
               equipment={})
@@ -638,6 +643,12 @@ CONFIGS = {
     "mace": Config({"difficulty": "normal"}, view=3, scenarios=("mace",), world=FIXTURES / "mace" / "world", fixture="mace",
                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                    player=MACE, keys=MACE_KEYS),
+    # The bot, in survival mode, sprints on the swim fixture's grass by the server's clock, its
+    # sprint's particles drawing from its random, which a loaf it drops shows; into the pool, where
+    # it swims, stops sprinting and swims again; and out onto the grass beyond (D444).
+    "swim": Config({}, view=3, scenarios=("swim",), world=FIXTURES / "swim" / "world", fixture="swim",
+                   rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                   player=SWIM, keys=FALL_KEYS + ("Air",)),
     # The bot, in survival mode by the checks fixture's wall, by the server's clock: a move too
     # quick, one through the wall and one into it, each of which the server sends it back from,
     # then a float it's kicked for (D420).

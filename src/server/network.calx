@@ -95,7 +95,7 @@ import world.level_writer.{UPDATE_LIMIT}
 import world.pistons.{check_if_extend}
 import world.placing.{PlaceFacts, Placement, bucket_stack, can_be_replaced, component_of, has_components, placement_state, stack_item}
 import world.attributes.{Attributes, Snapshot, attribute_id, broken, equip, sprint, stack_modifiers, unworn, update_player}
-import world.entity_data.{ABSORPTION, AIR_SUPPLY, FALL_FLYING_FLAG, ON_FIRE_FLAG, TICKS_FROZEN, CROUCHING, CROUCHING_FLAG, EntityData, HEALTH, MAIN_HAND, MODE_CUSTOMISATION, POSE_ID, SCORE, SHARED_FLAGS, SILENT, SPRINTING_FLAG, STANDING, SWIMMING, Value, player_data}
+import world.entity_data.{ABSORPTION, AIR_SUPPLY, FALL_FLYING_FLAG, ON_FIRE_FLAG, TICKS_FROZEN, CROUCHING, CROUCHING_FLAG, EntityData, HEALTH, MAIN_HAND, MODE_CUSTOMISATION, POSE_ID, SCORE, SHARED_FLAGS, SILENT, SPRINTING_FLAG, STANDING, SWIMMING, SWIMMING_FLAG, Value, player_data}
 import world.player_status.{Status, read_status, set_health, tick_food, tick_regeneration, write_status}
 import world.digging.{ABORT_DESTROY_BLOCK, ACTIONS, CHANGE_DESTROY_DIRECTION, DESTROY_PROGRESS, DESTROY_PROGRESS_SOUND, DROP_ALL_ITEMS, DROP_ITEM, Digging, RELEASE_USE_ITEM, STAB, START_DESTROY_BLOCK, STOP_DESTROY_BLOCK, SWAP_ITEM_WITH_OFFHAND, attack, break_block, can_destroy, destroy_progress, durability_change, entity_in_reach, eye_in_water, game_master, has_correct_tool, in_reach, java_int, within_range, may_break_in_adventure, may_use_in_adventure, mining_damage, player_destroy, shrunk, with_damage, enchanted_value, is_damaged, mends_in}
 import world.block_level.{update_output_signal}
@@ -457,9 +457,9 @@ struct Player {
     old_attributes: bool = false
     tracked: i32 = 0
     // Whether they're on the ground, as the last move let through said, `onGround`, and whether
-    // their eyes were in water as their last tick found them; the block they dig, as their game
-    // mode keeps it; and the last of their block changes to ack, `ackBlockChangesUpTo`, -1 for
-    // none (D376).
+    // their eyes were in water as their fluids were last looked at, `isEyeInFluid`, which a move
+    // out of water looks at again (D444); the block they dig, as their game mode keeps it; and the
+    // last of their block changes to ack, `ackBlockChangesUpTo`, -1 for none (D376).
     on_ground: bool = false
     eye_in_water: bool = false
     digging: Digging = Digging()
@@ -7131,9 +7131,12 @@ impl Network {
         if con.player.take_xp_delay > 0 {
             con.player.take_xp_delay -= 1
         }
-        let wet = self.eyes_in_water(con)
-        con.player.eye_in_water = wet
+        self.sprint_particle(mut con)
+        // `wasEyeInWater`, as their fluids were last looked at, before `baseTick` looks again
+        // (D444).
+        let was_eye = con.player.eye_in_water
         self.player_fluids_now(mut con)
+        self.update_swimming(mut con, was_eye)
         self.player_base_hurts(mut con)
         self.player_tick_death(mut con)
         con.player.based = true
@@ -7231,14 +7234,69 @@ impl Network {
         con.player.z = gz
     }
 
+    // `spawnSprintParticle` of the player where they may, `canSpawnSprintParticle`: sprinting, out
+    // of water and lava, neither a spectator nor crouching, and alive (D444). Where the block
+    // their feet are on, `getOnPosLegacy`, is drawn, not `RenderShape.INVISIBLE`, `drawn_block`,
+    // where the particle goes across, two doubles from their random; the particle is the client's
+    // to show, as `addParticle` on the server shows nothing.
+    fn sprint_particle(mut self, con: mut Connection) {
+        let sprinting = i32(con.player.entity_data.byte(SHARED_FLAGS)) & SPRINTING_FLAG != 0
+        let lava = con.player.based and con.player.lava > 0.0
+        let crouching = con.player.entity_data.number(POSE_ID) == CROUCHING
+        if not sprinting or con.player.in_water or con.player.mode == GameType.Spectator or crouching or lava or not player_alive(con) {
+            return
+        }
+        let d = con.player.dim
+        let shared = self.levels[d].shared_env() else return
+        let Env { facts: f, .. } = shared.value
+        if self.item_facts == none {
+            self.item_facts = some(BodyFacts.new(f))
+        }
+        let t = self.item_facts.take() else return
+        let (px, py, pz) = on_pos_of(f, t, self.levels[d], con.player.support, con.player.x, con.player.y, con.player.z, 0.2f32)
+        self.item_facts = some(t)
+        if not drawn_block(f, self.levels[d].collision_state(px, py, pz) ?? 0) {
+            return
+        }
+        var random = con.player.random.take() ?? LegacyRandom.new(self.entity_seed(con.player.entity_id))
+        _ = random.next_double()
+        _ = random.next_double()
+        con.player.random = some(random)
+    }
+
+    // `updateSwimming` of the player, as `baseTick` has it once their fluids are looked at
+    // (D444): never while they fly, `Player.updateSwimming`; swimming, they go on where they
+    // sprint in water; else they start where they sprint under water, their eyes in it as their
+    // fluids were looked at before, `was_eye`, `isUnderWater`, in a block whose fluid is water,
+    // `blockPosition`. Riding waits for vehicles.
+    fn update_swimming(self, con: mut Connection, was_eye: bool) {
+        var swim = false
+        if not con.player.abilities.flying {
+            let sprinting = i32(con.player.entity_data.byte(SHARED_FLAGS)) & SPRINTING_FLAG != 0
+            if swimming(con) {
+                swim = sprinting and con.player.in_water
+            } else if sprinting and was_eye and con.player.in_water {
+                let d = con.player.dim
+                if let shared = self.levels[d].shared_env() {
+                    let Env { facts: f, .. } = shared.value
+                    let (bx, by, bz) = (i32.saturate(con.player.x.floor()), i32.saturate(con.player.y.floor()), i32.saturate(con.player.z.floor()))
+                    swim = f.is_water(self.levels[d].collision_state(bx, by, bz) ?? 0)
+                }
+            }
+        }
+        con.player.entity_data.set_flag(SHARED_FLAGS, SWIMMING_FLAG, swim)
+    }
+
     // `LivingEntity.aiStep`'s `travel` for the player, which vanilla's server runs for them too,
     // `AUTHORITATIVE_SIDE_AND_SERVER` (D419): their body, `body_of`, travels as a mob's does with
     // nothing asked of it, as the server doesn't move them by what they press, through water, lava
     // or the air, their motion slowed, fallen and stopped by what they hit, on the ground only
     // where it moved them up or down, their fall forgotten on what's climbable; where it went
-    // then theirs till the tick's end. Swimming waits for the swimming pose, slow falling and
-    // levitation for effects. Nothing where the level hasn't its facts or the living's aren't
-    // ready.
+    // then theirs till the tick's end. Swimming, `Player.travel` first pulls them up or down
+    // toward where they look, by 0.085 of the way looking down past a fifth, else 0.06, where
+    // they look down or there's a fluid nine tenths of a block above their feet, as their server
+    // never has them jumping (D444). Slow falling and levitation come with effects. Nothing where
+    // the level hasn't its facts or the living's aren't ready.
     fn player_travel(mut self, con: mut Connection) {
         let d = con.player.dim
         if not self.living_ready(d) {
@@ -7249,6 +7307,15 @@ impl Network {
         let lent = self.lend_moving(f) else return
         let (lf, m, t) = lent
         var body = body_of(mut con, lf, self.world.portal_delay == 0)
+        if swimming(con) {
+            // `getLookAngle().y`, `-Mth.sin` of their pitch.
+            let look = f64(-table_sin(f64(con.player.x_rot * 0.017453292f32)))
+            let multiplier = if look < -0.2 { 0.085 } else { 0.06 }
+            let (ax, ay, az) = (i32.saturate(con.player.x.floor()), i32.saturate((con.player.y + 1.0 - 0.1).floor()), i32.saturate(con.player.z.floor()))
+            if look <= 0.0 or f.fluid(self.levels[d].collision_state(ax, ay, az) ?? 0) != 0u32 {
+                body.body.vy = body.body.vy + (look - body.body.vy) * multiplier
+            }
+        }
         var sounds = List<EntitySound>()
         let lava_fast = self.levels[d].fast_lava
         body.travel(lf, f, m, t, self.levels[d], lava_fast, mut sounds)
@@ -7525,15 +7592,15 @@ impl Network {
         return some((lf, m, t))
     }
 
-    // `updatePlayerPose` (CAL-141): where the player fits swimming, the pose they want, crouching
-    // if they hold shift and aren't flying, else standing, as Calcite has no sleeping, swimming,
-    // gliding or spinning yet; if they don't fit it and aren't a spectator, crouching where they
-    // fit that, else swimming.
+    // `updatePlayerPose` (CAL-141): where the player fits swimming, the pose they want, swimming
+    // where they swim (D444), crouching if they hold shift and aren't flying, else standing, as
+    // Calcite has no sleeping, gliding or spinning yet; if they don't fit it and aren't a
+    // spectator, crouching where they fit that, else swimming.
     fn update_pose(mut self, con: mut Connection) {
         if not self.fits(con, SWIMMING) {
             return
         }
-        let desired = if con.player.shift and not con.player.abilities.flying { CROUCHING } else { STANDING }
+        let desired = if swimming(con) { SWIMMING } else if con.player.shift and not con.player.abilities.flying { CROUCHING } else { STANDING }
         var pose = desired
         if con.player.mode != GameType.Spectator and not self.fits(con, desired) {
             pose = if self.fits(con, CROUCHING) { CROUCHING } else { SWIMMING }
@@ -11451,7 +11518,7 @@ impl Network {
         // `checkMovementStatistics` asks whether they're on what's climbable, `onClimbable`, which
         // keeps where, only where they moved and aren't in water (D427).
         var climbing = false
-        if not (dx == 0.0 and dy == 0.0 and dz == 0.0) and not con.player.eye_in_water and not con.player.in_water {
+        if not (dx == 0.0 and dy == 0.0 and dz == 0.0) and not swimming(con) and not con.player.eye_in_water and not con.player.in_water {
             climbing = self.player_climbing(con, lf)
             if climbing {
                 con.player.last_climbable = some((i32.saturate(con.player.x.floor()), i32.saturate(con.player.y.floor()), i32.saturate(con.player.z.floor())))
@@ -11606,13 +11673,15 @@ impl Network {
         self.item_facts = some(t)
     }
 
-    // `updateFluidInteraction` for the player (D418): the fluids their box is in; in water, their
-    // fall forgotten, and a splash where they've come into it once their first tick's gone,
-    // `doWaterSplashEffect`, its sound, `entity.player.splash`, or past a quarter's volume its
-    // high speed one, heard by all near but them; how deep they're in each kept for their
-    // travel; then, unless they fly, the currents' pushes, a player's, the mean of the flows,
-    // which their travel slows again (D419).
+    // `updateFluidInteraction` for the player (D418): whether their eyes are in water (D444); the
+    // fluids their box is in; in water, their fall forgotten, and a splash where they've come into
+    // it once their first tick's gone, `doWaterSplashEffect`, its sound, `entity.player.splash`,
+    // or past a quarter's volume its high speed one, heard by all near but them; how deep they're
+    // in each kept for their travel; then, unless they fly, the currents' pushes, a player's, the
+    // mean of the flows, which their travel slows again (D419).
     fn player_fluids(mut self, con: mut Connection, f: Facts, t: BodyFacts) {
+        // Their eyes in water as this finds them, as `update` keeps `eyesInside` (D444).
+        con.player.eye_in_water = self.eyes_in_water(con)
         let d = con.player.dim
         let b = pose_box(con.player.entity_data.number(POSE_ID), con.player.x, con.player.y, con.player.z)
         let flying = con.player.abilities.flying
@@ -12900,6 +12969,7 @@ fn body_of(con: mut Connection, lf: LivingFacts, portal: bool) -> Living {
     l.speed = con.player.speed
     l.flying = con.player.abilities.flying
     l.sprinting = sprints(con)
+    l.swimming = swimming(con)
     return l
 }
 
@@ -12980,11 +13050,11 @@ fn player_kind() -> u32 {
 }
 
 // `ServerPlayer.checkMovementStatistics`' exhaustion for a move of dx, dy, dz, the player on what's
-// climbable or not (D418), unless they didn't move: under water, a hundredth for each metre, in
-// centimetres rounded, as a float; in water, a hundredth for each metre across; on what's
-// climbable, none; on the ground, a tenth for each metre across sprinting, else none; and none
-// in the air. None where they're invulnerable, `causeFoodExhaustion`. Swimming waits for its
-// pose; the stats for stats.
+// climbable or not (D418), unless they didn't move: swimming (D444) or under water, a hundredth
+// for each metre, in centimetres rounded, as a float; in water, a hundredth for each metre
+// across; on what's climbable, none; on the ground, a tenth for each metre across sprinting, else
+// none; and none in the air. None where they're invulnerable, `causeFoodExhaustion`. The stats
+// come with stats.
 fn move_exhaustion(con: mut Connection, dx: f64, dy: f64, dz: f64, climbing: bool) {
     if dx == 0.0 and dy == 0.0 and dz == 0.0 {
         return
@@ -12992,7 +13062,7 @@ fn move_exhaustion(con: mut Connection, dx: f64, dy: f64, dz: f64, climbing: boo
     let whole = i32.saturate((f64(f32.nearest((dx * dx + dy * dy + dz * dz).sqrt()) * 100.0f32) + 0.5).floor())
     let across = i32.saturate((f64(f32.nearest((dx * dx + dz * dz).sqrt()) * 100.0f32) + 0.5).floor())
     var spent = 0.0f32
-    if con.player.eye_in_water {
+    if swimming(con) or con.player.eye_in_water {
         if whole > 0 {
             spent = 0.01f32 * f32.nearest(f64(whole)) * 0.01f32
         }
@@ -13040,6 +13110,28 @@ fn saved_impulse(d: JavaHashMap<String, Tag>?) -> (i32, (f64, f64, f64)?, bool) 
     let grace = if m.contains("current_impulse_context_reset_grace_time") { m["current_impulse_context_reset_grace_time"].number_int() ?? 0 } else { 0 }
     let dust = if m.contains("spawn_extra_particles_on_fall") { (m["spawn_extra_particles_on_fall"].number_int() ?? 0) != 0 } else { false }
     return (grace, vec3_of(m, "current_explosion_impact_pos"), dust)
+}
+
+// `Player.isSwimming` (D444): their shared flag for swimming, `updateSwimming`'s, where they don't
+// fly and aren't a spectator.
+fn swimming(con: Connection) -> bool {
+    return not con.player.abilities.flying and con.player.mode != GameType.Spectator and i32(con.player.entity_data.byte(SHARED_FLAGS)) & SWIMMING_FLAG != 0
+}
+
+// Whether the block state `state` is drawn, its render shape not `RenderShape.INVISIBLE` (D444):
+// not air, a liquid, a barrier, light, a structure void, an end portal or gateway, a bubble column
+// or a moving piston, the blocks whose classes say so.
+fn drawn_block(f: Facts, state: u32) -> bool {
+    if f.is_air(state) {
+        return false
+    }
+    let block = f.block(state)
+    for name in ["LiquidBlock", "BarrierBlock", "LightBlock", "StructureVoidBlock", "EndPortalBlock", "EndGatewayBlock", "BubbleColumnBlock", "MovingPistonBlock"] {
+        if f.is_a(block, String(name)) {
+            return false
+        }
+    }
+    return true
 }
 
 // `MaceItem.canSmashAttack` of the player (D443): fallen more than a block and a half, and not
