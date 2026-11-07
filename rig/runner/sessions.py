@@ -2,6 +2,7 @@
 vanilla 26.3 and against Calcite, and the two sessions are compared packet by packet.
 
     py -I rig/runner/sessions.py [--config NAME] [--scenario NAME] [--compare-only] [--show N] [--tape]
+                                 [--trace]
 
 For each configuration, a set of server.properties, this starts vanilla in a fresh folder under
 build/rig/sessions/, sets what vanilla draws at random to fixed values from its console, waits for
@@ -18,6 +19,9 @@ has a difference no file in rig/differences/ explains.
 and Calcite write its own there with --rng-tape, and lines the two up level by level
 (rig/runner/tapediff.py, D312). Both seed their levels' randoms again at RESEED, once the player's
 chunks are in, so the tapes line up from there whatever each drew while they loaded (D316).
+--trace has each write its living entities' states to entities.txt in its folder, as each of their
+ticks is done, a line each: vanilla's by the rig's agent and Calcite's with --entity-trace, to line
+a mob's moves up far finer than its packets show them (rig/runner/traces.py, CAL-159).
 """
 
 import argparse
@@ -81,11 +85,12 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # them with enchanted swords; `protect`, where it hits zombies in enchanted armor; `stand-hits`,
 # where it hits armor stands; `thorns`, where it hits a zombie in thorns; `fall`, where it falls;
 # `mace`, where it falls onto a zombie with a mace; `swim`, where it sprints and swims; `checks`,
-# where its moves are checked; and `duel`, where it hits a second player, Mate, whom the same bot
-# runs, recording Mate's packets as `duel-mate` (src/rig/session.calx).
+# where its moves are checked; `duel`, where it hits a second player, Mate, whom the same bot
+# runs, recording Mate's packets as `duel-mate`; and `zombie`, where a zombie hunts it
+# (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
-                   "checks", "stand-hits", "thorns", "mace", "swim", "duel"]
+                   "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -666,6 +671,15 @@ CONFIGS = {
                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                           ("minecraft:respawn_radius", nbt.Int(0))),
                    player=DUEL, mate=DUEL_MATE),
+    # The bot, in survival mode with its hands empty, stands at the spawn under the zombie
+    # fixture's roof, on normal, while Rot, the zombie six blocks east with his AI, takes it up as
+    # his target, comes for it and hits it (CAL-159); it hits him back once, then he hits it till
+    # it dies, the message naming him, and it leaves dead.
+    "zombie": Config({"difficulty": "normal"}, view=3, scenarios=("zombie",), world=FIXTURES / "zombie" / "world",
+                     fixture="zombie",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                            ("minecraft:respawn_radius", nbt.Int(0))),
+                     player=THORNS),
     # `thorns` with the bot holding an iron sword with unbreaking III: the hit whose thorns kill it
     # drops the sword, which the attack then wears, as vanilla's `postHurtEnemy` wears the stack
     # the drop holds, unbreaking drawing from the level's random (D450).
@@ -852,14 +866,16 @@ def adapter():
     return json.loads(ADAPTER.read_text(encoding="utf-8"))
 
 
-def vanilla_argv(a, tape=False):
+def vanilla_argv(a, tape=False, trace=False):
     """The adapter's java and class path, running vanilla's server with its own logging, and the
-    rig's agent, which seeds its levels' randoms, and with `tape` writes their draws (D311)."""
+    rig's agent, which seeds its levels' randoms, with `tape` writes their draws (D311), and with
+    `trace` its living entities' states (CAL-159)."""
     if "agent" not in a:
         sys.exit("sessions: the vanilla adapter was built without the agent; run py -I oracle/vanilla-adapter/build.py")
     argv = a["argv"]
     cp = argv[argv.index("-cp") + 1]
     agent = f"-javaagent:{a['agent']}=seed={LEVEL_RANDOM_SEED}" + (f",tape=tape.txt,reseed={RESEED}" if tape else "")
+    agent += ",trace=entities.txt" if trace else ""
     # Math.sin and Math.cos as StrictMath's, which Calcite's are, where HotSpot's intrinsics can
     # differ in the last bit: a dropped item's motion turns through them (CAL-148).
     strict = ["-XX:+UnlockDiagnosticVMOptions", "-XX:-UseLibmIntrinsic"]
@@ -1056,6 +1072,7 @@ def main():
     ap.add_argument("--compare-only", action="store_true", help="compare the last run's sessions")
     ap.add_argument("--show", type=int, default=3, help="differences shown for each packet, 0 for all")
     ap.add_argument("--tape", action="store_true", help="write both servers' levels' draws to tape.txt, and line them up")
+    ap.add_argument("--trace", action="store_true", help="write both servers' living entities' states to entities.txt")
     args = ap.parse_args()
     configs = args.config or list(CONFIGS)
     complete = args.config is None and args.scenario is None
@@ -1077,8 +1094,9 @@ def main():
                 continue
             print(f"{config}:", flush=True)
             taped = args.tape or CONFIGS[config].tape
-            record(config, "vanilla", vanilla_argv(a, taped), bot, scenarios[config])
-            record(config, "calcite", [str(server)] + (["--rng-tape", "tape.txt", "--rng-reseed", str(RESEED)] if taped else []), bot, scenarios[config])
+            record(config, "vanilla", vanilla_argv(a, taped, args.trace), bot, scenarios[config])
+            record(config, "calcite", [str(server)] + (["--rng-tape", "tape.txt", "--rng-reseed", str(RESEED)] if taped else [])
+                   + (["--entity-trace", "entities.txt"] if args.trace else []), bot, scenarios[config])
             if taped:
                 print(f"{config}: the levels' draws, vanilla's against Calcite's (D312):", flush=True)
                 tapediff.compare(tapediff.read(SESSIONS / config / "vanilla" / "tape.txt"),

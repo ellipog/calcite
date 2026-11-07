@@ -76,10 +76,11 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `PacketCheck.java` | Vanilla reading Calcite's packets, run by `check_packets.py` |
 | `ChatCheck.java` | Vanilla's client checking the signed chat in `build/packets/chat/`, run by `check_packets.py` |
 | `SessionDump.java` | Vanilla reading the protocol bot's sessions, as trees, run by `rig/runner/sessions.py` |
-| `agent/Agent.java` | The rig's Java agent: its arguments, and the three classes it changes as they load |
+| `agent/Agent.java` | The rig's Java agent: its arguments, and the four classes it changes as they load |
 | `agent/Entities.java` | What it does as each entity's made: its random seeded from its ID, and its UUID drawn again (D390) |
 | `agent/Levels.java` | What it does as each level's made: its random seeded, with its `randValue` (D318), the entity counter set back |
 | `agent/Tape.java` | The RNG tape: each draw of a level's random, with where it was drawn |
+| `agent/Trace.java` | The entity trace: each living entity's state as its tick's done ([D457](../../docs/decisions.md)) |
 | `WorldCheck.java` | Vanilla reading a world it saved and the same world saved by Calcite, with `RegionFile`, `NbtIo` and Gson, and comparing them file by file and chunk by chunk, run by `rig/runner/roundtrip.py` (`G5.2`) |
 | `ItemsProbe.java` | `items`: an item stack read with `ItemStack.CODEC` from JSON or SNBT, or with `OPTIONAL_STREAM_CODEC` from bytes, and written with either, or hashed with `HashOps` as a slot's `HashedStack` is, over `RegistriesProbe`'s registries |
 | `EnvironmentProbe.java` | `environment`: an `EnvironmentAttributeSystem` built as a level's but for the biomes, from a dimension type or a data pack's map and timelines, with every clock at the record's ticks and the record's rain and thunder, read by `getDimensionValue` |
@@ -100,7 +101,8 @@ Vanilla isn't repeatable run to run. Each level's `random` is seeded from `Rando
 - sets the entity counter back to 0 as the Overworld's level is made, so the first entity is 1;
 - seeds each entity's random, as its constructor ends, with `mixStafford13(N ^ id)`, its ID, and draws its UUID from it again, as Calcite's `level-random-seed=N` seeds its entities', so a drop's motion and UUID are the same on both ([D390](../../docs/decisions.md));
 - with `,tape=PATH` as well, writes each value a level's random draws to `PATH`, the RNG tape, a line each: the level, its game time, the bits drawn, the value, and the two frames of the stack that asked for it outside the random classes. As the JVM ends it adds `# end LEVEL TIME` for each level, its game time then. Calcite's `--rng-tape PATH` writes the same lines, without where each was drawn, and [`tapediff.py`](../../rig/runner/tapediff.py) lines the two up ([D312](../../docs/decisions.md));
-- with `,reseed=T` as well, seeds each level's random again as it was seeded, with its `randValue`, the first time the level's tick starts at game time T or later, as Calcite's `--rng-reseed T` does, so the tapes line up again from there whatever each server drew before ([D316](../../docs/decisions.md)).
+- with `,reseed=T` as well, seeds each level's random again as it was seeded, with its `randValue`, the first time the level's tick starts at game time T or later, as Calcite's `--rng-reseed T` does, so the tapes line up again from there whatever each server drew before ([D316](../../docs/decisions.md));
+- with `,trace=PATH` as well, writes each living entity's state to `PATH` as `ServerLevel.tickNonPassenger` is done with it, and a player's as `ServerPlayer.doTick` is, before `tickPlayer` puts them back where their client has them, a line each: the game time, its ID, its place and motion, its turns, its body's and its head's, what it's told to walk and its speed, and whether it's on the ground, each number as Java writes it, the shortest that reads back the same, a player's body's turn and walk as 0. Calcite's `--entity-trace PATH` writes the same lines, and [`traces.py`](../../rig/runner/traces.py) lines the two up ([D457](../../docs/decisions.md)).
 
 ```
 # seed 1103

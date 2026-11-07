@@ -22,7 +22,7 @@ import java.security.ProtectionDomain;
  * run, and from what Calcite draws with the same seed, and can write every draw a level's random
  * makes to a tape.
  *
- * <p>Started as {@code -javaagent:agent.jar=seed=N[,tape=PATH][,reseed=T]}. Each
+ * <p>Started as {@code -javaagent:agent.jar=seed=N[,tape=PATH][,reseed=T][,trace=PATH]}. Each
  * {@code ServerLevel}'s constructor, as it returns, calls {@link Levels#made}, which seeds the
  * level's random with {@code mixStafford13(N ^ name.hashCode())}, with the name the dimension's,
  * such as {@code minecraft:overworld}, and sets the entity counter back to 0 as the Overworld's is
@@ -32,7 +32,10 @@ import java.security.ProtectionDomain;
  * {@code LegacyRandomSource.next}, which every draw of a level's random comes down to, hands
  * {@link Tape#drew} each value it returns, which writes those of a level's random to the tape.
  * {@code Entity}'s constructor, as it returns, hands the entity to {@link Entities#made}, which
- * seeds its random from the seed and its ID (CAL-148).
+ * seeds its random from the seed and its ID (CAL-148). With {@code trace=PATH},
+ * {@code ServerLevel.tickNonPassenger} hands each entity it's ticked to {@link Trace#ticked} as it
+ * returns, which writes a living one's state, and {@code ServerPlayer.doTick} hands the player to
+ * {@link Trace#played} as it returns (CAL-159).
  *
  * <p>This class names no game class, so loading it loads none: {@code ServerLevel} and
  * {@code LegacyRandomSource} must load after the transformer is in place to be changed.
@@ -41,6 +44,7 @@ public final class Agent {
     private static final String LEVEL = "net/minecraft/server/level/ServerLevel";
     private static final String LEGACY = "net/minecraft/world/level/levelgen/LegacyRandomSource";
     private static final String ENTITY = "net/minecraft/world/entity/Entity";
+    private static final String PLAYER = "net/minecraft/server/level/ServerPlayer";
 
     private Agent() {
     }
@@ -48,6 +52,7 @@ public final class Agent {
     public static void premain(String arguments, Instrumentation inst) {
         Long seed = null;
         Path tape = null;
+        Path trace = null;
         long reseed = -1;
         for (String part : (arguments == null ? "" : arguments).split(",")) {
             if (part.isEmpty()) {
@@ -60,6 +65,7 @@ public final class Agent {
                 case "seed" -> seed = Long.parseLong(value);
                 case "tape" -> tape = Path.of(value);
                 case "reseed" -> reseed = Long.parseLong(value);
+                case "trace" -> trace = Path.of(value);
                 default -> throw new IllegalArgumentException("agent: unknown argument " + key);
             }
         }
@@ -67,6 +73,7 @@ public final class Agent {
             throw new IllegalArgumentException("agent: no seed=N given");
         }
         Tape.start(seed, tape);
+        Trace.start(trace);
         Levels.reseedAt(reseed);
         inst.addTransformer(new Transformer());
     }
@@ -74,14 +81,15 @@ public final class Agent {
     private static final class Transformer implements ClassFileTransformer {
         @Override
         public byte[] transform(ClassLoader loader, String name, Class<?> redefined, ProtectionDomain domain, byte[] bytes) {
-            if (!LEVEL.equals(name) && !LEGACY.equals(name) && !ENTITY.equals(name)) {
+            if (!LEVEL.equals(name) && !LEGACY.equals(name) && !ENTITY.equals(name) && !PLAYER.equals(name)) {
                 return null;
             }
             try {
                 ClassLoader from = loader != null ? loader : ClassLoader.getSystemClassLoader();
                 ClassFile cf = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(
                         ClassHierarchyResolver.defaultResolver().orElse(ClassHierarchyResolver.ofResourceParsing(from))));
-                return LEVEL.equals(name) ? level(cf, bytes) : ENTITY.equals(name) ? entity(cf, bytes) : legacy(cf, bytes);
+                return LEVEL.equals(name) ? level(cf, bytes) : ENTITY.equals(name) ? entity(cf, bytes)
+                        : PLAYER.equals(name) ? player(cf, bytes) : legacy(cf, bytes);
             } catch (Throwable t) {
                 // A transformer's exception is swallowed by the JVM, and the class loads unchanged,
                 // so the run would go on unseeded: stop it instead.
@@ -92,8 +100,9 @@ public final class Agent {
         }
     }
 
-    // Each of ServerLevel's constructors hands the level to Levels.made before it returns, and its
-    // tick hands it to Levels.ticking as it starts.
+    // Each of ServerLevel's constructors hands the level to Levels.made before it returns, its tick
+    // hands it to Levels.ticking as it starts, and tickNonPassenger hands it and the entity to
+    // Trace.ticked as it returns.
     private static byte[] level(ClassFile cf, byte[] bytes) {
         MethodTypeDesc withLevel = MethodTypeDesc.of(ConstantDescs.CD_void, ClassDesc.ofInternalName(LEVEL));
         ClassDesc levels = ClassDesc.of("calcite.rig.vanilla.agent.Levels");
@@ -116,9 +125,20 @@ public final class Agent {
                 b.with(e);
             }
         };
+        MethodTypeDesc withTwo = MethodTypeDesc.of(ConstantDescs.CD_void, ConstantDescs.CD_Object, ConstantDescs.CD_Object);
+        CodeTransform ticked = (b, e) -> {
+            if (e instanceof ReturnInstruction) {
+                b.aload(0);
+                b.aload(1);
+                b.invokestatic(ClassDesc.of("calcite.rig.vanilla.agent.Trace"), "ticked", withTwo);
+            }
+            b.with(e);
+        };
         ClassTransform both = (cb, ce) -> {
             if (ce instanceof MethodModel m && m.methodName().equalsString("<init>")) {
                 cb.transformMethod(m, MethodTransform.transformingCode(made));
+            } else if (ce instanceof MethodModel m && m.methodName().equalsString("tickNonPassenger")) {
+                cb.transformMethod(m, MethodTransform.transformingCode(ticked));
             } else if (ce instanceof MethodModel m && m.methodName().equalsString("tick")
                     && m.methodType().equalsString("(Ljava/util/function/BooleanSupplier;)V")) {
                 cb.transformMethod(m, MethodTransform.transformingCode(ticking));
@@ -144,6 +164,20 @@ public final class Agent {
         };
         return cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
                 m -> m.methodName().equalsString("<init>"), made));
+    }
+
+    // ServerPlayer.doTick hands the player to Trace.played as it returns.
+    private static byte[] player(ClassFile cf, byte[] bytes) {
+        MethodTypeDesc withOne = MethodTypeDesc.of(ConstantDescs.CD_void, ConstantDescs.CD_Object);
+        CodeTransform played = (b, e) -> {
+            if (e instanceof ReturnInstruction) {
+                b.aload(0);
+                b.invokestatic(ClassDesc.of("calcite.rig.vanilla.agent.Trace"), "played", withOne);
+            }
+            b.with(e);
+        };
+        return cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
+                m -> m.methodName().equalsString("doTick") && m.methodType().equalsString("()V"), played));
     }
 
     // LegacyRandomSource.next(int) hands each value it returns, itself and the bits to Tape.drew.
