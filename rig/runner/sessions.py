@@ -87,11 +87,12 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # `mace`, where it falls onto a zombie with a mace; `swim`, where it sprints and swims; `checks`,
 # where its moves are checked; `duel`, where it hits a second player, Mate, whom the same bot
 # runs, recording Mate's packets as `duel-mate`; `zombie`, where a zombie hunts it; `arrows`,
-# where arrows fly by it and onto it; and `skeleton`, where a skeleton shoots it or runs from the
-# sun (src/rig/session.calx).
+# where arrows fly by it and onto it; `skeleton`, where a skeleton shoots it or runs from the sun;
+# and `spider`, where a spider climbs to it (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
-                   "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton"]
+                   "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
+                   "spider"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -335,6 +336,8 @@ THORNS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0
 ARROWS = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(8.5), nbt.Double(-60.0), nbt.Double(8.5)]),
               Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, []),
               equipment={})
+# The bot's data in `spider`: `thorns`', on the spider fixture's pillar at the spawn (CAL-159).
+SPIDER = dict(THORNS, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-57.0), nbt.Double(0.5)]))
 # The bot's data in `thorns-sword`: `thorns`', holding an iron sword with unbreaking III, which its
 # death drops in the attack that wears it after (D450), on 10 health, so his thorns kill it while
 # it hits him with the sword rather than as it leaves.
@@ -703,6 +706,14 @@ CONFIGS = {
                        rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                               ("minecraft:respawn_radius", nbt.Int(0))),
                        player=THORNS),
+    # The bot, in survival mode with its hands empty, stands on the spider fixture's pillar at the
+    # spawn, on normal at midnight, while Webs, the spider eight blocks east with its AI, takes it
+    # up, goes for it, climbs the pillar's side, which its path can't, and bites it (CAL-159).
+    "spider": Config({"difficulty": "normal"}, view=3, scenarios=("spider",), world=FIXTURES / "spider" / "world",
+                     fixture="spider",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                            ("minecraft:respawn_radius", nbt.Int(0))),
+                     player=SPIDER),
     # The bot, in creative mode with nothing, which no monster takes up, stands at the spawn, on
     # normal at noon, while Sunny, the skeleton out in the sun with his AI, burns and runs for the
     # shade under the stone roof by him, his paths kept out of the sun once he's in it (CAL-159).
