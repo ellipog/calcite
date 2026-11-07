@@ -86,11 +86,11 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # where it hits armor stands; `thorns`, where it hits a zombie in thorns; `fall`, where it falls;
 # `mace`, where it falls onto a zombie with a mace; `swim`, where it sprints and swims; `checks`,
 # where its moves are checked; `duel`, where it hits a second player, Mate, whom the same bot
-# runs, recording Mate's packets as `duel-mate`; and `zombie`, where a zombie hunts it
-# (src/rig/session.calx).
+# runs, recording Mate's packets as `duel-mate`; `zombie`, where a zombie hunts it; and `arrows`,
+# where arrows fly by it and onto it (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
-                   "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie"]
+                   "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -329,6 +329,11 @@ SWEEP = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.
 THORNS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
     slotted(1, "bread", 3),
 ]), equipment={})
+# The bot's data in `arrows`: at the arrows fixture's spawn, the middle of chunk (0, 0), facing
+# east, in survival with nothing, so the arrow it picks up goes into its first slot (CAL-159).
+ARROWS = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(8.5), nbt.Double(-60.0), nbt.Double(8.5)]),
+              Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, []),
+              equipment={})
 # The bot's data in `thorns-sword`: `thorns`', holding an iron sword with unbreaking III, which its
 # death drops in the attack that wears it after (D450), on 10 health, so his thorns kill it while
 # it hits him with the sword rather than as it leaves.
@@ -680,6 +685,15 @@ CONFIGS = {
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
                      player=THORNS),
+    # The bot, in survival mode with nothing, stands at the arrows fixture's spawn, on normal at
+    # midnight, while arrows fly as the world loads (CAL-159): into a wall, into a zombie without
+    # AI and an armor stand, which breaks, onto its head, and onto the grass by it, where it picks
+    # up the one anyone may.
+    "arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "arrows" / "world",
+                     fixture="arrows",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                            ("minecraft:respawn_radius", nbt.Int(0))),
+                     player=ARROWS),
     # `thorns` with the bot holding an iron sword with unbreaking III: the hit whose thorns kill it
     # drops the sword, which the attack then wears, as vanilla's `postHurtEnemy` wears the stack
     # the drop holds, unbreaking drawing from the level's random (D450).
