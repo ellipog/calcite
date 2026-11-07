@@ -88,11 +88,12 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # where its moves are checked; `duel`, where it hits a second player, Mate, whom the same bot
 # runs, recording Mate's packets as `duel-mate`; `zombie`, where a zombie hunts it; `arrows`,
 # where arrows fly by it and onto it; `skeleton`, where a skeleton shoots it or runs from the sun;
-# and `spider`, where a spider climbs to it (src/rig/session.calx).
+# `spider`, where a spider climbs to it; and `creeper`, where a creeper comes for it
+# (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
-                   "spider"]
+                   "spider", "creeper"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -714,6 +715,14 @@ CONFIGS = {
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
                      player=SPIDER),
+    # The bot, in survival mode with its hands empty, stands on the creeper fixture's pillar at the
+    # spawn, on normal at midnight, while Boom, the creeper eight blocks east with its AI, takes it
+    # up and comes to the pillar's foot, from where it's too far up for Boom to swell (CAL-159).
+    "creeper": Config({"difficulty": "normal"}, view=3, scenarios=("creeper",), world=FIXTURES / "creeper" / "world",
+                      fixture="creeper",
+                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                             ("minecraft:respawn_radius", nbt.Int(0))),
+                      player=SPIDER),
     # The bot, in creative mode with nothing, which no monster takes up, stands at the spawn, on
     # normal at noon, while Sunny, the skeleton out in the sun with his AI, burns and runs for the
     # shade under the stone roof by him, his paths kept out of the sun once he's in it (CAL-159).
