@@ -89,11 +89,12 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # runs, recording Mate's packets as `duel-mate`; `zombie`, where a zombie hunts it; `arrows`,
 # where arrows fly by it and onto it; `skeleton`, where a skeleton shoots it or runs from the sun;
 # `spider`, where a spider climbs to it; `creeper`, where a creeper comes for it; and `enderman`,
-# where an enderman it stares at teleports away and comes back for it (src/rig/session.calx).
+# where an enderman it stares at teleports away and comes back for it; and `armadillo`, where it
+# sprints by armadillos and hits one (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
-                   "spider", "creeper", "enderman", "ender"]
+                   "spider", "creeper", "enderman", "ender", "armadillo"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -971,6 +972,15 @@ CONFIGS = {
     # The farm animals (CAL-156): as `mooshrooms`, in the farm fixture's birch forest and badlands
     # on grass, sheep, pigs, chickens and cows of their biomes' variants; and five without AI, two
     # chickens laying their eggs.
+    # Armadillos with their brains (CAL-160): the bot, in survival mode with its hand empty, stands
+    # at the armadillo fixture's spawn, penned with Dilly, by the server's clock from once it's
+    # loaded, while she and Rolly idle, strolling, looking about and at it; at 200 it sprints,
+    # which scares Dilly, who rolls up and peeks while it does, Rolly too far to see it; at 260 it
+    # stops, and as the danger she saw runs out she unrolls; at 420 it hits her, which rolls her up,
+    # and at 440 hits her again rolled up, which hurts her less; it leaves at 600.
+    "armadillo": Config({}, view=3, scenarios=("armadillo",), world=FIXTURES / "armadillo" / "world", fixture="armadillo",
+                        rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                        player=THORNS),
     "farm": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "farm" / "world", fixture="farm",
                    tape=True),
     # Plains (CAL-156): as `farm`, on the plains fixture's grass, where horses and donkeys spawn

@@ -1,0 +1,1068 @@
+/// Mobs' brains, as vanilla's `Brain` keeps them (CAL-160): the memories a brain holds,
+/// `MemorySlot`s by `MemoryModuleType`, each with the ticks it has left, `timeToLive`; its sensors,
+/// `Sensor`, each scanning every so many ticks from a start its mob's random puts off as the
+/// brain's made, `randomlyDelayStart`; its activities, `Activity`, the core ones always on beside
+/// one other, each with the memories it needs and those it forgets as it stops; and its
+/// behaviors, `BehaviorControl`, kept in the order vanilla goes over them,
+/// `availableBehaviorsByPriority`: their priorities least first, its `TreeMap`, then their
+/// activities in its `HashMap`'s order, each added at the front of its bin, `computeIfAbsent`,
+/// then each activity's behaviors in the order they're added, its `LinkedHashSet`. The behaviors'
+/// workings are `world.mob`'s, as they read the whole mob; what's theirs alone is here: what each
+/// keeps, whether it runs and till when, its duration drawn from the level's random as it starts,
+/// `Behavior.tryStart`, and the memories it needs to.
+module world.brain
+
+import nbt.tag.{Tag}
+import random.legacy.{LegacyRandom}
+import random.source.{RandomSource}
+import random.xoroshiro.{mix_stafford13}
+import std.java.math.{pow}
+import world.collision.{Aabb}
+import world.path_finder.{Path}
+
+/// The memories a brain may hold, `MemoryModuleType`, by Calcite's numbering; what each holds is
+/// its `Memo`.
+pub const MEMORY_WALK_TARGET: i32 = 0
+pub const MEMORY_LOOK_TARGET: i32 = 1
+pub const MEMORY_BREED_TARGET: i32 = 2
+pub const MEMORY_PATH: i32 = 3
+pub const MEMORY_HURT_BY: i32 = 4
+pub const MEMORY_HURT_BY_ENTITY: i32 = 5
+pub const MEMORY_CANT_REACH_WALK_TARGET_SINCE: i32 = 6
+pub const MEMORY_DANGER_DETECTED_RECENTLY: i32 = 7
+pub const MEMORY_NEAREST_VISIBLE_ADULT: i32 = 8
+pub const MEMORY_TEMPTING_PLAYER: i32 = 9
+pub const MEMORY_TEMPTATION_COOLDOWN_TICKS: i32 = 10
+pub const MEMORY_GAZE_COOLDOWN_TICKS: i32 = 11
+pub const MEMORY_IS_PANICKING: i32 = 12
+pub const MEMORY_NEAREST_LIVING_ENTITIES: i32 = 13
+pub const MEMORY_NEAREST_VISIBLE_LIVING_ENTITIES: i32 = 14
+pub const MEMORIES: i32 = 15
+
+/// The name of the memory `m`, as its type's registered.
+pub fn memory_name(m: i32) -> str {
+    return match m {
+        0 => "minecraft:walk_target",
+        1 => "minecraft:look_target",
+        2 => "minecraft:breed_target",
+        3 => "minecraft:path",
+        4 => "minecraft:hurt_by",
+        5 => "minecraft:hurt_by_entity",
+        6 => "minecraft:cant_reach_walk_target_since",
+        7 => "minecraft:danger_detected_recently",
+        8 => "minecraft:nearest_visible_adult",
+        9 => "minecraft:tempting_player",
+        10 => "minecraft:temptation_cooldown_ticks",
+        11 => "minecraft:gaze_cooldown_ticks",
+        12 => "minecraft:is_panicking",
+        13 => "minecraft:mobs",
+        14 => "minecraft:visible_mobs",
+        _ => "",
+    }
+}
+
+/// How a memory's saved, its type's codec: not at all, as a byte for a flag, `Codec.BOOL`, as an
+/// int, `Codec.INT`, or as a long, `Codec.LONG`.
+pub const SAVED_NOT: i32 = 0
+pub const SAVED_FLAG: i32 = 1
+pub const SAVED_INT: i32 = 2
+pub const SAVED_LONG: i32 = 3
+
+/// How the memory `m` is saved.
+pub fn saved_as(m: i32) -> i32 {
+    return match m {
+        7 => SAVED_FLAG,
+        10 => SAVED_INT,
+        11 => SAVED_INT,
+        12 => SAVED_FLAG,
+        _ => SAVED_NOT,
+    }
+}
+
+/// The memory named `name`, as a save has it, if Calcite keeps it.
+pub fn memory_named(name: String) -> i32? {
+    for m in 0..MEMORIES {
+        if name == String(memory_name(m)) {
+            return some(m)
+        }
+    }
+    return none
+}
+
+// The place of the memory `m` among a brain's slots.
+fn slot_of(m: i32) -> usize {
+    return usize.wrap(m)
+}
+
+/// What a memory's state must be for a behavior to start or an activity to be on, `MemoryStatus`:
+/// it holds something, it holds nothing, or it's only registered, whatever it holds.
+pub const STATUS_PRESENT: i32 = 0
+pub const STATUS_ABSENT: i32 = 1
+pub const STATUS_REGISTERED: i32 = 2
+
+/// A memory and the state it must be in.
+pub struct Need {
+    pub memory: i32
+    pub status: i32
+}
+
+/// What a `BlockPosTracker` tracks: its block, and the place in it, the block's center where it's
+/// made of a block, `atCenterOf`.
+pub struct Spot {
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub px: f64
+    pub py: f64
+    pub pz: f64
+}
+
+impl Spot {
+    /// `BlockPosTracker(BlockPos)`: the block at x, y, z, its center the place.
+    pub fn of_block(x: i32, y: i32, z: i32) -> Spot {
+        return Spot { x: x, y: y, z: z, px: f64(x) + 0.5, py: f64(y) + 0.5, pz: f64(z) + 0.5 }
+    }
+
+    /// `BlockPosTracker(Vec3)`: the place x, y, z, in the block that holds it, `containing`.
+    pub fn of_place(x: f64, y: f64, z: f64) -> Spot {
+        return Spot { x: i32.saturate(x.floor()), y: i32.saturate(y.floor()), z: i32.saturate(z.floor()), px: x, py: y, pz: z }
+    }
+}
+
+/// What an `EntityTracker` tracks: an entity by ID, whether the place it tracks is its eyes,
+/// `trackEyeHeight`, and whether the block it walks to is its eyes', `targetEyeHeight`.
+pub struct Follow {
+    pub id: i32
+    pub eyes: bool
+    pub target_eyes: bool = false
+}
+
+/// A `PositionTracker`: a place or an entity.
+pub enum Tracker {
+    Block(Spot)
+    Entity(Follow)
+}
+
+/// A `WalkTarget`: where to walk to, how fast, `speedModifier`, and how near is near enough in
+/// blocks, `closeEnoughDist`.
+pub struct Walk {
+    pub target: Tracker
+    pub speed: f32
+    pub close_enough: i32
+}
+
+impl Walk {
+    /// `WalkTarget(Vec3, ...)`: the block that holds x, y, z, its center the place.
+    pub fn to_place(x: f64, y: f64, z: f64, speed: f32, close_enough: i32) -> Walk {
+        let s = Spot.of_place(x, y, z)
+        return Walk { target: Tracker.Block(Spot.of_block(s.x, s.y, s.z)), speed: speed, close_enough: close_enough }
+    }
+}
+
+/// `NearestVisibleLivingEntities`: the living entities near a mob as its sensor found them, nearest
+/// first, by ID, and for each whether it's been tested whether the mob may see it, -1 not yet, 0
+/// not and 1 so; each is tested the first time it's asked of, `isEntityTargetable`, and kept.
+pub struct Visible {
+    pub ids: List<i32> = List<i32>()
+    pub seen: List<i8> = List<i8>()
+}
+
+/// What a mob was last hurt by, `DamageSource`, as its brain keeps it: the type, by ID, and its
+/// tags, `world.damage`'s bits, and the entity whose hurt it was, `getEntity`, where it's living.
+pub struct HurtMemo {
+    pub kind: i32
+    pub tags: u32 = 0u32
+    pub by: i32? = none
+}
+
+/// What a memory holds.
+pub enum Memo {
+    Flag(bool)
+    Int(i32)
+    Long(i64)
+    /// An entity, by ID.
+    Entity(i32)
+    /// Entities, by ID.
+    Entities(List<i32>)
+    Visible(Visible)
+    Look(Tracker)
+    Walk(Walk)
+    /// A path, by the number its navigation gave it, which tells one path from another as
+    /// vanilla's `==` does.
+    Path(i64)
+    Hurt(HurtMemo)
+}
+
+/// A `MemorySlot`: whether its memory's registered, what it holds, and the ticks it has left,
+/// `i64.MAX` for ever.
+pub struct Slot {
+    pub registered: bool = false
+    pub value: Memo? = none
+    pub ttl: i64 = i64.MAX
+}
+
+/// A living entity near a mob, as its brain reads it (CAL-160): its ID and UUID; its kind, a mob's
+/// by `world.mob`'s numbering, `PLAYER` for a player and `OTHER` for anything else living; where
+/// its feet are, its eyes' height and its box; whether it's alive, a baby, undead, `#undead`,
+/// panicking and in love; how visible it is to the mob, `getVisibilityPercent`; and a player's:
+/// whether they're a spectator, sprinting or riding, and which of the tempting sets they hold.
+pub struct Near {
+    pub id: i32
+    pub uuid: (i64, i64)
+    pub species: i32
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    pub eyes: f32
+    pub bounds: Aabb
+    pub alive: bool = true
+    pub baby: bool = false
+    pub undead: bool = false
+    pub panicking: bool = false
+    pub in_love: bool = false
+    pub visibility: f64 = 1.0
+    pub spectator: bool = false
+    pub sprinting: bool = false
+    pub passenger: bool = false
+    pub tempts: u32 = 0
+}
+
+/// The kinds of `Near` that aren't mobs: a player, and anything else living, an armor stand.
+pub const PLAYER: i32 = -1
+pub const OTHER: i32 = -2
+
+/// The activities, `Activity`, by Calcite's numbering.
+pub const ACTIVITY_CORE: i32 = 0
+pub const ACTIVITY_IDLE: i32 = 1
+pub const ACTIVITY_PANIC: i32 = 2
+
+/// The name of the activity `a`, as it's registered, which its hash is of.
+pub fn activity_name(a: i32) -> str {
+    return match a {
+        0 => "core",
+        1 => "idle",
+        2 => "panic",
+        _ => "",
+    }
+}
+
+/// An activity a brain has: the memories it needs to be on, and those it forgets as it stops,
+/// `activityMemoriesToEraseWhenStopped`.
+pub struct Doing {
+    pub activity: i32
+    pub needs: List<Need> = List<Need>()
+    pub forgets: List<i32> = List<i32>()
+}
+
+/// The sensors, `SensorType`, by Calcite's numbering: the living entities near,
+/// `NEAREST_LIVING_ENTITIES`; what hurt it, `HURT_BY`; a player holding its food,
+/// `FOOD_TEMPTATIONS`; the nearest adult of its type, `NEAREST_ADULT`; and an armadillo's scare,
+/// `ARMADILLO_SCARE_DETECTED`.
+pub const SENSOR_NEAREST_LIVING: i32 = 0
+pub const SENSOR_HURT_BY: i32 = 1
+pub const SENSOR_FOOD_TEMPTATIONS: i32 = 2
+pub const SENSOR_NEAREST_ADULT: i32 = 3
+pub const SENSOR_ARMADILLO_SCARE: i32 = 4
+
+/// How often the sensor `s` scans, `scanRate`.
+pub fn scan_rate(s: i32) -> i32 {
+    return if s == SENSOR_ARMADILLO_SCARE { 5 } else { 20 }
+}
+
+/// The memories the sensor `s` keeps, `requires`, which its brain registers.
+pub fn sensor_memories(s: i32) -> List<i32> {
+    return match s {
+        0 => [MEMORY_NEAREST_LIVING_ENTITIES, MEMORY_NEAREST_VISIBLE_LIVING_ENTITIES],
+        1 => [MEMORY_HURT_BY, MEMORY_HURT_BY_ENTITY],
+        2 => [MEMORY_TEMPTING_PLAYER],
+        3 => [MEMORY_NEAREST_VISIBLE_ADULT, MEMORY_NEAREST_VISIBLE_LIVING_ENTITIES],
+        4 => [MEMORY_NEAREST_LIVING_ENTITIES],
+        _ => List<i32>(),
+    }
+}
+
+/// A sensor: its kind, and the ticks till it scans, `timeToTick`.
+pub struct Sensor {
+    pub kind: i32
+    pub time_to_tick: i64 = 0
+}
+
+/// `SetEntityLookTargetSometimes`'s: whether it looks at players, as an armadillo's does, the
+/// square of how far, and its `Ticker`'s interval.
+pub struct LookSometimes {
+    pub player: bool
+    pub max_dist_sqr: f32
+    pub min_interval: i32
+    pub max_interval: i32
+}
+
+/// `AnimalMakeLove`'s: its partner's kind, its speed and how near is near enough.
+pub struct MakeLove {
+    pub species: i32
+    pub speed: f32
+    pub close_enough: i32
+}
+
+/// `RandomLookAround`'s: its interval, how far it turns either way and the pitches it looks at.
+pub struct LookAround {
+    pub min_interval: i32
+    pub max_interval: i32
+    pub max_yaw: f32
+    pub min_pitch: f32
+    pub pitch_range: f32
+}
+
+/// A behavior's kind, as it's made:
+pub enum Behavior {
+    /// `Swim`, jumping at the chance in what it floats in or lava.
+    Swim(f32)
+    /// `AnimalPanic` at the speed, an armadillo's, `ArmadilloPanic`, panicking only at the
+    /// environment's hurts and rolling out as it starts.
+    Panic(f32)
+    /// `LookAtTargetSink`.
+    LookAtTarget(i32)
+    /// `MoveToTargetSink`, an armadillo's, which doesn't start while it's scared, where so.
+    MoveToTarget(bool)
+    /// `CountDownCooldownTicks` of the memory.
+    CountDown(i32)
+    /// An armadillo's rolling out where no danger's been seen lately, `ARMADILLO_ROLLING_OUT`.
+    RollOut(i32)
+    LookSometimes(LookSometimes)
+    MakeLove(MakeLove)
+    /// `FollowTemptation` at the speed, near enough within 2 blocks, or 1 for a baby, as an
+    /// armadillo's is.
+    Tempted(f32)
+    /// `BabyFollowAdult` within the range at the speed.
+    FollowAdult((i32, i32, f32))
+    LookAround(LookAround)
+    /// `RandomStroll.stroll` at the speed, as far as 10 blocks across and 7 up or down.
+    Stroll(f32)
+    /// `SetWalkTargetFromLookTarget` at the speed, near enough within so many blocks.
+    WalkToLook((f32, i32))
+    /// `DoNothing`.
+    Idle(i32)
+    /// `ArmadilloBallUp`.
+    BallUp(i32)
+    /// `RunOne`, a `GateBehavior` that shuffles its behaviors and runs the first that starts, its
+    /// behaviors its deed's `gate`.
+    Gate(i32)
+}
+
+/// What a behavior keeps as it runs: `MoveToTargetSink`'s wait before it tries again,
+/// `remainingCooldown`, whether it has a path, `path`, and the one it found as it starts, the block
+/// it last made one to, `lastTargetPos`, and the speed it walks at, `speedModifier`; the ticks till
+/// `SetEntityLookTargetSometimes`' next
+/// start, its `Ticker`'s; the game time `AnimalMakeLove`'s baby comes, `spawnChildAtTime`; and
+/// `ArmadilloBallUp`'s ticks till it next peeks, `nextPeekTimer`, and whether danger was about as
+/// it last ticked, `dangerWasAround`.
+pub struct Keep {
+    pub cooldown: i32 = 0
+    pub path: bool = false
+    pub found: Path? = none
+    pub last_target: (i32, i32, i32)? = none
+    pub speed: f32 = 0.0f32
+    pub ticks: i32 = 0
+    pub child_at: i64 = 0
+    pub peek: i32 = 0
+    pub danger_was: bool = false
+}
+
+/// A behavior as a brain keeps it: whether it runs, `Behavior.Status`, the game time it times out
+/// after, `endTimestamp`, and how long it may run, `minDuration` and `maxDuration`; its kind and
+/// what it keeps; and a gate's behaviors.
+pub struct Deed {
+    pub running: bool = false
+    pub end: i64 = 0
+    pub min: i32 = 60
+    pub max: i32 = 60
+    pub kind: Behavior
+    pub keep: Keep = Keep()
+    pub gate: Gate? = none
+}
+
+/// A behavior a gate holds, with its weight and its draw of the gate's last shuffle, `randWeight`.
+pub struct Weighted {
+    pub deed: Deed
+    pub weight: i32
+    pub rand_weight: f64 = 0.0
+}
+
+/// `RunOne`'s: the memories it needs, and its behaviors, a `ShufflingList`, with its own random,
+/// which vanilla's makes unseeded, `RandomSource.create`, and the world's maker seeds.
+pub struct Gate {
+    pub needs: List<Need> = List<Need>()
+    pub entries: List<Weighted> = List<Weighted>()
+    pub random: LegacyRandom
+}
+
+impl Gate {
+    /// `ShufflingList.shuffle`: each entry drawn a weight, `-pow(draw, 1 / weight)`, then sorted
+    /// least first, keeping the order of those the same, as `List.sort` does.
+    pub fn shuffle(mut self) {
+        for i in 0..self.entries.len() {
+            let r = self.random.next_float()
+            let w = self.entries[i].weight
+            self.entries[i].rand_weight = -pow(f64(r), f64(1.0f32 / f32.nearest(w)))
+        }
+        // An insertion sort, stable as `TimSort` is.
+        for i in 1..self.entries.len() {
+            var j = i
+            while j > 0 and self.entries[j - 1].rand_weight > self.entries[j].rand_weight {
+                self.entries.swap(j - 1, j)
+                j -= 1
+            }
+        }
+    }
+
+    /// Whether any of its behaviors runs.
+    pub fn any_running(self) -> bool {
+        for e in self.entries {
+            if e.deed.running {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+/// A behavior a brain has, with its priority and its activity's.
+pub struct Run {
+    pub priority: i32
+    pub activity: i32
+    pub deed: Deed
+}
+
+/// The memories the behavior `d` needs to start, its `entryCondition`, or a builder's memory
+/// conditions, which its brain registers, in vanilla's order, which reads them as they come; a
+/// gate's own, then each of its behaviors', which it registers but doesn't need.
+pub fn entry_of(d: Deed) -> List<Need> {
+    var out = List<Need>()
+    match d.kind {
+        Behavior.Swim(_) => {},
+        Behavior.Panic(_) => {
+            out.push(Need { memory: MEMORY_IS_PANICKING, status: STATUS_REGISTERED })
+            out.push(Need { memory: MEMORY_HURT_BY, status: STATUS_REGISTERED })
+        },
+        Behavior.LookAtTarget(_) => out.push(Need { memory: MEMORY_LOOK_TARGET, status: STATUS_PRESENT }),
+        Behavior.MoveToTarget(_) => {
+            out.push(Need { memory: MEMORY_CANT_REACH_WALK_TARGET_SINCE, status: STATUS_REGISTERED })
+            out.push(Need { memory: MEMORY_PATH, status: STATUS_ABSENT })
+            out.push(Need { memory: MEMORY_WALK_TARGET, status: STATUS_PRESENT })
+        },
+        Behavior.CountDown(m) => out.push(Need { memory: m, status: STATUS_PRESENT }),
+        Behavior.RollOut(_) => out.push(Need { memory: MEMORY_DANGER_DETECTED_RECENTLY, status: STATUS_ABSENT }),
+        Behavior.LookSometimes(_) => {
+            out.push(Need { memory: MEMORY_LOOK_TARGET, status: STATUS_ABSENT })
+            out.push(Need { memory: MEMORY_NEAREST_VISIBLE_LIVING_ENTITIES, status: STATUS_PRESENT })
+        },
+        Behavior.MakeLove(_) => {
+            out.push(Need { memory: MEMORY_NEAREST_VISIBLE_LIVING_ENTITIES, status: STATUS_PRESENT })
+            out.push(Need { memory: MEMORY_BREED_TARGET, status: STATUS_ABSENT })
+            out.push(Need { memory: MEMORY_WALK_TARGET, status: STATUS_REGISTERED })
+            out.push(Need { memory: MEMORY_LOOK_TARGET, status: STATUS_REGISTERED })
+            out.push(Need { memory: MEMORY_IS_PANICKING, status: STATUS_ABSENT })
+        },
+        Behavior.Tempted(_) => {
+            out.push(Need { memory: MEMORY_LOOK_TARGET, status: STATUS_REGISTERED })
+            out.push(Need { memory: MEMORY_WALK_TARGET, status: STATUS_REGISTERED })
+            out.push(Need { memory: MEMORY_TEMPTATION_COOLDOWN_TICKS, status: STATUS_ABSENT })
+            out.push(Need { memory: MEMORY_TEMPTING_PLAYER, status: STATUS_PRESENT })
+            out.push(Need { memory: MEMORY_BREED_TARGET, status: STATUS_ABSENT })
+            out.push(Need { memory: MEMORY_IS_PANICKING, status: STATUS_ABSENT })
+        },
+        Behavior.FollowAdult(_) => {
+            out.push(Need { memory: MEMORY_NEAREST_VISIBLE_ADULT, status: STATUS_PRESENT })
+            out.push(Need { memory: MEMORY_LOOK_TARGET, status: STATUS_REGISTERED })
+            out.push(Need { memory: MEMORY_WALK_TARGET, status: STATUS_ABSENT })
+        },
+        Behavior.LookAround(_) => {
+            out.push(Need { memory: MEMORY_LOOK_TARGET, status: STATUS_ABSENT })
+            out.push(Need { memory: MEMORY_GAZE_COOLDOWN_TICKS, status: STATUS_ABSENT })
+        },
+        Behavior.Stroll(_) => out.push(Need { memory: MEMORY_WALK_TARGET, status: STATUS_ABSENT }),
+        Behavior.WalkToLook(_) => {
+            out.push(Need { memory: MEMORY_WALK_TARGET, status: STATUS_ABSENT })
+            out.push(Need { memory: MEMORY_LOOK_TARGET, status: STATUS_PRESENT })
+        },
+        Behavior.Idle(_) => {},
+        Behavior.BallUp(_) => {},
+        Behavior.Gate(_) => {
+            if let g = d.gate {
+                for n in g.needs {
+                    out.push(n)
+                }
+                for e in g.entries {
+                    for n in entry_of(e.deed) {
+                        out.push(n)
+                    }
+                }
+            }
+        },
+    }
+    return out
+}
+
+/// Whether a behavior of the kind `b` draws its duration as it starts: those that are
+/// `Behavior`s, and `DoNothing`; not a builder's `OneShot` nor a gate.
+pub fn timed(b: Behavior) -> bool {
+    return match b {
+        Behavior.RollOut(_) => false,
+        Behavior.LookSometimes(_) => false,
+        Behavior.FollowAdult(_) => false,
+        Behavior.Stroll(_) => false,
+        Behavior.WalkToLook(_) => false,
+        Behavior.Gate(_) => false,
+        _ => true,
+    }
+}
+
+/// A behavior of the kind `kind` that may run from `min` to `max` ticks.
+pub fn deed(kind: Behavior, min: i32, max: i32) -> Deed {
+    return Deed { min: min, max: max, kind: kind }
+}
+
+/// A `RunOne` of `entries`, needing `needs`, its random seeded `seed`.
+pub fn gate(entries: own List<Weighted>, needs: own List<Need>, seed: i64) -> Deed {
+    return Deed { min: 1, max: 1, kind: Behavior.Gate(0), gate: some(Gate { needs: needs, entries: entries, random: LegacyRandom.new(seed) }) }
+}
+
+/// The seed of the `k`th gate made with a brain whose mob's random was seeded `seed`, from 0, as
+/// the world's maker seeds what vanilla seeds from the clock, `mixStafford13(seed + k + 1)`.
+pub fn gate_seed(seed: i64, k: i64) -> i64 {
+    return mix_stafford13(seed + k + 1)
+}
+
+/// An armadillo's sensors, `Armadillo`'s brain provider's, in their order.
+pub fn armadillo_sensors() -> List<i32> {
+    return [SENSOR_NEAREST_LIVING, SENSOR_HURT_BY, SENSOR_FOOD_TEMPTATIONS, SENSOR_NEAREST_ADULT, SENSOR_ARMADILLO_SCARE]
+}
+
+/// An armadillo's activities, `ArmadilloAi.getActivities`, its gates' randoms seeded from `seed`,
+/// its own random's, `gate_seed`: core, its behaviors from 0, `Swim(0.8)`, `ArmadilloPanic(2)`,
+/// `LookAtTargetSink(45, 90)`, its own `MoveToTargetSink`, the temptation's and gaze's count
+/// downs, and its rolling out; idle, looking at a player within 6 every 30 to 60 ticks, making
+/// love, one of following a temptation and following an adult within 5 to 16, `RandomLookAround`
+/// every 150 to 250 ticks within 30 degrees, and where it has no walk target, one of strolling,
+/// walking to what it looks at and doing nothing for 30 to 60 ticks; and panic, where danger's been
+/// seen and it isn't panicking, balling up, for as long as 6,000 ticks.
+pub fn armadillo_activities(seed: i64) -> List<Activity> {
+    var core = List<Deed>()
+    core.push(deed(Behavior.Swim(0.8f32), 60, 60))
+    core.push(deed(Behavior.Panic(2.0f32), 100, 120))
+    core.push(deed(Behavior.LookAtTarget(0), 45, 90))
+    core.push(deed(Behavior.MoveToTarget(true), 150, 250))
+    core.push(deed(Behavior.CountDown(MEMORY_TEMPTATION_COOLDOWN_TICKS), 60, 60))
+    core.push(deed(Behavior.CountDown(MEMORY_GAZE_COOLDOWN_TICKS), 60, 60))
+    core.push(deed(Behavior.RollOut(0), 1, 1))
+    var idle = Activity { doing: Doing { activity: ACTIVITY_IDLE } }
+    idle.deeds.push((0, deed(Behavior.LookSometimes(LookSometimes { player: true, max_dist_sqr: 36.0f32, min_interval: 30, max_interval: 60 }), 1, 1)))
+    idle.deeds.push((1, deed(Behavior.MakeLove(MakeLove { species: 16, speed: 1.0f32, close_enough: 1 }), 110, 110)))
+    var follows = List<Weighted>()
+    follows.push(Weighted { deed: deed(Behavior.Tempted(1.25f32), 60, 60), weight: 1 })
+    follows.push(Weighted { deed: deed(Behavior.FollowAdult((5, 16, 1.25f32)), 1, 1), weight: 1 })
+    idle.deeds.push((2, gate(follows, List<Need>(), gate_seed(seed, 0))))
+    idle.deeds.push((3, deed(Behavior.LookAround(LookAround { min_interval: 150, max_interval: 250, max_yaw: 30.0f32, min_pitch: 0.0f32, pitch_range: 0.0f32 }), 60, 60)))
+    var strolls = List<Weighted>()
+    strolls.push(Weighted { deed: deed(Behavior.Stroll(1.0f32), 1, 1), weight: 1 })
+    strolls.push(Weighted { deed: deed(Behavior.WalkToLook((1.0f32, 3)), 1, 1), weight: 1 })
+    strolls.push(Weighted { deed: deed(Behavior.Idle(0), 30, 60), weight: 1 })
+    var absent = List<Need>()
+    absent.push(Need { memory: MEMORY_WALK_TARGET, status: STATUS_ABSENT })
+    idle.deeds.push((4, gate(strolls, absent, gate_seed(seed, 1))))
+    var scared = Activity { doing: Doing { activity: ACTIVITY_PANIC } }
+    scared.doing.needs.push(Need { memory: MEMORY_DANGER_DETECTED_RECENTLY, status: STATUS_PRESENT })
+    scared.doing.needs.push(Need { memory: MEMORY_IS_PANICKING, status: STATUS_ABSENT })
+    scared.deeds.push((0, deed(Behavior.BallUp(0), 6000, 6000)))
+    var out = List<Activity>()
+    out.push(Activity.counting(ACTIVITY_CORE, 0, core))
+    out.push(idle)
+    out.push(scared)
+    return out
+}
+
+/// A brain.
+pub struct Brain {
+    /// Its memories, by type.
+    pub slots: List<Slot> = List<Slot>()
+    /// Its sensors, in the order its mob's type gives them, `LinkedHashMap`'s.
+    pub sensors: List<Sensor> = List<Sensor>()
+    /// Its behaviors, in the order vanilla goes over them.
+    pub runs: List<Run> = List<Run>()
+    /// Its activities, in the order they're added, its core ones, and those on, a `HashSet`, of
+    /// which only whether one is in it shows; and the one it falls back on, `defaultActivity`.
+    pub doings: List<Doing> = List<Doing>()
+    pub core: List<i32> = List<i32>()
+    pub active: List<i32> = List<i32>()
+    pub default_activity: i32 = ACTIVITY_IDLE
+}
+
+/// An activity and its behaviors, each with its priority, as a brain's made of them,
+/// `ActivityData`.
+pub struct Activity {
+    pub doing: Doing
+    pub deeds: List<(i32, Deed)> = List<(i32, Deed)>()
+}
+
+impl Activity {
+    /// `ActivityData.create(activity, priorityOfFirstBehavior, behaviorList)`: the behaviors at
+    /// priorities counting up from `first`.
+    pub fn counting(activity: i32, first: i32, deeds: own List<Deed>) -> Activity {
+        var out = Activity { doing: Doing { activity: activity } }
+        var p = first
+        for d in deeds {
+            out.deeds.push((p, d.copy()))
+            p += 1
+        }
+        return out
+    }
+}
+
+impl Brain {
+    /// `new Brain()`, a mob's without one of its own: no memories, sensors or behaviors.
+    pub fn empty() -> Brain {
+        var b = Brain()
+        b.core.push(ACTIVITY_CORE)
+        b.use_default()
+        return b
+    }
+
+    /// `Brain.Provider.makeBrain`: its sensors in their order, each put off as `random` draws, the
+    /// memories they keep registered; then its activities, each behavior's memories registered;
+    /// then its core activity, and its default one on.
+    pub fn made<R: RandomSource>(sensors: List<i32>, activities: own List<Activity>, random: mut R) -> Brain {
+        var b = Brain()
+        for _ in 0..MEMORIES {
+            b.slots.push(Slot())
+        }
+        for s in sensors {
+            var sensor = Sensor { kind: s }
+            sensor.time_to_tick = i64(random.next_int_below(scan_rate(s)))
+            b.sensors.push(sensor)
+            for m in sensor_memories(s) {
+                b.slots[slot_of(m)].registered = true
+            }
+        }
+        // The behaviors by priority, then by activity in a `HashMap` of their names', each added
+        // at the front of its bin as `computeIfAbsent` adds it, then in their order.
+        var by_priority = SortedMap<i32, JavaHashMap<String, List<Run>>>()
+        for a in activities {
+            for (p, d) in a.deeds {
+                for n in entry_of(d) {
+                    b.slots[slot_of(n.memory)].registered = true
+                }
+                if not by_priority.contains(p) {
+                    by_priority.insert(p, JavaHashMap<String, List<Run>>())
+                }
+                let name = String(activity_name(a.doing.activity))
+                _ = by_priority[p].compute_if_absent(name.copy(), List<Run>())
+                by_priority[p][name].push(Run { priority: p, activity: a.doing.activity, deed: d.copy() })
+            }
+            b.doings.push(a.doing.copy())
+        }
+        for (_, by_activity) in by_priority {
+            for (_, runs) in by_activity {
+                for r in runs {
+                    b.runs.push(r.copy())
+                }
+            }
+        }
+        b.core.push(ACTIVITY_CORE)
+        b.use_default()
+        return b
+    }
+
+    /// Its behaviors, taken out to run, given back with `give_back_runs`.
+    pub fn take_runs(mut self) -> List<Run> {
+        var back = List<Run>()
+        while let r = self.runs.pop() {
+            back.push(r)
+        }
+        var out = List<Run>()
+        while let r = back.pop() {
+            out.push(r)
+        }
+        return out
+    }
+
+    pub fn give_back_runs(mut self, runs: own List<Run>) {
+        self.runs = runs
+    }
+
+    /// Whether it's a brain of its own, not `isBrainDead`.
+    pub fn alive(self) -> bool {
+        return not self.slots.is_empty() or not self.sensors.is_empty() or not self.runs.is_empty()
+    }
+
+    /// Whether the memory `m` is registered.
+    pub fn registered(self, m: i32) -> bool {
+        return slot_of(m) < self.slots.len() and self.slots[slot_of(m)].registered
+    }
+
+    /// `hasMemoryValue`.
+    pub fn has(self, m: i32) -> bool {
+        return self.check(m, STATUS_PRESENT)
+    }
+
+    /// `checkMemory`: whether the memory `m` is registered and in the state `status`.
+    pub fn check(self, m: i32, status: i32) -> bool {
+        if not self.registered(m) {
+            return false
+        }
+        let held = self.slots[slot_of(m)].value != none
+        return status == STATUS_REGISTERED or (status == STATUS_PRESENT and held) or (status == STATUS_ABSENT and not held)
+    }
+
+    /// Whether each of `needs` holds, `hasRequiredMemories`.
+    pub fn meets(self, needs: List<Need>) -> bool {
+        for n in needs {
+            if not self.check(n.memory, n.status) {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// `eraseMemory`.
+    pub fn erase(mut self, m: i32) {
+        if self.registered(m) {
+            self.slots[slot_of(m)].value = none
+            self.slots[slot_of(m)].ttl = i64.MAX
+        }
+    }
+
+    /// `setMemory`, for ever, where the memory's registered; an empty list held as nothing.
+    pub fn set(mut self, m: i32, value: own Memo) {
+        self.set_for(m, value, i64.MAX)
+    }
+
+    /// `setMemoryWithExpiry`, for `ttl` ticks.
+    pub fn set_for(mut self, m: i32, value: own Memo, ttl: i64) {
+        if not self.registered(m) {
+            return
+        }
+        var empty = false
+        if let Memo.Entities(ids) = value {
+            empty = ids.is_empty()
+        }
+        if empty {
+            self.erase(m)
+            return
+        }
+        self.slots[slot_of(m)].value = some(value)
+        self.slots[slot_of(m)].ttl = ttl
+    }
+
+    /// `setMemory` of an optional, nothing erasing it.
+    pub fn set_or_erase(mut self, m: i32, value: own Memo?) {
+        match value {
+            some(v) => self.set(m, v),
+            none => self.erase(m),
+        }
+    }
+
+    /// `getTimeUntilExpiry`.
+    pub fn ttl(self, m: i32) -> i64 {
+        let at = slot_of(m)
+        return if self.slots[at].value != none { self.slots[at].ttl } else { 0i64 }
+    }
+
+    /// `pack`, as `Brain.Packed.CODEC` saves it, its `memories`: each that may be saved and holds
+    /// something, by name, its `value` and, where it may run out, the ticks it has left, `ttl`.
+    pub fn packed(self) -> Tag {
+        var memories = JavaHashMap<String, Tag>()
+        for m in 0..MEMORIES {
+            let how = saved_as(m)
+            var value: Tag? = none
+            if how == SAVED_FLAG {
+                if let b = self.flag(m) {
+                    value = some(Tag.Byte(if b { 1i8 } else { 0i8 }))
+                }
+            } else if how == SAVED_INT {
+                if let n = self.int(m) {
+                    value = some(Tag.Int(n))
+                }
+            } else if how == SAVED_LONG {
+                if let n = self.long(m) {
+                    value = some(Tag.Long(n))
+                }
+            }
+            let v = value else continue
+            var entry = JavaHashMap<String, Tag>()
+            entry.insert(String("value"), v)
+            let ttl = self.ttl(m)
+            if ttl != i64.MAX {
+                entry.insert(String("ttl"), Tag.Long(ttl))
+            }
+            memories.insert(String(memory_name(m)), Tag.Compound(entry))
+        }
+        var out = JavaHashMap<String, Tag>()
+        out.insert(String("memories"), Tag.Compound(memories))
+        return Tag.Compound(out)
+    }
+
+    /// The memories of `packed`, as `Brain.Packed.CODEC` reads them, set as the brain's made of
+    /// them, `setMemoryInternal`: each it has registered that may be saved, its value read as its
+    /// codec reads it, with the ticks it has left where they're saved, else for ever. Those it
+    /// can't read are left.
+    pub fn unpack(mut self, packed: Tag) {
+        let Tag.Compound(p) = packed else return
+        if not p.contains("memories") {
+            return
+        }
+        let Tag.Compound(memories) = p["memories"] else return
+        for (name, held) in memories {
+            let m = memory_named(name.copy()) else continue
+            if not self.registered(m) {
+                continue
+            }
+            let Tag.Compound(entry) = held else continue
+            if not entry.contains("value") {
+                continue
+            }
+            let how = saved_as(m)
+            var memo: Memo? = none
+            if how == SAVED_FLAG {
+                if let b = entry["value"].number_bool() {
+                    memo = some(Memo.Flag(b))
+                }
+            } else if how == SAVED_INT {
+                if let n = entry["value"].number_int() {
+                    memo = some(Memo.Int(n))
+                }
+            } else if how == SAVED_LONG {
+                if let n = entry["value"].number_long() {
+                    memo = some(Memo.Long(n))
+                }
+            }
+            let v = memo else continue
+            var ttl: i64? = none
+            if entry.contains("ttl") {
+                ttl = entry["ttl"].number_long()
+            }
+            match ttl {
+                some(t) => self.set_for(m, v, t),
+                none => self.set(m, v),
+            }
+        }
+    }
+
+    /// The flag the memory `m` holds, if it holds one.
+    pub fn flag(self, m: i32) -> bool? {
+        if let v = self.slots[slot_of(m)].value {
+            if let Memo.Flag(f) = v {
+                return some(f)
+            }
+        }
+        return none
+    }
+
+    /// The number the memory `m` holds, if it holds one.
+    pub fn int(self, m: i32) -> i32? {
+        if let v = self.slots[slot_of(m)].value {
+            if let Memo.Int(n) = v {
+                return some(n)
+            }
+        }
+        return none
+    }
+
+    /// The long the memory `m` holds, if it holds one.
+    pub fn long(self, m: i32) -> i64? {
+        if let v = self.slots[slot_of(m)].value {
+            if let Memo.Long(n) = v {
+                return some(n)
+            }
+        }
+        return none
+    }
+
+    /// The entity the memory `m` holds, by ID, if it holds one.
+    pub fn entity(self, m: i32) -> i32? {
+        if let v = self.slots[slot_of(m)].value {
+            if let Memo.Entity(id) = v {
+                return some(id)
+            }
+        }
+        return none
+    }
+
+    /// The entities the memory `m` holds, by ID, none where it holds none.
+    pub fn entities(self, m: i32) -> List<i32> {
+        if let v = self.slots[slot_of(m)].value {
+            if let Memo.Entities(ids) = v {
+                return ids.copy()
+            }
+        }
+        return List<i32>()
+    }
+
+    /// The tracker the memory `m` holds, if it holds one.
+    pub fn tracker(self, m: i32) -> Tracker? {
+        if let v = self.slots[slot_of(m)].value {
+            if let Memo.Look(t) = v {
+                return some(t)
+            }
+        }
+        return none
+    }
+
+    /// The walk target the memory `m` holds, if it holds one.
+    pub fn walk(self, m: i32) -> Walk? {
+        if let v = self.slots[slot_of(m)].value {
+            if let Memo.Walk(w) = v {
+                return some(w)
+            }
+        }
+        return none
+    }
+
+    /// The path the memory `m` holds, by its number, if it holds one.
+    pub fn path(self, m: i32) -> i64? {
+        if let v = self.slots[slot_of(m)].value {
+            if let Memo.Path(n) = v {
+                return some(n)
+            }
+        }
+        return none
+    }
+
+    /// What the mob was last hurt by, as the memory `m` holds it, if it holds it.
+    pub fn hurt(self, m: i32) -> HurtMemo? {
+        if let v = self.slots[slot_of(m)].value {
+            if let Memo.Hurt(h) = v {
+                return some(h)
+            }
+        }
+        return none
+    }
+
+    /// The visible living entities the memory `m` holds, if it holds them, lent out to be tested
+    /// and given back with `give_back_visible`.
+    pub fn lend_visible(mut self, m: i32) -> Visible? {
+        let v = self.slots[slot_of(m)].value.take() else return none
+        match v {
+            Memo.Visible(seen) => return some(seen),
+            other => {
+                self.slots[slot_of(m)].value = some(other)
+                return none
+            },
+        }
+    }
+
+    /// Gives back what `lend_visible` lent.
+    pub fn give_back_visible(mut self, m: i32, seen: own Visible) {
+        self.slots[slot_of(m)].value = some(Memo.Visible(seen))
+    }
+
+    /// `forgetOutdatedMemories`: each memory that may expire forgotten where its time's up, else
+    /// a tick nearer it, `MemorySlot.tick`.
+    pub fn forget_outdated(mut self) {
+        for i in 0..self.slots.len() {
+            if self.slots[i].value == none or self.slots[i].ttl == i64.MAX {
+                continue
+            }
+            if self.slots[i].ttl <= 0 {
+                self.slots[i].value = none
+                self.slots[i].ttl = i64.MAX
+            } else {
+                self.slots[i].ttl -= 1
+            }
+        }
+    }
+
+    /// Whether the sensor `i` scans this tick, `Sensor.tick`: its count down by one, and at 0 or
+    /// below back to its rate.
+    pub fn sensor_due(mut self, i: usize) -> bool {
+        self.sensors[i].time_to_tick -= 1
+        if self.sensors[i].time_to_tick <= 0 {
+            self.sensors[i].time_to_tick = i64(scan_rate(self.sensors[i].kind))
+            return true
+        }
+        return false
+    }
+
+    /// `isActive`.
+    pub fn is_active(self, a: i32) -> bool {
+        return self.active.contains(a)
+    }
+
+    /// `useDefaultActivity`.
+    pub fn use_default(mut self) {
+        let a = self.default_activity
+        self.set_active(a)
+    }
+
+    // `setActiveActivity`: where it isn't on, what the others forget as they stop forgotten, and
+    // the core activities on with it.
+    fn set_active(mut self, a: i32) {
+        if self.is_active(a) {
+            return
+        }
+        for old in self.active.copy() {
+            if old == a {
+                continue
+            }
+            for d in self.doings.copy() {
+                if d.activity == old {
+                    for m in d.forgets {
+                        self.erase(m)
+                    }
+                }
+            }
+        }
+        self.active.clear()
+        for c in self.core {
+            self.active.push(c)
+        }
+        self.active.push(a)
+    }
+
+    /// `activityRequirementsAreMet`: whether the activity `a` is one it has, its memories as it
+    /// needs them.
+    pub fn can_do(self, a: i32) -> bool {
+        for d in self.doings {
+            if d.activity == a {
+                return self.meets(d.needs)
+            }
+        }
+        return false
+    }
+
+    /// `setActiveActivityToFirstValid`: the first of `activities` it may do, on.
+    pub fn set_first_valid(mut self, activities: List<i32>) {
+        for a in activities {
+            if self.can_do(a) {
+                self.set_active(a)
+                return
+            }
+        }
+    }
+
+    /// `setActiveActivityIfPossible`: the activity on where it may do it, else its default.
+    pub fn set_if_possible(mut self, a: i32) {
+        if self.can_do(a) {
+            self.set_active(a)
+        } else {
+            self.use_default()
+        }
+    }
+}
+
+/// `Behavior.tryStart`'s duration, as it starts at game time `now`: its time out drawn from the
+/// level's random, from `min` to `max` ticks on, as every behavior with a duration draws, even
+/// where they're the same.
+pub fn start_deed<R: RandomSource>(d: mut Deed, now: i64, level_random: mut R) {
+    d.running = true
+    let duration = d.min + level_random.next_int_below(d.max + 1 - d.min)
+    d.end = now + i64(duration)
+}
+
+/// Whether a behavior's timed out at game time `now`, `timedOut`, which a cooldown's count and a
+/// temptation never do.
+pub fn timed_out(d: Deed, now: i64) -> bool {
+    return match d.kind {
+        Behavior.CountDown(_) => false,
+        Behavior.Tempted(_) => false,
+        _ => now > d.end,
+    }
+}

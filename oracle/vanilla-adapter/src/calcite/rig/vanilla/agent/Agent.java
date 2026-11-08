@@ -37,7 +37,10 @@ import java.security.ProtectionDomain;
  * the seed and its ID (CAL-148). With {@code trace=PATH},
  * {@code ServerLevel.tickNonPassenger} hands each entity it's ticked to {@link Trace#ticked} as it
  * returns, which writes a living one's state, and {@code ServerPlayer.doTick} hands the player to
- * {@link Trace#played} as it returns (CAL-159).
+ * {@link Trace#played} as it returns (CAL-159). {@code Brain.Provider.makeBrain} hands the entity
+ * it's making a brain for to {@link Entities#braining} as it starts and calls
+ * {@link Entities#brained} as it returns, and each of {@code ShufflingList}'s constructors hands
+ * its random to {@link Entities#shuffling} as it returns, which seeds it (CAL-160).
  *
  * <p>This class names no game class, so loading it loads none: {@code ServerLevel} and
  * {@code LegacyRandomSource} must load after the transformer is in place to be changed.
@@ -47,6 +50,8 @@ public final class Agent {
     private static final String LEGACY = "net/minecraft/world/level/levelgen/LegacyRandomSource";
     private static final String ENTITY = "net/minecraft/world/entity/Entity";
     private static final String PLAYER = "net/minecraft/server/level/ServerPlayer";
+    private static final String PROVIDER = "net/minecraft/world/entity/ai/Brain$Provider";
+    private static final String SHUFFLING = "net/minecraft/world/entity/ai/behavior/ShufflingList";
 
     private Agent() {
     }
@@ -83,7 +88,8 @@ public final class Agent {
     private static final class Transformer implements ClassFileTransformer {
         @Override
         public byte[] transform(ClassLoader loader, String name, Class<?> redefined, ProtectionDomain domain, byte[] bytes) {
-            if (!LEVEL.equals(name) && !LEGACY.equals(name) && !ENTITY.equals(name) && !PLAYER.equals(name)) {
+            if (!LEVEL.equals(name) && !LEGACY.equals(name) && !ENTITY.equals(name) && !PLAYER.equals(name)
+                    && !PROVIDER.equals(name) && !SHUFFLING.equals(name)) {
                 return null;
             }
             try {
@@ -91,7 +97,8 @@ public final class Agent {
                 ClassFile cf = ClassFile.of(ClassFile.ClassHierarchyResolverOption.of(
                         ClassHierarchyResolver.defaultResolver().orElse(ClassHierarchyResolver.ofResourceParsing(from))));
                 return LEVEL.equals(name) ? level(cf, bytes) : ENTITY.equals(name) ? entity(cf, bytes)
-                        : PLAYER.equals(name) ? player(cf, bytes) : legacy(cf, bytes);
+                        : PLAYER.equals(name) ? player(cf, bytes) : PROVIDER.equals(name) ? provider(cf, bytes)
+                        : SHUFFLING.equals(name) ? shuffling(cf, bytes) : legacy(cf, bytes);
             } catch (Throwable t) {
                 // A transformer's exception is swallowed by the JVM, and the class loads unchanged,
                 // so the run would go on unseeded: stop it instead.
@@ -188,6 +195,55 @@ public final class Agent {
         };
         return cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
                 m -> m.methodName().equalsString("doTick") && m.methodType().equalsString("()V"), played));
+    }
+
+    // Brain.Provider.makeBrain hands its body to Entities.braining as it starts, and calls
+    // Entities.brained before it returns, the brain it returns left on the stack (CAL-160).
+    private static byte[] provider(ClassFile cf, byte[] bytes) {
+        ClassDesc entities = ClassDesc.of("calcite.rig.vanilla.agent.Entities");
+        MethodTypeDesc withOne = MethodTypeDesc.of(ConstantDescs.CD_void, ConstantDescs.CD_Object);
+        MethodTypeDesc withNone = MethodTypeDesc.of(ConstantDescs.CD_void);
+        int[] hooked = {0};
+        CodeTransform braining = new CodeTransform() {
+            @Override
+            public void atStart(CodeBuilder b) {
+                b.aload(1);
+                b.invokestatic(entities, "braining", withOne);
+                hooked[0]++;
+            }
+
+            @Override
+            public void accept(CodeBuilder b, CodeElement e) {
+                if (e instanceof ReturnInstruction) {
+                    b.invokestatic(entities, "brained", withNone);
+                }
+                b.with(e);
+            }
+        };
+        byte[] out = cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
+                m -> m.methodName().equalsString("makeBrain"), braining));
+        if (hooked[0] != 1) {
+            throw new IllegalStateException("Brain.Provider has " + hooked[0] + " makeBrain methods, not one");
+        }
+        return out;
+    }
+
+    // Each of ShufflingList's constructors hands its random to Entities.shuffling as it returns
+    // (CAL-160).
+    private static byte[] shuffling(ClassFile cf, byte[] bytes) {
+        ClassDesc list = ClassDesc.ofInternalName(SHUFFLING);
+        ClassDesc source = ClassDesc.of("net.minecraft.util.RandomSource");
+        MethodTypeDesc withOne = MethodTypeDesc.of(ConstantDescs.CD_void, ConstantDescs.CD_Object);
+        CodeTransform made = (b, e) -> {
+            if (e instanceof ReturnInstruction) {
+                b.aload(0);
+                b.getfield(list, "random", source);
+                b.invokestatic(ClassDesc.of("calcite.rig.vanilla.agent.Entities"), "shuffling", withOne);
+            }
+            b.with(e);
+        };
+        return cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
+                m -> m.methodName().equalsString("<init>"), made));
     }
 
     // LegacyRandomSource.next(int) hands each value it returns, itself and the bits to Tape.drew.
