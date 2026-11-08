@@ -41,6 +41,8 @@ import java.security.ProtectionDomain;
  * it's making a brain for to {@link Entities#braining} as it starts and calls
  * {@link Entities#brained} as it returns, and each of {@code ShufflingList}'s constructors hands
  * its random to {@link Entities#shuffling} as it returns, which seeds it (CAL-160).
+ * {@code InsideBrownianWalk}'s {@code Collections.shuffle}, which draws from a random of its own
+ * vanilla seeds from the clock, is {@link Entities#shuffle} instead, with the mob it walks.
  *
  * <p>This class names no game class, so loading it loads none: {@code ServerLevel} and
  * {@code LegacyRandomSource} must load after the transformer is in place to be changed.
@@ -52,6 +54,7 @@ public final class Agent {
     private static final String PLAYER = "net/minecraft/server/level/ServerPlayer";
     private static final String PROVIDER = "net/minecraft/world/entity/ai/Brain$Provider";
     private static final String SHUFFLING = "net/minecraft/world/entity/ai/behavior/ShufflingList";
+    private static final String INSIDE = "net/minecraft/world/entity/ai/behavior/InsideBrownianWalk";
 
     private Agent() {
     }
@@ -89,7 +92,7 @@ public final class Agent {
         @Override
         public byte[] transform(ClassLoader loader, String name, Class<?> redefined, ProtectionDomain domain, byte[] bytes) {
             if (!LEVEL.equals(name) && !LEGACY.equals(name) && !ENTITY.equals(name) && !PLAYER.equals(name)
-                    && !PROVIDER.equals(name) && !SHUFFLING.equals(name)) {
+                    && !PROVIDER.equals(name) && !SHUFFLING.equals(name) && !INSIDE.equals(name)) {
                 return null;
             }
             try {
@@ -98,7 +101,8 @@ public final class Agent {
                         ClassHierarchyResolver.defaultResolver().orElse(ClassHierarchyResolver.ofResourceParsing(from))));
                 return LEVEL.equals(name) ? level(cf, bytes) : ENTITY.equals(name) ? entity(cf, bytes)
                         : PLAYER.equals(name) ? player(cf, bytes) : PROVIDER.equals(name) ? provider(cf, bytes)
-                        : SHUFFLING.equals(name) ? shuffling(cf, bytes) : legacy(cf, bytes);
+                        : SHUFFLING.equals(name) ? shuffling(cf, bytes) : INSIDE.equals(name) ? inside(cf, bytes)
+                        : legacy(cf, bytes);
             } catch (Throwable t) {
                 // A transformer's exception is swallowed by the JVM, and the class loads unchanged,
                 // so the run would go on unseeded: stop it instead.
@@ -244,6 +248,49 @@ public final class Agent {
         };
         return cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
                 m -> m.methodName().equalsString("<init>"), made));
+    }
+
+    // InsideBrownianWalk's Collections.shuffle(List) is Entities.shuffle(List, Object) instead,
+    // with the mob the lambda that calls it is given, the first of its parameters that's a
+    // PathfinderMob, loaded from its slot (CAL-160).
+    private static byte[] inside(ClassFile cf, byte[] bytes) {
+        ClassDesc collections = ClassDesc.of("java.util.Collections");
+        ClassDesc mob = ClassDesc.of("net.minecraft.world.entity.PathfinderMob");
+        MethodTypeDesc withTwo = MethodTypeDesc.of(ConstantDescs.CD_void, ClassDesc.of("java.util.List"), ConstantDescs.CD_Object);
+        int[] hooked = {0};
+        ClassTransform each = (cb, ce) -> {
+            if (!(ce instanceof MethodModel m)) {
+                cb.with(ce);
+                return;
+            }
+            MethodTypeDesc type = m.methodTypeSymbol();
+            int slot = (m.flags().flagsMask() & ClassFile.ACC_STATIC) != 0 ? 0 : 1;
+            int body = -1;
+            for (ClassDesc p : type.parameterList()) {
+                if (p.equals(mob)) {
+                    body = slot;
+                    break;
+                }
+                slot += p.equals(ConstantDescs.CD_long) || p.equals(ConstantDescs.CD_double) ? 2 : 1;
+            }
+            int at = body;
+            CodeTransform swap = (b, e) -> {
+                if (at >= 0 && e instanceof InvokeInstruction i && i.owner().asSymbol().equals(collections)
+                        && i.name().equalsString("shuffle") && i.typeSymbol().parameterCount() == 1) {
+                    b.aload(at);
+                    b.invokestatic(ClassDesc.of("calcite.rig.vanilla.agent.Entities"), "shuffle", withTwo);
+                    hooked[0]++;
+                    return;
+                }
+                b.with(e);
+            };
+            cb.transformMethod(m, MethodTransform.transformingCode(swap));
+        };
+        byte[] out = cf.transformClass(cf.parse(bytes), each);
+        if (hooked[0] != 1) {
+            throw new IllegalStateException("InsideBrownianWalk calls Collections.shuffle " + hooked[0] + " times, not once");
+        }
+        return out;
     }
 
     // LegacyRandomSource.next(int) hands each value it returns, itself and the bits to Tape.drew.

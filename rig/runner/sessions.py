@@ -1059,6 +1059,11 @@ CONFIGS = {
     "asleep": Config({}, view=3, scenarios=("asleep",), world=FIXTURES / "sleep" / "world", fixture="sleep",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                      player=THORNS),
+    # Homeless (CAL-160): as `villagers`, on the homeless fixture's world, where Ada, Bo and Cy,
+    # with no homes at night, walk to a bed, step about under a roof and head for a village.
+    "homeless": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "homeless" / "world", fixture="homeless",
+                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                       player=THORNS),
     # Meet (CAL-160): as `villagers`, on the meet fixture's world, where Ada, Bo and Cy meet at
     # their bell, strolling around it and walking to each other to talk.
     "meet": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "meet" / "world", fixture="meet",

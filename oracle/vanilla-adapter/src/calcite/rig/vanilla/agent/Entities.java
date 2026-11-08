@@ -1,5 +1,10 @@
 package calcite.rig.vanilla.agent;
 
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.WeakHashMap;
 import net.minecraft.util.Mth;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.entity.Entity;
@@ -18,10 +23,16 @@ import net.minecraft.world.level.levelgen.RandomSupport;
  * {@code mixStafford13(mixStafford13(seed ^ id) + k + 1)}, {@code k} counting the brain's lists
  * from 0 in the order they're made, as Calcite seeds its gates' from the entity's seed. Lists made
  * outside a brain keep vanilla's unseeded random.
+ *
+ * <p>And {@code InsideBrownianWalk}'s shuffle of the blocks around a mob, which vanilla draws from
+ * {@code Collections}' own random, seeded from the clock, draws from a {@code java.util.Random} of
+ * the mob's own, made as it first shuffles, seeded with {@code mixStafford13(mixStafford13(seed ^
+ * id) + 1001)}, as Calcite seeds its (CAL-160).
  */
 public final class Entities {
     private static final ThreadLocal<Entity> BRAINING = new ThreadLocal<>();
     private static final ThreadLocal<int[]> LISTS = ThreadLocal.withInitial(() -> new int[1]);
+    private static final Map<Entity, Random> SHUFFLES = new WeakHashMap<>();
 
     private Entities() {
     }
@@ -41,6 +52,18 @@ public final class Entities {
     // The brain's made.
     public static void brained() {
         BRAINING.remove();
+    }
+
+    // `list` shuffled for the mob `body`, as Collections.shuffle(list, random) shuffles it, with
+    // the mob's own random for it.
+    public static void shuffle(List<?> list, Object body) {
+        Entity entity = (Entity) body;
+        Random random;
+        synchronized (SHUFFLES) {
+            random = SHUFFLES.computeIfAbsent(entity, e -> new Random(
+                    RandomSupport.mixStafford13(RandomSupport.mixStafford13(Tape.seed() ^ e.getId()) + 1001)));
+        }
+        Collections.shuffle(list, random);
     }
 
     // A ShufflingList's made, `random` its own.
