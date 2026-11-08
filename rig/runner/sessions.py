@@ -997,6 +997,12 @@ CONFIGS = {
     "armadillo": Config({}, view=3, scenarios=("armadillo",), world=FIXTURES / "armadillo" / "world", fixture="armadillo",
                         rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                         player=THORNS),
+    # Armadillos breeding (CAL-160): the bot standing as in `villagers` by Dilly and Rolly, in love
+    # and penned together, who find each other and have a baby, `AnimalMakeLove`.
+    "armadillo-love": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "armadillo-love" / "world",
+                             fixture="armadillo-love",
+                             rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                             player=THORNS),
     # Villagers without AI (CAL-160): the bot, in survival mode with its hand empty and pumpkins in
     # its hotbar, stands at the villager fixture's spawn by Ada, grown with no profession, Bo, a
     # baby, and Fen, a desert farmer; it uses Ada, who has no trades, and Bo, which makes each
