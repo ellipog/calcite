@@ -1035,6 +1035,12 @@ CONFIGS = {
     # section, where wheat, carrots, potatoes, beetroots and torchflower crops grow, farmland by
     # water wets and farmland away from it dries, back to dirt where nothing's on it; and items, an
     # orb, a chicken and a cow land on farmland, each drawing as it lands.
+    # Harvest (CAL-160): as `villagers`, on the harvest fixture's world, where Hal, a farmer,
+    # breaks ripe crops, plants seeds on bare farmland and grows young wheat with bone meal, and
+    # Cy, a cleric, grows beetroots with hers.
+    "harvest": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "harvest" / "world", fixture="harvest",
+                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                      player=THORNS),
     "crops": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "crops" / "world", fixture="crops",
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                            ("minecraft:random_tick_speed", nbt.Int(16))),
