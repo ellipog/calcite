@@ -1360,6 +1360,11 @@ class Server:
                     sys.exit(f"sessions: {self.name} never said {text!r}:\n{tail}")
                 self.seen.wait(left)
 
+    def said(self, text, after=0):
+        """Whether the server's said `text` since line `after`, without waiting."""
+        with self.seen:
+            return any(text in line for line in self.lines[after:])
+
     def type(self, command):
         self.p.stdin.write(command + "\n")
         self.p.stdin.flush()
@@ -1397,6 +1402,13 @@ def record(config, side, argv, bot, scenarios):
             if got.returncode != 0:
                 sys.exit(f"sessions: the bot failed {scenario} against {side}:\n{got.stdout}{got.stderr}")
             print(f"  {side}: {scenario}: {got.stdout.strip()}", flush=True)
+            # Where the bot left by the server's clock, at the same game time on both servers,
+            # the server runs PAUSE seconds empty, by its own ticks, once the players who joined
+            # have left, and pauses: what it does after the scenario and what it saves are then
+            # the same on both, not however long the stop took to come by the wall clock (D506).
+            # A bot that left by the wall clock left at other game times on each anyway.
+            if " left at game time " in got.stdout and server.said("joined the game", at):
+                at = server.wait_for(f"Server empty for {PAUSE} seconds, pausing", at)
     finally:
         server.stop()
 
