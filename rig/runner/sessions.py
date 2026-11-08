@@ -347,6 +347,11 @@ TRADER = dict(THORNS, Inventory=nbt.List(nbt.COMPOUND, [
     slotted(1, "bread", 3),
     slotted(2, "pumpkin", 40),
 ]))
+# The bot's data in `shows`: `thorns`', holding 8 emeralds, which pay for trades the villagers by
+# it hold up (CAL-160).
+SHOWS = dict(THORNS, Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "emerald", 8),
+]))
 # The bot's data in `arrows`: at the arrows fixture's spawn, the middle of chunk (0, 0), facing
 # east, in survival with nothing, so the arrow it picks up goes into its first slot (CAL-159).
 ARROWS = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(8.5), nbt.Double(-60.0), nbt.Double(8.5)]),
@@ -1078,6 +1083,12 @@ CONFIGS = {
     "bell": Config({}, view=3, scenarios=("bell",), world=FIXTURES / "bell" / "world", fixture="bell",
                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                    player=THORNS),
+    # Shows (CAL-160): as `villagers`, on the shows fixture's world, where the bot holds emeralds
+    # and Fen and Gil, farmers penned with it, hold up what the emeralds buy of their trades,
+    # Gil's offers made as he first looks.
+    "shows": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "shows" / "world", fixture="shows",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                    player=SHOWS),
     # Tag (CAL-160): as `villagers`, on the tag fixture's world, where Ada and Bo, babies, play tag
     # in the morning by the bell Cy claims.
     "tag": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "tag" / "world", fixture="tag",
