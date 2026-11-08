@@ -93,7 +93,7 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
-                   "spider", "creeper", "enderman"]
+                   "spider", "creeper", "enderman", "ender"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -790,6 +790,30 @@ CONFIGS = {
                        rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                               ("minecraft:respawn_radius", nbt.Int(0))),
                        player=SPIDER),
+    # The bot, in survival mode with nothing, at the spawn on normal at midnight, by Ender, the
+    # enderman with his AI two blocks east (CAL-159): it hits him once, so he takes it up, angry at
+    # it, and hits it till it dies, and it leaves dead; with `forgive_dead_players` on, as it is by
+    # default, he forgives it as it dies, `tellNeutralMobsThatIDied`, so he's saved angry at no one;
+    # in `ender-grudge`, with it off, he's saved angry at it still.
+    "ender-forgive": Config({"difficulty": "normal"}, view=3, scenarios=("ender",), world=FIXTURES / "ender-ground" / "world",
+                            fixture="ender-ground",
+                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                   ("minecraft:respawn_radius", nbt.Int(0))),
+                            player=THORNS),
+    "ender-grudge": Config({"difficulty": "normal"}, view=3, scenarios=("ender",), world=FIXTURES / "ender-ground" / "world",
+                           fixture="ender-ground",
+                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                  ("minecraft:respawn_radius", nbt.Int(0)), ("minecraft:forgive_dead_players", nbt.Byte(0))),
+                           player=THORNS),
+    # The bot, on the `enderman` fixture's pillar, hits Ender below it once, with `universal_anger`
+    # on (CAL-159): he doesn't take it up for its hit, `HurtByTargetGoal`, but angry at all players,
+    # `ResetUniversalAngerTargetGoal`, his look for players does a few ticks on, and he comes for it,
+    # too far up to hit.
+    "ender-hit": Config({"difficulty": "normal"}, view=3, scenarios=("ender",), world=FIXTURES / "enderman" / "world",
+                        fixture="enderman",
+                        rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                               ("minecraft:respawn_radius", nbt.Int(0)), ("minecraft:universal_anger", nbt.Byte(1))),
+                        player=SPIDER),
     # The bot, in creative mode with nothing, which no monster takes up, stands at the spawn, on
     # normal at noon, while Sunny, the skeleton out in the sun with his AI, burns and runs for the
     # shade under the stone roof by him, his paths kept out of the sun once he's in it (CAL-159).
