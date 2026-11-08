@@ -339,6 +339,10 @@ ARROWS = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(8.5), nbt.Double(-60.0
               equipment={})
 # The bot's data in `spider`: `thorns`', on the spider fixture's pillar at the spawn (CAL-159).
 SPIDER = dict(THORNS, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-57.0), nbt.Double(0.5)]))
+# The bot's data in `slime`: `thorns`', in iron armor, so the slime's hits wear it and leave the bot
+# alive till the session's end (CAL-159).
+SLIME = dict(THORNS, equipment={"head": stack("iron_helmet"), "chest": stack("iron_chestplate"),
+                                "legs": stack("iron_leggings"), "feet": stack("iron_boots")})
 # The bot's data in `thorns-sword`: `thorns`', holding an iron sword with unbreaking III, which its
 # death drops in the attack that wears it after (D450), on 10 health, so his thorns kill it while
 # it hits him with the sword rather than as it leaves.
@@ -740,6 +744,14 @@ CONFIGS = {
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                   ("minecraft:respawn_radius", nbt.Int(0))),
                            player=PLACE_CREATIVE),
+    # The bot, in survival mode in iron armor with its hands empty, stands at the spawn, on normal
+    # at midnight, while Gloop, the slime of size 2 five blocks east with its AI, takes it up, hops
+    # to it and hurts it as it touches it, wearing its armor (CAL-159).
+    "slime": Config({"difficulty": "normal"}, view=3, scenarios=("skeleton",), world=FIXTURES / "slime" / "world",
+                    fixture="slime",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                           ("minecraft:respawn_radius", nbt.Int(0))),
+                    player=SLIME),
     # The bot, in creative mode with nothing, which no monster takes up, stands at the spawn, on
     # normal at midnight, while Hex, the witch six blocks east with her AI, strolls and looks about
     # and at it, with no one to throw at and nothing to drink (CAL-159).
