@@ -125,7 +125,7 @@ import resources.identifier.{Identifier}
 import server.log.{Entry}
 import world.attributes.{ADD_MULTIPLIED_BASE, ADD_MULTIPLIED_TOTAL, ADD_VALUE, Modifier, Wearing, approximate_with, attribute_id, slot_names}
 import world.body.{BodyFacts, EntitySound, HOSTILE_SOURCE, bool_or, int_or, uuid_of, uuid_tag}
-import world.brain.{ACTIVITY_IDLE, ACTIVITY_PANIC, Activity, Behavior, Brain, Deed, Follow, HurtMemo, Keep, MEMORY_BREED_TARGET, MEMORY_CANT_REACH_WALK_TARGET_SINCE, MEMORY_DANGER_DETECTED_RECENTLY, MEMORY_GAZE_COOLDOWN_TICKS, MEMORY_HURT_BY, MEMORY_HURT_BY_ENTITY, MEMORY_IS_PANICKING, MEMORY_LOOK_TARGET, MEMORY_NEAREST_LIVING_ENTITIES, MEMORY_NEAREST_VISIBLE_ADULT, MEMORY_NEAREST_VISIBLE_LIVING_ENTITIES, MEMORY_PATH, MEMORY_TEMPTATION_COOLDOWN_TICKS, MEMORY_TEMPTING_PLAYER, MEMORY_WALK_TARGET, Memo, Near, PLAYER, SENSOR_ARMADILLO_SCARE, SENSOR_FOOD_TEMPTATIONS, SENSOR_HURT_BY, SENSOR_NEAREST_ADULT, SENSOR_NEAREST_LIVING, Spot, Tracker, Visible, Walk, armadillo_activities, armadillo_sensors, entry_of, start_deed, timed, timed_out, villager_sensors}
+import world.brain.{ACTIVITY_IDLE, ACTIVITY_PANIC, Acquire, Behavior, Brain, Deed, Follow, GlobalPos, HurtMemo, Keep, MEMORY_GOLEM_DETECTED_RECENTLY, MEMORY_INTERACTION_TARGET, MEMORY_LAST_SLEPT, MEMORY_NEAREST_BED, MEMORY_NEAREST_HOSTILE, MEMORY_NEAREST_PLAYERS, MEMORY_NEAREST_VISIBLE_PLAYER, MEMORY_POTENTIAL_JOB_SITE, MEMORY_SECONDARY_JOB_SITE, MEMORY_VISIBLE_VILLAGER_BABIES, Retry, SCHEDULE_BABY, SCHEDULE_VILLAGER, SENSOR_NEAREST_BED, SENSOR_NEAREST_ITEMS, SENSOR_NEAREST_PLAYERS, SENSOR_SECONDARY_POIS, SENSOR_VILLAGER_BABIES, SENSOR_VILLAGER_HOSTILES, STATUS_ABSENT, unmade_name, MEMORY_BREED_TARGET, MEMORY_CANT_REACH_WALK_TARGET_SINCE, MEMORY_DANGER_DETECTED_RECENTLY, MEMORY_GAZE_COOLDOWN_TICKS, MEMORY_HURT_BY, MEMORY_HURT_BY_ENTITY, MEMORY_IS_PANICKING, MEMORY_LOOK_TARGET, MEMORY_NEAREST_LIVING_ENTITIES, MEMORY_NEAREST_VISIBLE_ADULT, MEMORY_NEAREST_VISIBLE_LIVING_ENTITIES, MEMORY_PATH, MEMORY_TEMPTATION_COOLDOWN_TICKS, MEMORY_TEMPTING_PLAYER, MEMORY_WALK_TARGET, Memo, Near, PLAYER, SENSOR_ARMADILLO_SCARE, SENSOR_FOOD_TEMPTATIONS, SENSOR_HURT_BY, SENSOR_NEAREST_ADULT, SENSOR_NEAREST_LIVING, Spot, Tracker, Visible, Walk, armadillo_activities, armadillo_sensors, entry_of, start_deed, timed, timed_out, villager_sensors}
 import world.collision.{Aabb, CollisionBlocks}
 import world.damage.{Damage, DamageTypes, IS_FIRE, IS_PROJECTILE, NO_ANGER, PANIC_CAUSES, PANIC_ENVIRONMENTAL_CAUSES}
 import world.difficulty.{LocalDifficulty}
@@ -144,6 +144,10 @@ import world.clip.{clip_outline, widest_border}
 import world.movement.{Mover, MovementStates}
 import world.navigation.{BodyRotation, HEAD_ROT_SPEED, LookControl, MAX_HEAD_X_ROT, MAX_HEAD_Y_ROT, MoveControl, NavFacts, NavLevel, Navigation, Walker, clamp}
 import world.paths.{PathTypeCache, state_at}
+import world.poi.{HOME, Occupancy, Pois, types_of, valid_range}
+import world.pos.{BlockPos}
+import storage.poi.{PoiRecord}
+import world.villager_brain.{FARMER, NITWIT, NO_PROFESSION, villager_activities}
 import std.java.math.{cos, sin}
 import world.variants.{MobFacts, PLAINS_VILLAGERS, SoundSet, Sounds}
 import world.flowing.{liquid_of}
@@ -263,10 +267,60 @@ pub const ARMADILLO_SCARED: i32 = 2
 pub const ARMADILLO_UNROLLING: i32 = 3
 
 // What a brain's `findClosest` looks for, `world.mob`'s `find_closest`: a player, a grown one of
-// its kind, or a partner (CAL-160).
+// its kind, or a partner; and `find_closest_of`'s, one of a kind, one of a mob category, or a
+// hostile a villager fears (CAL-160).
 const PICK_PLAYER: i32 = 0
 const PICK_ADULT: i32 = 1
 const PICK_PARTNER: i32 = 2
+const PICK_SPECIES: i32 = 3
+const PICK_CATEGORY: i32 = 4
+const PICK_HOSTILE: i32 = 5
+
+// `VillagerHostilesSensor`'s distances, `ACCEPTABLE_DISTANCE_FROM_HOSTILES`: how near a mob of the
+// kind `species` must be for a villager to fear it, of those Calcite makes, a zombie's and a zombie
+// villager's 8; 0 for one it doesn't fear (CAL-160).
+fn hostile_distance(species: i32) -> f64 {
+    if species == ZOMBIE or species == ZOMBIE_VILLAGER {
+        return 8.0
+    }
+    return 0.0
+}
+
+// `AcquirePoi.JitteredLinearRetry.markAttempt` at the game time `now`: tried then, and put off
+// longer each try, 40 to 79 ticks more, drawn from the level's random, 400 at most.
+fn mark_attempt(r: mut Retry, now: i64, random: mut TapedRandom) {
+    r.previous = now
+    let suggested = r.delay + random.next_int_below(40) + 40
+    r.delay = if suggested < 400 { suggested } else { 400 }
+    r.next = now + i64(r.delay)
+}
+
+// Whether the block at `pos` is a bed a villager may sleep in, `#villagers_can_sleep_on_bed`,
+// that someone's in, its `OCCUPIED`; none where it's no such bed. A bed for `validateBedPoi` is
+// one no one's in, and `ValidateNearbyPoi`'s bed taken one someone is (CAL-160).
+fn bed_in_use<B: CollisionBlocks>(f: Facts, blocks: B, pos: BlockPos) -> bool? {
+    let state = state_at(blocks, pos.x, pos.y, pos.z)
+    if not f.tag(String("minecraft:villagers_can_sleep_on_bed")).contains(f.block(state)) {
+        return none
+    }
+    return some(f.get_bool(state, String("occupied")))
+}
+
+// An insertion sort of `found` by distance, the nearest first, stable as `List.sort` is.
+fn sort_nearest(found: mut List<(f64, i32)>) {
+    for i in 1..found.len() {
+        var j = i
+        while j > 0 {
+            let (a, _) = found[j - 1]
+            let (c, _) = found[j]
+            if a <= c {
+                break
+            }
+            found.swap(j - 1, j)
+            j -= 1
+        }
+    }
+}
 
 /// Where a kind's own values start, after an ageable mob's: a mooshroom's type, a sheep's wool, a
 /// cow's and chicken's variant then sound variant, a pig's after its boost time, and a horse's and
@@ -468,6 +522,17 @@ pub struct Mob {
     pub level_random: TapedRandom? = none
     sensor_range: f64 = 16.0
     pub near: List<Near> = List<Near>()
+    /// A villager's (CAL-160): the seed its gates' randoms are seeded from, its own random's,
+    /// which its brain's made again with; the level's points of interest, as its level lends
+    /// them for its tick; whether there are items its item sensor would look over; and the
+    /// activities its level's schedules have this tick, a grown villager's and a baby's, and its
+    /// dimension's name, as its level says before it ticks.
+    pub brain_seed: i64 = 0
+    pub pois: Pois? = none
+    pub items_near: bool = false
+    pub villager_activity: i32 = 1
+    pub baby_activity: i32 = 1
+    pub dimension: String = String()
     /// An armadillo's ticks in its state, `inStateTicks`, and till it next sheds a scute,
     /// `scuteTime` (CAL-160).
     in_state_ticks: i64 = 0
@@ -531,8 +596,8 @@ impl Mob {
             // `AbstractVillager`, an ageable mob but no animal, of the misc category: its brain
             // made in `LivingEntity`'s constructor right after its turn's drawn, its sensors put
             // off by its random; and one that may pick up loot (CAL-160).
-            var mb = Mob { living: l, navigation: Navigation.new(follow), species: species, category: MISC, ageable: true, can_pick_up_loot: true, width: w, height: h, eyes: eyes, baby_width: bw, baby_height: bh, baby_eyes: beyes }
-            mb.brain = some(Brain.made(villager_sensors(), List<Activity>(), mut mb.living.body.random))
+            var mb = Mob { living: l, navigation: Navigation.new(follow), species: species, category: MISC, ageable: true, can_pick_up_loot: true, width: w, height: h, eyes: eyes, baby_width: bw, baby_height: bh, baby_eyes: beyes, brain_seed: seed }
+            mb.brain = some(mb.villager_brain())
             mb.refresh_sounds()
             mb.navigate_as_kind(lf)
             return mb
@@ -585,9 +650,16 @@ impl Mob {
     // `FloatGoal` and a cube mob's float goal turn on as `registerGoals` makes them, for all but
     // the zombies and skeletons. And its movement speed's attribute kept, for an enderman's target.
     fn navigate_as_kind(mut self, lf: LivingFacts) {
-        if self.animal {
+        if self.animal or self.species == VILLAGER {
+            // An animal's, `Animal`'s constructor, and a villager's, `AbstractVillager`'s.
             self.navigation.maluses[usize(PATH_FIRE_IN_NEIGHBOR)] = 16.0f32
             self.navigation.maluses[usize(PATH_FIRE)] = -1.0f32
+        }
+        if self.species == VILLAGER {
+            // `Villager`'s constructor: it opens doors, floats, and finds paths at least 48 long
+            // (CAL-160).
+            self.navigation.can_open_doors = true
+            self.navigation.set_required_length(48.0f32)
         }
         if self.species == CHICKEN {
             self.navigation.maluses[usize(PATH_WATER)] = 0.0f32
@@ -853,6 +925,12 @@ impl Mob {
     // `FollowParentGoal` at `priority`, at `speed`, taking no controls.
     fn add_follow(mut self, priority: i32, speed: f64) {
         self.goals.add(priority, 0, false, Goal.FollowParent(FollowParent { speed: speed }))
+    }
+
+    /// Whether its brain's item sensor looks over the items near it, `NearestItemSensor`, which
+    /// its level tells it are there, `items_near`: a villager's (CAL-160).
+    pub fn wants_items(self) -> bool {
+        return self.species == VILLAGER
     }
 
     /// Whether its goals may look among the mobs near it this tick, which its level finds for it,
@@ -2563,7 +2641,11 @@ impl Mob {
         for i in 0..brain.sensors.len() {
             if brain.sensor_due(i) {
                 let kind = brain.sensors[i].kind
-                self.sense(mut brain, kind, lf, f, m, blocks, players)
+                if kind == SENSOR_NEAREST_BED {
+                    self.sense_bed(mut brain, i, now, mut random, lf, f, m, blocks, mut cache, min_y)
+                } else {
+                    self.sense(mut brain, kind, lf, f, m, blocks, players, sounds)
+                }
             }
         }
         var runs = brain.take_runs()
@@ -2590,7 +2672,7 @@ impl Mob {
 
     // The sensor of the kind `kind` scanning, `doTick`, after the range of the sensors' targeting
     // is set to its follow range, `updateTargetingConditionRanges`.
-    fn sense<B: CollisionBlocks>(mut self, brain: mut Brain, kind: i32, lf: LivingFacts, f: Facts, m: MovementStates, blocks: B, players: List<Follower>) {
+    fn sense<B: CollisionBlocks>(mut self, brain: mut Brain, kind: i32, lf: LivingFacts, f: Facts, m: MovementStates, blocks: B, players: List<Follower>, sounds: List<EntitySound>) {
         let follow = self.living.attributes.value(lf.follow_range)
         self.sensor_range = follow
         if kind == SENSOR_NEAREST_LIVING {
@@ -2698,7 +2780,181 @@ impl Mob {
                     brain.set_for(MEMORY_DANGER_DETECTED_RECENTLY, Memo.Flag(true), 80)
                 }
             }
+        } else if kind == SENSOR_NEAREST_PLAYERS {
+            // `PlayerSensor`: the players not spectating nearer than its follow range, nearest
+            // first, and the nearest of them it may see. Those it may attack aren't kept, as no
+            // villager's behavior reads them.
+            var found = List<(f64, i32)>()
+            for n in self.near {
+                if n.species == PLAYER and not n.spectator {
+                    let d = self.distance_sqr_to(n.x, n.y, n.z)
+                    if d < follow * follow {
+                        found.push((d, n.id))
+                    }
+                }
+            }
+            sort_nearest(mut found)
+            var ids = List<i32>()
+            for (_, id) in found {
+                ids.push(id)
+            }
+            var visible: i32? = none
+            for id in ids {
+                let n = self.near_of(id) else continue
+                if self.targetable(f, m, blocks, n) {
+                    visible = some(id)
+                    break
+                }
+            }
+            brain.set(MEMORY_NEAREST_PLAYERS, Memo.Entities(ids))
+            match visible {
+                some(id) => brain.set(MEMORY_NEAREST_VISIBLE_PLAYER, Memo.Entity(id)),
+                none => brain.erase(MEMORY_NEAREST_VISIBLE_PLAYER),
+            }
+        } else if kind == SENSOR_NEAREST_ITEMS {
+            // `NearestItemSensor`: the nearest item it wants and may see within 32, which isn't
+            // looked for yet, so items there are a Missing notice.
+            if self.items_near {
+                self.living.show(Shown.Missing(String("A villager's sight of the items it wants, NearestItemSensor")), sounds.len())
+            }
+        } else if kind == SENSOR_VILLAGER_HOSTILES {
+            // `VillagerHostilesSensor`: the nearest of its visible living entities that's a
+            // hostile within that kind's distance of it, or none.
+            match self.find_closest_of(mut brain, PICK_HOSTILE, 0, -1.0, f, m, blocks) {
+                some(id) => brain.set(MEMORY_NEAREST_HOSTILE, Memo.Entity(id)),
+                none => brain.erase(MEMORY_NEAREST_HOSTILE),
+            }
+        } else if kind == SENSOR_VILLAGER_BABIES {
+            // `VillagerBabiesSensor`: its visible living entities that are baby villagers, which
+            // it may see, in their order.
+            var babies = List<i32>()
+            if let held = brain.lend_visible(MEMORY_NEAREST_VISIBLE_LIVING_ENTITIES) {
+                var seen = held
+                for i in 0..seen.ids.len() {
+                    let e = self.near_of(seen.ids[i]) else continue
+                    if e.species == VILLAGER and e.baby and self.visible_at(mut seen, i, f, m, blocks) {
+                        babies.push(e.id)
+                    }
+                }
+                brain.give_back_visible(MEMORY_NEAREST_VISIBLE_LIVING_ENTITIES, seen)
+            }
+            brain.set(MEMORY_VISIBLE_VILLAGER_BABIES, Memo.Entities(babies))
+        } else if kind == SENSOR_SECONDARY_POIS {
+            // `SecondaryPoiSensor`: the blocks within 4 across and 2 up or down its profession
+            // works at too, `secondaryPoi`, a farmer's farmland, x, then y, then z.
+            let (_, profession, _) = self.living.data.villager(OWN + 1)
+            var sites = List<GlobalPos>()
+            if profession == FARMER {
+                let farmland = f.block_named(String("minecraft:farmland")) ?? u32.MAX
+                let (cx, cy, cz) = self.block_position()
+                for x in -4..5 {
+                    for y in -2..3 {
+                        for z in -4..5 {
+                            if f.block(state_at(blocks, cx + x, cy + y, cz + z)) == farmland {
+                                sites.push(GlobalPos { dimension: self.dimension.copy(), pos: BlockPos { x: cx + x, y: cy + y, z: cz + z } })
+                            }
+                        }
+                    }
+                }
+            }
+            if sites.is_empty() {
+                brain.erase(MEMORY_SECONDARY_JOB_SITE)
+            } else {
+                brain.set(MEMORY_SECONDARY_JOB_SITE, Memo.Places(sites))
+            }
         }
+        // `GolemSensor`'s iron golem among the living its sensor found is one Calcite doesn't make
+        // yet, so it never finds one.
+    }
+
+    // `NearestBedSensor` of the sensor `i` (CAL-160): a baby's, its tries started again and the
+    // game time it says it is drawn from the level's random, up to 19 ticks on; then the beds
+    // within 48 of it, of those not tried lately, the first 4, each not tried again till 40 ticks
+    // after that time; the nearest it can reach of them, `findPathToPois`, its nearest bed; else,
+    // where it tried fewer than 5, those whose time's before then tried again.
+    fn sense_bed<B: CollisionBlocks + MobLight + NavLevel>(mut self, brain: mut Brain, i: usize, now: i64, random: mut TapedRandom, lf: LivingFacts, f: Facts, m: MovementStates, blocks: B, cache: mut PathTypeCache, min_y: i32) {
+        if not self.baby() {
+            return
+        }
+        var s = brain.sensors[i].copy()
+        s.tried = 0
+        s.last_update = now + i64(random.next_int_below(20))
+        let pois = self.pois.take() ?? Pois.new(0, 0)
+        let (bx, by, bz) = self.block_position()
+        let center = BlockPos { x: bx, y: by, z: bz }
+        var targets = List<(i32, i32, i32)>()
+        for r in pois.in_range(types_of(1u32 << u32.wrap(HOME)), center, 48, Occupancy.Any) {
+            let key = r.pos.pack()
+            if s.tried_beds.contains(key) {
+                continue
+            }
+            s.tried += 1
+            if s.tried >= 5 {
+                continue
+            }
+            s.tried_beds.insert(key, s.last_update + 40)
+            targets.push((r.pos.x, r.pos.y, r.pos.z))
+        }
+        var found = false
+        if not targets.is_empty() {
+            let nf = nav_facts(lf, blocks, min_y)
+            let w = self.walker(lf)
+            if let p = self.navigation.create_path_to_any(lf, f, nf, m, blocks, mut cache, w, targets, 1) {
+                if p.reached {
+                    found = true
+                    let (tx, ty, tz) = p.target
+                    let target = BlockPos { x: tx, y: ty, z: tz }
+                    if pois.type_at(target) != none {
+                        brain.set(MEMORY_NEAREST_BED, Memo.Block(target))
+                    }
+                }
+            }
+        }
+        if not found and s.tried < 5 {
+            var stale = List<i64>()
+            for (k, t) in s.tried_beds {
+                if t < s.last_update {
+                    stale.push(k)
+                }
+            }
+            for k in stale {
+                _ = s.tried_beds.remove(k)
+            }
+        }
+        self.pois = some(pois)
+        brain.sensors[i] = s
+    }
+
+    // `NearestVisibleLivingEntities.findClosest` of a kind (CAL-160): the nearest of its brain's
+    // visible living entities that `pick` fits, within `within` squared of it where that isn't
+    // below 0, which it may see, its sight tested only of those that fit, in their order:
+    // `PICK_SPECIES` one of the kind `which`, `PICK_CATEGORY` one of the mob category `which`, and
+    // `PICK_HOSTILE` a hostile a villager fears within that kind's distance of it.
+    fn find_closest_of<B: CollisionBlocks>(mut self, brain: mut Brain, pick: i32, which: i32, within: f64, f: Facts, m: MovementStates, blocks: B) -> i32? {
+        var seen = brain.lend_visible(MEMORY_NEAREST_VISIBLE_LIVING_ENTITIES) else return none
+        var out: i32? = none
+        for i in 0..seen.ids.len() {
+            let e = self.near_of(seen.ids[i]) else continue
+            let d = self.distance_sqr_to(e.x, e.y, e.z)
+            var fits = false
+            if pick == PICK_SPECIES {
+                fits = e.species == which
+            } else if pick == PICK_CATEGORY {
+                fits = e.category == which
+            } else {
+                let h = hostile_distance(e.species)
+                fits = h > 0.0 and d <= h * h
+            }
+            if fits and within >= 0.0 {
+                fits = d <= within
+            }
+            if fits and self.visible_at(mut seen, i, f, m, blocks) {
+                out = some(e.id)
+                break
+            }
+        }
+        brain.give_back_visible(MEMORY_NEAREST_VISIBLE_LIVING_ENTITIES, seen)
+        return out
     }
 
     // `Armadillo.isScaredBy`: what's within 7 across and 2 up or down of its box, and undead, or
@@ -2733,7 +2989,9 @@ impl Mob {
                 return false
             }
             d.running = true
-            g.shuffle()
+            if not g.ordered {
+                g.shuffle()
+            }
             for i in 0..g.entries.len() {
                 if not g.entries[i].deed.running and self.try_start(mut brain, mut g.entries[i].deed, now, mut random, lf, f, m, blocks, mut cache, min_y, mut sounds) {
                     break
@@ -2752,7 +3010,7 @@ impl Mob {
         d.running = true
         if timed(kind) {
             start_deed(mut d, now, mut random)
-            self.start_behavior(mut brain, kind, mut d.keep, lf, f, blocks, min_y, mut sounds)
+            self.start_behavior(mut brain, kind, mut d.keep, mut random, lf, f, blocks, min_y, mut sounds)
         }
         return true
     }
@@ -2858,12 +3116,222 @@ impl Mob {
                 return true
             },
             Behavior.BallUp(_) => return self.living.body.on_ground and not self.in_liquid(),
+            Behavior.Doors(_) => {
+                // `InteractWithDoor`: where its path's started and isn't done, the doors at the
+                // node it last passed and the next, opened as it comes to them and closed behind
+                // it, which are a Missing notice so far; the same next node checked again, its
+                // count set to 20, else another not till that's counted down.
+                let about = self.navigation.nodes_about() else return false
+                let (passed, ahead) = about
+                var same = false
+                if let last = keep.last_node {
+                    same = last == ahead
+                }
+                if same {
+                    keep.cooldown = 20
+                } else {
+                    keep.cooldown -= 1
+                    if keep.cooldown > 0 {
+                        return false
+                    }
+                }
+                keep.last_node = some(ahead)
+                let doors = f.tag(String("minecraft:mob_interactable_doors"))
+                let (ax, ay, az) = passed
+                let (bx, by, bz) = ahead
+                if doors.contains(f.block(state_at(blocks, ax, ay, az))) or doors.contains(f.block(state_at(blocks, bx, by, bz))) {
+                    self.living.show(Shown.Missing(String("A villager's opening and closing doors, InteractWithDoor")), sounds.len())
+                }
+                return true
+            },
+            Behavior.ReactToBell(_) => {
+                self.living.show(Shown.Missing(String("A villager's hiding at a bell, ReactToBell")), sounds.len())
+                return false
+            },
+            // `SetRaidStatus`: one tick in 20, drawn from the level's random, a raid's activity on
+            // where there's a raid there, which there never is yet.
+            Behavior.RaidStatus(_) => return random.next_int_below(20) == 0,
+            Behavior.ValidatePoi(v) => {
+                let (memory, kinds) = v
+                return self.validate_poi(mut brain, memory, kinds, f, blocks)
+            },
+            Behavior.CompetitorScan(_) => {
+                // `PoiCompetitorScan`: of the villagers near holding the same job site, the one
+                // with the most experience keeps it, which reads their memories, a Missing notice
+                // so far.
+                for id in brain.entities(MEMORY_NEAREST_LIVING_ENTITIES) {
+                    if let n = self.near_of(id) {
+                        if n.species == VILLAGER and n.alive {
+                            self.living.show(Shown.Missing(String("A villager's competing for its job site, PoiCompetitorScan")), sounds.len())
+                            break
+                        }
+                    }
+                }
+                return true
+            },
+            // `LookAndFollowTradingPlayerSink`: there's no trading player yet.
+            Behavior.FollowTrader(_) => return false,
+            // `GoToWantedItem`: its item sensor doesn't find items yet.
+            Behavior.GoToItem(_) => return false,
+            Behavior.AcquirePoi(a) => return self.acquire_poi(mut brain, a, mut keep, now, mut random, lf, f, m, blocks, mut cache, min_y, sounds),
+            Behavior.GoToJobSite(_) => {
+                self.living.show(Shown.Missing(String("A villager's walk to the job site it found, GoToPotentialJobSite")), sounds.len())
+                return false
+            },
+            Behavior.YieldJobSite(_) => {
+                self.living.show(Shown.Missing(String("A villager's giving up a job site to another, YieldJobSite")), sounds.len())
+                return false
+            },
+            Behavior.AssignProfession(_) => {
+                // `AssignProfessionFromJobSite`: within 2 of the job site it found, its profession
+                // the site's, a Missing notice so far.
+                if let g = brain.place(MEMORY_POTENTIAL_JOB_SITE) {
+                    if self.distance_sqr_to(f64(g.pos.x) + 0.5, f64(g.pos.y) + 0.5, f64(g.pos.z) + 0.5) < 4.0 {
+                        self.living.show(Shown.Missing(String("A villager's taking a profession at its job site, AssignProfessionFromJobSite")), sounds.len())
+                    }
+                }
+                return false
+            },
+            Behavior.ResetProfession(_) => {
+                // `ResetProfession`: one with a profession, no experience and at level 1 at most,
+                // no job site, losing it, a Missing notice so far.
+                let (_, profession, level) = self.living.data.villager(OWN + 1)
+                if profession != NO_PROFESSION and profession != NITWIT and self.villager_xp == 0 and level <= 1 {
+                    self.living.show(Shown.Missing(String("A villager's losing its profession, ResetProfession")), sounds.len())
+                }
+                return false
+            },
+            Behavior.InteractWith(i) => {
+                // `InteractWith.of`: where it may, `selfFilter`, any of the kind among its visible
+                // living entities it may see; the nearest within its range, if any, its target,
+                // looked at and walked to till it's as near as it stops. Breeding's a Missing
+                // notice so far.
+                if i.breed and not self.villager_can_breed() {
+                    return false
+                }
+                if self.find_closest_of(mut brain, PICK_SPECIES, i.species, -1.0, f, m, blocks) == none {
+                    return false
+                }
+                if i.breed {
+                    self.living.show(Shown.Missing(String("A villager's breeding, VillagerMakeLove")), sounds.len())
+                    return false
+                }
+                let range = f64(i.range * i.range)
+                if let id = self.find_closest_of(mut brain, PICK_SPECIES, i.species, range, f, m, blocks) {
+                    brain.set(i.memory, Memo.Entity(id))
+                    brain.set(MEMORY_LOOK_TARGET, Memo.Look(Tracker.Entity(Follow { id: id, eyes: true })))
+                    brain.set(MEMORY_WALK_TARGET, Memo.Walk(Walk { target: Tracker.Entity(Follow { id: id, eyes: false }), speed: i.speed, close_enough: i.stop }))
+                }
+                return true
+            },
+            Behavior.VillageStroll(s) => {
+                let (speed, h, v) = s
+                match self.village_stroll_place(h, v, lf, f, blocks, mut cache, min_y) {
+                    some(p) => {
+                        let (x, y, z) = p
+                        brain.set(MEMORY_WALK_TARGET, Memo.Walk(Walk.to_place(x, y, z, speed, 0)))
+                    },
+                    none => brain.erase(MEMORY_WALK_TARGET),
+                }
+                return true
+            },
+            // `JumpOnBed.checkExtraStartConditions`: a baby near a bed, as one with its nearest bed
+            // always is.
+            Behavior.JumpOnBed(_) => return self.baby(),
+            // `GiveGiftToHero`: no player is a hero of the village yet.
+            Behavior.HeroGift(_) => return false,
+            Behavior.LookAndInteract(range) => {
+                // `SetLookAndInteract`: the nearest player it may see within `range`, its target,
+                // looked at.
+                let within = f64(range * range)
+                let id = self.find_closest_of(mut brain, PICK_SPECIES, PLAYER, within, f, m, blocks) else return false
+                brain.set(MEMORY_INTERACTION_TARGET, Memo.Entity(id))
+                brain.set(MEMORY_LOOK_TARGET, Memo.Look(Tracker.Entity(Follow { id: id, eyes: true })))
+                return true
+            },
+            Behavior.ShowTrades(_) => return self.shows_trades(brain),
+            Behavior.TradeWithVillager(_) => {
+                // `TradeWithVillager`: with the villager it's interacting with, alive and in its
+                // sight, a Missing notice so far.
+                let id = brain.entity(MEMORY_INTERACTION_TARGET) else return false
+                let n = self.near_of(id) else return false
+                if n.species == VILLAGER and n.alive and self.sees_near(mut brain, id, f, m, blocks) {
+                    self.living.show(Shown.Missing(String("A villager's trading with another, TradeWithVillager")), sounds.len())
+                }
+                return false
+            },
+            Behavior.VillagerLove(_) => {
+                self.living.show(Shown.Missing(String("A villager's breeding, VillagerMakeLove")), sounds.len())
+                return false
+            },
+            Behavior.LookAt(l) => {
+                // `SetEntityLookTarget`: the nearest it may see within its distance of the kind or
+                // mob category it looks at, looked at.
+                let within = f64(l.max_dist * l.max_dist)
+                let by_category = l.species == -100
+                let pick = if by_category { PICK_CATEGORY } else { PICK_SPECIES }
+                let which = if by_category { l.category } else { l.species }
+                let id = self.find_closest_of(mut brain, pick, which, within, f, m, blocks) else return false
+                brain.set(MEMORY_LOOK_TARGET, Memo.Look(Tracker.Entity(Follow { id: id, eyes: true })))
+                return true
+            },
+            Behavior.Schedule(_) => {
+                // `UpdateActivityFromSchedule`.
+                let scheduled = brain.scheduled(self.villager_activity, self.baby_activity)
+                brain.update_from_schedule(now, scheduled)
+                return true
+            },
+            Behavior.CalmDown(_) => {
+                // `VillagerCalmDown`: where it's no longer hurt, sees no hostile, and what hurt it
+                // is farther than 6 or gone, those forgotten and its schedule gone by.
+                var scared = brain.has(MEMORY_HURT_BY) or brain.has(MEMORY_NEAREST_HOSTILE)
+                if not scared {
+                    if let id = brain.entity(MEMORY_HURT_BY_ENTITY) {
+                        if let n = self.near_of(id) {
+                            scared = self.distance_sqr_to(n.x, n.y, n.z) <= 36.0
+                        }
+                    }
+                }
+                if not scared {
+                    brain.erase(MEMORY_HURT_BY)
+                    brain.erase(MEMORY_HURT_BY_ENTITY)
+                    let scheduled = brain.scheduled(self.villager_activity, self.baby_activity)
+                    brain.update_from_schedule(now, scheduled)
+                }
+                return true
+            },
+            Behavior.AwayFrom(a) => {
+                // `SetWalkTargetAwayFrom.entity`, not interrupting a walk: where it has none and
+                // what the memory holds is nearer than `dist`, of 10 tries, the first place found
+                // up to 16 away from it, `LandRandomPos.getPosAway`, walked to.
+                let (memory, speed, dist) = a
+                if brain.walk(MEMORY_WALK_TARGET) != none {
+                    return false
+                }
+                let id = brain.entity(memory) else return false
+                let n = self.near_of(id) else return false
+                if not (self.distance_sqr_to(n.x, n.y, n.z) < f64(dist * dist)) {
+                    return false
+                }
+                for _ in 0..10 {
+                    if let p = self.pos_away(lf, f, blocks, mut cache, min_y, 0.0, 16.0, (n.x, n.y, n.z)) {
+                        let (x, y, z) = p
+                        brain.set(MEMORY_WALK_TARGET, Memo.Walk(Walk.to_place(x, y, z, speed, 0)))
+                        break
+                    }
+                }
+                return true
+            },
+            Behavior.Unmade(n) => {
+                self.living.show(Shown.Missing("A villager's {unmade_name(n)}"), sounds.len())
+                return false
+            },
             _ => return true,
         }
     }
 
     // What the behavior of the kind `kind` does as it starts, `start`.
-    fn start_behavior<B: CollisionBlocks + NavLevel>(mut self, brain: mut Brain, kind: Behavior, keep: mut Keep, lf: LivingFacts, f: Facts, blocks: B, min_y: i32, sounds: mut List<EntitySound>) {
+    fn start_behavior<B: CollisionBlocks + NavLevel>(mut self, brain: mut Brain, kind: Behavior, keep: mut Keep, random: mut TapedRandom, lf: LivingFacts, f: Facts, blocks: B, min_y: i32, sounds: mut List<EntitySound>) {
         match kind {
             Behavior.Panic(_) => {
                 // `ArmadilloPanic.start`: rolled out first, then `AnimalPanic`'s.
@@ -2887,7 +3355,94 @@ impl Mob {
                 brain.set(MEMORY_GAZE_COOLDOWN_TICKS, Memo.Int(gaze))
             },
             Behavior.BallUp(_) => self.roll_up(true, mut sounds),
+            Behavior.VillagerPanic(_) => {
+                // `VillagerPanicTrigger.start`: hurt or seeing a hostile, where it isn't panicking
+                // its path, walk and look targets, partner and what it interacts with forgotten,
+                // and panic on.
+                if brain.has(MEMORY_HURT_BY) or brain.has(MEMORY_NEAREST_HOSTILE) {
+                    if not brain.is_active(ACTIVITY_PANIC) {
+                        for m in [MEMORY_PATH, MEMORY_WALK_TARGET, MEMORY_LOOK_TARGET, MEMORY_BREED_TARGET, MEMORY_INTERACTION_TARGET] {
+                            brain.erase(m)
+                        }
+                    }
+                    brain.set_if_possible(ACTIVITY_PANIC)
+                }
+            },
+            Behavior.ShowTrades(_) => {
+                // `ShowTradesToPlayer.start`: the player looked at, for 40 ticks to begin with.
+                _ = look_at_interaction(mut brain)
+                keep.look_time = 40
+            },
+            Behavior.JumpOnBed(speed) => {
+                // `JumpOnBed.start`: its nearest bed its target, 100 ticks to reach it, 3 to 6
+                // jumps, drawn from the level's random, none to wait, and walked to.
+                if let bed = brain.block(MEMORY_NEAREST_BED) {
+                    keep.bed = some((bed.x, bed.y, bed.z))
+                    keep.to_reach = 100
+                    keep.jumps = 3 + random.next_int_below(4)
+                    keep.jump_wait = 0
+                    brain.set(MEMORY_WALK_TARGET, Memo.Walk(Walk { target: Tracker.Block(Spot.of_block(bed.x, bed.y, bed.z)), speed: speed, close_enough: 0 }))
+                }
+            },
             _ => {},
+        }
+    }
+
+    // `JumpOnBed.onOrOverBed`: in a block a baby jumps on, or just over one.
+    fn on_or_over_bed<B: CollisionBlocks>(self, f: Facts, blocks: B) -> bool {
+        let (x, y, z) = self.block_position()
+        return jumpable(f, blocks, x, y, z) or jumpable(f, blocks, x, y - 1, z)
+    }
+
+    // `ShowTradesToPlayer.checkExtraStartConditions`: what it interacts with a player alive, it
+    // grown, and the player within about 4 of it, 17 squared.
+    fn shows_trades(self, brain: Brain) -> bool {
+        let id = brain.entity(MEMORY_INTERACTION_TARGET) else return false
+        let n = self.near_of(id) else return false
+        return n.species == PLAYER and n.alive and not self.baby() and self.distance_sqr_to(n.x, n.y, n.z) <= 17.0
+    }
+
+    // `ShowTradesToPlayer.tick`: the player looked at; where what's in their main hand isn't what
+    // was, `isSameItem`, and isn't nothing, the offers it pays for to be shown, its offers made
+    // as they're first asked for, `getOffers`, none for no trades, a Missing notice where it has
+    // them, as Calcite's villagers don't trade yet; none shown, its main hand emptied and 40 ticks
+    // left at most; and a tick less.
+    fn show_trades_tick(mut self, brain: mut Brain, keep: mut Keep, sounds: List<EntitySound>) {
+        let id = look_at_interaction(mut brain) else return
+        let n = self.near_of(id) else return
+        let changed = if let had = keep.player_item { had != n.main_hand } else { true }
+        if changed {
+            keep.player_item = some(n.main_hand)
+            if n.main_hand != 0 {
+                let (_, profession, _) = self.living.data.villager(OWN + 1)
+                let name = builtin_name(24, profession)
+                if name != "minecraft:none" and name != "minecraft:nitwit" {
+                    self.living.show(Shown.Missing(String("A villager's showing a player the trades their item pays for, ShowTradesToPlayer")), sounds.len())
+                } else if not self.kept.contains("Offers") {
+                    self.kept.insert(String("Offers"), Tag.Compound(JavaHashMap<String, Tag>()))
+                }
+            }
+        }
+        self.clear_held_item()
+        keep.look_time = keep.look_time.min(40) - 1
+    }
+
+    // `ShowTradesToPlayer.clearHeldItem`: its main hand emptied, and its chance of dropping what's
+    // there the default, 0.085, as `drop_chances` leaves it out.
+    fn clear_held_item(mut self) {
+        self.living.equipment[0] = none
+        if not self.kept.contains("drop_chances") {
+            return
+        }
+        var chances = JavaHashMap<String, Tag>()
+        if let Tag.Compound(had) = self.kept["drop_chances"] {
+            chances = had.copy()
+        }
+        _ = chances.remove(String("mainhand"))
+        if chances.is_empty() {
+            _ = self.kept.remove(String("drop_chances"))
+        } else {
+            self.kept.insert(String("drop_chances"), Tag.Compound(chances))
         }
     }
 
@@ -2959,7 +3514,11 @@ impl Mob {
                 }
             }
             if not g.any_running() {
+                // `doStop`: what it forgets as it stops, `exitErasedMemories`, forgotten.
                 d.running = false
+                for e in g.erases {
+                    brain.erase(e)
+                }
             }
             d.gate = some(g)
             return
@@ -2975,7 +3534,9 @@ impl Mob {
             }
             return
         }
-        if not timed_out(d, now) and self.still_on(mut brain, kind, d.keep, f, m, blocks) {
+        // `JumpOnBed` never times out, `timedOut`.
+        let out = if let Behavior.JumpOnBed(_) = kind { false } else { timed_out(d, now) }
+        if not out and self.still_on(mut brain, kind, d.keep, f, m, blocks) {
             self.tick_behavior(mut brain, kind, mut d.keep, now, lf, f, m, blocks, mut cache, min_y, mut sounds)
         } else {
             d.running = false
@@ -3008,6 +3569,19 @@ impl Mob {
             Behavior.CountDown(memory) => return (brain.int(memory) ?? 0) > 0,
             Behavior.Tempted(_) => return brain.has(MEMORY_TEMPTING_PLAYER) and not brain.has(MEMORY_BREED_TARGET) and not brain.has(MEMORY_IS_PANICKING),
             Behavior.BallUp(_) => return self.scared(),
+            Behavior.VillagerPanic(_) => return brain.has(MEMORY_HURT_BY) or brain.has(MEMORY_NEAREST_HOSTILE),
+            Behavior.ShowTrades(_) => return self.shows_trades(brain) and keep.look_time > 0 and brain.has(MEMORY_INTERACTION_TARGET),
+            Behavior.JumpOnBed(_) => {
+                // `JumpOnBed.canStillUse`: a baby whose bed's still one to jump on, not tired of
+                // walking to it, off it with no ticks left, nor of jumping, on or over it with no
+                // jumps left.
+                let (bx, by, bz) = keep.bed else return false
+                if not self.baby() or not jumpable(f, blocks, bx, by, bz) {
+                    return false
+                }
+                let over = self.on_or_over_bed(f, blocks)
+                return (over or keep.to_reach > 0) and not (over and keep.jumps <= 0)
+            },
             _ => return false,
         }
     }
@@ -3073,6 +3647,36 @@ impl Mob {
                 }
             },
             Behavior.BallUp(_) => self.ball_up_tick(brain, mut keep, mut sounds),
+            Behavior.VillagerPanic(_) => {
+                // Every 100 ticks of the game, an iron golem summoned where enough villagers near
+                // want one, `spawnGolemIfNeeded`, a Missing notice so far; one wants one only where
+                // it slept in the last day and hasn't seen a golem lately.
+                if now % 100 == 0 {
+                    if let slept = brain.long(MEMORY_LAST_SLEPT) {
+                        if now - slept < 24000 and not brain.has(MEMORY_GOLEM_DETECTED_RECENTLY) {
+                            self.living.show(Shown.Missing(String("A villager's summoning an iron golem, spawnGolemIfNeeded")), sounds.len())
+                        }
+                    }
+                }
+            },
+            Behavior.ShowTrades(_) => self.show_trades_tick(mut brain, mut keep, sounds),
+            Behavior.JumpOnBed(_) => {
+                // `JumpOnBed.tick`: off its bed, a tick less to reach it; on or over it, a tick
+                // less to wait, else, on its surface, a jump, a jump less and 5 ticks till the
+                // next.
+                if not self.on_or_over_bed(f, blocks) {
+                    keep.to_reach -= 1
+                } else if keep.jump_wait > 0 {
+                    keep.jump_wait -= 1
+                } else {
+                    let (x, y, z) = self.block_position()
+                    if jumpable(f, blocks, x, y, z) {
+                        self.jump = true
+                        keep.jumps -= 1
+                        keep.jump_wait = 5
+                    }
+                }
+            },
             _ => {},
         }
     }
@@ -3145,6 +3749,17 @@ impl Mob {
                     self.roll_out(mut sounds)
                 }
             },
+            Behavior.ShowTrades(_) => {
+                brain.erase(MEMORY_INTERACTION_TARGET)
+                self.clear_held_item()
+                keep.player_item = none
+            },
+            Behavior.JumpOnBed(_) => {
+                keep.bed = none
+                keep.to_reach = 0
+                keep.jumps = 0
+                keep.jump_wait = 0
+            },
             _ => {},
         }
     }
@@ -3195,6 +3810,210 @@ impl Mob {
         }
     }
 
+    // `Villager.customServerAiStep` (CAL-160): its brain's tick; then its own random's 1 in 100,
+    // for a raid there, which there never is yet; its trades come with trading.
+    fn villager_step<B: CollisionBlocks + MobLight + NavLevel>(mut self, lf: LivingFacts, f: Facts, m: MovementStates, blocks: B, cache: mut PathTypeCache, players: List<Follower>, min_y: i32, sounds: mut List<EntitySound>) {
+        self.tick_brain(lf, f, m, blocks, mut cache, players, min_y, mut sounds)
+        _ = self.living.body.random.next_int_below(100)
+    }
+
+    // `ValidateNearbyPoi` of the place `memory` holds, of the types `kinds` holds as bits
+    // (CAL-160): where it's in its dimension and within 16 of the place's middle, the memory
+    // forgotten where there's no point of interest of them there any more, or where it's a bed
+    // someone's in, which it's then given back, as no villager sleeps yet.
+    fn validate_poi<B: CollisionBlocks>(mut self, brain: mut Brain, memory: i32, kinds: u32, f: Facts, blocks: B) -> bool {
+        let g = brain.place(memory) else return false
+        if g.dimension != self.dimension {
+            return false
+        }
+        if self.distance_sqr_to(f64(g.pos.x) + 0.5, f64(g.pos.y) + 0.5, f64(g.pos.z) + 0.5) >= 256.0 {
+            return false
+        }
+        var pois = self.pois.take() ?? Pois.new(0, 0)
+        if not pois.exists(g.pos, types_of(kinds)) {
+            brain.erase(memory)
+        } else if bed_in_use(f, blocks, g.pos) == some(true) {
+            brain.erase(memory)
+            _ = pois.release(g.pos)
+        }
+        self.pois = some(pois)
+        return true
+    }
+
+    // `AcquirePoi` (CAL-160): where the memory it takes into is empty, and it's grown or needn't
+    // be: its first look put off up to 19 ticks, drawn from the level's random; then every 20 to
+    // 39, drawn, the points of its types with a ticket free within 48, nearest first, but those it
+    // couldn't reach lately, each tried again at its time, put off longer, drawn; the first 5,
+    // a bed among them only where no one's in it; a path to the nearest it can reach of them,
+    // `findPathToPois`, whose point it takes a ticket of, remembers and shows where it says so,
+    // trying all again after; else each of them it hadn't tried put off, drawn.
+    fn acquire_poi<B: CollisionBlocks + MobLight + NavLevel>(mut self, brain: mut Brain, a: Acquire, keep: mut Keep, now: i64, random: mut TapedRandom, lf: LivingFacts, f: Facts, m: MovementStates, blocks: B, cache: mut PathTypeCache, min_y: i32, sounds: List<EntitySound>) -> bool {
+        if not brain.check(a.memory, STATUS_ABSENT) {
+            return false
+        }
+        if a.adult_only and self.baby() {
+            return false
+        }
+        if keep.next_start == 0 {
+            keep.next_start = now + i64(random.next_int_below(20))
+            return false
+        }
+        if now < keep.next_start {
+            return false
+        }
+        keep.next_start = now + 20 + i64(random.next_int_below(20))
+        var stale = List<i64>()
+        for (k, r) in keep.retries {
+            if now - r.previous >= 400 {
+                stale.push(k)
+            }
+        }
+        for k in stale {
+            _ = keep.retries.remove(k)
+        }
+        var pois = self.pois.take() ?? Pois.new(0, 0)
+        let (bx, by, bz) = self.block_position()
+        let center = BlockPos { x: bx, y: by, z: bz }
+        let wanted = types_of(a.kinds)
+        var found = List<(f64, PoiRecord)>()
+        for r in pois.in_range(wanted.copy(), center, 48, Occupancy.HasSpace) {
+            let key = r.pos.pack()
+            if keep.retries.contains(key) {
+                var retry = keep.retries[key]
+                if now < retry.next {
+                    continue
+                }
+                mark_attempt(mut retry, now, mut random)
+                keep.retries.insert(key, retry)
+            }
+            let dx = f64(r.pos.x - bx)
+            let dy = f64(r.pos.y - by)
+            let dz = f64(r.pos.z - bz)
+            found.push((dx * dx + dy * dy + dz * dz, r))
+        }
+        // Nearest first, as `sorted` keeps those as near in their order.
+        for i in 1..found.len() {
+            var j = i
+            while j > 0 {
+                let (p, _) = found[j - 1]
+                let (q, _) = found[j]
+                if p <= q {
+                    break
+                }
+                found.swap(j - 1, j)
+                j -= 1
+            }
+        }
+        var picked = List<BlockPos>()
+        var targets = List<(i32, i32, i32)>()
+        var reach_range = 1
+        var n = 0
+        for (_, r) in found {
+            if n == 5 {
+                break
+            }
+            n += 1
+            if a.bed and bed_in_use(f, blocks, r.pos) != some(false) {
+                continue
+            }
+            picked.push(r.pos)
+            targets.push((r.pos.x, r.pos.y, r.pos.z))
+            let reach = valid_range(i32.wrap(r.kind))
+            if reach > reach_range {
+                reach_range = reach
+            }
+        }
+        var reached = false
+        if not targets.is_empty() {
+            let nf = nav_facts(lf, blocks, min_y)
+            let w = self.walker(lf)
+            if let p = self.navigation.create_path_to_any(lf, f, nf, m, blocks, mut cache, w, targets, reach_range) {
+                if p.reached {
+                    reached = true
+                    let (tx, ty, tz) = p.target
+                    let target = BlockPos { x: tx, y: ty, z: tz }
+                    if pois.type_at(target) != none {
+                        _ = pois.take(wanted, some(target), target, 1)
+                        brain.set(a.memory, Memo.Place(GlobalPos { dimension: self.dimension.copy(), pos: target }))
+                        if a.event >= 0 {
+                            self.living.show(Shown.Event(i8.wrap(a.event)), sounds.len())
+                        }
+                        keep.retries.clear()
+                    }
+                }
+            }
+        }
+        if not reached {
+            for pos in picked {
+                let key = pos.pack()
+                if not keep.retries.contains(key) {
+                    var retry = Retry()
+                    mark_attempt(mut retry, now, mut random)
+                    keep.retries.insert(key, retry)
+                }
+            }
+        }
+        self.pois = some(pois)
+        return true
+    }
+
+    // `VillageBoundRandomStroll`'s place (CAL-160), up to `h` across and `v` up or down: in a
+    // village, its section within 1 of a center, anywhere on land, `LandRandomPos.getPos`; else,
+    // toward the middle of the section nearest a village within 2 of its own, the first of the
+    // nearest, x, then y, then z, `DefaultRandomPos.getPosTowards`, where there's one nearer than
+    // its own; else anywhere on land.
+    fn village_stroll_place<B: CollisionBlocks + MobLight + NavLevel>(mut self, h: i32, v: i32, lf: LivingFacts, f: Facts, blocks: B, cache: mut PathTypeCache, min_y: i32) -> (f64, f64, f64)? {
+        let (bx, by, bz) = self.block_position()
+        let (sx, sy, sz) = (bx >> 4, by >> 4, bz >> 4)
+        var pois = self.pois.take() ?? Pois.new(0, 0)
+        let here = pois.sections_to_village(sx, sy, sz)
+        var toward: (i32, i32, i32)? = none
+        if here > 1 {
+            var best = here
+            for z in (sz - 2)..(sz + 3) {
+                for y in (sy - 2)..(sy + 3) {
+                    for x in (sx - 2)..(sx + 3) {
+                        let d = pois.sections_to_village(x, y, z)
+                        if d < best {
+                            best = d
+                            toward = some((x, y, z))
+                        }
+                    }
+                }
+            }
+        }
+        self.pois = some(pois)
+        let at = toward else return self.random_place(true, h, v, lf, f, blocks, mut cache, min_y)
+        let (cx, _, cz) = at
+        let dir = (f64(cx * 16 + 8) + 0.5 - self.living.body.x, f64(cz * 16 + 8) + 0.5 - self.living.body.z)
+        let w = Wander { x: self.living.body.x, y: self.living.body.y, z: self.living.body.z, min_y: min_y, top_y: blocks.top_y() }
+        let tries = towards_tries(mut self.living.body.random, f, lf.paths, blocks, mut cache, self.navigation.maluses, w, h, v, dir)
+        return self.best_place(lf, f, blocks, tries)
+    }
+
+    // `Villager.canBreed`: its food and its inventory's food points, bread 4 and a carrot, potato
+    // or beetroot 1, 12 at least, and grown, its age 0; it never sleeps yet.
+    fn villager_can_breed(self) -> bool {
+        if self.age != 0 {
+            return false
+        }
+        var points = self.food_level
+        if self.kept.contains("Inventory") {
+            if let Tag.List(items) = self.kept["Inventory"] {
+                for t in items {
+                    let Tag.Compound(c) = t else continue
+                    if not c.contains("id") {
+                        continue
+                    }
+                    let Tag.Str(id) = c["id"] else continue
+                    let each = if id == "minecraft:bread" { 4 } else if id == "minecraft:carrot" or id == "minecraft:potato" or id == "minecraft:beetroot" { 1 } else { 0 }
+                    points += each * int_or(c, "count", 1)
+                }
+            }
+        }
+        return points >= 12
+    }
+
     // `Animal`'s: its love gone where its age is anything but 0.
     fn animal_step(mut self) {
         if self.animal and self.age != 0 {
@@ -3235,6 +4054,8 @@ impl Mob {
             self.daylight_step(lf, f, m, blocks, min_y, mut sounds)
         } else if self.species == ARMADILLO {
             self.armadillo_step(lf, f, m, blocks, mut cache, players, min_y, mut sounds)
+        } else if self.species == VILLAGER {
+            self.villager_step(lf, f, m, blocks, mut cache, players, min_y, mut sounds)
         }
         self.animal_step()
         if self.species == SLIME {
@@ -5104,13 +5925,85 @@ impl Mob {
         self.make_sound(mut sounds, "entity.villager.no")
     }
 
-    // `Villager.refreshBrain`: its brain made again as it's made, its sensors put off again by its
-    // random, with the memories its old one would save, `pack` (CAL-160).
+    // `Villager.refreshBrain`: its old brain's behaviors stopped, `stopAll`; then its brain made
+    // again as it's made, its sensors put off again by its random, with the memories its old one
+    // would save, `pack`, going by its schedule from now, `registerBrainGoals` (CAL-160).
     fn refresh_brain(mut self) {
         let old = self.brain.take() else return
-        var brain = Brain.made(villager_sensors(), List<Activity>(), mut self.living.body.random)
-        brain.unpack(old.packed())
+        var stopped = old
+        self.stop_all(mut stopped)
+        var brain = self.villager_brain()
+        brain.unpack(stopped.packed())
+        let scheduled = brain.scheduled(self.villager_activity, self.baby_activity)
+        brain.update_from_schedule(self.game_time, scheduled)
         self.brain = some(brain)
+    }
+
+    // `Villager.makeBrain`'s `BRAIN_PROVIDER` (CAL-160): its sensors, each put off by its own
+    // random, and its profession's activities, a baby's or a grown one's, its gates seeded from
+    // its own seed; and `registerBrainGoals`' schedule, a baby's or a grown one's.
+    fn villager_brain(mut self) -> Brain {
+        let baby = self.baby()
+        let (_, profession, _) = self.living.data.villager(OWN + 1)
+        var b = Brain.made(villager_sensors(), villager_activities(self.brain_seed, profession, baby), mut self.living.body.random)
+        b.schedule = if baby { SCHEDULE_BABY } else { SCHEDULE_VILLAGER }
+        return b
+    }
+
+    /// A villager's brain as `registerBrainGoals` leaves it as it's made at the game time `now`
+    /// (CAL-160): its schedule's activity on, `adult` a grown villager's schedule's activity then
+    /// and `baby` a baby's.
+    pub fn settle_brain(mut self, now: i64, adult: i32, baby: i32) {
+        if self.species != VILLAGER {
+            return
+        }
+        var b = self.brain.take() else return
+        b.last_schedule = -9999
+        let scheduled = b.scheduled(adult, baby)
+        b.update_from_schedule(now, scheduled)
+        self.brain = some(b)
+    }
+
+    // `Brain.stopAll`: each of its behaviors running stopped, `doStop`, in the order it goes over
+    // them, durations' draws from the level's random where it's lent.
+    fn stop_all(mut self, brain: mut Brain) {
+        let lent = self.level_random.take()
+        let had = lent != none
+        var random = lent ?? TapedRandom.new(0i64)
+        var sounds = List<EntitySound>()
+        var runs = brain.take_runs()
+        for i in 0..runs.len() {
+            if runs[i].deed.running {
+                self.do_stop(mut brain, mut runs[i].deed, mut random, mut sounds)
+            }
+        }
+        brain.give_back_runs(runs)
+        if had {
+            self.level_random = some(random)
+        }
+    }
+
+    // `doStop` of the running behavior `d`: a gate's running behaviors each, and what it forgets
+    // as it stops forgotten; a behavior with a duration's `stop`.
+    fn do_stop(mut self, brain: mut Brain, d: mut Deed, random: mut TapedRandom, sounds: mut List<EntitySound>) {
+        d.running = false
+        if let Behavior.Gate(_) = d.kind {
+            var g = d.gate.take() else return
+            for i in 0..g.entries.len() {
+                if g.entries[i].deed.running {
+                    self.do_stop(mut brain, mut g.entries[i].deed, mut random, mut sounds)
+                }
+            }
+            for e in g.erases {
+                brain.erase(e)
+            }
+            d.gate = some(g)
+            return
+        }
+        let kind = d.kind
+        if timed(kind) {
+            self.stop_behavior(mut brain, kind, mut d.keep, mut random, mut sounds)
+        }
     }
 
     // `playEatingSound`, as it's fed: an armadillo's eating, `makeSound`; the others' none.
@@ -6323,7 +7216,7 @@ impl Mob {
         if species == VILLAGER and tag.contains("Brain") {
             // `LivingEntity.readAdditionalSaveData`'s last: its brain made again, its sensors put
             // off again by its random, with the memories it saved (CAL-160).
-            var brain = Brain.made(villager_sensors(), List<Activity>(), mut mob.living.body.random)
+            var brain = mob.villager_brain()
             brain.unpack(tag["Brain"].copy())
             mob.brain = some(brain)
         }
@@ -7014,6 +7907,19 @@ fn builtin_id(registry: usize, name: String) -> i32? {
         }
     }
     return none
+}
+
+// Whether the block at x, y, z is one a baby villager jumps on, `#villager_babies_can_jump_on_bed`.
+fn jumpable<B: CollisionBlocks>(f: Facts, blocks: B, x: i32, y: i32, z: i32) -> bool {
+    return f.tag(String("minecraft:villager_babies_can_jump_on_bed")).contains(f.block(state_at(blocks, x, y, z)))
+}
+
+// `ShowTradesToPlayer.lookAtTarget`: what the brain interacts with looked at, at its eyes, and
+// which that is.
+fn look_at_interaction(brain: mut Brain) -> i32? {
+    let id = brain.entity(MEMORY_INTERACTION_TARGET) else return none
+    brain.set(MEMORY_LOOK_TARGET, Memo.Look(Tracker.Entity(Follow { id: id, eyes: true })))
+    return some(id)
 }
 
 // A villager's data as `VillagerData.CODEC` reads it: its type and profession by name, plains and

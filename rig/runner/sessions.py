@@ -90,12 +90,12 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # where arrows fly by it and onto it; `skeleton`, where a skeleton shoots it or runs from the sun;
 # `spider`, where a spider climbs to it; `creeper`, where a creeper comes for it; and `enderman`,
 # where an enderman it stares at teleports away and comes back for it; `armadillo`, where it
-# sprints by armadillos and hits one; and `villager`, where it uses and hits villagers without AI
-# (src/rig/session.calx).
+# sprints by armadillos and hits one; `villager`, where it uses and hits villagers without AI; and
+# `villagers`, where it stands by villagers with their brains (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
-                   "spider", "creeper", "enderman", "ender", "armadillo", "villager"]
+                   "spider", "creeper", "enderman", "ender", "armadillo", "villager", "villagers"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -989,6 +989,14 @@ CONFIGS = {
     "villager": Config({}, view=3, scenarios=("villager",), world=FIXTURES / "villager" / "world", fixture="villager",
                        rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                        player=THORNS),
+    # Villagers with their brains (CAL-160): the bot, in survival mode with its hand empty, stands
+    # at the villagers fixture's spawn by the server's clock from once it's loaded, in the morning,
+    # while Ada, grown with no profession, five blocks east by a bed, and Bo, a baby, farther, idle:
+    # strolling, looking about and at it, Ada claiming the bed and showing it her trades; it leaves
+    # at 600.
+    "villagers": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "villagers" / "world", fixture="villagers",
+                        rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                        player=THORNS),
     "farm": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "farm" / "world", fixture="farm",
                    tape=True),
     # Plains (CAL-156): as `farm`, on the plains fixture's grass, where horses and donkeys spawn
