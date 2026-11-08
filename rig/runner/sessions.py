@@ -769,6 +769,15 @@ CONFIGS = {
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                   ("minecraft:respawn_radius", nbt.Int(0))),
                            player=ARROWS),
+    # The bot, in survival mode with nothing, stands at the arrow-blocks fixture's spawn, on normal
+    # at midnight, while arrows shot up as the world loads fall back onto blocks that act as
+    # they're hit (CAL-159): amethyst chimes, burning arrows light a campfire and a candle, and a
+    # chorus flower and a decorated pot break, the pot cracked, its sherds dropped.
+    "arrow-blocks": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "arrow-blocks" / "world",
+                           fixture="arrow-blocks",
+                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                  ("minecraft:respawn_radius", nbt.Int(0))),
+                           player=ARROWS),
     "ender-arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "ender-arrows" / "world",
                            fixture="ender-arrows",
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
