@@ -91,12 +91,13 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # `spider`, where a spider climbs to it; `creeper`, where a creeper comes for it; and `enderman`,
 # where an enderman it stares at teleports away and comes back for it; `armadillo`, where it
 # sprints by armadillos and hits one; `villager`, where it uses and hits villagers without AI;
-# `villagers`, where it stands by villagers with their brains; and `compost`, where it stands by
-# them too and takes a full composter's bone meal (src/rig/session.calx).
+# `villagers`, where it stands by villagers with their brains; `compost`, where it stands by
+# them too and takes a full composter's bone meal; and `asleep`, where it leaves while they sleep
+# (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
-                   "spider", "creeper", "enderman", "ender", "armadillo", "villager", "villagers", "compost"]
+                   "spider", "creeper", "enderman", "ender", "armadillo", "villager", "villagers", "compost", "asleep"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -1047,6 +1048,15 @@ CONFIGS = {
     # Throws (CAL-160): as `villagers`, on the throws fixture's world, where Ada, a nitwit, and Bo,
     # a farmer, trade and throw each other what they have too much of.
     "throws": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "throws" / "world", fixture="throws",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                     player=THORNS),
+    # Sleep (CAL-160): as `villagers`, on the sleep fixture's world, where Ada lies down in her bed,
+    # Bo walks to his and lies down, Cy, saved asleep, is put on his as he's loaded, and all get up
+    # as the day comes; and `asleep`, the same but left while they sleep, so they're saved asleep.
+    "sleep": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "sleep" / "world", fixture="sleep",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                    player=THORNS),
+    "asleep": Config({}, view=3, scenarios=("asleep",), world=FIXTURES / "sleep" / "world", fixture="sleep",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                      player=THORNS),
     # Crops (CAL-160): as `villagers`, on the crops fixture's world, with random ticks at 16 a
