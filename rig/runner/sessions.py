@@ -337,6 +337,12 @@ SWEEP = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.
 THORNS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, [
     slotted(1, "bread", 3),
 ]), equipment={})
+# The bot's data in `villager`: `thorns`', with 40 pumpkins in the hotbar's third slot, which it
+# trades with Fen, five trades' worth, which leave her short of her next level (CAL-160).
+TRADER = dict(THORNS, Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(1, "bread", 3),
+    slotted(2, "pumpkin", 40),
+]))
 # The bot's data in `arrows`: at the arrows fixture's spawn, the middle of chunk (0, 0), facing
 # east, in survival with nothing, so the arrow it picks up goes into its first slot (CAL-159).
 ARROWS = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(8.5), nbt.Double(-60.0), nbt.Double(8.5)]),
@@ -982,13 +988,14 @@ CONFIGS = {
     "armadillo": Config({}, view=3, scenarios=("armadillo",), world=FIXTURES / "armadillo" / "world", fixture="armadillo",
                         rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                         player=THORNS),
-    # Villagers without AI (CAL-160): the bot, in survival mode with its hand empty, stands at the
-    # villager fixture's spawn by Ada, grown with no profession, Bo, a baby, and Fen, a desert
-    # farmer; it uses Ada, who has no trades, and Bo, which makes each unhappy, then hits Fen and
-    # Ada, each of whom then gossips of it, and leaves at 600.
+    # Villagers without AI (CAL-160): the bot, in survival mode with its hand empty and pumpkins in
+    # its hotbar, stands at the villager fixture's spawn by Ada, grown with no profession, Bo, a
+    # baby, and Fen, a desert farmer; it uses Ada, who has no trades, and Bo, which makes each
+    # unhappy, then hits Fen and Ada, each of whom then gossips of it; then it trades its pumpkins
+    # with Fen for emeralds, and leaves at 600.
     "villager": Config({}, view=3, scenarios=("villager",), world=FIXTURES / "villager" / "world", fixture="villager",
                        rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
-                       player=THORNS),
+                       player=TRADER),
     # Villagers with their brains (CAL-160): the bot, in survival mode with its hand empty, stands
     # at the villagers fixture's spawn by the server's clock from once it's loaded, in the morning,
     # while Ada, grown with no profession, five blocks east by a bed, and Bo, a baby, farther by
