@@ -1031,6 +1031,14 @@ CONFIGS = {
     "pickup": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "pickup" / "world", fixture="pickup",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                      player=THORNS),
+    # Crops (CAL-160): as `villagers`, on the crops fixture's world, with random ticks at 16 a
+    # section, where wheat, carrots, potatoes, beetroots and torchflower crops grow, farmland by
+    # water wets and farmland away from it dries, back to dirt where nothing's on it; and items, an
+    # orb, a chicken and a cow land on farmland, each drawing as it lands.
+    "crops": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "crops" / "world", fixture="crops",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                           ("minecraft:random_tick_speed", nbt.Int(16))),
+                    player=THORNS),
     "farm": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "farm" / "world", fixture="farm",
                    tape=True),
     # Plains (CAL-156): as `farm`, on the plains fixture's grass, where horses and donkeys spawn
