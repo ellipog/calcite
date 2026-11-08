@@ -756,6 +756,15 @@ CONFIGS = {
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
                      player=ARROWS),
+    # The bot, in survival mode with nothing, stands at the spawn, on normal at midnight, while an
+    # arrow shot up falls back onto each of two endermen without AI (CAL-159): Ender dodges his,
+    # unhurt, teleporting away, `repeatedlyTryToTeleport`, and it flies on; Flare's is on fire, which
+    # sets him burning though he dodges it, so the fire's hurts teleport him.
+    "ender-arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "ender-arrows" / "world",
+                           fixture="ender-arrows",
+                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                  ("minecraft:respawn_radius", nbt.Int(0))),
+                           player=ARROWS),
     # The bot, in survival mode with its hands empty, stands at the spawn, on normal at midnight,
     # while Bones, the skeleton ten blocks east with his AI and a bow, takes it up as his target,
     # draws, shoots it and strafes about it (CAL-159).
