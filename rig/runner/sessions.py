@@ -90,12 +90,13 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # where arrows fly by it and onto it; `skeleton`, where a skeleton shoots it or runs from the sun;
 # `spider`, where a spider climbs to it; `creeper`, where a creeper comes for it; and `enderman`,
 # where an enderman it stares at teleports away and comes back for it; `armadillo`, where it
-# sprints by armadillos and hits one; `villager`, where it uses and hits villagers without AI; and
-# `villagers`, where it stands by villagers with their brains (src/rig/session.calx).
+# sprints by armadillos and hits one; `villager`, where it uses and hits villagers without AI;
+# `villagers`, where it stands by villagers with their brains; and `compost`, where it stands by
+# them too and takes a full composter's bone meal (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
-                   "spider", "creeper", "enderman", "ender", "armadillo", "villager", "villagers"]
+                   "spider", "creeper", "enderman", "ender", "armadillo", "villager", "villagers", "compost"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -1031,16 +1032,27 @@ CONFIGS = {
     "pickup": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "pickup" / "world", fixture="pickup",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                      player=THORNS),
-    # Crops (CAL-160): as `villagers`, on the crops fixture's world, with random ticks at 16 a
-    # section, where wheat, carrots, potatoes, beetroots and torchflower crops grow, farmland by
-    # water wets and farmland away from it dries, back to dirt where nothing's on it; and items, an
-    # orb, a chicken and a cow land on farmland, each drawing as it lands.
     # Harvest (CAL-160): as `villagers`, on the harvest fixture's world, where Hal, a farmer,
     # breaks ripe crops, plants seeds on bare farmland and grows young wheat with bone meal, and
     # Cy, a cleric, grows beetroots with hers.
     "harvest": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "harvest" / "world", fixture="harvest",
                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                       player=THORNS),
+    # Compost (CAL-160): as `villagers`, on the compost fixture's world, where the bot takes a full
+    # composter's bone meal at 450, and Hal, a farmer, bakes bread of his wheat, which he has no
+    # room for and drops, takes his full composter's bone meal and composts his seeds.
+    "compost": Config({}, view=3, scenarios=("compost",), world=FIXTURES / "compost" / "world", fixture="compost",
+                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                      player=THORNS),
+    # Throws (CAL-160): as `villagers`, on the throws fixture's world, where Ada, a nitwit, and Bo,
+    # a farmer, trade and throw each other what they have too much of.
+    "throws": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "throws" / "world", fixture="throws",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                     player=THORNS),
+    # Crops (CAL-160): as `villagers`, on the crops fixture's world, with random ticks at 16 a
+    # section, where wheat, carrots, potatoes, beetroots and torchflower crops grow, farmland by
+    # water wets and farmland away from it dries, back to dirt where nothing's on it; and items, an
+    # orb, a chicken and a cow land on farmland, each drawing as it lands.
     "crops": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "crops" / "world", fixture="crops",
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                            ("minecraft:random_tick_speed", nbt.Int(16))),
