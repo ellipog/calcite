@@ -991,9 +991,9 @@ CONFIGS = {
                        player=THORNS),
     # Villagers with their brains (CAL-160): the bot, in survival mode with its hand empty, stands
     # at the villagers fixture's spawn by the server's clock from once it's loaded, in the morning,
-    # while Ada, grown with no profession, five blocks east by a bed, and Bo, a baby, farther, idle:
-    # strolling, looking about and at it, Ada claiming the bed and showing it her trades; it leaves
-    # at 600.
+    # while Ada, grown with no profession, five blocks east by a bed, and Bo, a baby, farther by
+    # another, idle: strolling, looking about and at it, claiming the beds, Bo jumping on his, and
+    # Ada showing it her trades and trading with Bo; it leaves at 600.
     "villagers": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "villagers" / "world", fixture="villagers",
                         rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                         player=THORNS),
