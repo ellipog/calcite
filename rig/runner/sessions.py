@@ -93,12 +93,13 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # sprints by armadillos and hits one; `villager`, where it uses and hits villagers without AI;
 # `villagers`, where it stands by villagers with their brains; `compost`, where it stands by
 # them too and takes a full composter's bone meal; `asleep`, where it leaves while they sleep;
-# and `breed`, where it stays by them till 1000 (src/rig/session.calx).
+# `breed`, where it stays by them till 1000; and `hearsay`, where it stays till 1500
+# (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "villager", "villagers", "compost", "asleep",
-                   "breed"]
+                   "breed", "hearsay"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -1065,6 +1066,12 @@ CONFIGS = {
     "breed": Config({}, view=3, scenarios=("breed",), world=FIXTURES / "breed" / "world", fixture="breed",
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                     player=THORNS),
+    # Hearsay (CAL-160): as `villagers` but till 1500, on the hearsay fixture's world, where Ada and
+    # Bo, grown and penned together, talk, and once the game time's 1200 one passes on or hears
+    # what Ada's heard of two others.
+    "hearsay": Config({}, view=3, scenarios=("hearsay",), world=FIXTURES / "hearsay" / "world", fixture="hearsay",
+                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                      player=THORNS),
     # Tag (CAL-160): as `villagers`, on the tag fixture's world, where Ada and Bo, babies, play tag
     # in the morning by the bell Cy claims.
     "tag": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "tag" / "world", fixture="tag",
