@@ -90,15 +90,15 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # where arrows fly by it and onto it; `skeleton`, where a skeleton shoots it or runs from the sun;
 # `spider`, where a spider climbs to it; `creeper`, where a creeper comes for it; and `enderman`,
 # where an enderman it stares at teleports away and comes back for it; `armadillo`, where it
-# sprints by armadillos and hits one; `villager`, where it uses and hits villagers without AI;
-# `villagers`, where it stands by villagers with their brains; `compost`, where it stands by
-# them too and takes a full composter's bone meal; `asleep`, where it leaves while they sleep;
-# `breed`, where it stays by them till 1000; `hearsay`, where it stays till 1500; and `bell`,
-# where it rings a bell by them (src/rig/session.calx).
+# sprints by armadillos and hits one; `brush`, where it brushes one; `villager`, where it uses
+# and hits villagers without AI; `villagers`, where it stands by villagers with their brains;
+# `compost`, where it stands by them too and takes a full composter's bone meal; `asleep`, where
+# it leaves while they sleep; `breed`, where it stays by them till 1000; `hearsay`, where it
+# stays till 1500; and `bell`, where it rings a bell by them (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
-                   "spider", "creeper", "enderman", "ender", "armadillo", "villager", "villagers", "compost", "asleep",
+                   "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
@@ -346,6 +346,11 @@ THORNS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0
 TRADER = dict(THORNS, Inventory=nbt.List(nbt.COMPOUND, [
     slotted(1, "bread", 3),
     slotted(2, "pumpkin", 40),
+]))
+# The bot's data in `brush`: `thorns`', with a brush in its main hand, worn by its uses on an
+# armadillo till it breaks (CAL-160).
+BRUSHER = dict(THORNS, Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "brush", 1),
 ]))
 # The bot's data in `shows`: `thorns`', holding 8 emeralds, which pay for trades the villagers by
 # it hold up (CAL-160).
@@ -997,6 +1002,12 @@ CONFIGS = {
     "armadillo": Config({}, view=3, scenarios=("armadillo",), world=FIXTURES / "armadillo" / "world", fixture="armadillo",
                         rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                         player=THORNS),
+    # Brushing armadillos (CAL-160): as `armadillo`, but with a brush in the bot's main hand, which
+    # it uses on Dilly four times, each brushing a scute off her, the fourth breaking it, then
+    # once with its hand empty, which does nothing.
+    "brush": Config({}, view=3, scenarios=("brush",), world=FIXTURES / "armadillo" / "world", fixture="armadillo",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                    player=BRUSHER),
     # Armadillos breeding (CAL-160): the bot standing as in `villagers` by Dilly and Rolly, in love
     # and penned together, who find each other and have a baby, `AnimalMakeLove`.
     "armadillo-love": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "armadillo-love" / "world",
