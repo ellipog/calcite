@@ -48,6 +48,8 @@ ANSWERS = {
     "time": "Set minecraft:overworld to",
     "difficulty": "The difficulty has been set to",
     "forceload": "to be force loaded",
+    # Its center's and its size's, set at once; not "Nothing changed. The world border ...".
+    "worldborder": "the world border",
 }
 
 
