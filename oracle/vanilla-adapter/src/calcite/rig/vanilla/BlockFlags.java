@@ -74,6 +74,13 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  * overlap it, as an entity's box doesn't while it has physics, moved along an axis, for Calcite's
  * test.
  *
+ * <p>And each state's outline shape (CAL-159): {@code getShape} with an empty context, as {@code
+ * ClipContext.Block.OUTLINE} reads it, numbered as the others are, with the boxes of each. Of the
+ * states with an offset, only some move their shape by it, as a flower does, which a short grass
+ * doesn't: those, whose shape differs at another place, have the shape they have before it's
+ * offset and are listed in {@code outline_moved}. A shape that goes by its block entity, as a
+ * shulker box's, is the empty world's.
+ *
  * <p>Every value is fixed when the states are made, before any data pack loads, so the table is
  * the same for every world.
  */
@@ -124,6 +131,7 @@ final class BlockFlags {
         Faces faces = new Faces();
         Faces collisions = new Faces();
         Faces movements = new Faces();
+        Faces outlines = new Faces();
         Faces fluidFaces = new Faces();
         int[][] fluidFaceIds = new int[count][Direction.values().length];
         StringBuilder fluid = new StringBuilder();
@@ -131,6 +139,8 @@ final class BlockFlags {
         StringBuilder light = new StringBuilder();
         StringBuilder collision = new StringBuilder();
         StringBuilder movement = new StringBuilder();
+        StringBuilder outlineShapes = new StringBuilder();
+        StringBuilder outlineMoved = new StringBuilder();
         StringBuilder facts = new StringBuilder();
         // The states whose shape is a full block where their collision shape isn't, or the other
         // way round: what `Block.isShapeFullBlock(getShape)` says, as an exception to
@@ -169,6 +179,10 @@ final class BlockFlags {
             light.append("]");
             collision.append(id == 0 ? "" : ", ").append(collisions.id(collisionShape(state)));
             movement.append(id == 0 ? "" : ", ").append(movements.id(fluidShape(state)));
+            outlineShapes.append(id == 0 ? "" : ", ").append(outlines.id(outlineShape(state)));
+            if (outlineMoves(state)) {
+                outlineMoved.append(outlineMoved.isEmpty() ? "" : ", ").append(id);
+            }
             VoxelShape walls = fluidShape(state);
             fluid.append(id == 0 ? "[" : ", [");
             for (Direction direction : Direction.values()) {
@@ -615,6 +629,10 @@ final class BlockFlags {
         json.append(",\n  \"movement\": [").append(movement).append("],\n");
         json.append("  \"movement_boxes\": ");
         boxes(json, movements);
+        json.append(",\n  \"outline\": [").append(outlineShapes).append("],\n");
+        json.append("  \"outline_moved\": [").append(outlineMoved).append("],\n");
+        json.append("  \"outline_boxes\": ");
+        boxes(json, outlines);
         json.append(",\n  \"movement_factors\": [").append(movementFactors()).append("],\n");
         json.append("  \"movement_cases\": [").append(movementCases(movements)).append("]");
         json.append(",\n  \"face_occludes\": [");
@@ -687,7 +705,8 @@ final class BlockFlags {
         json.append("  \"offset_cases\": [").append(offsetCases).append("]\n}\n");
         Files.writeString(Path.of(args[0]), json, StandardCharsets.UTF_8);
         System.err.println("BlockFlags: wrote " + count + " states, " + faces.shapes.size() + " face shapes, "
-                + collisions.shapes.size() + " collision shapes and " + fluidCount + " fluid faces to " + args[0]);
+                + collisions.shapes.size() + " collision shapes, " + outlines.shapes.size() + " outline shapes and "
+                + fluidCount + " fluid faces to " + args[0]);
     }
 
     /** The state's collision shape as a fluid's wall test asks it, before vanilla offsets it by its position. */
@@ -1036,6 +1055,36 @@ final class BlockFlags {
                     .append(", ").append(box.maxX).append(", ").append(box.maxY).append(", ").append(box.maxZ).append("]");
         }
         json.append("]");
+    }
+
+    /**
+     * Whether the state's outline shape moves by its offset, as a flower's does: it has an offset,
+     * and its shape at the first place along x whose offset isn't the origin's isn't the one at
+     * the origin. A clamped offset, as pointed dripstone's, is the origin's at many places.
+     */
+    private static boolean outlineMoves(BlockState state) {
+        if (!state.hasOffsetFunction()) {
+            return false;
+        }
+        Vec3 origin = state.getOffset(BlockPos.ZERO);
+        for (int x = 1; x < 256; x++) {
+            BlockPos elsewhere = new BlockPos(x, 0, 0);
+            if (!state.getOffset(elsewhere).equals(origin)) {
+                return !state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).toAabbs()
+                    .equals(state.getShape(EmptyBlockGetter.INSTANCE, elsewhere).toAabbs());
+            }
+        }
+        throw new IllegalStateException(state + " has the origin's offset at every place up to x 255");
+    }
+
+    /** The state's outline shape, {@code getShape} with an empty context, before vanilla offsets it by its position where it moves by it. */
+    private static VoxelShape outlineShape(BlockState state) {
+        VoxelShape shape = state.getShape(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+        if (!outlineMoves(state)) {
+            return shape;
+        }
+        Vec3 offset = state.getOffset(BlockPos.ZERO);
+        return shape.move(-offset.x, -offset.y, -offset.z);
     }
 
     /** The state's collision shape with fluids, before vanilla offsets it by its position. */

@@ -8,6 +8,7 @@ import java.lang.classfile.CodeElement;
 import java.lang.classfile.CodeTransform;
 import java.lang.classfile.MethodModel;
 import java.lang.classfile.MethodTransform;
+import java.lang.classfile.instruction.InvokeInstruction;
 import java.lang.classfile.instruction.ReturnInstruction;
 import java.lang.constant.ClassDesc;
 import java.lang.constant.ConstantDescs;
@@ -31,8 +32,9 @@ import java.security.ProtectionDomain;
  * (D316).
  * {@code LegacyRandomSource.next}, which every draw of a level's random comes down to, hands
  * {@link Tape#drew} each value it returns, which writes those of a level's random to the tape.
- * {@code Entity}'s constructor, as it returns, hands the entity to {@link Entities#made}, which
- * seeds its random from the seed and its ID (CAL-148). With {@code trace=PATH},
+ * {@code Entity}'s constructor, once it's given the entity its ID and before it calls
+ * {@code defineSynchedData}, hands the entity to {@link Entities#made}, which seeds its random from
+ * the seed and its ID (CAL-148). With {@code trace=PATH},
  * {@code ServerLevel.tickNonPassenger} hands each entity it's ticked to {@link Trace#ticked} as it
  * returns, which writes a living one's state, and {@code ServerPlayer.doTick} hands the player to
  * {@link Trace#played} as it returns (CAL-159).
@@ -149,21 +151,29 @@ public final class Agent {
         return cf.transformClass(cf.parse(bytes), both);
     }
 
-    // Entity's constructor hands the entity to Entities.made before it returns, once it's given
-    // the entity its ID, which its field initializers only mark as unassigned; nothing after
-    // draws from its random until a subclass's constructor does.
+    // Entity's constructor hands the entity to Entities.made once it's given the entity its ID,
+    // which its field initializers only mark as unassigned, and before it calls
+    // defineSynchedData: a zombie villager's draws its profession from the entity's random, as
+    // Calcite's does from the seeded one (CAL-194). Nothing else draws from it until a subclass's
+    // constructor does. The call's arguments are on the stack already, which the seeding leaves.
     private static byte[] entity(ClassFile cf, byte[] bytes) {
         MethodTypeDesc withEntity = MethodTypeDesc.of(ConstantDescs.CD_void, ClassDesc.ofInternalName(ENTITY));
         ClassDesc entities = ClassDesc.of("calcite.rig.vanilla.agent.Entities");
+        int[] hooked = {0};
         CodeTransform made = (b, e) -> {
-            if (e instanceof ReturnInstruction) {
+            if (e instanceof InvokeInstruction i && i.name().equalsString("defineSynchedData")) {
                 b.aload(0);
                 b.invokestatic(entities, "made", withEntity);
+                hooked[0]++;
             }
             b.with(e);
         };
-        return cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
+        byte[] out = cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
                 m -> m.methodName().equalsString("<init>"), made));
+        if (hooked[0] != 1) {
+            throw new IllegalStateException("Entity's constructors call defineSynchedData " + hooked[0] + " times, not once");
+        }
+        return out;
     }
 
     // ServerPlayer.doTick hands the player to Trace.played as it returns.

@@ -730,11 +730,12 @@ CONFIGS = {
     # The bot, in survival mode with its hands empty, stands on the enderman fixture's pillar at
     # the spawn, on normal at midnight, and turns to stare at Ender, the enderman two blocks east
     # with its AI, who takes it up, teleports away as it's stared at so near, and comes back for
-    # it, angry (CAL-159). Mob griefing's off, so Ender takes no blocks.
+    # it, angry (CAL-159). With mob griefing on, Ender's take and leave goals draw, and it takes
+    # what it may hold and reach.
     "enderman": Config({"difficulty": "normal"}, view=3, scenarios=("enderman",), world=FIXTURES / "enderman" / "world",
                        fixture="enderman",
                        rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
-                              ("minecraft:respawn_radius", nbt.Int(0)), ("minecraft:mob_griefing", nbt.Byte(0))),
+                              ("minecraft:respawn_radius", nbt.Int(0))),
                        player=SPIDER),
     # The bot, in creative mode with nothing, which no monster takes up, stands at the spawn, on
     # normal at noon, while Sunny, the skeleton out in the sun with his AI, burns and runs for the
@@ -752,6 +753,15 @@ CONFIGS = {
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                            ("minecraft:respawn_radius", nbt.Int(0))),
                     player=SLIME),
+    # The bot, in creative mode with nothing, which no monster takes up, stands at the spawn, on
+    # normal at midnight, while Rot, the zombie villager six blocks east with its AI, and Shamble,
+    # the zombie six blocks south, stroll and look about and at it, Rot's random seeded before its
+    # profession's drawn (CAL-194).
+    "zombie-villager": Config({"difficulty": "normal"}, view=3, scenarios=("skeleton",),
+                              world=FIXTURES / "zombie-villager" / "world", fixture="zombie-villager",
+                              rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                     ("minecraft:respawn_radius", nbt.Int(0))),
+                              player=PLACE_CREATIVE),
     # The bot, in creative mode with nothing, which no monster takes up, stands at the spawn, on
     # normal at midnight, while Hex, the witch six blocks east with her AI, strolls and looks about
     # and at it, with no one to throw at and nothing to drink (CAL-159).
@@ -811,11 +821,11 @@ CONFIGS = {
     # Monsters (CAL-156): as `farm`, from dusk on the night fixture's plains, on normal, where
     # monsters spawn every tick, zombie horses among them, finalized by the difficulty where each
     # stands; the bot in creative, which they don't make for; and four without AI, a zombie, a
-    # skeleton with its bow, a creeper and a spider. Without mob griefing, as an enderman takes a
-    # block by its AI, which Calcite doesn't run yet, and one carrying a block stays, so it isn't
-    # counted against the monsters' cap and vanilla's would spawn again where Calcite's are at it.
+    # skeleton with its bow, a creeper and a spider. With mob griefing, so an enderman takes
+    # blocks of the grass and leaves them, and one carrying a block stays, off the monsters' cap
+    # (CAL-159).
     "night": Config({"difficulty": "normal"}, view=2, scenarios=("watch",), world=FIXTURES / "night" / "world",
-                    fixture="night", tape=True, player=NIGHT, rules=(("minecraft:mob_griefing", nbt.Byte(0)),)),
+                    fixture="night", tape=True, player=NIGHT),
     # A cow without AI sealed in a stone tank of water, its air nearly gone, which drowns, hurt in
     # its own tick till it dies, and its loot (D424); watched, as `stands`.
     "drown": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "drown" / "world", fixture="drown",

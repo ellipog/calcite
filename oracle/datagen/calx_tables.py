@@ -1263,6 +1263,90 @@ def collision_module(index, flags):
     return "\n".join(lines)
 
 
+def outline_module(index, flags):
+    """The text of src/world/outline_shapes.calx (CAL-159)."""
+    shapes = flags["outline"]
+    boxes = flags["outline_boxes"]
+    moved = flags["outline_moved"]
+
+    def on_grid(shape):
+        return all(c * BOX_UNIT == round(c * BOX_UNIT) and 0 <= round(c * BOX_UNIT) - BOX_FLOOR < 256
+                   for box in shape for c in box)
+
+    # The shapes whose coordinates aren't 32nds of a block, as a lectern's thirds, kept whole.
+    exact = [i for i, s in enumerate(boxes) if not on_grid(s)]
+    grid = dict(flags)
+    grid["outline_boxes"] = [[] if i in exact else s for i, s in enumerate(boxes)]
+    palette, single, pairs, chunks, starts, coords = shape_table(grid, "outline", "outline_boxes")
+    if not all(0 <= s < flags["states"] for s in moved) or moved != sorted(moved):
+        raise ValueError("outline_moved isn't states in ID order")
+    exact_starts = []
+    exact_coords = []
+    for i in exact:
+        exact_starts.append(len(exact_coords) // 6)
+        for box in boxes[i]:
+            exact_coords += box
+    exact_starts.append(len(exact_coords) // 6)
+    texts = [repr(float(c)) for c in exact_coords]
+    if any("e" in t or "n" in t for t in texts):
+        raise ValueError(f"an outline coordinate Calx can't read as written: {texts}")
+
+    def numbers(values, per=24):
+        rows = [", ".join(str(v) for v in values[i:i + per]) for i in range(0, len(values), per)]
+        return ",\n".join(f"        {r}" for r in rows)
+
+    lines = [
+        f"/// Each of vanilla {index['game_version']}'s block states' outline shapes: `getShape` with an empty context,",
+        "/// as `ClipContext.Block.OUTLINE` reads it. Of the states vanilla offsets by their position,",
+        "/// those whose shape moves by it, as a flower's, which a short grass's doesn't, have the shape",
+        "/// they have before it's offset, and are `moved_states`. A shape that goes by its block entity,",
+        "/// as a shulker box's, is the empty world's. Written by oracle/datagen/calx_tables.py from",
+        "/// block_flags.json (CAL-159): don't edit it.",
+        "///",
+        "/// The shapes are numbered, 0 the empty one and 1 the whole block, and each is a list of boxes,",
+        "/// as `toAabbs` gives them, in `world.collision_shapes`' units; those whose coordinates aren't",
+        "/// 32nds of a block, as a lectern's thirds, are `exact_shapes`, their boxes in `exact_boxes`.",
+        "module world.outline_shapes",
+        "",
+        "/// How many different shapes there are.",
+        f"pub const SHAPES: u32 = {len(boxes)}",
+        "",
+    ]
+    lines += shape_lines(shapes, palette, single, pairs, chunks, starts, coords)
+    lines += [
+        "/// The shapes whose coordinates aren't 32nds of a block, in order, which `shape_boxes` has as",
+        "/// empty.",
+        "pub fn exact_shapes() -> List<u32> {",
+        "    return [",
+        numbers(exact),
+        "    ]",
+        "}",
+        "",
+        "/// Where each of `exact_shapes`' boxes start in `exact_boxes`, and where the last ends.",
+        "pub fn exact_starts() -> List<u32> {",
+        "    return [",
+        numbers(exact_starts),
+        "    ]",
+        "}",
+        "",
+        "/// `exact_shapes`' boxes, six coordinates each, as vanilla has them.",
+        "pub fn exact_boxes() -> List<f64> {",
+        "    return [",
+        numbers(texts, 6),
+        "    ]",
+        "}",
+        "",
+        "/// The states whose outline moves by their offset, in ID order.",
+        "pub fn moved_states() -> List<u32> {",
+        "    return [",
+        numbers(moved),
+        "    ]",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def movement_module(index, flags):
     """The text of src/world/movement_shapes.calx."""
     shapes = flags["movement"]
@@ -1798,6 +1882,7 @@ def outputs(tables, version=VERSION):
         CALCITE / "src" / "world" / "collision_shapes.calx": collision_module(index, flags),
         CALCITE / "src" / "world" / "fluid_faces.calx": fluid_faces_module(index, flags),
         CALCITE / "src" / "world" / "movement_shapes.calx": movement_module(index, flags),
+        CALCITE / "src" / "world" / "outline_shapes.calx": outline_module(index, flags),
         CALCITE / "src" / "world" / "entity_facts.calx": entity_facts_module(index, entities),
         CALCITE / "src" / "world" / "item_defaults.calx": item_defaults_module(items),
     }
