@@ -997,6 +997,13 @@ CONFIGS = {
     "villagers": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "villagers" / "world", fixture="villagers",
                         rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                         player=THORNS),
+    # Professions (CAL-160): as `villagers`, on the professions fixture's world, where Di, a
+    # farmer with no job site, loses her profession and takes a fletching table; Fa, holding Ed's
+    # composter with less experience, forgets it and loses her profession, takes it and loses it
+    # again, then takes the composter by Cy as a farmer for good; and Cy is left with none.
+    "professions": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "professions" / "world", fixture="professions",
+                          rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                          player=THORNS),
     "farm": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "farm" / "world", fixture="farm",
                    tape=True),
     # Plains (CAL-156): as `farm`, on the plains fixture's grass, where horses and donkeys spawn
