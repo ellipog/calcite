@@ -782,6 +782,16 @@ CONFIGS = {
                        rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                               ("minecraft:respawn_radius", nbt.Int(0))),
                        player=THORNS),
+    # `skeleton`'s, on the skeleton-bow fixture's world, the bot in `zombie-sword`'s armor, with
+    # protection IV, so it lives: Bones's bow has power III, punch II and flame, so his arrows burn
+    # as they're shot, hit harder, knock the bot back and set it on fire (CAL-159). Not thorns,
+    # whose chance is drawn from the level's random, as Bones shoots before the levels are seeded
+    # again.
+    "skeleton-bow": Config({"difficulty": "normal"}, view=3, scenarios=("skeleton",), world=FIXTURES / "skeleton-bow" / "world",
+                           fixture="skeleton-bow",
+                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                  ("minecraft:respawn_radius", nbt.Int(0))),
+                           player=KNIGHT),
     # The bot, in survival mode with its hands empty, stands on the spider fixture's pillar at the
     # spawn, on normal at midnight, while Webs, the spider eight blocks east with its AI, takes it
     # up, goes for it, climbs the pillar's side, which its path can't, and bites it (CAL-159).

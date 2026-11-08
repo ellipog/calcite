@@ -78,7 +78,7 @@ import world.living.{ArmorStand, Death, Fired, Hurt, Living, LivingFacts, Shown,
 import world.difficulty.{LocalDifficulty, moon_brightness}
 import world.mob.{CHICKEN, COW, CREEPER, DONKEY, ENDERMAN, HORSE, INTERACT_SERVER, MOOSHROOM, Making, Mob, PIG, SHEEP, SKELETON, SLIME, SPIDER, WITCH, ZOMBIE, ZOMBIE_HORSE, ZOMBIE_VILLAGER, held_name, species_named, type_name}
 import world.variants.{MobFacts}
-import world.loot.{Attacked, Loot, LootEntity, LootParams, PostAttack, enchanted_amount, post_attack_effects, random_sequence, roll_table, weapon_effects}
+import world.loot.{Attacked, Loot, LootEntity, LootParams, PostAttack, enchanted_amount, post_attack_effects, random_sequence, roll_table, spawned_effects, weapon_effects}
 import world.item_tracker.{Tracker, Sent, delta_bytes, lp_vec3_bytes, path_bytes, section_of}
 import world.movement.{MovementStates, Mover, meets}
 import math.mth.{RAD_TO_DEG, table_atan2, table_cos, table_sin}
@@ -6207,7 +6207,8 @@ impl Network {
                 }
                 // What they wear does to it, then what its weapon's enchantments do to them,
                 // `doPostAttackEffects`, before it's hurt them last.
-                mob = self.victim_post_attack(mut c, d, mob)
+                let context = mob_damage_context(c, mob)
+                mob = self.victim_post_attack(mut c, d, mob, context)
                 if enchanted {
                     if let stack = held.copy() {
                         self.weapon_post_attack(mut c, d, mob, stack)
@@ -6265,15 +6266,22 @@ impl Network {
     // fire as it was where it didn't hurt them; hurt, an arrow more in a living thing where it
     // doesn't pierce, and a player that owns it told of its hit on another player,
     // `ARROW_HIT_SOUND`, unless it's silent; then what follows of the arrow, `struck`, its sounds
-    // played, and, where it drops itself, it dropped 0.1 up, `spawnAtLocation`. The enchantments
-    // of the weapon it was shot from and a tipped arrow's effects are said to be missing.
+    // played, and, where it drops itself, it dropped 0.1 up, `spawnAtLocation`. Shot from a
+    // weapon, its damage is what the weapon's enchantments make of it, `modifyDamage`, as a float,
+    // `arrow_enchanted`, before its speed's taken; and hurting a living thing, it's knocked back
+    // by their knockback, `doKnockback`, `arrow_knockback`, then the hit's post-attack effects
+    // are done, `arrow_post_attack` (CAL-159). A tipped arrow's effects are said to be missing.
     fn arrow_hit(mut self, es: own LevelEntities, d: usize, arrow: own Arrow, h: ArrowHit) -> LevelEntities {
         var all = es
         var a = arrow
         let id = a.body.id
         var kind = -1
+        var tags: u32? = none
         if let lf = self.living_facts {
             kind = lf.damage.id("arrow")
+            if kind >= 0 {
+                tags = some(lf.damage.tags_of(kind))
+            }
         }
         if kind < 0 {
             all.list.give_back_arrow(a)
@@ -6281,13 +6289,17 @@ impl Network {
         }
         let by = self.shooter_of(d, all.list, a.owner)
         var missing = List<String>()
-        if let items = self.items {
-            if let w = a.weapon {
-                if not items.enchantments(w.copy()).is_empty() {
-                    missing.push(String("The enchantments of the weapons arrows are shot from"))
-                }
-            }
+        // The hit's damage's context, `damageContext`, but for what it hit, which
+        // `arrow_enchanted` sets: dealt by the arrow, caused by what owns it, or by the arrow
+        // itself where nothing does, direct then (CAL-159).
+        let me = LootEntity { kind: String("minecraft:arrow"), on_fire: a.body.fire > 0 }
+        let (cause, direct) = match by {
+            some(o) => (o.loot.copy() ?? me.copy(), false),
+            none => (me.copy(), true),
         }
+        let context = LootParams { damage_source: true, attacker: some(cause), direct_attacker: some(me), direct: direct, damage_tags: tags }
+        let weapon = a.weapon.copy()
+        let (avx, avz) = (a.body.vx, a.body.vz)
         var source = Damage { kind: kind, cause: id, direct: id, at: some((a.body.x, a.body.y, a.body.z)), knock: some((a.body.vx, a.body.vz)) }
         var custom: Component? = none
         if a.body.extras.contains("CustomName") {
@@ -6308,7 +6320,10 @@ impl Network {
             blame.weapon = o.weapon.copy()
             attacker = o.loot.copy()
         }
-        let base = a.base_damage
+        var base = a.base_damage
+        if let w = weapon {
+            base = f64(self.arrow_enchanted(d, mut all, h, w.copy(), "minecraft:damage", context, f32.nearest(base)))
+        }
         let dealt = a.strike(h.target, base) else {
             all.list.give_back_arrow(a)
             return all
@@ -6383,6 +6398,13 @@ impl Network {
             hurt = was
         }
         if hurt and living {
+            if let w = weapon {
+                let knock = self.arrow_enchanted(d, mut all, h, w.copy(), "minecraft:knockback", context, 0.0f32)
+                if f64(knock) > 0.0 {
+                    all = self.arrow_knockback(all, h, f64(knock), avx, avz)
+                }
+            }
+            all = self.arrow_post_attack(all, d, h, by, weapon, context)
             if tipped {
                 missing.push(String("Tipped arrows' effects"))
             }
@@ -6420,6 +6442,173 @@ impl Network {
             self.put_entities(d, all)
             _ = self.make_drop(d, Dropped.Item(x, y + f64(0.1f32), z, item), none)
             all = self.take_entities(d)
+        }
+        return all
+    }
+
+    // `amount` as the enchantments on the weapon `weapon` an arrow was shot from change it with
+    // their effects of the component `name` against what it hit, `h`, the arrow's
+    // `EnchantmentHelper.modifyDamage` and `modifyKnockback` (CAL-159): `enchanted_amount` in the
+    // hit's context `context` with what was hit as `this`, where it is, their requirements tested
+    // with the level's random, what they process drawing from what was hit's own random; what
+    // they can't do said to be missing. Against what's neither a player, a mob nor an armor
+    // stand, unchanged.
+    fn arrow_enchanted(mut self, d: usize, all: mut LevelEntities, h: ArrowHit, weapon: Tag, name: str, context: LootParams, amount: f32) -> f32 {
+        let shared = self.levels[d].world_loot() else return amount
+        let env = self.levels[d].shared_env() else return amount
+        let Env { facts: f, .. } = env.value
+        var params = context.copy()
+        var missing = List<String>()
+        var random = self.levels[d].lend_level_random()
+        var out = amount
+        if h.player {
+            if let slot = self.slot_of_entity(h.target) {
+                if let held = self.connections[slot].take() {
+                    var con = held
+                    params.this_entity = true
+                    params.this = some(LootEntity { kind: String("minecraft:player"), hand: held_in(con, 0) })
+                    params.origin = some((con.player.x, con.player.y, con.player.z))
+                    var theirs = con.player.random.take() ?? LegacyRandom.new(self.entity_seed(con.player.entity_id))
+                    out = enchanted_amount(shared.value, f, self.levels[d], mut random, mut theirs, weapon, name, params, amount, mut missing)
+                    con.player.random = some(theirs)
+                    self.connections[slot] = some(con)
+                }
+            }
+        } else if all.list.is_mob(h.target) {
+            if let lent = all.list.lend_mob(h.target) {
+                var mob = lent
+                params.this_entity = true
+                params.this = some(mob.loot_entity())
+                params.origin = some((mob.living.body.x, mob.living.body.y, mob.living.body.z))
+                out = enchanted_amount(shared.value, f, self.levels[d], mut random, mut mob.living.body.random, weapon, name, params, amount, mut missing)
+                all.list.give_back_mob(mob)
+            }
+        } else if all.list.is_stand(h.target) {
+            if let lent = all.list.lend_stand(h.target) {
+                var stand = lent
+                params.this_entity = true
+                params.this = some(stand.loot_entity())
+                params.origin = some((stand.living.body.x, stand.living.body.y, stand.living.body.z))
+                out = enchanted_amount(shared.value, f, self.levels[d], mut random, mut stand.living.body.random, weapon, name, params, amount, mut missing)
+                all.list.give_back_stand(stand)
+            }
+        }
+        self.levels[d].give_back_level_random(random)
+        for m in missing {
+            self.levels[d].unimplemented(m)
+        }
+        return out
+    }
+
+    // `AbstractArrow.doKnockback` of what the arrow hit, `h`, by its weapon's knockback `knock`
+    // (CAL-159): along the arrow's way across, `avx`, `avz`, made a unit long, none where it's
+    // shorter than `1.0E-5F`, six tenths of the knockback less what they resist of it,
+    // `KNOCKBACK_RESISTANCE`, they're pushed that way and a tenth up, `push`, where it's anything.
+    fn arrow_knockback(mut self, es: own LevelEntities, h: ArrowHit, knock: f64, avx: f64, avz: f64) -> LevelEntities {
+        var all = es
+        let lf = self.living_facts.take() else return all
+        let dist = (avx * avx + avz * avz).sqrt()
+        let (ux, uz) = if dist < f64(1.0e-5f32) { (0.0, 0.0) } else { (avx / dist, avz / dist) }
+        if h.player {
+            if let slot = self.slot_of_entity(h.target) {
+                if let held = self.connections[slot].take() {
+                    var con = held
+                    let resisted = (1.0 - con.player.attributes.value(attribute_id(String("knockback_resistance")) ?? 0)).max(0.0)
+                    let scale = knock * 0.6 * resisted
+                    let (mx, mz) = (ux * scale, uz * scale)
+                    if mx * mx + mz * mz > 0.0 {
+                        player_push(mut con, mx, 0.1, mz)
+                    }
+                    self.connections[slot] = some(con)
+                }
+            }
+        } else if all.list.is_mob(h.target) {
+            if let lent = all.list.lend_mob(h.target) {
+                var mob = lent
+                let resisted = (1.0 - mob.living.attributes.value(lf.knockback_resistance)).max(0.0)
+                let scale = knock * 0.6 * resisted
+                let (mx, mz) = (ux * scale, uz * scale)
+                if mx * mx + mz * mz > 0.0 {
+                    mob.living.body.push(mx, 0.1, mz)
+                }
+                all.list.give_back_mob(mob)
+            }
+        } else if all.list.is_stand(h.target) {
+            if let lent = all.list.lend_stand(h.target) {
+                var stand = lent
+                let resisted = (1.0 - stand.living.attributes.value(lf.knockback_resistance)).max(0.0)
+                let scale = knock * 0.6 * resisted
+                let (mx, mz) = (ux * scale, uz * scale)
+                if mx * mx + mz * mz > 0.0 {
+                    stand.living.body.push(mx, 0.1, mz)
+                }
+                all.list.give_back_stand(stand)
+            }
+        }
+        self.living_facts = some(lf)
+        return all
+    }
+
+    // The post-attack effects of an arrow's hurt of what it hit, `h`, shot by `by` from `weapon`,
+    // `doPostAttackEffectsWithItemSource` (CAL-159): what a player hit wears does to the mob that
+    // shot it, `victim_post_attack`, in the hit's context `context` with them as `this`; then
+    // the weapon's own effects for its attacker, the mob, none of a bow's. What a mob or an armor
+    // stand hit wears, what a player wears against an arrow no mob shot, and the weapon's own
+    // effects, are said to be missing where there are any.
+    fn arrow_post_attack(mut self, es: own LevelEntities, d: usize, h: ArrowHit, by: Shooter?, weapon: Tag?, context: LootParams) -> LevelEntities {
+        var all = es
+        let shooter: i32? = match by {
+            some(o) => if o.mob { some(o.id) } else { none },
+            none => none,
+        }
+        if h.player {
+            if let slot = self.slot_of_entity(h.target) {
+                if let held = self.connections[slot].take() {
+                    var con = held
+                    if let m = shooter {
+                        if let lent = all.list.lend_mob(m) {
+                            var params = context.copy()
+                            params.this_entity = true
+                            params.this = some(LootEntity { kind: String("minecraft:player"), hand: held_in(con, 0) })
+                            params.origin = some((con.player.x, con.player.y, con.player.z))
+                            self.put_entities(d, all)
+                            let back = self.victim_post_attack(mut con, d, lent, params)
+                            all = self.take_entities(d)
+                            all.list.give_back_mob(back)
+                        }
+                    } else if self.any_enchanted(worn_by(con)) {
+                        self.levels[d].unimplemented(String("Post-attack effects of what a player wears against an arrow no mob shot"))
+                    }
+                    self.connections[slot] = some(con)
+                }
+            }
+        } else if all.list.is_mob(h.target) {
+            if self.any_enchanted(all.list.mob(h.target).living.equipment.copy()) {
+                self.levels[d].unimplemented(String("Post-attack effects of what a mob wears against arrows"))
+            }
+        } else if all.list.is_stand(h.target) {
+            if self.any_enchanted(all.list.stand(h.target).living.equipment.copy()) {
+                self.levels[d].unimplemented(String("Post-attack effects of what an armor stand wears against arrows"))
+            }
+        }
+        if let w = weapon {
+            if shooter != none {
+                if let shared = self.levels[d].world_loot() {
+                    if let env = self.levels[d].shared_env() {
+                        let Env { facts: f, .. } = env.value
+                        var missing = List<String>()
+                        var random = self.levels[d].lend_level_random()
+                        let done = post_attack_effects(shared.value, f, self.levels[d], mut random, w, 0, "attacker", context, mut missing)
+                        self.levels[d].give_back_level_random(random)
+                        if not done.is_empty() {
+                            missing.push(String("Post-attack effects of the weapons arrows are shot from"))
+                        }
+                        for m in missing {
+                            self.levels[d].unimplemented(m)
+                        }
+                    }
+                }
+            }
         }
         return all
     }
@@ -8105,16 +8294,24 @@ impl Network {
     // A mob's shot in the level `d`, `performRangedAttack` (CAL-159): its arrow, `getMobArrow`,
     // with the next ID, its damage drawn, `setBaseDamageFromMob`, shot at its target a fifth of the
     // way across above them at 1.6 blocks a tick, less off the harder the difficulty,
-    // `spawnProjectileUsingShoot`, and added, `addFreshEntity`. A tipped or spectral arrow's own,
-    // and what an enchanted bow does, said missing.
+    // `spawnProjectileUsingShoot`, and added, `addFreshEntity`, then what the enchantments on its
+    // item and its bow do as it's spawned, `applyOnProjectileSpawned`, `projectile_spawned`, the
+    // bow's where it's not the same item, which lights it where it's flame's (CAL-159): that it
+    // isn't on fire till its tick, the arrow's lit before it's added, which its tracker doesn't
+    // read. A tipped or spectral arrow's own, and the piercing of a weapon that has it,
+    // `getPiercingCount`, said missing.
     fn mob_fires(mut self, d: usize, s: Fired) {
         if held_name(some(s.item.copy())) != "minecraft:arrow" {
             self.levels[d].unimplemented(String("A mob shooting a tipped or spectral arrow, its own arrow"))
         }
-        var bows = List<Tag?>()
-        bows.push(some(s.weapon.copy()))
-        if self.any_enchanted(bows) {
-            self.levels[d].unimplemented(String("A mob's bow's enchantments on its shot"))
+        var pierces = false
+        if let items = self.items {
+            for (_, e) in items.enchantments(s.weapon.copy()) {
+                pierces = pierces or enchantment_has(e, "minecraft:projectile_piercing")
+            }
+        }
+        if pierces {
+            self.levels[d].unimplemented(String("Piercing on the arrows mobs shoot, getPiercingCount"))
         }
         self.entity_ids += 1
         let id = self.entity_ids
@@ -8127,7 +8324,46 @@ impl Network {
         let zd = s.tz - s.z
         let across = (xd * xd + zd * zd).sqrt()
         a.shoot(xd, yd + across * f64(0.2f32), zd, 1.6f32, f32.nearest(14 - difficulty * 4))
+        self.projectile_spawned(d, mut a, s.item.copy())
+        if held_name(some(s.weapon.copy())) != held_name(some(s.item.copy())) {
+            self.projectile_spawned(d, mut a, s.weapon.copy())
+        }
         self.add_arrow(d, a)
+    }
+
+    // What the enchantments on `stack` do to the arrow `a` the level `d` takes in,
+    // `EnchantmentHelper.onProjectileSpawned` (CAL-159): `spawned_effects` in its context, it as
+    // `this` where it is; flame's `ignite` lights it for its seconds, `igniteForSeconds`, where
+    // it's lit for less; what else they'd do is said to be missing.
+    fn projectile_spawned(mut self, d: usize, a: mut Arrow, stack: Tag) {
+        var one = List<Tag?>()
+        one.push(some(stack.copy()))
+        if not self.any_enchanted(one) {
+            return
+        }
+        let shared = self.levels[d].world_loot() else return
+        let env = self.levels[d].shared_env() else return
+        let Env { facts: f, .. } = env.value
+        let me = LootEntity { kind: String("minecraft:arrow"), on_fire: a.body.fire > 0 }
+        let params = LootParams { origin: some((a.body.x, a.body.y, a.body.z)), this_entity: true, this: some(me) }
+        var missing = List<String>()
+        var random = self.levels[d].lend_level_random()
+        let done = spawned_effects(shared.value, f, self.levels[d], mut random, stack, params, mut missing)
+        self.levels[d].give_back_level_random(random)
+        for what in done {
+            match what {
+                Attacked.Ignite(seconds) => {
+                    let ticks = i32.saturate(f64(seconds * 20.0f32).floor())
+                    if a.body.fire < ticks {
+                        a.body.fire = ticks
+                    }
+                },
+                _ => missing.push(String("Enchantments' effects on projectiles as they're spawned, but ignite")),
+            }
+        }
+        for m in missing {
+            self.levels[d].unimplemented(m)
+        }
     }
 
     // `addFreshEntity` of the arrow `a` in the level `d`, as `add_item` adds an item (CAL-159),
@@ -8363,7 +8599,7 @@ impl Network {
         self.put_entities(d, es)
         self.living_facts = some(lf)
         for (_, xa, za) in mine {
-            player_push(mut con, xa, za)
+            player_push(mut con, xa, 0.0, za)
         }
         // `other.push(player)`: the other, who may be pushed, pushed away from them, then they from
         // it where they may be.
@@ -8372,9 +8608,9 @@ impl Network {
                 var other = self.connections[slot].take() else continue
                 if let q = push_between(other.player.x, other.player.z, con.player.x, con.player.z) {
                     let (xa, za) = q
-                    player_push(mut other, -xa, -za)
+                    player_push(mut other, -xa, 0.0, -za)
                     if pushed {
-                        player_push(mut con, xa, za)
+                        player_push(mut con, xa, 0.0, za)
                     }
                 }
                 self.connections[slot] = some(other)
@@ -8393,7 +8629,7 @@ impl Network {
     fn push_player_by(mut self, id: i32, xa: f64, za: f64) {
         let slot = self.slot_of_entity(id) else return
         var con = self.connections[slot].take() else return
-        player_push(mut con, xa, za)
+        player_push(mut con, xa, 0.0, za)
         self.connections[slot] = some(con)
     }
 
@@ -8502,7 +8738,8 @@ impl Network {
         var again = self.take_entities(d)
         if let lent_again = again.list.lend_mob(id) {
             self.put_entities(d, again)
-            let touched = self.victim_post_attack(mut con, d, lent_again)
+            let context = mob_damage_context(con, lent_again)
+            let touched = self.victim_post_attack(mut con, d, lent_again, context)
             again = self.take_entities(d)
             again.list.give_back_mob(touched)
         }
@@ -8587,7 +8824,7 @@ impl Network {
     // `wear_worn`; `ignite` lights the mob for its seconds; `apply_mob_effect` draws its effect,
     // its duration and its amplifier from the mob's random, the effect coming with mob effects;
     // what's done to the player, or of another kind, is said to be missing. The mob, lent again.
-    fn victim_post_attack(mut self, con: mut Connection, d: usize, mob: own Mob) -> Mob {
+    fn victim_post_attack(mut self, con: mut Connection, d: usize, mob: own Mob, params: LootParams) -> Mob {
         var m = mob
         let worn = worn_by(con)
         if not self.any_enchanted(worn.copy()) {
@@ -8596,7 +8833,6 @@ impl Network {
         let shared = self.levels[d].world_loot() else return m
         let env = self.levels[d].shared_env() else return m
         let Env { facts: f, .. } = env.value
-        let params = mob_damage_context(con, m)
         var missing = List<String>()
         for k in 0..worn.len() {
             let each = worn[k].copy() else continue
@@ -15387,16 +15623,25 @@ fn beacon_of(con: Connection) -> Beacon {
     return Beacon { id: con.player.entity_id, uuid: uuid, x: con.player.x, y: con.player.y, z: con.player.z, center_x: con.player.center_x, center_z: con.player.center_z, view: con.player.view, spectator: con.player.mode == GameType.Spectator, first_tick: not con.player.based, transmit: transmit, receive: receive, style: style, color: color }
 }
 
-// `Entity.push` of the player by `xa`, `za` across (CAL-174): their motion more, where the push
-// is finite, and sent to those who see them, `needsSync`.
-fn player_push(con: mut Connection, xa: f64, za: f64) {
+// `Entity.push` of the player by `xa` and `za` across and `ya` up (CAL-174, CAL-159): their motion
+// more, where the push is finite, and sent to those who see them, `needsSync`.
+fn player_push(con: mut Connection, xa: f64, ya: f64, za: f64) {
     // `Double.isFinite`: NaN and the infinities less themselves aren't 0.
-    if xa - xa == 0.0 and za - za == 0.0 {
+    if xa - xa == 0.0 and ya - ya == 0.0 and za - za == 0.0 {
         con.player.vx = con.player.vx + xa
-        con.player.vy = con.player.vy + 0.0
+        con.player.vy = con.player.vy + ya
         con.player.vz = con.player.vz + za
         con.player.needs_sync = true
     }
+}
+
+// Whether the enchantment `e` has effects of the component `name`.
+fn enchantment_has(e: JavaHashMap<String, Tag>, name: str) -> bool {
+    if not e.contains("effects") {
+        return false
+    }
+    let Tag.Compound(effects) = e["effects"] else return false
+    return effects.contains(name)
 }
 
 // The player's body as what attacks them reads it (CAL-162): as their tracker sees it, of their
