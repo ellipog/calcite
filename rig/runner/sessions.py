@@ -346,6 +346,11 @@ SPIDER = dict(THORNS, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-57.
 # alive till the session's end (CAL-159).
 SLIME = dict(THORNS, equipment={"head": stack("iron_helmet"), "chest": stack("iron_chestplate"),
                                 "legs": stack("iron_leggings"), "feet": stack("iron_boots")})
+# The bot's data in `zombie-sword`: `thorns`', in diamond armor with protection IV on each piece, so
+# Rot's sword, its sharpness and its fire leave it alive till it leaves (CAL-159).
+PROTECTED = {"minecraft:enchantments": {"minecraft:protection": nbt.Int(4)}}
+KNIGHT = dict(THORNS, equipment={"head": stack("diamond_helmet", 1, PROTECTED), "chest": stack("diamond_chestplate", 1, PROTECTED),
+                                 "legs": stack("diamond_leggings", 1, PROTECTED), "feet": stack("diamond_boots", 1, PROTECTED)})
 # The bot's data in `zombie-thorns`: `slime`'s, its chestplate with thorns III, which hurts a mob that
 # hits it now and then and wears as it does (CAL-159).
 THORNY = dict(THORNS, equipment={"head": stack("iron_helmet"),
@@ -734,6 +739,14 @@ CONFIGS = {
                             rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                    ("minecraft:respawn_radius", nbt.Int(0))),
                             player=THORNY),
+    # `zombie`'s, Rot with an iron sword with sharpness II, knockback I and fire aspect I, the bot in
+    # diamond armor with protection IV (CAL-159): his hits deal more, knock it back and set it on
+    # fire, and it lives till it leaves.
+    "zombie-sword": Config({"difficulty": "normal"}, view=3, scenarios=("zombie",), world=FIXTURES / "zombie-sword" / "world",
+                           fixture="zombie-sword",
+                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                  ("minecraft:respawn_radius", nbt.Int(0))),
+                           player=KNIGHT),
     # The bot, in survival mode with nothing, stands at the arrows fixture's spawn, on normal at
     # midnight, while arrows fly as the world loads (CAL-159): into a wall, into a zombie without
     # AI and an armor stand, which breaks, onto its head, and onto the grass by it, where it picks
