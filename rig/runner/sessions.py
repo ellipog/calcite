@@ -264,6 +264,9 @@ PLACE = {
 }
 # In `place_creative`: in creative mode, with nothing, given each block's item as it goes.
 PLACE_CREATIVE = dict(PLACE, playerGameType=nbt.Int(1), Inventory=nbt.List(nbt.COMPOUND, []), equipment={})
+# In `zombie-head`: `place_creative`'s, wearing a zombie's head, which hides it from zombies to
+# half as far, `MOB_VISIBILITY` (CAL-159).
+ZOMBIE_HEAD = dict(PLACE_CREATIVE, equipment={"head": stack("zombie_head")})
 # In `use`: in survival mode, with nothing in its hands (D379).
 USE = dict(PLACE, Inventory=nbt.List(nbt.COMPOUND, []), equipment={})
 # In `use_items`: in survival mode, hungry, at 10 food, holding seeds, a cake, saplings, candles, a
@@ -762,6 +765,13 @@ CONFIGS = {
                               rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                      ("minecraft:respawn_radius", nbt.Int(0))),
                               player=PLACE_CREATIVE),
+    # `zombie-villager`'s, the bot in a zombie's head, which hides it from zombies to half as far
+    # (CAL-159): Shamble, six blocks off, looks at it only within 4, so never, and Rot as before.
+    "zombie-head": Config({"difficulty": "normal"}, view=3, scenarios=("skeleton",),
+                          world=FIXTURES / "zombie-villager" / "world", fixture="zombie-villager",
+                          rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                 ("minecraft:respawn_radius", nbt.Int(0))),
+                          player=ZOMBIE_HEAD),
     # The bot, in creative mode with nothing, which no monster takes up, stands at the spawn, on
     # normal at midnight, while Hex, the witch six blocks east with her AI, strolls and looks about
     # and at it, with no one to throw at and nothing to drink (CAL-159).
