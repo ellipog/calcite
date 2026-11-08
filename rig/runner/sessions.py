@@ -792,6 +792,14 @@ CONFIGS = {
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                   ("minecraft:respawn_radius", nbt.Int(0))),
                            player=ARROWS),
+    # The bot, in survival mode with nothing, stands at the arrow-targets fixture's spawn, on normal
+    # at midnight, while arrows from as the world loads hit a target block, a big dripleaf and a
+    # bell (CAL-159): the target gives its signal, the leaf tilts down and the bell rings.
+    "arrow-targets": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "arrow-targets" / "world",
+                            fixture="arrow-targets",
+                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                   ("minecraft:respawn_radius", nbt.Int(0))),
+                            player=ARROWS),
     "ender-arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "ender-arrows" / "world",
                            fixture="ender-arrows",
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
