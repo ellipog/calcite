@@ -713,6 +713,14 @@ CONFIGS = {
                              world=FIXTURES / "reinforcements" / "world", fixture="reinforcements",
                              rules=(("minecraft:show_advancement_messages", nbt.Byte(0)), ("minecraft:respawn_radius", nbt.Int(0))),
                              player=SLIME),
+    # `creeper`'s steps on the zombie-loot fixture's world, the bot on its pillar at midnight, while
+    # Grab, the zombie who picks up loot, comes to the pillar's foot, taking up a sword, a better
+    # one for it and a helmet on his way, and leaving what he doesn't want (CAL-159).
+    "zombie-loot": Config({"difficulty": "normal"}, view=3, scenarios=("creeper",), world=FIXTURES / "zombie-loot" / "world",
+                          fixture="zombie-loot",
+                          rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                 ("minecraft:respawn_radius", nbt.Int(0))),
+                          player=SPIDER),
     # The bot, in survival mode with nothing, stands at the arrows fixture's spawn, on normal at
     # midnight, while arrows fly as the world loads (CAL-159): into a wall, into a zombie without
     # AI and an armor stand, which breaks, onto its head, and onto the grass by it, where it picks
