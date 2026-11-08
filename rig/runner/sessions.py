@@ -1017,6 +1017,13 @@ CONFIGS = {
     "doors": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "doors" / "world", fixture="doors",
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                     player=THORNS),
+    # Work (CAL-160): as `villagers`, on the work fixture's world, where Gi, a librarian, works at
+    # her lectern and restocks her used offer; Ha, a cleric, works at his brewing stand on a new
+    # day, his offers made then, their demand caught up; Fa, a farmer, works at her composter,
+    # too soon for another restock; and Ib, a mason, walks back to his stonecutter.
+    "work": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "work" / "world", fixture="work",
+                   rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                   player=THORNS),
     "farm": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "farm" / "world", fixture="farm",
                    tape=True),
     # Plains (CAL-156): as `farm`, on the plains fixture's grass, where horses and donkeys spawn
