@@ -706,6 +706,13 @@ CONFIGS = {
                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                  ("minecraft:respawn_radius", nbt.Int(0))),
                           player=SLIME),
+    # `zombie`'s steps on hard at midnight, with natural spawning on, as `isSpawningMonsters`
+    # wants it (CAL-159): the bot, in `slime`'s iron armor, hits Rot, whose chance of calling
+    # reinforcements is 1, so he calls one, which comes where it may and goes for the bot.
+    "reinforcements": Config({"difficulty": "hard"}, view=3, scenarios=("zombie",),
+                             world=FIXTURES / "reinforcements" / "world", fixture="reinforcements",
+                             rules=(("minecraft:show_advancement_messages", nbt.Byte(0)), ("minecraft:respawn_radius", nbt.Int(0))),
+                             player=SLIME),
     # The bot, in survival mode with nothing, stands at the arrows fixture's spawn, on normal at
     # midnight, while arrows fly as the world loads (CAL-159): into a wall, into a zombie without
     # AI and an armor stand, which breaks, onto its head, and onto the grass by it, where it picks

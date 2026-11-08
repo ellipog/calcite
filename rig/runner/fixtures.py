@@ -51,6 +51,15 @@ ANSWERS = {
 }
 
 
+def answer(line):
+    """What the console answers `line` with: a `forceload remove`'s, which lets chunks a fixture
+    forced to build in go once it's built, "for force loading" (CAL-159)."""
+    words = line.split()
+    if words[:2] == ["forceload", "remove"]:
+        return "for force loading"
+    return ANSWERS[words[0]]
+
+
 def commands(name):
     """The fixture's commands, without its comments and blank lines."""
     lines = (SOURCES / f"{name}.txt").read_text(encoding="utf-8").splitlines()
@@ -134,13 +143,13 @@ def make(name, force=False):
             time.sleep(0.2)
         at = ask(server, "tick freeze", "The game is frozen", at)
         for line in typed:
-            at = ask(server, line, ANSWERS[line.split()[0]], at)
+            at = ask(server, line, answer(line), at)
         at = ask(server, "forceload remove all", "Unmarked all force loaded chunks", at)
         # The fixture's own forced chunks, which the builder's took out with its own, kept in the
         # world it saves (D428).
         for line in typed:
             if line.split()[0] == "forceload":
-                at = ask(server, line, ANSWERS["forceload"], at)
+                at = ask(server, line, answer(line), at)
         at = ask(server, "save-all flush", "Saved the game", at)
     finally:
         server.stop()
