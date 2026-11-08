@@ -800,6 +800,14 @@ CONFIGS = {
                             rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                    ("minecraft:respawn_radius", nbt.Int(0))),
                             player=ARROWS),
+    # The bot, in survival mode with nothing, stands at the arrow-buttons fixture's spawn, on normal
+    # at midnight, while arrows shot up as the world loads fall into buttons (CAL-159): an oak one,
+    # which they press and hold, lighting a lamp, and a stone one, which they don't.
+    "arrow-buttons": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "arrow-buttons" / "world",
+                            fixture="arrow-buttons",
+                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                   ("minecraft:respawn_radius", nbt.Int(0))),
+                            player=ARROWS),
     "ender-arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "ender-arrows" / "world",
                            fixture="ender-arrows",
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
