@@ -747,6 +747,20 @@ CONFIGS = {
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                   ("minecraft:respawn_radius", nbt.Int(0))),
                            player=KNIGHT),
+    # `zombie`'s steps on the zombie-fall fixture (CAL-159): Rot, on a pillar beside the bot, which
+    # hides it from him, is knocked off it by the bot's hit and hurt by his fall.
+    "zombie-fall": Config({"difficulty": "normal"}, view=3, scenarios=("zombie",), world=FIXTURES / "zombie-fall" / "world",
+                          fixture="zombie-fall",
+                          rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                 ("minecraft:respawn_radius", nbt.Int(0))),
+                          player=KNIGHT),
+    # `zombie`'s steps on the zombie-mace fixture (CAL-159): Rot, with a mace, drops off a pillar
+    # beside the bot, in `zombie-sword`'s armor, and smashes it as he falls.
+    "zombie-mace": Config({"difficulty": "normal"}, view=3, scenarios=("zombie",), world=FIXTURES / "zombie-mace" / "world",
+                          fixture="zombie-mace",
+                          rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                 ("minecraft:respawn_radius", nbt.Int(0))),
+                          player=KNIGHT),
     # The bot, in survival mode with nothing, stands at the arrows fixture's spawn, on normal at
     # midnight, while arrows fly as the world loads (CAL-159): into a wall, into a zombie without
     # AI and an armor stand, which breaks, onto its head, and onto the grass by it, where it picks
