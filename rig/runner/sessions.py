@@ -1004,6 +1004,12 @@ CONFIGS = {
     "professions": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "professions" / "world", fixture="professions",
                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                           player=THORNS),
+    # Doors (CAL-160): as `villagers`, on the doors fixture's world, where Cy and Di, shut in a
+    # hut, walk out through its door to the job sites outside, opening it and shutting it behind
+    # them.
+    "doors": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "doors" / "world", fixture="doors",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                    player=THORNS),
     "farm": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "farm" / "world", fixture="farm",
                    tape=True),
     # Plains (CAL-156): as `farm`, on the plains fixture's grass, where horses and donkeys spawn
