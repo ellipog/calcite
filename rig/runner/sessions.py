@@ -1024,6 +1024,13 @@ CONFIGS = {
     "work": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "work" / "world", fixture="work",
                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                    player=THORNS),
+    # Pickup (CAL-160): as `villagers`, on the pickup fixture's world, where Jo, a farmer, sees
+    # wheat seeds and bread near her, walks to them and picks them up, but not a diamond she
+    # doesn't want, nor bone meal too far to walk to; and Ko, a nitwit with a full inventory,
+    # leaves carrots he has no room for, which Jo picks up as she strolls by.
+    "pickup": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "pickup" / "world", fixture="pickup",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                     player=THORNS),
     "farm": Config({}, view=2, scenarios=("watch",), world=FIXTURES / "farm" / "world", fixture="farm",
                    tape=True),
     # Plains (CAL-156): as `farm`, on the plains fixture's grass, where horses and donkeys spawn
