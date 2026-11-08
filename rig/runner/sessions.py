@@ -697,6 +697,15 @@ CONFIGS = {
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
                      player=THORNS),
+    # `zombie`'s, with Rot on fire (CAL-159): his hits set the bot on fire now and then, by the
+    # local difficulty, and it burns. The bot's in `slime`'s iron armor, so it lives till it
+    # leaves: a death and respawn has vanilla reload the level's entities, which Calcite doesn't
+    # yet (CAL-193).
+    "zombie-fire": Config({"difficulty": "normal"}, view=3, scenarios=("zombie",), world=FIXTURES / "zombie-fire" / "world",
+                          fixture="zombie-fire",
+                          rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                 ("minecraft:respawn_radius", nbt.Int(0))),
+                          player=SLIME),
     # The bot, in survival mode with nothing, stands at the arrows fixture's spawn, on normal at
     # midnight, while arrows fly as the world loads (CAL-159): into a wall, into a zombie without
     # AI and an armor stand, which breaks, onto its head, and onto the grass by it, where it picks
