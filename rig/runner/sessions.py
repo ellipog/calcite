@@ -1059,6 +1059,11 @@ CONFIGS = {
     "asleep": Config({}, view=3, scenarios=("asleep",), world=FIXTURES / "sleep" / "world", fixture="sleep",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                      player=THORNS),
+    # Meet (CAL-160): as `villagers`, on the meet fixture's world, where Ada, Bo and Cy meet at
+    # their bell, strolling around it and walking to each other to talk.
+    "meet": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "meet" / "world", fixture="meet",
+                   rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                   player=THORNS),
     # Crops (CAL-160): as `villagers`, on the crops fixture's world, with random ticks at 16 a
     # section, where wheat, carrots, potatoes, beetroots and torchflower crops grow, farmland by
     # water wets and farmland away from it dries, back to dirt where nothing's on it; and items, an
