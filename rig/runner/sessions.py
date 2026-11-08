@@ -761,6 +761,14 @@ CONFIGS = {
                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                  ("minecraft:respawn_radius", nbt.Int(0))),
                           player=KNIGHT),
+    # `skeleton`'s steps on the zombie-spear fixture (CAL-159): the bot, in `zombie-sword`'s armor,
+    # stands while Rot, with an iron spear, comes to within 10 blocks, lowers it and charges, his
+    # spear's hits hurting and knocking it back, then gets away and charges again.
+    "zombie-spear": Config({"difficulty": "normal"}, view=3, scenarios=("skeleton",), world=FIXTURES / "zombie-spear" / "world",
+                           fixture="zombie-spear",
+                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                  ("minecraft:respawn_radius", nbt.Int(0))),
+                           player=KNIGHT),
     # The bot, in survival mode with nothing, stands at the arrows fixture's spawn, on normal at
     # midnight, while arrows fly as the world loads (CAL-159): into a wall, into a zombie without
     # AI and an armor stand, which breaks, onto its head, and onto the grass by it, where it picks

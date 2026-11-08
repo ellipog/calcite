@@ -27,23 +27,24 @@
 /// order they came into each, though nothing finds or ticks them.
 module world.entities
 
+import math.mth.{floor}
 import nbt.tag.{Tag}
 import registry.components.{ItemCodecs}
 import world.arrow.{Arrow, OwnerView, Target}
 import world.attributes.{Wearing}
 import world.body.{BodyFacts, EntitySound, push_between}
-import world.clip.{widest_border}
+import world.clip.{clip_including_border, widest_border}
 import world.collision.{Aabb, CollisionBlocks}
 import world.damage.{DamageTypes}
 import world.experience_orb.{ExperienceOrb, Follower, can_merge}
 import world.goals.{Kin}
-import world.inside.{Acted, Rain}
+import world.inside.{Acted, Rain, box_clip}
 import world.item_entity.{ItemEntity}
-import world.living.{ArmorStand, LivingFacts, Shown}
+import world.living.{ArmorStand, LivingFacts, Shown, Stab, StabDue}
 import world.menu.{count_of, same_components}
 import world.living.{Warding}
 import world.mob.{Mob, MobLight, ZOMBIE, ZOMBIE_VILLAGER}
-import world.movement.{MovementStates}
+import world.movement.{MovementStates, Mover}
 import world.navigation.{NavLevel}
 import world.paths.{PathTypeCache}
 import world.pos.{ChunkPos}
@@ -135,6 +136,10 @@ pub struct Entities {
     // whether it entered its `aiStep`'s own part and whether it bred, which the next `tick_next`
     // goes on with once its level's dealt the hit (CAL-159).
     paused: (usize, bool, bool)? = none
+    // The mob whose tick stopped at its use of a spear for the hits it met, its place in `all` and
+    // whether it bred, which the next `tick_next` goes on with once its level's dealt them
+    // (CAL-159).
+    paused_use: (usize, bool)? = none
     // The arrow whose tick stopped at the entities its way met, its place in `all`, which the next
     // `tick_next` goes on with once its level's dealt the hits (CAL-159).
     paused_arrow: usize? = none
@@ -782,6 +787,16 @@ impl Entities {
             }
             return true
         }
+        if let stopped_use = self.paused_use.take() {
+            let (at, bred) = stopped_use
+            self.heard = 0
+            let held = self.all[at].take() else return true
+            match held {
+                Entity.Mob(mob) => self.tick_mob_on(at, mob, bred, lf, f, m, t, blocks, codecs, min_y, fast_lava, players, mut sounds),
+                other => self.all[at] = some(other),
+            }
+            return true
+        }
         if let stopped_at = self.paused_arrow.take() {
             self.heard = 0
             let held = self.all[stopped_at].take() else return true
@@ -1146,9 +1161,35 @@ impl Entities {
         a.game_time = self.game_time
         a.hard = self.hard
         a.difficulty = self.difficulty
-        let entered = a.tick_thinking(lf, f, m, t, blocks, items, mut self.path_types, players, min_y, fast_lava, mut sounds)
+        a.tick_using(lf, f, m, t, blocks, items, players, min_y, fast_lava, mut sounds)
+        if let due = a.stab_due.take() {
+            let stabs = self.stabs_of(mut a, due, f, m, blocks, players)
+            if not stabs.is_empty() {
+                // Its spear's hits, which its level deals before its tick goes on, as vanilla's
+                // `damageEntities` is dealt as its use ticks, before its AI: what it showed so far
+                // kept, then the hits, and it stopped till the next `tick_next` (CAL-159).
+                let bred = self.keep_shown(id, mut a)
+                self.all[i] = some(Entity.Mob(a))
+                self.shown.push(Shown.Stabbed(stabs))
+                self.shown_by.push(id)
+                self.shown_after.push(sounds.len())
+                self.heard = sounds.len()
+                self.paused_use = some((i, bred))
+                return
+            }
+        }
+        self.tick_mob_on(i, a, false, lf, f, m, t, blocks, items, min_y, fast_lava, players, mut sounds)
+    }
+
+    // The mob `mob` at `i` after its use's tick, `tick_using`, `bred_before` whether it bred
+    // (CAL-159): the rest of its tick through its AI, `tick_thinking_on`, then, unless it attacked
+    // a player, the rest of its tick.
+    fn tick_mob_on<B: CollisionBlocks + EntityTicking + MobLight + NavLevel + Rain + Warding, W: Wearing>(mut self, i: usize, mob: own Mob, bred_before: bool, lf: LivingFacts, f: Facts, m: MovementStates, t: BodyFacts, blocks: B, items: W, min_y: i32, fast_lava: bool, players: List<Follower>, sounds: mut List<EntitySound>) {
+        var a = mob
+        let id = a.living.body.id
+        let entered = a.tick_thinking_on(lf, f, m, blocks, items, mut self.path_types, players, min_y, mut sounds)
         if not a.attacked() {
-            self.tick_mob_rest(i, a, entered, false, lf, f, m, t, blocks, items, fast_lava, players, mut sounds)
+            self.tick_mob_rest(i, a, entered, bred_before, lf, f, m, t, blocks, items, fast_lava, players, mut sounds)
             return
         }
         // Its attack on a player, which its level deals before its tick goes on, as vanilla's
@@ -1157,7 +1198,7 @@ impl Entities {
         // alerts told, and it stopped till the next `tick_next` (CAL-159).
         let alert = a.alerted
         a.alerted = none
-        let bred = self.keep_shown(id, mut a)
+        let bred = self.keep_shown(id, mut a) or bred_before
         let (ax, ay, az) = (a.living.body.x, a.living.body.y, a.living.body.z)
         let within = a.living.attributes.value(lf.follow_range)
         let zombie = a.species == ZOMBIE
@@ -1167,6 +1208,93 @@ impl Entities {
             self.alert_others(id, zombie, ax, ay, az, within, target, players)
         }
         self.paused = some((i, entered, bred))
+    }
+
+    // What the mob `a`'s spear meets as its use ticks, `due` what that asks, among the level's mobs
+    // and armor stands and `players`, `KineticWeapon.damageEntities` (CAL-159). Its way, along its
+    // head's look from its eyes, from its least reach to its most and its motion along that more,
+    // `getHitEntitiesAlong`, meets nothing where a block it collides with comes nearer than its
+    // least reach, else ends at such a block. What its way meets, in the order the level finds
+    // them, mobs and stands, then players, is what's alive, pickable and not invulnerable whose
+    // box is within its margin of the way, there clear of colliding blocks to the box's middle,
+    // `getManyEntityHitResult`. Each not hit too lately, `wasRecentlyStabbed`, is kept as hit now,
+    // and is hit where what it does holds: its speed along its look, less theirs, at least none,
+    // against the spear's conditions at a mob's fifth, `test`; the damage its attack damage's
+    // base and the whole of that times the spear's multiplier.
+    fn stabs_of<B: CollisionBlocks>(self, a: mut Mob, due: StabDue, f: Facts, m: MovementStates, blocks: B, players: List<Follower>) -> List<Stab> {
+        var out = List<Stab>()
+        let (ex, ey, ez) = due.eye
+        let (hx, hy, hz) = due.head_look
+        let least = due.reach.least
+        let from = (ex + hx * least, ey + hy * least, ez + hz * least)
+        let (mx, my, mz) = due.movement
+        let along = mx * hx + my * hy + mz * hz
+        let far = due.reach.most + along.max(0.0)
+        var to = (ex + hx * far, ey + hy * far, ez + hz * far)
+        let border = self.border ?? widest_border()
+        let mover = a.living.body.mover()
+        let way = clip_including_border(f, m, blocks, mover, due.eye, to, border)
+        if not way.missed {
+            to = (way.x, way.y, way.z)
+            if distance_sqr(due.eye, to) < distance_sqr(due.eye, from) {
+                return out
+            }
+        }
+        let (fx, fy, fz) = from
+        let (tx, ty, tz) = to
+        let half = due.reach.margin / 2.0
+        var area = Aabb { min_x: fx - half, min_y: fy - half, min_z: fz - half, max_x: fx + half, max_y: fy + half, max_z: fz + half }
+        area = expand_towards(area, tx - fx, ty - fy, tz - fz).inflate(1.0, 1.0, 1.0)
+        var found = List<(i32, Aabb, bool, (f64, f64, f64))>()
+        for id in self.found(area, a.living.body.id, 12) {
+            let slot = self.all[self.at[id]] else continue
+            match slot {
+                Entity.Stand(s) => {
+                    if not s.living.body.removed and s.living.alive() and not s.marker() and not s.living.body.invulnerable and s.living.invulnerable_time <= 0 {
+                        found.push((id, s.living.body.bounding_box(), false, (s.living.body.known_dx, s.living.body.known_dy, s.living.body.known_dz)))
+                    }
+                },
+                Entity.Mob(o) => {
+                    if not o.living.body.removed and o.living.alive() and not o.living.body.invulnerable and o.living.invulnerable_time <= 0 {
+                        found.push((id, o.living.body.bounding_box(), false, (o.living.body.known_dx, o.living.body.known_dy, o.living.body.known_dz)))
+                    }
+                },
+                _ => {},
+            }
+        }
+        for p in players {
+            if p.spectator or p.dead {
+                continue
+            }
+            let b = p.bounds else continue
+            if b.intersects(area.min_x, area.min_y, area.min_z, area.max_x, area.max_y, area.max_z) {
+                found.push((p.id, b, true, (p.known_dx, p.known_dy, p.known_dz)))
+            }
+        }
+        let k = due.kinetic
+        let (lx, ly, lz) = due.look
+        let (sx, sy, sz) = due.speed
+        let speed = lx * sx + ly * sy + lz * sz
+        let now = self.game_time
+        for (id, b, player, known) in found {
+            if not meets_way(f, m, blocks, mover, border, b, from, to, due.reach.margin) {
+                continue
+            }
+            if a.living.stabbed_lately(id, now, k.contact_cooldown) {
+                continue
+            }
+            let (kx, ky, kz) = known
+            let theirs = lx * (kx * 20.0) + ly * (ky * 20.0) + lz * (kz * 20.0)
+            let relative = (speed - theirs).max(0.0)
+            let dismounts = match k.dismount { some(c) => c.test(due.ticks, speed, relative, f64(0.2f32)), none => false }
+            let knocks = match k.knockback { some(c) => c.test(due.ticks, speed, relative, f64(0.2f32)), none => false }
+            let hurts = match k.damage { some(c) => c.test(due.ticks, speed, relative, f64(0.2f32)), none => false }
+            if dismounts or knocks or hurts {
+                let damage = f32.nearest(due.base_damage) + f32.nearest(floor(relative * f64(k.multiplier)))
+                out.push(Stab { target: id, player: player, damage: damage, hurts: hurts, knocks: knocks, dismounts: dismounts })
+            }
+        }
+        return out
     }
 
     // What the mob `a`, of the ID `id`, showed of its tick kept, `shown`, with its ID and the
@@ -1886,4 +2014,57 @@ fn section_chunk(key: i64) -> ChunkPos {
 /// `SectionPos.asLong`.
 pub fn pack(x: i32, y: i32, z: i32) -> i64 {
     return ((i64(x) & 4194303) << 42) | (i64(y) & 1048575) | ((i64(z) & 4194303) << 20)
+}
+
+// The square of the distance from `a` to `b`, `distanceToSqr`.
+fn distance_sqr(a: (f64, f64, f64), b: (f64, f64, f64)) -> f64 {
+    let (ax, ay, az) = a
+    let (bx, by, bz) = b
+    let (dx, dy, dz) = (bx - ax, by - ay, bz - az)
+    return dx * dx + dy * dy + dz * dz
+}
+
+// `AABB.expandTowards`: the box `b` stretched toward the side each of `xa`, `ya` and `za` goes.
+fn expand_towards(b: Aabb, xa: f64, ya: f64, za: f64) -> Aabb {
+    var out = b
+    if xa < 0.0 {
+        out.min_x += xa
+    } else if xa > 0.0 {
+        out.max_x += xa
+    }
+    if ya < 0.0 {
+        out.min_y += ya
+    } else if ya > 0.0 {
+        out.max_y += ya
+    }
+    if za < 0.0 {
+        out.min_z += za
+    } else if za > 0.0 {
+        out.max_z += za
+    }
+    return out
+}
+
+// Whether `getManyEntityHitResult`, taking in the box the way starts in, has the way from `from`
+// to `to` meet the box `b` within `margin` (CAL-159): `from` within it, the way through it, or,
+// with a margin, through it that much larger, and from there toward its middle, `getCenter`, up
+// to the first block `mover` collides with or the world border `border`, through it.
+fn meets_way<B: CollisionBlocks>(f: Facts, m: MovementStates, blocks: B, mover: Mover, border: (f64, f64, f64, f64), b: Aabb, from: (f64, f64, f64), to: (f64, f64, f64), margin: f64) -> bool {
+    let (fx, fy, fz) = from
+    if fx >= b.min_x and fx < b.max_x and fy >= b.min_y and fy < b.max_y and fz >= b.min_z and fz < b.max_z {
+        return true
+    }
+    if box_clip(b.min_x, b.min_y, b.min_z, b.max_x, b.max_y, b.max_z, from, to) != none {
+        return true
+    }
+    if margin <= 0.0 {
+        return false
+    }
+    let outside = box_clip(b.min_x - margin, b.min_y - margin, b.min_z - margin, b.max_x + margin, b.max_y + margin, b.max_z + margin, from, to) else return false
+    var towards = (b.min_x + 0.5 * (b.max_x - b.min_x), b.min_y + 0.5 * (b.max_y - b.min_y), b.min_z + 0.5 * (b.max_z - b.min_z))
+    let way = clip_including_border(f, m, blocks, mover, outside, towards, border)
+    if not way.missed {
+        towards = (way.x, way.y, way.z)
+    }
+    return box_clip(b.min_x, b.min_y, b.min_z, b.max_x, b.max_y, b.max_z, outside, towards) != none
 }
