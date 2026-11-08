@@ -1,0 +1,501 @@
+/// A level's points of interest, as vanilla's `PoiManager` keeps them (CAL-160): each section's,
+/// `PoiSection`, by its key, `SectionPos.asLong`, a chunk's sections all known once the chunk's
+/// loaded, `loadedChunks`, as `SectionStorage` keeps them; records added and removed as blocks
+/// change, and found, taken and released as villagers look for beds, job sites and bells; the
+/// chunks whose records changed, `dirtyChunks`, in the order they did, for saving; and how far
+/// each section is from a village, `sectionsToVillage`.
+///
+/// A search goes over a section's records by type, then each type's in its set's order, as
+/// `getRecords` does, the chunks in `ChunkPos.rangeClosed`'s order and each chunk's sections from
+/// the bottom, so what's first found is vanilla's but where records of two types are near: vanilla
+/// goes over types by their holders' identity hashes, which a run sets, and Calcite by their IDs.
+module world.poi
+
+import server.log.{Entry}
+import storage.poi.{PoiChunk, PoiRecord, PoiSection}
+import world.chunk.{Chunk}
+import world.pos.{BlockPos, ChunkPos}
+import worldgen.facts.{Facts}
+
+/// The types of points of interest, `PoiTypes`, by their IDs in `point_of_interest_type`.
+pub const ARMORER: i32 = 0
+pub const WEAPONSMITH: i32 = 12
+pub const HOME: i32 = 13
+pub const MEETING: i32 = 14
+pub const BEEHIVE: i32 = 15
+pub const BEE_NEST: i32 = 16
+pub const NETHER_PORTAL: i32 = 17
+pub const LODESTONE: i32 = 18
+pub const TEST_INSTANCE: i32 = 19
+pub const LIGHTNING_ROD: i32 = 20
+/// How many types there are.
+pub const POI_TYPES: i32 = 21
+
+/// The types of `#village`, `PoiTypeTags.VILLAGE`: the job sites, a bed and a bell.
+pub fn village_types() -> List<bool> {
+    var out = List<bool>()
+    for k in 0..POI_TYPES {
+        out.push(k <= MEETING)
+    }
+    return out
+}
+
+/// How many may claim a point of the type `kind`, its `maxTickets`: one each for a job site and
+/// a bed, 32 for a bell, and none for the rest.
+pub fn max_tickets(kind: i32) -> i32 {
+    if kind >= ARMORER and kind <= HOME {
+        return 1
+    }
+    if kind == MEETING {
+        return 32
+    }
+    return 0
+}
+
+/// How near a mob must come to a point of the type `kind` to be at it, its `validRange`: 6 for a
+/// bell and 1 for the rest.
+pub fn valid_range(kind: i32) -> i32 {
+    return if kind == MEETING { 6 } else { 1 }
+}
+
+/// Which records a search counts, `PoiManager.Occupancy`: those with a ticket free,
+/// `HAS_SPACE`; those with one taken, `IS_OCCUPIED`; or any, `ANY`.
+pub enum Occupancy {
+    HasSpace
+    IsOccupied
+    Any
+}
+
+// Whether `record` is one `occupancy` counts.
+fn counts(record: PoiRecord, occupancy: Occupancy) -> bool {
+    return match occupancy {
+        Occupancy.HasSpace => record.free_tickets > 0,
+        Occupancy.IsOccupied => record.free_tickets != max_tickets(i32.wrap(record.kind)),
+        Occupancy.Any => true,
+    }
+}
+
+/// The key of the section holding `pos`, `SectionPos.asLong`: 22 bits of its `x`, 22 of its `z`,
+/// then 20 of its `y`.
+pub fn section_key(x: i32, y: i32, z: i32) -> i64 {
+    return ((i64(x) & 0x3FFFFF) << 42) | (i64(y) & 0xFFFFF) | ((i64(z) & 0x3FFFFF) << 20)
+}
+
+/// What a chunk's section holds of points of interest as the chunk's read from its file, for
+/// `checkConsistencyWithBlocks`: its height, whether its states may hold one, `mayHavePoi`, and
+/// each its blocks are, with its type's tickets free, in `SectionPos.blocksInside`'s order, `x`
+/// fastest, then `y`, then `z`.
+pub struct Scanned {
+    pub y: i32
+    pub may: bool
+    pub points: List<PoiRecord>
+}
+
+/// What the sections of `chunk`, the chunk at `pos`, hold of points of interest, each from the
+/// bottom; a section with no point of interest isn't looked through.
+pub fn scan(f: Facts, chunk: Chunk, pos: ChunkPos) -> List<Scanned> {
+    var out = List<Scanned>()
+    let bottom = chunk.min_y() >> 4
+    for i in 0..chunk.section_count() {
+        let sy = bottom + i32.wrap(i)
+        let may = chunk.section_may_have_pois(i)
+        var points = List<PoiRecord>()
+        if may and chunk.section_pois(i) > 0 {
+            for z in 0..16 {
+                for y in 0..16 {
+                    for x in 0..16 {
+                        let kind = f.poi(chunk.section_block(i, x, y, z))
+                        if kind >= 0 {
+                            points.push(PoiRecord { pos: BlockPos { x: pos.x * 16 + x, y: sy * 16 + y, z: pos.z * 16 + z }, kind: u32.wrap(kind), free_tickets: max_tickets(kind) })
+                        }
+                    }
+                }
+            }
+        }
+        out.push(Scanned { y: sy, may: may, points: points })
+    }
+    return out
+}
+
+/// A level's points of interest.
+pub struct Pois {
+    /// The lowest section and how many there are, the level's height.
+    min_section: i32 = 0
+    sections: i32 = 0
+    /// Each section's records, `none` for a section with no data, as `storage` keeps them.
+    stored: Map<i64, PoiSection?> = Map<i64, PoiSection?>()
+    /// The chunks whose sections are all known, `loadedChunks`.
+    loaded: Set<i64> = Set<i64>()
+    /// The chunks whose records changed since they were last saved, in the order they did, as
+    /// `dirtyChunks`, a `LongLinkedOpenHashSet`, keeps them.
+    dirty: List<ChunkPos> = List<ChunkPos>()
+    dirty_set: Set<i64> = Set<i64>()
+    /// The sections that are a village's centers, `isVillageCenter`, each holding a record of a
+    /// `#village` type with a ticket taken; those of them whose sections near have been counted;
+    /// and each section that's been within 5 of a center as the distances were run, which
+    /// vanilla's `DistanceTracker` holds at 6 once it's farther, where one never near is 7.
+    centers: Set<i64> = Set<i64>()
+    absorbed: Set<i64> = Set<i64>()
+    ever_near: Set<i64> = Set<i64>()
+}
+
+impl Pois {
+    /// A level's, `sections` sections high from `min_section`, with none known.
+    pub fn new(min_section: i32, sections: i32) -> Pois {
+        return Pois { min_section: min_section, sections: sections }
+    }
+
+    /// Whether the chunk at `pos`'s sections are known.
+    pub fn knows(self, pos: ChunkPos) -> bool {
+        return self.loaded.contains(pos.pack())
+    }
+
+    /// `unpackChunk`: the chunk at `pos`'s sections as `chunk` holds them, read from its `poi`
+    /// file, or none for a chunk with no file, unless they're known already. A chunk with a
+    /// section is then to be saved again: vanilla counts each it reads as upgraded, its
+    /// `versionChanged` comparing the tag it read with a new one made of it.
+    pub fn load(mut self, pos: ChunkPos, chunk: PoiChunk?) {
+        if self.loaded.contains(pos.pack()) {
+            return
+        }
+        self.loaded.insert(pos.pack())
+        for i in 0..self.sections {
+            let key = section_key(pos.x, self.min_section + i, pos.z)
+            var section: PoiSection? = none
+            if let c = chunk {
+                if usize.wrap(i) < c.sections.len() {
+                    section = c.sections[usize.wrap(i)].copy()
+                }
+            }
+            let had = section != none
+            if had {
+                self.set_dirty(pos)
+            }
+            self.stored.insert(key, section)
+            if had {
+                // `onSectionLoad`.
+                self.recheck(key)
+            }
+        }
+    }
+
+    /// `checkConsistencyWithBlocks` of each section of the chunk at `pos` as it's read from its
+    /// file, its sections known, with what `scan` found of them: a section with data made again
+    /// from its blocks where it isn't valid, `refresh`, the chunk then to be saved; one without,
+    /// where its blocks may hold a point, made, and each point added, `getOrCreate`.
+    pub fn check(mut self, pos: ChunkPos, scanned: List<Scanned>, lines: mut List<Entry>) {
+        for s in scanned {
+            if self.outside(s.y) {
+                continue
+            }
+            let key = section_key(pos.x, s.y, pos.z)
+            var had: PoiSection? = none
+            if self.stored.contains(key) {
+                had = self.stored[key].copy()
+            }
+            if let section = had {
+                if section.valid {
+                    continue
+                }
+                var fixed = section
+                fixed.refresh(if s.may { s.points.copy() } else { List<PoiRecord>() })
+                self.stored.insert(key, some(fixed))
+                self.set_dirty(pos)
+                self.recheck(key)
+            } else if s.may {
+                self.stored.insert(key, some(PoiSection.new(true)))
+                for r in s.points {
+                    _ = self.add(r.pos, i32.wrap(r.kind), mut lines)
+                }
+            }
+        }
+    }
+
+    /// The chunk at `pos` as it's saved, `writeChunk`, each of its sections with data.
+    pub fn chunk(self, pos: ChunkPos) -> PoiChunk {
+        var list = List<PoiSection?>()
+        for i in 0..self.sections {
+            let key = section_key(pos.x, self.min_section + i, pos.z)
+            if self.stored.contains(key) {
+                list.push(self.stored[key].copy())
+            } else {
+                list.push(none)
+            }
+        }
+        return PoiChunk { min_section: self.min_section, sections: list }
+    }
+
+    /// The chunks whose records changed since they were last saved, in the order they did, each
+    /// then counted as saved, as `flushAll` writes them.
+    pub fn take_dirty(mut self) -> List<ChunkPos> {
+        let out = self.dirty.copy()
+        self.dirty = List<ChunkPos>()
+        self.dirty_set = Set<i64>()
+        return out
+    }
+
+    // `setDirty`: the chunk at `pos` marked to be saved, once until it is.
+    fn set_dirty(mut self, pos: ChunkPos) {
+        if not self.dirty_set.contains(pos.pack()) {
+            self.dirty_set.insert(pos.pack())
+            self.dirty.push(pos)
+        }
+    }
+
+    // Whether the section `y` is outside the level's height, `outsideStoredRange`.
+    fn outside(self, y: i32) -> bool {
+        return y < self.min_section or y >= self.min_section + self.sections
+    }
+
+    /// `add`, as a block of the type `kind` is set at `pos`: a record with its type's tickets free,
+    /// in a section made for it where there's none, `getOrCreate`. Whether it's added, with what
+    /// vanilla logs added to `lines`; `false` where the chunk's sections aren't known, which the
+    /// caller reads first.
+    pub fn add(mut self, pos: BlockPos, kind: i32, lines: mut List<Entry>) -> bool {
+        let sy = pos.y >> 4
+        if self.outside(sy) {
+            return false
+        }
+        let chunk = pos.chunk()
+        if not self.knows(chunk) {
+            return false
+        }
+        let key = section_key(pos.x >> 4, sy, pos.z >> 4)
+        var section = PoiSection.new(true)
+        if self.stored.contains(key) {
+            if let s = self.stored[key].copy() {
+                section = s
+            }
+        }
+        let added = section.add(PoiRecord { pos: pos, kind: u32.wrap(kind), free_tickets: max_tickets(kind) }, mut lines)
+        self.stored.insert(key, some(section))
+        if added {
+            self.set_dirty(chunk)
+            self.recheck(key)
+        }
+        return added
+    }
+
+    /// `remove`, as a block of a type is replaced at `pos`: its record taken out, with vanilla's
+    /// error added to `lines` where there's none in a section with data.
+    pub fn remove(mut self, pos: BlockPos, lines: mut List<Entry>) {
+        let sy = pos.y >> 4
+        if self.outside(sy) {
+            return
+        }
+        let key = section_key(pos.x >> 4, sy, pos.z >> 4)
+        if not self.stored.contains(key) {
+            return
+        }
+        var section = self.stored[key].copy() else return
+        let removed = section.remove(pos, mut lines)
+        self.stored.insert(key, some(section))
+        if removed {
+            self.set_dirty(pos.chunk())
+            self.recheck(key)
+        }
+    }
+
+    /// The type of the record at `pos`, `getType`, if there's one.
+    pub fn type_at(self, pos: BlockPos) -> i32? {
+        let record = self.record_at(pos) else return none
+        return some(i32.wrap(record.kind))
+    }
+
+    /// The record at `pos`, if there's one in a section that's known.
+    pub fn record_at(self, pos: BlockPos) -> PoiRecord? {
+        let key = section_key(pos.x >> 4, pos.y >> 4, pos.z >> 4)
+        if not self.stored.contains(key) {
+            return none
+        }
+        let section = self.stored[key].copy() else return none
+        return section.record_at(pos)
+    }
+
+    /// `getInChunk`: the records of the types `wanted` holds that `occupancy` counts in the chunk
+    /// at `pos`, its sections from the bottom, of those known.
+    pub fn in_chunk(self, wanted: List<bool>, pos: ChunkPos, occupancy: Occupancy) -> List<PoiRecord> {
+        var out = List<PoiRecord>()
+        for i in 0..self.sections {
+            let key = section_key(pos.x, self.min_section + i, pos.z)
+            if not self.stored.contains(key) {
+                continue
+            }
+            if let section = self.stored[key].copy() {
+                for r in section.records_of(wanted.copy()) {
+                    if counts(r, occupancy) {
+                        out.push(r)
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// `getInSquare`: those in the chunks within `radius` blocks across of `center`, a chunk more
+    /// each way, in `ChunkPos.rangeClosed`'s order, then within `radius` of it each way across.
+    pub fn in_square(self, wanted: List<bool>, center: BlockPos, radius: i32, occupancy: Occupancy) -> List<PoiRecord> {
+        let r = floor_div(radius, 16) + 1
+        let c = center.chunk()
+        var out = List<PoiRecord>()
+        for z in (c.z - r)..(c.z + r + 1) {
+            for x in (c.x - r)..(c.x + r + 1) {
+                for record in self.in_chunk(wanted.copy(), ChunkPos { x: x, z: z }, occupancy) {
+                    if (record.pos.x - center.x).abs() <= radius and (record.pos.z - center.z).abs() <= radius {
+                        out.push(record)
+                    }
+                }
+            }
+        }
+        return out
+    }
+
+    /// `getInRange`: those of the square within `radius` of `center`, `distSqr`.
+    pub fn in_range(self, wanted: List<bool>, center: BlockPos, radius: i32, occupancy: Occupancy) -> List<PoiRecord> {
+        let most = i64(radius) * i64(radius)
+        var out = List<PoiRecord>()
+        for record in self.in_square(wanted, center, radius, occupancy) {
+            if dist_sqr(record.pos, center) <= most {
+                out.push(record)
+            }
+        }
+        return out
+    }
+
+    /// `take`: the first record in range with a ticket free that `filter_pos` names, or the first
+    /// at all where it's `none`, with one of its tickets taken, `acquireTicket`. Where it is.
+    pub fn take(mut self, wanted: List<bool>, filter_pos: BlockPos?, center: BlockPos, radius: i32) -> BlockPos? {
+        for record in self.in_range(wanted, center, radius, Occupancy.HasSpace) {
+            if let want = filter_pos {
+                if record.pos != want {
+                    continue
+                }
+            }
+            let key = section_key(record.pos.x >> 4, record.pos.y >> 4, record.pos.z >> 4)
+            var section = self.stored[key].copy() else return none
+            let taken = section.acquire(record)
+            self.stored.insert(key, some(section))
+            if taken {
+                self.set_dirty(record.pos.chunk())
+                self.recheck(key)
+            }
+            return some(record.pos)
+        }
+        return none
+    }
+
+    /// `release`: one of the tickets of the record at `pos` given back. Whether one was, or
+    /// `none` where there's no record there, which vanilla throws for.
+    pub fn release(mut self, pos: BlockPos) -> bool? {
+        let key = section_key(pos.x >> 4, pos.y >> 4, pos.z >> 4)
+        if not self.stored.contains(key) {
+            return none
+        }
+        var section = self.stored[key].copy() else return none
+        let kind = section.record_at(pos) else return none
+        let given = section.release(pos, max_tickets(i32.wrap(kind.kind)))
+        self.stored.insert(key, some(section))
+        // `release` marks the chunk changed whether a ticket was given back or not.
+        self.set_dirty(pos.chunk())
+        self.recheck(key)
+        return given
+    }
+
+    // `setDirty`'s and `onSectionLoad`'s update of the distances to villages: whether the section
+    // at `key` is a village's center now, holding a record of a `#village` type with a ticket
+    // taken, `IS_OCCUPIED`, of those its types' sets hold.
+    fn recheck(mut self, key: i64) {
+        var center = false
+        if self.stored.contains(key) {
+            if let section = self.stored[key] {
+                for r in section.records_of(village_types()) {
+                    if r.free_tickets != max_tickets(i32.wrap(r.kind)) {
+                        center = true
+                        break
+                    }
+                }
+            }
+        }
+        if center {
+            self.centers.insert(key)
+        } else {
+            self.centers.remove(key)
+        }
+    }
+
+    /// `DistanceTracker.runAllUpdates`, as the manager ticks and before each distance is read:
+    /// the sections within 5 of each center that's come since it last ran counted as having been
+    /// near one.
+    pub fn run_villages(mut self) {
+        var fresh = List<i64>()
+        for key in self.centers {
+            if not self.absorbed.contains(key) {
+                fresh.push(key)
+            }
+        }
+        for key in fresh {
+            self.absorbed.insert(key)
+            let (x, y, z) = unpack_section(key)
+            for dx in -5..6 {
+                for dy in -5..6 {
+                    for dz in -5..6 {
+                        self.ever_near.insert(section_key(x + dx, y + dy, z + dz))
+                    }
+                }
+            }
+        }
+    }
+
+    /// `sectionsToVillage`, the distances run first: how many sections the section at `x`, `y`,
+    /// `z` is from a village's center, the most of the three ways, as `SectionTracker` spreads
+    /// it, as far as 5; past that 6 where it's been within 5 of one, else 7.
+    pub fn sections_to_village(mut self, x: i32, y: i32, z: i32) -> i32 {
+        self.run_villages()
+        var best = 6
+        for key in self.centers {
+            let (cx, cy, cz) = unpack_section(key)
+            var d = (cx - x).abs()
+            if (cy - y).abs() > d {
+                d = (cy - y).abs()
+            }
+            if (cz - z).abs() > d {
+                d = (cz - z).abs()
+            }
+            if d < best {
+                best = d
+            }
+        }
+        if best <= 5 {
+            return best
+        }
+        return if self.ever_near.contains(section_key(x, y, z)) { 6 } else { 7 }
+    }
+
+    /// `isCloseToVillage`: whether the section holding `pos` is within `sections` of a village's
+    /// center, never past 6.
+    pub fn close_to_village(mut self, pos: BlockPos, sections: i32) -> bool {
+        if sections > 6 {
+            return false
+        }
+        return self.sections_to_village(pos.x >> 4, pos.y >> 4, pos.z >> 4) <= sections
+    }
+}
+
+// A section's place from its key, `SectionPos.x`, `y` and `z`.
+fn unpack_section(key: i64) -> (i32, i32, i32) {
+    return (i32.wrap(key >> 42), i32.wrap((key << 44) >> 44), i32.wrap((key << 22) >> 42))
+}
+
+// `Math.floorDiv`.
+fn floor_div(a: i32, b: i32) -> i32 {
+    let q = a / b
+    return if (a % b != 0) and ((a < 0) != (b < 0)) { q - 1 } else { q }
+}
+
+// `Vec3i.distSqr`, as doubles.
+fn dist_sqr(a: BlockPos, b: BlockPos) -> i64 {
+    let dx = i64(a.x) - i64(b.x)
+    let dy = i64(a.y) - i64(b.y)
+    let dz = i64(a.z) - i64(b.z)
+    return dx * dx + dy * dy + dz * dz
+}

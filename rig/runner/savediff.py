@@ -16,6 +16,10 @@ stopped, `ENTITY_TIMING`: an item's or an ageable mob's age, and its motion, whi
 gathers as it falls 0.04 a tick between the moves it makes every 4 ticks; and a chicken's ticks
 until it lays, which count down a tick at a time (CAL-156). A living entity's attributes are
 compared in any order, `UNORDERED`, as vanilla's order changes from run to run.
+
+So are the POI chunks, in `poi/` (CAL-160): which chunks each saved, each chunk's sections in the
+order it saved them, and each section's `Valid` and its records, in order, each record's place,
+type and tickets free.
 """
 
 import struct
@@ -40,7 +44,8 @@ UNORDERED = {"attributes"}
 
 def chunks(world, dimension="minecraft/overworld", folder="region"):
     """Each chunk the world's region files of `dimension` hold, by its position, as a compound:
-    its blocks', or, with `folder` "entities", its entities'."""
+    its blocks', or, with `folder` "entities", its entities', or with "poi", its points of
+    interest."""
     out = {}
     for region in sorted((Path(world) / "dimensions" / dimension / folder).glob("r.*.*.mca")):
         data = region.read_bytes()
@@ -147,7 +152,7 @@ def compare(vanilla_world, calcite_world, area, show=20):
                     lines.append(f"chunk {cx}, {cz}: only {'vanilla' if a is not None else 'Calcite'} saved it")
                 continue
             lines += [f"chunk {cx}, {cz}: {d}" for d in chunk_differences(cx, cz, a, b, show)]
-    return lines + entity_differences(vanilla_world, calcite_world, area)
+    return lines + entity_differences(vanilla_world, calcite_world, area) + poi_differences(vanilla_world, calcite_world, area)
 
 
 def uuid_of(entity):
@@ -178,6 +183,30 @@ def entity_differences(vanilla_world, calcite_world, area):
                         lines.append(f"entities {cx}, {cz}: {ea.get('id')} {key}: {ea.get(key)!r:.200} vs {eb.get(key)!r:.200}")
                 if list(ea) != list(eb):
                     lines.append(f"entities {cx}, {cz}: {ea.get('id')}'s tags in another order: {list(ea)} vs {list(eb)}")
+    return lines
+
+
+def poi_differences(vanilla_world, calcite_world, area):
+    """The differences between the POI chunks in `area` as each world saved them (CAL-160)."""
+    v, c = chunks(vanilla_world, folder="poi"), chunks(calcite_world, folder="poi")
+    lines = []
+    x0, z0, x1, z1 = area
+    for cx in range(x0, x1 + 1):
+        for cz in range(z0, z1 + 1):
+            a, b = v.get((cx, cz)), c.get((cx, cz))
+            if a is None or b is None:
+                if a is not None or b is not None:
+                    lines.append(f"poi {cx}, {cz}: only {'vanilla' if a is not None else 'Calcite'} saved it")
+                continue
+            sa, sb = a.get("Sections", {}), b.get("Sections", {})
+            if list(sa) != list(sb):
+                lines.append(f"poi {cx}, {cz}: sections {list(sa)} vs {list(sb)}")
+                continue
+            for y in sa:
+                if sa[y] != sb[y]:
+                    lines.append(f"poi {cx}, {cz}: section {y}: {sa[y]!r:.300} vs {sb[y]!r:.300}")
+                elif list(sa[y]) != list(sb[y]):
+                    lines.append(f"poi {cx}, {cz}: section {y}'s tags in another order: {list(sa[y])} vs {list(sb[y])}")
     return lines
 
 

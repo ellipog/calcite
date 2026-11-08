@@ -62,8 +62,12 @@ import server.chunks.{Chunks, Next}
 import server.light_service.{LIGHT_ASKS, LightAsk, LightBody, LightDone, LightService, LightThread}
 import server.log.{Entry}
 import server.pregen.{Holds}
+import server.entity_io.{EntityDone, EntityJobs}
 import storage.chunk.{ChunkRest, PackedRest, RestStore, SavedTick}
-import storage.regions.{ChunkRead, region_of}
+import storage.poi.{PoiChunk, PoiFormat}
+import storage.region.{unpack}
+import storage.regions.{ChunkRead, read_root, region_of}
+import world.poi.{Pois, scan}
 import world.chunk.{AIR_STATE, BlockStates, Chunk, MOTION_BLOCKING}
 import world.collision.{CollisionBlocks, CollisionStates}
 import world.distance.{DistanceManager, Nearby, Ticking}
@@ -488,6 +492,21 @@ pub struct Level {
     // The dimension's sections, from its lowest.
     min_section: i32 = 0
     sections: i32 = 0
+    /// The dimension's points of interest (CAL-160), as its `PoiManager` keeps them.
+    pub pois: Pois = Pois()
+    // Where they're read from: its `poi` folder's thread, or, replaying, the recording's log, if
+    // the recording read them; the format they're read and written in; the chunks whose points
+    // are asked for and not back, and those to ask for at the next `dispatch`; the chunks read
+    // while theirs were away, held until they're back, as `scheduleChunkLoad` waits for both its
+    // reads; and the chunks that came before the block facts, whose points are looked for once
+    // they're here.
+    poi_jobs: EntityJobs? = none
+    poi_reads: bool = false
+    poi_format: PoiFormat? = none
+    poi_asked: Set<i64> = Set<i64>()
+    poi_asks: List<ChunkPos> = List<ChunkPos>()
+    poi_held: Map<i64, List<HeldRead>> = Map<i64, List<HeldRead>>()
+    poi_waiting: List<(i64, Shared<Chunk>, bool)> = List<(i64, Shared<Chunk>, bool)>()
     // Light, once chunks are read (D264): the queue to its thread and the steps back, or, in a
     // replay or a test, light itself, run here. The asks not yet handed over, or, run here, not
     // yet taken; whether light here steps as the level settles, as a test's does, rather than as
@@ -690,6 +709,14 @@ pub struct Level {
     pub handling: bool = false
 }
 
+// A chunk read while its points of interest were away, as `read_chunk` was handed it.
+struct HeldRead {
+    pos: ChunkPos
+    io: List<Entry>
+    loaded: Loaded
+    made: List<Entry>
+}
+
 /// The blocks set in a section since they were last broadcast, as `ChunkHolder.broadcastChanges`
 /// sends them (D321): the chunk and the section's `y`, and each block's place in the section,
 /// `x << 8 | z << 4 | y`, as `SectionPos.sectionRelativePos` packs it, in the order its set gives
@@ -868,6 +895,7 @@ impl Level {
         self.opened = true
         self.min_section = context.min_section
         self.sections = context.sections
+        self.pois = Pois.new(context.min_section, context.sections)
         self.columns.sections = usize.wrap(context.sections)
         var flat: FlatChunk? = none
         if let f = self.columns.flat {
@@ -1454,6 +1482,12 @@ impl Level {
     /// post-processed until it's given them (D329).
     pub fn set_env(mut self, env: own Env) {
         self.env = some(Shared(env))
+        // The points of interest of the chunks that came before, in the order they came.
+        let came = self.poi_waiting.copy()
+        self.poi_waiting.clear()
+        for (k, chunk, generated_now) in came {
+            self.check_pois(k, chunk, generated_now)
+        }
         let moving = self.moving_waiting.copy()
         self.moving_waiting.clear()
         for k in moving {
@@ -2664,8 +2698,171 @@ impl Level {
 
     /// Hands what's to be read to the IO thread, and what light's to be told to its thread.
     /// Replaying, there's no IO thread: what the recording read comes from the log.
+    /// Reads and writes the dimension's points of interest (CAL-160) with `jobs`, its `poi`
+    /// folder's thread, in `format`; or, replaying, from the recording's log where `logged`
+    /// says it read them. With neither, as a test's world, none are saved.
+    pub fn open_pois(mut self, jobs: own EntityJobs?, logged: bool, format: own PoiFormat?) {
+        self.poi_reads = logged
+        if let j = jobs {
+            self.poi_reads = true
+            self.poi_jobs = some(j)
+        }
+        self.poi_format = format
+    }
+
+    // Asks for what's saved of the points of interest of the chunk at `k`, unless they're known
+    // or asked for: none where nothing's read.
+    fn ask_pois(mut self, k: i64) {
+        let pos = unpacked(k)
+        if self.pois.knows(pos) or self.poi_asked.contains(k) {
+            return
+        }
+        if not self.poi_reads {
+            self.pois.load(pos, none)
+            return
+        }
+        self.poi_asked.insert(k)
+        self.poi_asks.push(pos)
+    }
+
+    /// What the dimension's `poi` folder's thread has done since this was last asked.
+    pub fn take_poi_done(mut self) -> Deque<EntityDone> {
+        let held = self.poi_jobs.take() else return Deque<EntityDone>()
+        var jobs = held
+        let done = jobs.take_done()
+        self.poi_jobs = some(jobs)
+        return done
+    }
+
+    /// What the `poi` folder's thread read of the points of interest of the chunk at `pos`, with
+    /// what it logged, `io`: the chunk's sections, as `SectionStorage` reads them, none for a
+    /// chunk that isn't there or that can't be read, with vanilla's error; then the chunks read
+    /// while they were away, taken in. `false` if they weren't asked for.
+    pub fn pois_read(mut self, pos: ChunkPos, io: List<Entry>, got: ChunkRead) -> bool {
+        let k = pos.pack()
+        if not self.poi_asked.contains(k) {
+            return false
+        }
+        self.poi_asked.remove(k)
+        for e in io {
+            self.lines.push(e.copy())
+        }
+        var chunk: PoiChunk? = none
+        var failed: String? = none
+        var lines = List<Entry>()
+        match got {
+            ChunkRead.Absent => {},
+            ChunkRead.Stored(stored) => match unpack(pos, stored, mut lines) {
+                ok(some(bytes)) => match read_root(bytes) {
+                    ok(Tag.Compound(m)) => {
+                        if let format = self.poi_format {
+                            chunk = some(PoiChunk.read(format, pos, self.min_section, self.sections, m, mut lines))
+                        }
+                    },
+                    ok(_) => {},
+                    err(e) => failed = some("{e.exception}: {e.message}"),
+                },
+                ok(none) => {},
+                err(e) => failed = some("{e.exception}: {e.message}"),
+            },
+            ChunkRead.Failed(e) => failed = some("{e.exception}: {e.message}"),
+        }
+        for e in lines {
+            self.lines.push(e.copy())
+        }
+        if let why = failed {
+            self.lines.push(Entry.error("Error reading chunk [{pos.x}, {pos.z}] data from disk: {why}"))
+        }
+        self.pois.load(pos, chunk)
+        if self.poi_held.contains(k) {
+            let held = self.poi_held[k].copy()
+            _ = self.poi_held.remove(k)
+            for h in held {
+                _ = self.read_chunk(h.pos, h.io, h.loaded.copy(), h.made)
+            }
+        }
+        return true
+    }
+
+    // The points of interest of `chunk`, the chunk at `k` as it's taken in, which it's known
+    // the points of: those the generator made it with added, as its blocks were set, where it's
+    // `generated_now`; else, as it's read from its file, `checkConsistencyWithBlocks`. Before
+    // the block facts are here, they're looked for once they are.
+    fn check_pois(mut self, k: i64, chunk: Shared<Chunk>, generated_now: bool) {
+        let some_env = self.env.copy()
+        let shared = some_env else {
+            self.poi_waiting.push((k, chunk.copy(), generated_now))
+            return
+        }
+        let Env { facts: f, .. } = shared.value
+        let pos = unpacked(k)
+        if not self.pois.knows(pos) {
+            self.pois.load(pos, none)
+        }
+        let found = scan(f, chunk.value, pos)
+        var lines = List<Entry>()
+        if generated_now {
+            for s in found {
+                for r in s.points {
+                    _ = self.pois.add(r.pos, i32.wrap(r.kind), mut lines)
+                }
+            }
+        } else {
+            self.pois.check(pos, found, mut lines)
+        }
+        for e in lines {
+            self.lines.push(e.copy())
+        }
+    }
+
+    /// `PoiManager.tick`, each tick, its saving then its distances to villages run,
+    /// `runAllUpdates`.
+    pub fn tick_pois(mut self) {
+        self.save_pois()
+        self.pois.run_villages()
+    }
+
+    /// `PoiManager.tick`'s saving, and `flushAll`'s: each chunk whose points of interest changed
+    /// written, in the order they did.
+    pub fn save_pois(mut self) {
+        let held = self.poi_jobs.take() else return
+        var jobs = held
+        let some_format = self.poi_format.copy()
+        if let format = some_format {
+            for pos in self.pois.take_dirty() {
+                jobs.write(pos, some(self.pois.chunk(pos).write(format)))
+            }
+        }
+        self.poi_jobs = some(jobs)
+    }
+
+    /// Has the `poi` folder's thread write what's changed and close its files, as the server
+    /// stops; `pois_closing` counts it until it has.
+    pub fn close_pois(mut self) {
+        self.save_pois()
+        let held = self.poi_jobs.take() else return
+        var jobs = held
+        jobs.close()
+        self.poi_jobs = some(jobs)
+    }
+
+    pub fn pois_closing(self) -> usize {
+        let jobs = self.poi_jobs else return 0
+        return jobs.closing()
+    }
+
     pub fn dispatch(mut self) {
         self.flush_light()
+        if not self.poi_asks.is_empty() {
+            if let held = self.poi_jobs.take() {
+                var j = held
+                for p in self.poi_asks {
+                    j.read(p)
+                }
+                self.poi_jobs = some(j)
+            }
+            self.poi_asks.clear()
+        }
         if self.asks.is_empty() {
             return
         }
@@ -2815,6 +3012,17 @@ impl Level {
         let n = self.asked.get(k) ?? 0
         if n == 0 {
             return false
+        }
+        if self.poi_asked.contains(k) {
+            // Held until its points of interest are read, as `scheduleChunkLoad` combines the
+            // two reads (CAL-160).
+            var held = List<HeldRead>()
+            if self.poi_held.contains(k) {
+                held = self.poi_held[k].copy()
+            }
+            held.push(HeldRead { pos: pos, io: io.copy(), loaded: loaded, made: made.copy() })
+            self.poi_held.insert(k, held)
+            return true
         }
         if n == 1 {
             _ = self.asked.remove(k)
@@ -3383,6 +3591,7 @@ impl Level {
             },
             Loaded.Saved(s) => {
                 var saved = s
+                self.check_pois(k, saved.chunk.copy(), saved.fresh)
                 // What the generator made isn't on the disk until it's let go of (D258).
                 if saved.fresh and saved.whole {
                     self.unsaved.insert(k)
@@ -3831,8 +4040,10 @@ impl Level {
         return false
     }
 
-    // Asks for a read of the chunk at `k`, once it's saved if it's waiting to be.
+    // Asks for a read of the chunk at `k`, once it's saved if it's waiting to be, and of its
+    // points of interest, `prefetch`, unless they're known.
     fn ask(mut self, k: i64) {
+        self.ask_pois(k)
         self.asked.insert(k, (self.asked.get(k) ?? 0) + 1)
         if self.saves_waiting.contains(k) {
             self.parked.push(k)
@@ -4187,8 +4398,22 @@ impl BlockLevel for Level {
             self.update_neighbour_shapes(state, x, y, z, shape_flags, limit - 1)
             self.update_indirect_shapes(f, state, x, y, z, shape_flags, limit - 1)
         }
-        if f.poi(old) != f.poi(now) {
-            self.report(String("Points of interest changed as blocks are set"))
+        // `updatePOIOnBlockStateChange`: a point of interest of the old state's type taken out,
+        // and one of the new state's added, where they differ (CAL-160).
+        let was = f.poi(old)
+        let is = f.poi(now)
+        if was != is {
+            let at = BlockPos { x: x, y: y, z: z }
+            var lines = List<Entry>()
+            if was >= 0 {
+                self.pois.remove(at, mut lines)
+            }
+            if is >= 0 {
+                _ = self.pois.add(at, is, mut lines)
+            }
+            for e in lines {
+                self.lines.push(e.copy())
+            }
         }
         return true
     }
