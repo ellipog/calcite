@@ -346,6 +346,11 @@ SPIDER = dict(THORNS, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-57.
 # alive till the session's end (CAL-159).
 SLIME = dict(THORNS, equipment={"head": stack("iron_helmet"), "chest": stack("iron_chestplate"),
                                 "legs": stack("iron_leggings"), "feet": stack("iron_boots")})
+# The bot's data in `zombie-thorns`: `slime`'s, its chestplate with thorns III, which hurts a mob that
+# hits it now and then and wears as it does (CAL-159).
+THORNY = dict(THORNS, equipment={"head": stack("iron_helmet"),
+                                 "chest": stack("iron_chestplate", 1, {"minecraft:enchantments": {"minecraft:thorns": nbt.Int(3)}}),
+                                 "legs": stack("iron_leggings"), "feet": stack("iron_boots")})
 # The bot's data in `thorns-sword`: `thorns`', holding an iron sword with unbreaking III, which its
 # death drops in the attack that wears it after (D450), on 10 health, so his thorns kill it while
 # it hits him with the sword rather than as it leaves.
@@ -721,6 +726,14 @@ CONFIGS = {
                           rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                  ("minecraft:respawn_radius", nbt.Int(0))),
                           player=SPIDER),
+    # `zombie`'s, the bot in `slime`'s iron armor with thorns III on its chestplate (CAL-159): Rot's
+    # hits on it are now and then thorns' on him, which hurt him from where it is and wear the
+    # chestplate, and it lives till it leaves.
+    "zombie-thorns": Config({"difficulty": "normal"}, view=3, scenarios=("zombie",), world=FIXTURES / "zombie" / "world",
+                            fixture="zombie",
+                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                   ("minecraft:respawn_radius", nbt.Int(0))),
+                            player=THORNY),
     # The bot, in survival mode with nothing, stands at the arrows fixture's spawn, on normal at
     # midnight, while arrows fly as the world loads (CAL-159): into a wall, into a zombie without
     # AI and an armor stand, which breaks, onto its head, and onto the grass by it, where it picks
