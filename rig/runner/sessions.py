@@ -99,7 +99,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
-                   "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying"]
+                   "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -390,6 +390,22 @@ LIFTED = dict(ARROWS, active_effects=nbt.List(nbt.COMPOUND, [
     effect("jump_boost", 400, 1),
     effect("slow_falling", 400),
 ]))
+# The bot's data in `eaten`: `arrows`', at 12 health, 2 food and no saturation, poisoned for 300
+# ticks, carrying apples, honey bottles, a potion of swiftness, milk, a golden apple, a suspicious
+# stew of night vision and a potion of healing in its hotbar, and bread in its off hand (D519).
+EATEN = dict(ARROWS, Health=nbt.Float(12.0), foodLevel=nbt.Int(2), foodSaturationLevel=nbt.Float(0.0),
+             Inventory=nbt.List(nbt.COMPOUND, [
+                 slotted(0, "apple", 3),
+                 slotted(1, "honey_bottle", 2),
+                 slotted(2, "potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:swiftness"}}),
+                 slotted(3, "milk_bucket"),
+                 slotted(4, "golden_apple"),
+                 slotted(5, "suspicious_stew", 1, {"minecraft:suspicious_stew_effects": nbt.List(nbt.COMPOUND, [
+                     {"id": "minecraft:night_vision", "duration": nbt.Int(100)}])}),
+                 slotted(6, "potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:healing"}}),
+             ]),
+             equipment={"offhand": stack("bread")},
+             active_effects=nbt.List(nbt.COMPOUND, [effect("poison", 300)]))
 # The bot's data in `undying`: `arrows`', at 1 health with a totem of undying in its off hand, and
 # swiftness and night vision saved on it, which the totem clears as it saves it (D518); 17 food
 # and no saturation, so it doesn't heal before the arrow falls on it.
@@ -917,6 +933,18 @@ CONFIGS = {
                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                              ("minecraft:respawn_radius", nbt.Int(0))),
                       player=UNDYING, keys=("active_effects", "Health", "AbsorptionAmount", "equipment", "foodLevel")),
+    # The bot, in survival mode at 12 health, 2 food and poisoned, stands at the eaten fixture's
+    # spawn, on normal at noon, and eats and drinks what it carries, each to its end: an apple,
+    # a honey bottle, which takes its poison off and leaves a bottle in its inventory, a potion
+    # of swiftness, and milk, which takes it off again; it starts on another apple and lets go of
+    # it, eats the bread in its off hand, then a golden apple and a suspicious stew, full, drinks
+    # a potion of healing, and can't eat another apple (D519); it leaves at 540.
+    "eaten": Config({"difficulty": "normal"}, view=3, scenarios=("eaten",), world=FIXTURES / "eaten" / "world",
+                    fixture="eaten",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                           ("minecraft:respawn_radius", nbt.Int(0))),
+                    player=EATEN, keys=("active_effects", "Health", "AbsorptionAmount", "foodLevel",
+                                        "foodSaturationLevel")),
     "ender-arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "ender-arrows" / "world",
                            fixture="ender-arrows",
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
