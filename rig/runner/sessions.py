@@ -94,16 +94,17 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # and hits villagers without AI; `villagers`, where it stands by villagers with their brains;
 # `compost`, where it stands by them too and takes a full composter's bone meal; `asleep`, where
 # it leaves while they sleep; `breed`, where it stays by them till 1000; `hearsay`, where it
-# stays till 1500; and `bell`, where it rings a bell by them (src/rig/session.calx).
+# stays till 1500; `bell`, where it rings a bell by them; and `talk`, where it types the commands
+# every player may use, with Mate there, recorded as `talk-mate` (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
-                   "traders", "frost", "soul", "splash", "linger"]
+                   "traders", "frost", "soul", "splash", "linger", "talk"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
-# (CAL-162).
-MATE_SCENARIOS = {"duel": "duel-mate"}
+# (CAL-162, CAL-165).
+MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate"}
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -333,6 +334,29 @@ RIVALS = {
              "Players": nbt.List(nbt.STRING, ["Bot"])},
             {"Name": "blue", "DisplayName": "Blue", "TeamColor": "blue", "DeathMessageVisibility": "hideForOtherTeams",
              "Players": nbt.List(nbt.STRING, ["Mate"])},
+        ]),
+    },
+    "DataVersion": nbt.Int(5023),
+}
+
+# The scoreboard in `talk` (CAL-165): the bot and Mate in aqua's team; trigger objectives, `door`,
+# shown in the sidebar, whose score the bot may use, and `bell`, whose it may not; and `kills`,
+# which isn't one.
+TALK = {
+    "data": {
+        "Objectives": nbt.List(C, [
+            {"Name": "door", "CriteriaName": "trigger", "DisplayName": "Door"},
+            {"Name": "bell", "CriteriaName": "trigger", "DisplayName": {"text": "Bell", "color": "gold"}},
+            {"Name": "kills", "CriteriaName": "totalKillCount", "DisplayName": "Kills"},
+        ]),
+        "PlayerScores": nbt.List(C, [
+            {"Name": "Bot", "Objective": "door", "Score": nbt.Int(3), "Locked": nbt.Byte(0)},
+            {"Name": "Bot", "Objective": "bell", "Score": nbt.Int(0), "Locked": nbt.Byte(1)},
+        ]),
+        "DisplaySlots": {"sidebar": "door"},
+        "Teams": nbt.List(C, [
+            {"Name": "pals", "DisplayName": "Pals", "TeamColor": "aqua",
+             "Players": nbt.List(nbt.STRING, ["Bot", "Mate"])},
         ]),
     },
     "DataVersion": nbt.Int(5023),
@@ -1610,6 +1634,10 @@ CONFIGS["teammates"] = replace(CONFIGS["duel"], saved={"scoreboard": TEAMMATES})
 # kills and deaths, its message seen by no one else, and the step into it pushes both, as red's
 # players push only each other but the other team's may push them.
 CONFIGS["rivals"] = replace(CONFIGS["duel"], saved={"scoreboard": RIVALS})
+# The bot on the duel fixture's world with Mate, in one team, typing the commands every player
+# may use (CAL-165): `list`, `help`, `me`, `msg`, `tell`, `teammsg`, `trigger` and `random`, with
+# their failures, and two it may not.
+CONFIGS["talk"] = replace(CONFIGS["duel"], scenarios=("talk",), saved={"scoreboard": TALK})
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
 BOT = "Bot"

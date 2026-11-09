@@ -23,6 +23,9 @@ IDs the protocol needs, which every compatible server encodes:
   from the same file (CAL-148).
 - `world.entity_facts`: what natural spawning asks of each entity type and block state, from
   entity_facts.json, which oracle/datagen/entity_facts.py writes beside the tables (D317).
+- `command.tree`: vanilla's command tree, as a dedicated server registers it, each node's
+  permission level and its argument's properties, from command_tree.json, which
+  oracle/datagen/command_tree.py writes beside the tables (CAL-165).
 """
 
 import argparse
@@ -1862,6 +1865,127 @@ def item_defaults_module(items):
     return "\n".join(lines)
 
 
+# The custom suggestions vanilla's arguments ask for, as command_tree.json names them; a node's
+# place among them, plus one, is in its facts.
+SUGGESTIONS = ["minecraft:ask_server", "minecraft:available_sounds", "minecraft:summonable_entities",
+               "minecraft:post_effects"]
+
+
+def command_tree_module(index, tree):
+    """The text of src/command/tree.calx: vanilla's command tree, as a dedicated server registers
+    it, from command_tree.json (CAL-165). Each node's parent, so its children are those after it
+    whose parent it is, in order; its facts; its name; its argument type's properties; and the
+    nodes that redirect, and where to."""
+    if tree["game_version"] != index["game_version"]:
+        raise ValueError(f"command_tree.json is {tree['game_version']}, the tables {index['game_version']}")
+    nodes = tree["nodes"]
+    if nodes[0]["kind"] != "root":
+        raise ValueError("command_tree.json doesn't start at the root")
+    parents = [-1] * len(nodes)
+    for i, n in enumerate(nodes):
+        for c in n["children"]:
+            if parents[c] != -1 or c <= i:
+                raise ValueError(f"node {c} isn't a tree's, in the order its walk comes to it")
+            parents[c] = i
+        if n["children"] != sorted(n["children"]):
+            raise ValueError(f"node {i}'s children aren't in the order the walk comes to them")
+    if any(p == -1 for p in parents[1:]):
+        raise ValueError("a node other than the root has no parent")
+    facts = []
+    names = []
+    properties = []
+    redirects = []
+    for i, n in enumerate(nodes):
+        kind = {"root": 0, "literal": 1, "argument": 2}[n["kind"]]
+        level = n["level"]
+        if not 0 <= level <= 4:
+            raise ValueError(f"node {i} is for no permission level")
+        f = kind | (4 if n["executable"] else 0) | level << 3
+        name = n.get("name", "")
+        if '"' in name or "\\" in name or "{" in name:
+            raise ValueError(f"{name!r} can't be written in a Calx string")
+        names.append(name)
+        if kind == 2:
+            props = bytes.fromhex(n["properties"])
+            if len(props) > 127 or n["parser"] > 255:
+                raise ValueError(f"node {i}'s argument doesn't fit its facts")
+            if "suggestions" in n:
+                f |= (SUGGESTIONS.index(n["suggestions"]) + 1) << 6
+            f |= len(props) << 9 | n["parser"] << 16
+            properties += list(props)
+        facts.append(f)
+        if n["redirect"] >= 0:
+            if n["children"]:
+                raise ValueError(f"node {i} redirects and has children")
+            redirects += [i, n["redirect"]]
+    lines = [
+        "/// Vanilla's command tree, as a dedicated server registers it (CAL-165): each node in the",
+        "/// order a walk from the root comes to it, a node and then its children's, as",
+        "/// `fillUsableCommands` copies them. Written by oracle/datagen/calx_tables.py from",
+        "/// command_tree.json, which oracle/datagen/command_tree.py writes beside the tables: don't",
+        "/// edit it.",
+        "module command.tree",
+        "",
+        "/// How many nodes there are, the root first.",
+        f"pub const NODES: usize = {len(nodes)}",
+        "",
+        "/// The custom suggestions an argument may ask for, as the packet names them.",
+        "pub fn suggestion_names() -> List<str> {",
+        f"    return [{strings(SUGGESTIONS)}]",
+        "}",
+        "",
+        "/// Each node's parent, the root's -1. A node's children are those whose parent it is, in",
+        "/// order, as vanilla added them.",
+        "pub fn node_parents() -> List<i32> {",
+        "    let values: List<i32> = [",
+        numbers(parents) + ",",
+        "    ]",
+        "    return values",
+        "}",
+        "",
+        "/// Each node's facts: its kind, 0 the root, 1 a literal and 2 an argument; 4 where a",
+        "/// command may end there; the lowest permission level that may use it, shifted by 3; for",
+        "/// an argument, its custom suggestions' place in `suggestion_names` plus one, or 0 for",
+        "/// none, shifted by 6, how many bytes its properties take, shifted by 9, and its type's ID",
+        "/// in `command_argument_type`, shifted by 16.",
+        "pub fn node_facts() -> List<u32> {",
+        "    let values: List<u32> = [",
+        numbers(facts, per=12) + ",",
+        "    ]",
+        "    return values",
+        "}",
+        "",
+        "/// Each node's name, the root's empty: a literal's word or an argument's name.",
+        "pub fn node_names() -> List<str> {",
+        "    return [",
+    ]
+    for k in range(0, len(names), 8):
+        lines.append("        " + strings(names[k:k + 8]) + ",")
+    lines += [
+        "    ]",
+        "}",
+        "",
+        "/// The arguments' properties, as `ArgumentTypeInfo.serializeToNetwork` writes them, one",
+        "/// after another in node order.",
+        "pub fn node_properties() -> List<u8> {",
+        "    let values: List<u8> = [",
+        numbers(properties) + ",",
+        "    ]",
+        "    return values",
+        "}",
+        "",
+        "/// Each node that redirects, then the node it redirects to.",
+        "pub fn node_redirects() -> List<i32> {",
+        "    let values: List<i32> = [",
+        numbers(redirects) + ",",
+        "    ]",
+        "    return values",
+        "}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def outputs(tables, version=VERSION):
     index = json.loads((tables / "index.json").read_text(encoding="utf-8"))
     packets = json.loads((tables / "packets.json").read_text(encoding="utf-8"))
@@ -1871,6 +1995,7 @@ def outputs(tables, version=VERSION):
     flags = json.loads((tables.parent / "block_flags.json").read_text(encoding="utf-8"))
     entities = json.loads((tables.parent / "entity_facts.json").read_text(encoding="utf-8"))
     items = json.loads((tables / "items.json").read_text(encoding="utf-8"))
+    commands = json.loads((tables.parent / "command_tree.json").read_text(encoding="utf-8"))
     return {
         CALCITE / "src" / "protocol" / "ids.calx": ids_module(index, packets),
         CALCITE / "src" / "registry" / "builtin.calx": builtin_module(index, registries),
@@ -1885,6 +2010,7 @@ def outputs(tables, version=VERSION):
         CALCITE / "src" / "world" / "outline_shapes.calx": outline_module(index, flags),
         CALCITE / "src" / "world" / "entity_facts.calx": entity_facts_module(index, entities),
         CALCITE / "src" / "world" / "item_defaults.calx": item_defaults_module(items),
+        CALCITE / "src" / "command" / "tree.calx": command_tree_module(index, commands),
     }
 
 
@@ -1904,6 +2030,9 @@ def main():
         return 2
     if not (args.tables.parent / "entity_facts.json").exists():
         print(f"no entity_facts.json beside {args.tables}: run oracle/datagen/entity_facts.py first", file=sys.stderr)
+        return 2
+    if not (args.tables.parent / "command_tree.json").exists():
+        print(f"no command_tree.json beside {args.tables}: run oracle/datagen/command_tree.py first", file=sys.stderr)
         return 2
     stale = []
     for path, text in outputs(args.tables, args.version).items():

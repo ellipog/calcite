@@ -1,0 +1,710 @@
+/// Brigadier's dispatcher over a command tree: vanilla's, from `command.tree`, with what Calcite
+/// adds to it. A command is read as `CommandDispatcher.parse` reads it, against the nodes its
+/// source may use, each argument by its type, and what went wrong is found as
+/// `Commands.finishParsing` finds it (CAL-165).
+///
+/// Each node's level is its own requirement's, as `canUse` tests it; a node under one that needs
+/// a level needs none itself, as brigadier's `requires` is the node's own.
+module command.dispatcher
+
+import chat.component.{Argument as TextArgument, Component, Contents}
+import command.reader.{Reader}
+import command.selector.{Ints, Selector, read_entities, read_ints}
+import command.tree.{NODES, node_facts, node_names, node_parents, node_properties, node_redirects, suggestion_names}
+import nbt.snbt.{SyntaxError, from_units, units_of}
+import nbt.tag.{Tag}
+import registry.builtin.{builtin_entries, builtin_names}
+import registry.registry.{Registry}
+import resources.identifier.{Identifier}
+import world.modes.{GameType}
+
+/// The permission level that lets a source use selectors, vanilla's `COMMANDS_ENTITY_SELECTORS`,
+/// the game masters'.
+pub const SELECTORS: i32 = 2
+
+/// The most a message argument may have, in UTF-16 units, `MessageArgument.MAX_LENGTH`.
+pub const MESSAGE_MOST: usize = 256
+
+/// Where a failure with no place in the input is, as vanilla's `create()` makes one with none.
+pub const NOWHERE: usize = 4294967295
+
+/// How an argument reads, by its type and its properties.
+pub enum ArgType {
+    /// `brigadier:bool`.
+    Bool
+    /// `brigadier:float`, `double`, `integer` and `long`, from their least to their most.
+    Float(f32, f32)
+    Double(f64, f64)
+    Integer(i32, i32)
+    Long(i64, i64)
+    /// `brigadier:string`: a word, `readUnquotedString`; a phrase, `readString`; or the rest.
+    Word
+    Phrase
+    Greedy
+    /// `minecraft:entity`: whether it's one only, and whether it's players only.
+    Entity(bool, bool)
+    /// `minecraft:gamemode`.
+    GameMode
+    /// `minecraft:resource_location` and `minecraft:dimension`: an identifier.
+    Id
+    /// `minecraft:message`: the rest, with selectors in it where the source may use them.
+    Message
+    /// `minecraft:objective`: a word.
+    Objective
+    /// `minecraft:int_range`.
+    IntRange
+    /// A type Calcite doesn't read yet, by its name.
+    Unread(String)
+}
+
+/// What a node is.
+pub enum Kind {
+    Root
+    Literal
+    Argument(ArgType)
+}
+
+/// A node of the tree: its kind and name, its children, in the order they were added, whether a
+/// command may end there, the level its requirement asks for, the node it redirects to, and an
+/// argument's type's ID in `command_argument_type`, its properties as the commands packet sends
+/// them, and the custom suggestions it asks for.
+pub struct Node {
+    pub kind: Kind
+    pub name: String
+    pub children: List<usize>
+    pub executable: bool
+    pub level: i32
+    pub redirect: usize?
+    pub parser: i32
+    pub properties: List<u8>
+    pub suggestions: String?
+}
+
+impl Node {
+    /// A literal named `name`.
+    pub fn literal(name: str, executable: bool, level: i32) -> Node {
+        return Node { kind: Kind.Literal, name: String(name), children: [], executable: executable, level: level, redirect: none, parser: -1, properties: [], suggestions: none }
+    }
+
+    /// An argument named `name` of the type named `parser` in `command_argument_type`, such as
+    /// `entity` or `brigadier:float`, with its properties as `serializeToNetwork` writes them.
+    pub fn argument(name: str, parser: str, properties: own List<u8>, executable: bool) -> Node {
+        let id = argument_type(parser)
+        let reads = arg_type(String(parser), properties)
+        return Node { kind: Kind.Argument(reads), name: String(name), children: [], executable: executable, level: 0, redirect: none, parser: id, properties: properties, suggestions: none }
+    }
+}
+
+/// A command tree, the root first.
+pub struct Tree {
+    pub nodes: List<Node>
+}
+
+impl Tree {
+    /// Vanilla's tree, as a dedicated server registers it.
+    pub fn vanilla() -> Tree {
+        let parent = node_parents()
+        let fact = node_facts()
+        let name = node_names()
+        let bytes = node_properties()
+        let asks = suggestion_names()
+        let types = argument_types()
+        var nodes = List<Node>()
+        var at: usize = 0
+        for i in 0..NODES {
+            let f = fact[i]
+            let size = usize((f >> 9) & 127)
+            var properties = List<u8>()
+            for b in at..at + size {
+                properties.push(bytes[b])
+            }
+            at += size
+            var parser: i32 = -1
+            let kind = match f & 3 {
+                0 => Kind.Root,
+                1 => Kind.Literal,
+                _ => {
+                    parser = i32.wrap(f >> 16)
+                    Kind.Argument(arg_type(types[usize.wrap(parser)].copy(), properties))
+                },
+            }
+            var suggestions: String? = none
+            let which = usize((f >> 6) & 7)
+            if which > 0 {
+                suggestions = some(String(asks[which - 1]))
+            }
+            nodes.push(Node { kind: kind, name: String(name[i]), children: [], executable: f & 4 != 0, level: i32.wrap((f >> 3) & 7), redirect: none, parser: parser, properties: properties, suggestions: suggestions })
+            if i > 0 {
+                nodes[usize.wrap(parent[i])].children.push(i)
+            }
+        }
+        let pairs = node_redirects()
+        var k: usize = 0
+        while k < pairs.len() {
+            nodes[usize.wrap(pairs[k])].redirect = some(usize.wrap(pairs[k + 1]))
+            k += 2
+        }
+        return Tree { nodes: nodes }
+    }
+
+    /// `node`, added under `parent` after its other children, at its place in the tree.
+    pub fn add(mut self, parent: usize, node: own Node) -> usize {
+        self.nodes.push(node)
+        let at = self.nodes.len() - 1
+        self.nodes[parent].children.push(at)
+        return at
+    }
+
+    /// `getRelevantNodes`: where `node` has literals, the one named by the word at the reader's
+    /// place, up to a space, if there is one; else its arguments.
+    fn relevant(self, node: usize, r: Reader) -> List<usize> {
+        var word_end = r.at
+        while word_end < r.units.len() and r.units[word_end] != ' ' {
+            word_end += 1
+        }
+        var has_literals = false
+        var arguments = List<usize>()
+        var word: String? = none
+        for c in self.nodes[node].children {
+            match self.nodes[c].kind {
+                Kind.Literal => {
+                    if not has_literals {
+                        has_literals = true
+                        word = some(from_units(r.units, r.at, word_end))
+                    }
+                    if let w = word {
+                        if w == self.nodes[c].name {
+                            return [c]
+                        }
+                    }
+                },
+                Kind.Argument(_) => arguments.push(c),
+                Kind.Root => {},
+            }
+        }
+        return arguments
+    }
+
+    /// The names of the nodes a context read, from the command's own: where it was redirected
+    /// to, the name of the node it went to first, such as `msg targets message` for `tell`'s.
+    pub fn path(self, c: Context) -> String {
+        var out = String()
+        if c.root != 0 {
+            out.push_str(self.nodes[c.root].name)
+        }
+        for n in c.nodes {
+            if not out.is_empty() {
+                out.push_str(" ")
+            }
+            out.push_str(self.nodes[n.node].name)
+        }
+        return out
+    }
+}
+
+/// A selector in a message, where it is in the message's text, in UTF-16 units.
+pub struct Part {
+    pub start: usize
+    pub end: usize
+    pub selector: Selector
+}
+
+/// A message argument as written, `MessageArgument.Message`: its text and the selectors in it.
+pub struct Message {
+    pub text: String
+    pub parts: List<Part>
+}
+
+/// An argument's value, as its type reads it.
+pub enum Value {
+    Bool(bool)
+    Float(f32)
+    Double(f64)
+    Int(i32)
+    Long(i64)
+    Text(String)
+    Entities(Selector)
+    Mode(GameType)
+    Id(Identifier)
+    Message(Message)
+    Range(Ints)
+}
+
+/// An argument read: its node's name, where it is in the input, in UTF-16 units, and its value.
+pub struct Argument {
+    pub name: String
+    pub start: usize
+    pub end: usize
+    pub value: Value
+}
+
+/// A node read, and where.
+pub struct Read {
+    pub node: usize
+    pub start: usize
+    pub end: usize
+}
+
+/// What a parse read from one node on, `CommandContextBuilder`: the node it started at, the
+/// nodes read, their arguments, and the node whose command runs, where the last read has one.
+pub struct Context {
+    pub root: usize
+    pub nodes: List<Read>
+    pub arguments: List<Argument>
+    pub command: usize?
+}
+
+impl Context {
+    /// The last argument named `name`.
+    pub fn argument(self, name: str) -> Value? {
+        var i = self.arguments.len()
+        while i > 0 {
+            i -= 1
+            if self.arguments[i].name == String(name) {
+                return some(self.arguments[i].value.copy())
+            }
+        }
+        return none
+    }
+
+    /// Where the last argument named `name` is, in the input.
+    pub fn place(self, name: str) -> (usize, usize)? {
+        var i = self.arguments.len()
+        while i > 0 {
+            i -= 1
+            if self.arguments[i].name == String(name) {
+                return some((self.arguments[i].start, self.arguments[i].end))
+            }
+        }
+        return none
+    }
+}
+
+/// What a parse found, `ParseResults`: its contexts, the first from the root and each after it
+/// where the one before redirected; where reading stopped; and each node that failed to read
+/// there, in the order they were tried, with why.
+pub struct Parse {
+    pub contexts: List<Context>
+    pub reader: Reader
+    pub errors: List<(usize, SyntaxError)>
+}
+
+impl Parse {
+    /// The context whose command runs, the last.
+    pub fn last(self) -> Context {
+        return self.contexts[self.contexts.len() - 1].copy()
+    }
+}
+
+/// `CommandDispatcher.parse`: `input` read from the root, for a source whose permission level
+/// is `level`.
+pub fn parse(t: Tree, input: String, level: i32, types: Registry) -> Parse {
+    let r = Reader.new(input)
+    let start = Context { root: 0, nodes: [], arguments: [], command: none }
+    return parse_nodes(t, 0, r, start, level, types)
+}
+
+/// `Commands.finishParsing`: the context whose command runs, or why there's none.
+/// `getParseException`: where reading stopped short, the one node's failure there, or else an
+/// unknown command where nothing was read and an unknown argument where something was; then
+/// `ContextChain.tryFlatten`: a last context with no command is an unknown command, where
+/// reading stopped.
+pub fn finish(p: Parse) -> Context ! SyntaxError {
+    if p.reader.can_read() {
+        if p.errors.len() == 1 {
+            let (_, e) = p.errors[0].copy()
+            fail e
+        }
+        let first = p.contexts[0].copy()
+        if first.nodes.is_empty() {
+            fail p.reader.error_here("command.unknown.command", [])
+        }
+        fail p.reader.error_here("command.unknown.argument", [])
+    }
+    let last = p.last()
+    if last.command == none {
+        fail p.reader.error_here("command.unknown.command", [])
+    }
+    return last
+}
+
+/// `SignableCommand.of`: the message arguments a parse read, each context's in order, by name,
+/// with what was written for each, which a client signs.
+pub fn signable(t: Tree, p: Parse) -> List<(String, String)> {
+    var out = List<(String, String)>()
+    for c in p.contexts {
+        for n in c.nodes {
+            if is_message(t.nodes[n.node].kind) {
+                out.push((t.nodes[n.node].name.copy(), from_units(p.reader.units, n.start, n.end)))
+            }
+        }
+    }
+    return out
+}
+
+// Whether a node is a message argument, the one `SignedArgument` vanilla has.
+fn is_message(k: Kind) -> bool {
+    return match k {
+        Kind.Argument(a) => match a {
+            ArgType.Message => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+// `parseNodes`: each child of `node` the source may use and the reader's place lets in, read
+// on a copy of the reader and the context. One that fails is kept with its failure. One that
+// reads, with more after it, goes on to its children, or, where it redirects, to the node it
+// redirects to in a context of its own, which is the parse. Of the rest, the first that read to
+// the end, else the first with no failures, else the first.
+fn parse_nodes(t: Tree, node: usize, original: Reader, so_far: Context, level: i32, types: Registry) -> Parse {
+    var errors = List<(usize, SyntaxError)>()
+    var potentials = List<Parse>()
+    for child in t.relevant(node, original) {
+        if t.nodes[child].level > level {
+            continue
+        }
+        var context = so_far.copy()
+        var reader = original.copy()
+        match read_node(t, child, mut reader, mut context, level, types) {
+            ok => {},
+            err(e) => {
+                errors.push((child, e))
+                continue
+            },
+        }
+        context.command = if t.nodes[child].executable { some(child) } else { none }
+        let redirect = t.nodes[child].redirect
+        let need: usize = if redirect == none { 2 } else { 1 }
+        if reader.at + need <= reader.units.len() {
+            reader.skip()
+            if let to = redirect {
+                let inner = Context { root: to, nodes: [], arguments: [], command: none }
+                let p = parse_nodes(t, to, reader, inner, level, types)
+                var contexts: List<Context> = [context]
+                for c in p.contexts {
+                    contexts.push(c.copy())
+                }
+                return Parse { contexts: contexts, reader: p.reader.copy(), errors: p.errors.copy() }
+            }
+            potentials.push(parse_nodes(t, child, reader, context, level, types))
+        } else {
+            potentials.push(Parse { contexts: [context], reader: reader, errors: [] })
+        }
+    }
+    if potentials.is_empty() {
+        return Parse { contexts: [so_far.copy()], reader: original.copy(), errors: errors }
+    }
+    var best: usize = 0
+    for i in 1..potentials.len() {
+        if rank(potentials[i]) < rank(potentials[best]) {
+            best = i
+        }
+    }
+    return potentials.swap_remove(best)
+}
+
+// How brigadier sorts the potential parses: those read to the end first, then those with no
+// failures.
+fn rank(p: Parse) -> i32 {
+    var r = 0
+    if p.reader.can_read() {
+        r += 2
+    }
+    if not p.errors.is_empty() {
+        r += 1
+    }
+    return r
+}
+
+// `CommandNode.parse`, then `parseNodes`' check that a space or the end comes after it.
+fn read_node(t: Tree, at: usize, r: mut Reader, context: mut Context, level: i32, types: Registry) ! SyntaxError {
+    let start = r.at
+    match t.nodes[at].kind {
+        Kind.Literal => {
+            // `relevant` only gives a literal its own word, which reads.
+            r.at += units_of(t.nodes[at].name).len()
+        },
+        Kind.Argument(reads) => {
+            let value = try read_argument(reads, mut r, level, types)
+            context.arguments.push(Argument { name: t.nodes[at].name.copy(), start: start, end: r.at, value: value })
+        },
+        Kind.Root => {},
+    }
+    context.nodes.push(Read { node: at, start: start, end: r.at })
+    if r.can_read() and r.peek() != ' ' {
+        fail r.error_here("command.expected.separator", [])
+    }
+}
+
+// An argument of the type `reads`, as its `parse` reads it from the reader's place.
+fn read_argument(reads: ArgType, r: mut Reader, level: i32, types: Registry) -> Value ! SyntaxError {
+    let start = r.at
+    match reads {
+        ArgType.Bool => return Value.Bool(try r.read_boolean()),
+        ArgType.Float(min, max) => {
+            let v = try r.read_float()
+            if v < min {
+                r.at = start
+                fail number_error(r, "argument.float.low", Tag.Float(min), Tag.Float(v))
+            }
+            if v > max {
+                r.at = start
+                fail number_error(r, "argument.float.big", Tag.Float(max), Tag.Float(v))
+            }
+            return Value.Float(v)
+        },
+        ArgType.Double(min, max) => {
+            let v = try r.read_double()
+            if v < min {
+                r.at = start
+                fail number_error(r, "argument.double.low", Tag.Double(min), Tag.Double(v))
+            }
+            if v > max {
+                r.at = start
+                fail number_error(r, "argument.double.big", Tag.Double(max), Tag.Double(v))
+            }
+            return Value.Double(v)
+        },
+        ArgType.Integer(min, max) => {
+            let v = try r.read_int()
+            if v < min {
+                r.at = start
+                fail number_error(r, "argument.integer.low", Tag.Int(min), Tag.Int(v))
+            }
+            if v > max {
+                r.at = start
+                fail number_error(r, "argument.integer.big", Tag.Int(max), Tag.Int(v))
+            }
+            return Value.Int(v)
+        },
+        ArgType.Long(min, max) => {
+            let v = try r.read_long()
+            if v < min {
+                r.at = start
+                fail number_error(r, "argument.long.low", Tag.Long(min), Tag.Long(v))
+            }
+            if v > max {
+                r.at = start
+                fail number_error(r, "argument.long.big", Tag.Long(max), Tag.Long(v))
+            }
+            return Value.Long(v)
+        },
+        ArgType.Word => return Value.Text(r.read_unquoted()),
+        ArgType.Phrase => return Value.Text(try r.read_string()),
+        ArgType.Greedy => {
+            let rest = r.remaining()
+            r.at = r.units.len()
+            return Value.Text(rest)
+        },
+        ArgType.Entity(single, players) => {
+            let s = try read_entities(mut r, types, level >= SELECTORS)
+            // `EntityArgument.parse`'s checks, each at the input's start.
+            if s.most > 1 and single {
+                r.at = 0
+                fail r.error_here(if players { String("argument.player.toomany") } else { String("argument.entity.toomany") }, [])
+            }
+            if s.entities and players and not s.current {
+                r.at = 0
+                fail r.error_here("argument.player.entities", [])
+            }
+            return Value.Entities(s)
+        },
+        ArgType.GameMode => {
+            let name = r.read_unquoted()
+            let mode = GameType.by_name(name) else fail r.error_here("argument.gamemode.invalid", [Component.literal(name)])
+            return Value.Mode(mode)
+        },
+        ArgType.Id => return Value.Id(try r.read_identifier()),
+        ArgType.Message => return Value.Message(try read_message(mut r, level >= SELECTORS, types)),
+        ArgType.Objective => return Value.Text(r.read_unquoted()),
+        ArgType.IntRange => return Value.Range(try read_ints(mut r)),
+        ArgType.Unread(name) => fail SyntaxError { message: Component.literal("Calcite can't read {name} arguments yet"), input: r.text.copy(), cursor: r.at },
+    }
+}
+
+// A number argument's bound error at the reader's place, with the bound and what was found as
+// numbers.
+fn number_error(r: Reader, key: str, bound: own Tag, found: own Tag) -> SyntaxError {
+    return SyntaxError { message: Component.translatable_args(String(key), [TextArgument.Number(bound), TextArgument.Number(found)]), input: r.text.copy(), cursor: r.at }
+}
+
+// `MessageArgument.Message.parseText`: the rest, of at most `MESSAGE_MOST` units, else a
+// failure with no place; with the selectors in it where the source may use them, each `@`
+// that isn't one's start passed by.
+fn read_message(r: mut Reader, selectors: bool, types: Registry) -> Message ! SyntaxError {
+    let left = r.units.len() - r.at
+    if left > MESSAGE_MOST {
+        fail SyntaxError { message: Component.translatable_args(String("argument.message.too_long"), [TextArgument.Number(Tag.Int(i32.wrap(left))), TextArgument.Number(Tag.Int(i32.wrap(MESSAGE_MOST)))]), input: String(), cursor: NOWHERE }
+    }
+    let text = r.remaining()
+    if not selectors {
+        r.at = r.units.len()
+        return Message { text: text, parts: [] }
+    }
+    let offset = r.at
+    var parts = List<Part>()
+    while r.can_read() {
+        if r.peek() != '@' {
+            r.skip()
+            continue
+        }
+        let start = r.at
+        match read_entities(mut r, types, true) {
+            ok(s) => parts.push(Part { start: start - offset, end: r.at - offset, selector: s }),
+            err(e) => {
+                if not passed_by(e) {
+                    fail e
+                }
+                r.at = start + 1
+            },
+        }
+    }
+    return Message { text: text, parts: parts }
+}
+
+// Whether a message passes by what failed to read as a selector: an `@` with no type after it,
+// or one it hasn't.
+fn passed_by(e: SyntaxError) -> bool {
+    return match e.message.contents {
+        Contents.Translatable(t) => t.key == "argument.entity.selector.missing" or t.key == "argument.entity.selector.unknown",
+        _ => false,
+    }
+}
+
+/// The ID of the argument type `name`, such as `entity` or `brigadier:float`, in
+/// `command_argument_type`.
+pub fn argument_type(name: str) -> i32 {
+    let types = argument_types()
+    for i in 0..types.len() {
+        if types[i] == String(name) {
+            return i32.wrap(i)
+        }
+    }
+    panic("there's no command argument type {name}")
+}
+
+// The argument types' names, in ID order, as `registry.builtin` writes them.
+fn argument_types() -> List<String> {
+    let names = builtin_names()
+    for r in 0..names.len() {
+        if names[r] == "command_argument_type" {
+            return builtin_entries(r)
+        }
+    }
+    panic("there's no command_argument_type registry")
+}
+
+/// The entity types, as a selector's `type` reads them: a registry made from the built-in
+/// one's names.
+pub fn entity_types() -> Registry {
+    let names = builtin_names()
+    var types = Registry.new(Identifier { namespace: "minecraft", path: "entity_type" }, false)
+    for r in 0..names.len() {
+        if names[r] == "entity_type" {
+            for e in builtin_entries(r) {
+                types.add(Identifier { namespace: "minecraft", path: e.copy() }, none)
+            }
+        }
+    }
+    return types
+}
+
+// How an argument of the type `name` reads, with its `properties`.
+fn arg_type(name: String, properties: List<u8>) -> ArgType {
+    if name == "brigadier:bool" {
+        return ArgType.Bool
+    }
+    if name == "brigadier:float" {
+        let flags = properties[0]
+        var at: usize = 1
+        var min = -f32.MAX
+        var max = f32.MAX
+        if flags & 1 != 0 {
+            min = f32.from_bits(u32.wrap(be(properties, at, 4)))
+            at += 4
+        }
+        if flags & 2 != 0 {
+            max = f32.from_bits(u32.wrap(be(properties, at, 4)))
+        }
+        return ArgType.Float(min, max)
+    }
+    if name == "brigadier:double" {
+        let flags = properties[0]
+        var at: usize = 1
+        var min = -f64.MAX
+        var max = f64.MAX
+        if flags & 1 != 0 {
+            min = f64.from_bits(be(properties, at, 8))
+            at += 8
+        }
+        if flags & 2 != 0 {
+            max = f64.from_bits(be(properties, at, 8))
+        }
+        return ArgType.Double(min, max)
+    }
+    if name == "brigadier:integer" {
+        let flags = properties[0]
+        var at: usize = 1
+        var min = i32.MIN
+        var max = i32.MAX
+        if flags & 1 != 0 {
+            min = i32.wrap(be(properties, at, 4))
+            at += 4
+        }
+        if flags & 2 != 0 {
+            max = i32.wrap(be(properties, at, 4))
+        }
+        return ArgType.Integer(min, max)
+    }
+    if name == "brigadier:long" {
+        let flags = properties[0]
+        var at: usize = 1
+        var min = i64.MIN
+        var max = i64.MAX
+        if flags & 1 != 0 {
+            min = i64.wrap(be(properties, at, 8))
+            at += 8
+        }
+        if flags & 2 != 0 {
+            max = i64.wrap(be(properties, at, 8))
+        }
+        return ArgType.Long(min, max)
+    }
+    if name == "brigadier:string" {
+        return match properties[0] {
+            0 => ArgType.Word,
+            1 => ArgType.Phrase,
+            _ => ArgType.Greedy,
+        }
+    }
+    if name == "entity" {
+        return ArgType.Entity(properties[0] & 1 != 0, properties[0] & 2 != 0)
+    }
+    if name == "gamemode" {
+        return ArgType.GameMode
+    }
+    if name == "resource_location" or name == "dimension" {
+        return ArgType.Id
+    }
+    if name == "message" {
+        return ArgType.Message
+    }
+    if name == "objective" {
+        return ArgType.Objective
+    }
+    if name == "int_range" {
+        return ArgType.IntRange
+    }
+    return ArgType.Unread(name.copy())
+}
+
+// `size` bytes from `at`, high first, as a `u64`.
+fn be(bytes: List<u8>, at: usize, size: usize) -> u64 {
+    var v: u64 = 0
+    for i in at..at + size {
+        v = (v << 8) | u64(bytes[i])
+    }
+    return v
+}

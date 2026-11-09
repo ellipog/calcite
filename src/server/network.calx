@@ -10,13 +10,16 @@ import auth.profile.{GameProfile, is_valid_name}
 import auth.services.{JoinCheck, KeySet, Services}
 import auth.session.{Joined, server_hash}
 import auth.velocity.{channel, request, read}
-import chat.component.{Argument, Component, HoverEvent, TextColor}
+import chat.component.{Argument, ClickEvent, Component, HoverEvent, TextColor}
+import command.dispatcher.{Message, Tree, entity_types}
+import command.selector.{Ints}
 import chat.language.{Language}
 import java.text.{string_hash}
 import java.uuid.{Uuid}
 import json.tree.{Json}
+import nbt.snbt.{from_units, units_of}
 import nbt.tag.{Tag}
-import protocol.chat.{ChatSession, ChatTypeBound, ClientboundPlayerChat, FilterMask, MessageSignature, PackedSignature, ServerboundChat, ServerboundChatCommandSigned, SignedBody}
+import protocol.chat.{ChatSession, ChatTypeBound, ClientboundDisguisedChat, ClientboundPlayerChat, FilterMask, MessageSignature, PackedSignature, ServerboundChat, ServerboundChatCommandSigned, SignedBody}
 import protocol.codec.{Decoder}
 import protocol.common.{ChatVisibility, ClientInformation, ClientboundDisconnect, HumanoidArm, ClientboundKeepAlive, ClientboundPostEffects, ClientboundResourcePackPush, ResourcePackAction, ServerboundKeepAlive}
 import protocol.configuration.{ClientboundCodeOfConduct, ClientboundFinishConfiguration, ConfigurationIn}
@@ -35,6 +38,7 @@ import registry.builtin.{builtin_entries, builtin_names}
 import registry.codec.{same}
 import registry.components.{ItemCodecs}
 import registry.registries.{Registries}
+import registry.registry.{Registry}
 import registry.streams.{Streams}
 import random.source.{RandomSource, shuffle}
 import random.taped.{TapedRandom}
@@ -43,7 +47,7 @@ import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
-import server.commands.{Failure, GAMEMASTERS, OWNERS, Parsed, PregenCommand, Targets, failure_context, parse, tree}
+import server.commands.{Failure, GAMEMASTERS, OWNERS, Parsed, PregenCommand, Targets, TriggerChange, failure_context, full_tree, help_node, parse_in, selector_targets, signable_in, tree, usage}
 import server.configuration.{Configuration}
 import server.layout.{Layout, Placed}
 import server.level.{ChunkPacket, Dropped, Heard, Level, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
@@ -52,7 +56,7 @@ import server.log.{Entry, Look}
 import server.pregen.{Choice, Run, Shape, Task as PregenTask, blocks, saved_data as pregen_data, saved_id as pregen_saved_id}
 import server.sending.{Outbox, Sending}
 import server.status.{ServerStatus}
-import server.play.{World, WorldState, damage_types_of, item_tag_names, team_display_name, level_random_seed, mob_facts_of, temptations_of}
+import server.play.{World, WorldState, component_of as text_of, damage_types_of, item_tag_names, synced_id, team_display_name, level_random_seed, mob_facts_of, temptations_of}
 import server.entity_io.{EntityDone, EntityJobs}
 import server.saving.{Save, Saving}
 import server.waypoints.{Beacon, Told, Waypoints, receives, transmits}
@@ -1020,8 +1024,41 @@ enum ClickRead {
 // A command, or a game mode picked with F3 and F4, from the player in a slot, which runs once
 // their connection is back in its slot (D239).
 enum Queued {
-    Command(usize, String)
+    /// A command, with the messages its player signed for its message arguments, by name.
+    Command(usize, String, List<(String, ChatMessage)>)
     Mode(usize, GameType)
+}
+
+// Every command, and the entity types a selector may name (CAL-165).
+struct CommandSet {
+    tree: Tree
+    types: Registry
+}
+
+// A message a command sends as its source's, `OutgoingChatMessage`: one the player sent, signed
+// or not, with what's shown in its place where that's different, or the text as no one's,
+// disguised (CAL-165).
+enum Outgoing {
+    Player(ChatMessage, Component?)
+    Disguised(Component)
+}
+
+impl Outgoing {
+    // `decoratedContent`.
+    fn content(self) -> Component {
+        return match self {
+            Outgoing.Player(m, shown) => shown.copy() ?? Component.literal(m.body.content),
+            Outgoing.Disguised(c) => c.copy(),
+        }
+    }
+
+    // `verifyChatTrusted`: signed, and not expired.
+    fn trusted(self, now: i64) -> bool {
+        return match self {
+            Outgoing.Player(m, _) => m.trusted(now),
+            Outgoing.Disguised(_) => false,
+        }
+    }
 }
 
 // Who runs a command: the console, or the player in a slot.
@@ -1129,6 +1166,8 @@ pub struct Network {
     entities_logged: bool = false
     // The commands waiting for their players' connections, and how many players have joined.
     queued: Deque<Queued> = Deque<Queued>()
+    // Every command, made the first time one's read (CAL-165).
+    commands: CommandSet? = none
     // The configuration and play packets that wait for the next tick, in the order they came on
     // every connection, as `PacketProcessor` holds them (CAL-150).
     scheduled: Deque<Scheduled> = Deque<Scheduled>()
@@ -1769,7 +1808,7 @@ impl Network {
         while not self.console_lines.is_empty() {
             let line = self.console_lines.remove(0)
             let input = if line.starts_with("/") { line[1..] } else { line.copy() }
-            self.run_command(Source.Console, input)
+            self.run_command(Source.Console, input, [])
         }
     }
 
@@ -17302,7 +17341,14 @@ impl Network {
         if let stays = self.refuse_chat(mut con, command, true) {
             return stays
         }
-        self.queued.push_last(Queued.Command(con.conn.slot(), command.copy()))
+        // `performUnsignedChatCommand`: one with arguments a client signs isn't run unsigned
+        // while the server enforces secure chat (CAL-165).
+        if self.enforces_secure_chat() and not self.signable_of(con, command.copy()).is_empty() {
+            self.logs.push(Entry.error("Received unsigned command packet from {player_name(con)}, but the command requires signing"))
+            self.system_message(mut con, Component.translatable("chat.disabled.invalid_command_signature", []).colored("red"))
+            return self.spam(mut con, true)
+        }
+        self.queued.push_last(Queued.Command(con.conn.slot(), command.copy(), []))
         return self.spam(mut con, true)
     }
 
@@ -17390,7 +17436,7 @@ impl Network {
     fn run_queued(mut self) {
         while let q = self.queued.pop_first() {
             match q {
-                Queued.Command(slot, input) => self.run_command(Source.Player(slot), input),
+                Queued.Command(slot, input, signed) => self.run_command(Source.Player(slot), input, signed),
                 Queued.Mode(slot, mode) => {
                     if self.change_mode(slot, mode) {
                         self.log_mode_change(Source.Player(slot), slot, mode)
@@ -17402,34 +17448,462 @@ impl Network {
 
     // Runs `input` from `source`, as `Commands.performCommand`: read against the commands the
     // source's permission level lets it use, then run, or its failure told to the source.
-    fn run_command(mut self, source: Source, input: String) {
-        match parse(input, self.level_of(source)) {
-            ok(Parsed.Stop) => {
+    // `signed` is the messages the player signed for its message arguments (CAL-165).
+    fn run_command(mut self, source: Source, input: String, signed: List<(String, ChatMessage)>) {
+        self.ready_commands()
+        let set = self.commands.take() else return
+        let level = self.level_of(source)
+        match parse_in(set.tree, input.copy(), level, set.types) {
+            ok(p) => {
+                self.commands = some(set)
+                self.run_parsed(source, p, signed)
+            },
+            err(f) => {
+                self.commands = some(set)
+                self.command_failed(source, f)
+            },
+        }
+    }
+
+    // A command read, run.
+    fn run_parsed(mut self, source: Source, p: own Parsed, signed: List<(String, ChatMessage)>) {
+        var done: Failure? = none
+        match p {
+            Parsed.Stop => {
                 self.success(source, Component.translatable("commands.stop.stopping", []), true)
                 self.stop_due = true
             },
-            ok(Parsed.GameMode(mode, targets)) => {
+            Parsed.GameMode(mode, targets) => {
                 match self.game_mode_command(source, mode, targets) {
                     ok => {},
-                    err(f) => self.command_failed(source, f),
+                    err(f) => done = some(f),
                 }
             },
-            ok(Parsed.FlySpeed(speed)) => self.fly_speed(source, speed),
-            ok(Parsed.Pregen(c)) => {
+            Parsed.FlySpeed(speed) => self.fly_speed(source, speed),
+            Parsed.Pregen(c) => {
                 match self.pregen_command(source, c) {
                     ok => {},
-                    err(f) => self.command_failed(source, f),
+                    err(f) => done = some(f),
                 }
             },
-            ok(Parsed.Dimension(id, targets)) => {
+            Parsed.Dimension(id, targets) => {
                 match self.dimension_command(source, id, targets) {
                     ok => {},
-                    err(f) => self.command_failed(source, f),
+                    err(f) => done = some(f),
                 }
             },
-            err(f) => self.command_failed(source, f),
+            Parsed.Help(command) => self.help(source, command),
+            Parsed.List(uuids) => self.list_players(source, uuids),
+            Parsed.Me(m) => self.me(source, m, signed),
+            Parsed.Msg(targets, m) => {
+                match self.msg(source, targets, m, signed) {
+                    ok => {},
+                    err(f) => done = some(f),
+                }
+            },
+            Parsed.TeamMsg(m) => {
+                match self.team_msg(source, m, signed) {
+                    ok => {},
+                    err(f) => done = some(f),
+                }
+            },
+            Parsed.Trigger(objective, change) => {
+                match self.trigger_command(source, objective, change) {
+                    ok => {},
+                    err(f) => done = some(f),
+                }
+            },
+            Parsed.Random(range, roll) => {
+                match self.random_command(source, range, roll) {
+                    ok => {},
+                    err(f) => done = some(f),
+                }
+            },
+            Parsed.Unrun(_) => done = some(Failure.alone(Component.literal("Calcite doesn't run this command yet"))),
+        }
+        if let f = done {
+            self.command_failed(source, f)
         }
     }
+
+    // Every command and the entity types a selector may name, made the first time a command's
+    // read (CAL-165).
+    fn ready_commands(mut self) {
+        let missing = match self.commands {
+            some(_) => false,
+            none => true,
+        }
+        if missing {
+            self.commands = some(CommandSet { tree: full_tree(), types: entity_types() })
+        }
+    }
+
+    // The message arguments of `command` as it reads for the player in `con`, each with what was
+    // written for it, which their client signs, `SignableCommand.of` (CAL-165).
+    fn signable_of(mut self, con: Connection, command: String) -> List<(String, String)> {
+        self.ready_commands()
+        let set = self.commands.take() else return List<(String, String)>()
+        let out = signable_in(set.tree, command, con.player.level, set.types)
+        self.commands = some(set)
+        return out
+    }
+
+    // `createSignedArgumentMismatchException`, then `handleMessageDecodeFailure`: the arguments
+    // the client signed and those the command has, logged, and the player told (CAL-165).
+    fn signature_mismatch(mut self, con: mut Connection, c: ServerboundChatCommandSigned, expected: List<(String, String)>) {
+        var names = String()
+        for a in c.argument_signatures {
+            if not names.is_empty() {
+                names.push_str(", ")
+            }
+            names.push_str(a.name)
+        }
+        var wanted = String()
+        for (n, _) in expected {
+            if not wanted.is_empty() {
+                wanted.push_str(", ")
+            }
+            wanted.push_str(n)
+        }
+        self.logs.push(Entry.error("Signed command mismatch between server and client ('{c.command}'): got [{names}] from client, but expected [{wanted}]"))
+        self.decode_failure(mut con, Component.translatable("chat.disabled.invalid_command_signature", []))
+    }
+
+    // `help`, `HelpCommand`: how each command the source may use is used, or, after a command
+    // written, how what it leads to is, a line each; a command that reads nothing fails
+    // (CAL-165).
+    fn help(mut self, source: Source, command: String?) {
+        self.ready_commands()
+        let set = self.commands.take() else return
+        let level = self.level_of(source)
+        var lines = List<String>()
+        var failed = false
+        match command {
+            none => {
+                for u in usage(set.tree, 0, level) {
+                    lines.push("/{u}")
+                }
+            },
+            some(c) => {
+                match help_node(set.tree, c.copy(), level, set.types) {
+                    some(at) => {
+                        for u in usage(set.tree, at, level) {
+                            lines.push("/{c} {u}")
+                        }
+                    },
+                    none => failed = true,
+                }
+            },
+        }
+        self.commands = some(set)
+        if failed {
+            self.command_failed(source, Failure.alone(Component.translatable("commands.help.failed", [])))
+            return
+        }
+        for line in lines {
+            self.success(source, Component.literal(line), false)
+        }
+    }
+
+    // `list`, `ListPlayersCommand`: how many players there are of how many may join, and each
+    // one's name, or their name and UUID (CAL-165).
+    fn list_players(mut self, source: Source, uuids: bool) {
+        let players = self.by_joining()
+        var names = List<Component>()
+        for slot in players {
+            if let c = self.connections[slot] {
+                if let p = c.profile {
+                    if uuids {
+                        names.push(Component.translatable("commands.list.nameAndId", [Component.literal(p.name), Component.literal(p.id.to_string())]))
+                    } else {
+                        names.push(self.player_name(p.copy()))
+                    }
+                }
+            }
+        }
+        let most = self.world.settings.max_players
+        let message = Component.translatable_args(String("commands.list.players"), [Argument.Number(Tag.Int(i32.wrap(players.len()))), Argument.Number(Tag.Int(most)), Argument.Text(format_list(names))])
+        self.success(source, message, false)
+    }
+
+    // The ID of the chat type `name` in the `chat_type` registry, where the world has it.
+    fn chat_type_id(self, name: str) -> i32? {
+        if let shared = self.world.registries {
+            match synced_id(shared.value, String("chat_type"), String(name)) {
+                ok(id) => return some(id),
+                err(_) => return none,
+            }
+        }
+        return none
+    }
+
+    // The name a command's source goes by, `getDisplayName`: the player's, or the console's,
+    // `Server`.
+    fn source_name(self, source: Source) -> Component {
+        return match source {
+            Source.Player(slot) => self.name_of(slot),
+            Source.Console => Component.literal("Server"),
+        }
+    }
+
+    // `ChatType.Bound.decorate`: `content` as the bound type shows it.
+    fn decorate(self, bound: ChatTypeBound, content: Component) -> Component {
+        let at = usize.wrap(bound.chat_type)
+        if at >= self.world.chat_types.len() {
+            return content.copy()
+        }
+        return self.world.chat_types[at].decorate(content, bound.name, bound.target_name)
+    }
+
+    // `Message.resolveComponent`: the message's text, or, where it has selectors and the source
+    // may use them, the text between them with the names of the players each picks in its place,
+    // a selector Calcite can't run yet left as it was written (CAL-165).
+    fn message_component(mut self, source: Source, m: Message) -> Component {
+        if m.parts.is_empty() or self.level_of(source) < GAMEMASTERS {
+            return Component.literal(m.text)
+        }
+        let units = units_of(m.text)
+        var out = Component.literal(from_units(units, 0, m.parts[0].start))
+        var read_to = m.parts[0].start
+        for part in m.parts {
+            let names = match selector_targets(part.selector) {
+                some(t) => self.joined_names(source, t),
+                none => Component.literal(from_units(units, part.start, part.end)),
+            }
+            if read_to < part.start {
+                out.extra.push(Component.literal(from_units(units, read_to, part.start)))
+            }
+            out.extra.push(names)
+            read_to = part.end
+        }
+        if read_to < units.len() {
+            out.extra.push(Component.literal(from_units(units, read_to, units.len())))
+        }
+        return out
+    }
+
+    // `EntitySelector.joinNames`: the names of the players `t` picks, as a list.
+    fn joined_names(mut self, source: Source, t: own Targets) -> Component {
+        var names = List<Component>()
+        for slot in self.players_named(source, t) {
+            names.push(self.name_of(slot))
+        }
+        return format_list(names)
+    }
+
+    // `MessageArgument.resolveChatMessage`: the message the player sent for the argument
+    // `name`, with what's shown in its place where selectors in it make that different, or,
+    // where there's none, the text as no one's, disguised (CAL-165).
+    fn resolved(mut self, source: Source, name: str, m: Message, signed: List<(String, ChatMessage)>) -> Outgoing {
+        let formatted = self.message_component(source, m)
+        let plain = m.parts.is_empty() or self.level_of(source) < GAMEMASTERS
+        for (n, message) in signed {
+            if n == String(name) {
+                // `withUnsignedContent` keeps it only where it isn't the signed text.
+                let shown: Component? = if plain { none } else { some(formatted.copy()) }
+                return Outgoing.Player(message.copy(), shown)
+            }
+        }
+        return Outgoing.Disguised(formatted)
+    }
+
+    // `logChatMessage`: the message as its type decorates it, after `[Not Secure]` where the
+    // server doesn't take it as its sender's.
+    fn log_chat(mut self, out: Outgoing, bound: ChatTypeBound) {
+        let shown = self.decorate(bound, out.content()).get_string(self.lang)
+        if out.trusted(self.clock.unix_ms) {
+            self.logs.push(Entry.info(shown))
+        } else {
+            self.logs.push(Entry.info("[Not Secure] {shown}"))
+        }
+    }
+
+    // `ServerPlayer.sendChatMessage` of a command's message to the player in `slot`, who gets it
+    // if they show all chat.
+    fn send_message_to(mut self, slot: usize, out: Outgoing, bound: ChatTypeBound) {
+        if slot >= self.connections.len() {
+            return
+        }
+        var con = self.connections[slot].take() else return
+        match out {
+            Outgoing.Player(m, shown) => self.player_chat_shown(mut con, m, shown.copy(), bound),
+            Outgoing.Disguised(c) => {
+                if con.information.chat_visibility == ChatVisibility.Full {
+                    self.send(mut con, ClientboundDisguisedChat { message: c.copy(), chat_type: bound.copy() }, State.Play)
+                }
+            },
+        }
+        self.connections[slot] = some(con)
+    }
+
+    // `me`, `EmoteCommands`: the action, as the source's, to every player, as
+    // `broadcastChatMessage` sends it, and logged (CAL-165).
+    fn me(mut self, source: Source, m: Message, signed: List<(String, ChatMessage)>) {
+        let kind = self.chat_type_id("emote_command") else return
+        let out = self.resolved(source, "action", m, signed)
+        let bound = ChatTypeBound { chat_type: kind, name: self.source_name(source), target_name: none }
+        self.log_chat(out, bound)
+        for slot in self.by_joining() {
+            self.send_message_to(slot, out, bound)
+        }
+    }
+
+    // `msg`, `MsgCommand`: the message to each player named, as `msg_command_incoming`, and to
+    // the source as `msg_command_outgoing` to them, the source's first each time; the console's
+    // is logged (CAL-165).
+    fn msg(mut self, source: Source, targets: own Targets, m: Message, signed: List<(String, ChatMessage)>) ! Failure {
+        let who = self.players_named(source, targets)
+        if who.is_empty() {
+            fail Failure.alone(Component.translatable("argument.entity.notfound.player", []))
+        }
+        let incoming = self.chat_type_id("msg_command_incoming") else return
+        let outgoing = self.chat_type_id("msg_command_outgoing") else return
+        let out = self.resolved(source, "message", m, signed)
+        let name = self.source_name(source)
+        for slot in who {
+            let to = ChatTypeBound { chat_type: outgoing, name: name.copy(), target_name: some(self.name_of(slot)) }
+            match source {
+                Source.Player(me) => self.send_message_to(me, out, to),
+                Source.Console => {
+                    let line = self.decorate(to, out.content())
+                    self.tell_server(line, true)
+                },
+            }
+            self.send_message_to(slot, out, ChatTypeBound { chat_type: incoming, name: name.copy(), target_name: none })
+        }
+    }
+
+    // `teammsg`, `TeamMsgCommand`: the message to each player in the source's team, the source
+    // as `team_msg_command_outgoing` and the rest as `team_msg_command_incoming`, each to the
+    // team's name (CAL-165).
+    fn team_msg(mut self, source: Source, m: Message, signed: List<(String, ChatMessage)>) ! Failure {
+        let me = match source {
+            Source.Player(slot) => slot,
+            Source.Console => fail Failure.alone(Component.translatable("permissions.requires.entity", [])),
+        }
+        var team: Team? = none
+        if let c = self.connections[me] {
+            if let p = c.profile {
+                team = self.world.scoreboard.team(p.name.copy())
+            }
+        }
+        let t = team else fail Failure.alone(Component.translatable("commands.teammsg.failed.noteam", []))
+        var receivers = List<usize>()
+        for slot in self.by_joining() {
+            var mate = slot == me
+            if let c = self.connections[slot] {
+                if let p = c.profile {
+                    if self.world.scoreboard.team_name(p.name.copy()) == some(t.name.copy()) {
+                        mate = true
+                    }
+                }
+            }
+            if mate {
+                receivers.push(slot)
+            }
+        }
+        if receivers.is_empty() {
+            return
+        }
+        let incoming = self.chat_type_id("team_msg_command_incoming") else return
+        let outgoing = self.chat_type_id("team_msg_command_outgoing") else return
+        let team_name = team_formatted(t)
+        let name = self.source_name(source)
+        let out = self.resolved(source, "message", m, signed)
+        for slot in receivers {
+            let kind = if slot == me { outgoing } else { incoming }
+            self.send_message_to(slot, out, ChatTypeBound { chat_type: kind, name: name.copy(), target_name: some(team_name.copy()) })
+        }
+    }
+
+    // `trigger`, `TriggerCommand`: the player's score of a trigger objective they may use one
+    // more, a value more, or set, which they may then not till it's enabled again, then said to
+    // the source and the operators (CAL-165).
+    fn trigger_command(mut self, source: Source, objective: String, change: TriggerChange) ! Failure {
+        let slot = match source {
+            Source.Player(s) => s,
+            Source.Console => fail Failure.alone(Component.translatable("permissions.requires.player", [])),
+        }
+        var con = self.connections[slot].take() else return
+        var found: GameProfile? = none
+        if let p = con.profile {
+            found = some(p.copy())
+        }
+        let p = found else {
+            self.connections[slot] = some(con)
+            return
+        }
+        let shown = some(self.player_name(p.copy()).to_nbt())
+        var count = 0
+        var value: i32? = none
+        match change {
+            TriggerChange.Simple => count = 1,
+            TriggerChange.Add(v) => count = v,
+            TriggerChange.Set(v) => value = some(v),
+        }
+        var problem: String? = none
+        match self.world.scoreboard.trigger(objective.copy(), p.name.copy(), shown, count, value) {
+            ok((_, sent)) => self.send_all(mut con, score_packets(sent)),
+            err(key) => problem = some(key),
+        }
+        self.connections[slot] = some(con)
+        if let key = problem {
+            var args = List<Component>()
+            if key == "arguments.objective.notFound" {
+                args.push(Component.literal(objective))
+            }
+            fail Failure.alone(Component.translatable(key, args))
+        }
+        let formatted = self.objective_formatted(objective)
+        let message = match change {
+            TriggerChange.Simple => Component.translatable("commands.trigger.simple.success", [formatted]),
+            TriggerChange.Add(v) => Component.translatable_args(String("commands.trigger.add.success"), [Argument.Text(formatted), Argument.Number(Tag.Int(v))]),
+            TriggerChange.Set(v) => Component.translatable_args(String("commands.trigger.set.success"), [Argument.Text(formatted), Argument.Number(Tag.Int(v))]),
+        }
+        self.success(source, message, true)
+    }
+
+    // `Objective.getFormattedDisplayName`: its display name, pointed at showing its name, in
+    // brackets.
+    fn objective_formatted(self, name: String) -> Component {
+        var inner = match self.world.scoreboard.objective_name(name.copy()) {
+            some(t) => text_of(t),
+            none => Component.literal(name),
+        }
+        inner.style.hover_event = some(HoverEvent.ShowText(Box(Component.literal(name))))
+        return Component.translatable("chat.square_brackets", [inner])
+    }
+
+    // `random value` and `random roll`, `RandomCommand.randomSample`: a number in the range, from
+    // the random of the source's level, told the source, or, rolled, every player (CAL-165).
+    fn random_command(mut self, source: Source, range: Ints, roll: bool) ! Failure {
+        let least = range.min ?? i32.MIN
+        let most = range.max ?? i32.MAX
+        let span = i64(most) - i64(least)
+        if span == 0 {
+            fail Failure.alone(Component.translatable("commands.random.error.range_too_small", []))
+        }
+        if span >= 2147483647 {
+            fail Failure.alone(Component.translatable("commands.random.error.range_too_large", []))
+        }
+        var d: usize = 0
+        if let Source.Player(slot) = source {
+            if let c = self.connections[slot] {
+                d = c.player.dim
+            }
+        }
+        var r = self.levels[d].lend_random()
+        // `Mth.randomBetweenInclusive`.
+        let value = r.next_int_below(most - least + 1) + least
+        self.levels[d].give_back_random(r)
+        if roll {
+            let message = Component.translatable_args(String("commands.random.roll"), [Argument.Text(self.source_name(source)), Argument.Number(Tag.Int(value)), Argument.Number(Tag.Int(least)), Argument.Number(Tag.Int(most))])
+            self.broadcast_system(message, Look.Plain)
+        } else {
+            self.success(source, Component.translatable_args(String("commands.random.sample.success"), [Argument.Number(Tag.Int(value))]), false)
+        }
+    }
+
 
     // The source's permission level: the console's is the owners'.
     fn level_of(self, source: Source) -> i32 {
@@ -18004,7 +18478,7 @@ impl Network {
     // where `broadcast`, to the operators.
     fn success(mut self, source: Source, message: own Component, broadcast: bool) {
         match source {
-            Source.Console => self.logs.push(Entry.info(message.get_string(self.lang))),
+            Source.Console => self.tell_server(message.copy(), true),
             Source.Player(slot) => self.tell_slot(slot, message.copy()),
         }
         if broadcast {
@@ -18046,8 +18520,17 @@ impl Network {
             }
         }
         if from != none {
-            self.logs.push(Entry.info(line.get_string(self.lang)))
+            self.tell_server(line, true)
         }
+    }
+
+    // `MinecraftServer.sendSystemMessage`: a message to the server, logged as `System chat:` and
+    // its text, which Calcite's console shows alone, or not at all where it isn't `shown`
+    // (CAL-165).
+    fn tell_server(mut self, message: own Component, shown: bool) {
+        let text = message.get_string(self.lang)
+        let look = if shown { Look.Words(text.copy()) } else { Look.Quiet }
+        self.logs.push(Entry.info("System chat: {text}").calcite(look))
     }
 
     // A command's failure, as `Commands.performCommand` sends it: its message, then where in the
@@ -18056,9 +18539,9 @@ impl Network {
         let where_ = failure_context(f)
         match source {
             Source.Console => {
-                self.logs.push(Entry.info(f.message.get_string(self.lang)))
+                self.tell_server(f.message.copy(), true)
                 if let c = where_ {
-                    self.logs.push(Entry.info(c.get_string(self.lang)).calcite(Look.Quiet))
+                    self.tell_server(c, false)
                 }
             },
             Source.Player(slot) => {
@@ -18096,13 +18579,13 @@ impl Network {
 
     // A command with signed arguments, as `handleSignedChatCommand`: what it says the player
     // has seen is checked, then its characters, then its arguments' signatures, against the
-    // arguments the command has. Calcite has no commands, so none has an argument to sign. A
-    // command that comes with signatures doesn't match, as `collectSignedArguments` finds,
-    // which breaks the player's chain, and isn't run; one without is unknown. Either counts
-    // toward the player's command spam.
+    // message arguments the command has, `collectSignedArguments` (CAL-165). With none signed,
+    // each is the player's, unsigned, `collectUnsignedArguments`; else each signed is checked
+    // on the player's chain, and one the command hasn't breaks it. One that doesn't match or
+    // doesn't check isn't run. Either way it counts toward the player's command spam.
     fn signed_command(mut self, con: mut Connection, c: ServerboundChatCommandSigned) -> bool {
-        match con.player.last_seen.apply_update(c.last_seen) {
-            ok(_) => {},
+        let seen = match con.player.last_seen.apply_update(c.last_seen) {
+            ok(s) => s,
             err(problem) => {
                 self.chat_invalid(mut con, "Failed to validate message acknowledgements", problem)
                 return false
@@ -18111,20 +18594,45 @@ impl Network {
         if let stays = self.refuse_chat(mut con, c.command, true) {
             return stays
         }
+        let expected = self.signable_of(con, c.command.copy())
+        var signed = List<(String, ChatMessage)>()
         if c.argument_signatures.is_empty() {
-            self.queued.push_last(Queued.Command(con.conn.slot(), c.command.copy()))
-        } else {
-            con.player.chain.set_broken()
-            var names = String()
-            for a in c.argument_signatures {
-                if not names.is_empty() {
-                    names.push_str(", ")
-                }
-                names.push_str(a.name)
+            for (name, value) in expected {
+                let body = MessageBody { content: value.copy(), time_stamp: self.clock.unix_ms, salt: 0, last_seen: [] }
+                let message = self.unpack(mut con, none, body) else return self.spam(mut con, true)
+                signed.push((name.copy(), message))
             }
-            self.logs.push(Entry.error("Signed command mismatch between server and client ('{c.command}'): got [{names}] from client, but expected []"))
-            self.decode_failure(mut con, Component.translatable("chat.disabled.invalid_command_signature", []))
+        } else {
+            for a in c.argument_signatures {
+                var found: String? = none
+                for (name, value) in expected {
+                    if found == none and name == a.name {
+                        found = some(value.copy())
+                    }
+                }
+                let value = found else {
+                    con.player.chain.set_broken()
+                    self.signature_mismatch(mut con, c, expected)
+                    return self.spam(mut con, true)
+                }
+                let body = MessageBody { content: value, time_stamp: c.time_stamp, salt: c.salt, last_seen: seen.copy() }
+                let message = self.unpack(mut con, some(a.signature.copy()), body) else return self.spam(mut con, true)
+                signed.push((a.name.copy(), message))
+            }
+            for (name, _) in expected {
+                var has = false
+                for (n, _) in signed {
+                    if n == name {
+                        has = true
+                    }
+                }
+                if not has {
+                    self.signature_mismatch(mut con, c, expected)
+                    return self.spam(mut con, true)
+                }
+            }
         }
+        self.queued.push_last(Queued.Command(con.conn.slot(), c.command.copy(), signed))
         return self.spam(mut con, true)
     }
 
@@ -18269,6 +18777,12 @@ impl Network {
     // client's cache, where it has them. A signed one then goes in the cache and among those the
     // player is to say they saw, and too many they haven't ends their connection.
     fn player_chat(mut self, con: mut Connection, message: ChatMessage, chat: ChatTypeBound) {
+        self.player_chat_shown(mut con, message, none, chat)
+    }
+
+    // `player_chat` with what's shown in place of the signed text, where that's different
+    // (CAL-165).
+    fn player_chat_shown(mut self, con: mut Connection, message: ChatMessage, shown: Component?, chat: ChatTypeBound) {
         if con.information.chat_visibility != ChatVisibility.Full {
             return
         }
@@ -18279,7 +18793,7 @@ impl Network {
             seen.push(con.player.signatures.pack(s))
         }
         let body = SignedBody { content: message.body.content.copy(), time_stamp: message.body.time_stamp, salt: message.body.salt, last_seen: seen }
-        let packet = ClientboundPlayerChat { global_index: index, sender: message.sender, index: message.index, signature: message.signature.copy(), body: body, unsigned_content: none, filter_mask: FilterMask.PassThrough, chat_type: chat.copy() }
+        let packet = ClientboundPlayerChat { global_index: index, sender: message.sender, index: message.index, signature: message.signature.copy(), body: body, unsigned_content: shown.copy(), filter_mask: FilterMask.PassThrough, chat_type: chat.copy() }
         self.send(mut con, packet, State.Play)
         let signature = message.signature else return
         con.player.signatures.push(message.body.last_seen, some(signature.copy()))
@@ -22595,4 +23109,39 @@ fn score_packets(sent: List<ScoreSent>) -> List<List<u8>> {
 fn wire_format(saved: Tag?) -> NumberFormat? {
     let (kind, payload) = format_on_wire(saved) else return none
     return some(NumberFormat { kind: kind, payload: payload })
+}
+
+// `ComponentUtils.formatList` with its default separator: nothing, the one, or each after the
+// first after a gray `, ` (CAL-165).
+fn format_list(values: List<Component>) -> Component {
+    if values.is_empty() {
+        return Component.empty()
+    }
+    if values.len() == 1 {
+        return values[0].copy()
+    }
+    var out = Component.empty()
+    for i in 0..values.len() {
+        if i > 0 {
+            out.extra.push(Component.literal(", ").colored("gray"))
+        }
+        out.extra.push(values[i].copy())
+    }
+    return out
+}
+
+// `PlayerTeam.getFormattedDisplayName` with `TeamMsgCommand`'s style: the team's display name,
+// shift-clicked to its name and pointed at showing it, in brackets in its color, pointed at to
+// say to message the team, and clicked to start to (CAL-165).
+fn team_formatted(t: Team) -> Component {
+    var inner = text_of(t.display_name)
+    inner.style.insertion = some(t.name.copy())
+    inner.style.hover_event = some(HoverEvent.ShowText(Box(Component.literal(t.name))))
+    var out = Component.translatable("chat.square_brackets", [inner])
+    if let c = t.color {
+        out = out.colored(String(color_name(c)))
+    }
+    out.style.hover_event = some(HoverEvent.ShowText(Box(Component.translatable("chat.type.team.hover", []))))
+    out.style.click_event = some(ClickEvent.SuggestCommand("/teammsg "))
+    return out
 }
