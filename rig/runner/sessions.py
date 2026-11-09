@@ -613,8 +613,9 @@ CONFIGS = {
     # slots, then joins again and sets creative slots; what each saves of it is compared (CAL-135).
     "inventory": Config({}, scenarios=("join", "creative"), player=INVENTORY),
     # The bot, in survival with the same inventory, clicks in its inventory menu; what each server
-    # sends back, and what each saves of it, is compared (CAL-136).
-    "clicks": Config({}, scenarios=("clicks",), player=CLICKS),
+    # sends back, and what each saves of it, is compared (CAL-136). Taped, as the mobs natural
+    # spawning puts by it are drawn from the levels' randoms (CAL-222).
+    "clicks": Config({}, scenarios=("clicks",), player=CLICKS, tape=True),
     "uncompressed": Config({"network-compression-threshold": "-1"}),
     # A saved world, whose chunks both servers read and light (CAL-76). A view of 3 sends the
     # chunks from -4 to 4, which vanilla lights with their neighbours, all of them full in the
@@ -890,12 +891,12 @@ CONFIGS = {
     # The bot, in survival mode with nothing, stands at the arrows fixture's spawn, on normal at
     # midnight, while arrows fly as the world loads (CAL-159): into a wall, into a zombie without
     # AI and an armor stand, which breaks, onto its head, and onto the grass by it, where it picks
-    # up the one anyone may.
+    # up the one anyone may. Taped, as the stand's drop is drawn from the level's random (CAL-222).
     "arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "arrows" / "world",
                      fixture="arrows",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
-                     player=ARROWS),
+                     player=ARROWS, tape=True),
     # The bot, in survival mode with nothing, stands at the spawn, on normal at midnight, while an
     # arrow shot up falls back onto each of two endermen without AI (CAL-159): Ender dodges his,
     # unhurt, teleporting away, `repeatedlyTryToTeleport`, and it flies on; Flare's is on fire, which
