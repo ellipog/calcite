@@ -100,7 +100,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
-                   "traders", "frost", "soul"]
+                   "traders", "frost", "soul", "splash"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -398,6 +398,15 @@ LIFTED = dict(ARROWS, active_effects=nbt.List(nbt.COMPOUND, [
 # nothing but stone in its first hotbar slot (D520).
 BEACONS = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(5.5), nbt.Double(-60.0), nbt.Double(5.5)]),
                playerGameType=nbt.Int(1), Inventory=nbt.List(nbt.COMPOUND, [slotted(0, "stone", 64)]), equipment={})
+# The bot's data in `splash`: `arrows`', in survival mode facing east, with splash potions of
+# poison, healing, regeneration, water and harming in its first five hotbar slots (D527).
+SPLASH = dict(ARROWS, Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "splash_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:poison"}}),
+    slotted(1, "splash_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:healing"}}),
+    slotted(2, "splash_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:regeneration"}}),
+    slotted(3, "splash_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:water"}}),
+    slotted(4, "splash_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:harming"}}),
+]))
 # The bot's data in `beacon_menu`: `beacons`', in survival mode with an iron ingot, a gold ingot
 # and four emeralds in its first three hotbar slots (D521).
 BEACON_MENU = dict(BEACONS, playerGameType=nbt.Int(0), Inventory=nbt.List(nbt.COMPOUND, [
@@ -963,6 +972,16 @@ CONFIGS = {
                            ("minecraft:respawn_radius", nbt.Int(0))),
                     player=EATEN, keys=("active_effects", "Health", "AbsorptionAmount", "foodLevel",
                                         "foodSaturationLevel")),
+    # Splash potions thrown (D527): the bot, in survival mode at the splash fixture's spawn, on
+    # normal at midnight, throws splash potions at Moo, the cow, and Rot, the zombie, both without
+    # AI: poison at the cow, which poisons it and the bot; healing at the zombie, which hurts it;
+    # regeneration at its own feet; water at nothing; and harming at the cow, which hurts it and
+    # the bot; and it leaves at 420.
+    "splash": Config({"difficulty": "normal"}, view=3, scenarios=("splash",), world=FIXTURES / "splash" / "world",
+                     fixture="splash",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                            ("minecraft:respawn_radius", nbt.Int(0))),
+                     player=SPLASH, keys=("active_effects", "Health", "AbsorptionAmount")),
     # The bot, in creative mode with stone in its hand, stands at the beacons fixture's spawn, on
     # normal at noon, among beacons that pulse their effects onto it every 80 ticks (D520): speed,
     # jump boost but not its regeneration, two levels short, resistance through bedrock, strength
