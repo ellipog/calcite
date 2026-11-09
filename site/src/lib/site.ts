@@ -8,6 +8,10 @@ export const SITE = {
 	 *  so a preview deploy or a local one never passes for the site. */
 	url: 'https://calcitemc.com',
 	github: 'https://github.com/ellipog/calcite',
+	/** The nightly build's files, whose addresses stay the same as each night's replaces the last
+	 *  (.github/workflows/nightly.yml). */
+	nightly: 'https://github.com/ellipog/calcite/releases/download/nightly/',
+	nightlyRelease: 'https://github.com/ellipog/calcite/releases/tag/nightly',
 	blob: 'https://github.com/ellipog/calcite/blob/main/',
 	tree: 'https://github.com/ellipog/calcite/tree/main/',
 	acta: 'https://acta.aaenz.no/p/aaen-studios/calcite',
@@ -25,6 +29,7 @@ export const NAV = [
 	{ href: '/benchmarks', label: 'Benchmarks' },
 	{ href: '/plugins', label: 'Plugins' },
 	{ href: '/roadmap', label: 'Roadmap' },
+	{ href: '/download', label: 'Download' },
 ] as const;
 
 /** Minecraft's usage guidelines ask for this on anything made for the game that isn't Mojang's. */

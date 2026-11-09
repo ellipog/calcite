@@ -5,7 +5,7 @@ description: How to run a Calcite server, from building it to letting players in
 
 # Running Calcite
 
-This guide is for whoever runs a Calcite server. It's written as Calcite is now, before its first release: you build it from source, and it does what the [status](#what-works-today) below says. The website renders these pages; each is plain Markdown here too.
+This guide is for whoever runs a Calcite server. It's written as Calcite is now, before its first release: you download a nightly build or build it from source, and it does what the [status](#what-works-today) below says. The website renders these pages; each is plain Markdown here too.
 
 ## What works today
 

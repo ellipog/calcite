@@ -13,6 +13,11 @@ export const PAGES = {
 		title: 'Plugins',
 		description: "Calcite's plugin API: native Calx plugins at full speed, WASM plugins in a sandbox, where a plugin's code runs, and the five samples it was designed with.",
 	},
+	download: {
+		path: '/download',
+		title: 'Download',
+		description: "Calcite's nightly builds for Windows and Linux: the newest commit whose tests passed, built each night, with how to start one and what it does first.",
+	},
 	roadmap: {
 		path: '/roadmap',
 		title: 'Roadmap',

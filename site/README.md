@@ -36,6 +36,7 @@ The site is then at http://localhost:3000. Under `next dev` it also serves two i
 | `/docs` and `/docs/*` | `docs/guide/*.md`, `docs/pregen.md` and `plugins/api/HOST_API.md`, in the order `docs/guide/README.md` lists them |
 | `/plugins` | Sections of `plugins/api/HOST_API.md` and `plugins/samples/README.md`, and the samples' code |
 | `/roadmap` | `docs/PLAN.md`'s table and phase sections, and the status line in the top-level `README.md` |
+| `/download` | The nightly release's `nightly.json`, which `.github/workflows/nightly.yml` publishes beside the archives, read at most once an hour; the buttons link the archives' fixed addresses |
 
 ### Benchmark numbers
 
@@ -149,5 +150,6 @@ The site is built to deploy on Vercel, but any host that runs Next.js 16 works. 
 - **Include files outside the root directory in the build step:** on. The site reads `../docs`, `../bench`, `../cases`, `../plugins`, `../rig` and `../src` as it builds, so the whole repo has to be checked out.
 - **Install command:** `bun install`. **Build command:** `bun run build`.
 - **Environment:** nothing. The site's address, `https://calcitemc.com`, is `SITE.url` in `src/lib/site.ts`; canonical links, the sitemap, robots.txt and the cards' addresses use it from every build, preview deploys and local ones included.
+- **Ignored build step:** `vercel.json` runs `scripts/ignore-build.sh`, which skips the build unless something the site is built from changed since the branch's last deploy: `site/`, or what it reads of the rest of the repo, the table above's sources. `docs/decisions.md`, which nearly every commit adds to, isn't among them, since it only names the decisions a page cites, and a page that cites a new one changes itself. Without an earlier deploy to compare with, it builds.
 
-Every page is static except `/roadmap`, which is regenerated in the background when it's more than an hour old.
+Every page is static except `/roadmap` and `/download`, which are regenerated in the background when they're more than an hour old.

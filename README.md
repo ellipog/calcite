@@ -21,6 +21,10 @@ Phase 5 made the world: chunks, storage, regions and worldgen. On the [benchmark
 
 Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calcite)). Calx has its own board, aaen-studios/clx ([open](https://acta.aaenz.no/aaen-studios/clx)). The phase gates live here.
 
+## Download
+
+There's no release yet. Each night the newest commit whose tests passed is built for Windows and Linux on x86-64: [calcitemc.com/download](https://calcitemc.com/download), or the [`nightly` release](https://github.com/ellipog/calcite/releases/tag/nightly). These are development builds, so back up a world before you open it with one. [Getting started](docs/guide/start.md) says how to start one, or build it yourself.
+
 ## Docs
 
 - [Running Calcite](docs/guide/README.md): building and starting a server, its settings, proxies, the console, recording and moving worlds

@@ -1,13 +1,24 @@
 ---
 title: Getting started
-description: Install Calx, build Calcite, start it and join it with Minecraft: Java Edition 26.3.
+description: Download a nightly build of Calcite or build it from source, start it and join it with Minecraft: Java Edition 26.3.
 ---
 
 # Getting started
 
-There's no release to download yet, so you build Calcite from source. It's one command once Calx is installed.
+There's no release of Calcite yet. You can download a nightly build, or build it from source, which is one command once Calx is installed.
 
-## What you need
+## Download a nightly
+
+Each night the newest commit on `main` whose tests passed is built for Windows and Linux on x86-64. [calcitemc.com/download](https://calcitemc.com/download) has the downloads, and so does the [`nightly` release](https://github.com/ellipog/calcite/releases/tag/nightly) on GitHub, with each build's commit and checksums. The archives' addresses don't change from night to night:
+
+- Windows: <https://github.com/ellipog/calcite/releases/download/nightly/calcite-windows-x64.zip>
+- Linux: <https://github.com/ellipog/calcite/releases/download/nightly/calcite-linux-x64.tar.gz>
+
+A nightly has passed Calcite's tests and nothing more, so back up a world before you open it with one. Each archive unpacks to a folder, `calcite`, with the server, its `LICENSE`, `NOTICE` and a short readme. Start the server in that folder, or copy it to the folder you want the server's files in, and go on at [Start it](#start-it).
+
+On Linux the build needs a glibc at least as new as the one the release notes name.
+
+## What you need to build it
 
 - Windows or Linux, on x86-64.
 - [Calx](https://calxlang.com), with clang and lld from LLVM 18 or later, which Calx builds programs with. [Install Calx](https://calxlang.com/guide/install/) says how to get them.

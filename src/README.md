@@ -679,8 +679,11 @@ Where it differs from vanilla, for now:
 
 ```sh
 py -I src/test/run.py                   # every test and example on this page, debug and release, and builds the server
+py -I src/test/run.py play mob          # only those tests
 py -I rig/runner/rig.py score           # everything the rig can check
 ```
+
+`run.py` runs the builds side by side, as many at once as `--jobs` says, by default the machine's cores up to 8, heaviest first. A build's weight is the lines of every module it reaches. They can overlap, since calx links each program under a name of its own and each test's files go in a temp folder of its own. A test that talks over sockets, or writes to a fixed folder under `build/`, as `play` and `configuration` do, is only built then, and run alone once the rest are done: its clients wait for the server's answers only so long, which a machine busy with builds can outlast, and `play` did, in its dimensions part. calx keeps the programs it builds, so its run takes the one just built. `--shard K/N` runs the K-th of N parts, the builds dealt heaviest first to the lightest part, and every part works out the same deal. CI runs the tests in four parts on each system, four builds at a time, and keeps calx's objects between runs, so the modules that didn't change aren't compiled again ([D562](../docs/decisions.md)).
 
 [`bench/`](../bench/README.md) holds the bot benchmark, which times the server with 100 players joining, walking and chatting, per commit ([D154](../docs/decisions.md)). The server's `--tick-times FILE` writes each tick's start and work as it ends, for it.
 
