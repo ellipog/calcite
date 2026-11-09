@@ -99,7 +99,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
-                   "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted"]
+                   "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -390,6 +390,15 @@ LIFTED = dict(ARROWS, active_effects=nbt.List(nbt.COMPOUND, [
     effect("jump_boost", 400, 1),
     effect("slow_falling", 400),
 ]))
+# The bot's data in `undying`: `arrows`', at 1 health with a totem of undying in its off hand, and
+# swiftness and night vision saved on it, which the totem clears as it saves it (D518); 17 food
+# and no saturation, so it doesn't heal before the arrow falls on it.
+UNDYING = dict(ARROWS, Health=nbt.Float(1.0), foodLevel=nbt.Int(17), foodSaturationLevel=nbt.Float(0.0),
+               equipment={"offhand": stack("totem_of_undying")},
+               active_effects=nbt.List(nbt.COMPOUND, [
+                   effect("speed", 300),
+                   effect("night_vision", -1, ambient=True, show_particles=False),
+               ]))
 # The bot's data in `spider`: `thorns`', on the spider fixture's pillar at the spawn (CAL-159).
 SPIDER = dict(THORNS, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-57.0), nbt.Double(0.5)]))
 # The bot's data in `slime`: `thorns`', in iron armor, so the slime's hits wear it and leave the bot
@@ -898,6 +907,16 @@ CONFIGS = {
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
                      player=LIFTED, keys=("active_effects", "Health", "Motion", "fall_distance", "foodExhaustionLevel")),
+    # The bot, in survival mode at 1 health with a totem in its off hand and effects saved on it,
+    # stands at the undying fixture's spawn, on normal at midnight, while a plain arrow shot up
+    # falls back onto it and its totem saves it, its effects cleared and the totem's given; it hits
+    # Undying, a zombie without AI at 1 health with a totem, at 120, at 200, which would kill it
+    # but for its totem, and at 280, which its absorption takes (D518); it leaves at 400.
+    "undying": Config({"difficulty": "normal"}, view=3, scenarios=("undying",), world=FIXTURES / "undying" / "world",
+                      fixture="undying",
+                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                             ("minecraft:respawn_radius", nbt.Int(0))),
+                      player=UNDYING, keys=("active_effects", "Health", "AbsorptionAmount", "equipment", "foodLevel")),
     "ender-arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "ender-arrows" / "world",
                            fixture="ender-arrows",
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
