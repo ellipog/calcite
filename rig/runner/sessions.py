@@ -60,6 +60,9 @@ VIEW = 4
 # pauses once it's been empty PAUSE seconds, and the bot runs only once it has, so the bot joins
 # both at the same game time and their ticks line up from there (D315).
 PAUSE = 2
+# How long a scenario's bot may run, in seconds, by the wall clock: `select` runs past two
+# minutes of steps (D559).
+BOT_SECONDS = 300
 BASE = {
     "online-mode": "false",
     "server-ip": "127.0.0.1",
@@ -1837,7 +1840,7 @@ def record(config, side, argv, bot, scenarios):
             argv = [str(bot), str(port), str(CONFIGS[config].view), scenario, str(out)]
             if scenario in MATE_SCENARIOS:
                 argv.append(str(folder / f"{MATE_SCENARIOS[scenario]}.bin"))
-            got = subprocess.run(argv, cwd=CALCITE, capture_output=True, text=True, encoding="utf-8", timeout=120)
+            got = subprocess.run(argv, cwd=CALCITE, capture_output=True, text=True, encoding="utf-8", timeout=BOT_SECONDS)
             if got.returncode != 0:
                 sys.exit(f"sessions: the bot failed {scenario} against {side}:\n{got.stdout}{got.stderr}")
             print(f"  {side}: {scenario}: {got.stdout.strip()}", flush=True)
