@@ -100,7 +100,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
-                   "traders"]
+                   "traders", "frost"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -505,6 +505,8 @@ SWIM = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(20.
 # The bot's data in `checks`: in survival mode at the spawn, facing east, its hands empty (D420).
 CHECKS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, []),
               equipment={})
+# The bot's data in `frost`: `checks`', in diamond boots with frost walker II (D524).
+FROST = dict(CHECKS, equipment={"feet": stack("diamond_boots", 1, {"minecraft:enchantments": {"minecraft:frost_walker": nbt.Int(2)}})})
 # The bot's data in `night`: in creative mode at the spawn, so the monsters that spawn don't make
 # for it (CAL-156).
 NIGHT = {
@@ -1113,6 +1115,13 @@ CONFIGS = {
     "swim": Config({}, view=3, scenarios=("swim",), world=FIXTURES / "swim" / "world", fixture="swim",
                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                    player=SWIM, keys=FALL_KEYS + ("Air",)),
+    # The bot, in survival mode at the frost fixture's spawn in boots with frost walker II, by the
+    # server's clock from game time 200, walks east across its pool on what it freezes, three
+    # blocks a second, onto the grass beyond, and stays as the frosted ice melts; it leaves at 900
+    # (D524).
+    "frost": Config({}, view=3, scenarios=("frost",), world=FIXTURES / "frost" / "world", fixture="frost",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                    player=FROST, keys=FALL_KEYS),
     # The bot, in survival mode by the checks fixture's wall, by the server's clock: a move too
     # quick, one through the wall and one into it, each of which the server sends it back from,
     # then a float it's kicked for (D420).
