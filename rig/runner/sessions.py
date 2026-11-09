@@ -99,7 +99,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
-                   "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons"]
+                   "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -394,6 +394,10 @@ LIFTED = dict(ARROWS, active_effects=nbt.List(nbt.COMPOUND, [
 # nothing but stone in its first hotbar slot (D520).
 BEACONS = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(5.5), nbt.Double(-60.0), nbt.Double(5.5)]),
                playerGameType=nbt.Int(1), Inventory=nbt.List(nbt.COMPOUND, [slotted(0, "stone", 64)]), equipment={})
+# The bot's data in `beacon_menu`: `beacons`', in survival mode with an iron ingot, a gold ingot
+# and four emeralds in its first three hotbar slots (D521).
+BEACON_MENU = dict(BEACONS, playerGameType=nbt.Int(0), Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "iron_ingot"), slotted(1, "gold_ingot"), slotted(2, "emerald", 4)]))
 # The bot's data in `eaten`: `arrows`', at 12 health, 2 food and no saturation, poisoned for 300
 # ticks, carrying apples, honey bottles, a potion of swiftness, milk, a golden apple, a suspicious
 # stew of night vision and a potion of healing in its hotbar, and bread in its off hand (D519).
@@ -960,6 +964,16 @@ CONFIGS = {
                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                              ("minecraft:respawn_radius", nbt.Int(0))),
                       player=BEACONS, keys=("active_effects", "Health")),
+    # The bot, in survival mode with an iron ingot, a gold ingot and four emeralds, stands at the
+    # beacons fixture's spawn, on normal at noon, and uses the beacon of jump boost, which opens
+    # its menu: it pays with the iron ingot and picks speed, which the beacon gives from then on,
+    # puts the gold ingot in and closes the menu, which drops it, then opens it again and
+    # shift-clicks the emeralds, which don't go in, more than one (D521); it leaves at 480.
+    "beacon_menu": Config({"difficulty": "normal"}, view=3, scenarios=("beacon-menu",),
+                          world=FIXTURES / "beacons" / "world", fixture="beacons",
+                          rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                 ("minecraft:respawn_radius", nbt.Int(0))),
+                          player=BEACON_MENU, keys=("active_effects", "Inventory")),
     "ender-arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "ender-arrows" / "world",
                            fixture="ender-arrows",
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
