@@ -151,6 +151,10 @@ class Config:
     # The second player's saved data, Mate's, whom the whitelist lets in with the bot, or none
     # where there's none (CAL-162).
     mate: dict | None = None
+    # Data packs put in the world's datapacks folder, which both servers find and load as they
+    # start: each pack's folder name and its files, by their paths in it, with what's in them
+    # (CAL-164).
+    datapacks: dict | None = None
 
 
 def stack(item, count=1, components=None):
@@ -218,6 +222,36 @@ CRAFTS = {
         slotted(16, "stick", 2),
         slotted(17, "cobblestone", 8),
     ]),
+}
+
+# The bot's data in `rewards`: in survival mode, its inventory full of wooden swords but for 30
+# cobblestone in its last slot, so what an advancement's loot gives mostly doesn't fit (CAL-164).
+REWARDS = dict(CRAFTS, Inventory=nbt.List(nbt.COMPOUND, [slotted(n, "wooden_sword") for n in range(35)] + [
+    slotted(35, "cobblestone", 30)]))
+
+
+# A loot table of an advancement's rewards with a pool for each `item` and `count` in `pools`, an
+# entry's `modifier` setting its count, its random sequence its own ID, `name`, so both servers
+# draw the same.
+def reward_table(name, *pools):
+    return json.dumps({"type": "minecraft:advancement_reward", "random_sequence": name, "pools": [
+        {"rolls": 1, "entries": [{"type": "minecraft:item", "name": item, "modifier": {
+            "type": "minecraft:set_count", "count": count}}]} for item, count in pools]})
+
+
+# The `rewards` data pack: an advancement done on the player's first tick, which gives 5
+# experience and two loot tables, 4 cobblestone, which fit, then 40 cobblestone, of which 30 fit
+# and 10 are dropped, 2 diamonds, 1 to 3 arrows and 70 ender pearls, all dropped, the pearls in
+# stacks of 16 (CAL-164).
+REWARDS_PACK = {
+    "pack.mcmeta": json.dumps({"pack": {"description": "The rig's rewards", "min_format": 121, "max_format": 121}}),
+    "data/rig/advancement/given.json": json.dumps({
+        "criteria": {"ticked": {"trigger": "minecraft:tick"}},
+        "rewards": {"experience": 5, "loot": ["rig:fits", "rig:given"]}}),
+    "data/rig/loot_table/fits.json": reward_table("rig:fits", ("minecraft:cobblestone", 4)),
+    "data/rig/loot_table/given.json": reward_table(
+        "rig:given", ("minecraft:cobblestone", 40), ("minecraft:diamond", 2),
+        ("minecraft:arrow", {"type": "minecraft:uniform", "min": 1, "max": 3}), ("minecraft:ender_pearl", 70)),
 }
 
 # The bot's data in `dig`: in survival mode, by the spawn, holding a wooden shovel, with shears, a
@@ -616,6 +650,10 @@ CONFIGS = {
     # sends back, and what each saves of it, is compared (CAL-136). Taped, as the mobs natural
     # spawning puts by it are drawn from the levels' randoms (CAL-222).
     "clicks": Config({}, scenarios=("clicks",), player=CLICKS, tape=True),
+    # The bot joins with its inventory full but for a slot, and a data pack's advancement gives it
+    # experience and loot on its first tick: what fits added with a sound, the rest dropped for it
+    # alone to pick up at once (CAL-164).
+    "rewards": Config({}, scenarios=("join",), player=REWARDS, datapacks={"rewards": REWARDS_PACK}),
     "uncompressed": Config({"network-compression-threshold": "-1"}),
     # A saved world, whose chunks both servers read and light (CAL-76). A view of 3 sends the
     # chunks from -4 to 4, which vanilla lights with their neighbours, all of them full in the
@@ -1568,7 +1606,12 @@ def prepare(folder, config, port, vanilla):
         nbt.write(folder / "world" / "players" / "data" / f"{offline_uuid(BOT)}.dat", c.player)
     if c.mate is not None:
         nbt.write(folder / "world" / "players" / "data" / f"{offline_uuid(MATE)}.dat", c.mate)
-    rules = folder / "world" / "data" / "minecraft" / "game_rules.dat"
+    for pack, files in (c.datapacks or {}).items():
+        for path, text in files.items():
+            at = folder / "world" / "datapacks" / pack / path
+            at.parent.mkdir(parents=True, exist_ok=True)
+            at.write_text(text, encoding="utf-8")
+    rules =folder / "world" / "data" / "minecraft" / "game_rules.dat"
     if rules.is_file():
         saved = nbt.read(rules)
         saved["data"]["minecraft:respawn_radius"] = nbt.Int(0)
