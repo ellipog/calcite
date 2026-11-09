@@ -740,8 +740,7 @@ CONFIGS = {
                    rules=DIG_DROP_RULES, player=ORBS),
     # The bot, in survival mode, feeds the feed fixture's penned cows, calf and sheep wheat by the
     # server's clock (D415), and waits as the cows and the sheep breed, their orbs come to it and
-    # their babies grow; no natural spawning, and no advancement messages, as Calcite has no
-    # advancements yet (CAL-158).
+    # their babies grow; no natural spawning, and no advancement messages (CAL-158).
     "feed": Config({}, view=3, scenarios=("feed",), world=FIXTURES / "feed" / "world", fixture="feed",
                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                    player=FEED),
