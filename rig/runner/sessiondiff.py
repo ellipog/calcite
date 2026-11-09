@@ -82,6 +82,10 @@ CHANGES = {"play/block_update", "play/section_blocks_update", "play/light_update
 # identity, so after the overworld the Nether and the End come in either order (CAL-147).
 UNORDERED = {"configuration/update_tags", "play/update_tags", "play/set_time", "play/level_chunk_with_light", "play/update_attributes", "play/update_recipes", "play/login"}
 SORTED = {"play/update_attributes": ("attributes", "attribute")}
+# A living entity's effects' particles, `DATA_EFFECT_PARTICLES`, come from its `activeEffects`, a
+# HashMap keyed by the effects' holders, which hash by identity, so vanilla sends two or more in
+# another order each run; a list of them is compared sorted, and its bytes aren't (D513).
+PARTICLE_TYPE = "#minecraft:particle_type/"
 # Fields vanilla draws afresh each run, which can't match: the session ID the server draws as it
 # starts, which every login gets; the time on a chat message without a signature, which is the
 # server's clock as it reads the message; and a sound's seed, which `Level.playSound` draws from
@@ -157,6 +161,10 @@ def load(path):
         if kind in SORTED and isinstance(value, dict):
             field_name, key = SORTED[kind]
             value = dict(value, **{field_name: sorted(value.get(field_name, []), key=lambda e: str(e.get(key)))})
+        if kind == "play/set_entity_data":
+            value, moved = particles_sorted(value)
+            if moved:
+                r["sha256"] = ""
         if kind in LIT:
             value = under_world_empty(value)
         if kind in CLOCK:
@@ -185,6 +193,22 @@ def load(path):
                 continue
         step.entries.append(Entry(kind, value, r["sha256"], r.get("error", "")))
     return [s for s in steps if s.name != "start" or s.entries or s.changes or s.entities]
+
+
+def particles_sorted(value):
+    """A `set_entity_data`'s `value` with each of its lists of two or more particles sorted, and
+    whether it had one."""
+    if not isinstance(value, dict) or not isinstance(value.get("packedItems"), list):
+        return value, False
+    items = []
+    moved = False
+    for item in value["packedItems"]:
+        v = item.get("value") if isinstance(item, dict) else None
+        if isinstance(v, list) and len(v) > 1 and all(isinstance(p, dict) and str(p.get("type", "")).startswith(PARTICLE_TYPE) for p in v):
+            item = dict(item, value=sorted(v, key=lambda p: json.dumps(p, sort_keys=True)))
+            moved = True
+        items.append(item)
+    return dict(value, packedItems=items), moved
 
 
 def without(value, names):

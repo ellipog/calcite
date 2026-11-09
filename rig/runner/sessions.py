@@ -99,7 +99,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
-                   "breed", "hearsay", "bell", "bane"]
+                   "breed", "hearsay", "bell", "bane", "tipped"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -842,6 +842,15 @@ CONFIGS = {
                             rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                    ("minecraft:respawn_radius", nbt.Int(0))),
                             player=ARROWS),
+    # The bot, in survival mode with nothing, stands at the tipped fixture's spawn, on normal at
+    # midnight, while tipped arrows from as the world loads hit a cow, a zombie and a pig without
+    # AI (D513), which take their potions' effects, and one sticks in a wall, where its potion
+    # wears off 600 ticks later; it leaves at 700.
+    "tipped": Config({"difficulty": "normal"}, view=3, scenarios=("tipped",), world=FIXTURES / "tipped" / "world",
+                     fixture="tipped",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                            ("minecraft:respawn_radius", nbt.Int(0))),
+                     player=ARROWS),
     "ender-arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "ender-arrows" / "world",
                            fixture="ender-arrows",
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),

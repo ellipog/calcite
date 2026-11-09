@@ -38,8 +38,9 @@ LEFT_OUT = {"LastUpdate", "InhabitedTime", "xPos", "zPos", "yPos", "DataVersion"
 ENTITY_TIMING = {"Age", "Motion", "EggLayTime"}
 # An entity's lists in an order no server keeps (CAL-156): a living entity's attributes, which
 # vanilla saves as its `AttributeMap`'s hash map of holders gives them, by identity hashes that
-# differ from run to run; compared as sets.
-UNORDERED = {"attributes"}
+# differ from run to run, and its effects, as its `activeEffects`' hash map of holders gives them
+# (D513); compared as sets.
+UNORDERED = {"attributes", "active_effects"}
 
 
 def chunks(world, dimension="minecraft/overworld", folder="region"):
