@@ -91,7 +91,7 @@ import world.living.{ArmorStand, Death, Fired, Hurled, Hurt, Living, LivingFacts
 import world.difficulty.{LocalDifficulty, moon_brightness}
 import world.mob.{CHICKEN, COW, CREEPER, DONKEY, ENDERMAN, HORSE, INTERACT_SERVER, MOOSHROOM, Making, Mob, PIG, SHEEP, SKELETON, SLIME, SPIDER, VILLAGER, WITCH, ZOMBIE, ZOMBIE_HORSE, ZOMBIE_VILLAGER, held_name, species_named, type_name}
 import world.variants.{MobFacts}
-import world.loot.{Attacked, Located, LocatedEntry, Loot, LootEntity, LootParams, PostAttack, condition_holds, disk_blocks, disk_holds, enchanted_amount, equipment_drop_chance, float_sample, ints_hold, item_holds, location_entries, location_holds, post_attack_effects, random_sequence, roll_table, spawned_effects, tick_entries, tick_holds, trade_offers, trade_sequence, weapon_effects}
+import world.loot.{Attacked, Located, LocatedEntry, Loot, LootEntity, LootParams, PostAttack, condition_holds, disk_blocks, disk_holds, doubles_match, enchanted_amount, equipment_drop_chance, float_sample, ints_hold, item_holds, location_entries, location_holds, post_attack_effects, random_sequence, roll_table, spawned_effects, tick_entries, tick_holds, trade_offers, trade_sequence, weapon_effects}
 import world.item_tracker.{Tracker, Sent, delta_bytes, lp_vec3_bytes, path_bytes, section_of}
 import world.movement.{MovementStates, Mover, meets}
 import math.mth.{RAD_TO_DEG, round_float, table_atan2, table_cos, table_sin}
@@ -571,6 +571,11 @@ struct Player {
     combat: CombatTracker = CombatTracker()
     hurt_by_mob: (i32, i32)? = none
     hurt_by_mob_name: Component? = none
+    // The player who hurt them last, by their UUID, and the ticks that's remembered for,
+    // `lastHurtByPlayer` and `lastHurtByPlayerMemoryTime`, who has the credit for their death
+    // before any mob, `getKillCredit` (CAL-164).
+    hurt_by_player: (i64, i64)? = none
+    hurt_by_player_memory: i32 = 0
     last_climbable: (i32, i32, i32)? = none
     death_time: i32 = 0
     removed: bool = false
@@ -1164,6 +1169,9 @@ pub struct Network {
     // Whether the block a player's using swung their arm, `SUCCESS_SERVER`, until it's sent them
     // (CAL-143).
     server_swing: bool = false
+    // The mob lent out of its level's list as it hurts a player, by its ID, as loot and a
+    // criterion's predicates read it, so the hurt's and the death's triggers find it (CAL-164).
+    lent_mob: (i32, LootEntity)? = none
     // The attack a player's packet asked for, by their connection's slot and the entity ID of what
     // they attack, made once their connection's back among the others, `attack_deferred`, so
     // the players it hurts are heard by them as by everyone (CAL-162).
@@ -5387,11 +5395,16 @@ impl Network {
         self.award_all(mut con, matched)
     }
 
-    // `CriteriaTriggers.CONSUME_ITEM.trigger` for the player, who used up `stack` (CAL-164): each
-    // criterion listening whose `item`, if it has one, holds of the stack, and whose player's
-    // condition holds, awarded.
+    // `CriteriaTriggers.CONSUME_ITEM.trigger` for the player, who used up `stack` (CAL-164).
     fn consume_item(mut self, con: mut Connection, stack: Tag) {
-        let listening = con.player.advancements.listening(String("minecraft:consume_item"))
+        self.item_trigger(mut con, "minecraft:consume_item", stack)
+    }
+
+    // The trigger `trigger` of a stack alone, such as `CONSUME_ITEM` and `USED_TOTEM`, for the
+    // player, of `stack` (CAL-164): each criterion listening whose `item`, if it has one, holds of
+    // the stack, and whose player's condition holds, awarded.
+    fn item_trigger(mut self, con: mut Connection, trigger: str, stack: Tag) {
+        let listening = con.player.advancements.listening(String(trigger))
         if listening.is_empty() {
             return
         }
@@ -5438,25 +5451,182 @@ impl Network {
         if condition == Tag.End {
             return true
         }
+        let me = self.looted(con) else return false
+        return self.entity_condition(con, condition, me)
+    }
+
+    // What loot and a criterion's predicates read of the player, `player_looted`, with the facts
+    // that takes made the first time they're asked for (CAL-164).
+    fn looted(mut self, con: Connection) -> LootEntity? {
         let d = con.player.dim
-        let shared = self.levels[d].world_loot() else return false
-        let env = self.levels[d].shared_env() else return false
+        let env = self.levels[d].shared_env() else return none
         let Env { facts: f, .. } = env.value
         if self.item_facts == none {
             self.item_facts = some(BodyFacts.new(f))
         }
-        let t = self.item_facts.take() else return false
+        let t = self.item_facts.take() else return none
         let me = self.player_looted(con, f, t)
         self.item_facts = some(t)
-        let params = LootParams { origin: some((con.player.x, con.player.y, con.player.z)), this_entity: true, this: some(me) }
+        return some(me)
+    }
+
+    // What a criterion's predicates read of the entity `id` of the level `d` (CAL-164): of `con`'s
+    // player where it's them, of another player, or of a mob or an arrow where the level's
+    // entities are in; else nothing, as of one that isn't there.
+    fn entity_looted(mut self, d: usize, id: i32, con: Connection) -> LootEntity? {
+        if id < 0 {
+            return none
+        }
+        if con.player.entity_id == id {
+            return self.looted(con)
+        }
+        if let (lent, seen) = self.lent_mob {
+            if lent == id {
+                return some(seen.copy())
+            }
+        }
+        if let slot = self.slot_of_entity(id) {
+            let other = self.connections[slot].take() else return none
+            let them = self.looted(other)
+            self.connections[slot] = some(other)
+            return them
+        }
+        if d >= self.entities.len() or self.entities[d] == none {
+            return none
+        }
+        let es = self.take_entities(d)
+        var out: LootEntity? = none
+        if es.list.is_mob(id) {
+            out = some(es.list.mob(id).loot_entity())
+        } else if es.list.is_arrow(id) {
+            let a = es.list.arrow(id)
+            out = some(LootEntity { kind: String("minecraft:arrow"), at: some((a.body.x, a.body.y, a.body.z)) })
+        }
+        self.put_entities(d, es)
+        return out
+    }
+
+    // What a hurt of the damage `source` in the level `d` is to a criterion's damage predicate,
+    // `con`'s player being where it's read (CAL-164): what caused it and what dealt it, where
+    // they're known, whether they're the same, `isDirect`, and its type's tags.
+    fn hit_of(mut self, d: usize, types: DamageTypes, source: Damage, con: Connection) -> Hit {
+        let attacker = self.entity_looted(d, source.cause, con)
+        let direct = if source.direct == source.cause { attacker.copy() } else { self.entity_looted(d, source.direct, con) }
+        return Hit { attacker: attacker, direct: direct, is_direct: source.cause == source.direct, tags: types.tags_of(source.kind) }
+    }
+
+    // `DamagePredicate.matches` of `predicate` for `con`'s player (CAL-164): `dealt` and `taken`
+    // within its bounds, its `source_entity` holding of what caused it, `blocked` as it was, and
+    // its `type`, a `DamageSourcePredicate`, holding of the hit where the player is.
+    fn damage_holds(mut self, con: Connection, predicate: Tag, dealt: f32, taken: f32, blocked: bool, hit: Hit) -> bool {
+        let Tag.Compound(p) = predicate else return false
+        if p.contains("dealt") and not doubles_match(p["dealt"], f64(dealt)) {
+            return false
+        }
+        if p.contains("taken") and not doubles_match(p["taken"], f64(taken)) {
+            return false
+        }
+        if p.contains("source_entity") {
+            let e = hit.attacker.copy() else return false
+            if not self.entity_condition(con, entity_properties(p["source_entity"]), e) {
+                return false
+            }
+        }
+        if p.contains("blocked") and (p["blocked"].number_bool() ?? false) != blocked {
+            return false
+        }
+        if not p.contains("type") {
+            return true
+        }
+        let d = con.player.dim
+        let shared = self.levels[d].world_loot() else return false
+        let env = self.levels[d].shared_env() else return false
+        let Env { facts: f, .. } = env.value
+        var condition = JavaHashMap<String, Tag>()
+        condition.insert(String("type"), Tag.Str(String("minecraft:damage_source_properties")))
+        condition.insert(String("predicate"), p["type"].copy())
+        let params = LootParams { origin: some((con.player.x, con.player.y, con.player.z)), damage_source: true, attacker: hit.attacker.copy(), direct_attacker: hit.direct.copy(), direct: hit.is_direct, damage_tags: some(hit.tags) }
         var missing = List<String>()
         var random = self.levels[d].lend_level_random()
-        let holds = condition_holds(shared.value, f, self.levels[d], mut random, condition, params, mut missing)
+        let holds = condition_holds(shared.value, f, self.levels[d], mut random, Tag.Compound(condition), params, mut missing)
         self.levels[d].give_back_level_random(random)
         for m in missing {
             self.levels[d].unimplemented(m)
         }
         return holds
+    }
+
+    // `CriteriaTriggers.ENTITY_HURT_PLAYER.trigger` for the player, hurt as `hit` has it, `dealt`
+    // of it to take, `taken` taken, blocked or not (CAL-164): each criterion listening whose
+    // `damage` holds and whose player's condition holds, awarded.
+    fn entity_hurt_player(mut self, con: mut Connection, dealt: f32, taken: f32, blocked: bool, hit: Hit) {
+        let listening = con.player.advancements.listening(String("minecraft:entity_hurt_player"))
+        if listening.is_empty() {
+            return
+        }
+        var matched = List<Listener>()
+        for (key, conditions) in listening {
+            let damage = field_of(conditions, "damage")
+            if damage != Tag.End and not self.damage_holds(con, damage, dealt, taken, blocked, hit.copy()) {
+                continue
+            }
+            if self.player_holds(con, conditions) {
+                matched.push(key.copy())
+            }
+        }
+        self.award_all(mut con, matched)
+    }
+
+    // `CriteriaTriggers.PLAYER_HURT_ENTITY.trigger` for the player, who hurt `victim` as `hit` has
+    // it (CAL-164): each criterion listening whose `damage` holds, whose `entity` holds of the
+    // victim where the player is, and whose player's condition holds, awarded.
+    fn player_hurt_entity(mut self, con: mut Connection, victim: LootEntity, dealt: f32, taken: f32, blocked: bool, hit: Hit) {
+        let listening = con.player.advancements.listening(String("minecraft:player_hurt_entity"))
+        if listening.is_empty() {
+            return
+        }
+        var matched = List<Listener>()
+        for (key, conditions) in listening {
+            let damage = field_of(conditions, "damage")
+            if damage != Tag.End and not self.damage_holds(con, damage, dealt, taken, blocked, hit.copy()) {
+                continue
+            }
+            let entity = field_of(conditions, "entity")
+            if entity != Tag.End and not self.entity_condition(con, entity, victim.copy()) {
+                continue
+            }
+            if self.player_holds(con, conditions) {
+                matched.push(key.copy())
+            }
+        }
+        self.award_all(mut con, matched)
+    }
+
+    // `CriteriaTriggers.ENTITY_KILLED_PLAYER.trigger` for the player, killed by `killer`, who has
+    // the credit (CAL-164): each criterion listening whose `entity` holds of the killer where the
+    // player is and whose player's condition holds, awarded. A `killing_blow` is said to be
+    // missing, and doesn't hold.
+    fn entity_killed_player(mut self, con: mut Connection, killer: LootEntity) {
+        let listening = con.player.advancements.listening(String("minecraft:entity_killed_player"))
+        if listening.is_empty() {
+            return
+        }
+        let d = con.player.dim
+        var matched = List<Listener>()
+        for (key, conditions) in listening {
+            if field_of(conditions, "killing_blow") != Tag.End {
+                self.levels[d].unimplemented(String("A kill's killing blow, as an advancement tests it"))
+                continue
+            }
+            let entity = field_of(conditions, "entity")
+            if entity != Tag.End and not self.entity_condition(con, entity, killer.copy()) {
+                continue
+            }
+            if self.player_holds(con, conditions) {
+                matched.push(key.copy())
+            }
+        }
+        self.award_all(mut con, matched)
     }
 
     // Each of `matched`, a criterion that held, awarded in turn, as `SimpleCriterionTrigger`
@@ -7464,7 +7634,9 @@ impl Network {
         let shown = living_display_name(mob.living, this.kind.copy())
         let blame = Blame { cause: some(shown.copy()), direct: some(shown), weapon: weapon }
         let waiting = con.player.waiting_for_respawn
+        self.lent_mob = some((id, this.copy()))
         let hurt = self.hurt_player_by(mut con, lf, source, damage, blame)
+        self.lent_mob = none
         if self.world.forgive_dead_players and con.player.waiting_for_respawn and not waiting {
             // Their death's told the mob that killed them too, lent out as it is, within reach,
             // so well within the box `tellNeutralMobsThatIDied` looks in.
@@ -7604,7 +7776,9 @@ impl Network {
         var hurt = false
         if s.hurts {
             let waiting = con.player.waiting_for_respawn
+            self.lent_mob = some((id, this.copy()))
             hurt = self.hurt_player_by(mut con, lf, source, damage, blame)
+            self.lent_mob = none
             if self.world.forgive_dead_players and con.player.waiting_for_respawn and not waiting {
                 // Their death's told the mob that killed them too, as `mob_attack` tells it.
                 if let p = con.profile {
@@ -7870,7 +8044,7 @@ impl Network {
             all = self.take_entities(d)
         } else if all.list.is_mob(h.target) {
             living = true
-            let (back, was, dodged) = self.shoot_mob(all, d, h.target, source, amount, attacker, burns, stuck)
+            let (back, was, dodged) = self.shoot_mob(all, d, h.target, source, amount, attacker, context.direct_attacker.copy(), burns, stuck)
             all = back
             hurt = was
             flies_on = dodged
@@ -8447,8 +8621,10 @@ impl Network {
     // arrow more in it where it's `stuck`. An enderman it'd hurt dodges it
     // instead, `dodge`, then, in the arrow's tick, within the world border, what that shows and
     // plays sent in turn, the fire the arrow lit kept, as `projectileReceivesSideEffectsOnHit`
-    // has it (CAL-159). The level's entities, whether it was hurt, and whether it was dodged.
-    fn shoot_mob(mut self, es: own LevelEntities, d: usize, target: i32, source: Damage, amount: f32, attacker: LootEntity?, burns: bool, stuck: bool) -> (LevelEntities, bool, bool) {
+    // has it (CAL-159). Where a player caused it, their `PLAYER_HURT_ENTITY` as its `hurtServer`
+    // ends, dealt by `projectile` (CAL-164). The level's entities, whether it was hurt, and
+    // whether it was dodged.
+    fn shoot_mob(mut self, es: own LevelEntities, d: usize, target: i32, source: Damage, amount: f32, attacker: LootEntity?, projectile: LootEntity?, burns: bool, stuck: bool) -> (LevelEntities, bool, bool) {
         var all = es
         let lent = all.list.lend_mob(target) else return (all, false, false)
         var mob = lent
@@ -8508,8 +8684,10 @@ impl Network {
         } else if not dodged {
             mob.living.body.fire = fire
         }
+        let hit_tags = lf.damage.tags_of(source.kind)
         self.items = some(items)
         self.living_facts = some(lf)
+        let victim = mob.loot_entity()
         all.list.give_back_mob(mob)
         if dodged {
             var k = 0usize
@@ -8552,6 +8730,13 @@ impl Network {
             self.put_entities(d, all)
             self.died(d, target, death)
             all = self.take_entities(d)
+        }
+        if h.hurt {
+            if let who = source.player {
+                self.put_entities(d, all)
+                self.shot_by_player(who, victim, projectile, h.dealt, h.taken, hit_tags)
+                all = self.take_entities(d)
+            }
         }
         // The reinforcements it called, after its death, as `Zombie.hurtServer` calls them.
         if let t = call {
@@ -8843,8 +9028,9 @@ impl Network {
         if ender {
             self.levels[d].unimplemented(String("An enderman a thrown potion hurts, hurtWithCleanWater and its teleports"))
         }
+        let potion = LootEntity { kind: s.kind.copy(), at: some((s.x, s.y, s.z)) }
         let (source, attacker, _) = self.splash_source(d, all.list, s, kind, tx, tz)
-        let (back, _, _) = self.shoot_mob(all, d, id, source, amount, attacker, false, false)
+        let (back, _, _) = self.shoot_mob(all, d, id, source, amount, attacker, some(potion), false, false)
         return back
     }
 
@@ -12434,6 +12620,12 @@ impl Network {
                 self.changed_block(mut con, f, t)
             }
         }
+        // `baseTick`: the player who hurt them forgotten once its ticks are out (CAL-164).
+        if con.player.hurt_by_player_memory > 0 {
+            con.player.hurt_by_player_memory -= 1
+        } else {
+            con.player.hurt_by_player = none
+        }
         if let (by, stamp) = con.player.hurt_by_mob {
             if not self.living_alive(d, by) or con.player.own_ticks - stamp > 100 {
                 con.player.hurt_by_mob = none
@@ -15193,6 +15385,12 @@ impl Network {
         if h.dies {
             self.mob_dies(mut con, d, items, mut mob, lf.damage.tags_of(source.kind))
         }
+        // `PLAYER_HURT_ENTITY` as its `hurtServer` ends, the player both what caused it and what
+        // dealt it (CAL-164).
+        if let me_looted = self.looted(con) {
+            let hit = Hit { attacker: some(me_looted.copy()), direct: some(me_looted), is_direct: true, tags: lf.damage.tags_of(source.kind) }
+            self.player_hurt_entity(mut con, mob.loot_entity(), h.dealt, h.taken, false, hit)
+        }
         let hard = self.world.settings.difficulty == Difficulty.Hard
         var out = h
         out.reinforce = mob.after_hurt(h, hard, source)
@@ -17915,6 +18113,7 @@ impl Network {
         if damage < 0.0f32 {
             damage = 0.0f32
         }
+        let dealt = damage
         if lf.damage.is(kind, DAMAGES_HELMET) and worn_in(con, 5) != none {
             self.hurt_equipment(mut con, lf.damage, source, damage, [5usize])
             damage = damage * 0.75f32
@@ -17939,6 +18138,12 @@ impl Network {
         if source.cause >= 0 and (source.living_cause or source.player != none) and not lf.damage.is(kind, NO_ANGER) {
             con.player.hurt_by_mob = some((source.cause, con.player.own_ticks))
             con.player.hurt_by_mob_name = blame.cause.copy()
+        }
+        // `resolvePlayerResponsibleForDamage`: a player who caused it remembered 100 ticks
+        // (CAL-164). A tame wolf's owner comes with wolves.
+        if let who = source.player {
+            con.player.hurt_by_player = some(who)
+            con.player.hurt_by_player_memory = 100
         }
         let me = con.player.entity_id
         if whole {
@@ -17977,8 +18182,73 @@ impl Network {
         if con.player.effects.has(INFESTED) {
             self.levels[d].unimplemented(String("The silverfish of the infested effect as a player's hurt"))
         }
+        // `ENTITY_HURT_PLAYER`, then the `PLAYER_HURT_ENTITY` of the player who caused it, as
+        // `hurtServer` ends (CAL-164). A shield's block comes with shields.
+        let hit = self.hit_of(d, lf.damage, source, con)
+        self.entity_hurt_player(mut con, dealt, damage, false, hit.copy())
+        if let who = source.player {
+            self.player_hurt_player(mut con, who, dealt, damage, hit)
+        }
         self.send_level_events_with(d, mut con)
         return true
+    }
+
+    // The `PLAYER_HURT_ENTITY` of the player of the UUID `who`, whose projectile `projectile` hurt
+    // `victim`, `dealt` of it to take, `taken` taken, the damage's tags `tags` (CAL-164).
+    fn shot_by_player(mut self, who: (i64, i64), victim: LootEntity, projectile: LootEntity?, dealt: f32, taken: f32, tags: u32) {
+        let (most, least) = who
+        for slot in 0..self.connections.len() {
+            if not self.playing(slot) {
+                continue
+            }
+            var other = self.connections[slot].take() else continue
+            let found = match other.profile {
+                some(p) => p.id.most == most and p.id.least == least,
+                none => false,
+            }
+            if found {
+                if let me = self.looted(other) {
+                    let hit = Hit { attacker: some(me), direct: projectile.copy(), is_direct: false, tags: tags }
+                    self.player_hurt_entity(mut other, victim.copy(), dealt, taken, false, hit)
+                }
+            }
+            self.connections[slot] = some(other)
+            if found {
+                return
+            }
+        }
+    }
+
+    // The `PLAYER_HURT_ENTITY` of the player of the UUID `who`, who hurt `con`'s player as `hit`
+    // has it (CAL-164), they themselves where it's them.
+    fn player_hurt_player(mut self, con: mut Connection, who: (i64, i64), dealt: f32, taken: f32, hit: Hit) {
+        let (most, least) = who
+        let me = self.looted(con) else return
+        let themselves = match con.profile {
+            some(p) => p.id.most == most and p.id.least == least,
+            none => false,
+        }
+        if themselves {
+            self.player_hurt_entity(mut con, me, dealt, taken, false, hit)
+            return
+        }
+        for slot in 0..self.connections.len() {
+            if not self.playing(slot) {
+                continue
+            }
+            var other = self.connections[slot].take() else continue
+            var found = false
+            if let p = other.profile {
+                found = p.id.most == most and p.id.least == least
+            }
+            if found {
+                self.player_hurt_entity(mut other, me.copy(), dealt, taken, false, hit.copy())
+            }
+            self.connections[slot] = some(other)
+            if found {
+                return
+            }
+        }
     }
 
     // `checkTotemDeathProtection` for the player (D518): unless the damage of the type `kind`
@@ -18007,9 +18277,11 @@ impl Network {
         self.items = some(items)
         let p = protection else return false
         let stack = held_in(con, hand) else return false
-        set_held(mut con, hand, shrunk(stack, 1))
+        set_held(mut con, hand, shrunk(stack.copy(), 1))
         let d = con.player.dim
-        self.levels[d].unimplemented(String("A totem's used stat, its used_totem criterion and its use's vibration"))
+        self.levels[d].unimplemented(String("A totem's used stat and its use's vibration"))
+        // `CriteriaTriggers.USED_TOTEM`, of the stack as it was (CAL-164).
+        self.item_trigger(mut con, "minecraft:used_totem", stack)
         let (max_health, _) = player_maxes(con.player.attributes)
         set_health(mut con.player.entity_data, 1.0f32, max_health)
         self.consume_player(mut con, lf, death_effects(p))
@@ -18705,6 +18977,19 @@ impl Network {
                 self.make_drops_for(mut con)
             }
         }
+        // Who has the credit for their death, `getKillCredit`, the player who hurt them lately,
+        // else the mob, awarded it, `awardKillScore`: their `ENTITY_KILLED_PLAYER`, then, where
+        // it's a player, that player's `PLAYER_KILLED_ENTITY` of them (CAL-164).
+        let credited = match con.player.hurt_by_player {
+            some(who) => self.player_entity(con, who),
+            none => match con.player.hurt_by_mob {
+                some((by, _)) => some(by),
+                none => none,
+            },
+        }
+        if let by = credited {
+            self.kill_credited(mut con, by)
+        }
         self.send_level_events_with(d, mut con)
         self.send_seen_and_self(mut con, encode_play(ClientboundEntityEvent { entity_id: me, event: 3i8 }))
         con.player.entity_data.set(TICKS_FROZEN, Value.Number(0))
@@ -18713,6 +18998,47 @@ impl Network {
         let block = BlockPos { x: i32.saturate(con.player.x.floor()), y: i32.saturate(con.player.y.floor()), z: i32.saturate(con.player.z.floor()) }
         con.player.last_death = some(GlobalPos { dimension: self.world.dims[d].id.copy(), pos: block })
         con.player.waiting_for_respawn = true
+    }
+
+    // The entity ID of the player of the UUID `who` in the level of `con`'s player, theirs where
+    // it's them, `none` where that player isn't there (CAL-164).
+    fn player_entity(self, con: Connection, who: (i64, i64)) -> i32? {
+        let (most, least) = who
+        if let p = con.profile {
+            if p.id.most == most and p.id.least == least {
+                return some(con.player.entity_id)
+            }
+        }
+        for slot in 0..self.connections.len() {
+            if not self.playing(slot) {
+                continue
+            }
+            if let other = self.connections[slot] {
+                if let p = other.profile {
+                    if p.id.most == most and p.id.least == least and other.player.dim == con.player.dim {
+                        return some(other.player.entity_id)
+                    }
+                }
+            }
+        }
+        return none
+    }
+
+    // `awardKillScore` of the entity `by`, which has the credit for the death of `con`'s player
+    // (CAL-164): their `ENTITY_KILLED_PLAYER` of it, and, where it's another player, that player's
+    // `PLAYER_KILLED_ENTITY` of them. Nothing where it's gone.
+    fn kill_credited(mut self, con: mut Connection, by: i32) {
+        let d = con.player.dim
+        let killer = self.entity_looted(d, by, con) else return
+        self.entity_killed_player(mut con, killer)
+        if by == con.player.entity_id {
+            return
+        }
+        let slot = self.slot_of_entity(by) else return
+        let me = self.looted(con) else return
+        var other = self.connections[slot].take() else return
+        self.killed_by_player(mut other, me)
+        self.connections[slot] = some(other)
     }
 
     // `PlayerList.respawn` of a dead player, as `handleClientCommand` asks it (D428): where they
@@ -19920,11 +20246,12 @@ fn smash_push(living: mut Living, lf: LivingFacts, x: f64, y: f64, z: f64, fell:
 // chunks it's sent and is to send, their chat and its checks, their teleports and moves, and
 // their data as it was read, kept; their game modes, their abilities as the mode gives them,
 // their attributes' bases, `assignBaseValues`, without their modifiers, full health, their
-// enchantment seed, ender chest, skin's parts and main hand, and where they last died; what they
-// carried, the slot they held, and their experience only where `keeps`, with `keep_inventory`
-// or for a spectator, `transferInventoryXpAndScore`; their health, food and experience sent again
-// on their next tick; `random`, their new entity's; everything else a new player's, their
-// client's loading timer at 60 and no longer waiting for them to respawn.
+// enchantment seed, ender chest, skin's parts and main hand, where they last died, their
+// advancements, which the player list keeps for them, and their recipe book, `copyOverData`
+// (CAL-164); what they carried, the slot they held, and their experience only where `keeps`,
+// with `keep_inventory` or for a spectator, `transferInventoryXpAndScore`; their health, food and
+// experience sent again on their next tick; `random`, their new entity's; everything else a new
+// player's, their client's loading timer at 60 and no longer waiting for them to respawn.
 fn respawned_player(old: Player, information: ClientInformation, random: own LegacyRandom, dim: usize, keeps: bool) -> Player {
     var abilities = Abilities()
     abilities.update(old.mode)
@@ -19948,7 +20275,7 @@ fn respawned_player(old: Player, information: ClientInformation, random: own Leg
     status.sent_xp = -1
     let inventory = if keeps { old.inventory.copy() } else { Inventory.empty() }
     let selected = if keeps { old.selected } else { 0 }
-    return Player { entity_id: old.entity_id, tick_count: old.tick_count, teleport_id: old.teleport_id, awaiting: old.awaiting, awaiting_time: old.awaiting_time, position_this_tick: old.position_this_tick, moved_this_tick: old.moved_this_tick, center_x: old.center_x, center_z: old.center_z, view: old.view, sender: old.sender.copy(), asked: old.asked, last_seen: old.last_seen.copy(), next_chat_index: old.next_chat_index, chat_spam: old.chat_spam, command_spam: old.command_spam, session: old.session.copy(), chain: old.chain, signatures: old.signatures.copy(), data: old.data.copy(), mode: old.mode, previous_mode: old.previous_mode, abilities: abilities, level: old.level, joined: old.joined, dim: dim, selected: selected, inventory: inventory, ender: old.ender.copy(), attributes: attributes, worn: unworn(), ack: old.ack, entity_data: data, status: status, random: some(random), last_death: old.last_death.copy(), first_good: old.first_good, last_good: old.last_good, move_packets: old.move_packets, known_packets: old.known_packets, floating: old.floating, floating_ticks: old.floating_ticks }
+    return Player { entity_id: old.entity_id, tick_count: old.tick_count, teleport_id: old.teleport_id, awaiting: old.awaiting, awaiting_time: old.awaiting_time, position_this_tick: old.position_this_tick, moved_this_tick: old.moved_this_tick, center_x: old.center_x, center_z: old.center_z, view: old.view, sender: old.sender.copy(), asked: old.asked, last_seen: old.last_seen.copy(), next_chat_index: old.next_chat_index, chat_spam: old.chat_spam, command_spam: old.command_spam, session: old.session.copy(), chain: old.chain, signatures: old.signatures.copy(), data: old.data.copy(), mode: old.mode, previous_mode: old.previous_mode, abilities: abilities, level: old.level, joined: old.joined, dim: dim, selected: selected, inventory: inventory, ender: old.ender.copy(), attributes: attributes, worn: unworn(), ack: old.ack, entity_data: data, status: status, random: some(random), last_death: old.last_death.copy(), advancements: old.advancements.copy(), recipe_book: old.recipe_book.copy(), first_good: old.first_good, last_good: old.last_good, move_packets: old.move_packets, known_packets: old.known_packets, floating: old.floating, floating_ticks: old.floating_ticks }
 }
 
 // What a player's saved data `d` says of their death (D427): the ticks they've been dead,
@@ -20398,6 +20725,25 @@ fn held_in(con: Connection, hand: i32) -> Tag? {
         return con.player.inventory.selected(con.player.selected)
     }
     return con.player.inventory.menu_slot(45)
+}
+
+// A hurt as a criterion's damage predicate reads it (CAL-164): what caused it and what dealt it,
+// where they're known, whether they're the same, `isDirect`, and its type's tags.
+struct Hit {
+    attacker: LootEntity? = none
+    direct: LootEntity? = none
+    is_direct: bool = false
+    tags: u32 = 0u32
+}
+
+// An entity predicate as a condition of `this`, `minecraft:entity_properties`, as
+// `EntityPredicate.matches` tests one of an entity in `createContext` (CAL-164).
+fn entity_properties(predicate: Tag) -> Tag {
+    var m = JavaHashMap<String, Tag>()
+    m.insert(String("type"), Tag.Str(String("minecraft:entity_properties")))
+    m.insert(String("entity"), Tag.Str(String("this")))
+    m.insert(String("predicate"), predicate.copy())
+    return Tag.Compound(m)
 }
 
 // Whether `set`, a `HolderSet` of recipes as its codec writes it, an ID or a list of them, holds
