@@ -92,9 +92,12 @@ PARTICLE_TYPE = "#minecraft:particle_type/"
 RUNS = {"play/update_mob_effect", "play/remove_mob_effect"}
 # Fields vanilla draws afresh each run, which can't match: the session ID the server draws as it
 # starts, which every login gets; the time on a chat message without a signature, which is the
-# server's clock as it reads the message; and a sound's seed, which `Level.playSound` draws from
-# `threadSafeRandom`, seeded afresh as the server starts (CAL-125).
-DRAWN = {"login/login_finished": {"sessionId"}, "play/player_chat": {"timeStamp"}, "play/sound": {"seed"}}
+# server's clock as it reads the message; a sound's seed, which `Level.playSound` draws from
+# `threadSafeRandom`, seeded afresh as the server starts (CAL-125); and a player's latency, how
+# many milliseconds their client took to answer a keep-alive, `handleKeepAlive`, which on one
+# machine is 0 or 1 as the clock's milliseconds turn over (D558).
+DRAWN = {"login/login_finished": {"sessionId"}, "play/player_chat": {"timeStamp"}, "play/sound": {"seed"},
+         "play/player_info_update": {"latency"}}
 # An advancement update's layout down a tab, each added advancement's `y`, comes of vanilla's
 # `TreeNodePosition` walking each advancement's children in the order of a set hashed by
 # identity, so it's another each run, where its `x`, its depth, isn't; and when each criterion

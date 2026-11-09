@@ -317,6 +317,7 @@ class Sessions(unittest.TestCase):
             self.packet("play", "level_chunk_with_light", {"x": 1, "z": 0, "data": 1}, "c2"),
             self.packet("play", "chunk_batch_finished", {"batchSize": 2}),
             self.packet("play", "commands", {"entries": 3}),
+            self.packet("play", "player_info_update", {"entries": [{"profileId": "p", "latency": 0}]}, "l0"),
         ]
         calcite = [
             {"mark": "step login"},
@@ -327,10 +328,12 @@ class Sessions(unittest.TestCase):
             self.packet("play", "level_chunk_with_light", {"x": 1, "z": 0, "data": 1}, "c9"),
             self.packet("play", "level_chunk_with_light", {"x": 0, "z": 0, "data": 1}, "c8"),
             self.packet("play", "chunk_batch_finished", {"batchSize": 2}),
+            self.packet("play", "player_info_update", {"entries": [{"profileId": "p", "latency": 1}]}, "l1"),
         ]
         report, _ = self.compare(vanilla, calcite)
         keys = sorted((f.key, f.what) for f in report.findings)
-        # The session ID is drawn, and chunks are a set whose bytes vanilla doesn't fix.
+        # The session ID and a player's latency are drawn, and chunks are a set whose bytes vanilla
+        # doesn't fix.
         self.assertEqual(keys, [("session:join/configuration/custom_payload", "differs"), ("session:join/join/commands", "only vanilla sends it")])
         self.assertFalse(report.passed)
         brand = "---\ntitle: Brand\nkind: identity\ncases:\n  - session:*/configuration/custom_payload\n---\n"
