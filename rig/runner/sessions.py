@@ -1665,6 +1665,65 @@ def typed(value):
     return (type(value).__name__, value)
 
 
+def progress_kept(pairs):
+    """A progress file's object as its members, in order, each criterion's time only that it was
+    obtained: when is the server's clock as it was awarded."""
+    return [(k, True if isinstance(v, str) else v) for k, v in pairs]
+
+
+def compare_progress(config, name=None):
+    """Whether both servers saved the bot's advancements the same (CAL-164),
+    `players/advancements/<uuid>.json`: each advancement with progress, in the order they were
+    started, each with its criteria obtained, in their `HashMap`'s order, and whether it's done,
+    printing what differs. A server that saved none, as when the bot never left, says so."""
+    name = name or BOT
+    saved = {}
+    for side in ("vanilla", "calcite"):
+        path = SESSIONS / config / side / "world" / "players" / "advancements" / f"{offline_uuid(name)}.json"
+        if not path.is_file():
+            print(f"saved progress differs  [{config}] {side} saved no advancements for {name}")
+            return False
+        saved[side] = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=progress_kept)
+    vanilla, calcite = saved["vanilla"], saved["calcite"]
+    same = vanilla == calcite
+    count = sum(1 for k, _ in vanilla if k != "DataVersion")
+    who = "" if name == BOT else f" ({name})"
+    print(f"saved progress {'PASS' if same else 'differs'}    {count} advancements{who}")
+    if not same:
+        kept = dict(calcite)
+        for k, v in vanilla:
+            if kept.get(k) != v:
+                print(f"  [{config}] {k}:\n      vanilla: {v}\n      calcite: {kept.get(k)}")
+        for k, _ in calcite:
+            if k not in dict(vanilla):
+                print(f"  [{config}] {k}: only Calcite saved it")
+        if [k for k, _ in vanilla] != [k for k, _ in calcite]:
+            print(f"  [{config}] the order differs")
+    return compare_book(config, name) and same
+
+
+def compare_book(config, name):
+    """Whether both servers saved the player `name`'s recipe book the same, their data's
+    `recipeBook` (CAL-164): its tabs' settings, and the recipes known and highlighted, each list
+    sorted, as vanilla's come from sets hashed by identity, in another order each run."""
+    books = {}
+    for side in ("vanilla", "calcite"):
+        path = SESSIONS / config / side / "world" / "players" / "data" / f"{offline_uuid(name)}.dat"
+        if not path.is_file():
+            print(f"saved book     differs  [{config}] {side} saved no data for {name}")
+            return False
+        book = nbt.read(path).get("recipeBook")
+        if isinstance(book, dict):
+            book = {k: sorted(v) if isinstance(v, list) else v for k, v in book.items()}
+        books[side] = book
+    same = books["vanilla"] == books["calcite"]
+    known = len((books["vanilla"] or {}).get("recipes", []))
+    print(f"saved book     {'PASS' if same else 'differs'}    {known} recipes known")
+    if not same:
+        print(f"  [{config}] recipeBook:\n      vanilla: {books['vanilla']}\n      calcite: {books['calcite']}")
+    return same
+
+
 def compare_saved(config, name=None):
     """Whether both servers saved the bot's PLAYER_KEYS and the configuration's own keys the same,
     or the player `name`'s, printing what differs."""
@@ -1761,7 +1820,8 @@ def main():
     dump(a, files)
     report = sessiondiff.run(SESSIONS, configs, scenarios, CALCITE / "rig" / "differences", show=args.show, complete=complete)
     saved = all([compare_saved(c) for c in configs if CONFIGS[c].player is not None and scenarios[c]]
-                + [compare_saved(c, MATE) for c in configs if CONFIGS[c].mate is not None and scenarios[c]])
+                + [compare_saved(c, MATE) for c in configs if CONFIGS[c].mate is not None and scenarios[c]]
+                + [compare_progress(c) for c in configs if scenarios[c]])
     for c in configs:
         if CONFIGS[c].fixture is not None and scenarios[c]:
             compare_chunks(c, args.show)

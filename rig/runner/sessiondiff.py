@@ -103,6 +103,10 @@ DRAWN = {"login/login_finished": {"sessionId"}, "play/player_chat": {"timeStamp"
 # `HashSet`s and a `HashMap` filled as that walk goes, whose entries in one bucket keep the order
 # they went in, so another each run too; each is compared in order of its IDs (CAL-164).
 ADVANCEMENTS = "play/update_advancements"
+# The recipe book a player joins with, `sendInitialRecipeBook`, is what they know, `known`, a set
+# hashed by identity, so vanilla sends it in another order each run; it's compared in order of
+# the displays' numbers, and its bytes aren't (CAL-164).
+KNOWN_RECIPES = "play/recipe_book_add"
 # An item's enchantments, as SessionDump writes `ItemEnchantments`, are an `Object2IntOpenHashMap`
 # keyed by their holders, which hash by identity, so vanilla writes two or more in another order
 # each run; they're compared in their text's order, and the bytes aren't (CAL-164).
@@ -177,6 +181,9 @@ def load(path):
         if kind == ADVANCEMENTS:
             value = advancements_sorted(obtained_only(without(value, {"y"})))
             r["sha256"] = ""
+        if kind == KNOWN_RECIPES and isinstance(value, dict) and value.get("replace"):
+            value = dict(value, entries=sorted(value.get("entries", []), key=display_number))
+            r["sha256"] = ""
         value, moved = enchantments_sorted(value)
         if moved:
             r["sha256"] = ""
@@ -250,6 +257,14 @@ def particles_sorted(value):
             moved = True
         items.append(item)
     return dict(value, packedItems=items), moved
+
+
+def display_number(entry):
+    """A recipe book entry's display's number, as SessionDump writes `RecipeDisplayId`."""
+    try:
+        return int(entry["contents"]["id"]["index"])
+    except (KeyError, TypeError, ValueError):
+        return -1
 
 
 def advancements_sorted(value):

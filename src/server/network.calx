@@ -14,6 +14,7 @@ import chat.component.{Argument, Component, HoverEvent, TextColor}
 import chat.language.{Language}
 import java.text.{string_hash}
 import java.uuid.{Uuid}
+import json.tree.{Json}
 import nbt.tag.{Tag}
 import protocol.chat.{ChatSession, ChatTypeBound, ClientboundPlayerChat, FilterMask, MessageSignature, PackedSignature, ServerboundChat, ServerboundChatCommandSigned, SignedBody}
 import protocol.codec.{Decoder}
@@ -63,6 +64,7 @@ import storage.level.{LevelData, Spawn, data_version_or}
 import storage.region.{Compression, unpack}
 import storage.regions.{ChunkRead, read_root}
 import storage.players.{PlayerFiles, SavedPosition, saved_position}
+import storage.progress.{ProgressFiles}
 import storage.poi.{PoiFormat}
 import storage.world_gen.{world_gen_id}
 import world.border.{Border, BorderSettings, saved_id as border_id}
@@ -1085,6 +1087,8 @@ pub struct Network {
     // for.
     spawn_pending: bool = false
     players: PlayerFiles? = none
+    // The world's players' advancements, `players/advancements`, which a replay hasn't (CAL-164).
+    progress_files: ProgressFiles? = none
     collisions: CollisionStates? = none
     // Whether each block state is a liquid, which players' poses pass through, made from the
     // block facts when a pose is first fitted (CAL-141).
@@ -1239,6 +1243,11 @@ impl Network {
         self.respawn = respawn
         self.respawn_radius = respawn_radius
         self.players = players
+    }
+
+    /// Sets the folder of the world's players' advancements, which a replay hasn't (CAL-164).
+    pub fn set_progress(mut self, files: own ProgressFiles?) {
+        self.progress_files = files
     }
 
     /// Sets who may join, which is everyone until it's set.
@@ -1944,7 +1953,20 @@ impl Network {
         let p = con.profile else return
         var saving = self.saving.take() else return
         let dimension = self.world.dims[con.player.dim].id.to_string()
-        saving.save(Save.Player(p.id, p.name.copy(), Tag.Compound(player_tag(con.player, p.id, dimension))))
+        var tag = player_tag(con.player, p.id, dimension)
+        // Their recipe book, `ServerRecipeBook.pack` (CAL-164).
+        if let shared = self.world.recipes.copy() {
+            tag.insert(String("recipeBook"), con.player.recipe_book.pack(shared.value))
+        }
+        saving.save(Save.Player(p.id, p.name.copy(), Tag.Compound(tag)))
+        // Then their advancements, `PlayerAdvancements.save` (CAL-164).
+        if let a = self.world.advancements {
+            if let files = self.progress_files {
+                let offset = unsafe { self.clock.local_offset() }
+                let members = con.player.advancements.to_json(a.value, offset)
+                saving.save(Save.Progress(files.copy(), files.file(p.id.to_string()), members))
+            }
+        }
         self.saving = some(saving)
     }
 
@@ -4976,10 +4998,33 @@ impl Network {
         kept.update(mode)
         self.joins += 1
         con.player = Player { entity_id: id, x: con.prepare.x, y: con.prepare.y, z: con.prepare.z, y_rot: y_rot, x_rot: x_rot, last_seen: LastSeenValidator.new(), chat_spam: chat_spam, command_spam: command_spam, data: saved_data, mode: mode, previous_mode: previous, abilities: kept, level: self.access.level(profile.id), joined: self.joins, sender: ChunkSender.with_rate(self.world.settings.chunk_send_cap, self.world.settings.chunk_send_multiplier, self.world.settings.chunk_send_boost), dim: con.prepare.dim, selected: selected, inventory: inventory, ender: ender, attributes: attributes, worn: unworn(), old_attributes: old_attributes, entity_data: player_data(), random: some(random) }
-        // Their advancements, as `getPlayerAdvancements` makes them with the player, each
-        // criterion listened for (CAL-164).
-        if let a = self.world.advancements {
-            con.player.advancements = PlayerAdvancements.fresh(a.value)
+        // Their advancements, as `getPlayerAdvancements` makes them with the player: their file
+        // read, then each criterion listened for (CAL-164).
+        if let a = self.world.advancements.copy() {
+            var lines = List<Entry>()
+            var path = String()
+            var file_json: Json? = none
+            if let files = self.progress_files {
+                path = files.file(profile.id.to_string())
+                file_json = files.load(path, mut lines)
+            }
+            let (read_path, json) = self.link.json_file(path, file_json, mut lines)
+            con.player.advancements = PlayerAdvancements.loaded(a.value, json, read_path, mut lines)
+            for e in lines {
+                self.logs.push(e.copy())
+            }
+        }
+        // Their recipe book, as `readAdditionalSaveData` reads it from their data (CAL-164).
+        if let shared = self.world.recipes.copy() {
+            if let data = con.player.data.copy() {
+                if data.contains(String("recipeBook")) {
+                    var lines = List<Entry>()
+                    con.player.recipe_book = RecipeBook.loaded(shared.value, data[String("recipeBook")].copy(), mut lines)
+                    for e in lines {
+                        self.logs.push(e.copy())
+                    }
+                }
+            }
         }
         // Their health and the rest of their status, as `readAdditionalSaveData` reads them, then
         // their skin parts and main hand, `updateOptions` (CAL-141).
@@ -5058,7 +5103,14 @@ impl Network {
         self.send(mut con, tree(level), State.Play)
         self.send(mut con, ClientboundRecipeBookSettings { crafting: closed_tab(), furnace: closed_tab(), blast_furnace: closed_tab(), smoker: closed_tab() }, State.Play)
         // `sendInitialRecipeBook`: what they know, highlighted where they're yet to look at it.
-        self.send(mut con, ClientboundRecipeBookAdd { recipes: BookRecipes {}, replace: true }, State.Play)
+        var known = BookRecipes {}
+        if let shared = self.world.recipes.copy() {
+            var w = Writer.new()
+            let count = con.player.recipe_book.write_known(shared.value, mut w)
+            let problem = w.problem()
+            known = BookRecipes { count: count, bytes: w.into_bytes(), problem: problem }
+        }
+        self.send(mut con, ClientboundRecipeBookAdd { recipes: known, replace: true }, State.Play)
         self.broadcast_system(Component.translatable("multiplayer.player.joined", [display_name(profile)]).colored("yellow"), Look.Quiet)
         let (px, py, pz) = (con.player.x, con.player.y, con.player.z)
         // Where they are kept from the start, as their first tick, which comes before their
