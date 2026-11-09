@@ -1717,7 +1717,57 @@ def compare_progress(config, name=None):
                 print(f"  [{config}] {k}: only Calcite saved it")
         if [k for k, _ in vanilla] != [k for k, _ in calcite]:
             print(f"  [{config}] the order differs")
-    return compare_book(config, name) and same
+    book = compare_book(config, name)
+    stats = compare_stats(config, name)
+    return book and stats and same
+
+
+# The custom stats that count the ticks a player's been in, as `doTick` awards them. A bot joins
+# by the wall clock, saying its client's loaded once its chunks are in, which starts its hurts in
+# a wall (D431), and some scenarios leave by it too, so these can be a few ticks apart on the two
+# servers where all else is the same; they're told, but don't fail the comparison.
+TIMED_STATS = {"minecraft:play_time", "minecraft:total_world_time", "minecraft:time_since_death",
+               "minecraft:time_since_rest", "minecraft:sneak_time"}
+
+
+def compare_stats(config, name):
+    """Whether both servers saved the player `name`'s statistics the same (CAL-164),
+    `players/stats/<uuid>.json`: each type's stats and their counts, and the order each type's
+    are in, a `HashMap`'s of their names, printing what differs. The types themselves can go in
+    any order, as vanilla groups them in a `HashMap` keyed by identity, in another order each run.
+    The time stats, `TIMED_STATS`, need only be saved by both; where their counts differ it's
+    told. A server that saved none says so."""
+    saved = {}
+    for side in ("vanilla", "calcite"):
+        path = SESSIONS / config / side / "world" / "players" / "stats" / f"{offline_uuid(name)}.json"
+        if not path.is_file():
+            print(f"saved stats    differs  [{config}] {side} saved no statistics for {name}")
+            return False
+        saved[side] = json.loads(path.read_text(encoding="utf-8"))
+    vanilla, calcite = saved["vanilla"], saved["calcite"]
+    vs, cs = vanilla.get("stats", {}), calcite.get("stats", {})
+    timed = lambda kind, k: kind == "minecraft:custom" and k in TIMED_STATS
+    same = set(vs) == set(cs) and vanilla.get("DataVersion") == calcite.get("DataVersion")
+    for kind in sorted(set(vs) | set(cs)):
+        a, b = vs.get(kind, {}), cs.get(kind, {})
+        if set(a) != set(b) or list(a) != list(b):
+            same = False
+        elif any(a[k] != b[k] for k in a if not timed(kind, k)):
+            same = False
+    count = sum(len(v) for v in vs.values())
+    who = "" if name == BOT else f" ({name})"
+    print(f"saved stats    {'PASS' if same else 'differs'}    {count} stats{who}")
+    for kind in sorted(set(vs) | set(cs)):
+        a, b = vs.get(kind, {}), cs.get(kind, {})
+        for k in sorted(set(a) | set(b)):
+            if a.get(k) != b.get(k):
+                late = " (timing)" if timed(kind, k) and k in a and k in b else ""
+                print(f"  [{config}] {kind} {k}: vanilla {a.get(k)}, calcite {b.get(k)}{late}")
+        if set(a) == set(b) and list(a) != list(b):
+            print(f"  [{config}] {kind}: the order differs")
+    if vanilla.get("DataVersion") != calcite.get("DataVersion"):
+        print(f"  [{config}] DataVersion: vanilla {vanilla.get('DataVersion')}, calcite {calcite.get('DataVersion')}")
+    return same
 
 
 def compare_book(config, name):

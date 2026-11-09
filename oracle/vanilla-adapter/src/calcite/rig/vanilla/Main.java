@@ -72,7 +72,8 @@ public final class Main {
                 new DatafixProbe(),
                 new BlockEntityProbe(),
                 new EnvironmentProbe(),
-                new ItemsProbe())) {
+                new ItemsProbe(),
+                new StatsProbe())) {
             probes.put(probe.name(), probe);
         }
 
