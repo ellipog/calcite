@@ -781,10 +781,12 @@ CONFIGS = {
     # server's clock, on normal, which keeps them (D439): one in a diamond chestplate with
     # protection IV, which takes its share of each hit; and one in diamond boots with frost walker
     # II and one in a leather helmet with fire protection IV, which give nothing against a hit.
+    # Taped, as what its hits do draws from the level's random, which holds what loading drew till
+    # it's seeded again (CAL-223).
     "protect": Config({"difficulty": "normal"}, view=3, scenarios=("protect",), world=FIXTURES / "protect" / "world",
                       fixture="protect",
                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
-                      player=SWEEP),
+                      player=SWEEP, tape=True),
     # The bot, in survival mode with `enchant`'s swords, hits the stand_hits fixture's armor stands
     # by the server's clock (D441): Bob, named, shaken by a hit, again 30 ticks on, then broken by
     # one 3 ticks after that, dropping his helmet and himself, named, the first sweep reaching the
@@ -799,11 +801,13 @@ CONFIGS = {
     # server's clock, on normal, which keeps him (D442): his thorns hurt it back, knocking it back
     # and bringing it into combat, which ends 300 of its ticks after; then they kill it, the
     # message naming him and the sword with a custom name he holds (D448), and it leaves dead.
+    # Taped, as thorns' chance and damage are drawn from the level's random, which drew what loading
+    # drew till it's seeded again (CAL-223).
     "thorns": Config({"difficulty": "normal"}, view=3, scenarios=("thorns",), world=FIXTURES / "thorns" / "world",
                      fixture="thorns",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
-                     player=THORNS),
+                     player=THORNS, tape=True),
     # The bot, in survival with an iron sword, hits a second player, Mate, by the server's clock on
     # the duel fixture's world, on normal, a sheep by Mate (CAL-162): a punch, a sword's hit whose
     # sweep reaches the sheep, a hit on the sheep whose sweep reaches Mate, a sprint's knockback
@@ -847,12 +851,12 @@ CONFIGS = {
                           player=SPIDER),
     # `zombie`'s, the bot in `slime`'s iron armor with thorns III on its chestplate (CAL-159): Rot's
     # hits on it are now and then thorns' on him, which hurt him from where it is and wear the
-    # chestplate, and it lives till it leaves.
+    # chestplate, and it lives till it leaves. Taped, as `thorns` is (CAL-223).
     "zombie-thorns": Config({"difficulty": "normal"}, view=3, scenarios=("zombie",), world=FIXTURES / "zombie" / "world",
                             fixture="zombie",
                             rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                    ("minecraft:respawn_radius", nbt.Int(0))),
-                            player=THORNY),
+                            player=THORNY, tape=True),
     # `zombie`'s, Rot with an iron sword with sharpness II, knockback I and fire aspect I, the bot in
     # diamond armor with protection IV (CAL-159): his hits deal more, knock it back and set it on
     # fire, and it lives till it leaves.
@@ -1003,12 +1007,13 @@ CONFIGS = {
     # normal at midnight, throws splash potions at Moo, the cow, and Rot, the zombie, both without
     # AI: poison at the cow, which poisons it and the bot; healing at the zombie, which hurts it;
     # regeneration at its own feet; water at nothing; and harming at the cow, which hurts it and
-    # the bot; and it leaves at 420.
+    # the bot; and it leaves at 420. Taped, as the throws' pitches are drawn from the level's
+    # random, which holds what loading drew till it's seeded again (CAL-223).
     "splash": Config({"difficulty": "normal"}, view=3, scenarios=("splash",), world=FIXTURES / "splash" / "world",
                      fixture="splash",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
-                     player=SPLASH, keys=("active_effects", "Health", "AbsorptionAmount")),
+                     player=SPLASH, keys=("active_effects", "Health", "AbsorptionAmount"), tape=True),
     # Lingering potions thrown (D529): the bot, as in `splash`, throws lingering potions, each of
     # which leaves a cloud where it lands that doses what's in it each second, shrinking as it
     # does: poison at Moo, the cow; healing at Rot, the zombie, which hurts him; regeneration and
@@ -1163,12 +1168,13 @@ CONFIGS = {
                           player=USE, keys=("active_effects", "Health", "AbsorptionAmount")),
     # `thorns` with the bot holding an iron sword with unbreaking III: the hit whose thorns kill it
     # drops the sword, which the attack then wears, as vanilla's `postHurtEnemy` wears the stack
-    # the drop holds, unbreaking drawing from the level's random (D450).
+    # the drop holds, unbreaking drawing from the level's random (D450). Taped, as `thorns` is
+    # (CAL-223).
     "thorns-sword": Config({"difficulty": "normal"}, view=3, scenarios=("thorns",), world=FIXTURES / "thorns" / "world",
                            fixture="thorns",
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                   ("minecraft:respawn_radius", nbt.Int(0))),
-                           player=THORNS_SWORD),
+                           player=THORNS_SWORD, tape=True),
     # The bot, in survival mode with a mace, falls onto the mace fixture's column and from it to
     # the ground by the server's clock, on normal, which keeps the zombie, smashing as it falls
     # (D443): a heavy smash on him from seven blocks, which pushes the cow and the stand by him; a
