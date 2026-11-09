@@ -99,7 +99,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
-                   "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten"]
+                   "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -390,6 +390,10 @@ LIFTED = dict(ARROWS, active_effects=nbt.List(nbt.COMPOUND, [
     effect("jump_boost", 400, 1),
     effect("slow_falling", 400),
 ]))
+# The bot's data in `beacons`: `place`'s, at the beacons fixture's spawn, in creative mode with
+# nothing but stone in its first hotbar slot (D520).
+BEACONS = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(5.5), nbt.Double(-60.0), nbt.Double(5.5)]),
+               playerGameType=nbt.Int(1), Inventory=nbt.List(nbt.COMPOUND, [slotted(0, "stone", 64)]), equipment={})
 # The bot's data in `eaten`: `arrows`', at 12 health, 2 food and no saturation, poisoned for 300
 # ticks, carrying apples, honey bottles, a potion of swiftness, milk, a golden apple, a suspicious
 # stew of night vision and a potion of healing in its hotbar, and bread in its off hand (D519).
@@ -945,6 +949,17 @@ CONFIGS = {
                            ("minecraft:respawn_radius", nbt.Int(0))),
                     player=EATEN, keys=("active_effects", "Health", "AbsorptionAmount", "foodLevel",
                                         "foodSaturationLevel")),
+    # The bot, in creative mode with stone in its hand, stands at the beacons fixture's spawn, on
+    # normal at noon, among beacons that pulse their effects onto it every 80 ticks (D520): speed,
+    # jump boost but not its regeneration, two levels short, resistance through bedrock, strength
+    # and regeneration, and haste II; at 300 it breaks a corner of the speed beacon's base, which
+    # goes off, and at 400 puts stone on the glass over the jump boost beacon, which cuts its beam;
+    # it leaves at 560.
+    "beacons": Config({"difficulty": "normal"}, view=3, scenarios=("beacons",), world=FIXTURES / "beacons" / "world",
+                      fixture="beacons",
+                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                             ("minecraft:respawn_radius", nbt.Int(0))),
+                      player=BEACONS, keys=("active_effects", "Health")),
     "ender-arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "ender-arrows" / "world",
                            fixture="ender-arrows",
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
