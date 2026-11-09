@@ -1116,6 +1116,14 @@ CONFIGS = {
                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                            ("minecraft:respawn_radius", nbt.Int(0))),
                     player=PLACE_CREATIVE),
+    # `witch` with the bot in survival with nothing, which Hex takes up (D528): she comes within
+    # ten blocks, stops where she sees it, and throws splash potions at it every three seconds,
+    # poison first, then harming, each flying and splashing it; it leaves at 300.
+    "witch-throw": Config({"difficulty": "normal"}, view=3, scenarios=("skeleton",), world=FIXTURES / "witch" / "world",
+                          fixture="witch",
+                          rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                 ("minecraft:respawn_radius", nbt.Int(0))),
+                          player=USE, keys=("active_effects", "Health", "AbsorptionAmount")),
     # `thorns` with the bot holding an iron sword with unbreaking III: the hit whose thorns kill it
     # drops the sword, which the attack then wears, as vanilla's `postHurtEnemy` wears the stack
     # the drop holds, unbreaking drawing from the level's random (D450).
