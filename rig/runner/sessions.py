@@ -99,7 +99,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
-                   "breed", "hearsay", "bell"]
+                   "breed", "hearsay", "bell", "bane"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -342,7 +342,7 @@ THORNS = dict(PLACE, Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0
     slotted(1, "bread", 3),
 ]), equipment={})
 # The bot's data in `villager`: `thorns`', with 40 pumpkins in the hotbar's third slot, which it
-# trades with Fen, five trades' worth, which leave her short of her next level (CAL-160).
+# trades with Fen, five trades' worth, the first taking her up a level (CAL-160, D509).
 TRADER = dict(THORNS, Inventory=nbt.List(nbt.COMPOUND, [
     slotted(1, "bread", 3),
     slotted(2, "pumpkin", 40),
@@ -378,6 +378,10 @@ KNIGHT = dict(THORNS, equipment={"head": stack("diamond_helmet", 1, PROTECTED), 
 THORNY = dict(THORNS, equipment={"head": stack("iron_helmet"),
                                  "chest": stack("iron_chestplate", 1, {"minecraft:enchantments": {"minecraft:thorns": nbt.Int(3)}}),
                                  "legs": stack("iron_leggings"), "feet": stack("iron_boots")})
+# The bot's data in `bane`: `thorns`', holding an iron sword with bane of arthropods I (D512).
+BANE = dict(THORNS, Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "iron_sword", 1, {"minecraft:enchantments": {"minecraft:bane_of_arthropods": nbt.Int(1)}}),
+]))
 # The bot's data in `thorns-sword`: `thorns`', holding an iron sword with unbreaking III, which its
 # death drops in the attack that wears it after (D450), on 10 health, so his thorns kill it while
 # it hits him with the sword rather than as it leaves.
@@ -1014,6 +1018,14 @@ CONFIGS = {
                              fixture="armadillo-love",
                              rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                              player=THORNS),
+    # A spider without AI (D512): the bot, in survival mode holding a sword with bane of arthropods
+    # I, stands at the bane fixture's spawn by Webs and hits it at 200 and 300, each hit slowing it,
+    # slowness IV for a second and a half, its particles shown and its speed sent, and leaves at
+    # 400.
+    "bane": Config({"difficulty": "normal"}, view=3, scenarios=("bane",), world=FIXTURES / "bane" / "world", fixture="bane",
+                   rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                          ("minecraft:respawn_radius", nbt.Int(0))),
+                   player=BANE),
     # Villagers without AI (CAL-160): the bot, in survival mode with its hand empty and pumpkins in
     # its hotbar, stands at the villager fixture's spawn by Ada, grown with no profession, Bo, a
     # baby, and Fen, a desert farmer; it uses Ada, who has no trades, and Bo, which makes each
