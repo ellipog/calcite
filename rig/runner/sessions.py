@@ -100,7 +100,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
-                   "enchanted"]
+                   "traders"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -1175,9 +1175,16 @@ CONFIGS = {
     # a weaponsmith, a fletcher, a fisherman and a toolsmith, and uses each in turn, its offers made
     # from its level's trade set as it does, enchanted books, weapons and tools among them with the
     # cost their enchanting adds, and closes each one's trades; it leaves at 460.
-    "enchanted": Config({}, view=3, scenarios=("enchanted",), world=FIXTURES / "enchanted" / "world", fixture="enchanted",
+    "enchanted": Config({}, view=3, scenarios=("traders",), world=FIXTURES / "enchanted" / "world", fixture="enchanted",
                         rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                         player=ENCHANTED),
+    # Dyed trades (D523): as `enchanted`, on the dyed fixture's world, among leatherworkers at the
+    # first five levels, a farmer at the fourth and two fletchers at the fifth, whose offers are
+    # made as the bot uses them, leather armor dyed at random, suspicious stew of a random effect
+    # and tipped arrows of a random potion among them.
+    "dyed": Config({}, view=3, scenarios=("traders",), world=FIXTURES / "dyed" / "world", fixture="dyed",
+                   rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                   player=ENCHANTED),
     # Villagers with their brains (CAL-160): the bot, in survival mode with its hand empty, stands
     # at the villagers fixture's spawn by the server's clock from once it's loaded, in the morning,
     # while Ada, grown with no profession, five blocks east by a bed, and Bo, a baby, farther by
