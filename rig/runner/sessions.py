@@ -1644,8 +1644,9 @@ CONFIGS["rivals"] = replace(CONFIGS["duel"], saved={"scoreboard": RIVALS})
 # their failures, and two it may not.
 CONFIGS["talk"] = replace(CONFIGS["duel"], scenarios=("talk",), saved={"scoreboard": TALK})
 # `talk` with the bot an operator, which types selectors with options in `say`, `gamemode` and
-# `msg` (CAL-165).
-CONFIGS["select"] = replace(CONFIGS["talk"], scenarios=("select",), ops=("Bot",))
+# `msg` (CAL-165). Taped, as weather's lengths, blocks' drops and summoned mobs are drawn from the
+# levels' randoms, which line up only once seeded again (D316).
+CONFIGS["select"] = replace(CONFIGS["talk"], scenarios=("select",), ops=("Bot",), tape=True)
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
 BOT = "Bot"
