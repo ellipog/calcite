@@ -100,7 +100,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
-                   "traders", "frost", "soul", "splash"]
+                   "traders", "frost", "soul", "splash", "linger"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -406,6 +406,15 @@ SPLASH = dict(ARROWS, Inventory=nbt.List(nbt.COMPOUND, [
     slotted(2, "splash_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:regeneration"}}),
     slotted(3, "splash_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:water"}}),
     slotted(4, "splash_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:harming"}}),
+]))
+# The bot's data in `linger`: `arrows`', in survival mode facing east, with lingering potions of
+# poison, healing, regeneration, harming and slowness in its first five hotbar slots (D529).
+LINGER = dict(ARROWS, Inventory=nbt.List(nbt.COMPOUND, [
+    slotted(0, "lingering_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:poison"}}),
+    slotted(1, "lingering_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:healing"}}),
+    slotted(2, "lingering_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:regeneration"}}),
+    slotted(3, "lingering_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:harming"}}),
+    slotted(4, "lingering_potion", 1, {"minecraft:potion_contents": {"potion": "minecraft:slowness"}}),
 ]))
 # The bot's data in `beacon_menu`: `beacons`', in survival mode with an iron ingot, a gold ingot
 # and four emeralds in its first three hotbar slots (D521).
@@ -982,6 +991,16 @@ CONFIGS = {
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
                      player=SPLASH, keys=("active_effects", "Health", "AbsorptionAmount")),
+    # Lingering potions thrown (D529): the bot, as in `splash`, throws lingering potions, each of
+    # which leaves a cloud where it lands that doses what's in it each second, shrinking as it
+    # does: poison at Moo, the cow; healing at Rot, the zombie, which hurts him; regeneration and
+    # then harming at its own feet; and slowness away to the north, whose cloud is still there as
+    # it leaves at 480, saved with the chunks.
+    "linger": Config({"difficulty": "normal"}, view=3, scenarios=("linger",), world=FIXTURES / "splash" / "world",
+                     fixture="splash",
+                     rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                            ("minecraft:respawn_radius", nbt.Int(0))),
+                     player=LINGER, keys=("active_effects", "Health", "AbsorptionAmount")),
     # The bot, in creative mode with stone in its hand, stands at the beacons fixture's spawn, on
     # normal at noon, among beacons that pulse their effects onto it every 80 ticks (D520): speed,
     # jump boost but not its regeneration, two levels short, resistance through bedrock, strength
