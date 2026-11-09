@@ -86,6 +86,10 @@ SORTED = {"play/update_attributes": ("attributes", "attribute")}
 # HashMap keyed by the effects' holders, which hash by identity, so vanilla sends two or more in
 # another order each run; a list of them is compared sorted, and its bytes aren't (D513).
 PARTICLE_TYPE = "#minecraft:particle_type/"
+# A player's effects are their `activeEffects`, the same map, so vanilla tells them a run of them,
+# as they join or as they're ticked, in another order each run; a run of `update_mob_effect` or
+# `remove_mob_effect` packets is compared sorted (D514).
+RUNS = {"play/update_mob_effect", "play/remove_mob_effect"}
 # Fields vanilla draws afresh each run, which can't match: the session ID the server draws as it
 # starts, which every login gets; the time on a chat message without a signature, which is the
 # server's clock as it reads the message; and a sound's seed, which `Level.playSound` draws from
@@ -192,7 +196,26 @@ def load(path):
                 step.entities.setdefault(who, []).append(Entry(kind, value, r["sha256"], r.get("error", "")))
                 continue
         step.entries.append(Entry(kind, value, r["sha256"], r.get("error", "")))
+    for s in steps:
+        s.entries = runs_sorted(s.entries)
     return [s for s in steps if s.name != "start" or s.entries or s.changes or s.entities]
+
+
+def runs_sorted(entries):
+    """`entries` with each run of two or more of a kind in RUNS sorted."""
+    out = []
+    i = 0
+    while i < len(entries):
+        j = i
+        while entries[i].kind in RUNS and j < len(entries) and entries[j].kind == entries[i].kind:
+            j += 1
+        if j - i > 1:
+            out.extend(sorted(entries[i:j], key=lambda e: e.text()))
+            i = j
+        else:
+            out.append(entries[i])
+            i += 1
+    return out
 
 
 def particles_sorted(value):

@@ -99,7 +99,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
-                   "breed", "hearsay", "bell", "bane", "tipped"]
+                   "breed", "hearsay", "bell", "bane", "tipped", "dosed"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162).
 MATE_SCENARIOS = {"duel": "duel-mate"}
@@ -108,7 +108,9 @@ MATE_SCENARIOS = {"duel": "duel-mate"}
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
 # their IDs (D375); and its ender chest's items (CAL-144).
 PLAYER_KEYS = ("Inventory", "equipment", "SelectedItemSlot", "playerGameType", "attributes", "EnderItems")
-SORTED_KEYS = {"attributes": "id"}
+# Its effects too, where a configuration compares them, which vanilla saves as its map of them by
+# their holders' identity hashes gives them (D514).
+SORTED_KEYS = {"attributes": "id", "active_effects": "id"}
 # The world the round trip has vanilla make and save (rig/runner/roundtrip.py), from the seed
 # `calcite` with real terrain, its chunks full from -6 to 5 around the origin.
 SAVED_WORLD = CALCITE / "build" / "rig" / "roundtrip" / "vanilla" / "world"
@@ -362,6 +364,26 @@ SHOWS = dict(THORNS, Inventory=nbt.List(nbt.COMPOUND, [
 ARROWS = dict(PLACE, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(8.5), nbt.Double(-60.0), nbt.Double(8.5)]),
               Rotation=nbt.List(nbt.FLOAT, [nbt.Float(-90.0), nbt.Float(0.0)]), Inventory=nbt.List(nbt.COMPOUND, []),
               equipment={})
+# The bot's data in `dosed`: `arrows`', at half health, with effects saved on it (D514):
+# regeneration I for 120 ticks, which heals it at 100 and 50; poison I for 49, which hurts it at
+# 25, its 25th tick, after its client's loaded on both servers, which spare it till then; resistance
+# I for 300, which takes a fifth of the arrow's hurt; hunger II for 200; glowing for 80; and night
+# vision for ever, ambient, its particles hidden.
+def effect(name, duration, amplifier=0, **flags):
+    out = {"id": f"minecraft:{name}", "amplifier": nbt.Byte(amplifier), "duration": nbt.Int(duration)}
+    for k, v in flags.items():
+        out[k] = nbt.Byte(1 if v else 0)
+    return out
+
+
+DOSED = dict(ARROWS, Health=nbt.Float(10.0), active_effects=nbt.List(nbt.COMPOUND, [
+    effect("regeneration", 120),
+    effect("poison", 49),
+    effect("resistance", 300),
+    effect("hunger", 200, 1),
+    effect("glowing", 80),
+    effect("night_vision", -1, ambient=True, show_particles=False),
+]))
 # The bot's data in `spider`: `thorns`', on the spider fixture's pillar at the spawn (CAL-159).
 SPIDER = dict(THORNS, Pos=nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-57.0), nbt.Double(0.5)]))
 # The bot's data in `slime`: `thorns`', in iron armor, so the slime's hits wear it and leave the bot
@@ -851,6 +873,15 @@ CONFIGS = {
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
                      player=ARROWS),
+    # The bot, in survival mode with nothing and the effects its data's saved with, stands at the
+    # dosed fixture's spawn, on normal at midnight, while a tipped arrow of swiftness shot up falls
+    # back onto its head (D514): its effects tick, heal it, hurt it and end, told it as they do,
+    # and the arrow's swiftness is added, its speed's modifier sent; it leaves at 400.
+    "dosed": Config({"difficulty": "normal"}, view=3, scenarios=("dosed",), world=FIXTURES / "dosed" / "world",
+                    fixture="dosed",
+                    rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                           ("minecraft:respawn_radius", nbt.Int(0))),
+                    player=DOSED, keys=("active_effects", "Health", "AbsorptionAmount", "foodLevel", "foodSaturationLevel", "foodExhaustionLevel")),
     "ender-arrows": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "ender-arrows" / "world",
                            fixture="ender-arrows",
                            rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
