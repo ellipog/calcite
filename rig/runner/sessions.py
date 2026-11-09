@@ -930,6 +930,16 @@ CONFIGS = {
                             rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                    ("minecraft:respawn_radius", nbt.Int(0))),
                             player=ARROWS),
+    # The bot, in survival mode with nothing, stands at the arbalistic fixture's spawn, on normal
+    # at midnight, while its piercing arrow from a crossbow, shot as the world loads, kills a
+    # zombie, a skeleton, a creeper, a cow and a pig without AI in a row (CAL-164), each kill its
+    # `player_killed_entity` and each hit its `killed_by_arrow`, the fifth `adventure/arbalistic`,
+    # and their orbs come to it.
+    "arbalistic": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "arbalistic" / "world",
+                         fixture="arbalistic",
+                         rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                                ("minecraft:respawn_radius", nbt.Int(0))),
+                         player=ARROWS),
     # The bot, in survival mode with nothing, stands at the tipped fixture's spawn, on normal at
     # midnight, while tipped arrows from as the world loads hit a cow, a zombie and a pig without
     # AI (D513), which take their potions' effects, and one sticks in a wall, where its potion
