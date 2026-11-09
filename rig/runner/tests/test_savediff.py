@@ -56,9 +56,20 @@ class SaveDiffTest(unittest.TestCase):
         a = chunk([], [chest], block_ticks=[tick])
         b = chunk([], [full], block_ticks=[])
         got = savediff.chunk_differences(0, 0, a, b, 5)
-        self.assertEqual(len(got), 2)
+        self.assertEqual(len(got), 3)
         self.assertTrue(got[0].startswith("block entity 1, 2, 3: "))
         self.assertEqual(got[1], "block_ticks: 1 only vanilla's, 0 only Calcite's")
+        self.assertEqual(got[2], "  only vanilla's: i minecraft:water, p 0, t 5, x 1, y 2, z 3")
+
+    def test_ticks_by_when_due(self):
+        # The same tick, due at game time 223, saved 17 ticks off at 206 and 18 off at 205, is
+        # the same (D541); one due at another time isn't.
+        tick = {"i": "minecraft:big_dripleaf", "x": 1, "y": 2, "z": 3, "p": 0}
+        a = chunk([], block_ticks=[dict(tick, t=17)], LastUpdate=206)
+        b = chunk([], block_ticks=[dict(tick, t=18)], LastUpdate=205)
+        self.assertEqual(savediff.chunk_differences(0, 0, a, b, 5), [])
+        late = chunk([], block_ticks=[dict(tick, t=19)], LastUpdate=205)
+        self.assertEqual(len(savediff.chunk_differences(0, 0, a, late, 5)), 3)
 
     def test_times_left_out(self):
         a = chunk([], LastUpdate=254, InhabitedTime=40)
