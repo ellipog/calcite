@@ -1,0 +1,1085 @@
+/// The server's advancements, as `ServerAdvancementManager` keeps them once its resources load
+/// (CAL-164): each of the `advancement` registry, in its order, with its parent, how it's shown,
+/// its rewards, its criteria and its requirements, and the tree they make, `AdvancementTree`,
+/// each put in once its parent is, a pass at a time, with each root's shown advancements laid out
+/// as `TreeNodePosition` lays them out. Then which of a tree's advancements a player is shown, as
+/// `AdvancementVisibilityEvaluator` decides it from which they've done, and a player's progress in
+/// one, `AdvancementProgress`, with what `update_advancements` sends of them.
+///
+/// One thing can't be vanilla's: vanilla keeps an advancement's children in a set hashed by
+/// identity, whose order changes from run to run, and lays them out in that order, so where an
+/// advancement goes down its tab, its `y`, isn't the same from one run of vanilla to the next.
+/// Calcite keeps them in the order they're put in the tree, so its own layout doesn't change.
+module world.advancements
+
+import json.tree.{Json}
+import nbt.tag.{Accounter, Tag, read_any}
+import protocol.wire.{DecodeError, Reader, Wire, Writer}
+import registry.registries.{Registries}
+import registry.streams.{Streams, network_id}
+import resources.identifier.{Identifier}
+import server.log.{Entry}
+
+/// How an advancement is shown, as vanilla's `DisplayInfo`: its title and description as text
+/// components, its icon as its stack's template, its frame, `AdvancementType`'s ID (a task 0, a
+/// challenge 1, a goal 2), its tab's background, and whether it's toasted, announced in chat and
+/// hidden.
+pub struct DisplayInfo {
+    pub title: Tag
+    pub description: Tag
+    pub icon: Tag
+    pub frame: i32 = 0
+    pub background: String? = none
+    pub show_toast: bool = true
+    pub announce: bool = true
+    pub hidden: bool = false
+}
+
+/// A criterion, by its name: its trigger, a whole ID, and its trigger's conditions, as their codec
+/// wrote them, an empty compound where there are none.
+pub struct Criterion {
+    pub name: String
+    pub trigger: String
+    pub conditions: Tag
+}
+
+/// What an advancement gives once it's done, `AdvancementRewards`: experience, the loot of its
+/// tables, as their holder set was written, recipes by ID, and a function by ID.
+pub struct Rewards {
+    pub experience: i32 = 0
+    pub loot: Tag? = none
+    pub recipes: List<String> = List<String>()
+    pub function: String? = none
+}
+
+/// An advancement, `AdvancementHolder`: its ID, its parent's, how it's shown, its rewards, its
+/// criteria, in the order their compound keeps them, which of them it needs, `requirements`, each
+/// a list of which one will do, and whether it sends telemetry as it's done.
+pub struct Advancement {
+    pub id: String
+    pub parent: String? = none
+    pub display: DisplayInfo? = none
+    pub rewards: Rewards = Rewards()
+    pub criteria: List<Criterion> = List<Criterion>()
+    pub requirements: List<List<String>> = List<List<String>>()
+    pub telemetry: bool = false
+}
+
+impl Advancement {
+    /// The advancement `id` from what its codec wrote, `value`.
+    pub fn of(id: String, value: Tag) -> Advancement {
+        var a = Advancement { id: id.copy() }
+        if let p = text(field(value, "parent")) {
+            a.parent = some(p)
+        }
+        let shown = field(value, "display")
+        if shown != Tag.End {
+            var d = DisplayInfo { title: field(shown, "title"), description: field(shown, "description"), icon: field(shown, "icon") }
+            d.frame = match text(field(shown, "frame")) {
+                some(f) => if f == "challenge" { 1 } else if f == "goal" { 2 } else { 0 },
+                none => 0,
+            }
+            d.background = text(field(shown, "background"))
+            d.show_toast = flag(field(shown, "show_toast"), true)
+            d.announce = flag(field(shown, "announce_to_chat"), true)
+            d.hidden = flag(field(shown, "hidden"), false)
+            a.display = some(d)
+        }
+        let rewards = field(value, "rewards")
+        a.rewards.experience = match field(rewards, "experience") {
+            Tag.Int(n) => n,
+            _ => 0,
+        }
+        let loot = field(rewards, "loot")
+        if loot != Tag.End {
+            a.rewards.loot = some(loot)
+        }
+        a.rewards.recipes = texts(field(rewards, "recipes"))
+        a.rewards.function = text(field(rewards, "function"))
+        match field(value, "criteria") {
+            Tag.Compound(criteria) => {
+                for (name, c) in criteria {
+                    let conditions = field(c, "conditions")
+                    let given = if conditions == Tag.End { Tag.Compound(JavaHashMap<String, Tag>()) } else { conditions }
+                    a.criteria.push(Criterion { name: name.copy(), trigger: text(field(c, "trigger")) ?? String(), conditions: given })
+                }
+            },
+            _ => {},
+        }
+        match field(value, "requirements") {
+            Tag.List(sets) => {
+                for set in sets {
+                    a.requirements.push(texts(set))
+                }
+            },
+            _ => {},
+        }
+        a.telemetry = flag(field(value, "sends_telemetry_event"), false)
+        return a
+    }
+
+    /// Its criteria's names, as `AdvancementRequirements.names` gathers them from its
+    /// requirements.
+    pub fn names(self) -> List<String> {
+        var out = List<String>()
+        for set in self.requirements {
+            for n in set {
+                if not out.contains(n) {
+                    out.push(n.copy())
+                }
+            }
+        }
+        return out
+    }
+}
+
+/// The server's advancements and their tree, `ServerAdvancementManager` and `AdvancementTree`:
+/// each advancement in the registry's order, and, of those in the tree, each's parent and
+/// children, in the order they were put in, and where it's laid out on its tab.
+pub struct Advancements {
+    pub all: List<Advancement> = List<Advancement>()
+    by_id: JavaHashMap<String, usize> = JavaHashMap<String, usize>()
+    /// Those in the tree, in the order they were put in it.
+    pub nodes: List<usize> = List<usize>()
+    /// Whether each is in the tree, its parent there and its children.
+    pub placed: List<bool> = List<bool>()
+    pub parents: List<usize?> = List<usize?>()
+    pub children: List<List<usize>> = List<List<usize>>()
+    /// Where each shown one's laid out, its depth across and its place down.
+    pub x: List<f32> = List<f32>()
+    pub y: List<f32> = List<f32>()
+}
+
+impl Advancements {
+    /// The advancements of `r`'s `advancement` registry, and their tree, with vanilla's lines for
+    /// those that couldn't be put in it, and how many were, in `logs`.
+    pub fn of(r: Registries, logs: mut List<Entry>) -> Advancements {
+        var all = List<Advancement>()
+        if let at = r.find_reloadable(String("advancement")) {
+            for k in 0..r.reloadable[at].entries.len() {
+                if k >= r.reloadable[at].contents.len() {
+                    break
+                }
+                var pos: usize = 0
+                var accounter = Accounter.unlimited()
+                let value = match read_any(r.reloadable[at].contents[k], mut pos, mut accounter) {
+                    ok(v) => v,
+                    err(_) => continue,
+                }
+                all.push(Advancement.of(r.reloadable[at].entries[k].to_string(), value))
+            }
+        }
+        return Advancements.made(all, mut logs)
+    }
+
+    /// The advancements `all`, in the order the registry has them, put in their tree.
+    pub fn made(all: own List<Advancement>, logs: mut List<Entry>) -> Advancements {
+        var out = Advancements()
+        for i in 0..all.len() {
+            out.by_id.insert(all[i].id.copy(), i)
+            out.placed.push(false)
+            out.parents.push(none)
+            out.children.push(List<usize>())
+            out.x.push(0.0f32)
+            out.y.push(0.0f32)
+        }
+        out.all = all
+        out.add_all(mut logs)
+        out.reposition()
+        return out
+    }
+
+    /// The advancement `id`, a whole ID, by its place.
+    pub fn find(self, id: String) -> usize? {
+        return self.by_id.get(id)
+    }
+
+    // `AdvancementTree.addAll`: each put in once its parent is, a pass over those left at a time,
+    // `removeIf(tryInsert)`, so one may follow its parent in the same pass; those whose parents
+    // never come are logged and left out.
+    fn add_all(mut self, logs: mut List<Entry>) {
+        var left = List<usize>()
+        for i in 0..self.all.len() {
+            left.push(i)
+        }
+        while not left.is_empty() {
+            var still = List<usize>()
+            for i in left {
+                if not self.try_insert(i) {
+                    still.push(i)
+                }
+            }
+            if still.len() == left.len() {
+                var names = String()
+                for k in 0..still.len() {
+                    if k > 0 {
+                        names.push_str(", ")
+                    }
+                    names.push_str(self.all[still[k]].id)
+                }
+                logs.push(Entry.error("Couldn't load advancements: [{names}]"))
+                break
+            }
+            left = still
+        }
+        logs.push(Entry.info("Loaded {self.nodes.len()} advancements").on(String("Worker-Main-1")))
+    }
+
+    // `tryInsert`: the advancement `i` put in the tree under its parent, if it has none or its
+    // parent's there.
+    fn try_insert(mut self, i: usize) -> bool {
+        var parent: usize? = none
+        if let p = self.all[i].parent {
+            let at = self.by_id.get(p) else return false
+            if not self.placed[at] {
+                return false
+            }
+            parent = some(at)
+        }
+        if let p = parent {
+            self.children[p].push(i)
+        }
+        self.parents[i] = parent
+        self.placed[i] = true
+        self.nodes.push(i)
+        return true
+    }
+
+    /// The root of the tree `i` is in, `AdvancementNode.root`.
+    pub fn root(self, i: usize) -> usize {
+        var at = i
+        while let p = self.parents[at] {
+            at = p
+        }
+        return at
+    }
+
+    // `repositionNodes`: each root that's shown laid out with its tree, `TreeNodePosition.run`.
+    fn reposition(mut self) {
+        for n in self.nodes.copy() {
+            if self.parents[n] == none and is_shown(self.all[n]) {
+                var layout = Layout()
+                layout.run(self, n)
+                for p in layout.all {
+                    self.x[p.node] = f32.nearest(p.x)
+                    self.y[p.node] = p.y
+                }
+            }
+        }
+    }
+
+    /// Which of the tree `root` is the root of are shown to a player, as `evaluateVisibility`
+    /// decides it, where `done` says which they've done: each of the tree's, children before
+    /// their parents, and whether it's shown.
+    pub fn visibility(self, root: usize, done: List<bool>) -> List<(usize, bool)> {
+        var out = List<(usize, bool)>()
+        var rules: List<Rule> = [Rule.Same, Rule.Same, Rule.Same]
+        _ = self.evaluate(root, mut rules, done, mut out)
+        return out
+    }
+
+    // `evaluateVisibility` of the advancement `i`: its rule pushed, its children's done, then
+    // whether it's shown, it or one under it done, or else the nearest of its own and its two
+    // nearest ancestors' rules that says.
+    fn evaluate(self, i: usize, rules: mut List<Rule>, done: List<bool>, out: mut List<(usize, bool)>) -> bool {
+        let self_done = done[i]
+        rules.push(rule(self.all[i], self_done))
+        var any_done = self_done
+        for c in self.children[i] {
+            if self.evaluate(c, mut rules, done, mut out) {
+                any_done = true
+            }
+        }
+        var shown = any_done
+        if not shown {
+            var k: usize = 0
+            while k <= 2 {
+                let r = rules[rules.len() - 1 - k]
+                if r == Rule.Show {
+                    shown = true
+                    break
+                }
+                if r == Rule.Hide {
+                    break
+                }
+                k += 1
+            }
+        }
+        _ = rules.pop()
+        out.push((i, shown))
+        return any_done
+    }
+}
+
+// Whether the advancement `a` is shown, has a display.
+fn is_shown(a: Advancement) -> bool {
+    return match a.display {
+        some(_) => true,
+        none => false,
+    }
+}
+
+// What an advancement says of its own and its children's being shown, `VisibilityRule`.
+enum Rule {
+    Show
+    Hide
+    Same
+}
+
+// `evaluateVisibilityRule`: one not shown hides; one done shows; one hidden hides till it's done.
+fn rule(a: Advancement, done: bool) -> Rule {
+    let d = a.display else return Rule.Hide
+    if done {
+        return Rule.Show
+    }
+    if d.hidden {
+        return Rule.Hide
+    }
+    return Rule.Same
+}
+
+// A shown advancement's place in a tab's layout, `TreeNodePosition`, by the places in its
+// `Layout`.
+struct Place {
+    node: usize
+    parent: usize?
+    previous: usize?
+    child_index: i32
+    children: List<usize> = List<usize>()
+    ancestor: usize
+    thread: usize? = none
+    x: i32
+    y: f32 = -1.0f32
+    modifier: f32 = 0.0f32
+    change: f32 = 0.0f32
+    shift: f32 = 0.0f32
+}
+
+// A tab's layout, `TreeNodePosition.run`: Buchheim's walks of the tree of shown advancements
+// under a root, those not shown passed through to their children.
+struct Layout {
+    all: List<Place> = List<Place>()
+}
+
+impl Layout {
+    fn run(mut self, a: Advancements, root: usize) {
+        let r = self.make(a, root, none, none, 1, 0)
+        self.first_walk(r)
+        let start = self.all[r].y
+        let min = self.second_walk(r, 0.0f32, 0, start)
+        if min < 0.0f32 {
+            self.third_walk(r, -min)
+        }
+    }
+
+    // The place of the advancement `node`, then its children's.
+    fn make(mut self, a: Advancements, node: usize, parent: usize?, previous: usize?, child_index: i32, depth: i32) -> usize {
+        let me = self.all.len()
+        self.all.push(Place { node: node, parent: parent, previous: previous, child_index: child_index, ancestor: me, x: depth })
+        var last: usize? = none
+        for c in a.children[node] {
+            last = self.add_child(a, me, c, last)
+        }
+        return me
+    }
+
+    // `addChild`: a child that's shown placed under `me`, after `previous`; one that isn't, its
+    // own children in its place.
+    fn add_child(mut self, a: Advancements, me: usize, node: usize, previous: usize?) -> usize? {
+        if is_shown(a.all[node]) {
+            let index = i32.wrap(self.all[me].children.len() + 1)
+            let depth = self.all[me].x + 1
+            let p = self.make(a, node, some(me), previous, index, depth)
+            self.all[me].children.push(p)
+            return some(p)
+        }
+        var last = previous
+        for c in a.children[node] {
+            last = self.add_child(a, me, c, last)
+        }
+        return last
+    }
+
+    fn first_walk(mut self, v: usize) {
+        let children = self.all[v].children.copy()
+        if children.is_empty() {
+            self.all[v].y = match self.all[v].previous {
+                some(p) => self.all[p].y + 1.0f32,
+                none => 0.0f32,
+            }
+            return
+        }
+        var default_ancestor: usize? = none
+        for c in children {
+            self.first_walk(c)
+            default_ancestor = some(self.apportion(c, default_ancestor ?? c))
+        }
+        self.execute_shifts(v)
+        let midpoint = (self.all[children[0]].y + self.all[children[children.len() - 1]].y) / 2.0f32
+        if let p = self.all[v].previous {
+            self.all[v].y = self.all[p].y + 1.0f32
+            self.all[v].modifier = self.all[v].y - midpoint
+        } else {
+            self.all[v].y = midpoint
+        }
+    }
+
+    fn second_walk(mut self, v: usize, mod_sum: f32, depth: i32, min: f32) -> f32 {
+        self.all[v].y += mod_sum
+        self.all[v].x = depth
+        var low = min
+        if self.all[v].y < low {
+            low = self.all[v].y
+        }
+        let m = self.all[v].modifier
+        for c in self.all[v].children.copy() {
+            low = self.second_walk(c, mod_sum + m, depth + 1, low)
+        }
+        return low
+    }
+
+    fn third_walk(mut self, v: usize, offset: f32) {
+        self.all[v].y += offset
+        for c in self.all[v].children.copy() {
+            self.third_walk(c, offset)
+        }
+    }
+
+    fn execute_shifts(mut self, v: usize) {
+        var shift = 0.0f32
+        var change = 0.0f32
+        var i = self.all[v].children.len()
+        while i > 0 {
+            i -= 1
+            let c = self.all[v].children[i]
+            self.all[c].y += shift
+            self.all[c].modifier += shift
+            change += self.all[c].change
+            shift += self.all[c].shift + change
+        }
+    }
+
+    fn previous_or_thread(self, v: usize) -> usize? {
+        if let t = self.all[v].thread {
+            return some(t)
+        }
+        if self.all[v].children.is_empty() {
+            return none
+        }
+        return some(self.all[v].children[0])
+    }
+
+    fn next_or_thread(self, v: usize) -> usize? {
+        if let t = self.all[v].thread {
+            return some(t)
+        }
+        if self.all[v].children.is_empty() {
+            return none
+        }
+        return some(self.all[v].children[self.all[v].children.len() - 1])
+    }
+
+    fn apportion(mut self, v: usize, default_ancestor: usize) -> usize {
+        let previous = self.all[v].previous else return default_ancestor
+        let parent = self.all[v].parent ?? v
+        var vir = v
+        var vor = v
+        var vil = previous
+        var vol = self.all[parent].children[0]
+        var sir = self.all[v].modifier
+        var sor = self.all[v].modifier
+        var sil = self.all[vil].modifier
+        var sol = self.all[vol].modifier
+        while self.next_or_thread(vil) != none and self.previous_or_thread(vir) != none {
+            vil = self.next_or_thread(vil) ?? vil
+            vir = self.previous_or_thread(vir) ?? vir
+            vol = self.previous_or_thread(vol) ?? vol
+            vor = self.next_or_thread(vor) ?? vor
+            self.all[vor].ancestor = v
+            let shift = self.all[vil].y + sil - (self.all[vir].y + sir) + 1.0f32
+            if shift > 0.0f32 {
+                let w = self.ancestor_of(vil, v, default_ancestor)
+                self.move_subtree(w, v, shift)
+                sir += shift
+                sor += shift
+            }
+            sil += self.all[vil].modifier
+            sir += self.all[vir].modifier
+            sol += self.all[vol].modifier
+            sor += self.all[vor].modifier
+        }
+        if self.next_or_thread(vil) != none and self.next_or_thread(vor) == none {
+            self.all[vor].thread = self.next_or_thread(vil)
+            self.all[vor].modifier += sil - sor
+            return default_ancestor
+        }
+        if self.previous_or_thread(vir) != none and self.previous_or_thread(vol) == none {
+            self.all[vol].thread = self.previous_or_thread(vir)
+            self.all[vol].modifier += sir - sol
+        }
+        return v
+    }
+
+    fn move_subtree(mut self, w: usize, right: usize, shift: f32) {
+        let subtrees = f32.nearest(self.all[right].child_index - self.all[w].child_index)
+        if subtrees != 0.0f32 {
+            self.all[right].change -= shift / subtrees
+            self.all[w].change += shift / subtrees
+        }
+        self.all[right].shift += shift
+        self.all[right].y += shift
+        self.all[right].modifier += shift
+    }
+
+    // `getAncestor`: `w`'s ancestor, where it's among `other`'s siblings, else `default_ancestor`.
+    fn ancestor_of(self, w: usize, other: usize, default_ancestor: usize) -> usize {
+        let a = self.all[w].ancestor
+        let parent = self.all[other].parent ?? other
+        if self.all[parent].children.contains(a) {
+            return a
+        }
+        return default_ancestor
+    }
+}
+
+/// A player's progress in an advancement, `AdvancementProgress`: each criterion its requirements
+/// name, by name, with when it was obtained, in milliseconds since the epoch, or `none` where it
+/// hasn't been, in the order a `HashMap` keeps them.
+pub struct Progress {
+    pub criteria: JavaHashMap<String, i64?> = JavaHashMap<String, i64?>()
+}
+
+impl Progress {
+    /// `update`: the criteria `a`'s requirements don't name dropped, and those they do that it
+    /// hasn't added, not obtained.
+    pub fn update(mut self, a: Advancement) {
+        let names = a.names()
+        var gone = List<String>()
+        for (k, _) in self.criteria {
+            if not names.contains(k) {
+                gone.push(k.copy())
+            }
+        }
+        for k in gone {
+            _ = self.criteria.remove(k)
+        }
+        for n in names {
+            if not self.criteria.contains(n) {
+                self.criteria.insert(n.copy(), none)
+            }
+        }
+    }
+
+    /// Whether the criterion `name` is obtained.
+    pub fn has(self, name: String) -> bool {
+        if not self.criteria.contains(name) {
+            return false
+        }
+        return self.criteria[name] != none
+    }
+
+    /// `isDone`: each of `a`'s requirements met by one of its criteria; never for none.
+    pub fn is_done(self, a: Advancement) -> bool {
+        if a.requirements.is_empty() {
+            return false
+        }
+        for set in a.requirements {
+            var met = false
+            for n in set {
+                if self.has(n) {
+                    met = true
+                    break
+                }
+            }
+            if not met {
+                return false
+            }
+        }
+        return true
+    }
+
+    /// `hasProgress`: whether any criterion is obtained.
+    pub fn has_progress(self) -> bool {
+        for (_, at) in self.criteria {
+            if at != none {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// `grantProgress`: the criterion `name` obtained at `now`, if it's there and wasn't.
+    pub fn grant(mut self, name: String, now: i64) -> bool {
+        if not self.criteria.contains(name) or self.criteria[name] != none {
+            return false
+        }
+        self.criteria.insert(name.copy(), some(now))
+        return true
+    }
+
+    /// `revokeProgress`: the criterion `name` no longer obtained, if it was.
+    pub fn revoke(mut self, name: String) -> bool {
+        if not self.criteria.contains(name) or self.criteria[name] == none {
+            return false
+        }
+        self.criteria.insert(name.copy(), none)
+        return true
+    }
+
+    // `AdvancementProgress.STREAM_CODEC`: each criterion by name, with when it was obtained,
+    // `ByteBufCodecs.INSTANT` as an optional long.
+    fn write(self, w: mut Writer) {
+        w.count(self.criteria.len())
+        for (name, at) in self.criteria {
+            w.string(name, 32767)
+            match at {
+                some(t) => {
+                    w.bool(true)
+                    w.i64(t)
+                },
+                none => w.bool(false),
+            }
+        }
+    }
+}
+
+/// What `update_advancements` sends, `ClientboundUpdateAdvancementsPacket`, written with the
+/// registries, as a packet's `Wire` has none.
+pub struct SentAdvancements {
+    bytes: List<u8> = List<u8>()
+    problem: String? = none
+}
+
+impl SentAdvancements {
+    /// The packet: whether the client's to start again, `reset`; the advancements `added`, each
+    /// with where it's laid out; the IDs of those `removed`; each advancement's progress in
+    /// `progress`; and whether it's shown, `show`.
+    pub fn of(a: Advancements, reset: bool, added: List<usize>, removed: List<String>, progress: List<(usize, Progress)>, show: bool, streams: Streams, r: Registries) -> SentAdvancements {
+        var w = Writer.new()
+        w.bool(reset)
+        w.count(added.len())
+        for i in added {
+            write_positioned(a, i, streams, r, mut w)
+        }
+        w.count(removed.len())
+        for id in removed {
+            w.string(id, 32767)
+        }
+        w.count(progress.len())
+        for (i, p) in progress {
+            w.string(a.all[i].id, 32767)
+            p.write(mut w)
+        }
+        w.bool(show)
+        let problem = w.problem()
+        return SentAdvancements { bytes: w.into_bytes(), problem: problem }
+    }
+}
+
+impl Wire for SentAdvancements {
+    fn read(r: mut Reader) -> SentAdvancements ! DecodeError {
+        return SentAdvancements { bytes: r.rest() }
+    }
+
+    fn write(self, w: mut Writer) {
+        if let p = self.problem {
+            w.refuse(p.copy())
+            return
+        }
+        w.raw(self.bytes)
+    }
+}
+
+// `PositionedAdvancement.STREAM_CODEC`: the advancement, `AdvancementHolder.STREAM_CODEC`, its
+// ID, its parent's, how it's shown and its requirements, then where it's laid out.
+fn write_positioned(a: Advancements, i: usize, streams: Streams, r: Registries, w: mut Writer) {
+    let adv = a.all[i].copy()
+    w.string(adv.id, 32767)
+    match adv.parent {
+        some(p) => {
+            w.bool(true)
+            w.string(p, 32767)
+        },
+        none => w.bool(false),
+    }
+    match adv.display {
+        some(d) => {
+            w.bool(true)
+            write_display(d, streams, r, mut w)
+        },
+        none => w.bool(false),
+    }
+    w.count(adv.requirements.len())
+    for set in adv.requirements {
+        w.count(set.len())
+        for n in set {
+            w.string(n, 32767)
+        }
+    }
+    w.bool(adv.telemetry)
+    w.f32(a.x[i])
+    w.f32(a.y[i])
+}
+
+// `DisplayInfo.serializeToNetwork`: its title and description, its icon, its frame, its flags
+// (a background 1, toasted 2, hidden 4), then its background's ID if it has one.
+fn write_display(d: DisplayInfo, streams: Streams, r: Registries, w: mut Writer) {
+    w.nbt(d.title)
+    w.nbt(d.description)
+    write_template(d.icon, streams, r, mut w)
+    w.varint(d.frame)
+    var flags: i32 = match d.background {
+        some(_) => 1,
+        none => 0,
+    }
+    if d.show_toast {
+        flags |= 2
+    }
+    if d.hidden {
+        flags |= 4
+    }
+    w.i32(flags)
+    if let b = d.background {
+        w.string(b, 32767)
+    }
+}
+
+// `ItemStackTemplate.STREAM_CODEC`: the template's item, its count and its patch.
+fn write_template(template: Tag, streams: Streams, r: Registries, w: mut Writer) {
+    let item = text(field(template, "id")) ?? String()
+    let item_id = network_id(r, String("minecraft:item"), item.copy()) else {
+        w.refuse("no item {item}")
+        return
+    }
+    w.varint(item_id)
+    let count = match field(template, "count") {
+        Tag.Int(n) => n,
+        _ => 1,
+    }
+    w.varint(count)
+    var components = List<(String, Tag, Json)>()
+    match field(template, "components") {
+        Tag.Compound(patch) => {
+            for (k, v) in patch {
+                components.push((k.copy(), v.copy(), Json.Null))
+            }
+        },
+        _ => {},
+    }
+    streams.write_patch(components, r, mut w)
+}
+
+// The field `key` of the compound `value`, or `Tag.End` where it has none.
+fn field(value: Tag, key: str) -> Tag {
+    match value {
+        Tag.Compound(m) => {
+            if m.contains(String(key)) {
+                return m[String(key)].copy()
+            }
+        },
+        _ => {},
+    }
+    return Tag.End
+}
+
+// The text of the string tag `t`, or `none`.
+fn text(t: Tag) -> String? {
+    return match t {
+        Tag.Str(s) => some(s.copy()),
+        _ => none,
+    }
+}
+
+// The texts of the list of string tags `t`.
+fn texts(t: Tag) -> List<String> {
+    var out = List<String>()
+    match t {
+        Tag.List(items) => {
+            for i in items {
+                if let s = text(i) {
+                    out.push(s)
+                }
+            }
+        },
+        _ => {},
+    }
+    return out
+}
+
+// The boolean the byte tag `t` is, or `default` where there's none.
+fn flag(t: Tag, default: bool) -> bool {
+    return match t {
+        Tag.Byte(b) => b != 0i8,
+        _ => default,
+    }
+}
+
+/// A criterion a player listens for, `PlayerAdvancements.TriggerInstanceKey`: the advancement, by
+/// its place and ID, and the criterion's name, hashed as the record hashes them, so a trigger's
+/// listeners go in the order vanilla's `HashMap` keeps them.
+pub struct Listener {
+    pub at: usize
+    pub id: Identifier
+    pub criterion: String
+}
+
+impl JavaHash for Listener {
+    fn java_hash(self) -> i32 {
+        return 31 * self.id.java_hash() + self.criterion.java_hash()
+    }
+}
+
+/// What an award did, `award`: whether the criterion was granted, and whether that finished the
+/// advancement, whose rewards and announcement the server gives.
+pub struct Awarded {
+    pub granted: bool = false
+    pub finished: bool = false
+}
+
+/// A player's advancements, `PlayerAdvancements`: their progress in each, the advancements
+/// they're shown, those whose progress has changed and the roots whose trees' showing may have,
+/// since the last update, the criteria they listen for, by trigger, and whether the next update is
+/// their first.
+pub struct PlayerAdvancements {
+    progress: List<Progress?> = List<Progress?>()
+    /// The order each was started in, `progress`' `LinkedHashMap`'s.
+    started: List<usize> = List<usize>()
+    visible: List<bool> = List<bool>()
+    changed: JavaHashSet<Identifier> = JavaHashSet<Identifier>()
+    roots: JavaHashSet<Identifier> = JavaHashSet<Identifier>()
+    first: bool = true
+    listeners: JavaHashMap<String, JavaHashMap<Listener, Tag>> = JavaHashMap<String, JavaHashMap<Listener, Tag>>()
+}
+
+impl PlayerAdvancements {
+    /// A player's advancements with no progress, as `load` leaves them with no file: each one's
+    /// criteria listened for, in the registry's order. None has no criteria, which vanilla's
+    /// codec never reads, so none is awarded.
+    pub fn fresh(a: Advancements) -> PlayerAdvancements {
+        var out = PlayerAdvancements()
+        for _ in a.all {
+            out.progress.push(none)
+            out.visible.push(false)
+        }
+        for i in 0..a.all.len() {
+            out.register(a, i)
+        }
+        return out
+    }
+
+    /// `getOrStartProgress` of the advancement `i`: its progress, started where it wasn't.
+    pub fn start(mut self, a: Advancements, i: usize) {
+        if self.progress[i] != none {
+            return
+        }
+        var p = Progress()
+        p.update(a.all[i])
+        self.progress[i] = some(p)
+        self.started.push(i)
+    }
+
+    /// Whether the advancement `i` is done, its progress started if it wasn't.
+    pub fn is_done(mut self, a: Advancements, i: usize) -> bool {
+        self.start(a, i)
+        let p = self.progress[i] else return false
+        return p.is_done(a.all[i])
+    }
+
+    // `registerListeners`: each criterion of the advancement `i` not obtained listened for, while
+    // it isn't done.
+    fn register(mut self, a: Advancements, i: usize) {
+        self.start(a, i)
+        let p = self.progress[i].copy() ?? Progress()
+        if p.is_done(a.all[i]) {
+            return
+        }
+        for c in a.all[i].criteria {
+            if p.criteria.contains(c.name) and not p.has(c.name) {
+                self.listen(a, i, c)
+            }
+        }
+    }
+
+    // `unregisterListeners`: each criterion of the advancement `i` obtained, or all of them once
+    // it's done, no longer listened for.
+    fn unregister(mut self, a: Advancements, i: usize) {
+        self.start(a, i)
+        let p = self.progress[i].copy() ?? Progress()
+        let done = p.is_done(a.all[i])
+        for c in a.all[i].criteria {
+            if p.criteria.contains(c.name) and (p.has(c.name) or done) {
+                self.unlisten(a, i, c)
+            }
+        }
+    }
+
+    fn listen(mut self, a: Advancements, i: usize, c: Criterion) {
+        let key = Listener { at: i, id: identifier(a.all[i].id), criterion: c.name.copy() }
+        var map = self.listeners.remove(c.trigger) ?? JavaHashMap<Listener, Tag>()
+        map.insert(key, c.conditions.copy())
+        self.listeners.insert(c.trigger.copy(), map)
+    }
+
+    fn unlisten(mut self, a: Advancements, i: usize, c: Criterion) {
+        let key = Listener { at: i, id: identifier(a.all[i].id), criterion: c.name.copy() }
+        let found = self.listeners.remove(c.trigger) else return
+        var map = found
+        _ = map.remove(key)
+        if not map.is_empty() {
+            self.listeners.insert(c.trigger.copy(), map)
+        }
+    }
+
+    /// The criteria listened for with the trigger `trigger`, a whole ID, each with its
+    /// conditions, in the order vanilla's `HashMap` goes over them.
+    pub fn listening(self, trigger: String) -> List<(Listener, Tag)> {
+        var out = List<(Listener, Tag)>()
+        if not self.listeners.contains(trigger) {
+            return out
+        }
+        for (k, v) in self.listeners[trigger] {
+            out.push((k.copy(), v.copy()))
+        }
+        return out
+    }
+
+    /// `award`: the criterion `criterion` of the advancement `i` granted at `now`, in
+    /// milliseconds since the epoch, if it wasn't; its listeners dropped once it's obtained, and
+    /// its tree's showing looked at again once it's done.
+    pub fn award(mut self, a: Advancements, i: usize, criterion: String, now: i64) -> Awarded {
+        var out = Awarded()
+        self.start(a, i)
+        var p = self.progress[i].take() ?? Progress()
+        let was_done = p.is_done(a.all[i])
+        let granted = p.grant(criterion, now)
+        let done = p.is_done(a.all[i])
+        self.progress[i] = some(p)
+        if granted {
+            self.unregister(a, i)
+            self.changed.insert(identifier(a.all[i].id))
+            out.granted = true
+            out.finished = not was_done and done
+        }
+        if not was_done and done {
+            self.mark_visibility(a, i)
+        }
+        return out
+    }
+
+    /// `revoke`: the criterion `criterion` of the advancement `i` no longer obtained, if it was;
+    /// listened for again, and its tree's showing looked at again once it's no longer done.
+    pub fn revoke(mut self, a: Advancements, i: usize, criterion: String) -> bool {
+        self.start(a, i)
+        var p = self.progress[i].take() ?? Progress()
+        let was_done = p.is_done(a.all[i])
+        let revoked = p.revoke(criterion)
+        let done = p.is_done(a.all[i])
+        self.progress[i] = some(p)
+        if revoked {
+            self.register(a, i)
+            self.changed.insert(identifier(a.all[i].id))
+        }
+        if was_done and not done {
+            self.mark_visibility(a, i)
+        }
+        return revoked
+    }
+
+    // `markForVisibilityUpdate`: the root of the advancement `i`'s tree, where it's in one.
+    fn mark_visibility(mut self, a: Advancements, i: usize) {
+        if not a.placed[i] {
+            return
+        }
+        self.roots.insert(identifier(a.all[a.root(i)].id))
+    }
+
+    /// `flushDirty`: where it's their first or anything's changed, each marked tree's showing
+    /// looked at again, then, of what that and the changes since give, the update to send, if
+    /// there's anything in it, written with `streams` against `r`, with `show`.
+    pub fn flush(mut self, a: Advancements, show: bool, streams: Streams, r: Registries) -> SentAdvancements? {
+        var sent: SentAdvancements? = none
+        if self.first or not self.roots.is_empty() or not self.changed.is_empty() {
+            var added = JavaHashSet<Identifier>()
+            var removed = JavaHashSet<Identifier>()
+            var roots = List<usize>()
+            for id in self.roots {
+                if let at = a.find(id.to_string()) {
+                    roots.push(at)
+                }
+            }
+            self.roots = JavaHashSet<Identifier>()
+            for root in roots {
+                self.update_visibility(a, root, mut added, mut removed)
+            }
+            var progress = JavaHashMap<Identifier, usize>()
+            for id in self.changed {
+                if let at = a.find(id.to_string()) {
+                    if self.visible[at] {
+                        progress.insert(id.copy(), at)
+                    }
+                }
+            }
+            self.changed = JavaHashSet<Identifier>()
+            if not progress.is_empty() or not added.is_empty() or not removed.is_empty() {
+                var added_at = List<usize>()
+                for id in added {
+                    if let at = a.find(id.to_string()) {
+                        added_at.push(at)
+                    }
+                }
+                var removed_ids = List<String>()
+                for id in removed {
+                    removed_ids.push(id.to_string())
+                }
+                var progress_of = List<(usize, Progress)>()
+                for (_, at) in progress {
+                    progress_of.push((at, self.progress[at].copy() ?? Progress()))
+                }
+                sent = some(SentAdvancements.of(a, self.first, added_at, removed_ids, progress_of, show, streams, r))
+            }
+        }
+        self.first = false
+        return sent
+    }
+
+    // `updateTreeVisibility` of the tree `root` is the root of: each shown that wasn't added, its
+    // progress then among what's changed; each no longer shown that was, removed.
+    fn update_visibility(mut self, a: Advancements, root: usize, added: mut JavaHashSet<Identifier>, removed: mut JavaHashSet<Identifier>) {
+        var done = List<bool>()
+        for _ in a.all {
+            done.push(false)
+        }
+        self.mark_done(a, root, mut done)
+        for (i, shown) in a.visibility(root, done) {
+            let id = identifier(a.all[i].id)
+            if shown {
+                if not self.visible[i] {
+                    self.visible[i] = true
+                    added.insert(id.copy())
+                    if self.progress[i] != none {
+                        self.changed.insert(id)
+                    }
+                }
+            } else if self.visible[i] {
+                self.visible[i] = false
+                removed.insert(id)
+            }
+        }
+    }
+
+    // Which of the tree under `i` are done, each's progress started where it wasn't.
+    fn mark_done(mut self, a: Advancements, i: usize, done: mut List<bool>) {
+        done[i] = self.is_done(a, i)
+        for c in a.children[i] {
+            self.mark_done(a, c, mut done)
+        }
+    }
+}
+
+// The identifier `id` is, a whole ID.
+fn identifier(id: String) -> Identifier {
+    return match Identifier.parse(id) {
+        ok(i) => i,
+        err(_) => Identifier { namespace: String("minecraft"), path: id.copy() },
+    }
+}

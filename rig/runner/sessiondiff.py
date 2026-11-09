@@ -95,6 +95,18 @@ RUNS = {"play/update_mob_effect", "play/remove_mob_effect"}
 # server's clock as it reads the message; and a sound's seed, which `Level.playSound` draws from
 # `threadSafeRandom`, seeded afresh as the server starts (CAL-125).
 DRAWN = {"login/login_finished": {"sessionId"}, "play/player_chat": {"timeStamp"}, "play/sound": {"seed"}}
+# An advancement update's layout down a tab, each added advancement's `y`, comes of vanilla's
+# `TreeNodePosition` walking each advancement's children in the order of a set hashed by
+# identity, so it's another each run, where its `x`, its depth, isn't; and when each criterion
+# was obtained is the server's clock as it was awarded. Neither is compared, only whether each
+# was obtained. And the advancements added, those removed and the progress sent come from
+# `HashSet`s and a `HashMap` filled as that walk goes, whose entries in one bucket keep the order
+# they went in, so another each run too; each is compared in order of its IDs (CAL-164).
+ADVANCEMENTS = "play/update_advancements"
+# An item's enchantments, as SessionDump writes `ItemEnchantments`, are an `Object2IntOpenHashMap`
+# keyed by their holders, which hash by identity, so vanilla writes two or more in another order
+# each run; they're compared in their text's order, and the bytes aren't (CAL-164).
+ENCHANTED = ("ItemEnchantments{enchantments={", "ItemEnchantments{storedEnchantments={")
 SUITES = {"status": "status", "login": "login", "configuration": "configuration"}
 # Packets lined up by where they are as well as by kind: a block's event and a sound, which
 # pistons and clocks send over and over (CAL-125).
@@ -162,6 +174,12 @@ def load(path):
         value = r.get("value")
         if kind in DRAWN:
             value = without(value, DRAWN[kind])
+        if kind == ADVANCEMENTS:
+            value = advancements_sorted(obtained_only(without(value, {"y"})))
+            r["sha256"] = ""
+        value, moved = enchantments_sorted(value)
+        if moved:
+            r["sha256"] = ""
         if kind in SORTED and isinstance(value, dict):
             field_name, key = SORTED[kind]
             value = dict(value, **{field_name: sorted(value.get(field_name, []), key=lambda e: str(e.get(key)))})
@@ -232,6 +250,89 @@ def particles_sorted(value):
             moved = True
         items.append(item)
     return dict(value, packedItems=items), moved
+
+
+def advancements_sorted(value):
+    """An advancement update's `value` with what it adds, removes and sends progress of in order
+    of their IDs."""
+    if not isinstance(value, dict):
+        return value
+    def added_id(a):
+        return json.dumps(a.get("advancement", {}).get("id") if isinstance(a, dict) else a)
+
+    def progress_id(p):
+        return json.dumps(p[0] if isinstance(p, list) and p else p)
+
+    out = dict(value)
+    for name, key in (("added", added_id), ("removed", json.dumps), ("progress", progress_id)):
+        if isinstance(out.get(name), list):
+            out[name] = sorted(out[name], key=key)
+    return out
+
+
+def obtained_only(value):
+    """An advancement update's `value` with each criterion's `obtained` only whether it was."""
+    if isinstance(value, dict):
+        return {k: (v is not None if k == "obtained" else obtained_only(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [obtained_only(v) for v in value]
+    return value
+
+
+def enchantments_sorted(value):
+    """`value` with each item's enchantments in its text in order, and whether it has two or
+    more of an item's, whose bytes may then be in another order."""
+    if isinstance(value, dict):
+        out = {}
+        moved = False
+        for k, v in value.items():
+            out[k], m = enchantments_sorted(v)
+            moved = moved or m
+        return out, moved
+    if isinstance(value, list):
+        out = []
+        moved = False
+        for v in value:
+            e, m = enchantments_sorted(v)
+            out.append(e)
+            moved = moved or m
+        return out, moved
+    if isinstance(value, str) and any(e in value for e in ENCHANTED):
+        return sorted_enchantments_text(value)
+    return value, False
+
+
+def sorted_enchantments_text(text):
+    """`text` with the entries of each `ItemEnchantments` map in it sorted, and whether one has
+    two or more."""
+    several = False
+    for head in ENCHANTED:
+        at = 0
+        while True:
+            i = text.find(head, at)
+            if i < 0:
+                break
+            start = i + len(head)
+            depth = 1
+            j = start
+            parts = []
+            last = start
+            while j < len(text) and depth > 0:
+                c = text[j]
+                if c in "{[":
+                    depth += 1
+                elif c in "}]":
+                    depth -= 1
+                elif c == "," and depth == 1 and text.startswith(", ", j):
+                    parts.append(text[last:j])
+                    last = j + 2
+                j += 1
+            parts.append(text[last:j - 1])
+            several = several or len(parts) > 1
+            inner = ", ".join(sorted(parts))
+            text = text[:start] + inner + text[j - 1:]
+            at = start + len(inner)
+    return text, several
 
 
 def without(value, names):
