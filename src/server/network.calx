@@ -127,7 +127,7 @@ import world.entity_facts.{CREATURE, MONSTER}
 import world.environment.{baby_villager_activity, fast_lava, increased_fire_burnout, monsters_burn, moon_phase, sun_angle, surface_slime_spawn_chance, villager_activity, water_evaporates}
 import world.natural.{MobMaker, SpawnPlace, SpawnState, reinforce, spawn_for_chunk, spawn_for_generation, spawning_categories, spawns_in}
 import world.random_sequences.{RandomSequences, saved_id as sequences_id}
-import world.scoreboard.{ScoreSent, Team, color_name, format_on_wire, saved_id as scoreboard_id}
+import world.scoreboard.{RULE_ALWAYS, RULE_OTHER_TEAMS, RULE_OWN_TEAM, ScoreSent, Team, color_name, color_rgb, format_on_wire, saved_id as scoreboard_id, team_pushes}
 import world.random_ticks.{TickPlace, Viewer}
 import world.advancements.{Advancements, DisplayInfo, Listener, PlayerAdvancements}
 import world.recipes.{RecipeBook, Stonecutting}
@@ -1183,6 +1183,9 @@ pub struct Network {
     // where the world has them (CAL-153).
     loot: Shared<Loot>? = none
     sequences_at: usize? = none
+    // The scores sent every player while one's taken out of the connections, to be sent them
+    // after, where they're being kept (CAL-164).
+    held_scores: List<List<u8>>? = none
     // Whether the levels have the world's jukebox songs yet (CAL-143).
     songs_given: bool = false
     // Whether the block a player's using swung their arm, `SUCCESS_SERVER`, until it's sent them
@@ -2704,11 +2707,11 @@ impl Network {
         var out = List<Beacon>()
         for slot in self.level_slots(d) {
             if let c = self.connections[slot] {
-                out.push(beacon_of(c))
+                out.push(beacon_of(c, self.waypoint_color(c)))
             }
         }
         if con.player.dim == d {
-            out.push(beacon_of(con))
+            out.push(beacon_of(con, self.waypoint_color(con)))
         }
         return out
     }
@@ -2734,7 +2737,7 @@ impl Network {
         if not con.player.based or con.player.removed {
             return
         }
-        let me = beacon_of(con)
+        let me = beacon_of(con, self.waypoint_color(con))
         let d = con.player.dim
         let bs = self.beacons(d, con)
         let bar = self.world.locator_bar
@@ -2753,7 +2756,7 @@ impl Network {
     // `ServerChunkCache.move`'s locator bar (CAL-174): the player's links looked at again where
     // they receive waypoints and aren't removed, `updatePlayer`.
     fn waypoints_seek(mut self, con: mut Connection) {
-        let me = beacon_of(con)
+        let me = beacon_of(con, self.waypoint_color(con))
         if con.player.removed or not receives(me) {
             return
         }
@@ -2771,7 +2774,7 @@ impl Network {
     // `addPlayer`, which tracks their own where they transmit one, as `onTrackingStart` then
     // does again.
     fn waypoints_enter(mut self, con: mut Connection) {
-        let me = beacon_of(con)
+        let me = beacon_of(con, self.waypoint_color(con))
         let d = con.player.dim
         let bs = self.beacons(d, con)
         let bar = self.world.locator_bar
@@ -2814,7 +2817,7 @@ impl Network {
         if not updated.contains(transmit) and not updated.contains(receive) {
             return
         }
-        let me = beacon_of(con)
+        let me = beacon_of(con, self.waypoint_color(con))
         let d = con.player.dim
         let bs = self.beacons(d, con)
         let bar = self.world.locator_bar
@@ -6265,10 +6268,16 @@ impl Network {
         self.send_all(mut con, score_packets(sent))
     }
 
-    // Each of `packets` to every player, `con`'s first, as `broadcastAll` sends it.
+    // Each of `packets` to every player, `con`'s first, as `broadcastAll` sends it; kept for
+    // one taken out of the connections too, where `held_scores` is (CAL-164).
     fn send_all(mut self, con: mut Connection, packets: List<List<u8>>) {
         for packet in packets {
             self.send_bytes(mut con, packet.copy())
+            if let held = self.held_scores.take() {
+                var more = held
+                more.push(packet.copy())
+                self.held_scores = some(more)
+            }
             self.broadcast(packet)
         }
     }
@@ -6340,6 +6349,189 @@ impl Network {
             con.player.recorded_level = some(level)
             self.score_criteria(mut con, String("level"), 0, some(level))
         }
+    }
+
+    // A player's death message told as their team's death message visibility has it, `die`
+    // (CAL-164): where they're in no team, or it's `always`, to everyone, `broadcastSystemMessage`,
+    // them too; where it's `hideForOtherTeams`, to the others in their team only, by its players'
+    // order, `broadcastSystemToTeam`; where it's `hideForOwnTeam`, to each not in it,
+    // `broadcastSystemToAllExceptTeam`; where it's `never`, to no one. Only the first is logged.
+    fn death_message(mut self, con: mut Connection, message: own Component) {
+        var team: Team? = none
+        if let p = con.profile {
+            team = self.world.scoreboard.team(p.name.copy())
+        }
+        let shown = match team {
+            some(t) => t.death_messages,
+            none => RULE_ALWAYS,
+        }
+        if shown == RULE_ALWAYS {
+            self.broadcast_system(message.copy(), Look.Quiet)
+            if con.information.chat_visibility != ChatVisibility.Hidden {
+                self.send(mut con, ClientboundSystemChat { content: message, overlay: false }, State.Play)
+            }
+            return
+        }
+        let t = team else return
+        let packet = encode_play(ClientboundSystemChat { content: message, overlay: false })
+        if shown == RULE_OTHER_TEAMS {
+            for name in t.players {
+                let slot = self.slot_named(name.copy()) else continue
+                self.system_to(slot, packet.copy())
+            }
+        } else if shown == RULE_OWN_TEAM {
+            var told = List<usize>()
+            for slot in 0..self.connections.len() {
+                if not self.playing(slot) {
+                    continue
+                }
+                let c = self.connections[slot] else continue
+                let p = c.profile else continue
+                if self.world.scoreboard.team_name(p.name.copy()) != some(t.name.copy()) {
+                    told.push(slot)
+                }
+            }
+            for slot in told {
+                self.system_to(slot, packet.copy())
+            }
+        }
+    }
+
+    // The slot of the player playing named `name`, `getPlayerByName`, but the one being handled.
+    fn slot_named(self, name: String) -> usize? {
+        for slot in 0..self.connections.len() {
+            if not self.playing(slot) {
+                continue
+            }
+            if let c = self.connections[slot] {
+                if let p = c.profile {
+                    if p.name == name {
+                        return some(slot)
+                    }
+                }
+            }
+        }
+        return none
+    }
+
+    // A system message, `packet`, to the player in `slot` where they show system messages,
+    // `sendSystemMessage`.
+    fn system_to(mut self, slot: usize, packet: own List<u8>) {
+        var other = self.connections[slot].take() else return
+        if other.information.chat_visibility != ChatVisibility.Hidden {
+            self.send_bytes(mut other, packet)
+        }
+        self.connections[slot] = some(other)
+    }
+
+    // The name of the player of the UUID `who`, `con`'s or another playing's (CAL-164).
+    fn player_name_by(self, con: Connection, who: (i64, i64)) -> String? {
+        let (most, least) = who
+        if let p = con.profile {
+            if p.id.most == most and p.id.least == least {
+                return some(p.name.copy())
+            }
+        }
+        for slot in 0..self.connections.len() {
+            if not self.playing(slot) {
+                continue
+            }
+            if let other = self.connections[slot] {
+                if let p = other.profile {
+                    if p.id.most == most and p.id.least == least {
+                        return some(p.name.copy())
+                    }
+                }
+            }
+        }
+        return none
+    }
+
+    // The name of the team the player of `c` is in, where they're in one (CAL-164).
+    fn team_name_of(self, c: Connection) -> String? {
+        if self.world.scoreboard.teams.is_empty() {
+            return none
+        }
+        let p = c.profile else return none
+        return self.world.scoreboard.team_name(p.name.copy())
+    }
+
+    // Whether the team the player of `c` is in allows friendly fire, as one in none does.
+    fn friendly_fire_of(self, c: Connection) -> bool {
+        if self.world.scoreboard.teams.is_empty() {
+            return true
+        }
+        let p = c.profile else return true
+        return match self.world.scoreboard.team(p.name.copy()) {
+            some(t) => t.friendly_fire,
+            none => true,
+        }
+    }
+
+    // The collision rule of the team the player of `c` is in, `always` where they're in none.
+    fn collision_rule_of(self, c: Connection) -> i32 {
+        if self.world.scoreboard.teams.is_empty() {
+            return RULE_ALWAYS
+        }
+        let p = c.profile else return RULE_ALWAYS
+        return self.world.scoreboard.collision_of(p.name.copy())
+    }
+
+    // The color of the team the player of `c` is in, as their waypoint takes it where its icon
+    // has none, `cloneAndAssignStyle` (CAL-164): its RGB, but black's a dark gray; none where
+    // they're in no team or it has no color.
+    fn waypoint_color(self, c: Connection) -> i32? {
+        if self.world.scoreboard.teams.is_empty() {
+            return none
+        }
+        let p = c.profile else return none
+        let t = self.world.scoreboard.team(p.name.copy()) else return none
+        let id = t.color else return none
+        return some(if id == 0 { -13619152 } else { color_rgb(id) })
+    }
+
+    // Whether the players of `a` and `b` are in the same team, `isAlliedTo` (CAL-164).
+    fn allied(self, a: Connection, b: Connection) -> bool {
+        if self.world.scoreboard.teams.is_empty() {
+            return false
+        }
+        let pa = a.profile else return false
+        let pb = b.profile else return false
+        return self.world.scoreboard.allied(pa.name.copy(), pb.name.copy())
+    }
+
+    // Whether a mob, in no team, may push the player of `c` as their team's collision rule has
+    // it, `pushableBy` (CAL-164).
+    fn mob_pushes(self, c: Connection) -> bool {
+        return team_pushes(RULE_ALWAYS, self.collision_rule_of(c), false)
+    }
+
+    // `ServerLevel.EntityCallbacks.onDestroyed`'s `entityRemoved` of the living entities the
+    // scoreboard had that were taken away, `es`'s `unscored`, that of `id` where it's given, else
+    // all (CAL-164): each one's scores gone, `reset_score` of them all, then it out of its team,
+    // `set_player_team` taking it out, to every player.
+    fn unscore(mut self, es: mut LevelEntities, id: i32?) {
+        var kept = List<(i32, (i64, i64))>()
+        var due = List<(i64, i64)>()
+        for (gone, u) in es.list.unscored {
+            if id == none or id == some(gone) {
+                due.push(u)
+            } else {
+                kept.push((gone, u))
+            }
+        }
+        es.list.unscored = kept
+        for u in due {
+            let name = Uuid.new(u.0, u.1).to_string()
+            let (scores, left) = self.world.scoreboard.entity_removed(name.copy())
+            if scores {
+                self.broadcast(encode_play(ClientboundResetScore { owner: name.copy(), objective: none }))
+            }
+            if let t = left {
+                self.broadcast(encode_play(ClientboundSetPlayerTeam { name: t, body: TeamBody { method: 4, players: [name.copy()] } }))
+            }
+        }
+        es.list.scored = self.world.scoreboard.uuid_holders()
     }
 
     // The player `profile`'s name as vanilla shows it, in their team where they're in one,
@@ -7749,6 +7941,7 @@ impl Network {
         es.list.universal_anger = self.world.universal_anger
         es.list.border = some(self.border_of(d))
         es.list.pvp = self.world.pvp
+        es.list.scored = if self.world.scoreboard.scores.is_empty() and self.world.scoreboard.team_of.is_empty() { List<(i64, i64)>() } else { self.world.scoreboard.uuid_holders() }
         es.list.game_time = self.world.game_time
         es.list.hard = self.world.settings.difficulty == Difficulty.Hard
         es.list.difficulty = self.world.settings.difficulty.id()
@@ -7901,6 +8094,9 @@ impl Network {
             k = self.play_until(d, sounds, k, after[g])
             self.send_level_events(d)
             self.item_gone(mut es, gone[g])
+            if not es.list.unscored.is_empty() {
+                self.unscore(mut es, some(gone[g]))
+            }
         }
         while n < shown.len() {
             k = self.play_until(d, sounds, k, shown_after[n])
@@ -7916,6 +8112,10 @@ impl Network {
         }
         _ = self.play_until(d, sounds, k, sounds.len())
         self.send_level_events(d)
+        // Those the scoreboard had that went another way, forgotten too (CAL-164).
+        if not es.list.unscored.is_empty() {
+            self.unscore(mut es, none)
+        }
         self.put_entities(d, es)
         return (true, attacked)
     }
@@ -10043,7 +10243,11 @@ impl Network {
         // `ENTITY_KILLED` of its type.
         if let who = death.killed_by {
             if let victim = death.this.copy() {
-                self.player_killed(d, who, victim)
+                let name = match death.uuid {
+                    some(u) => some(Uuid.new(u.0, u.1).to_string()),
+                    none => none,
+                }
+                self.player_killed(d, who, victim, name)
             }
         }
         if let who = death.by_player {
@@ -10140,7 +10344,7 @@ impl Network {
     // level `d`, who killed `victim` (CAL-164): each criterion listening whose `entity` holds of
     // the victim, tested in `EntityPredicate.createContext` of it where the player is, and whose
     // player's condition holds, awarded. A `killing_blow` is said to be missing, and doesn't hold.
-    fn player_killed(mut self, d: usize, who: (i64, i64), victim: LootEntity) {
+    fn player_killed(mut self, d: usize, who: (i64, i64), victim: LootEntity, victim_name: String?) {
         let (most, least) = who
         for slot in 0..self.connections.len() {
             if not self.playing(slot) {
@@ -10152,7 +10356,7 @@ impl Network {
                 found = con.player.dim == d and p.id.most == most and p.id.least == least
             }
             if found {
-                self.killed_by_player(mut con, victim.copy(), none)
+                self.killed_by_player(mut con, victim.copy(), victim_name.copy())
             }
             self.connections[slot] = some(con)
             if found {
@@ -10165,8 +10369,8 @@ impl Network {
     // scores of `totalKillCount` one more, then their `PLAYER_KILLS` and scores of
     // `playerKillCount` where it's a player, else their `MOB_KILLS`; then, `handleTeamKill`, their
     // scores of `teamkill.` the color of the victim's team, and the victim's of `killedByTeam.`
-    // the color of theirs, where the victim is a player, `victim_name`, as no mob's in a team
-    // yet; then the kill trigger.
+    // the color of theirs, the victim by their name on the scoreboard, `victim_name`, a mob's its
+    // UUID; then the kill trigger.
     fn killed_by_player(mut self, con: mut Connection, victim: LootEntity, victim_name: String?) {
         self.score_criteria(mut con, String("totalKillCount"), 1, none)
         let by_player = victim.kind == "minecraft:player"
@@ -10606,10 +10810,12 @@ impl Network {
                 height: f32.nearest(pose_height(pose)),
                 spectator: c.player.mode == GameType.Spectator,
                 dead: c.player.entity_data.float(HEALTH) <= 0.0f32,
-                pushable: self.player_pushable(c, lf, f),
+                pushable: if self.mob_pushes(c) { self.player_pushable(c, lf, f) } else { none },
                 discrete: c.player.shift,
                 tempts: lf.tempting.of(stack_item(held_in(c, 0))) | lf.tempting.of(stack_item(held_in(c, 1))),
                 uuid: match c.profile { some(p) => some((p.id.most, p.id.least)), none => none },
+                team: self.team_name_of(c),
+                friendly_fire: self.friendly_fire_of(c),
                 enemy: c.player.mode != GameType.Spectator and c.player.entity_data.float(HEALTH) > 0.0f32 and not c.player.abilities.invulnerable,
                 creative: c.player.mode == GameType.Creative,
                 bounds: some(pose_box(pose, c.player.x, c.player.y, c.player.z)),
@@ -12484,10 +12690,14 @@ impl Network {
         let lf = self.living_facts.take() else return
         let b = pose_box(con.player.entity_data.number(POSE_ID), con.player.x, con.player.y, con.player.z)
         let me = con.player.entity_id
+        let ours = self.collision_rule_of(con)
         var others = List<usize>()
         for slot in self.level_slots(d) {
             if let c = self.connections[slot] {
                 if c.player.entity_id == me {
+                    continue
+                }
+                if not team_pushes(ours, self.collision_rule_of(c), self.allied(con, c)) {
                     continue
                 }
                 if let pb = self.player_pushable(c, lf, f) {
@@ -12500,7 +12710,8 @@ impl Network {
         var es = self.take_entities(d)
         let pushes = con.player.mode != GameType.Spectator
         let pushed = self.player_pushable(con, lf, f) != none
-        let mobs = es.list.pushed_by_player(me, con.player.x, con.player.z, b, pushes, pushed, lf, f, self.levels[d])
+        // No mob is in a team yet, so their collision rules are `always`.
+        let mobs = if team_pushes(ours, RULE_ALWAYS, false) { es.list.pushed_by_player(me, con.player.x, con.player.z, b, pushes, pushed, lf, f, self.levels[d]) } else { 0 }
         let mine = es.list.take_player_pushes()
         self.put_entities(d, es)
         self.living_facts = some(lf)
@@ -16504,7 +16715,7 @@ impl Network {
                 let other = pose_box(c.player.entity_data.number(POSE_ID), c.player.x, c.player.y, c.player.z)
                 let (ox, oy, oz) = (px - c.player.x, py - c.player.y, pz - c.player.z)
                 let other_id = c.player.entity_id
-                if other_id != me and other_id != target and not c.player.removed and c.player.mode != GameType.Spectator and other.intersects(around.min_x, around.min_y, around.min_z, around.max_x, around.max_y, around.max_z) and ox * ox + oy * oy + oz * oz < 9.0 {
+                if other_id != me and other_id != target and not c.player.removed and c.player.mode != GameType.Spectator and not self.allied(con, c) and other.intersects(around.min_x, around.min_y, around.min_z, around.max_x, around.max_y, around.max_z) and ox * ox + oy * oy + oz * oz < 9.0 {
                     players.push(slot)
                 }
             }
@@ -16719,7 +16930,7 @@ impl Network {
     // entity, `killedEntity`, their `ENTITY_KILLED` of its type.
     fn mob_dies(mut self, con: mut Connection, d: usize, items: ItemCodecs, mob: mut Mob, tags: u32) {
         if mob.living.hurt_by_player_memory > 0 {
-            self.killed_by_player(mut con, mob.loot_entity(), none)
+            self.killed_by_player(mut con, mob.loot_entity(), some(Uuid.new(mob.living.body.uuid.0, mob.living.body.uuid.1).to_string()))
         }
         con.player.stats.award(String("minecraft:killed"), mob.loot_entity().kind, 1)
         mob.living.killed()
@@ -19146,6 +19357,19 @@ impl Network {
         if source.player != none and not self.world.pvp {
             return false
         }
+        // Nor by a player in their team where it doesn't allow friendly fire,
+        // `doTeamsAllowDamage` (CAL-164).
+        if let who = source.player {
+            if not self.world.scoreboard.teams.is_empty() {
+                if let p = con.profile {
+                    if let attacker = self.player_name_by(con, who) {
+                        if not self.world.scoreboard.allows_damage(p.name.copy(), attacker) {
+                            return false
+                        }
+                    }
+                }
+            }
+        }
         if con.player.abilities.invulnerable and not lf.damage.is(kind, BYPASSES_INVULNERABILITY) {
             return false
         }
@@ -20015,10 +20239,7 @@ impl Network {
         }
         if self.world.show_death_messages {
             self.send(mut con, ClientboundPlayerCombatKill { player_id: me, message: message.copy() }, State.Play)
-            self.broadcast_system(message.copy(), Look.Quiet)
-            if con.information.chat_visibility != ChatVisibility.Hidden {
-                self.send(mut con, ClientboundSystemChat { content: message, overlay: false }, State.Play)
-            }
+            self.death_message(mut con, message)
         } else {
             self.send(mut con, ClientboundPlayerCombatKill { player_id: me, message: Component.literal(String()) }, State.Play)
         }
@@ -20120,8 +20341,15 @@ impl Network {
             none => none,
         }
         var other = self.connections[slot].take() else return
+        // The scores their kill sends every player, sent them too once it's done, as they're
+        // out of the connections meanwhile (CAL-164).
+        self.held_scores = some(List<List<u8>>())
         self.killed_by_player(mut other, me, victim_name)
+        let held = self.held_scores.take() ?? List<List<u8>>()
         self.connections[slot] = some(other)
+        for packet in held {
+            self.send_bytes(mut con, packet.copy())
+        }
     }
 
     // `ServerStatsCounter.sendStats` (CAL-164): the stats set since they were last sent, and none
@@ -20969,8 +21197,10 @@ fn player_tag(player: Player, id: Uuid, dimension: own String) -> JavaHashMap<St
 }
 
 // What the locator bar asks of the player (CAL-174): their waypoint's icon as their data had it,
-// `locator_bar_icon`, its style and color, the default style and none where it has none.
-fn beacon_of(con: Connection) -> Beacon {
+// `locator_bar_icon`, its style and color, the default style and none where it has none; and
+// where it has no color, their team's, `team_color`, where theirs has one,
+// `cloneAndAssignStyle` (CAL-164).
+fn beacon_of(con: Connection, team_color: i32?) -> Beacon {
     var style = String("minecraft:default")
     var color: i32? = none
     if let data = con.player.data {
@@ -20994,6 +21224,9 @@ fn beacon_of(con: Connection) -> Beacon {
     let uuid = match con.profile {
         some(p) => (p.id.most, p.id.least),
         none => (0, 0),
+    }
+    if color == none {
+        color = team_color
     }
     let transmit = con.player.attributes.value(attribute_id(String("waypoint_transmit_range")) ?? 0)
     let receive = con.player.attributes.value(attribute_id(String("waypoint_receive_range")) ?? 0)

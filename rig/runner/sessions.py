@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -299,6 +299,40 @@ SCOREBOARD = {
             {"Name": "blue", "DisplayName": "Blue", "SeeFriendlyInvisibles": nbt.Byte(0),
              "DeathMessageVisibility": "never", "Players": nbt.List(nbt.STRING, ["carol"])},
             {"Name": "empty", "DisplayName": "Empty"},
+        ]),
+    },
+    "DataVersion": nbt.Int(5023),
+}
+
+# The scoreboard in `teammates` (CAL-164): the bot and Mate in one team, which allows no friendly
+# fire and no collisions.
+TEAMMATES = {
+    "data": {"Teams": nbt.List(C, [
+        {"Name": "pals", "DisplayName": "Pals", "AllowFriendlyFire": nbt.Byte(0), "CollisionRule": "never",
+         "Players": nbt.List(nbt.STRING, ["Bot", "Mate"])},
+    ])},
+    "DataVersion": nbt.Int(5023),
+}
+
+# The scoreboard in `rivals` (CAL-164): the bot in red, whose players push only each other, and
+# Mate in blue, whose death messages only its own players see; objectives of kills, player kills,
+# deaths, kills of blue and deaths by red, each shown.
+RIVALS = {
+    "data": {
+        "Objectives": nbt.List(C, [
+            {"Name": "kills", "CriteriaName": "totalKillCount", "DisplayName": "Kills"},
+            {"Name": "pk", "CriteriaName": "playerKillCount", "DisplayName": "Player kills"},
+            {"Name": "deaths", "CriteriaName": "deathCount", "DisplayName": "Deaths"},
+            {"Name": "tk", "CriteriaName": "teamkill.blue", "DisplayName": "Blues killed"},
+            {"Name": "kbt", "CriteriaName": "killedByTeam.red", "DisplayName": "Killed by red"},
+        ]),
+        "DisplaySlots": {"sidebar": "kills", "list": "pk", "below_name": "deaths", "sidebar.team.red": "tk",
+                         "sidebar.team.blue": "kbt"},
+        "Teams": nbt.List(C, [
+            {"Name": "red", "DisplayName": "Red", "TeamColor": "red", "CollisionRule": "pushOwnTeam",
+             "Players": nbt.List(nbt.STRING, ["Bot"])},
+            {"Name": "blue", "DisplayName": "Blue", "TeamColor": "blue", "DeathMessageVisibility": "hideForOtherTeams",
+             "Players": nbt.List(nbt.STRING, ["Mate"])},
         ]),
     },
     "DataVersion": nbt.Int(5023),
@@ -1568,6 +1602,14 @@ CONFIGS = {
                              rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:random_tick_speed", nbt.Int(0)),
                                     ("minecraft:respawn_radius", nbt.Int(0)))),
 }
+# `duel` with the bot and Mate in one team, which allows no friendly fire and no collisions
+# (CAL-164): no hit hurts Mate, the sheep's sweep passes it by, and the step into it pushes
+# neither.
+CONFIGS["teammates"] = replace(CONFIGS["duel"], saved={"scoreboard": TEAMMATES})
+# `duel` with the bot in red and Mate in blue (CAL-164): Mate's death counts for each criteria of
+# kills and deaths, its message seen by no one else, and the step into it pushes both, as red's
+# players push only each other but the other team's may push them.
+CONFIGS["rivals"] = replace(CONFIGS["duel"], saved={"scoreboard": RIVALS})
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
 BOT = "Bot"
