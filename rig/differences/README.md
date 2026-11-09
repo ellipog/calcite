@@ -47,6 +47,7 @@ The body says what vanilla does, what Calcite does, and why the difference is wo
 | [`lists-kept.md`](lists-kept.md) | bug | A player list that can't be read is left as it is, where vanilla writes what it read over it |
 | [`log-line-endings.md`](log-line-endings.md) | platform | logs/latest.log ends its lines with `\n` on Windows too |
 | [`log-second-roll.md`](log-second-roll.md) | bug | logs/latest.log rolls once at start, so an archive isn't lost |
+| [`own-commands.md`](own-commands.md) | identity | Game masters and owners get Calcite's own commands in their commands packet, after vanilla's |
 | [`properties-on-windows.md`](properties-on-windows.md) | platform | server.properties ends its lines with `\n` on Windows, and its date names the zone by its offset there |
 | [`properties-range-percentage.md`](properties-range-percentage.md) | bug | A server.properties `entity-broadcast-range-percentage` that isn't a number is the default, instead of stopping the server |
 | [`snbt-depth.md`](snbt-depth.md) | bug | Deeply nested SNBT is rejected at depth 512, instead of overflowing the stack |

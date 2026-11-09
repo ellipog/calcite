@@ -94,17 +94,19 @@ SCENARIOS = ["status", "outdated", "bad-name", "stranger", "join"]
 # and hits villagers without AI; `villagers`, where it stands by villagers with their brains;
 # `compost`, where it stands by them too and takes a full composter's bone meal; `asleep`, where
 # it leaves while they sleep; `breed`, where it stays by them till 1000; `hearsay`, where it
-# stays till 1500; `bell`, where it rings a bell by them; and `talk`, where it types the commands
-# every player may use, with Mate there, recorded as `talk-mate` (src/rig/session.calx).
+# stays till 1500; `bell`, where it rings a bell by them; `talk`, where it types the commands
+# every player may use, with Mate there, recorded as `talk-mate`; and `select`, where it types
+# selectors with options as an operator, with Mate there, recorded as `select-mate`
+# (src/rig/session.calx).
 OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
                    "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
-                   "traders", "frost", "soul", "splash", "linger", "talk"]
+                   "traders", "frost", "soul", "splash", "linger", "talk", "select"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
-MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate"}
+MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate"}
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -1638,6 +1640,9 @@ CONFIGS["rivals"] = replace(CONFIGS["duel"], saved={"scoreboard": RIVALS})
 # may use (CAL-165): `list`, `help`, `me`, `msg`, `tell`, `teammsg`, `trigger` and `random`, with
 # their failures, and two it may not.
 CONFIGS["talk"] = replace(CONFIGS["duel"], scenarios=("talk",), saved={"scoreboard": TALK})
+# `talk` with the bot an operator, which types selectors with options in `say`, `gamemode` and
+# `msg` (CAL-165).
+CONFIGS["select"] = replace(CONFIGS["talk"], scenarios=("select",), ops=("Bot",))
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
 BOT = "Bot"
