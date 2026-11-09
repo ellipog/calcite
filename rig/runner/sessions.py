@@ -940,6 +940,15 @@ CONFIGS = {
                          rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                 ("minecraft:respawn_radius", nbt.Int(0))),
                          player=ARROWS),
+    # The bot, in survival mode with nothing, stands at the bullseye fixture's spawn, on normal at
+    # midnight, while its arrow, shot from beside it as the world loads, strikes the middle of a
+    # target block 31.5 blocks east (CAL-164), whose signal of 15 is its `target_hit`,
+    # `adventure/bullseye`.
+    "bullseye": Config({"difficulty": "normal"}, view=3, scenarios=("arrows",), world=FIXTURES / "bullseye" / "world",
+                       fixture="bullseye",
+                       rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                              ("minecraft:respawn_radius", nbt.Int(0))),
+                       player=ARROWS),
     # The bot, in survival mode with nothing, stands at the tipped fixture's spawn, on normal at
     # midnight, while tipped arrows from as the world loads hit a cow, a zombie and a pig without
     # AI (D513), which take their potions' effects, and one sticks in a wall, where its potion

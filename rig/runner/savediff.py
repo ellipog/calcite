@@ -6,9 +6,10 @@ entity, the block and fluid ticks waiting, the heightmaps and the light, as vani
 
 A section's palette and the bits it packs its states in depend on the order its blocks were set
 in, so states are compared block by block, not as bytes; a block entity is compared by its
-position, as a compound, and the ticks as sets, since each server keeps them in its own order.
-What each saves of when it saved, `LastUpdate`, and how long players were near, `InhabitedTime`,
-aren't compared: the bot's steps land on different game times on the two servers.
+position, as a compound, and the ticks as sets, since each server keeps them in its own order,
+each by the game time it's due. What each saves of when it saved, `LastUpdate`, and how long
+players were near, `InhabitedTime`, aren't compared: the bot's steps land on different game times
+on the two servers.
 
 The entity chunks, in `entities/`, are compared too (CAL-148): each chunk's entities in the order
 it saved them, by their UUIDs, and each entity's tags, but those that tell when the server
@@ -118,8 +119,18 @@ def block_entities(chunk):
 
 
 def ticks(chunk, key):
-    """A chunk's ticks of `key`, each as a hashable tuple, as a set."""
-    return {tuple(sorted((k, str(v)) for k, v in t.items())) for t in chunk.get(key, [])}
+    """A chunk's ticks of `key`, each as a hashable tuple, as a set: its delay, `t`, as the game
+    time it's due, from when the chunk was saved, `LastUpdate`, as the two servers may stop and
+    save a tick apart, the same tick due 17 ticks after one's save and 18 after the other's
+    (CAL-164)."""
+    saved = chunk.get("LastUpdate", 0)
+    out = set()
+    for tick in chunk.get(key, []):
+        due = dict(tick)
+        if "t" in due:
+            due["t"] = int(due["t"]) + int(saved)
+        out.add(tuple(sorted((k, str(v)) for k, v in due.items())))
+    return out
 
 
 def light(chunk, bottom):
@@ -235,6 +246,9 @@ def chunk_differences(cx, cz, a, b, show):
         ta, tb = ticks(a, key), ticks(b, key)
         if ta != tb:
             out.append(f"{key}: {len(ta - tb)} only vanilla's, {len(tb - ta)} only Calcite's")
+            for side, only in (("vanilla's", sorted(ta - tb)[:3]), ("Calcite's", sorted(tb - ta)[:3])):
+                for tick in only:
+                    out.append(f"  only {side}: " + ", ".join(f"{k} {v}" for k, v in tick))
     for key in sorted((set(a) | set(b)) - LEFT_OUT - {"sections", "block_entities", "block_ticks", "fluid_ticks"}):
         if a.get(key) != b.get(key):
             out.append(f"{key}: {a.get(key)!r:.200} vs {b.get(key)!r:.200}")
