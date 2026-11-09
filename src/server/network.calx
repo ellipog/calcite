@@ -27,7 +27,9 @@ import protocol.play.{Abilities, ClientboundWaypoint, ClientboundAnimate, Client
 import protocol.state.{State}
 import protocol.status.{ClientboundStatusResponse, ClientboundPongResponse, StatusIn}
 import protocol.wire.{DecodeError, Reader, Writer, Wire, Packet, write_packet}
+import random.any.{AnyRandom}
 import random.legacy.{LegacyRandom}
+import random.worldgen.{WorldgenRandom}
 import registry.builtin.{builtin_entries, builtin_names}
 import registry.codec.{same}
 import registry.components.{ItemCodecs}
@@ -112,9 +114,9 @@ import world.menu.{CRAFTING_MENU, Clicker, Effect, HashedStack, INVENTORY_MENU, 
 import world.item.{ItemStack, SentOffers, SentStack, WornSlot, WornSlots}
 import world.modes.{Difficulty, GameType, PreviousGameType}
 import world.pos.{BlockPos, ChunkPos}
-import world.entity_facts.{MONSTER}
+import world.entity_facts.{CREATURE, MONSTER}
 import world.environment.{baby_villager_activity, fast_lava, increased_fire_burnout, monsters_burn, moon_phase, sun_angle, surface_slime_spawn_chance, villager_activity, water_evaporates}
-import world.natural.{MobMaker, SpawnPlace, SpawnState, reinforce, spawn_for_chunk, spawning_categories, spawns_in}
+import world.natural.{MobMaker, SpawnPlace, SpawnState, reinforce, spawn_for_chunk, spawn_for_generation, spawning_categories, spawns_in}
 import world.random_sequences.{RandomSequences, saved_id as sequences_id}
 import world.random_ticks.{TickPlace, Viewer}
 import world.recipes.{Stonecutting}
@@ -604,6 +606,9 @@ struct LevelEntities {
     // across.
     kept_mobs: Map<i32, (i32, f64, f64)> = Map<i32, (i32, f64, f64)>()
     last_kept: i32 = 0
+    // The mobs each chunk spawned as it generated, saved as `ProtoChunk.addEntity` saves them,
+    // till it comes to be full and they're loaded again (CAL-161).
+    generated: OpenHashMap<i64, List<Tag>> = OpenHashMap<i64, List<Tag>>()
     jobs: EntityJobs? = none
     stopping: bool = false
     saved_all: bool = false
@@ -1529,6 +1534,8 @@ impl Network {
                     return true
                 }
                 self.level_lines()
+                // As `light_done` spawns what the step's light lets spawn (CAL-161).
+                self.generation_spawns(d)
                 self.levels[d].dispatch()
             },
             Input.Chunk(d, pos, io, bytes) => {
@@ -8803,33 +8810,8 @@ impl Network {
                 }
                 let species = species_named(type_id.copy())
                 if species != none and codecs_ready and self.living_ready(d) and self.mob_facts_ready() {
-                    self.entity_ids += 1
-                    let id = self.entity_ids
-                    let seed = self.entity_seed(id)
-                    let kind = u32.wrap(self.entity_type(type_name(species ?? MOOSHROOM)))
-                    if let lf = self.living_facts {
-                        if let facts = self.mob_facts {
-                            if let mb = Mob.loaded(lf, facts, kind, id, seed, saved.tag, mut lines) {
-                                // A skeleton's weapon goal as what it holds has it, as its
-                                // `readAdditionalSaveData` ends (CAL-159).
-                                var skel = mb
-                                skel.reassess_weapon(self.world.settings.difficulty == Difficulty.Hard)
-                                // An enderman's carried block read as a state, `BlockState.CODEC`,
-                                // where it's one, else none (CAL-159).
-                                if skel.species == ENDERMAN and skel.kept.contains("carriedBlockState") {
-                                    var state: u32? = none
-                                    if let codecs = self.items {
-                                        state = codecs.state_of(skel.kept["carriedBlockState"].copy())
-                                    }
-                                    let tag = if state != none { some(skel.kept["carriedBlockState"].copy()) } else { none }
-                                    skel.set_carried(state, tag)
-                                }
-                                // An enderman's legacy anger, `AngerTime`, read as the game time
-                                // plus it (CAL-159).
-                                skel.anger_from(self.world.game_time)
-                                entities.push(ReadEntity.Mob(skel))
-                            }
-                        }
+                    if let mb = self.loaded_mob(species ?? MOOSHROOM, saved.tag, mut lines) {
+                        entities.push(ReadEntity.Mob(mb))
                     }
                     continue
                 }
@@ -8864,6 +8846,144 @@ impl Network {
         after.inbox.push(ReadEntities { pos: pos, entities: entities })
         self.put_entities(d, after)
         return true
+    }
+
+    // A mob of the kind `species` loaded from `tag`, with the next ID and a seed from it, as
+    // `EntityType.loadEntityRecursive` makes one and `load` reads it in, what that logs added to
+    // `lines`; none where it can't be read, which takes its ID all the same.
+    fn loaded_mob(mut self, species: i32, tag: JavaHashMap<String, Tag>, lines: mut List<Entry>) -> Mob? {
+        self.entity_ids += 1
+        let id = self.entity_ids
+        let seed = self.entity_seed(id)
+        let kind = u32.wrap(self.entity_type(type_name(species)))
+        let lf = self.living_facts else return none
+        let facts = self.mob_facts else return none
+        var mb = Mob.loaded(lf, facts, kind, id, seed, tag, mut lines) else return none
+        // A skeleton's weapon goal as what it holds has it, as its `readAdditionalSaveData` ends
+        // (CAL-159).
+        mb.reassess_weapon(self.world.settings.difficulty == Difficulty.Hard)
+        // An enderman's carried block read as a state, `BlockState.CODEC`, where it's one, else
+        // none (CAL-159).
+        if mb.species == ENDERMAN and mb.kept.contains("carriedBlockState") {
+            var state: u32? = none
+            if let codecs = self.items {
+                state = codecs.state_of(mb.kept["carriedBlockState"].copy())
+            }
+            let carried = if state != none { some(mb.kept["carriedBlockState"].copy()) } else { none }
+            mb.set_carried(state, carried)
+        }
+        // An enderman's legacy anger, `AngerTime`, read as the game time plus it (CAL-159).
+        mb.anger_from(self.world.game_time)
+        return some(mb)
+    }
+
+    // The spawn step of each fresh chunk of the level `d` that's ready for it, in the order they
+    // came to be (CAL-161), as `NoiseBasedChunkGenerator.spawnOriginalMobs` runs it before the
+    // chunk's full: its mobs kept as tags for it, and the chunk loaded, so it can come to be.
+    fn generation_spawns(mut self, d: usize) {
+        let ready = self.levels[d].take_spawn_ready()
+        for (pos, legacy) in ready {
+            let made = self.generation_spawn(d, pos, legacy)
+            self.levels[d].spawned(pos)
+            if not made.is_empty() {
+                var es = self.take_entities(d)
+                es.generated.insert(pos.pack(), made)
+                self.put_entities(d, es)
+            }
+        }
+    }
+
+    // `spawnMobsForChunkGeneration` in the chunk at `pos` of the level `d` (CAL-161), with
+    // `spawn_mobs` on and what natural spawning knows: its creatures made in `WorldGenRegion`'s
+    // place, whose sky doesn't darken and where no entity's in the way, each taking an ID and a
+    // seed as `create` does, with the chunk's own random, `WorldgenRandom` over a legacy source
+    // seeded for its decoration, and the region's, `worldgen_region_random` at its corner, of the
+    // `RandomState`'s source, legacy if `legacy`. Each is saved as `ProtoChunk.addEntity` saves
+    // it. A type Calcite doesn't make yet is reported, and ends the chunk's spawning.
+    fn generation_spawn(mut self, d: usize, pos: ChunkPos, legacy: bool) -> List<Tag> {
+        var out = List<Tag>()
+        if not self.world.spawn_rules.mobs or not self.world.natural_ready() or not self.items_ready() or not self.living_ready(d) or not self.mob_facts_ready() {
+            return out
+        }
+        let n = self.world.natural.take() else return out
+        var place = self.spawn_place(d, List<SpawnerPlayer>(), [CREATURE])
+        place.sky_darken = 0
+        var maker = self.mob_making(d)
+        maker.blocking = List<Aabb>()
+        maker.ids = self.entity_ids
+        maker.seeds = self.entity_seeds
+        maker.lf = self.living_facts.take()
+        maker.facts = self.mob_facts.take()
+        let seed = self.world.seed
+        let xo = pos.x * 16
+        let zo = pos.z * 16
+        var r = WorldgenRandom.new(LegacyRandom.new(0))
+        _ = r.set_decoration_seed(seed, xo, zo)
+        var source = AnyRandom.of(legacy, seed)
+        let positional = source.fork_positional()
+        var named = positional.from_hash_of(String("minecraft:worldgen_region_random"))
+        let factory = named.fork_positional()
+        var region = factory.at(xo, 0, zo)
+        let top = self.world.dims[d].min_y + self.world.dims[d].height - 1
+        let ceiling = self.world.dims[d].ceiling
+        var thrown: String? = none
+        var missing: i32? = none
+        self.levels[d].begin_region(pos)
+        match spawn_for_generation(n, self.world.mobs[d], place, mut self.levels[d], mut maker, pos.x, pos.z, top, ceiling, mut r, mut region) {
+            ok(m) => missing = m,
+            err(e) => thrown = some("{e.exception}: {e.message}"),
+        }
+        self.levels[d].end_region()
+        self.world.natural = some(n)
+        self.entity_ids = maker.ids
+        self.entity_seeds = maker.seeds
+        self.living_facts = maker.lf.take()
+        self.mob_facts = maker.facts.take()
+        if let e = thrown {
+            self.logs.push(Entry.error("Spawning mobs as chunk {pos.x}, {pos.z} generated threw {e}"))
+        }
+        if let type_id = missing {
+            var name = String("an entity type")
+            if let codecs = self.items {
+                name = codecs.builtin_name("entity_type", type_id) ?? name
+            }
+            self.levels[d].unimplemented("{name} among the mobs chunks spawn as they generate")
+        }
+        for m in maker.made {
+            out.push(m.saved())
+        }
+        return out
+    }
+
+    // The mobs the chunk at `pos` of the level `d` spawned as it generated, added as it comes to
+    // be full, as `postLoadProtoChunk` adds them, `addWorldGenChunkEntities`, before its entities
+    // are read (CAL-161): each loaded again from its tag as `loadEntitiesRecursive` loads it,
+    // with an ID and a seed of its own.
+    fn add_generated(mut self, d: usize, pos: ChunkPos) {
+        var es = self.take_entities(d)
+        let made = es.generated.remove(pos.pack())
+        self.put_entities(d, es)
+        let tags = made else return
+        if not self.items_ready() or not self.living_ready(d) or not self.mob_facts_ready() {
+            return
+        }
+        var lines = List<Entry>()
+        for tag in tags {
+            let Tag.Compound(m) = tag else continue
+            var name = String()
+            if m.contains("id") {
+                if let Tag.Str(s) = m["id"] {
+                    name = s.copy()
+                }
+            }
+            let species = species_named(name) else continue
+            if let mb = self.loaded_mob(species, m, mut lines) {
+                self.add_mob(d, mb)
+            }
+        }
+        for e in lines {
+            self.logs.push(e.copy())
+        }
     }
 
     // Asks for the entities of the chunk at `pos` of the level `d`, `requestChunkLoad`: from its
@@ -8914,6 +9034,7 @@ impl Network {
     // as `onFullChunkStatusChange` tells it: one that came to be is accessible, and its entities
     // are asked for if it's fresh; one that stopped being is to unload (CAL-148).
     fn entity_visibility(mut self, d: usize) {
+        self.generation_spawns(d)
         let changes = self.levels[d].take_full_changes()
         for (pos, full) in changes {
             let k = pos.pack()
@@ -8927,6 +9048,9 @@ impl Network {
                 es.to_unload.insert(k)
             }
             self.put_entities(d, es)
+            if full {
+                self.add_generated(d, pos)
+            }
             if full and fresh {
                 self.ask_entities(d, pos)
             }
@@ -16246,7 +16370,9 @@ impl Network {
     }
 
     // Takes in each step each dimension's light thread has done, recording it, as the server's
-    // loop hands it over (D264).
+    // loop hands it over (D264); then the spawn step of each fresh chunk whose light that gave,
+    // so it comes to be full as soon as it can, as vanilla's worldgen threads spawn a chunk's
+    // mobs whenever its light's done (CAL-161).
     fn light_done(mut self) {
         for dim in 0..self.levels.len() {
             var any = false
@@ -16257,6 +16383,7 @@ impl Network {
                 any = true
             }
             if any {
+                self.generation_spawns(dim)
                 self.levels[dim].dispatch()
             }
         }

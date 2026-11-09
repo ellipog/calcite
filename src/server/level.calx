@@ -528,6 +528,15 @@ pub struct Level {
     // The chunks light's initialized, and those it's lit, which are full.
     initialized: OpenHashSet<i64> = OpenHashSet<i64>()
     lit: OpenHashSet<i64> = OpenHashSet<i64>()
+    // The fresh chunks whose mobs are still to spawn, `ChunkStatus.SPAWN` to come, each with
+    // whether its noise settings use the legacy random source; those of them lit at a level that
+    // wants them full, in the order they came to be, to spawn once their light's here; and those
+    // whose light was watched for it (CAL-161). One isn't loaded until it's spawned. While one
+    // spawns, the 3×3 around it, `region`, is read as `WorldGenRegion` reads it, full or not.
+    spawn_due: OpenHashMap<i64, bool> = OpenHashMap<i64, bool>()
+    spawn_next: LinkedSet<i64> = LinkedSet<i64>()
+    spawn_watch: OpenHashSet<i64> = OpenHashSet<i64>()
+    region: i64? = none
     // The chunks that may have come to be full, or stopped being, since `take_full_changes` was
     // last asked, and those it last said are full (CAL-148).
     full_maybe: List<i64> = List<i64>()
@@ -3217,10 +3226,10 @@ impl Level {
         match gone {
             Body.Saved(s) => {
                 if s.fresh and s.whole {
-                    let SavedChunk { chunk: chunk, rest: rest, .. } = s
+                    let SavedChunk { chunk: chunk, rest: rest, spawn_due: due, .. } = s
                     let r = rest else return
                     var jobs = self.jobs.take() else return
-                    jobs.save_chunk(unpacked(k), Whole { chunk: chunk, rest: r }, none)
+                    jobs.save_chunk(unpacked(k), Whole { chunk: chunk, rest: r, spawn_due: due }, none)
                     self.jobs = some(jobs)
                 }
             },
@@ -3279,6 +3288,7 @@ impl Level {
     fn changed(mut self, k: i64) {
         self.ticks_to_check.insert(k)
         self.full_maybe.push(k)
+        self.spawn_maybe(k)
         let level = self.dm.chunk_level(k, false)
         // Its ticking chunk goes at once where its level's too high for it, as `updateFutures`
         // demotes it; else it's to come in at the next main-thread pass (D447).
@@ -3509,6 +3519,9 @@ impl Level {
                 self.forget_light(k, save)
             }
         }
+        _ = self.spawn_due.remove(k)
+        self.spawn_next.remove(k)
+        self.spawn_watch.remove(k)
         _ = self.inhabited.remove(k)
     }
 
@@ -3529,11 +3542,12 @@ impl Level {
                 if whole {
                     let r = rest else return none
                     let inhabited = self.inhabited.get(k) ?? 0
+                    let due = self.spawn_due.contains(k)
                     if let t = ticks {
                         let (block, fluid) = t
-                        return some(Whole { chunk: chunk, rest: r.with_ticks(block, fluid), last_update: self.game_time, inhabited: inhabited })
+                        return some(Whole { chunk: chunk, rest: r.with_ticks(block, fluid), last_update: self.game_time, inhabited: inhabited, spawn_due: due })
                     }
-                    return some(Whole { chunk: chunk, rest: r, last_update: self.game_time, inhabited: inhabited })
+                    return some(Whole { chunk: chunk, rest: r, last_update: self.game_time, inhabited: inhabited, spawn_due: due })
                 }
             },
             _ => {},
@@ -3691,7 +3705,7 @@ impl Level {
             let (block, fluid) = t
             r = r.with_ticks(block, fluid)
         }
-        return some(Whole { chunk: c, rest: r, last_update: self.game_time, inhabited: self.inhabited.get(k) ?? 0 })
+        return some(Whole { chunk: c, rest: r, last_update: self.game_time, inhabited: self.inhabited.get(k) ?? 0, spawn_due: self.spawn_due.contains(k) })
     }
 
     /// The chunk at `pos` had a tick where mobs may spawn in it, `incrementInhabitedTime`, which
@@ -3722,11 +3736,17 @@ impl Level {
         self.stale(k)
         match loaded {
             Loaded.Generate => {
+                _ = self.spawn_due.remove(k)
                 self.columns.put(k, Body.Flat)
                 self.came(k, LightBody.Flat, [], [], false)
             },
             Loaded.Saved(s) => {
                 var saved = s
+                if saved.fresh and saved.spawn_due {
+                    self.spawn_due.insert(k, saved.legacy)
+                } else {
+                    _ = self.spawn_due.remove(k)
+                }
                 self.check_pois(k, saved.chunk.copy(), saved.fresh)
                 // What the generator made isn't on the disk until it's let go of (D258).
                 if saved.fresh and saved.whole {
@@ -3920,6 +3940,7 @@ impl Level {
                 self.unsaved.insert(k)
             }
             self.lit.insert(k)
+            self.spawn_maybe(k)
             self.came_loaded(k)
             self.reading.unlit.remove(k)
             if not self.spawns.is_empty() and self.near_spawn(k) {
@@ -4107,9 +4128,111 @@ impl Level {
     // Whether the chunk at `k` is full: lit, if chunks are read, or there, if they're all flat.
     fn loaded(self, k: i64) -> bool {
         if self.opened {
-            return self.lit.contains(k)
+            return self.lit.contains(k) and not self.spawn_due.contains(k)
         }
         return self.columns.slots.contains(k)
+    }
+
+    // The chunk at `k`, if its mobs are still to spawn, is to once its light's here, where it's
+    // lit at a level that wants it full: the spawn step comes only on the way to `FULL` (CAL-161).
+    // Its light's asked for at once, so it comes with light's next step.
+    fn spawn_maybe(mut self, k: i64) {
+        if not self.spawn_due.contains(k) or not self.lit.contains(k) or self.dm.chunk_level(k, false) > FULL {
+            return
+        }
+        self.spawn_next.insert(k)
+        if self.lighting and not self.light_data.contains(k) and not self.watching.contains(k) and not self.flat_around(unpacked(k)) {
+            self.watch(k)
+            self.spawn_watch.insert(k)
+        }
+    }
+
+    /// The fresh chunks ready for their mobs to spawn, `ChunkStatus.SPAWN` (CAL-161): each still
+    /// due, lit and at a level that wants it full, in the order it came to be, with whether its
+    /// noise settings use the legacy random source, once the level has its light, which spawn
+    /// rules read; it's asked for where it isn't here yet, and the chunk waits for it.
+    pub fn take_spawn_ready(mut self) -> List<(ChunkPos, bool)> {
+        var out = List<(ChunkPos, bool)>()
+        if self.spawn_next.is_empty() {
+            return out
+        }
+        var keys = List<i64>()
+        for k in self.spawn_next {
+            keys.push(k)
+        }
+        for k in keys {
+            let legacy = self.spawn_due.get(k) else {
+                self.spawn_next.remove(k)
+                continue
+            }
+            if not self.lit.contains(k) or self.dm.chunk_level(k, false) > FULL {
+                self.spawn_next.remove(k)
+                continue
+            }
+            if self.lighting and not self.light_data.contains(k) and not self.flat_around(unpacked(k)) {
+                if not self.watching.contains(k) {
+                    self.watch(k)
+                    self.spawn_watch.insert(k)
+                }
+                if not self.light_eager {
+                    continue
+                }
+                _ = self.step_here()
+                if not self.light_data.contains(k) {
+                    continue
+                }
+            }
+            self.spawn_next.remove(k)
+            out.push((unpacked(k), legacy))
+        }
+        return out
+    }
+
+    /// Reads the 3×3 around `pos` as the spawn step's `WorldGenRegion` does, until `end_region`:
+    /// each chunk held, full or not, whose blocks, heights and biomes are there (CAL-161).
+    pub fn begin_region(mut self, pos: ChunkPos) {
+        self.region = some(pos.pack())
+    }
+
+    /// Reads only the full chunks again, as `begin_region` began.
+    pub fn end_region(mut self) {
+        self.region = none
+    }
+
+    // Whether the chunk at `pos` is in the region `begin_region` began, and held with its blocks.
+    fn in_region(self, pos: ChunkPos) -> bool {
+        let c = self.region else return false
+        let at = unpacked(c)
+        if pos.x < at.x - 1 or pos.x > at.x + 1 or pos.z < at.z - 1 or pos.z > at.z + 1 {
+            return false
+        }
+        let k = pos.pack()
+        if self.columns.live.contains(k) {
+            return true
+        }
+        if not self.columns.slots.contains(k) {
+            return false
+        }
+        return match self.columns.slots[k] {
+            Body.Loading => false,
+            _ => true,
+        }
+    }
+
+    /// The chunk at `pos` has had its mobs spawned (CAL-161), and is loaded, as `ChunkStatus.FULL`
+    /// follows the spawn step: what waits on it may be ready now, and its light, if it was watched
+    /// for the spawning, is let go of, as `release` lets it go.
+    pub fn spawned(mut self, pos: ChunkPos) {
+        let k = pos.pack()
+        if self.spawn_due.remove(k) == none {
+            return
+        }
+        self.spawn_next.remove(k)
+        self.came_loaded(k)
+        if self.spawn_watch.contains(k) {
+            self.spawn_watch.remove(k)
+            self.release(k)
+        }
     }
 
     // A main-thread pass of the chunks to tick, outside the server's tick (D447): each still at a
@@ -4208,7 +4331,7 @@ impl SpawnLevel for Level {
     // `Level.getHeight`: the world's bottom where the chunk isn't loaded.
     fn surface(self, kind: i32, x: i32, z: i32) -> i32 {
         let pos = ChunkPos { x: x >> 4, z: z >> 4 }
-        if self.full(pos) {
+        if self.full(pos) or self.in_region(pos) {
             let k = pos.pack()
             if self.columns.live.contains(k) {
                 return self.columns.live[k].height(kind, x & 15, z & 15)
@@ -4235,7 +4358,7 @@ impl SpawnLevel for Level {
     // -1, no biome, where the chunk isn't loaded, which vanilla would ask its generator for.
     fn noise_biome(self, qx: i32, qy: i32, qz: i32) -> i32 {
         let pos = ChunkPos { x: qx >> 2, z: qz >> 2 }
-        if not self.full(pos) {
+        if not self.full(pos) and not self.in_region(pos) {
             return -1
         }
         let k = pos.pack()
@@ -5181,7 +5304,7 @@ impl CollisionBlocks for Level {
 
     fn collision_state(self, x: i32, y: i32, z: i32) -> u32? {
         let pos = ChunkPos { x: x >> 4, z: z >> 4 }
-        if not self.full(pos) {
+        if not self.full(pos) and not self.in_region(pos) {
             return none
         }
         let k = pos.pack()

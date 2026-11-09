@@ -3,7 +3,8 @@ generate the same sample of chunks from the same seed and packs, and the chunks 
 compared: each section's blocks and biomes, the heightmaps, the block entities, the block and fluid
 ticks, the blocks marked for post-processing, and the structures' starts and references.
 
-    py -I rig/runner/terragen.py [--reuse] [--areas N] [--no-packs] [--orders]
+    py -I rig/runner/terragen.py [--reuse | --calcite] [--areas N] [--no-packs] [--orders]
+                                 [--part-way]
 
 It runs in build/rig/terragen/, with Mojang's EULA accepted in its scratch folder only (CAL-42).
 The packs are bench/terralith.py's, fetched and checked against their SHA-512s there, and the
@@ -14,12 +15,22 @@ seed is C2ME's, as the benchmark's is.
    each is loaded, saves and stops. A chunk loaded so ticks, and vanilla post-processes it as it
    starts to, so what's compared is the ring of chunks 2 out from those, at the area's edge,
    which a force-loaded chunk needs full and which never tick: as a pregenerated chunk is.
-2. `calcite/`: Calcite's server pregenerates each area, and stops.
+2. `calcite/`: Calcite's server pregenerates each area, and stops. With --part-way, it
+   pregenerates the middle 10 by 10 of each first and stops, so the ring is saved lit around them,
+   at `minecraft:light`, its mobs still to spawn; then it starts again and pregenerates the whole,
+   carrying on from what it saved (CAL-161).
 3. Each chunk of the rings is read from both worlds' region files and compared, its blocks and
    biomes decoded, so a palette's order doesn't count, and its ticks, blocks to update and block
    entities by position, so their order doesn't either.
 
-Light, entities and the times a chunk keeps aren't compared. Where features from neighbouring
+The mobs each area's chunks spawned as they generated, `spawnMobsForChunkGeneration`, are
+compared too, from each world's entity files, each as it's saved but for what's drawn from a
+random of its own, its UUID and a chicken's egg time, and with its attributes sorted, which
+vanilla saves in the order of a hash map keyed by identity (CAL-161): the same in a ring chunk
+whose heightmaps are, so its surface is, unless vanilla's has a type Calcite doesn't make yet,
+which ends a chunk's spawning in Calcite.
+
+Light and the times a chunk keeps aren't compared. Where features from neighbouring
 chunks meet, what's left depends on the order the chunks were decorated in, which vanilla doesn't
 fix and Calcite fixes as its own (D29, D214): ore and stone blobs over each other, dripstone and
 sculk, trees, and the ticks, blocks to update and block entities that go with them (D288). So
@@ -34,7 +45,8 @@ what's compared is in two parts:
 It writes both to build/rig/terragen/report.json, and exits with 1 if anything that must be the
 same isn't. --orders has vanilla make the sample a second time, force-loading one chunk at a time
 from the far corner, in vanilla2/, and counts what that moves too, for scale. --reuse compares the
-last run's worlds again. --no-packs does it all without the packs, in build/rig/terragen/plain/.
+last run's worlds again, and --calcite makes Calcite's again against the last run's vanilla ones.
+--no-packs does it all without the packs, in build/rig/terragen/plain/.
 """
 
 import argparse
@@ -59,6 +71,7 @@ ROOT = CALCITE / "build" / "rig" / "terragen"
 # The packs each world has: the pins, or none with --no-packs.
 PACKS = PINS
 REGION = Path("world") / "dimensions" / "minecraft" / "overworld" / "region"
+ENTITIES = Path("world") / "dimensions" / "minecraft" / "overworld" / "entities"
 # Each area's side in chunks, and how far in from its edge the chunks force-loaded start.
 SIDE = 12
 INSET = 2
@@ -72,6 +85,12 @@ def chunks_of(area):
     x0, z0 = area
     edge = (0, SIDE - 1)
     return [((x0 >> 4) + dx, (z0 >> 4) + dz) for dz in range(SIDE) for dx in range(SIDE) if dx in edge or dz in edge]
+
+
+def area_of(area):
+    """Every chunk of the area, whose mobs are compared."""
+    x0, z0 = area
+    return [((x0 >> 4) + dx, (z0 >> 4) + dz) for dz in range(SIDE) for dx in range(SIDE)]
 
 
 def forced_of(area):
@@ -131,7 +150,7 @@ def vanilla(areas, name="vanilla", one_by_one=False):
     print(f"  vanilla made {len(areas)} areas in {name}/ in {time.monotonic() - began:.1f} s", flush=True)
 
 
-def calcite(areas, calx):
+def calcite(areas, calx, part_way=False):
     out = CALCITE / "build" / "rig" / "terragen" / "calcite.exe"
     out.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run([calx, "build", "--release", "src/calcite.calx", "-o", str(out)], cwd=CALCITE, check=True)
@@ -139,18 +158,19 @@ def calcite(areas, calx):
     prepare(folder, free_port(), False)
     (folder / "calcite.properties").write_text("console-dashboard=off\nrecord-inputs=false\n", encoding="utf-8")
     began = time.monotonic()
-    server = Server([str(out)], folder, "calcite")
-    try:
-        at = server.wait_for("Done (", timeout=600)
-        half = SIDE * 8
-        for x0, z0 in areas:
-            # The square of the area's chunks.
-            server.type(f"pregen center {(x0 >> 4) * 16 + half} {(z0 >> 4) * 16 + half}")
-            server.type(f"pregen radius {half}")
-            server.type("pregen start")
-            at = server.wait_for(" done: ", at, timeout=3600)
-    finally:
-        server.stop()
+    half = SIDE * 8
+    # The square of each area's chunks, its middle first where it's made part-way.
+    for radius in ([half - 16, half] if part_way else [half]):
+        server = Server([str(out)], folder, "calcite")
+        try:
+            at = server.wait_for("Done (", timeout=600)
+            for x0, z0 in areas:
+                server.type(f"pregen center {(x0 >> 4) * 16 + half} {(z0 >> 4) * 16 + half}")
+                server.type(f"pregen radius {radius}")
+                server.type("pregen start")
+                at = server.wait_for(" done: ", at, timeout=3600)
+        finally:
+            server.stop()
     print(f"  Calcite made its chunks in {time.monotonic() - began:.1f} s", flush=True)
 
 
@@ -258,11 +278,18 @@ PLACED_FLAGS = {"hps", "Witch", "Cat", "placedMainChest", "placedHiddenChest", "
 
 
 def unplaced(start):
-    """A start without the flags its pieces set as they're placed."""
+    """A start without the flags its pieces set as they're placed, nor the height of a shipwreck
+    that's adjusted it, `height_adjusted`, which `ShipwreckPiece.postProcess` works out from the
+    heights around it the first time it's placed, so the order decides it too."""
     out = plain(start)
     for piece in out.get("Children", []):
         for flag in PLACED_FLAGS:
             piece.pop(flag, None)
+        if piece.get("height_adjusted"):
+            piece.pop("TPY", None)
+            bb = piece.get("BB")
+            if isinstance(bb, list) and len(bb) == 6:
+                piece["BB"] = [bb[0], bb[2], bb[3], bb[5]]
     return out
 
 
@@ -339,8 +366,80 @@ def compare(cx, cz, v, c):
                 diffs.append(f"structure start {k} differs: vanilla {json.dumps(unplaced(vstart[k]))[:400]}, "
                              f"Calcite {json.dumps(unplaced(cstart[k]))[:400]}")
             elif plain(vstart[k]) != plain(cstart[k]):
-                moved.append(f"structure start {k}: its pieces' placed flags differ")
+                moved.append(f"structure start {k}: its pieces' placed flags or heights differ")
     return diffs, moved, blocks_off
+
+
+# What an entity draws from a random of its own as it's made, which depends on its ID, and so on
+# the order vanilla's threads made the chunks in.
+OWN_RANDOM = ("UUID", "EggLayTime")
+
+
+def mobs(chunk):
+    """An entity chunk's entities as they're saved, but for `OWN_RANDOM`, with their attributes
+    sorted, and sorted by type and place, so no order counts."""
+    out = []
+    for e in (chunk or {}).get("Entities", []):
+        tag = plain(e)
+        for key in OWN_RANDOM:
+            tag.pop(key, None)
+        if isinstance(tag.get("attributes"), list):
+            tag["attributes"] = sorted(tag["attributes"], key=lambda a: str(a.get("id")))
+        out.append(tag)
+    return sorted(out, key=lambda t: (str(t.get("id", "")), [float(p) for p in t.get("Pos", [])]))
+
+
+def short(tags):
+    """Entities as their types and places, for the report."""
+    return [f"{t.get('id')} at {[round(float(p), 3) for p in t.get('Pos', [])]}" for t in tags]
+
+
+def compare_mobs(vm, cm):
+    """What differs between vanilla's mobs in a chunk and Calcite's, or None."""
+    if vm == cm:
+        return None
+    if [t.get("id") for t in vm] != [t.get("id") for t in cm] or [t.get("Pos") for t in vm] != [t.get("Pos") for t in cm]:
+        return f"vanilla's {short(vm)[:6]}, Calcite's {short(cm)[:6]}"
+    for a, b in zip(vm, cm):
+        if a != b:
+            keys = sorted(k for k in set(a) | set(b) if a.get(k) != b.get(k))
+            said = "; ".join(f"{k}: vanilla {json.dumps(a.get(k))[:160]}, Calcite {json.dumps(b.get(k))[:160]}" for k in keys[:4])
+            return f"{a.get('id')} at {short([a])[0]}: {said}"
+    return None
+
+
+def mob_tally(areas, v, c, moved):
+    """The mobs of each area's chunks, vanilla's against Calcite's: how many chunks have any in
+    each, how many are the same, and those that differ, in a ring chunk whose surface the order
+    doesn't move, `moved` the rest, where vanilla has no type Calcite doesn't make, which must be
+    the same, and the rest."""
+    out = {"vanilla_chunks": 0, "calcite_chunks": 0, "vanilla_mobs": 0, "calcite_mobs": 0, "same": 0, "wrong": [], "other": []}
+    made = set()
+    found = {}
+    for area in areas:
+        for cx, cz in area_of(area):
+            vm, cm = mobs(v.chunk(cx, cz)), mobs(c.chunk(cx, cz))
+            found[(cx, cz)] = (vm, cm)
+            made |= {t.get("id") for t in cm}
+    ring = {tuple(xz) for area in areas for xz in chunks_of(area)}
+    for (cx, cz), (vm, cm) in found.items():
+        out["vanilla_chunks"] += 1 if vm else 0
+        out["calcite_chunks"] += 1 if cm else 0
+        out["vanilla_mobs"] += len(vm)
+        out["calcite_mobs"] += len(cm)
+        diff = compare_mobs(vm, cm)
+        if diff is None:
+            out["same"] += 1 if vm else 0
+            continue
+        unmade = sorted({str(t.get("id")) for t in vm} - made)
+        row = {"chunk": [cx, cz], "difference": diff}
+        if unmade:
+            row["unmade"] = unmade
+        if (cx, cz) in ring and (cx, cz) not in moved and not unmade:
+            out["wrong"].append(row)
+        else:
+            out["other"].append(row)
+    return out
 
 
 def ticks(tags):
@@ -359,27 +458,35 @@ def marks(chunk):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--reuse", action="store_true", help="compare the last run's worlds again")
+    parser.add_argument("--calcite", action="store_true", help="make Calcite's worlds again, against the last run's vanilla ones")
     parser.add_argument("--areas", type=int, default=len(AREAS), help="how many of the sample's areas")
     parser.add_argument("--no-packs", action="store_true", help="vanilla's worldgen alone, in build/rig/terragen/plain/")
     parser.add_argument("--orders", action="store_true", help="have vanilla make the sample again in another order, for scale")
+    parser.add_argument("--part-way", action="store_true", help="have Calcite make each area's middle first, stop and carry on")
     args = parser.parse_args()
     if args.no_packs:
         global ROOT, PACKS
         ROOT, PACKS = ROOT / "plain", []
     areas = AREAS[:args.areas]
-    if not args.reuse:
+    if args.calcite:
+        calcite(areas, find_calx(), args.part_way)
+    elif not args.reuse:
         fetch()
         vanilla(areas)
         if args.orders:
             vanilla(areas, "vanilla2", True)
-        calcite(areas, find_calx())
+        calcite(areas, find_calx(), args.part_way)
     v = Regions(ROOT / "vanilla" / REGION)
     report = {"calcite": tally(areas, v, Regions(ROOT / "calcite" / REGION))}
     if (ROOT / "vanilla2" / REGION).is_dir() and (args.orders or args.reuse):
         report["vanilla2"] = tally(areas, v, Regions(ROOT / "vanilla2" / REGION))
+    moved = {tuple(r["chunk"]) for r in report["calcite"]["moved"] if any(d.startswith("heightmap") for d in r["differences"])}
+    report["mobs"] = mob_tally(areas, Regions(ROOT / "vanilla" / ENTITIES), Regions(ROOT / "calcite" / ENTITIES), moved)
     (ROOT / "report.json").write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
     total = sum(len(chunks_of(a)) for a in areas)
     for name, t in report.items():
+        if name == "mobs":
+            continue
         who = "Calcite" if name == "calcite" else "vanilla in another order"
         print(f"terragen: {who}: {total - len(t['wrong'])} of {total} chunks have what must be vanilla's; "
               f"{t['same']} are vanilla's whole; the order moves {t['blocks']} blocks in {t['moved_chunks']} chunks", flush=True)
@@ -388,8 +495,14 @@ def main():
         print(f"  chunk {r['chunk'][0]}, {r['chunk'][1]}:")
         for d in r["differences"][:6]:
             print(f"    {d}")
+    m = report["mobs"]
+    print(f"terragen: mobs: {m['vanilla_mobs']} in {m['vanilla_chunks']} of vanilla's chunks, {m['calcite_mobs']} in "
+          f"{m['calcite_chunks']} of Calcite's; {m['same']} chunks the same; {len(m['wrong'])} differ that must not, "
+          f"{len(m['other'])} where the blocks differ or vanilla has a type Calcite doesn't make", flush=True)
+    for r in m["wrong"][:12] + m["other"][:8]:
+        print(f"  chunk {r['chunk'][0]}, {r['chunk'][1]}{' (unmade ' + ', '.join(r['unmade']) + ')' if 'unmade' in r else ''}: {r['difference']}")
     print(f"terragen: what differs is in {ROOT / 'report.json'}")
-    if wrong:
+    if wrong or m["wrong"]:
         sys.exit(1)
 
 
