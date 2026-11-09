@@ -155,6 +155,9 @@ class Config:
     # start: each pack's folder name and its files, by their paths in it, with what's in them
     # (CAL-164).
     datapacks: dict | None = None
+    # Saved data put in the world's data/minecraft folder, which both servers read as they start:
+    # each file's root by its name, such as `scoreboard` (CAL-164).
+    saved: dict | None = None
 
 
 def stack(item, count=1, components=None):
@@ -252,6 +255,53 @@ REWARDS_PACK = {
     "data/rig/loot_table/given.json": reward_table(
         "rig:given", ("minecraft:cobblestone", 40), ("minecraft:diamond", 2),
         ("minecraft:arrow", {"type": "minecraft:uniform", "min": 1, "max": 3}), ("minecraft:ender_pearl", 70)),
+}
+
+C = nbt.COMPOUND
+
+
+# The scoreboard in `scores` (CAL-164): objectives of the leave stat, health, shown as hearts in
+# the list, food, which follows its holders' display names and has a styled number format, in the
+# sidebar, air, with a fixed one, armor, experience, with a blank one, its level, deaths, below
+# names, and a dummy, in the red team's sidebar; scores of the dummy, one with a display and a
+# format of its own, of deaths for the bot, and one of an objective there isn't, which both servers
+# leave out; and three teams: red, with a color, a prefix and a suffix, its own rules, the bot and
+# alice, blue, with carol, and an empty one.
+SCOREBOARD = {
+    "data": {
+        "Objectives": nbt.List(C, [
+            {"Name": "left", "CriteriaName": "minecraft.custom:minecraft.leave_game", "DisplayName": "Left"},
+            {"Name": "hp", "CriteriaName": "health", "DisplayName": {"text": "Health", "color": "red"},
+             "RenderType": "hearts"},
+            {"Name": "food", "CriteriaName": "food", "DisplayName": "Food", "display_auto_update": nbt.Byte(1),
+             "format": {"type": "minecraft:styled", "color": "gold", "bold": nbt.Byte(1)}},
+            {"Name": "air", "CriteriaName": "air", "DisplayName": "Air",
+             "format": {"type": "minecraft:fixed", "value": "lots"}},
+            {"Name": "armor", "CriteriaName": "armor", "DisplayName": "Armor"},
+            {"Name": "xp", "CriteriaName": "xp", "DisplayName": "XP", "format": {"type": "minecraft:blank"}},
+            {"Name": "level", "CriteriaName": "level", "DisplayName": "Level"},
+            {"Name": "deaths", "CriteriaName": "deathCount", "DisplayName": "Deaths"},
+            {"Name": "plain", "DisplayName": "Plain"},
+        ]),
+        "PlayerScores": nbt.List(C, [
+            {"Name": "alice", "Objective": "plain", "Score": nbt.Int(5), "Locked": nbt.Byte(1)},
+            {"Name": "#fake", "Objective": "plain", "Score": nbt.Int(-3), "display": "Fake",
+             "format": {"type": "minecraft:fixed", "value": "?"}},
+            {"Name": "Bot", "Objective": "deaths", "Score": nbt.Int(2)},
+            {"Name": "carol", "Objective": "ghost", "Score": nbt.Int(1)},
+        ]),
+        "DisplaySlots": {"list": "hp", "sidebar": "food", "below_name": "deaths", "sidebar.team.red": "plain"},
+        "Teams": nbt.List(C, [
+            {"Name": "red", "DisplayName": "Red", "TeamColor": "red", "AllowFriendlyFire": nbt.Byte(0),
+             "MemberNamePrefix": "[R] ", "MemberNameSuffix": {"text": " *", "color": "gray"},
+             "NameTagVisibility": "hideForOtherTeams", "CollisionRule": "pushOwnTeam",
+             "Players": nbt.List(nbt.STRING, ["Bot", "alice"])},
+            {"Name": "blue", "DisplayName": "Blue", "SeeFriendlyInvisibles": nbt.Byte(0),
+             "DeathMessageVisibility": "never", "Players": nbt.List(nbt.STRING, ["carol"])},
+            {"Name": "empty", "DisplayName": "Empty"},
+        ]),
+    },
+    "DataVersion": nbt.Int(5023),
 }
 
 # The bot's data in `dig`: in survival mode, by the spawn, holding a wooden shovel, with shears, a
@@ -654,6 +704,7 @@ CONFIGS = {
     # experience and loot on its first tick: what fits added with a sound, the rest dropped for it
     # alone to pick up at once (CAL-164).
     "rewards": Config({}, scenarios=("join",), player=REWARDS, datapacks={"rewards": REWARDS_PACK}),
+    "scores": Config({}, scenarios=("join",), saved={"scoreboard": SCOREBOARD}),
     "uncompressed": Config({"network-compression-threshold": "-1"}),
     # A saved world, whose chunks both servers read and light (CAL-76). A view of 3 sends the
     # chunks from -4 to 4, which vanilla lights with their neighbours, all of them full in the
@@ -1611,6 +1662,8 @@ def prepare(folder, config, port, vanilla):
             at = folder / "world" / "datapacks" / pack / path
             at.parent.mkdir(parents=True, exist_ok=True)
             at.write_text(text, encoding="utf-8")
+    for name, saved in (c.saved or {}).items():
+        nbt.write(folder / "world" / "data" / "minecraft" / f"{name}.dat", saved)
     rules =folder / "world" / "data" / "minecraft" / "game_rules.dat"
     if rules.is_file():
         saved = nbt.read(rules)
@@ -1820,6 +1873,39 @@ def compare_stats(config, name):
     return same
 
 
+def scoreboard_kept(root):
+    """A saved scoreboard as it's compared: its scores sorted, as vanilla keeps each holder's
+    by its objectives' identity hashes, in another order each run."""
+    data = dict(root.get("data", {}))
+    if isinstance(data.get("PlayerScores"), list):
+        data["PlayerScores"] = sorted((typed(s) for s in data["PlayerScores"]), key=repr)
+    return {k: typed(v) if k != "PlayerScores" else v for k, v in data.items()}, root.get("DataVersion")
+
+
+def compare_scoreboard(config):
+    """Whether both servers saved the scoreboard the same (CAL-164), `data/minecraft/scoreboard.dat`,
+    which a new world's is too, empty: its objectives, scores, display slots and teams, each in
+    its map's order but the scores, printing what differs."""
+    kept = {}
+    for side in ("vanilla", "calcite"):
+        path = SESSIONS / config / side / "world" / "data" / "minecraft" / "scoreboard.dat"
+        kept[side] = scoreboard_kept(nbt.read(path)) if path.is_file() else None
+    same = kept["vanilla"] == kept["calcite"]
+    vanilla = kept["vanilla"] or ({}, None)
+    print(f"saved scores   {'PASS' if same else 'differs'}    {len(vanilla[0].get('PlayerScores', []))} scores")
+    if not same:
+        if kept["vanilla"] is None or kept["calcite"] is None:
+            print(f"  [{config}] only {'Calcite' if kept['vanilla'] is None else 'vanilla'} saved a scoreboard")
+        else:
+            (a, av), (b, bv) = kept["vanilla"], kept["calcite"]
+            for k in sorted(set(a) | set(b)):
+                if a.get(k) != b.get(k):
+                    print(f"  [{config}] {k}:\n      vanilla: {a.get(k)}\n      calcite: {b.get(k)}")
+            if av != bv:
+                print(f"  [{config}] DataVersion: vanilla {av}, calcite {bv}")
+    return same
+
+
 def compare_book(config, name):
     """Whether both servers saved the player `name`'s recipe book the same, their data's
     `recipeBook` (CAL-164): its tabs' settings, and the recipes known and highlighted, each list
@@ -1939,7 +2025,8 @@ def main():
     report = sessiondiff.run(SESSIONS, configs, scenarios, CALCITE / "rig" / "differences", show=args.show, complete=complete)
     saved = all([compare_saved(c) for c in configs if CONFIGS[c].player is not None and scenarios[c]]
                 + [compare_saved(c, MATE) for c in configs if CONFIGS[c].mate is not None and scenarios[c]]
-                + [compare_progress(c) for c in configs if scenarios[c]])
+                + [compare_progress(c) for c in configs if scenarios[c]]
+                + [compare_scoreboard(c) for c in configs if scenarios[c]])
     for c in configs:
         if CONFIGS[c].fixture is not None and scenarios[c]:
             compare_chunks(c, args.show)
