@@ -25,7 +25,7 @@ export const SOFTWARE: Thing = {
 	applicationSubCategory: 'Minecraft: Java Edition server',
 	softwareRequirements: `Minecraft: Java Edition ${SITE.minecraft} to join`,
 	isAccessibleForFree: true,
-	license: 'https://opensource.org/licenses/MIT',
+	license: `${SITE.blob}LICENSE`,
 	author: { '@id': id('studio') },
 	sameAs: [SITE.github],
 };

@@ -56,7 +56,7 @@ export function SiteFooter() {
 						<AaenMark size={16} />
 						<span className="link">An Aaen Studios project</span>
 					</a>
-					<p>MIT licensed. Calcite contains no Mojang code or assets.</p>
+					<p>Source-available under BSL 1.1, and MIT two years after each version. Calcite contains no Mojang code or assets.</p>
 					<p>{NOT_MOJANG}</p>
 				</div>
 			</div>

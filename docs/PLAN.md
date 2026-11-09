@@ -367,10 +367,11 @@ Every decision is in [`decisions.md`](decisions.md), with the date and the phase
 
 Notes on licensing and legal questions:
 
-- **Copying code (D59).** Copy only when it's clearly the best option and its license allows it in an MIT project, keeping the notice. GPL code can't be copied.
-- MIT is one more reason not to read GPL servers. Pumpkin, Paper and Folia are GPL; Pumpkin's plugin API crates are MIT/Apache.
+- **License (D544).** Calcite is under the Business Source License 1.1: free for everyone running their own servers, a license from Aaen Studios for hosting companies, and each version MIT after two years. The plugin API, the SDK, the translation layer and Calx are MIT.
+- **Copying code (D59, D544).** Copy only when it's clearly the best option and its license allows it in both Calcite's BSL files and its MIT ones, keeping the notice. GPL code can't be copied.
+- GPL code can't go into a BSL project any more than an MIT one, which is one more reason not to read GPL servers. Pumpkin, Paper and Folia are GPL; Pumpkin's plugin API crates are MIT/Apache.
 - Bit-exact parity means reproducing Mojang's behaviour closely, and vanilla's code is easy to read now that it's unobfuscated. Mojang's code has no license that allows copying, so Calcite is written from it as a reference, in its own structure for regions and actors. Where the bits force it, the arithmetic still follows vanilla's, in the same order. That raises the same derivative-work question every third-party server lives with. Before publishing anything, read Mojang's EULA and usage guidelines; I'm not a lawyer.
-- Wasmtime's Apache 2.0 license is fine to embed in an MIT project. No other native library is vendored: zlib, lz4 and the crypto are written in Calx's runtime (D118).
+- Wasmtime's Apache 2.0 license is fine to embed in Calcite; its license and NOTICE go in THIRD_PARTY.txt when it lands. No other native library is vendored: zlib, lz4 and the crypto are written in Calx's runtime (D118).
 - For Bedrock, Geyser's standalone proxy translates to the Java protocol, so it should work in front of Calcite unchanged. Bedrock-only accounts would need an auth plugin along the lines of Floodgate.
 
 ## Repo layout

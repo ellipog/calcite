@@ -36,4 +36,11 @@ Acta board: aaen-studios/calcite ([open](https://acta.aaenz.no/aaen-studios/calc
 
 ## License
 
-MIT. Calcite contains no Mojang code or assets. It reads vanilla's data from Mojang's official client jar: from the game's copy if it's installed, or else by downloading just the part of the jar that holds the data, the first time it starts.
+Calcite is source-available under the [Business Source License 1.1](LICENSE). Running it is free on your own servers, commercial ones included, and you can read, change and share the code. Offering Calcite to others as a hosting service needs a license from Aaen Studios: write to licensing@aaenz.no. Each version becomes MIT two years after it's published, and everything up to [`mit-final`](https://github.com/ellipog/calcite/tree/mit-final) is already MIT.
+
+- Free: your own server or network, even if players pay for ranks or access; hosting friends for free; running Calcite on a VPS or server slot you rent.
+- Needs a license: a hosting company offering Calcite to its customers, preinstalled, as a one-click install or as a choice in its panel, including free hosts paid for by ads.
+
+The plugin API and sample plugins are MIT, so plugins can use any license. Calx, the language Calcite is written in, is MIT too. [NOTICE](NOTICE) lists everything under other licenses, and [CONTRIBUTING](CONTRIBUTING.md) says how contributions work.
+
+Calcite contains no Mojang code or assets. It reads vanilla's data from Mojang's official client jar: from the game's copy if it's installed, or else by downloading just the part of the jar that holds the data, the first time it starts.
