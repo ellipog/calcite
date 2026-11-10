@@ -210,7 +210,8 @@ export default function Components() {
 						</Box>
 						<Box label="Code · copy it">
 							<CodeBlock code={'# every chunk within 2000 blocks of 0, 0\npregen radius 2000\npregen start\n# players come first while it runs'} />
-							<p className="note">The bar down the left is half density; it fills solid when the code is copied. Comments are left out of the copy.</p>
+							<CodeBlock lang="properties" code={'# server.properties\nserver-port=25565\nonline-mode=true\nmotd=A Minecraft Server'} />
+							<p className="note">The bar down the left is half density; it fills solid when the code is copied. Comments are faint and left out of the copy. Given a language it knows, a block is highlighted in the text blues.</p>
 						</Box>
 					</Grid>
 				</section>

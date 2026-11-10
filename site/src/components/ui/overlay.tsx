@@ -1,7 +1,8 @@
 'use client';
 
-import { cloneElement, createContext, useCallback, useContext, useEffect, useRef, useState, type ReactElement, type ReactNode } from 'react';
+import { cloneElement, createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactElement, type ReactNode } from 'react';
 import { still } from '@/lib/dither/motion';
+import { highlight, type Kind } from '@/lib/highlight';
 import { cn } from '@/lib/cn';
 import { Button } from './button';
 
@@ -100,6 +101,22 @@ export function Dialog({ trigger, title, children, actions }: { trigger: ReactEl
 
 const LANGS: Record<string, string> = { sh: 'shell', bash: 'shell', powershell: 'PowerShell', properties: '.properties', toml: '.toml', json: '.json', calx: 'Calx' };
 
+// Each kind of token in its text blue (globals.css). Code is DM Mono 400 in the deep blue; the
+// words that give a line its shape, keywords and the names being called, are 500.
+export const HL: Record<Kind, string | undefined> = {
+	plain: undefined,
+	kw: 'text-ink font-medium',
+	key: 'text-ink',
+	type: 'text-indigo',
+	fn: 'font-medium',
+	str: 'text-ice',
+	num: 'text-sky',
+	attr: 'text-sky',
+	var: 'text-indigo',
+	punct: 'text-soft',
+	com: 'text-faint',
+};
+
 export function CodeBlock({
 	code,
 	copy = true,
@@ -109,15 +126,17 @@ export function CodeBlock({
 }: {
 	code: string;
 	copy?: boolean;
-	/** What a line starts with to be a comment, which is lighter and isn't copied; null for none. */
+	/** What a line starts with to be a comment, which is fainter and isn't copied; null for none. */
 	comment?: string | null;
-	/** Shown in the corner, as `sh` or `powershell`, where it helps to know. */
+	/** Highlights the code, if it's one of the languages in lib/highlight.ts, and is shown in the
+	 * corner, as `sh` or `powershell`, where it helps to know. */
 	lang?: string;
 	className?: string;
 }) {
 	const toast = useToast();
 	const [done, setDone] = useState(0);
 	const lines = code.split('\n');
+	const tokens = useMemo(() => highlight(code, lang), [code, lang]);
 	const isComment = (l: string) => comment != null && l.trim().startsWith(comment);
 	const run = async () => {
 		const keep = lines.filter((l) => l.trim() && !isComment(l));
@@ -136,12 +155,22 @@ export function CodeBlock({
 	}, [done]);
 	return (
 		<div className={cn('relative min-w-0', className)}>
-			{lang && LANGS[lang] && Math.max(...lines.map((l) => l.length)) <= 56 && <span className="pointer-events-none absolute top-0 right-0 font-mono text-[11px] leading-none select-none max-sm:hidden" style={{ right: copy ? 72 : 10, top: 15 }}>{LANGS[lang]}</span>}
+			{lang && LANGS[lang] && Math.max(...lines.map((l) => l.length)) <= 56 && <span className="pointer-events-none absolute top-0 right-0 font-mono text-[11px] leading-none text-soft select-none max-sm:hidden" style={{ right: copy ? 72 : 10, top: 15 }}>{LANGS[lang]}</span>}
 			{/* on a phone the button gets a strip of its own above the code, so no line starts under it */}
-			<pre key={done} className={cn('d-code m-0 overflow-x-auto py-4 pl-[22px] font-mono text-[13.5px] leading-[1.7] font-medium whitespace-pre', copy ? 'pr-[76px] max-sm:pt-[50px] max-sm:pr-[18px]' : 'pr-[18px]', done > 0 && 'done')}>
+			<pre key={done} className={cn('d-code m-0 overflow-x-auto py-4 pl-[22px] font-mono text-[13.5px] leading-[1.7] font-normal text-deep whitespace-pre', copy ? 'pr-[76px] max-sm:pt-[50px] max-sm:pr-[18px]' : 'pr-[18px]', done > 0 && 'done')}>
 				{lines.map((l, i) => (
-					<span key={i} className={isComment(l) ? 'font-normal' : undefined}>
-						{l}
+					<span key={i} className={isComment(l) ? HL.com : undefined}>
+						{isComment(l)
+							? l
+							: tokens[i].map(([k, s], j) =>
+									HL[k] ? (
+										<span key={j} className={HL[k]}>
+											{s}
+										</span>
+									) : (
+										s
+									),
+								)}
 						{i < lines.length - 1 && '\n'}
 					</span>
 				))}

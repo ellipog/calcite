@@ -1,5 +1,6 @@
 import { Panel, Rules } from '@/components/ui/text';
 import { Sub } from '@/components/ui/sub';
+import { CodeBlock } from '@/components/ui/overlay';
 import { contrast, INK, PAPER } from '@/lib/dither/math';
 import { cn } from '@/lib/cn';
 import { Cap, H3, Section } from './_parts';
@@ -23,7 +24,7 @@ export function Idea() {
 				</Panel>
 				<Panel label="one ink" className={q}>
 					<H3>One ink</H3>
-					<p>Cobalt and paper, nothing else. Hierarchy comes from size, weight and density, never from a second colour.</p>
+					<p>Cobalt and paper for everything drawn. Hierarchy comes from size, weight and density; text alone has a few solid blues, for reading and for code.</p>
 				</Panel>
 				<Panel label="dots" className={q}>
 					<H3>Dots, not tints</H3>
@@ -46,9 +47,41 @@ const LEVELS = [6, 12, 25, 31, 38, 50, 62, 75, 88, 100];
 const TINT: Record<number, string> = { 6: 'tint-6', 12: 'tint-12', 25: 'tint-25', 31: 'tint-31', 38: 'tint-38', 50: 'tint-50', 62: 'tint-62', 75: 'tint-75', 88: 'tint-88', 100: 'tint-100' };
 export { TINT };
 
+// The text blues, in globals.css as --text-color-*: solid, for text only, never a fill.
+const TEXT: { name: string; cls: string; hex: string; role: string; sample: string; font: 'display' | 'text' | 'mono' }[] = [
+	{ name: 'cobalt', cls: 'text-ink', hex: '#1838D0', role: 'the mark, the name, headings, links, labels, buttons, numbers; code keywords', sample: 'calcite', font: 'display' },
+	{ name: 'deep', cls: 'text-deep', hex: '#1A2766', role: 'running text: paragraphs, list items, table cells; code', sample: 'Every region ticks on its own core.', font: 'text' },
+	{ name: 'soft', cls: 'text-soft', hex: '#4A5689', role: 'secondary text, captions; code punctuation', sample: 'on our benchmark machine', font: 'text' },
+	{ name: 'faint', cls: 'text-faint', hex: '#5F6A99', role: 'code comments, asides', sample: '// players come first', font: 'mono' },
+	{ name: 'ice', cls: 'text-ice', hex: '#006E7A', role: 'code strings', sample: '"homes.use"', font: 'mono' },
+	{ name: 'sky', cls: 'text-sky', hex: '#0868C8', role: 'code numbers, literals, constants, annotations, flags', sample: '@save 25565 true', font: 'mono' },
+	{ name: 'indigo', cls: 'text-indigo', hex: '#3D3BC9', role: 'code types', sample: 'Player Location', font: 'mono' },
+];
+const SET = {
+	display: 'font-display text-[22px] font-semibold tracking-tight',
+	text: 'text-[17px]',
+	mono: 'font-mono text-[15px]',
+};
+
+// from the homes sample plugin, plugins/samples/homes/homes.calx
+const SAMPLE = `region {
+    // The signature is the command tree: /sethome [name], where name is a HomeName defaulting to "home".
+    @command("sethome", permission: USE)
+    fn sethome(p: Player, name: HomeName = HomeName("home")) ! Text {
+        let data = p.data(Homes)
+        let full = data.homes.len() >= config.max_homes
+        if full and not data.homes.has(name) and not p.has(UNLIMITED) {
+            fail t"<red>You already have {config.max_homes} homes. Delete one with /delhome."
+        }
+        data.homes.put(name, p.location())
+        p.send(t"<green>Home <white>{name.0}</white> set.")
+    }
+}`;
+
 export function Colour() {
 	return (
-		<Section id="colour" n={3} name="Colour" title="Cobalt on paper." lead="Two colours, and only two. Text is always solid ink, or solid paper on a block of ink. Every lighter blue is one of the densities below.">
+		<Section id="colour" n={3} name="Colour" title="Cobalt on paper." lead="One ink on paper for everything drawn: every lighter blue in a fill or a picture is one of the densities below. Text alone has a few more blues, solid, so a long page reads easily and code can be told apart.">
+
 			<div className="grid grid-cols-1 rule sm:grid-cols-2">
 				<div className="flex min-h-[220px] flex-col justify-between bg-ink p-[22px] text-paper">
 					<b className="font-display text-[40px] leading-none font-extrabold tracking-title">Cobalt</b>
@@ -102,6 +135,23 @@ export function Colour() {
 					<span className="note bg-paper px-1.5 py-0.5">always on a block of its own</span>
 				</div>
 			</div>
+			<Sub>Text blues · solid, for text only</Sub>
+			<div className="rule-t">
+				{TEXT.map((t) => (
+					<div key={t.name} className="grid grid-cols-1 items-baseline gap-1.5 rule-b py-4 md:grid-cols-[180px_minmax(0,1fr)_minmax(0,1.1fr)] md:gap-6">
+						<div className="font-mono text-xs leading-[1.6]">
+							<b className="block font-medium">{t.name}</b>
+							{t.hex} · {contrast(t.hex, PAPER).toFixed(1)} : 1
+						</div>
+						<div className={cn('min-w-0 leading-tight [overflow-wrap:anywhere]', SET[t.font], t.cls)}>{t.sample}</div>
+						<p className="text-sm leading-normal text-soft">{t.role}</p>
+					</div>
+				))}
+			</div>
+			<Cap>They&apos;re --text-color-* in globals.css, so each makes a text-* utility and nothing else: there&apos;s no bg-deep or border-sky. Running text takes the deep blue by itself, and every other piece of text stays cobalt unless it says otherwise. Each has at least 4.5:1 on paper.</Cap>
+			<Sub>Code</Sub>
+			<CodeBlock code={SAMPLE} lang="calx" comment="//" copy={false} />
+			<Cap>Keywords and the keys of .properties, TOML and JSON in cobalt, names being called in 500, the rest of the code in the deep blue at 400. Strings toward ice, numbers and annotations azure, types indigo, punctuation soft, comments faint. lib/highlight.ts reads Calx, shell, PowerShell, .properties, TOML and JSON.</Cap>
 		</Section>
 	);
 }

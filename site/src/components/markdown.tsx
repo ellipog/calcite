@@ -59,7 +59,7 @@ function Runs({ c, ctx }: { c: Inline[]; ctx: Ctx }): ReactNode {
 			case 'code':
 				// short code stays on one line; a long path or command may break anywhere
 				return (
-					<code key={k} className={cn('font-mono text-[0.9em] font-medium', i.v.length > 28 ? '[overflow-wrap:anywhere]' : 'whitespace-nowrap')}>
+					<code key={k} className={cn('font-mono text-[0.9em] font-medium text-ink', i.v.length > 28 ? '[overflow-wrap:anywhere]' : 'whitespace-nowrap')}>
 						{i.v}
 					</code>
 				);
@@ -137,7 +137,7 @@ function Blocks({ blocks, ctx, tight }: { blocks: Block[]; ctx: Ctx; tight?: boo
 					<L key={k} className={cn('mb-5 grid max-w-[68ch] grid-cols-[minmax(0,1fr)] gap-2 text-[17px] leading-[1.6]', tight && 'mt-2')}>
 						{b.items.map((it, j) => (
 							<li key={j} className="relative min-w-0 pl-7">
-								<span aria-hidden className={cn('absolute left-0', b.ordered ? 'top-[0.2em] font-mono text-[13px] font-medium' : 'top-[0.62em] size-[6px] bg-ink')}>
+								<span aria-hidden className={cn('absolute left-0', b.ordered ? 'top-[0.2em] font-mono text-[13px] font-medium text-ink' : 'top-[0.62em] size-[6px] bg-ink')}>
 									{b.ordered ? String(j + 1).padStart(2, '0') : null}
 								</span>
 								<Blocks blocks={it} ctx={ctx} tight />
