@@ -12,7 +12,7 @@ import auth.session.{Joined, server_hash}
 import auth.velocity.{channel, request, read}
 import chat.component.{Argument, ClickEvent, Component, Contents, HoverEvent, Score as ScoreText, Style, TextColor, Translation}
 import command.coordinates.{Coordinates}
-import command.dispatcher.{BlockInput, BlockNames, Builder, Holder, ItemInput, Known, Message, ResourceNames, Suggestion, Suggestions, Tree, Value as ArgValue, create, entity_type_names, entity_types, parse_from, suggest_node, suggestion_context}
+import command.dispatcher.{BlockInput, BlockNames, BlockTag, BlockTest, Builder, Holder, ItemInput, Known, Message, ResourceNames, Suggestion, Suggestions, Tree, Value as ArgValue, create, entity_type_names, entity_types, parse_from, suggest_node, suggestion_context}
 import command.reader.{Reader as CommandReader}
 import command.selector.{Advancement as Wanted, Ints, Progress as Wanting, Score, Selector, Sorting, Test, read_selector}
 import chat.language.{Language}
@@ -21,7 +21,7 @@ import java.uuid.{Uuid}
 import json.tree.{Json}
 import nbt.snbt.{from_units, units_of}
 import java.character.{is_whitespace}
-import nbt.path.{NbtPath, PathFailure, too_deep}
+import nbt.path.{NbtPath, PathFailure, compare_nbt, too_deep}
 import nbt.pretty.{pretty}
 import nbt.tag.{Tag, merge_compound}
 import protocol.chat.{ChatSession, ChatTypeBound, ClientboundDisguisedChat, ClientboundPlayerChat, FilterMask, MessageSignature, PackedSignature, ServerboundChat, ServerboundChatCommandSigned, SignedBody}
@@ -52,7 +52,7 @@ import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
-import server.commands.{DataAction, DataHow, DataSource, DataTarget, Destination, Facing, Failure, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
+import server.commands.{Condition, DataAction, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
 import server.configuration.{Configuration}
 import server.layout.{Layout, Placed}
 import server.level.{ChunkPacket, Dropped, Heard, Level, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
@@ -80,6 +80,7 @@ import storage.world.{join as join_path}
 import storage.world_gen.{world_gen_id}
 import world.border.{Border, BorderSettings, saved_id as border_id}
 import world.clocks.{saved_id as clocks_id}
+import world.chunk.{MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, WORLD_SURFACE}
 import world.collision.{Aabb, CollisionStates, eye_height, pose_box, pose_height, pose_size}
 import world.entities.{Entities}
 import world.body.{Body, BodyFacts, EntitySound, NEUTRAL_SOURCE, PLAYERS_SOURCE, bool_or, on_pos_of, push_between, splash_draws, support_of}
@@ -1272,10 +1273,27 @@ impl Outgoing {
     }
 }
 
-// Who runs a command: the console, or the player in a slot.
-enum Source {
+// Who hears what a command says, vanilla's `CommandSource`: the console, or the player in a slot.
+enum Output {
     Console
     Player(usize)
+}
+
+// A command's source, vanilla's `CommandSourceStack` (CAL-165): who hears what it says; the
+// player it runs as, if any, whose name it goes by; where it runs from, as it looks, a pitch and
+// a yaw, in which level, by its place among the world's; whether its anchor is the entity's eyes
+// rather than its feet; and its permission level. `execute` changes each but the output.
+struct Source {
+    output: Output
+    entity: usize?
+    x: f64
+    y: f64
+    z: f64
+    x_rot: f32
+    y_rot: f32
+    dim: usize
+    eyes: bool = false
+    level: i32
 }
 
 // `ClientboundGameEventPacket.CHANGE_GAME_MODE`.
@@ -2024,7 +2042,8 @@ impl Network {
         while not self.console_lines.is_empty() {
             let line = self.console_lines.remove(0)
             let input = if line.starts_with("/") { line[1..] } else { line.copy() }
-            self.run_command(Source.Console, input, [])
+            let source = self.console_source()
+            self.run_command(source, input, [])
         }
     }
 
@@ -7994,10 +8013,12 @@ impl Network {
     // The play listener's `teleport` of a change with `relatives`, `Relative`'s bits (CAL-165):
     // each part from where the player is where its bit's set, else from nothing, as
     // `PositionMoveRotation.calculateAbsolute` adds them, their pitch then kept within 90 of
-    // level, and their motion kept along each axis whose bit of motion is set, else none; their
-    // head turned with them, `teleportSetPosition`. The client is sent the change and the bits,
-    // and is to accept it before it moves on its own. Motion turned with them, `ROTATE_DELTA`,
-    // isn't there, as nothing that teleports a player asks for it yet.
+    // level, and their motion along each axis whose bit of motion is set the movement their
+    // client last told of, as `PositionMoveRotation.of` takes a player's `getKnownMovement`, not
+    // the motion the server keeps, else none (D565); their head turned with them,
+    // `teleportSetPosition`. The client is sent the change and the bits, and is to accept it
+    // before it moves on its own. Motion turned with them, `ROTATE_DELTA`, isn't there, as
+    // nothing that teleports a player asks for it yet.
     fn teleport_by(mut self, con: mut Connection, x: f64, y: f64, z: f64, y_rot: f32, x_rot: f32, relatives: i32) {
         let ox = if relatives & 1 != 0 { con.player.x } else { 0.0 }
         let oy = if relatives & 2 != 0 { con.player.y } else { 0.0 }
@@ -8006,9 +8027,9 @@ impl Network {
         let o_x_rot = if relatives & 16 != 0 { con.player.x_rot } else { 0.0f32 }
         let to_y_rot = o_y_rot + y_rot
         let to_x_rot = (o_x_rot + x_rot).max(-90.0f32).min(90.0f32)
-        con.player.vx = if relatives & 32 != 0 { con.player.vx + 0.0 } else { 0.0 }
-        con.player.vy = if relatives & 64 != 0 { con.player.vy + 0.0 } else { 0.0 }
-        con.player.vz = if relatives & 128 != 0 { con.player.vz + 0.0 } else { 0.0 }
+        con.player.vx = if relatives & 32 != 0 { con.player.known_x + 0.0 } else { 0.0 }
+        con.player.vy = if relatives & 64 != 0 { con.player.known_y + 0.0 } else { 0.0 }
+        con.player.vz = if relatives & 128 != 0 { con.player.known_z + 0.0 } else { 0.0 }
         con.player.awaiting_time = con.player.tick_count
         con.player.teleport_id += 1
         if con.player.teleport_id == 2147483647 {
@@ -17692,7 +17713,11 @@ impl Network {
     fn run_queued(mut self) {
         while let q = self.queued.pop_first() {
             match q {
-                Queued.Command(slot, input, signed) => self.run_command(Source.Player(slot), input, signed),
+                Queued.Command(slot, input, signed) => {
+                    if let source = self.player_source(slot) {
+                        self.run_command(source, input, signed)
+                    }
+                },
                 Queued.Suggest(slot) => {
                     if slot < self.connections.len() {
                         if let taken = self.connections[slot].take() {
@@ -17704,7 +17729,9 @@ impl Network {
                 },
                 Queued.Mode(slot, mode) => {
                     if self.change_mode(slot, mode) {
-                        self.log_mode_change(Source.Player(slot), slot, mode)
+                        if let source = self.player_source(slot) {
+                            self.log_mode_change(source, slot, mode)
+                        }
                     }
                 },
             }
@@ -17921,7 +17948,7 @@ impl Network {
     fn run_command(mut self, source: Source, input: String, signed: List<(String, ChatMessage)>) {
         self.ready_commands()
         let set = self.commands.take() else return
-        let level = self.level_of(source)
+        let level = source.level
         match parse_in(set.tree, input.copy(), level, set.types) {
             ok(p) => {
                 self.commands = some(set)
@@ -17934,10 +17961,24 @@ impl Network {
         }
     }
 
-    // A command read, run.
+    // A command read, run, its failure told its source.
     fn run_parsed(mut self, source: Source, p: own Parsed, signed: List<(String, ChatMessage)>) {
+        match p {
+            Parsed.Execute(steps, end) => self.execute_command(source, steps, end, signed),
+            _ => {
+                match self.perform(source, p, signed) {
+                    ok => {},
+                    err(f) => self.command_failed(source, f),
+                }
+            },
+        }
+    }
+
+    // A command read, run as `source`, or why not.
+    fn perform(mut self, source: Source, p: own Parsed, signed: List<(String, ChatMessage)>) ! Failure {
         var done: Failure? = none
         match p {
+            Parsed.Execute(steps, end) => self.execute_command(source, steps, end, signed),
             Parsed.Stop => {
                 self.success(source, Component.translatable("commands.stop.stopping", []), true)
                 self.stop_due = true
@@ -18069,7 +18110,7 @@ impl Network {
             Parsed.Unrun(_) => done = some(Failure.alone(Component.literal("Calcite doesn't run this command yet"))),
         }
         if let f = done {
-            self.command_failed(source, f)
+            fail f
         }
     }
 
@@ -18089,7 +18130,11 @@ impl Network {
                 if let b = r.value.find_builtin(String("block")) {
                     let states = StateCodec.new(r.value.builtin[b])
                     let entities = self.block_entity_blocks(states)
-                    t.blocks = some(Shared(BlockNames { states: states, entities: entities }))
+                    var tags = List<BlockTag>()
+                    for tag in r.value.builtin[b].tags {
+                        tags.push(BlockTag { name: tag.name.copy(), blocks: tag.values.copy() })
+                    }
+                    t.blocks = some(Shared(BlockNames { states: states, entities: entities, tags: tags }))
                 }
             }
             self.commands = some(CommandSet { tree: t, types: entity_types() })
@@ -18164,7 +18209,7 @@ impl Network {
     fn help(mut self, source: Source, command: String?) {
         self.ready_commands()
         let set = self.commands.take() else return
-        let level = self.level_of(source)
+        let level = source.level
         var lines = List<String>()
         var failed = false
         match command {
@@ -18229,9 +18274,42 @@ impl Network {
     // The name a command's source goes by, `getDisplayName`: the player's, or the console's,
     // `Server`.
     fn source_name(self, source: Source) -> Component {
-        return match source {
-            Source.Player(slot) => self.name_of(slot),
-            Source.Console => Component.literal("Server"),
+        return match source.entity {
+            some(slot) => self.name_of(slot),
+            none => Component.literal("Server"),
+        }
+    }
+
+    // `ServerPlayer.createCommandSourceStack`: the player in `slot` as a command's source, where
+    // they are and look, at their permission level (CAL-165).
+    fn player_source(self, slot: usize) -> Source? {
+        if slot >= self.connections.len() {
+            return none
+        }
+        if let c = self.connections[slot] {
+            return some(Source { output: Output.Player(slot), entity: some(slot), x: c.player.x, y: c.player.y, z: c.player.z, x_rot: c.player.x_rot, y_rot: c.player.y_rot, dim: c.player.dim, level: c.player.level })
+        }
+        return none
+    }
+
+    // `MinecraftServer.createCommandSourceStack`: the console as a command's source, at the
+    // corner of the world's spawn block in its level, looking ahead, at the owners' level.
+    fn console_source(self) -> Source {
+        let dim = self.world.dimension_of(self.respawn.dimension.copy()) ?? (self.world.dimension_of(overworld()) ?? 0)
+        let at = self.respawn.pos
+        return Source { output: Output.Console, entity: none, x: f64(at.x), y: f64(at.y), z: f64(at.z), x_rot: 0.0f32, y_rot: 0.0f32, dim: dim, level: OWNERS }
+    }
+
+    // `CommandSourceStack.sendSystemMessage`: a message to the player the source runs as, or
+    // else to its output.
+    fn tell_source(mut self, source: Source, message: own Component) {
+        if let slot = source.entity {
+            self.tell_slot(slot, message)
+            return
+        }
+        match source.output {
+            Output.Console => self.tell_server(message, true),
+            Output.Player(slot) => self.tell_slot(slot, message),
         }
     }
 
@@ -18248,7 +18326,7 @@ impl Network {
     // may use them, the text between them with the names of those each picks in its place
     // (CAL-165).
     fn message_component(mut self, source: Source, m: Message) -> Component ! Failure {
-        if m.parts.is_empty() or self.level_of(source) < GAMEMASTERS {
+        if m.parts.is_empty() or source.level < GAMEMASTERS {
             return Component.literal(m.text)
         }
         let units = units_of(m.text)
@@ -18282,7 +18360,7 @@ impl Network {
     // where there's none, the text as no one's, disguised (CAL-165).
     fn resolved(mut self, source: Source, name: str, m: Message, signed: List<(String, ChatMessage)>) -> Outgoing ! Failure {
         let formatted = try self.message_component(source, m)
-        let plain = m.parts.is_empty() or self.level_of(source) < GAMEMASTERS
+        let plain = m.parts.is_empty() or source.level < GAMEMASTERS
         for (n, message) in signed {
             if n == String(name) {
                 // `withUnsignedContent` keeps it only where it isn't the signed text.
@@ -18349,11 +18427,12 @@ impl Network {
         let name = self.source_name(source)
         for slot in who {
             let to = ChatTypeBound { chat_type: outgoing, name: name.copy(), target_name: some(self.name_of(slot)) }
-            match source {
-                Source.Player(me) => self.send_message_to(me, out, to),
-                Source.Console => {
+            // `sendChatMessage`: to the player it runs as, or as a system message to its output.
+            match source.entity {
+                some(me) => self.send_message_to(me, out, to),
+                none => {
                     let line = self.decorate(to, out.content())
-                    self.tell_server(line, true)
+                    self.tell_source(source, line)
                 },
             }
             self.send_message_to(slot, out, ChatTypeBound { chat_type: incoming, name: name.copy(), target_name: none })
@@ -18364,10 +18443,7 @@ impl Network {
     // as `team_msg_command_outgoing` and the rest as `team_msg_command_incoming`, each to the
     // team's name (CAL-165).
     fn team_msg(mut self, source: Source, m: Message, signed: List<(String, ChatMessage)>) ! Failure {
-        let me = match source {
-            Source.Player(slot) => slot,
-            Source.Console => fail Failure.alone(Component.translatable("permissions.requires.entity", [])),
-        }
+        let me = source.entity else fail Failure.alone(Component.translatable("permissions.requires.entity", []))
         var team: Team? = none
         if let c = self.connections[me] {
             if let p = c.profile {
@@ -18407,10 +18483,7 @@ impl Network {
     // more, a value more, or set, which they may then not till it's enabled again, then said to
     // the source and the operators (CAL-165).
     fn trigger_command(mut self, source: Source, objective: String, change: TriggerChange) ! Failure {
-        let slot = match source {
-            Source.Player(s) => s,
-            Source.Console => fail Failure.alone(Component.translatable("permissions.requires.player", [])),
-        }
+        let slot = source.entity else fail Failure.alone(Component.translatable("permissions.requires.player", []))
         var con = self.connections[slot].take() else return
         var found: GameProfile? = none
         if let p = con.profile {
@@ -18682,6 +18755,408 @@ impl Network {
         }
     }
 
+    // `execute`, as vanilla's `BuildContexts` and `ExecuteCommand` run it (CAL-165): each step in
+    // turn on each source there is, in order, each making the sources the next takes; then what
+    // it runs, run as each source left, in order. From the first step that forks, as `as`, `at`,
+    // `positioned as`, `rotated as`, `facing entity` and every condition do, what fails as a
+    // source runs it is left out quietly, `forkedMode`; before then, the failure's told and
+    // nothing more runs. Making more sources than `max_command_forks` lets there be stops it all,
+    // `command.forkLimit`, told only where nothing's forked yet.
+    fn execute_command(mut self, source: Source, steps: List<ExecuteStep>, end: ExecuteEnd, signed: List<(String, ChatMessage)>) {
+        var sources: List<Source> = [source]
+        var forked = false
+        for step in steps {
+            if forks(step) {
+                forked = true
+            }
+            var next = List<Source>()
+            for s in sources {
+                match self.execute_step(s, step) {
+                    ok(made) => {
+                        if next.len() + made.len() >= FORK_LIMIT {
+                            if not forked {
+                                self.command_failed(source, Failure.alone(Component.translatable_args(String("command.forkLimit"), [Argument.Number(Tag.Int(i32.wrap(FORK_LIMIT)))])))
+                            }
+                            return
+                        }
+                        for m in made {
+                            next.push(m)
+                        }
+                    },
+                    err(f) => {
+                        if not forked {
+                            self.command_failed(s, f)
+                            return
+                        }
+                    },
+                }
+            }
+            sources = next
+        }
+        for s in sources {
+            match end {
+                ExecuteEnd.Run(run) => {
+                    match self.perform(s, run.value.copy(), signed) {
+                        ok => {},
+                        err(f) => {
+                            if not forked {
+                                self.command_failed(s, f)
+                            }
+                        },
+                    }
+                },
+                ExecuteEnd.Test(expected, cond) => {
+                    match self.execute_test(s, expected, cond) {
+                        ok => {},
+                        err(f) => {
+                            if not forked {
+                                self.command_failed(s, f)
+                            }
+                        },
+                    }
+                },
+            }
+        }
+    }
+
+    // What one of `execute`'s steps makes of the source `s` (CAL-165), as its redirect modifier
+    // does: `withEntity`, `withPosition`, `withRotation`, `withLevel`, `withAnchor` or `facing`;
+    // for those with a selector, a source for each entity it picks, `getOptionalEntities`, none
+    // where it picks none; for a condition, the source where it holds as it should, else none.
+    fn execute_step(mut self, s: Source, step: ExecuteStep) -> List<Source> ! Failure {
+        var out = List<Source>()
+        match step {
+            ExecuteStep.As(who) => {
+                for slot in try self.entities_selected(s, who) {
+                    var n = s
+                    n.entity = some(slot)
+                    out.push(n)
+                }
+            },
+            ExecuteStep.At(who) => {
+                for slot in try self.entities_selected(s, who) {
+                    if let c = self.connections[slot] {
+                        var n = s
+                        n.dim = c.player.dim
+                        n.x = c.player.x
+                        n.y = c.player.y
+                        n.z = c.player.z
+                        n.x_rot = c.player.x_rot
+                        n.y_rot = c.player.y_rot
+                        out.push(n)
+                    }
+                }
+            },
+            ExecuteStep.Positioned(at) => {
+                let (x, y, z) = self.point_of(s, at)
+                var n = s
+                n.x = x
+                n.y = y
+                n.z = z
+                n.eyes = false
+                out.push(n)
+            },
+            ExecuteStep.PositionedAs(who) => {
+                for slot in try self.entities_selected(s, who) {
+                    if let c = self.connections[slot] {
+                        var n = s
+                        n.x = c.player.x
+                        n.y = c.player.y
+                        n.z = c.player.z
+                        out.push(n)
+                    }
+                }
+            },
+            ExecuteStep.Over(name) => {
+                // The source's level must have the chunk it's in, `hasChunk`, else
+                // `argument.pos.unloaded`; then it's on the heightmap there, `getHeight`.
+                let x = mth_floor(s.x)
+                let z = mth_floor(s.z)
+                if not self.levels[s.dim].full(ChunkPos { x: x >> 4, z: z >> 4 }) {
+                    fail Failure.alone(Component.translatable("argument.pos.unloaded", []))
+                }
+                let height = self.levels[s.dim].height_at(heightmap_kind(name), x, z) else fail Failure.alone(Component.translatable("argument.pos.unloaded", []))
+                var n = s
+                n.y = f64(height)
+                out.push(n)
+            },
+            ExecuteStep.Rotated(turn) => {
+                let (x_rot, y_rot) = turn.turn(s.x_rot, s.y_rot)
+                var n = s
+                n.x_rot = x_rot
+                n.y_rot = y_rot
+                out.push(n)
+            },
+            ExecuteStep.RotatedAs(who) => {
+                for slot in try self.entities_selected(s, who) {
+                    if let c = self.connections[slot] {
+                        var n = s
+                        n.x_rot = c.player.x_rot
+                        n.y_rot = c.player.y_rot
+                        out.push(n)
+                    }
+                }
+            },
+            ExecuteStep.Facing(at) => {
+                let (x, y, z) = self.point_of(s, at)
+                out.push(self.facing(s, x, y, z))
+            },
+            ExecuteStep.FacingEntity(who, eyes) => {
+                for slot in try self.entities_selected(s, who) {
+                    if let c = self.connections[slot] {
+                        let lift = if eyes { eye_height(c.player.entity_data.number(POSE_ID)) } else { 0.0 }
+                        out.push(self.facing(s, c.player.x, c.player.y + lift, c.player.z))
+                    }
+                }
+            },
+            ExecuteStep.Align(axes) => {
+                var n = s
+                if axes & 1 != 0 {
+                    n.x = f64(mth_floor(s.x))
+                }
+                if axes & 2 != 0 {
+                    n.y = f64(mth_floor(s.y))
+                }
+                if axes & 4 != 0 {
+                    n.z = f64(mth_floor(s.z))
+                }
+                out.push(n)
+            },
+            ExecuteStep.Anchored(eyes) => {
+                var n = s
+                n.eyes = eyes
+                out.push(n)
+            },
+            ExecuteStep.In(id) => {
+                // `withLevel`: in another level, the place scaled as a portal scales it,
+                // `getTeleportationScale`, along x and z.
+                let to = self.world.dimension_of(id) else fail Failure.alone(Component.translatable("argument.dimension.invalid", [Component.literal(id.to_string())]))
+                var n = s
+                if to != s.dim {
+                    let scale = self.world.dims[s.dim].scale / self.world.dims[to].scale
+                    n.x = s.x * scale
+                    n.z = s.z * scale
+                    n.dim = to
+                }
+                out.push(n)
+            },
+            ExecuteStep.Test(expected, cond) => {
+                let count = try self.condition_count(s, cond)
+                if condition_held(cond, count) == expected {
+                    out.push(s)
+                }
+            },
+        }
+        return out
+    }
+
+    // `Coordinates.getPosition` for the source `s` (CAL-165): world coordinates from where it
+    // is, local ones from its anchor, its entity's eyes where it's anchored there.
+    fn point_of(self, s: Source, at: Coordinates) -> (f64, f64, f64) {
+        let lift = match at {
+            Coordinates.Local(_, _, _) => self.anchor_lift(s),
+            _ => 0.0,
+        }
+        return at.position(s.x, s.y + lift, s.z, s.x_rot, s.y_rot)
+    }
+
+    // How far above where the source is its anchor is, `EntityAnchorArgument.Anchor.apply`: its
+    // entity's eye height where it's anchored at the eyes and has one, else none.
+    fn anchor_lift(self, s: Source) -> f64 {
+        if not s.eyes {
+            return 0.0
+        }
+        let slot = s.entity else return 0.0
+        if let c = self.connections[slot] {
+            return eye_height(c.player.entity_data.number(POSE_ID))
+        }
+        return 0.0
+    }
+
+    // `CommandSourceStack.facing`: the source `s` looking from its anchor toward `x`, `y`, `z`,
+    // turned with `Mth.atan2` as `Entity.lookAt` turns, each angle wrapped (CAL-165).
+    fn facing(self, s: Source, x: f64, y: f64, z: f64) -> Source {
+        let xd = x - s.x
+        let yd = y - (s.y + self.anchor_lift(s))
+        let zd = z - s.z
+        let sd = (xd * xd + zd * zd).sqrt()
+        let pi = f64(3.1415927f32)
+        var n = s
+        n.x_rot = wrap_degrees(f32.nearest(-((table_atan2(yd, sd) ?? 0.0) * 180.0 / pi)))
+        n.y_rot = wrap_degrees(f32.nearest((table_atan2(zd, xd) ?? 0.0) * 180.0 / pi) - 90.0f32)
+        return n
+    }
+
+    // What a condition of `execute`'s finds as the source `s` (CAL-165): 1 where it holds and 0
+    // where it doesn't, or, for `entity` and `data`, how many entities or tags it finds, and for
+    // `blocks`, how many blocks it compared, or -1 where one doesn't match.
+    fn condition_count(mut self, s: Source, cond: Condition) -> i32 ! Failure {
+        match cond {
+            Condition.Block(at, test) => {
+                // A `BlockInWorld` at the loaded place, `getLoadedBlockPos`.
+                let (x, y, z, d) = try self.loaded_pos(s, at)
+                return if try self.block_matches(d, test, x, y, z) { 1 } else { 0 }
+            },
+            Condition.Blocks(start, end, to, masked) => return try self.blocks_matching(s, start, end, to, masked),
+            Condition.Entity(who) => return i32.wrap((try self.entities_selected(s, who)).len()),
+            Condition.Score(target, objective, op, other, other_objective) => {
+                let a = try self.single_holder(s, target)
+                let ao = try self.objective_arg(objective.copy())
+                let b = try self.single_holder(s, other)
+                let bo = try self.objective_arg(other_objective.copy())
+                let av = self.world.scoreboard.score_value(a, ao.name.copy()) else return 0
+                let bv = self.world.scoreboard.score_value(b, bo.name.copy()) else return 0
+                let passed = if op == "=" { av == bv } else if op == "<" { av < bv } else if op == "<=" { av <= bv } else if op == ">" { av > bv } else { av >= bv }
+                return if passed { 1 } else { 0 }
+            },
+            Condition.Matches(target, objective, range) => {
+                let a = try self.single_holder(s, target)
+                let ao = try self.objective_arg(objective.copy())
+                let av = self.world.scoreboard.score_value(a, ao.name.copy()) else return 0
+                return if range.matches(av) { 1 } else { 0 }
+            },
+            Condition.Data(target, path) => {
+                let a = try self.data_accessor(s, target)
+                let data = self.data_read(a)
+                return i32.wrap(path.count_matching(data))
+            },
+            Condition.Dimension(id) => {
+                let d = self.world.dimension_of(id) else fail Failure.alone(Component.translatable("argument.dimension.invalid", [Component.literal(id.to_string())]))
+                return if d == s.dim { 1 } else { 0 }
+            },
+            Condition.Loaded(at) => {
+                // `isChunkLoaded` at the block the coordinates give, `getBlockPos`, unchecked.
+                let (px, _, pz) = self.point_of(s, at)
+                let pos = ChunkPos { x: mth_floor(px) >> 4, z: mth_floor(pz) >> 4 }
+                return if self.levels[s.dim].entities_ticking_status(pos) { 1 } else { 0 }
+            },
+        }
+    }
+
+    // `ScoreHolderArgument.getName`: the first holder of those `h` names, which must name one.
+    fn single_holder(mut self, s: Source, h: Holder) -> String ! Failure {
+        let found = try self.holders_of(s, h, false)
+        return found[0].name.copy()
+    }
+
+    // `BlockPredicateArgument.Result.test` of the block at `x`, `y`, `z` in the level `d`
+    // (CAL-165): a block's, the same block with each property written as it was written; a
+    // tag's, a block in the tag with each property named, which it must have, at the value
+    // written, which must be one of its; then, where NBT was given, its block entity, which must
+    // be there, as it saves with its full metadata, holding that, `compareNbt`.
+    fn block_matches(mut self, d: usize, test: BlockTest, x: i32, y: i32, z: i32) -> bool ! Failure {
+        let shared = self.levels[d].shared_env() else fail Failure.alone(Component.literal("Calcite can't test blocks in a level without its blocks"))
+        let Env { facts: f, .. } = shared.value
+        let state = self.block_at(d, f, x, y, z) ?? f.ids.air_state
+        let names = self.block_names() else fail Failure.alone(Component.literal("Calcite can't test blocks yet"))
+        let block = names.value.states.block_of(state)
+        if let members = test.tag {
+            if not members.contains(i32.wrap(block)) {
+                return false
+            }
+            for (key, raw) in test.vague {
+                let p = names.value.states.prop(block, key.copy()) else return false
+                let value = names.value.states.value_of(p, raw.copy()) else return false
+                if p.get(state) != value {
+                    return false
+                }
+            }
+        } else {
+            if block != names.value.states.block_of(test.state) {
+                return false
+            }
+            for p in test.given {
+                if p.get(state) != p.get(test.state) {
+                    return false
+                }
+            }
+        }
+        let wanted = test.nbt else return true
+        let saved = self.levels[d].saved_block_entity(x, y, z) else return false
+        return compare_nbt(wanted, some(saved), true)
+    }
+
+    // `ExecuteCommand.checkRegions` (CAL-165): each block of the area between the loaded corners
+    // `start` and `end`, `z` then `y` then `x`, or each that isn't air where `masked`, compared
+    // with the one as far from the loaded corner `to`: the same state, and where it has a block
+    // entity, one there of its type with its components and what it saves, all but where it is;
+    // how many it compared, or -1 at the first that doesn't match. An area of more than 32768
+    // blocks fails, `commands.execute.blocks.toobig`.
+    fn blocks_matching(mut self, s: Source, start: Coordinates, end: Coordinates, to: Coordinates, masked: bool) -> i32 ! Failure {
+        let (ax, ay, az, d) = try self.loaded_pos(s, start)
+        let (bx, by, bz, _) = try self.loaded_pos(s, end)
+        let (tx, ty, tz, _) = try self.loaded_pos(s, to)
+        let (min_x, min_y, min_z) = (ax.min(bx), ay.min(by), az.min(bz))
+        let (max_x, max_y, max_z) = (ax.max(bx), ay.max(by), az.max(bz))
+        let area = (i64(max_x) - i64(min_x) + 1) * (i64(max_y) - i64(min_y) + 1) * (i64(max_z) - i64(min_z) + 1)
+        if area > 32768 {
+            fail Failure.alone(Component.translatable_args(String("commands.execute.blocks.toobig"), [Argument.Number(Tag.Int(32768)), Argument.Number(Tag.Long(area))]))
+        }
+        let shared = self.levels[d].shared_env() else fail Failure.alone(Component.literal("Calcite can't test blocks in a level without its blocks"))
+        let Env { facts: f, .. } = shared.value
+        let (ox, oy, oz) = (tx - min_x, ty - min_y, tz - min_z)
+        var count = 0
+        for z in min_z..max_z + 1 {
+            for y in min_y..max_y + 1 {
+                for x in min_x..max_x + 1 {
+                    let here = self.block_at(d, f, x, y, z) ?? f.ids.air_state
+                    if masked and f.is_air(here) {
+                        continue
+                    }
+                    let there = self.block_at(d, f, x + ox, y + oy, z + oz) ?? f.ids.air_state
+                    if here != there {
+                        return -1
+                    }
+                    if let mine = self.levels[d].saved_block_entity(x, y, z) {
+                        let theirs = self.levels[d].saved_block_entity(x + ox, y + oy, z + oz) else return -1
+                        if not unplaced(mine).java_equals(unplaced(theirs)) {
+                            return -1
+                        }
+                    }
+                    count += 1
+                }
+            }
+        }
+        return count
+    }
+
+    // An `execute if` or `execute unless` that ends it (CAL-165), as the condition's command
+    // runs: for `entity` and `data`, `createNumericConditionalHandler`, `if` passing with how many
+    // it found, `commands.execute.conditional.pass_count`, where it found any, else
+    // `commands.execute.conditional.fail`, and `unless` passing,
+    // `commands.execute.conditional.pass`, where it found none, else
+    // `commands.execute.conditional.fail_count` with how many; for `blocks`, the same by whether
+    // they matched, with how many it compared; for the rest, passing where it holds as it
+    // should, else failing.
+    fn execute_test(mut self, s: Source, expected: bool, cond: Condition) ! Failure {
+        let count = try self.condition_count(s, cond)
+        let counted = match cond {
+            Condition.Entity(_) => true,
+            Condition.Data(_, _) => true,
+            Condition.Blocks(_, _, _, _) => true,
+            _ => false,
+        }
+        let held = condition_held(cond, count)
+        if not counted {
+            if held != expected {
+                fail Failure.alone(Component.translatable("commands.execute.conditional.fail", []))
+            }
+            self.success(s, Component.translatable("commands.execute.conditional.pass", []), false)
+            return
+        }
+        if expected {
+            if not held {
+                fail Failure.alone(Component.translatable("commands.execute.conditional.fail", []))
+            }
+            self.success(s, Component.translatable_args(String("commands.execute.conditional.pass_count"), [Argument.Number(Tag.Int(count))]), false)
+            return
+        }
+        if held {
+            fail Failure.alone(Component.translatable_args(String("commands.execute.conditional.fail_count"), [Argument.Number(Tag.Int(count))]))
+        }
+        self.success(s, Component.translatable("commands.execute.conditional.pass", []), false)
+    }
+
     // `getModifiedSuccess` (CAL-165).
     fn data_modified(self, a: Accessor) -> Component {
         return match a {
@@ -18779,7 +19254,7 @@ impl Network {
             ScoreboardAction.SetDisplay(slot, name) => try self.set_display_slot(source, slot, name),
             ScoreboardAction.DisplayName(name, given) => {
                 let o = try self.objective_arg(name)
-                let shown = try self.resolve_text(source, given, source_slot(source), 0)
+                let shown = try self.resolve_text(source, given, source.entity, 0)
                 if o.display_name != shown.to_nbt() {
                     let changes = self.world.scoreboard.set_display_name(o.name.copy(), shown.to_nbt())
                     self.tell_scoreboard(changes)
@@ -18871,7 +19346,7 @@ impl Network {
     fn add_objective(mut self, source: Source, name: String, criteria: String, given: Component?) ! Failure {
         var shown = Component.literal(name.copy())
         if let g = given {
-            shown = try self.resolve_text(source, g, source_slot(source), 0)
+            shown = try self.resolve_text(source, g, source.entity, 0)
         }
         if self.world.scoreboard.objectives.contains(name) {
             fail Failure.alone(Component.translatable("commands.scoreboard.objectives.add.duplicate", []))
@@ -19050,7 +19525,7 @@ impl Network {
         let o = try self.objective_arg(name)
         var display: Component? = none
         if let g = given {
-            display = some(try self.resolve_text(source, g, source_slot(source), 0))
+            display = some(try self.resolve_text(source, g, source.entity, 0))
         }
         let saved = match display {
             some(d) => some(d.to_nbt()),
@@ -19163,7 +19638,7 @@ impl Network {
         match g {
             NumberFormatGiven.Blank => m.insert(String("type"), Tag.Str(String("minecraft:blank"))),
             NumberFormatGiven.Fixed(c) => {
-                let shown = try self.resolve_text(source, c, source_slot(source), 0)
+                let shown = try self.resolve_text(source, c, source.entity, 0)
                 m.insert(String("type"), Tag.Str(String("minecraft:fixed")))
                 m.insert(String("value"), shown.to_nbt())
             },
@@ -19304,12 +19779,7 @@ impl Network {
         if span >= 2147483647 {
             fail Failure.alone(Component.translatable("commands.random.error.range_too_large", []))
         }
-        var d: usize = 0
-        if let Source.Player(slot) = source {
-            if let c = self.connections[slot] {
-                d = c.player.dim
-            }
-        }
+        let d = source.dim
         var r = self.levels[d].lend_random()
         // `Mth.randomBetweenInclusive`.
         let value = r.next_int_below(most - least + 1) + least
@@ -19323,17 +19793,6 @@ impl Network {
     }
 
 
-    // The source's permission level: the console's is the owners'.
-    fn level_of(self, source: Source) -> i32 {
-        return match source {
-            Source.Console => OWNERS,
-            Source.Player(slot) => match self.connections[slot] {
-                some(c) => c.player.level,
-                none => 0,
-            },
-        }
-    }
-
     // `gamemode`, as `GameModeCommand.setMode`: each player named, or the one running it, put in
     // `mode`, and told of it where they weren't in it already.
     fn game_mode_command(mut self, source: Source, mode: GameType, targets: own Selector?) ! Failure {
@@ -19344,10 +19803,8 @@ impl Network {
                 fail Failure.alone(Component.translatable("argument.entity.notfound.player", []))
             }
         } else {
-            match source {
-                Source.Player(slot) => who.push(slot),
-                Source.Console => fail Failure.alone(Component.translatable("permissions.requires.player", [])),
-            }
+            let slot = source.entity else fail Failure.alone(Component.translatable("permissions.requires.player", []))
+            who.push(slot)
         }
         for slot in who {
             if self.change_mode(slot, mode) {
@@ -19360,10 +19817,7 @@ impl Network {
     // their mode changed, and the source what it did, each told to the operators too.
     fn log_mode_change(mut self, source: Source, target: usize, mode: GameType) {
         let name = Component.translatable("gameMode.{mode.name()}", [])
-        let by_target = match source {
-            Source.Player(slot) => slot == target,
-            Source.Console => false,
-        }
+        let by_target = source.entity == some(target)
         if by_target {
             self.success(source, Component.translatable("commands.gamemode.success.self", [name]), true)
             return
@@ -19454,7 +19908,7 @@ impl Network {
     // or of every player, in the order they joined, those its tests pass, no more than it may
     // pick where it doesn't sort them, else all, sorted, then no more than it may pick.
     fn players_selected(mut self, source: Source, s: Selector) -> List<usize> ! Failure {
-        try self.may_select(source, s)
+        try may_select(source, s)
         var out = List<usize>()
         if let name = s.player {
             if let slot = self.player_called(name) {
@@ -19471,18 +19925,15 @@ impl Network {
         if let what = s.unrun() {
             fail Failure.alone(Component.literal("Calcite can't run selectors with {what} yet"))
         }
-        let (sx, sy, sz, level) = self.source_place(source)
+        let (sx, sy, sz, level) = (source.x, source.y, source.z, source.dim)
         let x = s.x ?? sx
         let y = s.y ?? sy
         let z = s.z ?? sz
         if s.current {
-            match source {
-                Source.Player(slot) => {
-                    if self.playing(slot) and self.selects(s, slot, x, y, z) {
-                        out.push(slot)
-                    }
-                },
-                Source.Console => {},
+            if let slot = source.entity {
+                if self.playing(slot) and self.selects(s, slot, x, y, z) {
+                    out.push(slot)
+                }
             }
             return out
         }
@@ -19525,7 +19976,7 @@ impl Network {
         if not s.entities or s.player != none or s.current {
             return try self.players_selected(source, s)
         }
-        try self.may_select(source, s)
+        try may_select(source, s)
         if let id = s.uuid {
             if let slot = self.player_with(id) {
                 var out = List<usize>()
@@ -19537,19 +19988,12 @@ impl Network {
         fail Failure.alone(Component.literal("Calcite can't run selectors of entities that aren't players yet"))
     }
 
-    // `checkPermissions`: a selector written with `@` only for a game master's source.
-    fn may_select(self, source: Source, s: Selector) ! Failure {
-        if s.uses_selector and self.level_of(source) < GAMEMASTERS {
-            fail Failure.alone(Component.translatable("argument.entity.selector.not_allowed", []))
-        }
-    }
-
     // `weather`, `WeatherCommand`: the weather set as `setWeatherParameters` sets it, for the
     // ticks given, or as long as the source's level's random draws, as `RAIN_DELAY`,
     // `RAIN_DURATION` or `THUNDER_DURATION` draws it; then the source told, and the operators
     // (CAL-165).
     fn weather_command(mut self, source: Source, kind: WeatherKind, duration: i32?) {
-        let (_, _, _, d) = self.source_place(source)
+        let (_, _, _, d) = (source.x, source.y, source.z, source.dim)
         let (least, most) = match kind {
             WeatherKind.Clear => (RAIN_DELAY_MIN, RAIN_DELAY_MAX),
             WeatherKind.Rain => (RAIN_DURATION_MIN, RAIN_DURATION_MAX),
@@ -19591,10 +20035,8 @@ impl Network {
                 fail Failure.alone(Component.translatable("argument.entity.notfound.entity", []))
             }
         } else {
-            match source {
-                Source.Player(slot) => victims.push(slot),
-                Source.Console => fail Failure.alone(Component.translatable("permissions.requires.entity", [])),
-            }
+            let slot = source.entity else fail Failure.alone(Component.translatable("permissions.requires.entity", []))
+            victims.push(slot)
         }
         for slot in victims {
             if slot >= self.connections.len() {
@@ -19613,13 +20055,13 @@ impl Network {
     }
 
     // `BlockPosArgument.getLoadedBlockPos` of `at` for `source` (CAL-165): the block the place
-    // the coordinates give from where the source is and looks is in, `BlockPos.containing`, with
-    // its level, which must have its chunk, `argument.pos.unloaded`, and be inside the world's
-    // height and 30,000,000 blocks out, `argument.pos.outofworld`.
+    // the coordinates give from where the source is and looks is in, local ones from its anchor,
+    // `point_of`, `BlockPos.containing`, with its level, which must have its chunk,
+    // `argument.pos.unloaded`, and be inside the world's height and 30,000,000 blocks out,
+    // `argument.pos.outofworld`.
     fn loaded_pos(self, source: Source, at: Coordinates) -> (i32, i32, i32, usize) ! Failure {
-        let (sx, sy, sz, d) = self.source_place(source)
-        let (x_rot, y_rot) = self.source_turn(source)
-        let (px, py, pz) = at.position(sx, sy, sz, x_rot, y_rot)
+        let d = source.dim
+        let (px, py, pz) = self.point_of(source, at)
         let x = mth_floor(px)
         let y = mth_floor(py)
         let z = mth_floor(pz)
@@ -19775,13 +20217,12 @@ impl Network {
         if flags & SUMMON == 0 {
             fail Failure.alone(Component.translatable("entity.not_summonable", [Component.literal(name.copy())]))
         }
-        let (sx, sy, sz, d) = self.source_place(source)
+        let (sx, sy, sz, d) = (source.x, source.y, source.z, source.dim)
         var px = sx
         var py = sy
         var pz = sz
         if let c = at {
-            let (x_rot, y_rot) = self.source_turn(source)
-            let (qx, qy, qz) = c.position(sx, sy, sz, x_rot, y_rot)
+            let (qx, qy, qz) = self.point_of(source, c)
             px = qx
             py = qy
             pz = qz
@@ -20045,10 +20486,8 @@ impl Network {
                 fail Failure.alone(Component.translatable("argument.entity.notfound.entity", []))
             }
         } else {
-            match source {
-                Source.Player(slot) => victims.push(slot),
-                Source.Console => fail Failure.alone(Component.translatable("permissions.requires.entity", [])),
-            }
+            let slot = source.entity else fail Failure.alone(Component.translatable("permissions.requires.entity", []))
+            victims.push(slot)
         }
         var message = Component.empty()
         match to {
@@ -20073,14 +20512,15 @@ impl Network {
                 }
             },
             Destination.At(location, rotation, facing) => {
-                let (sx, sy, sz, d) = self.source_place(source)
-                let (s_x_rot, s_y_rot) = self.source_turn(source)
+                let d = source.dim
+                let (s_x_rot, s_y_rot) = (source.x_rot, source.y_rot)
                 // What they're to face, as the command's arguments are got before it runs: a
-                // place from where the source is, or the first entity the selector finds.
+                // place from where the source is, local coordinates from its anchor, or the first
+                // entity the selector finds.
                 var look: Toward? = none
                 match facing {
                     some(Facing.Place(toward)) => {
-                        let (fx, fy, fz) = toward.position(sx, sy, sz, s_x_rot, s_y_rot)
+                        let (fx, fy, fz) = self.point_of(source, toward)
                         look = some(Toward.Place(fx, fy, fz))
                     },
                     some(Facing.Entity(s, eyes)) => {
@@ -20092,7 +20532,7 @@ impl Network {
                     },
                     none => {},
                 }
-                let (x, y, z) = location.position(sx, sy, sz, s_x_rot, s_y_rot)
+                let (x, y, z) = self.point_of(source, location)
                 var turn: (f32, f32)? = none
                 var turned = 0
                 if let r = rotation {
@@ -20241,7 +20681,7 @@ impl Network {
     // alone. Each change sends the clock to every player as `modifyClock` does, even where a
     // time marker isn't found or is reached already, which fail after it.
     fn time_command(mut self, source: Source, clock: own Identifier?, action: own TimeAction) ! Failure {
-        let (_, _, _, d) = self.source_place(source)
+        let (_, _, _, d) = (source.x, source.y, source.z, source.dim)
         let chosen = match clock {
             some(name) => self.clock_named(name),
             none => self.world.dims[d].default_clock,
@@ -20387,18 +20827,6 @@ impl Network {
         return self.world.dims[d].id.to_string()
     }
 
-    // The pitch and yaw the source looks at, `getRotation`: a player's own, the console's none.
-    fn source_turn(self, source: Source) -> (f32, f32) {
-        match source {
-            Source.Player(slot) => {
-                if let c = self.connections[slot] {
-                    return (c.player.x_rot, c.player.y_rot)
-                }
-            },
-            Source.Console => {},
-        }
-        return (0.0f32, 0.0f32)
-    }
 
     // `tellraw`, `TellRawCommand`: the message, resolved for each player named in turn, sent
     // them as a system message (CAL-165).
@@ -20591,21 +21019,6 @@ impl Network {
         return none
     }
 
-    // Where a command runs and the level it runs in, as its `CommandSourceStack` has them: the
-    // player's, or, for the console, the low corner of the world's spawn in the spawn's level,
-    // `createCommandSourceStack`, the overworld where there's no such level.
-    fn source_place(self, source: Source) -> (f64, f64, f64, usize) {
-        match source {
-            Source.Player(slot) => {
-                if let c = self.connections[slot] {
-                    return (c.player.x, c.player.y, c.player.z, c.player.dim)
-                }
-            },
-            Source.Console => {},
-        }
-        let level = self.world.dimension_of(self.respawn.dimension.copy()) ?? (self.world.dimension_of(overworld()) ?? 0)
-        return (f64(self.respawn.pos.x), f64(self.respawn.pos.y), f64(self.respawn.pos.z), level)
-    }
 
     // The players in the level `d`, in the order they came into it, as `ServerLevel.players()`
     // has them.
@@ -20802,12 +21215,9 @@ impl Network {
     // `calcite flyspeed`: the player's flying speed set to `speed` times vanilla's, and sent, or
     // told them (D239).
     fn fly_speed(mut self, source: Source, speed: f32?) {
-        let slot = match source {
-            Source.Player(s) => s,
-            Source.Console => {
-                self.command_failed(source, Failure.alone(Component.translatable("permissions.requires.player", [])))
-                return
-            },
+        let slot = source.entity else {
+            self.command_failed(source, Failure.alone(Component.translatable("permissions.requires.player", [])))
+            return
         }
         var con = self.connections[slot].take() else return
         if let s = speed {
@@ -20822,11 +21232,12 @@ impl Network {
         self.connections[slot] = some(con)
     }
 
-    // What a source is known by among the pregen choices: the console, or a player's UUID.
+    // What a source is known by among the pregen choices: the console, or a player's UUID, by
+    // who hears it.
     fn source_key(self, source: Source) -> String {
-        match source {
-            Source.Console => return String("console"),
-            Source.Player(slot) => {
+        match source.output {
+            Output.Console => return String("console"),
+            Output.Player(slot) => {
                 if let c = self.connections[slot] {
                     if let p = c.profile {
                         return p.id.to_string()
@@ -20837,17 +21248,6 @@ impl Network {
         }
     }
 
-    // The dimension the source is in, by its place among the world's: the overworld's for the
-    // console.
-    fn dim_of(self, source: Source) -> usize {
-        return match source {
-            Source.Console => 0,
-            Source.Player(slot) => match self.connections[slot] {
-                some(c) => c.player.dim,
-                none => 0,
-            },
-        }
-    }
 
     // `pregen`, as Chunky's commands: starting, pausing, carrying on with and cancelling the
     // tasks, a dimension's each, saying how they go, and choosing what the source's next one
@@ -20858,7 +21258,7 @@ impl Network {
         var choice = self.choices.get(key) ?? Choice.new()
         match c {
             PregenCommand.Start => {
-                let dim = choice.dim ?? self.dim_of(source)
+                let dim = choice.dim ?? source.dim
                 let id = self.world.dims[dim].id.to_string()
                 if self.pregen_in(dim) != none {
                     fail Failure.alone(Component.literal("Pregen is already running in {id}: cancel it first"))
@@ -20869,15 +21269,12 @@ impl Network {
                 }
                 let total = task.total
                 var starter: Uuid? = none
-                match source {
-                    Source.Player(slot) => {
-                        if let con = self.connections[slot] {
-                            if let p = con.profile {
-                                starter = some(p.id)
-                            }
+                if let Output.Player(slot) = source.output {
+                    if let con = self.connections[slot] {
+                        if let p = con.profile {
+                            starter = some(p.id)
                         }
-                    },
-                    Source.Console => {},
+                    }
                 }
                 self.pregens.push(Run { dim: dim, id: id.copy(), task: task, starter: starter, logged_at: self.now })
                 self.pregen_touched = true
@@ -20940,7 +21337,7 @@ impl Network {
                 }
             },
             PregenCommand.Selection => {
-                let dim = choice.dim ?? self.dim_of(source)
+                let dim = choice.dim ?? source.dim
                 let id = self.world.dims[dim].id.to_string()
                 let count = choice.selection.area().count()
                 self.success(source, Component.literal("Pregen selection: {id}, {choice.selection.described()}, {count} chunks"), false)
@@ -20957,15 +21354,12 @@ impl Network {
                     x = gx
                     z = gz
                 } else {
-                    match source {
-                        Source.Player(slot) => {
-                            if let con = self.connections[slot] {
-                                x = con.player.x
-                                z = con.player.z
-                            }
-                        },
-                        Source.Console => fail Failure.alone(Component.translatable("permissions.requires.player", [])),
+                    // Where the player running it is, as the source has it.
+                    if source.entity == none {
+                        fail Failure.alone(Component.translatable("permissions.requires.player", []))
                     }
+                    x = source.x
+                    z = source.z
                 }
                 choice.selection.center_x = x
                 choice.selection.center_z = z
@@ -21028,10 +21422,8 @@ impl Network {
                 fail Failure.alone(Component.translatable("argument.entity.notfound.player", []))
             }
         } else {
-            match source {
-                Source.Player(s) => who.push(s),
-                Source.Console => fail Failure.alone(Component.translatable("permissions.requires.player", [])),
-            }
+            let s = source.entity else fail Failure.alone(Component.translatable("permissions.requires.player", []))
+            who.push(s)
         }
         for slot in who {
             var at: (usize, f64, f64, i32)? = none
@@ -21039,10 +21431,7 @@ impl Network {
                 at = some((con.player.dim, con.player.x, con.player.z, con.player.entity_id))
             }
             let (from, px, pz, entity_id) = at else continue
-            let me = match source {
-                Source.Player(s) => s == slot,
-                Source.Console => false,
-            }
+            let me = source.entity == some(slot)
             let (x, z) = self.destination(from, to, px, pz)
             let chunk = ChunkPos.containing(x, z)
             var i: usize = 0
@@ -21156,9 +21545,9 @@ impl Network {
     // until Calcite reads the game rules, lets them have it, and the console logging it; then,
     // where `broadcast`, to the operators.
     fn success(mut self, source: Source, message: own Component, broadcast: bool) {
-        match source {
-            Source.Console => self.tell_server(message.copy(), true),
-            Source.Player(slot) => self.tell_slot(slot, message.copy()),
+        match source.output {
+            Output.Console => self.tell_server(message.copy(), true),
+            Output.Player(slot) => self.tell_slot(slot, message.copy()),
         }
         if broadcast {
             self.inform_admins(source, message)
@@ -21166,17 +21555,15 @@ impl Network {
     }
 
     // `broadcastToAdmins`, as `shouldInformAdmins` lets it: in gray italics, `[Source: message]`,
-    // to each operator but the source, and logged where a player ran it. The console's go to
-    // the operators where `broadcast-console-to-ops` says so.
+    // the source by the name it goes by, to each operator but the one who hears it, and logged
+    // where that's a player. The console's go to the operators where `broadcast-console-to-ops`
+    // says so.
     fn inform_admins(mut self, source: Source, message: own Component) {
-        var by = Component.literal("Server")
+        let by = self.source_name(source)
         var from: usize? = none
-        match source {
-            Source.Player(slot) => {
-                by = self.name_of(slot)
-                from = some(slot)
-            },
-            Source.Console => {
+        match source.output {
+            Output.Player(slot) => from = some(slot),
+            Output.Console => {
                 if not self.world.settings.broadcast_console_to_ops {
                     return
                 }
@@ -21216,14 +21603,14 @@ impl Network {
     // input, each in red; the console logs their text.
     fn command_failed(mut self, source: Source, f: own Failure) {
         let where_ = failure_context(f)
-        match source {
-            Source.Console => {
+        match source.output {
+            Output.Console => {
                 self.tell_server(f.message.copy(), true)
                 if let c = where_ {
                     self.tell_server(c, false)
                 }
             },
-            Source.Player(slot) => {
+            Output.Player(slot) => {
                 var con = self.connections[slot].take() else return
                 self.failure(mut con, f.message.copy())
                 if let c = where_ {
@@ -25932,13 +26319,6 @@ fn shown_of(h: HolderFound) -> Tag? {
     }
 }
 
-// The player running a command from `source`, `getEntity`, where it's one.
-fn source_slot(source: Source) -> usize? {
-    return match source {
-        Source.Player(slot) => some(slot),
-        Source.Console => none,
-    }
-}
 
 // `Objective.getFormattedDisplayName`: the objective's display name, pointed at showing its name,
 // in brackets.
@@ -25982,6 +26362,71 @@ fn joined_with(values: List<Component>, between: Component) -> Component {
         out.extra.push(values[i].copy())
     }
     return out
+}
+
+// The most sources `execute` may make, the `max_command_forks` rule's default, which Calcite
+// doesn't read yet.
+const FORK_LIMIT: usize = 65536
+
+// Whether an `execute` step forks, as brigadier's `fork` makes a node, rather than redirecting:
+// those that make a source for each entity, and every condition (CAL-165).
+fn forks(step: ExecuteStep) -> bool {
+    return match step {
+        ExecuteStep.As(_) => true,
+        ExecuteStep.At(_) => true,
+        ExecuteStep.PositionedAs(_) => true,
+        ExecuteStep.RotatedAs(_) => true,
+        ExecuteStep.FacingEntity(_, _) => true,
+        ExecuteStep.Test(_, _) => true,
+        _ => false,
+    }
+}
+
+// Whether a condition holds, by what `condition_count` found: for `entity` and `data`, that it
+// found any; for `blocks`, that they matched; else that it's 1 (CAL-165).
+fn condition_held(cond: Condition, count: i32) -> bool {
+    return match cond {
+        Condition.Entity(_) => count > 0,
+        Condition.Data(_, _) => count > 0,
+        Condition.Blocks(_, _, _, _) => count >= 0,
+        _ => count == 1,
+    }
+}
+
+// The heightmap a `heightmap` argument names, by its kind (CAL-165).
+fn heightmap_kind(name: String) -> i32 {
+    if name == "world_surface" {
+        return WORLD_SURFACE
+    }
+    if name == "ocean_floor" {
+        return OCEAN_FLOOR
+    }
+    if name == "motion_blocking" {
+        return MOTION_BLOCKING
+    }
+    return MOTION_BLOCKING_NO_LEAVES
+}
+
+// A block entity's saved data without where it is, `x`, `y` and `z`, as `checkRegions` compares
+// two by their types, components and what they save (CAL-165).
+fn unplaced(t: Tag) -> Tag {
+    match t {
+        Tag.Compound(m) => {
+            var kept = m.copy()
+            _ = kept.remove(String("x"))
+            _ = kept.remove(String("y"))
+            _ = kept.remove(String("z"))
+            return Tag.Compound(kept)
+        },
+        _ => return t.copy(),
+    }
+}
+
+// `checkPermissions`: a selector written with `@` only for a game master's source.
+fn may_select(source: Source, s: Selector) ! Failure {
+    if s.uses_selector and source.level < GAMEMASTERS {
+        fail Failure.alone(Component.translatable("argument.entity.selector.not_allowed", []))
+    }
 }
 
 // `ComponentUtils.formatList` with its default separator: nothing, the one, or each after the

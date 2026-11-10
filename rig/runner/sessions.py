@@ -60,9 +60,9 @@ VIEW = 4
 # pauses once it's been empty PAUSE seconds, and the bot runs only once it has, so the bot joins
 # both at the same game time and their ticks line up from there (D315).
 PAUSE = 2
-# How long a scenario's bot may run, in seconds, by the wall clock: `select` runs past two
-# minutes of steps (D559).
-BOT_SECONDS = 300
+# How long a scenario's bot may run, in seconds, by the wall clock: `select` runs past four
+# minutes of steps (D559, D565).
+BOT_SECONDS = 420
 BASE = {
     "online-mode": "false",
     "server-ip": "127.0.0.1",
