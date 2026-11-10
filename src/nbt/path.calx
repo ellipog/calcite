@@ -11,7 +11,7 @@ module nbt.path
 import chat.component.{Component}
 import java.number.{parse_int}
 import nbt.snbt.{SyntaxError, compound_at, from_units, units_of}
-import nbt.tag.{Tag}
+import nbt.tag.{Tag, merge_compound}
 
 /// A step of a path, vanilla's `NbtPathArgument.Node`.
 pub enum Node {
@@ -34,6 +34,10 @@ pub struct NbtPath {
     /// The text from where it starts to where reading stopped, which `asString` gives.
     pub original: String
     pub nodes: List<Node>
+    /// Where each step ends, from where the path starts, in UTF-16 units, which a failure to
+    /// find anything names the path up to. Vanilla keeps these in a hash map by step, where
+    /// every `[]` is the same object, so for each of those the last one's end is used.
+    pub ends: List<usize>
 }
 
 /// Why a path can't be read: a syntax error, with vanilla's message and place, or what vanilla
@@ -59,10 +63,12 @@ pub fn parse(text: String) -> NbtPath ! PathError {
 pub fn read(text: String, start: usize) -> (NbtPath, usize) ! PathError {
     var r = Reader { units: units_of(text), text: text.copy(), at: start }
     var nodes = List<Node>()
+    var ends = List<usize>()
     var first = true
     while r.can_read() and r.peek() != SPACE {
         let node = try r.node(first)
         nodes.push(node)
+        ends.push(r.at - start)
         first = false
         if r.can_read() {
             let next = r.peek()
@@ -72,7 +78,857 @@ pub fn read(text: String, start: usize) -> (NbtPath, usize) ! PathError {
         }
     }
     let original = from_units(r.units, start, r.at)
-    return (NbtPath { original: original, nodes: nodes }, r.at)
+    return (NbtPath { original: original, nodes: nodes, ends: ends }, r.at)
+}
+
+/// Why a path finds nothing, or can't change what it finds: vanilla's `NbtPath` failures, and
+/// `DataCommands`' on what a path finds (CAL-165).
+pub enum PathFailure {
+    /// `arguments.nbtpath.nothing_found`: the path up to the step that found nothing.
+    NothingFound(String)
+    /// `arguments.nbtpath.too_deep`: what's put would be 512 or more deep.
+    TooDeep
+    /// `commands.data.modify.expected_list`: what was found where a list was wanted.
+    ExpectedList(Tag)
+    /// `commands.data.modify.expected_object`: what was found where a compound was wanted.
+    ExpectedObject(Tag)
+    /// `commands.data.modify.invalid_index`: where an element couldn't be put.
+    InvalidIndex(i32)
+    /// An exception vanilla doesn't expect, by its message, as a change of a path of no steps
+    /// throws looking for its last one.
+    Unexpected(String)
+}
+
+// What a change of a path does at its last step.
+enum Edit {
+    // `set`: the last step set to the tag in each parent.
+    Set(Tag)
+    // `remove`: what the last step finds in each parent, taken away.
+    Remove
+    // `insert`: the tags put at the index in each list the path finds or makes.
+    Insert(i32, List<Tag>)
+    // `DataCommands`' `merge`: the compound merged into each compound the path finds or makes.
+    Merge(JavaHashMap<String, Tag>)
+}
+
+// How a change is going: how many it's changed, which steps found something, and its failure.
+struct Run {
+    count: i32 = 0
+    found: List<bool>
+    failure: PathFailure? = none
+}
+
+impl NbtPath {
+    /// `get`: what the path finds in `tag`, in order, or the first step that finds nothing.
+    pub fn get(self, tag: Tag) -> List<Tag> ! PathFailure {
+        var found: List<Tag> = [tag.copy()]
+        for i in 0..self.nodes.len() {
+            var next = List<Tag>()
+            for t in found {
+                children(self.nodes[i], t, mut next)
+            }
+            if next.is_empty() {
+                fail self.nothing_found(i)
+            }
+            found = next
+        }
+        return found
+    }
+
+    /// `countMatching`: how many tags the path finds in `tag`.
+    pub fn count_matching(self, tag: Tag) -> usize {
+        var found: List<Tag> = [tag.copy()]
+        for node in self.nodes {
+            var next = List<Tag>()
+            for t in found {
+                children(node, t, mut next)
+            }
+            if next.is_empty() {
+                return 0
+            }
+            found = next
+        }
+        return found.len()
+    }
+
+    /// `set`: the path's last step set to `value` in each parent it finds or makes in `tag`, and
+    /// how many that changed. Like each change, `tag` is changed in place, so what was made on
+    /// the way is kept where it fails, as in vanilla, which changes the tag it's given.
+    pub fn set(self, tag: mut Tag, value: Tag) -> i32 ! PathFailure {
+        if too_deep(value, self.nodes.len()) {
+            fail PathFailure.TooDeep
+        }
+        return try self.change(mut tag, Edit.Set(value.java_copy()))
+    }
+
+    /// `insert`: `values` put at `index`, or from the end where it's below 0, `-1` after the
+    /// last, in each list or array the path finds or makes in `tag`, and how many that changed.
+    pub fn insert(self, index: i32, tag: mut Tag, values: List<Tag>) -> i32 ! PathFailure {
+        var copies = List<Tag>()
+        for v in values {
+            let c = v.java_copy()
+            if too_deep(c, self.nodes.len()) {
+                fail PathFailure.TooDeep
+            }
+            copies.push(c)
+        }
+        return try self.change(mut tag, Edit.Insert(index, copies))
+    }
+
+    /// `DataCommands`' `merge`: `from` merged into each compound the path finds or makes in
+    /// `tag`, and how many that changed.
+    pub fn merge(self, tag: mut Tag, from: JavaHashMap<String, Tag>) -> i32 ! PathFailure {
+        return try self.change(mut tag, Edit.Merge(from.copy()))
+    }
+
+    /// `remove`: what the path finds in `tag` taken away, and how many.
+    pub fn remove(self, tag: mut Tag) -> i32 ! PathFailure {
+        return try self.change(mut tag, Edit.Remove)
+    }
+
+    // `createNotFoundException` for step `i`.
+    fn nothing_found(self, i: usize) -> PathFailure {
+        var end = self.ends[i]
+        if is_all(self.nodes[i]) {
+            for k in 0..self.nodes.len() {
+                if is_all(self.nodes[k]) {
+                    end = self.ends[k]
+                }
+            }
+        }
+        return PathFailure.NothingFound(from_units(units_of(self.original), 0, end))
+    }
+
+    // `edit` on `tag`: down each step to the parents of the last, made where they're missing
+    // as `getOrCreateParents` makes them, or only found for a removal, then the last step.
+    // Vanilla makes every parent, and for an insert or a merge every tag at the end, before it
+    // changes any, so where one fails, the rest are still made, though not changed.
+    fn change(self, tag: mut Tag, edit: Edit) -> i32 ! PathFailure {
+        if self.nodes.is_empty() {
+            fail PathFailure.Unexpected(String("Index -1 out of bounds for length 0"))
+        }
+        var run = Run { found: List<bool>() }
+        for _ in self.nodes {
+            run.found.push(false)
+        }
+        self.walk(mut tag, 0, edit, mut run)
+        if let f = run.failure {
+            fail f.copy()
+        }
+        match edit {
+            Edit.Remove => {},
+            _ => {
+                for i in 0..self.nodes.len() - 1 {
+                    if not run.found[i] {
+                        fail self.nothing_found(i)
+                    }
+                }
+            },
+        }
+        return run.count
+    }
+
+    // Step `i` on its parent `t`: the change, at the last step, or on to what it finds.
+    fn walk(self, t: mut Tag, i: usize, edit: Edit, run: mut Run) {
+        let last = i + 1 == self.nodes.len()
+        if last {
+            match edit {
+                Edit.Set(value) => {
+                    run.count += set_tag(self.nodes[i], mut t, value)
+                    return
+                },
+                Edit.Remove => {
+                    run.count += remove_tag(self.nodes[i], mut t)
+                    return
+                },
+                Edit.Insert(_, _) => self.each(mut t, i, some(Tag.List(List<Tag>())), edit, mut run),
+                Edit.Merge(_) => self.each(mut t, i, some(Tag.Compound(JavaHashMap<String, Tag>())), edit, mut run),
+            }
+            return
+        }
+        let made: Tag? = match edit {
+            Edit.Remove => none,
+            _ => some(preferred_parent(self.nodes[i + 1])),
+        }
+        self.each(mut t, i, made, edit, mut run)
+    }
+
+    // What step `i` finds in `t`, each in place, or, with `made`, makes where it finds nothing,
+    // as `getOrCreateTag`: each taken on down the path, or changed if it's at the end.
+    fn each(self, t: mut Tag, i: usize, made: Tag?, edit: Edit, run: mut Run) {
+        match self.nodes[i] {
+            Node.MatchRootObject(pattern) => {
+                if is_compound_tag(t) and compare_nbt(pattern, some(t.copy()), true) {
+                    run.found[i] = true
+                    self.down(mut t, i, edit, mut run)
+                }
+            },
+            Node.CompoundChild(name) => {
+                var m = match t {
+                    Tag.Compound(x) => x.copy(),
+                    _ => return,
+                }
+                if not m.contains(name) {
+                    let new = made else return
+                    m.insert(name.copy(), new.copy())
+                }
+                var c = m[name].copy()
+                run.found[i] = true
+                self.down(mut c, i, edit, mut run)
+                m.insert(name.copy(), c)
+                t = Tag.Compound(m)
+            },
+            Node.MatchObject(name, pattern) => {
+                var m = match t {
+                    Tag.Compound(x) => x.copy(),
+                    _ => return,
+                }
+                if not m.contains(name) {
+                    if made == none {
+                        return
+                    }
+                    m.insert(name.copy(), pattern.java_copy())
+                } else if not compare_nbt(pattern, some(m[name].copy()), true) {
+                    return
+                }
+                var c = m[name].copy()
+                run.found[i] = true
+                self.down(mut c, i, edit, mut run)
+                m.insert(name.copy(), c)
+                t = Tag.Compound(m)
+            },
+            Node.AllElements => {
+                if let items = list_of(t) {
+                    var list = items
+                    if list.is_empty() {
+                        let new = made else return
+                        list.push(new.copy())
+                    }
+                    run.found[i] = true
+                    for k in 0..list.len() {
+                        var c = list[k].copy()
+                        self.down(mut c, i, edit, mut run)
+                        list[k] = c
+                    }
+                    t = Tag.List(list)
+                    return
+                }
+                // An array's numbers, which nothing under them changes. An empty one takes no
+                // list or compound made for it.
+                let numbers = elements(t) else return
+                if numbers.is_empty() {
+                    return
+                }
+                run.found[i] = true
+                for n in numbers {
+                    var c = n.copy()
+                    self.down(mut c, i, edit, mut run)
+                }
+            },
+            Node.IndexedElement(index) => {
+                if let items = list_of(t) {
+                    let k = index_in(index, items.len()) else return
+                    var list = items
+                    var c = list[k].copy()
+                    run.found[i] = true
+                    self.down(mut c, i, edit, mut run)
+                    list[k] = c
+                    t = Tag.List(list)
+                    return
+                }
+                let numbers = elements(t) else return
+                let k = index_in(index, numbers.len()) else return
+                var c = numbers[k].copy()
+                run.found[i] = true
+                self.down(mut c, i, edit, mut run)
+            },
+            Node.MatchElement(pattern) => {
+                var list = match t {
+                    Tag.List(x) => x.copy(),
+                    _ => return,
+                }
+                var hits = List<usize>()
+                for k in 0..list.len() {
+                    if compare_nbt(pattern, some(list[k].copy()), true) {
+                        hits.push(k)
+                    }
+                }
+                if hits.is_empty() {
+                    if made == none {
+                        return
+                    }
+                    list.push(pattern.java_copy())
+                    hits.push(list.len() - 1)
+                }
+                run.found[i] = true
+                for k in hits {
+                    var c = list[k].copy()
+                    self.down(mut c, i, edit, mut run)
+                    list[k] = c
+                }
+                t = Tag.List(list)
+            },
+        }
+    }
+
+    // What step `i` found, `c`: changed if it's the last, else taken on to the next step.
+    fn down(self, c: mut Tag, i: usize, edit: Edit, run: mut Run) {
+        if i + 1 < self.nodes.len() {
+            self.walk(mut c, i + 1, edit, mut run)
+            return
+        }
+        if run.failure != none {
+            return
+        }
+        match edit {
+            Edit.Insert(index, values) => {
+                match insert_into(mut c, index, values) {
+                    ok(changed) => {
+                        if changed {
+                            run.count += 1
+                        }
+                    },
+                    err(f) => run.failure = some(f),
+                }
+            },
+            Edit.Merge(from) => {
+                let before = c.copy()
+                match before {
+                    Tag.Compound(m) => {
+                        var mine = m.copy()
+                        merge_compound(mut mine, from)
+                        let after = Tag.Compound(mine)
+                        if not after.java_equals(before) {
+                            run.count += 1
+                        }
+                        c = after
+                    },
+                    _ => run.failure = some(PathFailure.ExpectedObject(before.copy())),
+                }
+            },
+            _ => {},
+        }
+    }
+}
+
+/// `NbtPath.isTooDeep`: whether `tag`, `depth` deep, holds anything 512 or more deep.
+pub fn too_deep(tag: Tag, depth: usize) -> bool {
+    if depth >= 512 {
+        return true
+    }
+    match tag {
+        Tag.Compound(m) => {
+            for (_, v) in m {
+                if too_deep(v, depth + 1) {
+                    return true
+                }
+            }
+        },
+        Tag.List(items) => {
+            for v in items {
+                if too_deep(v, depth + 1) {
+                    return true
+                }
+            }
+        },
+        _ => {},
+    }
+    return false
+}
+
+/// `NbtUtils.compareNbt`: whether `actual` has everything `expected` has: of its type, a
+/// compound with each of its keys matching, with `partial` a list with an element matching
+/// each of its, or empty if it's empty, and anything else equal.
+pub fn compare_nbt(expected: Tag, actual: Tag?, partial: bool) -> bool {
+    let a = actual else return false
+    if expected.id() != a.id() {
+        return false
+    }
+    match expected {
+        Tag.Compound(want) => {
+            match a {
+                Tag.Compound(have) => {
+                    if have.len() < want.len() {
+                        return false
+                    }
+                    for (k, v) in want {
+                        let got: Tag? = if have.contains(k) { some(have[k].copy()) } else { none }
+                        if not compare_nbt(v, got, partial) {
+                            return false
+                        }
+                    }
+                    return true
+                },
+                _ => return false,
+            }
+        },
+        Tag.List(want) => {
+            if not partial {
+                return expected.java_equals(a)
+            }
+            match a {
+                Tag.List(have) => {
+                    if want.is_empty() {
+                        return have.is_empty()
+                    }
+                    if have.len() < want.len() {
+                        return false
+                    }
+                    for w in want {
+                        var hit = false
+                        for h in have {
+                            if compare_nbt(w, some(h.copy()), partial) {
+                                hit = true
+                                break
+                            }
+                        }
+                        if not hit {
+                            return false
+                        }
+                    }
+                    return true
+                },
+                _ => return false,
+            }
+        },
+        _ => return expected.java_equals(a),
+    }
+}
+
+// `getTag`: what `node` finds under `parent`, added to `out`.
+fn children(node: Node, parent: Tag, out: mut List<Tag>) {
+    match node {
+        Node.MatchRootObject(pattern) => {
+            if is_compound_tag(parent) and compare_nbt(pattern, some(parent.copy()), true) {
+                out.push(parent.copy())
+            }
+        },
+        Node.CompoundChild(name) => {
+            match parent {
+                Tag.Compound(m) => {
+                    if m.contains(name) {
+                        out.push(m[name].copy())
+                    }
+                },
+                _ => {},
+            }
+        },
+        Node.MatchObject(name, pattern) => {
+            match parent {
+                Tag.Compound(m) => {
+                    if m.contains(name) and compare_nbt(pattern, some(m[name].copy()), true) {
+                        out.push(m[name].copy())
+                    }
+                },
+                _ => {},
+            }
+        },
+        Node.AllElements => {
+            if let all = elements(parent) {
+                for e in all {
+                    out.push(e.copy())
+                }
+            }
+        },
+        Node.IndexedElement(index) => {
+            if let all = elements(parent) {
+                if let k = index_in(index, all.len()) {
+                    out.push(all[k].copy())
+                }
+            }
+        },
+        Node.MatchElement(pattern) => {
+            match parent {
+                Tag.List(items) => {
+                    for e in items {
+                        if compare_nbt(pattern, some(e.copy()), true) {
+                            out.push(e.copy())
+                        }
+                    }
+                },
+                _ => {},
+            }
+        },
+    }
+}
+
+// `setTag`: the tag `node` stands for in `parent` set to `value`, and how many that changed.
+fn set_tag(node: Node, parent: mut Tag, value: Tag) -> i32 {
+    match node {
+        Node.CompoundChild(name) => {
+            var m = match parent {
+                Tag.Compound(x) => x.copy(),
+                _ => return 0,
+            }
+            let changed = not m.contains(name) or not value.java_equals(m[name])
+            m.insert(name.copy(), value.java_copy())
+            parent = Tag.Compound(m)
+            return if changed { 1 } else { 0 }
+        },
+        Node.MatchObject(name, pattern) => {
+            var m = match parent {
+                Tag.Compound(x) => x.copy(),
+                _ => return 0,
+            }
+            if not m.contains(name) or not compare_nbt(pattern, some(m[name].copy()), true) {
+                return 0
+            }
+            if value.java_equals(m[name]) {
+                return 0
+            }
+            m.insert(name.copy(), value.java_copy())
+            parent = Tag.Compound(m)
+            return 1
+        },
+        Node.AllElements => {
+            let numbers = elements(parent) else return 0
+            let size = numbers.len()
+            if list_of(parent) != none {
+                if size == 0 {
+                    parent = Tag.List([value.java_copy()])
+                    return 1
+                }
+                var same: usize = 0
+                for e in numbers {
+                    if value.java_equals(e) {
+                        same += 1
+                    }
+                }
+                if same == size {
+                    return 0
+                }
+                var list = List<Tag>()
+                for _ in 0..size {
+                    list.push(value.java_copy())
+                }
+                parent = Tag.List(list)
+                return i32.wrap(size - same)
+            }
+            // An array takes a number only, as its type. Where it had nothing, that's 1
+            // whether it took it or not; else, where it isn't one, the array is left empty.
+            if size == 0 {
+                if let one = array_put(parent, 0, value) {
+                    parent = one
+                }
+                return 1
+            }
+            var same: usize = 0
+            for e in numbers {
+                if value.java_equals(e) {
+                    same += 1
+                }
+            }
+            if same == size {
+                return 0
+            }
+            var filled = emptied(parent)
+            for k in 0..size {
+                match array_put(filled, k, value) {
+                    some(next) => filled = next,
+                    none => {
+                        parent = filled
+                        return 0
+                    },
+                }
+            }
+            parent = filled
+            return i32.wrap(size - same)
+        },
+        Node.IndexedElement(index) => {
+            let numbers = elements(parent) else return 0
+            let k = index_in(index, numbers.len()) else return 0
+            if value.java_equals(numbers[k]) {
+                return 0
+            }
+            if let items = list_of(parent) {
+                var list = items
+                list[k] = value.java_copy()
+                parent = Tag.List(list)
+                return 1
+            }
+            let set = array_set(parent, k, value) else return 0
+            parent = set
+            return 1
+        },
+        Node.MatchElement(pattern) => {
+            var list = match parent {
+                Tag.List(x) => x.copy(),
+                _ => return 0,
+            }
+            if list.is_empty() {
+                list.push(value.java_copy())
+                parent = Tag.List(list)
+                return 1
+            }
+            var changed = 0
+            for k in 0..list.len() {
+                if compare_nbt(pattern, some(list[k].copy()), true) and not value.java_equals(list[k]) {
+                    list[k] = value.java_copy()
+                    changed += 1
+                }
+            }
+            parent = Tag.List(list)
+            return changed
+        },
+        Node.MatchRootObject(_) => return 0,
+    }
+}
+
+// `removeTag`: what `node` finds in `parent` taken away, and how many.
+fn remove_tag(node: Node, parent: mut Tag) -> i32 {
+    match node {
+        Node.CompoundChild(name) => {
+            var m = match parent {
+                Tag.Compound(x) => x.copy(),
+                _ => return 0,
+            }
+            if m.remove(name) == none {
+                return 0
+            }
+            parent = Tag.Compound(m)
+            return 1
+        },
+        Node.MatchObject(name, pattern) => {
+            var m = match parent {
+                Tag.Compound(x) => x.copy(),
+                _ => return 0,
+            }
+            if not m.contains(name) or not compare_nbt(pattern, some(m[name].copy()), true) {
+                return 0
+            }
+            _ = m.remove(name)
+            parent = Tag.Compound(m)
+            return 1
+        },
+        Node.AllElements => {
+            let all = elements(parent) else return 0
+            if all.is_empty() {
+                return 0
+            }
+            parent = emptied(parent)
+            return i32.wrap(all.len())
+        },
+        Node.IndexedElement(index) => {
+            let all = elements(parent) else return 0
+            let k = index_in(index, all.len()) else return 0
+            parent = removed_at(parent, k)
+            return 1
+        },
+        Node.MatchElement(pattern) => {
+            var list = match parent {
+                Tag.List(x) => x.copy(),
+                _ => return 0,
+            }
+            var changed = 0
+            var k = list.len()
+            while k > 0 {
+                k -= 1
+                if compare_nbt(pattern, some(list[k].copy()), true) {
+                    _ = list.remove(k)
+                    changed += 1
+                }
+            }
+            parent = Tag.List(list)
+            return changed
+        },
+        Node.MatchRootObject(_) => return 0,
+    }
+}
+
+// The insert of `values` at `index` into the list or array `c`: whether it took any, or why
+// not. What was put before a failure stays, as in vanilla.
+fn insert_into(c: mut Tag, index: i32, values: List<Tag>) -> bool ! PathFailure {
+    let size = match elements(c) {
+        some(all) => all.len(),
+        none => fail PathFailure.ExpectedList(c.copy()),
+    }
+    var at: i64 = if index < 0 { i64.wrap(size) + i64(index) + 1 } else { i64(index) }
+    var modified = false
+    for v in values {
+        let length = elements(c) ?? List<Tag>()
+        let is_list = match c {
+            Tag.List(_) => true,
+            _ => false,
+        }
+        // An array takes only numbers, and doesn't look at the index for anything else.
+        if not is_list and v.int_value() == none {
+            continue
+        }
+        if at < 0 or at > i64.wrap(length.len()) {
+            fail PathFailure.InvalidIndex(i32.wrap(at))
+        }
+        if is_list {
+            var list = length
+            list.insert(usize.wrap(at), v.java_copy())
+            c = Tag.List(list)
+        } else {
+            c = inserted_number(c, usize.wrap(at), v)
+        }
+        at += 1
+        modified = true
+    }
+    return modified
+}
+
+// The elements of `t` if it's a list, not an array.
+fn list_of(t: Tag) -> List<Tag>? {
+    return match t {
+        Tag.List(items) => some(items.copy()),
+        _ => none,
+    }
+}
+
+// Whether `node` is `[]`.
+fn is_all(node: Node) -> bool {
+    return match node {
+        Node.AllElements => true,
+        _ => false,
+    }
+}
+
+fn is_compound_tag(t: Tag) -> bool {
+    return match t {
+        Tag.Compound(_) => true,
+        _ => false,
+    }
+}
+
+// `createPreferredParentTag`: what's made for `node` to look in where there's nothing.
+fn preferred_parent(node: Node) -> Tag {
+    return match node {
+        Node.AllElements => Tag.List(List<Tag>()),
+        Node.IndexedElement(_) => Tag.List(List<Tag>()),
+        Node.MatchElement(_) => Tag.List(List<Tag>()),
+        _ => Tag.Compound(JavaHashMap<String, Tag>()),
+    }
+}
+
+// The index `index` stands for in `size` elements, from the end where it's below 0, if it's
+// one of them.
+fn index_in(index: i32, size: usize) -> usize? {
+    let k: i64 = if index < 0 { i64.wrap(size) + i64(index) } else { i64(index) }
+    if k < 0 or k >= i64.wrap(size) {
+        return none
+    }
+    return some(usize.wrap(k))
+}
+
+// A list's or an array's elements, as `CollectionTag` gives them, an array's as tags of its
+// type, or `none` for anything else.
+fn elements(t: Tag) -> List<Tag>? {
+    var out = List<Tag>()
+    match t {
+        Tag.List(items) => return some(items.copy()),
+        Tag.ByteArray(v) => {
+            for x in v {
+                out.push(Tag.Byte(x))
+            }
+        },
+        Tag.IntArray(v) => {
+            for x in v {
+                out.push(Tag.Int(x))
+            }
+        },
+        Tag.LongArray(v) => {
+            for x in v {
+                out.push(Tag.Long(x))
+            }
+        },
+        _ => return none,
+    }
+    return some(out)
+}
+
+// The list or array `t` with nothing in it, `clear`.
+fn emptied(t: Tag) -> Tag {
+    return match t {
+        Tag.ByteArray(_) => Tag.ByteArray(List<i8>()),
+        Tag.IntArray(_) => Tag.IntArray(List<i32>()),
+        Tag.LongArray(_) => Tag.LongArray(List<i64>()),
+        _ => Tag.List(List<Tag>()),
+    }
+}
+
+// The list or array `t` without its element at `k`.
+fn removed_at(t: Tag, k: usize) -> Tag {
+    match t {
+        Tag.ByteArray(v) => {
+            var a = v.copy()
+            _ = a.remove(k)
+            return Tag.ByteArray(a)
+        },
+        Tag.IntArray(v) => {
+            var a = v.copy()
+            _ = a.remove(k)
+            return Tag.IntArray(a)
+        },
+        Tag.LongArray(v) => {
+            var a = v.copy()
+            _ = a.remove(k)
+            return Tag.LongArray(a)
+        },
+        Tag.List(v) => {
+            var a = v.copy()
+            _ = a.remove(k)
+            return Tag.List(a)
+        },
+        _ => return t.copy(),
+    }
+}
+
+// The array `t` with the number `v` put in at `k`, as its type, `addTag`. `k` is in range.
+fn inserted_number(t: Tag, k: usize, v: Tag) -> Tag {
+    match t {
+        Tag.ByteArray(a) => {
+            var out = a.copy()
+            out.insert(k, v.byte_value() ?? 0)
+            return Tag.ByteArray(out)
+        },
+        Tag.IntArray(a) => {
+            var out = a.copy()
+            out.insert(k, v.int_value() ?? 0)
+            return Tag.IntArray(out)
+        },
+        Tag.LongArray(a) => {
+            var out = a.copy()
+            out.insert(k, v.long_value() ?? 0)
+            return Tag.LongArray(out)
+        },
+        _ => return t.copy(),
+    }
+}
+
+// The array `t` with `v` put at `k`, `addTag` there, if it's a number, else `none`.
+fn array_put(t: Tag, k: usize, v: Tag) -> Tag? {
+    if v.int_value() == none {
+        return none
+    }
+    return some(inserted_number(t, k, v))
+}
+
+// The array `t` with its element at `k` set to `v`, `setTag`, if it's a number, else `none`.
+fn array_set(t: Tag, k: usize, v: Tag) -> Tag? {
+    if v.int_value() == none {
+        return none
+    }
+    match t {
+        Tag.ByteArray(a) => {
+            var out = a.copy()
+            out[k] = v.byte_value() ?? 0
+            return some(Tag.ByteArray(out))
+        },
+        Tag.IntArray(a) => {
+            var out = a.copy()
+            out[k] = v.int_value() ?? 0
+            return some(Tag.IntArray(out))
+        },
+        Tag.LongArray(a) => {
+            var out = a.copy()
+            out[k] = v.long_value() ?? 0
+            return some(Tag.LongArray(out))
+        },
+        _ => return none,
+    }
 }
 
 // Brigadier's `StringReader` over the text's units.

@@ -21,7 +21,9 @@ import java.uuid.{Uuid}
 import json.tree.{Json}
 import nbt.snbt.{from_units, units_of}
 import java.character.{is_whitespace}
-import nbt.tag.{Tag}
+import nbt.path.{NbtPath, PathFailure, too_deep}
+import nbt.pretty.{pretty}
+import nbt.tag.{Tag, merge_compound}
 import protocol.chat.{ChatSession, ChatTypeBound, ClientboundDisguisedChat, ClientboundPlayerChat, FilterMask, MessageSignature, PackedSignature, ServerboundChat, ServerboundChatCommandSigned, SignedBody}
 import protocol.codec.{Decoder}
 import protocol.common.{ChatVisibility, ClientInformation, ClientboundDisconnect, HumanoidArm, ClientboundKeepAlive, ClientboundPostEffects, ClientboundResourcePackPush, ResourcePackAction, ServerboundKeepAlive}
@@ -50,7 +52,7 @@ import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
-import server.commands.{Destination, Facing, Failure, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
+import server.commands.{DataAction, DataHow, DataSource, DataTarget, Destination, Facing, Failure, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
 import server.configuration.{Configuration}
 import server.layout.{Layout, Placed}
 import server.level.{ChunkPacket, Dropped, Heard, Level, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
@@ -73,6 +75,8 @@ import storage.regions.{ChunkRead, read_root}
 import storage.players.{PlayerFiles, SavedPosition, saved_position}
 import storage.progress.{ProgressFiles}
 import storage.poi.{PoiFormat}
+import storage.saved.{SavedFiles}
+import storage.world.{join as join_path}
 import storage.world_gen.{world_gen_id}
 import world.border.{Border, BorderSettings, saved_id as border_id}
 import world.clocks.{saved_id as clocks_id}
@@ -136,6 +140,7 @@ import world.entity_facts.{CREATURE, MONSTER, PEACEFUL, SUMMON, types as type_fa
 import world.environment.{baby_villager_activity, fast_lava, increased_fire_burnout, monsters_burn, moon_phase, sun_angle, surface_slime_spawn_chance, villager_activity, water_evaporates}
 import world.natural.{MobMaker, SpawnPlace, SpawnState, reinforce, spawn_for_chunk, spawn_for_generation, spawning_categories, spawns_in}
 import world.random_sequences.{RandomSequences, saved_id as sequences_id}
+import world.command_storage.{storage_id}
 import world.scoreboard.{Change, Objective, RULE_ALWAYS, RULE_OTHER_TEAMS, RULE_OWN_TEAM, ScoreSent, Team, color_name, color_rgb, format_on_wire, read_only, saved_id as scoreboard_id, slot_name, team_pushes}
 import world.random_ticks.{TickPlace, Viewer}
 import world.advancements.{Advancements, DisplayInfo, Listener, PlayerAdvancements}
@@ -1356,6 +1361,9 @@ pub struct Network {
     // which a replay hasn't (CAL-164).
     progress_files: ProgressFiles? = none
     stats_files: ProgressFiles? = none
+    // The world's saved data, `data`, which command storage is read from as it's first asked
+    // for, and which a replay hasn't (CAL-165).
+    data_files: SavedFiles? = none
     collisions: CollisionStates? = none
     // Whether each block state is a liquid, which players' poses pass through, made from the
     // block facts when a pose is first fitted (CAL-141).
@@ -1748,6 +1756,7 @@ impl Network {
     /// Saves players' data to `players`, and the world's `level.dat` to its folder at `world`,
     /// from now on, on the saver's thread (D189). Until this, and replaying, nothing is saved.
     pub fn open_saving(mut self, players: own PlayerFiles, world: own String) {
+        self.data_files = some(SavedFiles.at(join_path(world, "data")))
         match self.link.waker() {
             ok(waker) => self.saving = some(Saving.start(players, world, waker)),
             err(_) => self.logs.push(Entry.error("Can't save the world: there's nothing to wake the server's poll with")),
@@ -2313,6 +2322,10 @@ impl Network {
         // `storeToSaveDataIfDirty` and `setData` save it, or new (CAL-164).
         if let packed = self.world.scoreboard.take_save() {
             saving.save(Save.Data(scoreboard_id(), packed))
+        }
+        // Each namespace of command storage that's changed (CAL-165).
+        for (id, packed) in self.world.storage.take_saves() {
+            saving.save(Save.Data(id.copy(), packed.copy()))
         }
         for d in 0..self.world.dims.len() {
             if self.world.dims[d].border.dirty {
@@ -17809,6 +17822,11 @@ impl Network {
                 b.suggest_resources(names)
             }
         }
+        // `data`'s storages, `SUGGEST_STORAGE`: the IDs of the namespaces read or made so far
+        // (CAL-165).
+        if path.starts_with("data ") and (path.ends_with(" storage target") or path.ends_with(" storage source")) {
+            b.suggest_resources(self.world.storage.keys())
+        }
     }
 
     // The names of the holders `targets` names, as `getNamesWithDefaultWildcard` finds them for
@@ -18038,6 +18056,12 @@ impl Network {
             },
             Parsed.Scoreboard(action) => {
                 match self.scoreboard_command(source, action) {
+                    ok => {},
+                    err(f) => done = some(f),
+                }
+            },
+            Parsed.Data(action) => {
+                match self.data_command(source, action) {
                     ok => {},
                     err(f) => done = some(f),
                 }
@@ -18436,6 +18460,301 @@ impl Network {
                 inner.style.hover_event = some(HoverEvent.ShowText(Box(Component.literal(name))))
                 Component.translatable("chat.square_brackets", [inner])
             },
+        }
+    }
+
+    // `data`, `DataCommands` (CAL-165): the NBT of an entity, a block entity or a command storage
+    // compound, read whole or by a path, merged into, changed at a path, or taken from, each
+    // failure vanilla's. A `modify`'s source is found before its target, as vanilla's lambda
+    // finds them. A player's data can't be changed, as in vanilla, and a block entity's can't
+    // yet. A storage compound is changed in place, as vanilla changes the one `get` gives, so
+    // what a change made on the way stays where it fails.
+    fn data_command(mut self, source: Source, action: own DataAction) ! Failure {
+        match action {
+            DataAction.Merge(target, nbt) => {
+                // `mergeData`: the old data copied and merged with the compound given, which
+                // must change it.
+                let a = try self.data_accessor(source, target)
+                let old = self.data_read(a)
+                if too_deep(nbt, 0) {
+                    fail Failure.alone(Component.translatable("arguments.nbtpath.too_deep", []))
+                }
+                let result = merged_tag(old.java_copy(), nbt)
+                if old.java_equals(result) {
+                    fail Failure.alone(Component.translatable("commands.data.merge.failed", []))
+                }
+                try self.data_write(a, result)
+                let told = self.data_modified(a)
+                self.success(source, told, true)
+            },
+            DataAction.Get(target, path, scale) => {
+                // `getData`, whole or by a path, which must find one tag, or `getNumeric`, a
+                // number scaled and rounded down.
+                let a = try self.data_accessor(source, target)
+                let data = self.data_read(a)
+                let p = path else {
+                    let told = self.data_printed(a, data)
+                    self.success(source, told, false)
+                    return
+                }
+                let tag = try single_tag(p, data)
+                if let s = scale {
+                    let n = tag.number_double() else fail Failure.alone(Component.translatable("commands.data.get.invalid", [Component.literal(p.original.copy())]))
+                    let told = self.data_got(a, p, s, mth_floor(n * s))
+                    self.success(source, told, false)
+                    return
+                }
+                let told = self.data_printed(a, tag)
+                self.success(source, told, false)
+            },
+            DataAction.Remove(target, path) => {
+                let a = try self.data_accessor(source, target)
+                var data = self.data_read(a)
+                var count: i32 = 0
+                var failure: PathFailure? = none
+                match path.remove(mut data) {
+                    ok(n) => count = n,
+                    err(f) => failure = some(f),
+                }
+                if let f = failure {
+                    self.data_in_place(a, data)
+                    fail path_failure(f)
+                }
+                if count == 0 {
+                    self.data_in_place(a, data)
+                    fail Failure.alone(Component.translatable("commands.data.merge.failed", []))
+                }
+                try self.data_write(a, data)
+                let told = self.data_modified(a)
+                self.success(source, told, true)
+            },
+            DataAction.Modify(target, to, how, from) => {
+                // `manipulateData`: the source found, then the target's data changed at its
+                // path, which must change something.
+                let sources = try self.data_sources(source, from)
+                let a = try self.data_accessor(source, target)
+                var data = self.data_read(a)
+                var count: i32 = 0
+                var failure: PathFailure? = none
+                match how {
+                    DataHow.Insert(index) => {
+                        match to.insert(index, mut data, sources) {
+                            ok(n) => count = n,
+                            err(f) => failure = some(f),
+                        }
+                    },
+                    DataHow.Set => {
+                        match to.set(mut data, sources[sources.len() - 1]) {
+                            ok(n) => count = n,
+                            err(f) => failure = some(f),
+                        }
+                    },
+                    DataHow.Merge => {
+                        // Each source no deeper than 512 and a compound, all merged into one,
+                        // then merged into each compound the path finds or makes.
+                        var combined = JavaHashMap<String, Tag>()
+                        for s in sources {
+                            if too_deep(s, 0) {
+                                fail Failure.alone(Component.translatable("arguments.nbtpath.too_deep", []))
+                            }
+                            match s {
+                                Tag.Compound(m) => merge_compound(mut combined, m),
+                                _ => fail path_failure(PathFailure.ExpectedObject(s.copy())),
+                            }
+                        }
+                        match to.merge(mut data, combined) {
+                            ok(n) => count = n,
+                            err(f) => failure = some(f),
+                        }
+                    },
+                }
+                if let f = failure {
+                    self.data_in_place(a, data)
+                    fail path_failure(f)
+                }
+                if count == 0 {
+                    self.data_in_place(a, data)
+                    fail Failure.alone(Component.translatable("commands.data.merge.failed", []))
+                }
+                try self.data_write(a, data)
+                let told = self.data_modified(a)
+                self.success(source, told, true)
+            },
+        }
+    }
+
+    // What a `data modify` puts, as its lambda finds it (CAL-165): a tag; or a source's data or
+    // what a path finds in it, as it is, or as text, `stringifyTagList`, each a string's value or
+    // a number's SNBT, cut as `substring` cuts it.
+    fn data_sources(mut self, source: Source, from: DataSource) -> List<Tag> ! Failure {
+        var out = List<Tag>()
+        match from {
+            DataSource.Value(t) => out.push(t.copy()),
+            DataSource.From(target, path) => out = try self.data_found(source, target, path),
+            DataSource.Text(target, path, start, end) => {
+                let found = try self.data_found(source, target, path)
+                for t in found {
+                    let text = match t {
+                        Tag.Str(s) => s.copy(),
+                        Tag.List(_) => fail Failure.alone(Component.translatable("commands.data.modify.expected_value", [Component.literal(t.to_snbt())])),
+                        Tag.Compound(_) => fail Failure.alone(Component.translatable("commands.data.modify.expected_value", [Component.literal(t.to_snbt())])),
+                        Tag.ByteArray(_) => fail Failure.alone(Component.translatable("commands.data.modify.expected_value", [Component.literal(t.to_snbt())])),
+                        Tag.IntArray(_) => fail Failure.alone(Component.translatable("commands.data.modify.expected_value", [Component.literal(t.to_snbt())])),
+                        Tag.LongArray(_) => fail Failure.alone(Component.translatable("commands.data.modify.expected_value", [Component.literal(t.to_snbt())])),
+                        _ => t.to_snbt(),
+                    }
+                    out.push(Tag.Str(try cut_text(text, start, end)))
+                }
+            },
+        }
+        return out
+    }
+
+    // `getSingletonSource` or `resolveSourcePath`: a source's whole data, or what the path finds
+    // in it (CAL-165).
+    fn data_found(mut self, source: Source, target: DataTarget, path: NbtPath?) -> List<Tag> ! Failure {
+        let a = try self.data_accessor(source, target)
+        let data = self.data_read(a)
+        var out = List<Tag>()
+        if let p = path {
+            match p.get(data) {
+                ok(tags) => out = tags,
+                err(f) => fail path_failure(f),
+            }
+        } else {
+            out.push(data)
+        }
+        return out
+    }
+
+    // A `data` target found, as its `ArgProvider` finds it (CAL-165): the one entity the
+    // selector picks, `argument.entity.notfound.entity` where it picks none; the block entity at
+    // a loaded place, `commands.data.block.invalid` where there's none; or a storage ID.
+    fn data_accessor(mut self, source: Source, target: DataTarget) -> Accessor ! Failure {
+        match target {
+            DataTarget.Entity(s) => {
+                let picked = try self.entities_selected(source, s)
+                if picked.is_empty() {
+                    fail Failure.alone(Component.translatable("argument.entity.notfound.entity", []))
+                }
+                return Accessor.Player(picked[0])
+            },
+            DataTarget.Block(at) => {
+                let (x, y, z, d) = try self.loaded_pos(source, at)
+                if self.levels[d].saved_block_entity(x, y, z) == none {
+                    fail Failure.alone(Component.translatable("commands.data.block.invalid", []))
+                }
+                return Accessor.Block(d, x, y, z)
+            },
+            DataTarget.Storage(id) => return Accessor.Storage(id.copy()),
+        }
+    }
+
+    // `getData` (CAL-165): a player's data as `getEntityTagToCompare` gives it, a block entity's
+    // as it saves, or a storage compound, its namespace read first if it hasn't been.
+    fn data_read(mut self, a: Accessor) -> Tag {
+        match a {
+            Accessor.Player(slot) => return self.player_data_tag(slot),
+            Accessor.Block(d, x, y, z) => return self.levels[d].saved_block_entity(x, y, z) ?? Tag.Compound(JavaHashMap<String, Tag>()),
+            Accessor.Storage(id) => {
+                self.ready_storage(id.namespace.copy())
+                return self.world.storage.get(id)
+            },
+        }
+    }
+
+    // `setData` (CAL-165): a storage compound stored, or taken away where it's empty. A player's
+    // can't be, `commands.data.entity.invalid`, and Calcite can't change a block entity's yet.
+    fn data_write(mut self, a: Accessor, data: own Tag) ! Failure {
+        match a {
+            Accessor.Player(_) => fail Failure.alone(Component.translatable("commands.data.entity.invalid", [])),
+            Accessor.Block(_, _, _, _) => fail Failure.alone(Component.literal("Calcite can't change block entities' data yet")),
+            Accessor.Storage(id) => self.world.storage.set(id.copy(), data),
+        }
+    }
+
+    // Keeps what a change made to a storage compound where the command fails, as vanilla's
+    // changes to the compound `get` gave stay (CAL-165).
+    fn data_in_place(mut self, a: Accessor, data: own Tag) {
+        match a {
+            Accessor.Storage(id) => self.world.storage.changed_in_place(id.copy(), data),
+            _ => {},
+        }
+    }
+
+    // `getModifiedSuccess` (CAL-165).
+    fn data_modified(self, a: Accessor) -> Component {
+        return match a {
+            Accessor.Player(slot) => Component.translatable("commands.data.entity.modified", [self.name_of(slot)]),
+            Accessor.Block(_, x, y, z) => Component.translatable_args(String("commands.data.block.modified"), [Argument.Number(Tag.Int(x)), Argument.Number(Tag.Int(y)), Argument.Number(Tag.Int(z))]),
+            Accessor.Storage(id) => Component.translatable("commands.data.storage.modified", [Component.literal(id.to_string())]),
+        }
+    }
+
+    // `getPrintSuccess` of a tag, shown as `toPrettyComponent` shows it (CAL-165).
+    fn data_printed(self, a: Accessor, tag: Tag) -> Component {
+        return match a {
+            Accessor.Player(slot) => Component.translatable("commands.data.entity.query", [self.name_of(slot), pretty(tag)]),
+            Accessor.Block(_, x, y, z) => Component.translatable_args(String("commands.data.block.query"), [Argument.Number(Tag.Int(x)), Argument.Number(Tag.Int(y)), Argument.Number(Tag.Int(z)), Argument.Text(pretty(tag))]),
+            Accessor.Storage(id) => Component.translatable("commands.data.storage.query", [Component.literal(id.to_string()), pretty(tag)]),
+        }
+    }
+
+    // `getPrintSuccess` of a number scaled: the path, the scale as `%.2f` writes it, and the
+    // number (CAL-165).
+    fn data_got(self, a: Accessor, path: NbtPath, scale: f64, value: i32) -> Component {
+        let shown = Component.literal(path.original.copy())
+        let scaled = Component.literal(format_fixed(scale, 2))
+        return match a {
+            Accessor.Player(slot) => Component.translatable_args(String("commands.data.entity.get"), [Argument.Text(shown), Argument.Text(self.name_of(slot)), Argument.Text(scaled), Argument.Number(Tag.Int(value))]),
+            Accessor.Block(_, x, y, z) => Component.translatable_args(String("commands.data.block.get"), [Argument.Text(shown), Argument.Number(Tag.Int(x)), Argument.Number(Tag.Int(y)), Argument.Number(Tag.Int(z)), Argument.Text(scaled), Argument.Number(Tag.Int(value))]),
+            Accessor.Storage(id) => Component.translatable_args(String("commands.data.storage.get"), [Argument.Text(shown), Argument.Text(Component.literal(id.to_string())), Argument.Text(scaled), Argument.Number(Tag.Int(value))]),
+        }
+    }
+
+    // `NbtPredicate.getEntityTagToCompare` of the player at `slot` (CAL-165): their data as
+    // Calcite saves it, `saveWithoutId`'s, without the `DataVersion` a save adds, and with what
+    // they hold, `SelectedItem`, where they hold something.
+    fn player_data_tag(self, slot: usize) -> Tag {
+        var data = JavaHashMap<String, Tag>()
+        if slot < self.connections.len() {
+            if let con = self.connections[slot] {
+                if let p = con.profile {
+                    let dimension = self.world.dims[con.player.dim].id.to_string()
+                    data = player_tag(con.player, p.id, dimension)
+                    _ = data.remove("DataVersion")
+                    if let shared = self.world.recipes.copy() {
+                        data.insert(String("recipeBook"), con.player.recipe_book.pack(shared.value))
+                    }
+                    if let held = con.player.inventory.selected(con.player.selected) {
+                        data.insert(String("SelectedItem"), held)
+                    }
+                }
+            }
+        }
+        return Tag.Compound(data)
+    }
+
+    // Reads `namespace`'s command storage the first time it's asked for, as `SavedDataStorage`
+    // reads saved data, through the link, so a replay has what the recording read (CAL-165).
+    fn ready_storage(mut self, namespace: String) {
+        if self.world.storage.looked_for(namespace) {
+            return
+        }
+        var lines = List<Entry>()
+        var found = FileRead.Absent
+        if let files = self.data_files {
+            if let data = files.load(storage_id(namespace), mut lines) {
+                found = FileRead.Read(data)
+            }
+        }
+        let root = match self.link.file(found, mut lines) {
+            FileRead.Read(data) => some(data),
+            _ => none,
+        }
+        self.world.storage.read(namespace, root, mut lines)
+        for e in lines {
+            self.logs.push(e.copy())
         }
     }
 
@@ -25517,6 +25836,77 @@ fn selector_in_text(pattern: String) -> Selector ! Failure {
         err(_) => {},
     }
     fail Failure.alone(Component.literal("Invalid selector component: {pattern}"))
+}
+
+// A `data` target found, `DataAccessor` (CAL-165): a player, by their connection's slot; a block
+// entity, by its level and place; or a storage compound, by its ID.
+enum Accessor {
+    Player(usize)
+    Block(usize, i32, i32, i32)
+    Storage(Identifier)
+}
+
+// The compound `base` with `nbt`, a compound, merged into it, `CompoundTag.merge`.
+fn merged_tag(base: own Tag, nbt: Tag) -> Tag {
+    var m = match base {
+        Tag.Compound(x) => x.copy(),
+        _ => JavaHashMap<String, Tag>(),
+    }
+    match nbt {
+        Tag.Compound(other) => merge_compound(mut m, other),
+        _ => {},
+    }
+    return Tag.Compound(m)
+}
+
+// `getSingleTag`: the one tag `path` finds in `data`, `commands.data.get.multiple` where it finds
+// more (CAL-165).
+fn single_tag(path: NbtPath, data: Tag) -> Tag ! Failure {
+    var found = List<Tag>()
+    match path.get(data) {
+        ok(tags) => found = tags,
+        err(f) => fail path_failure(f),
+    }
+    if found.len() > 1 {
+        fail Failure.alone(Component.translatable("commands.data.get.multiple", []))
+    }
+    return found[0].copy()
+}
+
+// A path's failure as the command fails with it (CAL-165): its message, each tag in it as SNBT,
+// as `translatableEscape` writes it; and an exception vanilla doesn't expect as `command.failed`,
+// with its message where it's pointed at.
+fn path_failure(f: PathFailure) -> Failure {
+    return match f {
+        PathFailure.NothingFound(p) => Failure.alone(Component.translatable("arguments.nbtpath.nothing_found", [Component.literal(p.copy())])),
+        PathFailure.TooDeep => Failure.alone(Component.translatable("arguments.nbtpath.too_deep", [])),
+        PathFailure.ExpectedList(t) => Failure.alone(Component.translatable("commands.data.modify.expected_list", [Component.literal(t.to_snbt())])),
+        PathFailure.ExpectedObject(t) => Failure.alone(Component.translatable("commands.data.modify.expected_object", [Component.literal(t.to_snbt())])),
+        PathFailure.InvalidIndex(i) => Failure.alone(Component.translatable_args(String("commands.data.modify.invalid_index"), [Argument.Number(Tag.Int(i))])),
+        PathFailure.Unexpected(m) => {
+            var failed = Component.translatable("command.failed", [])
+            failed.style.hover_event = some(HoverEvent.ShowText(Box(Component.literal(m.copy()))))
+            Failure.alone(failed)
+        },
+    }
+}
+
+// `substring` of `text` for `data modify … string` (CAL-165), in UTF-16 units: from `start`, or
+// the whole where none's given, to `end` or the end, each from the end where it's below 0, else
+// `commands.data.modify.invalid_substring` with where they came to.
+fn cut_text(text: String, start: i32?, end: i32?) -> String ! Failure {
+    let s = start else return text.copy()
+    let units = units_of(text)
+    let length = i32.wrap(units.len())
+    let from = if s >= 0 { s } else { length + s }
+    var to = length
+    if let e = end {
+        to = if e >= 0 { e } else { length + e }
+    }
+    if from >= 0 and to <= length and from <= to {
+        return from_units(units, usize.wrap(from), usize.wrap(to))
+    }
+    fail Failure.alone(Component.translatable_args(String("commands.data.modify.invalid_substring"), [Argument.Number(Tag.Int(from)), Argument.Number(Tag.Int(to))]))
 }
 
 // A score holder as `ScoreHolderArgument` finds it (CAL-165): its name on the scoreboard,

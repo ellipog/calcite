@@ -1985,6 +1985,39 @@ def compare_scoreboard(config):
     return same
 
 
+def ordered(value):
+    """A tag with its type and each compound's keys in order, for saved data whose order is
+    vanilla's to match: a compound as its (key, value) pairs as they were written."""
+    if isinstance(value, dict):
+        return [(k, ordered(v)) for k, v in value.items()]
+    if isinstance(value, list):
+        return (type(value).__name__, getattr(value, "kind", None), [ordered(v) for v in value])
+    return (type(value).__name__, value)
+
+
+def storage_kept(world):
+    """A world's command storage as it's compared (CAL-165): each namespace's
+    `data/<namespace>/command_storage.dat`, by namespace, its root in order."""
+    return {path.parent.name: ordered(nbt.read(path))
+            for path in sorted((world / "data").glob("*/command_storage.dat"))}
+
+
+def compare_storage(config):
+    """Whether both servers saved command storage the same (CAL-165), each namespace's compounds
+    with their keys in the order written, which is that of the maps `CompoundTag.copy` makes,
+    printing what differs. Nothing's printed where neither saved any."""
+    kept = {side: storage_kept(SESSIONS / config / side / "world") for side in ("vanilla", "calcite")}
+    if not kept["vanilla"] and not kept["calcite"]:
+        return True
+    same = kept["vanilla"] == kept["calcite"]
+    print(f"saved storage  {'PASS' if same else 'differs'}    {len(kept['vanilla'])} namespaces")
+    if not same:
+        for ns in sorted(set(kept["vanilla"]) | set(kept["calcite"])):
+            if kept["vanilla"].get(ns) != kept["calcite"].get(ns):
+                print(f"  [{config}] {ns}:\n      vanilla: {kept['vanilla'].get(ns)}\n      calcite: {kept['calcite'].get(ns)}")
+    return same
+
+
 def compare_book(config, name):
     """Whether both servers saved the player `name`'s recipe book the same, their data's
     `recipeBook` (CAL-164): its tabs' settings, and the recipes known and highlighted, each list
@@ -2105,7 +2138,8 @@ def main():
     saved = all([compare_saved(c) for c in configs if CONFIGS[c].player is not None and scenarios[c]]
                 + [compare_saved(c, MATE) for c in configs if CONFIGS[c].mate is not None and scenarios[c]]
                 + [compare_progress(c) for c in configs if scenarios[c]]
-                + [compare_scoreboard(c) for c in configs if scenarios[c]])
+                + [compare_scoreboard(c) for c in configs if scenarios[c]]
+                + [compare_storage(c) for c in configs if scenarios[c]])
     for c in configs:
         if CONFIGS[c].fixture is not None and scenarios[c]:
             compare_chunks(c, args.show)
