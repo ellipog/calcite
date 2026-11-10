@@ -44,6 +44,7 @@ import registry.codec.{same}
 import registry.components.{ItemCodecs}
 import registry.registries.{Registries}
 import registry.registry.{Registry}
+import registry.tags.{build_tags}
 import registry.streams.{Streams}
 import random.source.{RandomSource, shuffle}
 import random.taped.{TapedRandom}
@@ -52,11 +53,12 @@ import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
-import server.commands.{Condition, DataAction, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
+import server.commands.{Condition, DataAction, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, FunctionArgs, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
 import server.configuration.{Configuration}
 import server.layout.{Layout, Placed}
 import server.level.{ChunkPacket, Dropped, Heard, Level, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
 import server.link.{FileRead, Input, Link, Report}
+import server.functions.{Function, read_function}
 import server.log.{Entry, Look}
 import server.pregen.{Choice, Run, Shape, Task as PregenTask, blocks, saved_data as pregen_data, saved_id as pregen_saved_id}
 import server.sending.{Outbox, Sending}
@@ -1282,9 +1284,10 @@ enum Output {
 // A command's source, vanilla's `CommandSourceStack` (CAL-165): who hears what it says; the
 // player it runs as, if any, whose name it goes by; where it runs from, as it looks, a pitch and
 // a yaw, in which level, by its place among the world's; whether its anchor is the entity's eyes
-// rather than its feet; its permission level; and what it's to store after each command it runs,
-// its result callbacks, as the newest of the server's `store_links` it has, by place plus one, 0
-// for none (D566). `execute` changes each but the output.
+// rather than its feet; its permission level; what's told what each command it runs gives, its
+// result callback, by its place among the command queue's `callbacks` plus one, 0 for none
+// (D566, D567); and whether what it says is kept to itself, `withSuppressedOutput`, as a
+// function's commands' is (D567). `execute` changes each but the output.
 struct Source {
     output: Output
     entity: usize?
@@ -1296,16 +1299,8 @@ struct Source {
     dim: usize
     eyes: bool = false
     level: i32
-    stores: usize = 0
-}
-
-// One of `execute store`'s callbacks (D566): whether it stores the result, or the success, where
-// it stores it, and the link it was added after, by place plus one, 0 for none, as
-// `CommandResultCallback.chain` chains them.
-struct StoreLink {
-    result: bool
-    to: StoreTo
-    parent: usize
+    callback: usize = 0
+    silent: bool = false
 }
 
 // Where a `store` stores, as its step found it (D566): the scores of the holders found of an
@@ -1314,6 +1309,73 @@ enum StoreTo {
     Score(List<HolderFound>, String)
     Data(Accessor, NbtPath, String, f64)
 }
+
+// A result callback, vanilla's `CommandResultCallback` (D566, D567), told whether a command ran
+// and what it gave: an `execute store`'s, storing the result, or the success, where its step
+// found; two in turn, by place plus one, as `chain` makes them; a function's result said to a
+// source, `commands.function.result`, then another told, `decorateOutputIfNeeded`; or a sum of
+// functions' results, by place, added to.
+enum Callback {
+    Store(bool, StoreTo)
+    Chain(usize, usize)
+    Signal(Source, Identifier, usize)
+    Add(usize)
+}
+
+// A frame of the command queue, vanilla's `Frame` (D567): how deep it is; what's told what it
+// returns, a callback by place plus one; and what returning from it throws away of what's
+// queued: what's at `discard_from` or deeper, or everything for -1, the top frame's.
+struct QueueFrame {
+    depth: i32
+    back: usize
+    discard_from: i32
+}
+
+// A command as the queue runs it (D567): its steps, what it runs at its end, and the messages
+// its player signed for its message arguments.
+struct Plan {
+    steps: List<ExecuteStep>
+    end: ExecuteEnd
+    signed: List<(String, ChatMessage)>
+}
+
+// What the command queue runs (D567), vanilla's entry actions, each naming a plan, a list of
+// sources, a function or a sum by its place: a command for a source to run from its first step,
+// `BuildContexts.TopLevel`; a function's line, `BuildContexts.Unbound`, or its lines from one on,
+// `ContinuationTask`; the rest of a command's steps from one on for the sources there, with the
+// one that ran it and its modifiers, `Continuation`; the end of a command run by a source,
+// `ExecuteCommand`, or by the sources from one on; a function called for a source, with what's
+// told what it returns and whether returning from it returns from the frame it's called in,
+// `CallFunction`; a failure returned from the frame, `FallthroughTask`; and functions' results'
+// sum told a callback, where there's one.
+enum Action {
+    Command(Source, usize)
+    Line(usize, usize, Source)
+    Lines(usize, usize, Source)
+    Steps(Source, usize, usize, usize, u8)
+    Run(Source, usize, u8)
+    Runs(usize, usize, usize, u8)
+    Call(usize, Source, usize, bool)
+    Fallthrough
+    Sum(usize, usize)
+}
+
+// An entry of the command queue, `CommandQueueEntry`: its frame, by place, and what it runs.
+struct QueueEntry {
+    frame: usize
+    action: Action
+}
+
+// `ChainModifiers`: forked, and returning (D567).
+const FORKED: u8 = 1
+const RETURNING: u8 = 2
+
+// The most commands a queue runs, the `max_command_sequence_length` rule's default, which Calcite
+// doesn't read yet (D567).
+const COMMAND_LIMIT: i32 = 65536
+
+// The most entries a queue holds, `MAX_QUEUE_DEPTH` (D567).
+const QUEUE_LIMIT: usize = 10000000
 
 // `ClientboundGameEventPacket.CHANGE_GAME_MODE`.
 const CHANGE_GAME_MODE: u8 = 3
@@ -1419,9 +1481,30 @@ pub struct Network {
     queued: Deque<Queued> = Deque<Queued>()
     // Every command, made the first time one's read (CAL-165).
     commands: CommandSet? = none
-    // The `execute store` callbacks of the commands running, which each `execute` adds to and
-    // takes back off when it's done (D566).
-    store_links: List<StoreLink> = List<StoreLink>()
+    // The command queue, vanilla's `ExecutionContext` (D567): whether one runs, and whether it's
+    // held too many entries; its entries, the front last; those the entry running queues, put in
+    // front once it's run; its frames; the depth of the entry running; how many more commands it
+    // may run; and the result callbacks, commands, lists of sources and sums its entries name by
+    // place, all let go once it's done.
+    queue_running: bool = false
+    queue_overflow: bool = false
+    queue: List<QueueEntry> = List<QueueEntry>()
+    queue_new: List<QueueEntry> = List<QueueEntry>()
+    frames: List<QueueFrame> = List<QueueFrame>()
+    queue_depth: i32 = 0
+    quota: i32 = 0
+    callbacks: List<Callback> = List<Callback>()
+    plans: List<Plan> = List<Plan>()
+    source_lists: List<List<Source>> = List<List<Source>>()
+    sums: List<(bool, i32)> = List<(bool, i32)>()
+    // The world's functions, read at the first tick, and their IDs and tags, by their places in
+    // `functions`; those `#minecraft:tick` runs each tick; and whether those of
+    // `#minecraft:load` are still to run, `postReload` (D567).
+    functions_read: bool = false
+    functions: List<Function> = List<Function>()
+    function_names: Registry? = none
+    ticking: List<usize> = List<usize>()
+    post_reload: bool = false
     // The configuration and play packets that wait for the next tick, in the order they came on
     // every connection, as `PacketProcessor` holds them (CAL-150).
     scheduled: Deque<Scheduled> = Deque<Scheduled>()
@@ -2622,11 +2705,13 @@ impl Network {
         return true
     }
 
-    // The server's part of a tick, as `tickChildren` runs it: the clocks; every 20 ticks the
+    // The server's part of a tick, as `tickChildren` runs it: the functions (D567); the clocks;
+    // every 20 ticks the
     // players told the game time; each level's tick, in the world's order; the pregen tasks'
     // steps; the connections; the players' latency every 601 ticks; then each player is sent the
     // chunks that are due, in the world phase.
     fn tick_children(mut self, now: u64) {
+        self.tick_functions()
         self.world.clocks.tick(self.world.advance_time)
         if self.ticks % 20 == 0 {
             let time = encode_play(ClientboundSetTime { game_time: self.world.game_time, clocks: [] })
@@ -17983,17 +18068,22 @@ impl Network {
         }
     }
 
-    // A command read, run, its failure told its source.
+    // A command read, run from `source` as `Commands.performCommand` runs it, the top of a command
+    // queue, `queueInitialCommandExecution`, whose return nothing's told (D567).
     fn run_parsed(mut self, source: Source, p: own Parsed, signed: List<(String, ChatMessage)>) {
-        match p {
-            Parsed.Execute(steps, end) => self.execute_command(source, steps, end, signed),
-            _ => {
-                match self.perform(source, p, signed) {
-                    ok(_) => {},
-                    err(f) => self.command_failed(source, f),
-                }
-            },
+        let plan = self.plan_of(p, signed)
+        self.in_context(source, Action.Command(source, plan), 0, none)
+    }
+
+    // A command as the queue runs it, among its plans, by place (D567): an `execute`'s steps and
+    // end, or a command alone, which has no steps.
+    fn plan_of(mut self, p: own Parsed, signed: List<(String, ChatMessage)>) -> usize {
+        let plan = match p {
+            Parsed.Execute(steps, end) => Plan { steps: steps.copy(), end: end.copy(), signed: signed.copy() },
+            _ => Plan { steps: List<ExecuteStep>(), end: ExecuteEnd.Run(Box(p)), signed: signed.copy() },
         }
+        self.plans.push(plan)
+        return self.plans.len() - 1
     }
 
     // A command read, run as `source`: what it gives, as vanilla's `Command.run` returns it, or
@@ -18002,7 +18092,10 @@ impl Network {
         var done: Failure? = none
         var result = 0
         match p {
-            Parsed.Execute(steps, end) => self.execute_command(source, steps, end, signed),
+            // An `execute` run by another is one: the queue runs `function` and `return` itself.
+            Parsed.Execute(_, _) => {},
+            Parsed.Function(_, _, _) => {},
+            Parsed.Return(_) => {},
             Parsed.Stop => {
                 self.success(source, Component.translatable("commands.stop.stopping", []), true)
                 self.stop_due = true
@@ -18177,6 +18270,85 @@ impl Network {
         }
     }
 
+    // The world's functions read, at the first tick (D567), as `ServerFunctionLibrary.reload`
+    // reads them, against the commands at `GAMEMASTERS`, in the order of its `HashMap`; one that
+    // can't be is logged and left out, `Failed to load function`; then their tags built, and
+    // those of `#minecraft:tick` kept to run each tick, with those of `#minecraft:load` to run
+    // first, `postReload`.
+    fn read_functions(mut self) {
+        self.functions_read = true
+        self.ready_commands()
+        let set = self.commands.take() else return
+        var texts = JavaHashMap<Identifier, String>()
+        for (id, text) in self.world.functions.files {
+            texts.insert(id.copy(), text.copy())
+        }
+        var names = Registry.new(Identifier { namespace: String("minecraft"), path: String("function") }, false)
+        for (id, text) in texts {
+            match read_function(id.copy(), text.copy(), set.tree, set.types, self.lang) {
+                ok(f) => {
+                    names.add(id.copy(), none)
+                    self.functions.push(f)
+                },
+                err(message) => {
+                    // Calcite's words leave out the class where it's the usual one.
+                    let usual = "java.lang.IllegalArgumentException: "
+                    let words = if message.starts_with(usual) { message[usual.len()..] } else { message.copy() }
+                    let look = Look.Words("Function {id.to_string()} can't load: {words}")
+                    self.logs.push(Entry.error("Failed to load function {id.to_string()}\njava.util.concurrent.CompletionException: {message}").calcite(look))
+                },
+            }
+        }
+        self.commands = some(set)
+        _ = build_tags(self.world.functions.tags, mut names, mut self.logs)
+        self.ticking.clear()
+        for v in names.tag_ids(Identifier { namespace: String("minecraft"), path: String("tick") }) {
+            self.ticking.push(usize.wrap(v))
+        }
+        self.function_names = some(names)
+        self.post_reload = true
+    }
+
+    // `ServerFunctionManager.tick` (D567): once, the functions of `#minecraft:load`, then each
+    // tick those of `#minecraft:tick`, each run alone by the game loop's source, the console's
+    // at `GAMEMASTERS`, kept to itself; one with macro lines, which needs arguments, is skipped.
+    fn tick_functions(mut self) {
+        if not self.functions_read {
+            self.read_functions()
+        }
+        if self.functions.is_empty() {
+            return
+        }
+        if self.post_reload {
+            self.post_reload = false
+            var load = List<usize>()
+            if let names = self.function_names {
+                for v in names.tag_ids(Identifier { namespace: String("minecraft"), path: String("load") }) {
+                    load.push(usize.wrap(v))
+                }
+            }
+            for f in load {
+                self.run_function(f)
+            }
+        }
+        let ticking = self.ticking.copy()
+        for f in ticking {
+            self.run_function(f)
+        }
+    }
+
+    // `ServerFunctionManager.execute` (D567): the function `f` run by the game loop's source.
+    fn run_function(mut self, f: usize) {
+        if self.functions[f].macro {
+            return
+        }
+        var sender = self.console_source()
+        sender.level = GAMEMASTERS
+        sender.silent = true
+        let id = self.functions[f].id.copy()
+        self.in_context(sender, Action.Call(f, sender, 0, false), 0, some(id))
+    }
+
     // The blocks whose default states have block entities, `hasBlockEntity`, as `block_state`
     // arguments suggest their NBT for (CAL-165).
     fn block_entity_blocks(self, states: StateCodec) -> List<u32> {
@@ -18340,6 +18512,9 @@ impl Network {
     // `CommandSourceStack.sendSystemMessage`: a message to the player the source runs as, or
     // else to its output.
     fn tell_source(mut self, source: Source, message: own Component) {
+        if source.silent {
+            return
+        }
         if let slot = source.entity {
             self.tell_slot(slot, message)
             return
@@ -18466,9 +18641,14 @@ impl Network {
         let name = self.source_name(source)
         for slot in who {
             let to = ChatTypeBound { chat_type: outgoing, name: name.copy(), target_name: some(self.name_of(slot)) }
-            // `sendChatMessage`: to the player it runs as, or as a system message to its output.
+            // `sendChatMessage`: to the player it runs as, or as a system message to its output,
+            // unless the source keeps to itself (D567).
             match source.entity {
-                some(me) => self.send_message_to(me, out, to),
+                some(me) => {
+                    if not source.silent {
+                        self.send_message_to(me, out, to)
+                    }
+                },
                 none => {
                     let line = self.decorate(to, out.content())
                     self.tell_source(source, line)
@@ -18819,38 +18999,235 @@ impl Network {
         }
     }
 
-    // `execute`, as vanilla's `BuildContexts` and `ExecuteCommand` run it (CAL-165): each step in
-    // turn on each source there is, in order, each making the sources the next takes; then what
-    // it runs, run as each source left, in order. From the first step that forks, as `as`, `at`,
-    // `positioned as`, `rotated as`, `facing entity` and every condition do, what fails as a
-    // source runs it is left out quietly, `forkedMode`; before then, the failure's told and
-    // nothing more runs. Making more sources than `max_command_forks` lets there be stops it all,
-    // `command.forkLimit`, told only where nothing's forked yet. What a source's `store` steps
-    // added is stored after each command it runs, `stored`, and taken back off when it's done
-    // (D566).
-    fn execute_command(mut self, source: Source, steps: List<ExecuteStep>, end: ExecuteEnd, signed: List<(String, ChatMessage)>) {
-        let mark = self.store_links.len()
-        self.execute_chain(source, steps, end, signed)
-        while self.store_links.len() > mark {
-            _ = self.store_links.pop()
+    // `Commands.executeCommandInContext` (D567): `top`, the top of a command queue for `sender`,
+    // whose return `back` is told, then the queue run, where none runs; else `top` queued to run
+    // in the one that does, a frame deeper than its entry running, or at the top where that's at
+    // the top, `createTopFrame`. What throws stops the queue, as a read-only score's store does:
+    // `command.failed` for a command, where `Commands.performCommand` catches it, or, for a
+    // function's, `function`, logged, where `ServerFunctionManager.execute` does. Then all it
+    // kept is let go.
+    fn in_context(mut self, sender: Source, top: own Action, back: usize, function: Identifier?) {
+        if self.queue_running {
+            if self.queue_depth == 0 {
+                self.frames.push(QueueFrame { depth: 0, back: back, discard_from: -1 })
+            } else {
+                let depth = self.queue_depth + 1
+                self.frames.push(QueueFrame { depth: depth, back: back, discard_from: depth })
+            }
+            let at = self.frames.len() - 1
+            self.queue_next(at, top)
+            return
+        }
+        self.queue_running = true
+        self.quota = COMMAND_LIMIT
+        self.frames.push(QueueFrame { depth: 0, back: back, discard_from: -1 })
+        let at = self.frames.len() - 1
+        self.queue_next(at, top)
+        match self.run_queue() {
+            ok => {},
+            err(f) => {
+                match function {
+                    // Vanilla's log has the exception's trace below it.
+                    some(id) => self.logs.push(Entry.warn("Failed to execute function {id.to_string()}")),
+                    none => self.command_failed(sender, f),
+                }
+            },
+        }
+        self.queue_overflow = false
+        self.queue.clear()
+        self.queue_new.clear()
+        self.frames.clear()
+        self.callbacks.clear()
+        self.plans.clear()
+        self.source_lists.clear()
+        self.sums.clear()
+        self.queue_depth = 0
+        self.queue_running = false
+    }
+
+    // `ExecutionContext.queueNext` (D567): `action` in `frame`, to go in front of what's queued
+    // once the entry running has run; past `QUEUE_LIMIT` entries, the queue's thrown away and
+    // stops, `handleQueueOverflow`.
+    fn queue_next(mut self, frame: usize, action: own Action) {
+        if self.queue_new.len() + self.queue.len() > QUEUE_LIMIT {
+            self.queue_overflow = true
+            self.queue_new.clear()
+            self.queue.clear()
+        }
+        if not self.queue_overflow {
+            self.queue_new.push(QueueEntry { frame: frame, action: action })
         }
     }
 
-    // `execute_command`'s chain, its steps then what it runs (CAL-165).
-    fn execute_chain(mut self, source: Source, steps: List<ExecuteStep>, end: ExecuteEnd, signed: List<(String, ChatMessage)>) {
-        var sources: List<Source> = [source]
-        var forked = false
-        for step in steps {
-            if forks(step) {
-                forked = true
+    // `pushNewCommands`: what the entry running queued, in front of the rest, in its order.
+    fn push_new(mut self) {
+        while let e = self.queue_new.pop() {
+            self.queue.push(e)
+        }
+    }
+
+    // `ExecutionContext.runCommandQueue` (D567): each entry from the front, what it queues put in
+    // front once it's run, till none's left or the commands it may run are spent, which is
+    // logged.
+    fn run_queue(mut self) ! Failure {
+        self.push_new()
+        loop {
+            if self.quota <= 0 {
+                self.logs.push(Entry.info("Command execution stopped due to limit (executed {COMMAND_LIMIT} commands)"))
+                break
             }
+            let e = self.queue.pop() else break
+            self.queue_depth = self.frames[e.frame].depth
+            try self.run_entry(e)
+            if self.queue_overflow {
+                self.logs.push(Entry.error("Command execution stopped due to command queue overflow (max {QUEUE_LIMIT})"))
+                break
+            }
+            self.push_new()
+        }
+        self.queue_depth = 0
+    }
+
+    // `Frame.discard` (D567): what's queued at the frame's depth or deeper, from the front, or
+    // all of it for the top frame's, `commandQueue.clear`; what the entry running has queued
+    // stays.
+    fn discard(mut self, frame: usize) {
+        let from = self.frames[frame].discard_from
+        if from < 0 {
+            self.queue.clear()
+            return
+        }
+        while self.queue.len() > 0 and self.frames[self.queue[self.queue.len() - 1].frame].depth >= from {
+            _ = self.queue.pop()
+        }
+    }
+
+    // A source list among the queue's, by place (D567).
+    fn add_sources(mut self, sources: own List<Source>) -> usize {
+        self.source_lists.push(sources)
+        return self.source_lists.len() - 1
+    }
+
+    // `CommandResultCallback.chain` (D566, D567): `first` then `second`, either alone where the
+    // other's none, by place plus one.
+    fn chain(mut self, first: usize, second: usize) -> usize {
+        if first == 0 {
+            return second
+        }
+        if second == 0 {
+            return first
+        }
+        self.callbacks.push(Callback.Chain(first, second))
+        return self.callbacks.len()
+    }
+
+    // A callback among the queue's, by place plus one (D567).
+    fn add_callback(mut self, c: own Callback) -> usize {
+        self.callbacks.push(c)
+        return self.callbacks.len()
+    }
+
+    // One entry of the queue run (D567).
+    fn run_entry(mut self, e: own QueueEntry) ! Failure {
+        let frame = e.frame
+        match e.action {
+            Action.Command(s, plan) => try self.build(s, [s], plan, 0, frame, 0),
+            Action.Line(f, i, s) => {
+                let line = self.functions[f].lines[i].copy()
+                let plan = self.plan_of(line, [])
+                try self.build(s, [s], plan, 0, frame, 0)
+            },
+            Action.Lines(f, i, s) => {
+                self.queue_next(frame, Action.Line(f, i, s))
+                if i + 1 < self.functions[f].lines.len() {
+                    self.queue_next(frame, Action.Lines(f, i + 1, s))
+                }
+            },
+            Action.Steps(original, list, plan, step, modifiers) => {
+                let sources = self.source_lists[list].copy()
+                try self.build(original, sources, plan, step, frame, modifiers)
+            },
+            Action.Run(s, plan, modifiers) => try self.execute_run(s, plan, modifiers),
+            Action.Runs(list, i, plan, modifiers) => {
+                let s = self.source_lists[list][i]
+                self.queue_next(frame, Action.Run(s, plan, modifiers))
+                if i + 1 < self.source_lists[list].len() {
+                    self.queue_next(frame, Action.Runs(list, i + 1, plan, modifiers))
+                }
+            },
+            Action.Call(f, s, back, return_parent) => {
+                // `CallFunction`: a frame a step deeper, which, returning, throws away what's
+                // queued at its depth, or what its caller's would where it returns from that.
+                self.quota -= 1
+                let depth = self.frames[frame].depth + 1
+                let from = if return_parent { self.frames[frame].discard_from } else { depth }
+                self.frames.push(QueueFrame { depth: depth, back: back, discard_from: from })
+                let inner = self.frames.len() - 1
+                let n = self.functions[f].lines.len()
+                // `ContinuationTask.schedule`: one or two queued as they are, more in turn.
+                if n == 1 or n == 2 {
+                    for i in 0..n {
+                        self.queue_next(inner, Action.Line(f, i, s))
+                    }
+                } else if n > 2 {
+                    self.queue_next(inner, Action.Lines(f, 0, s))
+                }
+            },
+            Action.Fallthrough => {
+                let back = self.frames[frame].back
+                try self.callback(back, false, 0)
+                self.discard(frame)
+            },
+            Action.Sum(sum, back) => {
+                let (any, total) = self.sums[sum]
+                if any {
+                    try self.callback(back, true, total)
+                }
+            },
+        }
+    }
+
+    // `BuildContexts.execute` (CAL-165, D567): from the step `first` of the plan, each step in
+    // turn on each source there is, in order, each making the sources the next takes; then what
+    // the plan runs at its end, queued for each source left, in order, `ExecuteCommand`, or, for
+    // `function` and `return`, run as each now. From the first step that forks, as `as`, `at`,
+    // `positioned as`, `rotated as`, `facing entity` and every condition do, what fails as a
+    // source runs it is left out quietly, `forkedMode`; before then, the failure's told and
+    // nothing more runs. Making more sources than `max_command_forks` lets there be stops it all,
+    // `command.forkLimit`, told `original` only where nothing's forked yet. `return run` throws
+    // away the rest of the frame and queues the rest returning, which runs only the first source,
+    // its callback chained with the frame's; with no sources left returning, the frame returns a
+    // failure.
+    fn build(mut self, original: Source, given: own List<Source>, plan: usize, first: usize, frame: usize, given_modifiers: u8) ! Failure {
+        var sources = given
+        var modifiers = given_modifiers
+        let steps = self.plans[plan].steps.copy()
+        for i in first..steps.len() {
+            if let ExecuteStep.ReturnRun = steps[i] {
+                // `ReturnFromCommandCustomModifier`.
+                if sources.is_empty() {
+                    if modifiers & RETURNING != 0 {
+                        self.queue_next(frame, Action.Fallthrough)
+                    }
+                    return
+                }
+                self.discard(frame)
+                let list = self.add_sources(sources)
+                self.queue_next(frame, Action.Steps(original, list, plan, i + 1, modifiers | RETURNING))
+                return
+            }
+            if forks(steps[i]) {
+                modifiers = modifiers | FORKED
+            }
+            self.quota -= 1
+            let forked = modifiers & FORKED != 0
             var next = List<Source>()
             for s in sources {
-                match self.execute_step(s, step) {
+                match self.execute_step(s, steps[i]) {
                     ok(made) => {
                         if next.len() + made.len() >= FORK_LIMIT {
                             if not forked {
-                                self.command_failed(source, Failure.alone(Component.translatable_args(String("command.forkLimit"), [Argument.Number(Tag.Int(i32.wrap(FORK_LIMIT)))])))
+                                self.command_failed(original, Failure.alone(Component.translatable_args(String("command.forkLimit"), [Argument.Number(Tag.Int(i32.wrap(FORK_LIMIT)))])))
                             }
                             return
                         }
@@ -18868,88 +19245,286 @@ impl Network {
             }
             sources = next
         }
-        for s in sources {
-            // What it gave, or how it failed; stored first, as `runExecutable` calls the callback
-            // before the failure's told (D566).
-            var result = 0
-            var failure: Failure? = none
-            match end {
-                ExecuteEnd.Run(run) => {
-                    match self.perform(s, run.value.copy(), signed) {
-                        ok(r) => result = r,
-                        err(f) => failure = some(f),
-                    }
-                },
-                ExecuteEnd.Test(expected, cond) => {
-                    match self.execute_test(s, expected, cond) {
-                        ok(r) => result = r,
-                        err(f) => failure = some(f),
-                    }
-                },
+        if sources.is_empty() {
+            if modifiers & RETURNING != 0 {
+                self.queue_next(frame, Action.Fallthrough)
             }
-            match self.stored(s, failure == none, result) {
-                ok => {},
-                err(f) => {
-                    // A store that throws, as a read-only score's does, stops it all.
-                    self.command_failed(source, f)
-                    return
-                },
+            return
+        }
+        if self.custom_end(plan) {
+            for s in sources {
+                try self.run_custom(s, plan, modifiers, frame)
             }
-            if let f = failure {
-                if not forked {
-                    self.command_failed(s, f)
+            return
+        }
+        var runs = sources
+        if modifiers & RETURNING != 0 {
+            var returning = runs[0]
+            let back = self.frames[frame].back
+            returning.callback = self.chain(returning.callback, back)
+            runs = [returning]
+        }
+        // `ContinuationTask.schedule`: one or two queued as they are, more in turn.
+        if runs.len() <= 2 {
+            for s in runs {
+                self.queue_next(frame, Action.Run(s, plan, modifiers))
+            }
+        } else {
+            let list = self.add_sources(runs)
+            self.queue_next(frame, Action.Runs(list, 0, plan, modifiers))
+        }
+    }
+
+    // Whether the plan's end is a custom command executor, `function` or `return` (D567).
+    fn custom_end(self, plan: usize) -> bool {
+        match self.plans[plan].end {
+            ExecuteEnd.Run(run) => {
+                return match run.value {
+                    Parsed.Function(_, _, _) => true,
+                    Parsed.Return(_) => true,
+                    _ => false,
                 }
+            },
+            _ => return false,
+        }
+    }
+
+    // `ExecuteCommand.execute` (CAL-165, D566, D567): the plan's end run by `s`, what it gives,
+    // or that it failed, told its callback, as `runExecutable` tells it before the failure's
+    // told; which, but where it's forked, it is.
+    fn execute_run(mut self, s: Source, plan: usize, modifiers: u8) ! Failure {
+        self.quota -= 1
+        var result = 0
+        var failure: Failure? = none
+        let end = self.plans[plan].end.copy()
+        match end {
+            ExecuteEnd.Run(run) => {
+                let signed = self.plans[plan].signed.copy()
+                match self.perform(s, run.value.copy(), signed) {
+                    ok(r) => result = r,
+                    err(f) => failure = some(f),
+                }
+            },
+            ExecuteEnd.Test(expected, cond) => {
+                match self.execute_test(s, expected, cond) {
+                    ok(r) => result = r,
+                    err(f) => failure = some(f),
+                }
+            },
+        }
+        try self.callback(s.callback, failure == none, result)
+        if let f = failure {
+            if modifiers & FORKED == 0 {
+                self.command_failed(s, f)
             }
         }
     }
 
-    // `execute store`'s callbacks for the source `s` (CAL-165, D566), `CommandResultCallback`
-    // chained, the first step's first: what the command gave, `result`, or 1 where it ran and 0
-    // where it failed, into each holder's score of the objective, made where there's none,
-    // `getOrCreatePlayerScore`, which for a read-only objective throws, `command.failed`; or
-    // into the data at the path, as a tag of the type named, scaled, `storeData`: set, then the
-    // data stored, its failures ignored, as a player's is, or left as the path left it where
-    // the path fails.
-    fn stored(mut self, s: Source, success: bool, result: i32) ! Failure {
-        var chain = List<usize>()
-        var at = s.stores
-        while at > 0 {
-            chain.push(at - 1)
-            at = self.store_links[at - 1].parent
-        }
-        var i = chain.len()
-        while i > 0 {
-            i -= 1
-            let link = self.store_links[chain[i]].copy()
-            let value = if link.result { result } else if success { 1 } else { 0 }
-            match link.to {
-                StoreTo.Score(who, objective) => {
-                    let o = try self.objective_arg(objective.copy())
-                    for h in who {
-                        let fresh = self.world.scoreboard.touch(h.name.copy(), o.name.copy())
-                        if read_only(o.criteria.copy()) {
-                            var failed = Component.translatable("command.failed", [])
-                            failed.style.hover_event = some(HoverEvent.ShowText(Box(Component.literal("Cannot modify read-only score"))))
-                            fail Failure.alone(failed)
+    // `function` and `return`, run as `s` (D567), as their custom executors run: `function`'s
+    // failure told `s`, but where it's forked, and its callback told it failed,
+    // `WithErrorHandling`; `return` telling `s`'s callback and the frame's what it returns, or
+    // that it fails, then throwing away the rest of the frame.
+    fn run_custom(mut self, s: Source, plan: usize, modifiers: u8, frame: usize) ! Failure {
+        let end = self.plans[plan].end.copy()
+        let ExecuteEnd.Run(run) = end else return
+        match run.value {
+            Parsed.Function(id, tag, args) => {
+                match self.queue_functions(s, id, tag, args, modifiers, frame) {
+                    ok => {},
+                    err(f) => {
+                        if modifiers & FORKED == 0 {
+                            self.command_failed(s, f)
                         }
-                        let (changes, _) = self.world.scoreboard.set_value(h.name.copy(), o.name.copy(), value, shown_of(h.copy()), fresh)
-                        self.tell_scoreboard(changes)
-                    }
-                },
-                StoreTo.Data(a, path, kind, scale) => {
-                    var data = self.data_read(a)
-                    let tag = stored_tag(kind.copy(), f64(value) * scale)
-                    match path.set(mut data, tag) {
-                        ok(_) => {
-                            match self.data_write(a, data) {
-                                ok => {},
-                                err(_) => {},
-                            }
-                        },
-                        err(_) => self.data_in_place(a, data),
-                    }
-                },
+                        try self.callback(s.callback, false, 0)
+                    },
+                }
+            },
+            Parsed.Return(value) => {
+                let returned = value ?? 0
+                try self.callback(s.callback, value != none, returned)
+                let back = self.frames[frame].back
+                try self.callback(back, value != none, returned)
+                self.discard(frame)
+            },
+            _ => {},
+        }
+    }
+
+    // `FunctionCommand.FunctionCustomExecutor` (D567): the functions named, the one or a tag's,
+    // `FunctionArgument.getFunctionCollection`, which must be some,
+    // `commands.function.scheduled.no_functions`; what they're given; the source said what's
+    // scheduled; then each called for the source kept to itself at most at `GAMEMASTERS`,
+    // `modifySenderForExecution`, with no callback of its own, `queueFunctions`. Returning, what
+    // each returns is told `s`'s callback and the frame's, then a failure returned, which the
+    // first return stops; else what each returns is told `s`'s callback, or for more than one
+    // where it has one, their sum once they've run. Where `s` isn't kept to itself, each
+    // function's result is said to it first, `decorateOutputIfNeeded`.
+    fn queue_functions(mut self, s: Source, id: Identifier, tag: bool, args: FunctionArgs, modifiers: u8, frame: usize) ! Failure {
+        var called = List<usize>()
+        if let names = self.function_names {
+            if tag {
+                for v in names.tag_ids(id) {
+                    called.push(usize.wrap(v))
+                }
+            } else if let f = names.id(id) {
+                called.push(usize.wrap(f))
             }
+        }
+        if not tag and called.is_empty() {
+            fail Failure.alone(Component.translatable("arguments.function.unknown", [Component.literal(id.to_string())]))
+        }
+        if called.is_empty() {
+            fail Failure.alone(Component.translatable("commands.function.scheduled.no_functions", [Component.literal(id.to_string())]))
+        }
+        let given = try self.function_args(s, args)
+        var function_source = s
+        function_source.silent = true
+        function_source.level = function_source.level.min(GAMEMASTERS)
+        function_source.callback = 0
+        if called.len() == 1 {
+            let shown = Component.literal(self.functions[called[0]].id.to_string())
+            self.success(s, Component.translatable("commands.function.scheduled.single", [shown]), true)
+        } else {
+            var shown = List<Component>()
+            for f in called {
+                shown.push(Component.literal(self.functions[f].id.to_string()))
+            }
+            self.success(s, Component.translatable("commands.function.scheduled.multiple", [format_list(shown)]), true)
+        }
+        if modifiers & RETURNING != 0 {
+            let back = self.frames[frame].back
+            let out = self.chain(s.callback, back)
+            for f in called {
+                let collector = self.decorated(s, f, out)
+                try self.queue_call(given, frame, function_source, f, collector, true)
+            }
+            self.queue_next(frame, Action.Fallthrough)
+            return
+        }
+        if called.len() == 1 or s.callback == 0 {
+            for f in called {
+                let collector = self.decorated(s, f, s.callback)
+                try self.queue_call(given, frame, function_source, f, collector, false)
+            }
+            return
+        }
+        self.sums.push((false, 0))
+        let sum = self.sums.len() - 1
+        let partial = self.add_callback(Callback.Add(sum))
+        for f in called {
+            let collector = self.decorated(s, f, partial)
+            try self.queue_call(given, frame, function_source, f, collector, false)
+        }
+        self.queue_next(frame, Action.Sum(sum, s.callback))
+    }
+
+    // What `function` gives the functions (D567): none, the compound written, or a target's data,
+    // whole or the one tag a path finds in it, which must be a compound,
+    // `commands.function.error.argument_not_compound`.
+    fn function_args(mut self, s: Source, args: FunctionArgs) -> Tag? ! Failure {
+        match args {
+            FunctionArgs.None => return none,
+            FunctionArgs.Given(t) => return some(t.copy()),
+            FunctionArgs.With(target, path) => {
+                let a = try self.data_accessor(s, target)
+                let data = self.data_read(a)
+                let p = path else return some(data)
+                let found = try single_tag(p, data)
+                if let Tag.Compound(_) = found {
+                    return some(found)
+                }
+                fail Failure.alone(Component.translatable("commands.function.error.argument_not_compound", [Component.literal(found.type_name())]))
+            },
+        }
+    }
+
+    // `decorateOutputIfNeeded` (D567): `back`, after the function's result's said to `s`,
+    // `commands.function.result`, where `s` isn't kept to itself.
+    fn decorated(mut self, s: Source, f: usize, back: usize) -> usize {
+        if s.silent {
+            return back
+        }
+        let id = self.functions[f].id.copy()
+        return self.add_callback(Callback.Signal(s, id, back))
+    }
+
+    // `instantiateAndQueueFunctions` (D567): the function, made with what it's given, its call
+    // queued for `s` in `frame`; one with macro lines, which Calcite doesn't run yet, fails,
+    // `commands.function.instantiationFailure`.
+    fn queue_call(mut self, given: Tag?, frame: usize, s: Source, f: usize, back: usize, return_parent: bool) ! Failure {
+        if self.functions[f].macro {
+            let id = Component.literal(self.functions[f].id.to_string())
+            let reason = match given {
+                none => Component.translatable("commands.function.error.missing_arguments", [id.copy()]),
+                some(_) => Component.literal("Calcite can't run macro functions yet"),
+            }
+            fail Failure.alone(Component.translatable("commands.function.instantiationFailure", [id, reason]))
+        }
+        self.queue_next(frame, Action.Call(f, s, back, return_parent))
+    }
+
+    // A `CommandResultCallback` of the queue's told what a command gave or that it failed (D566,
+    // D567), by place plus one, none at 0. `execute store`'s: what it gave, `result`, or 1 where
+    // it ran and 0 where it failed, into each holder's score of the objective, made where there's
+    // none, `getOrCreatePlayerScore`, which for a read-only objective throws, `command.failed`;
+    // or into the data at the path, as a tag of the type named, scaled, `storeData`: set, then
+    // the data stored, its failures ignored, as a player's is, or left as the path left it where
+    // the path fails. A chain's first then its second; a function's result said to the source
+    // that called it, `commands.function.result`, then told on; or added to a sum.
+    fn callback(mut self, at: usize, success: bool, result: i32) ! Failure {
+        if at == 0 {
+            return
+        }
+        let c = self.callbacks[at - 1].copy()
+        match c {
+            Callback.Chain(first, second) => {
+                try self.callback(first, success, result)
+                try self.callback(second, success, result)
+            },
+            Callback.Signal(s, id, back) => {
+                self.success(s, Component.translatable_args(String("commands.function.result"), [Argument.Text(Component.literal(id.to_string())), Argument.Number(Tag.Int(result))]), true)
+                try self.callback(back, success, result)
+            },
+            Callback.Add(sum) => {
+                let (_, total) = self.sums[sum]
+                self.sums[sum] = (true, i32.wrap(i64(total) + i64(result)))
+            },
+            Callback.Store(stores_result, to) => {
+                let value = if stores_result { result } else if success { 1 } else { 0 }
+                try self.store_value(to, value)
+            },
+        }
+    }
+
+    // `execute store`'s store of `value` (CAL-165, D566), as `callback` tells it.
+    fn store_value(mut self, to: StoreTo, value: i32) ! Failure {
+        match to {
+            StoreTo.Score(who, objective) => {
+                let o = try self.objective_arg(objective.copy())
+                for h in who {
+                    let fresh = self.world.scoreboard.touch(h.name.copy(), o.name.copy())
+                    if read_only(o.criteria.copy()) {
+                        var failed = Component.translatable("command.failed", [])
+                        failed.style.hover_event = some(HoverEvent.ShowText(Box(Component.literal("Cannot modify read-only score"))))
+                        fail Failure.alone(failed)
+                    }
+                    let (changes, _) = self.world.scoreboard.set_value(h.name.copy(), o.name.copy(), value, shown_of(h.copy()), fresh)
+                    self.tell_scoreboard(changes)
+                }
+            },
+            StoreTo.Data(a, path, kind, scale) => {
+                var data = self.data_read(a)
+                let tag = stored_tag(kind.copy(), f64(value) * scale)
+                match path.set(mut data, tag) {
+                    ok(_) => {
+                        match self.data_write(a, data) {
+                            ok => {},
+                            err(_) => {},
+                        }
+                    },
+                    err(_) => self.data_in_place(a, data),
+                }
+            },
         }
     }
 
@@ -19099,11 +19674,13 @@ impl Network {
                         StoreTo.Data(a, path.copy(), kind.copy(), scale)
                     },
                 }
-                self.store_links.push(StoreLink { result: result, to: to, parent: s.stores })
                 var n = s
-                n.stores = self.store_links.len()
+                let store = self.add_callback(Callback.Store(result, to))
+                n.callback = self.chain(s.callback, store)
                 out.push(n)
             },
+            // `return run` is no redirect: `build` runs it.
+            ExecuteStep.ReturnRun => out.push(s),
         }
         return out
     }
@@ -21747,6 +22324,9 @@ impl Network {
     // until Calcite reads the game rules, lets them have it, and the console logging it; then,
     // where `broadcast`, to the operators.
     fn success(mut self, source: Source, message: own Component, broadcast: bool) {
+        if source.silent {
+            return
+        }
         match source.output {
             Output.Console => self.tell_server(message.copy(), true),
             Output.Player(slot) => self.tell_slot(slot, message.copy()),
@@ -21804,6 +22384,9 @@ impl Network {
     // A command's failure, as `Commands.performCommand` sends it: its message, then where in the
     // input, each in red; the console logs their text.
     fn command_failed(mut self, source: Source, f: own Failure) {
+        if source.silent {
+            return
+        }
         let where_ = failure_context(f)
         match source.output {
             Output.Console => {

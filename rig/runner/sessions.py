@@ -263,6 +263,36 @@ REWARDS_PACK = {
         ("minecraft:arrow", {"type": "minecraft:uniform", "min": 1, "max": 3}), ("minecraft:ender_pearl", 70)),
 }
 
+# The functions `select` types `function` with (D567): `rig:load`, which `#minecraft:load` runs
+# once, making the objective `fn`; `rig:tick`, which `#minecraft:tick` runs each tick, counting
+# them and moving a player's `fn` of 50 on to 51; `rig:hello`, which says so; `rig:ret`, which
+# returns 7 before it says all it would; `rig:retfail`, which fails; `rig:retrun`, which returns
+# what a command gives; `rig:add` and `rig:double`, `#rig:both`, which give 2 and 3; `rig:count`,
+# which calls itself till it's counted to 10; `rig:deep`, which calls itself till the command
+# quota stops it; `rig:macro`, which needs arguments; `rig:bad`, which can't be read for its `/`;
+# and `#rig:broken`, which can't be built for a function there isn't.
+FUNCS_PACK = {
+    "pack.mcmeta": json.dumps({"pack": {"description": "The rig's functions", "min_format": 121, "max_format": 121}}),
+    "data/minecraft/tags/function/load.json": json.dumps({"values": ["rig:load"]}),
+    "data/minecraft/tags/function/tick.json": json.dumps({"values": ["rig:tick"]}),
+    "data/rig/tags/function/both.json": json.dumps({"values": ["rig:add", "rig:double"]}),
+    "data/rig/tags/function/broken.json": json.dumps({"values": ["rig:hello", "rig:nope"]}),
+    "data/rig/function/load.mcfunction": "scoreboard objectives add fn dummy\nscoreboard players set #loaded fn 1\n",
+    "data/rig/function/tick.mcfunction": "# Each tick.\nscoreboard players add #ticks fn 1\n"
+                                         "execute as @a[scores={fn=50}] run scoreboard players set @s fn 51\n",
+    "data/rig/function/hello.mcfunction": "say hello from a function\n",
+    "data/rig/function/ret.mcfunction": "say before\nreturn 7\nsay after\n",
+    "data/rig/function/retfail.mcfunction": "return fail\n",
+    "data/rig/function/retrun.mcfunction": "return run scoreboard players get #loaded fn\n",
+    "data/rig/function/add.mcfunction": "return 2\n",
+    "data/rig/function/double.mcfunction": "return 3\n",
+    "data/rig/function/count.mcfunction": "scoreboard players add #n fn 1\n"
+                                          "execute if score #n fn matches ..9 run \\\n    function rig:count\n",
+    "data/rig/function/deep.mcfunction": "scoreboard players add #deep fn 1\nfunction rig:deep\n",
+    "data/rig/function/macro.mcfunction": "$say $(x)\n",
+    "data/rig/function/bad.mcfunction": "/say hi\n",
+}
+
 C = nbt.COMPOUND
 
 
@@ -1644,9 +1674,10 @@ CONFIGS["rivals"] = replace(CONFIGS["duel"], saved={"scoreboard": RIVALS})
 # their failures, and two it may not.
 CONFIGS["talk"] = replace(CONFIGS["duel"], scenarios=("talk",), saved={"scoreboard": TALK})
 # `talk` with the bot an operator, which types selectors with options in `say`, `gamemode` and
-# `msg` (CAL-165). Taped, as weather's lengths, blocks' drops and summoned mobs are drawn from the
-# levels' randoms, which line up only once seeded again (D316).
-CONFIGS["select"] = replace(CONFIGS["talk"], scenarios=("select",), ops=("Bot",), tape=True)
+# `msg` (CAL-165), and runs the functions of FUNCS_PACK (D567). Taped, as weather's lengths,
+# blocks' drops and summoned mobs are drawn from the levels' randoms, which line up only once
+# seeded again (D316).
+CONFIGS["select"] = replace(CONFIGS["talk"], scenarios=("select",), ops=("Bot",), tape=True, datapacks={"funcs": FUNCS_PACK})
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
 BOT = "Bot"
