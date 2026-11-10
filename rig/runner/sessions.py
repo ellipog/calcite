@@ -60,9 +60,9 @@ VIEW = 4
 # pauses once it's been empty PAUSE seconds, and the bot runs only once it has, so the bot joins
 # both at the same game time and their ticks line up from there (D315).
 PAUSE = 2
-# How long a scenario's bot may run, in seconds, by the wall clock: `select` runs past five
-# minutes of steps (D559, D565, D566).
-BOT_SECONDS = 480
+# How long a scenario's bot may run, in seconds, by the wall clock: `select` runs past eight
+# minutes of steps (D559, D565, D566, D574).
+BOT_SECONDS = 600
 BASE = {
     "online-mode": "false",
     "server-ip": "127.0.0.1",
@@ -1698,8 +1698,10 @@ CONFIGS["talk"] = replace(CONFIGS["duel"], scenarios=("talk",), saved={"scoreboa
 # `talk` with the bot an operator, which types selectors with options in `say`, `gamemode` and
 # `msg` (CAL-165), and runs the functions of FUNCS_PACK (D567). Taped, as weather's lengths,
 # blocks' drops and summoned mobs are drawn from the levels' randoms, which line up only once
-# seeded again (D316).
-CONFIGS["select"] = replace(CONFIGS["talk"], scenarios=("select",), ops=("Bot",), tape=True, datapacks={"funcs": FUNCS_PACK})
+# seeded again (D316). Where the bot respawns, which its bed sets, and its sleep's ticks are
+# compared too (D574).
+CONFIGS["select"] = replace(CONFIGS["talk"], scenarios=("select",), ops=("Bot",), tape=True, datapacks={"funcs": FUNCS_PACK},
+                            keys=("respawn", "SleepTimer"))
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
 BOT = "Bot"
