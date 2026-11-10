@@ -52,7 +52,7 @@ import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
-import server.commands.{Condition, DataAction, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
+import server.commands.{Condition, DataAction, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
 import server.configuration.{Configuration}
 import server.layout.{Layout, Placed}
 import server.level.{ChunkPacket, Dropped, Heard, Level, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
@@ -1282,7 +1282,9 @@ enum Output {
 // A command's source, vanilla's `CommandSourceStack` (CAL-165): who hears what it says; the
 // player it runs as, if any, whose name it goes by; where it runs from, as it looks, a pitch and
 // a yaw, in which level, by its place among the world's; whether its anchor is the entity's eyes
-// rather than its feet; and its permission level. `execute` changes each but the output.
+// rather than its feet; its permission level; and what it's to store after each command it runs,
+// its result callbacks, as the newest of the server's `store_links` it has, by place plus one, 0
+// for none (D566). `execute` changes each but the output.
 struct Source {
     output: Output
     entity: usize?
@@ -1294,6 +1296,23 @@ struct Source {
     dim: usize
     eyes: bool = false
     level: i32
+    stores: usize = 0
+}
+
+// One of `execute store`'s callbacks (D566): whether it stores the result, or the success, where
+// it stores it, and the link it was added after, by place plus one, 0 for none, as
+// `CommandResultCallback.chain` chains them.
+struct StoreLink {
+    result: bool
+    to: StoreTo
+    parent: usize
+}
+
+// Where a `store` stores, as its step found it (D566): the scores of the holders found of an
+// objective, by its name; or the tag at a path of a data target, of a type, the value scaled.
+enum StoreTo {
+    Score(List<HolderFound>, String)
+    Data(Accessor, NbtPath, String, f64)
 }
 
 // `ClientboundGameEventPacket.CHANGE_GAME_MODE`.
@@ -1400,6 +1419,9 @@ pub struct Network {
     queued: Deque<Queued> = Deque<Queued>()
     // Every command, made the first time one's read (CAL-165).
     commands: CommandSet? = none
+    // The `execute store` callbacks of the commands running, which each `execute` adds to and
+    // takes back off when it's done (D566).
+    store_links: List<StoreLink> = List<StoreLink>()
     // The configuration and play packets that wait for the next tick, in the order they came on
     // every connection, as `PacketProcessor` holds them (CAL-150).
     scheduled: Deque<Scheduled> = Deque<Scheduled>()
@@ -17967,143 +17989,156 @@ impl Network {
             Parsed.Execute(steps, end) => self.execute_command(source, steps, end, signed),
             _ => {
                 match self.perform(source, p, signed) {
-                    ok => {},
+                    ok(_) => {},
                     err(f) => self.command_failed(source, f),
                 }
             },
         }
     }
 
-    // A command read, run as `source`, or why not.
-    fn perform(mut self, source: Source, p: own Parsed, signed: List<(String, ChatMessage)>) ! Failure {
+    // A command read, run as `source`: what it gives, as vanilla's `Command.run` returns it, or
+    // why it failed (D566).
+    fn perform(mut self, source: Source, p: own Parsed, signed: List<(String, ChatMessage)>) -> i32 ! Failure {
         var done: Failure? = none
+        var result = 0
         match p {
             Parsed.Execute(steps, end) => self.execute_command(source, steps, end, signed),
             Parsed.Stop => {
                 self.success(source, Component.translatable("commands.stop.stopping", []), true)
                 self.stop_due = true
+                result = 1
             },
             Parsed.GameMode(mode, targets) => {
                 match self.game_mode_command(source, mode, targets) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
-            Parsed.FlySpeed(speed) => self.fly_speed(source, speed),
+            Parsed.FlySpeed(speed) => {
+                match self.fly_speed(source, speed) {
+                    ok(r) => result = r,
+                    err(f) => done = some(f),
+                }
+            },
             Parsed.Pregen(c) => {
                 match self.pregen_command(source, c) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Dimension(id, targets) => {
                 match self.dimension_command(source, id, targets) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
-            Parsed.Help(command) => self.help(source, command),
-            Parsed.List(uuids) => self.list_players(source, uuids),
+            Parsed.Help(command) => {
+                match self.help(source, command) {
+                    ok(r) => result = r,
+                    err(f) => done = some(f),
+                }
+            },
+            Parsed.List(uuids) => result = self.list_players(source, uuids),
             Parsed.Me(m) => {
                 match self.broadcast_command(source, "emote_command", "action", m, signed) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Say(m) => {
                 match self.broadcast_command(source, "say_command", "message", m, signed) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
-            Parsed.Weather(kind, duration) => self.weather_command(source, kind, duration),
+            Parsed.Weather(kind, duration) => result = self.weather_command(source, kind, duration),
             Parsed.Kill(targets) => {
                 match self.kill_command(source, targets) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.SetBlock(at, block, mode) => {
                 match self.setblock_command(source, at, block, mode) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Fill(from, to, block, mode) => {
                 match self.fill_command(source, from, to, block, mode) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Give(targets, item, count) => {
                 match self.give_command(source, targets, item, count) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Teleport(targets, to) => {
                 match self.teleport_command(source, targets, to) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Time(clock, action) => {
                 match self.time_command(source, clock, action) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.TellRaw(targets, message) => {
                 match self.tellraw(source, targets, message) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Title(targets, action) => {
                 match self.title(source, targets, action) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Msg(targets, m) => {
                 match self.msg(source, targets, m, signed) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.TeamMsg(m) => {
                 match self.team_msg(source, m, signed) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Trigger(objective, change) => {
                 match self.trigger_command(source, objective, change) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Random(range, roll) => {
                 match self.random_command(source, range, roll) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Summon(kind, at, nbt) => {
                 match self.summon_command(source, kind, at, nbt) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Scoreboard(action) => {
                 match self.scoreboard_command(source, action) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
             Parsed.Data(action) => {
                 match self.data_command(source, action) {
-                    ok => {},
+                    ok(r) => result = r,
                     err(f) => done = some(f),
                 }
             },
@@ -18112,6 +18147,7 @@ impl Network {
         if let f = done {
             fail f
         }
+        return result
     }
 
     // Every command and the entity types a selector may name, made the first time a command's
@@ -18204,11 +18240,11 @@ impl Network {
     }
 
     // `help`, `HelpCommand`: how each command the source may use is used, or, after a command
-    // written, how what it leads to is, a line each; a command that reads nothing fails
-    // (CAL-165).
-    fn help(mut self, source: Source, command: String?) {
+    // written, how what it leads to is, a line each, giving how many; a command that reads
+    // nothing fails (CAL-165).
+    fn help(mut self, source: Source, command: String?) -> i32 ! Failure {
         self.ready_commands()
-        let set = self.commands.take() else return
+        let set = self.commands.take() else return 0
         let level = source.level
         var lines = List<String>()
         var failed = false
@@ -18231,17 +18267,17 @@ impl Network {
         }
         self.commands = some(set)
         if failed {
-            self.command_failed(source, Failure.alone(Component.translatable("commands.help.failed", [])))
-            return
+            fail Failure.alone(Component.translatable("commands.help.failed", []))
         }
         for line in lines {
             self.success(source, Component.literal(line), false)
         }
+        return i32.wrap(lines.len())
     }
 
     // `list`, `ListPlayersCommand`: how many players there are of how many may join, and each
-    // one's name, or their name and UUID (CAL-165).
-    fn list_players(mut self, source: Source, uuids: bool) {
+    // one's name, or their name and UUID, giving how many players (CAL-165).
+    fn list_players(mut self, source: Source, uuids: bool) -> i32 {
         let players = self.by_joining()
         var names = List<Component>()
         for slot in players {
@@ -18258,6 +18294,7 @@ impl Network {
         let most = self.world.settings.max_players
         let message = Component.translatable_args(String("commands.list.players"), [Argument.Number(Tag.Int(i32.wrap(players.len()))), Argument.Number(Tag.Int(most)), Argument.Text(format_list(names))])
         self.success(source, message, false)
+        return i32.wrap(players.len())
     }
 
     // The ID of the chat type `name` in the `chat_type` registry, where the world has it.
@@ -18402,27 +18439,29 @@ impl Network {
 
     // `me`, `EmoteCommands`, and `say`, `SayCommand`: the message argument `argument`, as the
     // source's, to every player, as `broadcastChatMessage` sends it with the chat type `kind`, and
-    // logged (CAL-165).
-    fn broadcast_command(mut self, source: Source, kind: str, argument: str, m: Message, signed: List<(String, ChatMessage)>) ! Failure {
-        let chat_type = self.chat_type_id(kind) else return
+    // logged, giving 1 (CAL-165).
+    fn broadcast_command(mut self, source: Source, kind: str, argument: str, m: Message, signed: List<(String, ChatMessage)>) -> i32 ! Failure {
+        let chat_type = self.chat_type_id(kind) else return 1
         let out = try self.resolved(source, argument, m, signed)
         let bound = ChatTypeBound { chat_type: chat_type, name: self.source_name(source), target_name: none }
         self.log_chat(out, bound)
         for slot in self.by_joining() {
             self.send_message_to(slot, out, bound)
         }
+        return 1
     }
 
     // `msg`, `MsgCommand`: the message to each player named, as `msg_command_incoming`, and to
     // the source as `msg_command_outgoing` to them, the source's first each time; the console's
-    // is logged (CAL-165).
-    fn msg(mut self, source: Source, targets: own Selector, m: Message, signed: List<(String, ChatMessage)>) ! Failure {
+    // is logged; it gives how many players it's to (CAL-165).
+    fn msg(mut self, source: Source, targets: own Selector, m: Message, signed: List<(String, ChatMessage)>) -> i32 ! Failure {
         let who = try self.players_selected(source, targets)
         if who.is_empty() {
             fail Failure.alone(Component.translatable("argument.entity.notfound.player", []))
         }
-        let incoming = self.chat_type_id("msg_command_incoming") else return
-        let outgoing = self.chat_type_id("msg_command_outgoing") else return
+        let count = i32.wrap(who.len())
+        let incoming = self.chat_type_id("msg_command_incoming") else return count
+        let outgoing = self.chat_type_id("msg_command_outgoing") else return count
         let out = try self.resolved(source, "message", m, signed)
         let name = self.source_name(source)
         for slot in who {
@@ -18437,12 +18476,13 @@ impl Network {
             }
             self.send_message_to(slot, out, ChatTypeBound { chat_type: incoming, name: name.copy(), target_name: none })
         }
+        return count
     }
 
     // `teammsg`, `TeamMsgCommand`: the message to each player in the source's team, the source
     // as `team_msg_command_outgoing` and the rest as `team_msg_command_incoming`, each to the
-    // team's name (CAL-165).
-    fn team_msg(mut self, source: Source, m: Message, signed: List<(String, ChatMessage)>) ! Failure {
+    // team's name, giving how many (CAL-165).
+    fn team_msg(mut self, source: Source, m: Message, signed: List<(String, ChatMessage)>) -> i32 ! Failure {
         let me = source.entity else fail Failure.alone(Component.translatable("permissions.requires.entity", []))
         var team: Team? = none
         if let c = self.connections[me] {
@@ -18465,11 +18505,12 @@ impl Network {
                 receivers.push(slot)
             }
         }
+        let count = i32.wrap(receivers.len())
         if receivers.is_empty() {
-            return
+            return count
         }
-        let incoming = self.chat_type_id("team_msg_command_incoming") else return
-        let outgoing = self.chat_type_id("team_msg_command_outgoing") else return
+        let incoming = self.chat_type_id("team_msg_command_incoming") else return count
+        let outgoing = self.chat_type_id("team_msg_command_outgoing") else return count
         let team_name = team_formatted(t)
         let name = self.source_name(source)
         let out = try self.resolved(source, "message", m, signed)
@@ -18477,21 +18518,22 @@ impl Network {
             let kind = if slot == me { outgoing } else { incoming }
             self.send_message_to(slot, out, ChatTypeBound { chat_type: kind, name: name.copy(), target_name: some(team_name.copy()) })
         }
+        return count
     }
 
     // `trigger`, `TriggerCommand`: the player's score of a trigger objective they may use one
     // more, a value more, or set, which they may then not till it's enabled again, then said to
-    // the source and the operators (CAL-165).
-    fn trigger_command(mut self, source: Source, objective: String, change: TriggerChange) ! Failure {
+    // the source and the operators, giving the score it's left (CAL-165).
+    fn trigger_command(mut self, source: Source, objective: String, change: TriggerChange) -> i32 ! Failure {
         let slot = source.entity else fail Failure.alone(Component.translatable("permissions.requires.player", []))
-        var con = self.connections[slot].take() else return
+        var con = self.connections[slot].take() else return 0
         var found: GameProfile? = none
         if let p = con.profile {
             found = some(p.copy())
         }
         let p = found else {
             self.connections[slot] = some(con)
-            return
+            return 0
         }
         let shown = some(self.player_name(p.copy()).to_nbt())
         var count = 0
@@ -18502,8 +18544,12 @@ impl Network {
             TriggerChange.Set(v) => value = some(v),
         }
         var problem: String? = none
+        var left = 0
         match self.world.scoreboard.trigger(objective.copy(), p.name.copy(), shown, count, value) {
-            ok((_, sent)) => self.send_all(mut con, score_packets(sent)),
+            ok((v, sent)) => {
+                left = v
+                self.send_all(mut con, score_packets(sent))
+            },
             err(key) => problem = some(key),
         }
         self.connections[slot] = some(con)
@@ -18521,6 +18567,7 @@ impl Network {
             TriggerChange.Set(v) => Component.translatable_args(String("commands.trigger.set.success"), [Argument.Text(formatted), Argument.Number(Tag.Int(v))]),
         }
         self.success(source, message, true)
+        return left
     }
 
     // `Objective.getFormattedDisplayName`: its display name, pointed at showing its name, in
@@ -18542,7 +18589,7 @@ impl Network {
     // finds them. A player's data can't be changed, as in vanilla, and a block entity's can't
     // yet. A storage compound is changed in place, as vanilla changes the one `get` gives, so
     // what a change made on the way stays where it fails.
-    fn data_command(mut self, source: Source, action: own DataAction) ! Failure {
+    fn data_command(mut self, source: Source, action: own DataAction) -> i32 ! Failure {
         match action {
             DataAction.Merge(target, nbt) => {
                 // `mergeData`: the old data copied and merged with the compound given, which
@@ -18559,26 +18606,41 @@ impl Network {
                 try self.data_write(a, result)
                 let told = self.data_modified(a)
                 self.success(source, told, true)
+                return 1
             },
             DataAction.Get(target, path, scale) => {
-                // `getData`, whole or by a path, which must find one tag, or `getNumeric`, a
-                // number scaled and rounded down.
+                // `getData`, whole, giving 1, or by a path, which must find one tag, giving a
+                // number rounded down, how many a list, an array or a compound holds, or how
+                // long a string is in UTF-16 units; or `getNumeric`, a number scaled and
+                // rounded down, giving that.
                 let a = try self.data_accessor(source, target)
                 let data = self.data_read(a)
                 let p = path else {
                     let told = self.data_printed(a, data)
                     self.success(source, told, false)
-                    return
+                    return 1
                 }
                 let tag = try single_tag(p, data)
                 if let s = scale {
                     let n = tag.number_double() else fail Failure.alone(Component.translatable("commands.data.get.invalid", [Component.literal(p.original.copy())]))
-                    let told = self.data_got(a, p, s, mth_floor(n * s))
+                    let got = mth_floor(n * s)
+                    let told = self.data_got(a, p, s, got)
                     self.success(source, told, false)
-                    return
+                    return got
+                }
+                let result = match tag {
+                    Tag.Str(text) => i32.wrap(units_of(text.copy()).len()),
+                    Tag.List(l) => i32.wrap(l.len()),
+                    Tag.ByteArray(l) => i32.wrap(l.len()),
+                    Tag.IntArray(l) => i32.wrap(l.len()),
+                    Tag.LongArray(l) => i32.wrap(l.len()),
+                    Tag.Compound(m) => i32.wrap(m.len()),
+                    Tag.End => fail Failure.alone(Component.translatable("commands.data.get.unknown", [Component.literal(p.original.copy())])),
+                    _ => mth_floor(tag.number_double() ?? 0.0),
                 }
                 let told = self.data_printed(a, tag)
                 self.success(source, told, false)
+                return result
             },
             DataAction.Remove(target, path) => {
                 let a = try self.data_accessor(source, target)
@@ -18600,6 +18662,7 @@ impl Network {
                 try self.data_write(a, data)
                 let told = self.data_modified(a)
                 self.success(source, told, true)
+                return count
             },
             DataAction.Modify(target, to, how, from) => {
                 // `manipulateData`: the source found, then the target's data changed at its
@@ -18652,6 +18715,7 @@ impl Network {
                 try self.data_write(a, data)
                 let told = self.data_modified(a)
                 self.success(source, told, true)
+                return count
             },
         }
     }
@@ -18761,8 +18825,19 @@ impl Network {
     // `positioned as`, `rotated as`, `facing entity` and every condition do, what fails as a
     // source runs it is left out quietly, `forkedMode`; before then, the failure's told and
     // nothing more runs. Making more sources than `max_command_forks` lets there be stops it all,
-    // `command.forkLimit`, told only where nothing's forked yet.
+    // `command.forkLimit`, told only where nothing's forked yet. What a source's `store` steps
+    // added is stored after each command it runs, `stored`, and taken back off when it's done
+    // (D566).
     fn execute_command(mut self, source: Source, steps: List<ExecuteStep>, end: ExecuteEnd, signed: List<(String, ChatMessage)>) {
+        let mark = self.store_links.len()
+        self.execute_chain(source, steps, end, signed)
+        while self.store_links.len() > mark {
+            _ = self.store_links.pop()
+        }
+    }
+
+    // `execute_command`'s chain, its steps then what it runs (CAL-165).
+    fn execute_chain(mut self, source: Source, steps: List<ExecuteStep>, end: ExecuteEnd, signed: List<(String, ChatMessage)>) {
         var sources: List<Source> = [source]
         var forked = false
         for step in steps {
@@ -18794,25 +18869,84 @@ impl Network {
             sources = next
         }
         for s in sources {
+            // What it gave, or how it failed; stored first, as `runExecutable` calls the callback
+            // before the failure's told (D566).
+            var result = 0
+            var failure: Failure? = none
             match end {
                 ExecuteEnd.Run(run) => {
                     match self.perform(s, run.value.copy(), signed) {
-                        ok => {},
-                        err(f) => {
-                            if not forked {
-                                self.command_failed(s, f)
-                            }
-                        },
+                        ok(r) => result = r,
+                        err(f) => failure = some(f),
                     }
                 },
                 ExecuteEnd.Test(expected, cond) => {
                     match self.execute_test(s, expected, cond) {
-                        ok => {},
-                        err(f) => {
-                            if not forked {
-                                self.command_failed(s, f)
+                        ok(r) => result = r,
+                        err(f) => failure = some(f),
+                    }
+                },
+            }
+            match self.stored(s, failure == none, result) {
+                ok => {},
+                err(f) => {
+                    // A store that throws, as a read-only score's does, stops it all.
+                    self.command_failed(source, f)
+                    return
+                },
+            }
+            if let f = failure {
+                if not forked {
+                    self.command_failed(s, f)
+                }
+            }
+        }
+    }
+
+    // `execute store`'s callbacks for the source `s` (CAL-165, D566), `CommandResultCallback`
+    // chained, the first step's first: what the command gave, `result`, or 1 where it ran and 0
+    // where it failed, into each holder's score of the objective, made where there's none,
+    // `getOrCreatePlayerScore`, which for a read-only objective throws, `command.failed`; or
+    // into the data at the path, as a tag of the type named, scaled, `storeData`: set, then the
+    // data stored, its failures ignored, as a player's is, or left as the path left it where
+    // the path fails.
+    fn stored(mut self, s: Source, success: bool, result: i32) ! Failure {
+        var chain = List<usize>()
+        var at = s.stores
+        while at > 0 {
+            chain.push(at - 1)
+            at = self.store_links[at - 1].parent
+        }
+        var i = chain.len()
+        while i > 0 {
+            i -= 1
+            let link = self.store_links[chain[i]].copy()
+            let value = if link.result { result } else if success { 1 } else { 0 }
+            match link.to {
+                StoreTo.Score(who, objective) => {
+                    let o = try self.objective_arg(objective.copy())
+                    for h in who {
+                        let fresh = self.world.scoreboard.touch(h.name.copy(), o.name.copy())
+                        if read_only(o.criteria.copy()) {
+                            var failed = Component.translatable("command.failed", [])
+                            failed.style.hover_event = some(HoverEvent.ShowText(Box(Component.literal("Cannot modify read-only score"))))
+                            fail Failure.alone(failed)
+                        }
+                        let (changes, _) = self.world.scoreboard.set_value(h.name.copy(), o.name.copy(), value, shown_of(h.copy()), fresh)
+                        self.tell_scoreboard(changes)
+                    }
+                },
+                StoreTo.Data(a, path, kind, scale) => {
+                    var data = self.data_read(a)
+                    let tag = stored_tag(kind.copy(), f64(value) * scale)
+                    match path.set(mut data, tag) {
+                        ok(_) => {
+                            match self.data_write(a, data) {
+                                ok => {},
+                                err(_) => {},
                             }
                         },
+                        err(_) => self.data_in_place(a, data),
                     }
                 },
             }
@@ -18945,6 +19079,30 @@ impl Network {
                 if condition_held(cond, count) == expected {
                     out.push(s)
                 }
+            },
+            ExecuteStep.Store(result, target) => {
+                // `storeValue` and `storeData`, what they store into found now: the holders,
+                // `*` every one, then the objective; a boss bar, which Calcite has none of; or
+                // the data's accessor. Its callback's chained to the source's, `stored` (D566).
+                let to = match target {
+                    StoreTarget.Score(h, name) => {
+                        let who = try self.holders_of(s, h, true)
+                        let o = try self.objective_arg(name.copy())
+                        StoreTo.Score(who, o.name.copy())
+                    },
+                    StoreTarget.Bossbar(id, _) => fail Failure.alone(Component.translatable("commands.bossbar.unknown", [Component.literal(id.to_string())])),
+                    StoreTarget.Data(t, path, kind, scale) => {
+                        let a = try self.data_accessor(s, t)
+                        if let Accessor.Block(_, _, _, _) = a {
+                            fail Failure.alone(Component.literal("Calcite can't store into block entities' data yet"))
+                        }
+                        StoreTo.Data(a, path.copy(), kind.copy(), scale)
+                    },
+                }
+                self.store_links.push(StoreLink { result: result, to: to, parent: s.stores })
+                var n = s
+                n.stores = self.store_links.len()
+                out.push(n)
             },
         }
         return out
@@ -19127,8 +19285,8 @@ impl Network {
     // `commands.execute.conditional.pass`, where it found none, else
     // `commands.execute.conditional.fail_count` with how many; for `blocks`, the same by whether
     // they matched, with how many it compared; for the rest, passing where it holds as it
-    // should, else failing.
-    fn execute_test(mut self, s: Source, expected: bool, cond: Condition) ! Failure {
+    // should, else failing. Passing, it gives how many `if` found, where it counts them, else 1.
+    fn execute_test(mut self, s: Source, expected: bool, cond: Condition) -> i32 ! Failure {
         let count = try self.condition_count(s, cond)
         let counted = match cond {
             Condition.Entity(_) => true,
@@ -19142,19 +19300,20 @@ impl Network {
                 fail Failure.alone(Component.translatable("commands.execute.conditional.fail", []))
             }
             self.success(s, Component.translatable("commands.execute.conditional.pass", []), false)
-            return
+            return 1
         }
         if expected {
             if not held {
                 fail Failure.alone(Component.translatable("commands.execute.conditional.fail", []))
             }
             self.success(s, Component.translatable_args(String("commands.execute.conditional.pass_count"), [Argument.Number(Tag.Int(count))]), false)
-            return
+            return count
         }
         if held {
             fail Failure.alone(Component.translatable_args(String("commands.execute.conditional.fail_count"), [Argument.Number(Tag.Int(count))]))
         }
         self.success(s, Component.translatable("commands.execute.conditional.pass", []), false)
+        return 1
     }
 
     // `getModifiedSuccess` (CAL-165).
@@ -19236,12 +19395,16 @@ impl Network {
     // `scoreboard`, `ScoreboardCommand` (CAL-165): each of its commands as vanilla runs it, its
     // arguments found in the order its lambdas find them, each change told to the players as
     // `ServerScoreboard` tells them, as it's made, then the source told, and, where vanilla
-    // broadcasts it, the operators.
-    fn scoreboard_command(mut self, source: Source, action: own ScoreboardAction) ! Failure {
+    // broadcasts it, the operators. Each gives what vanilla's does (D566): how many objectives
+    // there are, after one's added or taken away; a score; the scores changed, summed, as
+    // `CommandResponseTracker` sums them; how many holders or scores are listed; 0 for an
+    // objective's display.
+    fn scoreboard_command(mut self, source: Source, action: own ScoreboardAction) -> i32 ! Failure {
         match action {
-            ScoreboardAction.ListObjectives => self.list_objectives(source),
+            ScoreboardAction.ListObjectives => return self.list_objectives(source),
             ScoreboardAction.AddObjective(name, criteria, shown) => {
                 try self.add_objective(source, name, criteria, shown)
+                return i32.wrap(self.world.scoreboard.objectives.len())
             },
             ScoreboardAction.RemoveObjective(name) => {
                 let o = try self.objective_arg(name)
@@ -19250,6 +19413,7 @@ impl Network {
                 self.tell_scoreboard(changes)
                 self.scoring_changed()
                 self.success(source, Component.translatable("commands.scoreboard.objectives.remove.success", [shown]), true)
+                return i32.wrap(self.world.scoreboard.objectives.len())
             },
             ScoreboardAction.SetDisplay(slot, name) => try self.set_display_slot(source, slot, name),
             ScoreboardAction.DisplayName(name, given) => {
@@ -19290,18 +19454,19 @@ impl Network {
                 let key = if format == none { "clear" } else { "set" }
                 self.success(source, Component.translatable("commands.scoreboard.objectives.modify.objectiveFormat.{key}", [Component.literal(o.name.copy())]), true)
             },
-            ScoreboardAction.ListHolders(target) => try self.list_holders(source, target),
+            ScoreboardAction.ListHolders(target) => return try self.list_holders(source, target),
             ScoreboardAction.Get(target, name) => {
                 let who = try self.holders_of(source, target, false)
                 let h = who[0].copy()
                 let o = try self.objective_arg(name)
                 let s = self.world.scoreboard.score(h.name.copy(), o.name.copy()) else fail Failure.alone(Component.translatable("commands.scoreboard.players.get.null", [Component.literal(o.name.copy()), h.feedback.copy()]))
                 self.success(source, Component.translatable_args(String("commands.scoreboard.players.get.success"), [Argument.Text(h.feedback.copy()), Argument.Number(Tag.Int(s.value)), Argument.Text(objective_shown(o.copy()))]), false)
+                return s.value
             },
-            ScoreboardAction.Change(word, targets, name, value) => try self.change_scores(source, word, targets, name, value),
-            ScoreboardAction.Reset(targets, name) => try self.reset_scores(source, targets, name),
-            ScoreboardAction.Enable(targets, name) => try self.enable_scores(source, targets, name),
-            ScoreboardAction.ScoreName(targets, name, given) => try self.name_scores(source, targets, name, given),
+            ScoreboardAction.Change(word, targets, name, value) => return try self.change_scores(source, word, targets, name, value),
+            ScoreboardAction.Reset(targets, name) => return try self.reset_scores(source, targets, name),
+            ScoreboardAction.Enable(targets, name) => return try self.enable_scores(source, targets, name),
+            ScoreboardAction.ScoreName(targets, name, given) => return try self.name_scores(source, targets, name, given),
             ScoreboardAction.ScoreFormat(targets, name, given) => {
                 let format = try self.format_of(source, given)
                 let who = try self.holders_of(source, targets, true)
@@ -19313,31 +19478,34 @@ impl Network {
                     self.tell_scoreboard(changes)
                     found.push((h.feedback.copy(), 1))
                 }
-                let (one, count, _) = tracked(found, false)
+                let (one, count, total) = tracked(found, false)
                 let key = if format == none { "clear" } else { "set" }
                 let message = match one {
                     some(f) => Component.translatable("commands.scoreboard.players.display.numberFormat.{key}.success.single", [f, objective_shown(o.copy())]),
                     none => Component.translatable_args("commands.scoreboard.players.display.numberFormat.{key}.success.multiple", [Argument.Number(Tag.Int(count)), Argument.Text(objective_shown(o.copy()))]),
                 }
                 self.success(source, message, true)
+                return total
             },
-            ScoreboardAction.Operation(targets, to, op, from, from_name) => try self.operate_scores(source, targets, to, op, from, from_name),
+            ScoreboardAction.Operation(targets, to, op, from, from_name) => return try self.operate_scores(source, targets, to, op, from, from_name),
         }
+        return 0
     }
 
     // `scoreboard objectives list`, `listObjectives`: how many objectives there are and their
-    // names, in the order its map keeps them, or that there are none.
-    fn list_objectives(mut self, source: Source) {
+    // names, in the order its map keeps them, or that there are none; it gives how many.
+    fn list_objectives(mut self, source: Source) -> i32 {
         let all = self.world.scoreboard.all_objectives()
         if all.is_empty() {
             self.success(source, Component.translatable("commands.scoreboard.objectives.list.empty", []), false)
-            return
+            return 0
         }
         var names = List<Component>()
         for o in all {
             names.push(objective_shown(o.copy()))
         }
         self.success(source, Component.translatable_args(String("commands.scoreboard.objectives.list.success"), [Argument.Number(Tag.Int(i32.wrap(all.len()))), Argument.Text(format_list(names))]), false)
+        return i32.wrap(all.len())
     }
 
     // `scoreboard objectives add`, `addObjective`: the display name resolved, or the name where
@@ -19384,33 +19552,34 @@ impl Network {
 
     // `scoreboard players list`, `listTrackedPlayers` and `listTrackedPlayerScores`: how many
     // holders there are and their names, or that there are none; or, of the holder named, how
-    // many scores they have, then each, by objective, or that they've none.
-    fn list_holders(mut self, source: Source, target: Holder?) ! Failure {
+    // many scores they have, then each, by objective, or that they've none; it gives how many.
+    fn list_holders(mut self, source: Source, target: Holder?) -> i32 ! Failure {
         let given = target else {
             let names = self.world.scoreboard.holders()
             if names.is_empty() {
                 self.success(source, Component.translatable("commands.scoreboard.players.list.empty", []), false)
-                return
+                return 0
             }
             var shown = List<Component>()
             for n in names {
                 shown.push(Component.literal(n.copy()))
             }
             self.success(source, Component.translatable_args(String("commands.scoreboard.players.list.success"), [Argument.Number(Tag.Int(i32.wrap(names.len()))), Argument.Text(format_list(shown))]), false)
-            return
+            return i32.wrap(names.len())
         }
         let who = try self.holders_of(source, given, false)
         let h = who[0].copy()
         let scores = self.world.scoreboard.scores_held(h.name.copy())
         if scores.is_empty() {
             self.success(source, Component.translatable("commands.scoreboard.players.list.entity.empty", [h.feedback.copy()]), false)
-            return
+            return 0
         }
         self.success(source, Component.translatable_args(String("commands.scoreboard.players.list.entity.success"), [Argument.Text(h.feedback.copy()), Argument.Number(Tag.Int(i32.wrap(scores.len())))]), false)
         for (objective, value) in scores {
             let shown = self.objective_formatted(objective.copy())
             self.success(source, Component.translatable_args(String("commands.scoreboard.players.list.entity.entry"), [Argument.Text(shown), Argument.Number(Tag.Int(value))]), false)
         }
+        return i32.wrap(scores.len())
     }
 
     // `scoreboard players set`, `add` and `remove`, `setScore`, `addScore` and `removeScore`:
@@ -19418,8 +19587,8 @@ impl Network {
     // then set, `ScoreAccess.set`, to the score, or so much more or less, as an int wraps; then
     // the source told of the one holder, or how many, which for `set` counts only those it's
     // given a score that isn't 0, as `CommandResponseTracker` counts them, so setting several to 0
-    // tells of 0.
-    fn change_scores(mut self, source: Source, word: String, targets: Holder, name: String, value: i32) ! Failure {
+    // tells of 0. It gives the scores summed, as an int wraps.
+    fn change_scores(mut self, source: Source, word: String, targets: Holder, name: String, value: i32) -> i32 ! Failure {
         let who = try self.holders_of(source, targets, true)
         let o = try self.writable_objective(name)
         var found = List<(Component, i32)>()
@@ -19436,13 +19605,13 @@ impl Network {
         }
         let shown = objective_shown(o.copy())
         if word == "set" {
-            let (one, count, _) = tracked(found, false)
+            let (one, count, total) = tracked(found, false)
             let message = match one {
                 some(f) => Component.translatable_args(String("commands.scoreboard.players.set.success.single"), [Argument.Text(shown), Argument.Text(f), Argument.Number(Tag.Int(value))]),
                 none => Component.translatable_args(String("commands.scoreboard.players.set.success.multiple"), [Argument.Text(shown), Argument.Number(Tag.Int(count)), Argument.Number(Tag.Int(value))]),
             }
             self.success(source, message, true)
-            return
+            return total
         }
         let (one, count, total) = tracked(found, true)
         let message = match one {
@@ -19450,11 +19619,13 @@ impl Network {
             none => Component.translatable_args("commands.scoreboard.players.{word}.success.multiple", [Argument.Number(Tag.Int(value)), Argument.Text(shown), Argument.Number(Tag.Int(count))]),
         }
         self.success(source, message, true)
+        return total
     }
 
     // `scoreboard players reset`, `resetScores` and `resetScore`: each holder's scores taken
-    // away, or their score of the objective, found after them; then the source told.
-    fn reset_scores(mut self, source: Source, targets: Holder, name: String?) ! Failure {
+    // away, or their score of the objective, found after them; then the source told. It gives
+    // how many.
+    fn reset_scores(mut self, source: Source, targets: Holder, name: String?) -> i32 ! Failure {
         let who = try self.holders_of(source, targets, true)
         var objective: Objective? = none
         if let n = name {
@@ -19481,13 +19652,14 @@ impl Network {
             },
         }
         self.success(source, message, true)
+        return count
     }
 
     // `scoreboard players enable`, `enableTrigger`: the objective, which must be a trigger
     // objective, else `commands.scoreboard.players.enable.invalid`; each holder's score of it made
     // where there's none, then unlocked where it's locked; then the source told of those
-    // unlocked, or `commands.scoreboard.players.enable.failed` where none were.
-    fn enable_scores(mut self, source: Source, targets: Holder, name: String) ! Failure {
+    // unlocked, or `commands.scoreboard.players.enable.failed` where none were, giving how many.
+    fn enable_scores(mut self, source: Source, targets: Holder, name: String) -> i32 ! Failure {
         let who = try self.holders_of(source, targets, true)
         let o = try self.objective_arg(name)
         if o.criteria != "trigger" {
@@ -19515,12 +19687,13 @@ impl Network {
             none => Component.translatable_args(String("commands.scoreboard.players.enable.success.multiple"), [Argument.Text(objective_shown(o.copy())), Argument.Number(Tag.Int(count))]),
         }
         self.success(source, message, true)
+        return count
     }
 
     // `scoreboard players display name`, `setScoreDisplay`: the name resolved, after the
     // holders and the objective are found; each holder's score made where there's none, then the
-    // text shown for them set, or cleared; then the source told.
-    fn name_scores(mut self, source: Source, targets: Holder, name: String, given: Component?) ! Failure {
+    // text shown for them set, or cleared; then the source told, giving how many.
+    fn name_scores(mut self, source: Source, targets: Holder, name: String, given: Component?) -> i32 ! Failure {
         let who = try self.holders_of(source, targets, true)
         let o = try self.objective_arg(name)
         var display: Component? = none
@@ -19551,6 +19724,7 @@ impl Network {
             },
         }
         self.success(source, message, true)
+        return count
     }
 
     // `scoreboard players operation`, `performOperation`: the holders, the target objective,
@@ -19560,8 +19734,9 @@ impl Network {
     // `*=` as an int wraps, `/=` and `%=` rounding down, `Math.floorDiv` and `floorMod`, else
     // `arguments.operation.div0` for a source of 0, `<` and `>` the lesser and greater, and `><`
     // swaps them, the source's set after the holder's, which for a read-only source throws, as
-    // vanilla's does, `command.failed`. Then the source told of the holder's score, or how many.
-    fn operate_scores(mut self, source: Source, targets: Holder, to_name: String, op: String, sources: Holder, from_name: String) ! Failure {
+    // vanilla's does, `command.failed`. Then the source told of the holder's score, or how many;
+    // it gives the holders' scores summed, as an int wraps.
+    fn operate_scores(mut self, source: Source, targets: Holder, to_name: String, op: String, sources: Holder, from_name: String) -> i32 ! Failure {
         let who = try self.holders_of(source, targets, true)
         let to = try self.writable_objective(to_name)
         let froms = try self.holders_of(source, sources, true)
@@ -19620,6 +19795,7 @@ impl Network {
             none => Component.translatable_args(String("commands.scoreboard.players.operation.success.multiple"), [Argument.Text(shown), Argument.Number(Tag.Int(count))]),
         }
         self.success(source, message, true)
+        return total
     }
 
     // The holder's score of the objective, 0 where there's none.
@@ -19768,8 +19944,9 @@ impl Network {
     }
 
     // `random value` and `random roll`, `RandomCommand.randomSample`: a number in the range, from
-    // the random of the source's level, told the source, or, rolled, every player (CAL-165).
-    fn random_command(mut self, source: Source, range: Ints, roll: bool) ! Failure {
+    // the random of the source's level, told the source, or, rolled, every player, and given
+    // (CAL-165).
+    fn random_command(mut self, source: Source, range: Ints, roll: bool) -> i32 ! Failure {
         let least = range.min ?? i32.MIN
         let most = range.max ?? i32.MAX
         let span = i64(most) - i64(least)
@@ -19790,12 +19967,12 @@ impl Network {
         } else {
             self.success(source, Component.translatable_args(String("commands.random.sample.success"), [Argument.Number(Tag.Int(value))]), false)
         }
+        return value
     }
 
-
     // `gamemode`, as `GameModeCommand.setMode`: each player named, or the one running it, put in
-    // `mode`, and told of it where they weren't in it already.
-    fn game_mode_command(mut self, source: Source, mode: GameType, targets: own Selector?) ! Failure {
+    // `mode`, and told of it where they weren't in it already; it gives how many were.
+    fn game_mode_command(mut self, source: Source, mode: GameType, targets: own Selector?) -> i32 ! Failure {
         var who = List<usize>()
         if let t = targets {
             who = try self.players_selected(source, t)
@@ -19806,11 +19983,14 @@ impl Network {
             let slot = source.entity else fail Failure.alone(Component.translatable("permissions.requires.player", []))
             who.push(slot)
         }
+        var count = 0
         for slot in who {
             if self.change_mode(slot, mode) {
                 self.log_mode_change(source, slot, mode)
+                count += 1
             }
         }
+        return count
     }
 
     // `logGamemodeChange`: the player who changed their own mode is told so; another is told
@@ -19990,9 +20170,9 @@ impl Network {
 
     // `weather`, `WeatherCommand`: the weather set as `setWeatherParameters` sets it, for the
     // ticks given, or as long as the source's level's random draws, as `RAIN_DELAY`,
-    // `RAIN_DURATION` or `THUNDER_DURATION` draws it; then the source told, and the operators
-    // (CAL-165).
-    fn weather_command(mut self, source: Source, kind: WeatherKind, duration: i32?) {
+    // `RAIN_DURATION` or `THUNDER_DURATION` draws it; then the source told, and the operators. It
+    // gives the ticks given, or -1, not what was drawn, as vanilla's does (CAL-165).
+    fn weather_command(mut self, source: Source, kind: WeatherKind, duration: i32?) -> i32 {
         let (_, _, _, d) = (source.x, source.y, source.z, source.dim)
         let (least, most) = match kind {
             WeatherKind.Clear => (RAIN_DELAY_MIN, RAIN_DELAY_MAX),
@@ -20022,12 +20202,14 @@ impl Network {
             },
         }
         self.success(source, Component.translatable("commands.weather.set.{name}", []), true)
+        return duration ?? -1
     }
 
     // `kill`, `KillCommand`: each named, or the one running it, killed in turn, as
     // `LivingEntity.kill` kills it, hurt by `generic_kill` as much as a float may be; then the
-    // source told, and the operators: of the one where there's one, else of how many (CAL-165).
-    fn kill_command(mut self, source: Source, targets: own Selector?) ! Failure {
+    // source told, and the operators: of the one where there's one, else of how many, which it
+    // gives (CAL-165).
+    fn kill_command(mut self, source: Source, targets: own Selector?) -> i32 ! Failure {
         var victims = List<usize>()
         if let s = targets {
             victims = try self.entities_selected(source, s)
@@ -20052,6 +20234,7 @@ impl Network {
             Component.translatable_args("commands.kill.success.multiple", [Argument.Number(Tag.Int(i32.wrap(victims.len())))])
         }
         self.success(source, message, true)
+        return i32.wrap(victims.len())
     }
 
     // `BlockPosArgument.getLoadedBlockPos` of `at` for `source` (CAL-165): the block the place
@@ -20163,7 +20346,7 @@ impl Network {
     // `BlockInput.place` places it, sent to clients and with what it changes skipped, or with its
     // neighbours' shapes and on-place left alone too where `strict`, else failing; then, unless
     // `strict`, those around told; and the source told, and the operators.
-    fn setblock_command(mut self, source: Source, at: own Coordinates, input: own BlockInput, mode: own String) ! Failure {
+    fn setblock_command(mut self, source: Source, at: own Coordinates, input: own BlockInput, mode: own String) -> i32 ! Failure {
         let (x, y, z, d) = try self.loaded_pos(source, at)
         let shared = self.levels[d].shared_env() else fail Failure.alone(Component.literal("Calcite can't set blocks in a level without its blocks"))
         let Env { facts: f, .. } = shared.value
@@ -20191,6 +20374,7 @@ impl Network {
             self.block_set(d, x, y, z, old)
         }
         self.success(source, Component.translatable_args("commands.setblock.success", [Argument.Number(Tag.Int(x)), Argument.Number(Tag.Int(y)), Argument.Number(Tag.Int(z))]), true)
+        return 1
     }
 
     // `summon`, `SummonCommand.createEntity` (CAL-165): a type that may be summoned, else
@@ -20205,7 +20389,7 @@ impl Network {
     // `tryAddFreshEntityWithPassengers`, else `commands.summon.failed.uuid`, and the source told
     // its name, and the operators. Calcite summons only the mobs it makes, and loads no
     // passengers yet.
-    fn summon_command(mut self, source: Source, kind: own Identifier, at: own Coordinates?, nbt: own Tag?) ! Failure {
+    fn summon_command(mut self, source: Source, kind: own Identifier, at: own Coordinates?, nbt: own Tag?) -> i32 ! Failure {
         let name = kind.to_string()
         var type_id: i32? = none
         if let set = self.commands {
@@ -20303,6 +20487,7 @@ impl Network {
             self.add_mob(d, made[i].copy())
         }
         self.success(source, Component.translatable("commands.summon.success", [shown]), true)
+        return 1
     }
 
     // Whether an entity of the UUID `uuid` is loaded in the level `d`, `isLoaded`: one of its
@@ -20333,7 +20518,7 @@ impl Network {
     // placed, or broken, counted; then, unless `strict`, those around each placed told, in turn;
     // `commands.fill.failed` where none changed, else the source told how many, and the
     // operators.
-    fn fill_command(mut self, source: Source, from: own Coordinates, to: own Coordinates, input: own BlockInput, mode: own String) ! Failure {
+    fn fill_command(mut self, source: Source, from: own Coordinates, to: own Coordinates, input: own BlockInput, mode: own String) -> i32 ! Failure {
         let (x0, y0, z0, d) = try self.loaded_pos(source, from)
         let (x1, y1, z1, _) = try self.loaded_pos(source, to)
         let min_x = min(x0, x1)
@@ -20400,6 +20585,7 @@ impl Network {
             fail Failure.alone(Component.translatable("commands.fill.failed", []))
         }
         self.success(source, Component.translatable_args("commands.fill.success", [Argument.Number(Tag.Int(count))]), true)
+        return count
     }
 
     // `give`, `GiveCommand` (CAL-165): the players named; the item made as
@@ -20410,7 +20596,7 @@ impl Network {
     // tick, `ITEM_PICKUP` heard with a pitch from their random, and their menu's changes sent;
     // else what's left dropped for them alone to pick up at once. Then the source told, and the
     // operators, of the player where there's one, else of how many.
-    fn give_command(mut self, source: Source, targets: own Selector, input: own ItemInput, count: i32) ! Failure {
+    fn give_command(mut self, source: Source, targets: own Selector, input: own ItemInput, count: i32) -> i32 ! Failure {
         let who = try self.players_selected(source, targets)
         if who.is_empty() {
             fail Failure.alone(Component.translatable("argument.entity.notfound.player", []))
@@ -20471,14 +20657,15 @@ impl Network {
             Component.translatable_args("commands.give.success.multiple", [Argument.Number(Tag.Int(count)), Argument.Text(shown), Argument.Number(Tag.Int(i32.wrap(who.len())))])
         }
         self.success(source, message, true)
+        return i32.wrap(who.len())
     }
 
     // `teleport` and `tp`, `TeleportCommand` (CAL-165): those named, or the one running it, each
     // in turn to the entity named, its place and turn, `teleportToEntity`; or to the place, from
     // where the source is and looks, turned as the rotation says or as they were,
     // `teleportToPos`; then the source told, and the operators, of the one where there's one,
-    // else of how many, the place as `%f` writes it.
-    fn teleport_command(mut self, source: Source, targets: own Selector?, to: own Destination) ! Failure {
+    // else of how many, the place as `%f` writes it; it gives how many.
+    fn teleport_command(mut self, source: Source, targets: own Selector?, to: own Destination) -> i32 ! Failure {
         var victims = List<usize>()
         if let s = targets {
             victims = try self.entities_selected(source, s)
@@ -20584,6 +20771,7 @@ impl Network {
             },
         }
         self.success(source, message, true)
+        return i32.wrap(victims.len())
     }
 
     // `performTeleport` of the player in `slot` to the level at `d` (CAL-165): nowhere outside the
@@ -20679,8 +20867,10 @@ impl Network {
     // level's dimension type, set, moved on or back, moved to a time marker, paused, resumed or
     // its rate set, then the source told, and the operators; or asked after, the source told
     // alone. Each change sends the clock to every player as `modifyClock` does, even where a
-    // time marker isn't found or is reached already, which fail after it.
-    fn time_command(mut self, source: Source, clock: own Identifier?, action: own TimeAction) ! Failure {
+    // time marker isn't found or is reached already, which fail after it. It gives the ticks
+    // set; the clock's, wrapped, `wrap_time`, after it's moved on, back or to a marker, or as
+    // it's asked after; the timeline's or the game's, wrapped; or 1 (D566).
+    fn time_command(mut self, source: Source, clock: own Identifier?, action: own TimeAction) -> i32 ! Failure {
         let (_, _, _, d) = (source.x, source.y, source.z, source.dim)
         let chosen = match clock {
             some(name) => self.clock_named(name),
@@ -20699,6 +20889,7 @@ impl Network {
                 self.world.clocks.clocks[i].partial_tick = 0.0f32
                 self.clock_changed(i)
                 self.success(source, Component.translatable_args("commands.time.set.absolute", [named_text(name), Argument.Number(Tag.Int(t))]), true)
+                return t
             },
             TimeAction.SetMarker(marker) => {
                 // `moveToTimeMarker`: the marker of that name on the clock, if any, whether the
@@ -20732,12 +20923,14 @@ impl Network {
                     fail Failure.alone(Component.translatable_args("commands.time.set.already_at_time_marker", [named_text(name), named_text(marked)]))
                 }
                 self.success(source, Component.translatable_args("commands.time.set.time_marker", [named_text(name), named_text(marked)]), true)
+                return wrap_time(self.world.clocks.clocks[i].total_ticks)
             },
             TimeAction.Add(t) => {
                 let to = (total + i64(t)).max(0)
                 self.world.clocks.clocks[i].total_ticks = to
                 self.clock_changed(i)
                 self.success(source, Component.translatable_args("commands.time.set.absolute", [named_text(name), Argument.Number(Tag.Long(to))]), true)
+                return wrap_time(to)
             },
             TimeAction.Pause => {
                 if self.world.clocks.clocks[i].paused {
@@ -20746,6 +20939,7 @@ impl Network {
                 self.world.clocks.clocks[i].paused = true
                 self.clock_changed(i)
                 self.success(source, Component.translatable_args("commands.time.pause", [named_text(name)]), true)
+                return 1
             },
             TimeAction.Resume => {
                 if not self.world.clocks.clocks[i].paused {
@@ -20754,6 +20948,7 @@ impl Network {
                 self.world.clocks.clocks[i].paused = false
                 self.clock_changed(i)
                 self.success(source, Component.translatable_args("commands.time.resume", [named_text(name)]), true)
+                return 1
             },
             TimeAction.Rate(r) => {
                 if self.world.clocks.clocks[i].rate == r {
@@ -20762,9 +20957,11 @@ impl Network {
                 self.world.clocks.clocks[i].rate = r
                 self.clock_changed(i)
                 self.success(source, Component.translatable_args("commands.time.rate", [named_text(name), Argument.Number(Tag.Float(r))]), true)
+                return 1
             },
             TimeAction.QueryTime => {
                 self.success(source, Component.translatable_args("commands.time.query.absolute", [named_text(name), Argument.Number(Tag.Long(total))]), false)
+                return wrap_time(total)
             },
             TimeAction.QueryTimeline(timeline) => {
                 let (clock_of, current, _) = self.timeline_at(timeline) else fail Failure.alone(Component.literal("Calcite has no timeline {timeline.to_string()}"))
@@ -20772,6 +20969,7 @@ impl Network {
                     fail Failure.alone(Component.translatable_args("commands.time.wrong_timeline_for_clock", [named_text(timeline.to_string()), named_text(name)]))
                 }
                 self.success(source, Component.translatable_args("commands.time.query.timeline", [named_text(timeline.to_string()), Argument.Number(Tag.Long(current))]), false)
+                return wrap_time(current)
             },
             TimeAction.QueryRepetitions(timeline) => {
                 let (clock_of, _, periods) = self.timeline_at(timeline) else fail Failure.alone(Component.literal("Calcite has no timeline {timeline.to_string()}"))
@@ -20779,10 +20977,12 @@ impl Network {
                     fail Failure.alone(Component.translatable_args("commands.time.wrong_timeline_for_clock", [named_text(timeline.to_string()), named_text(name)]))
                 }
                 self.success(source, Component.translatable_args("commands.time.query.timeline.repetitions", [named_text(timeline.to_string()), Argument.Number(Tag.Long(i64(periods)))]), false)
+                return periods
             },
             TimeAction.QueryGameTime => {
                 let time = self.world.game_time
                 self.success(source, Component.translatable_args("commands.time.query.gametime", [Argument.Number(Tag.Long(time))]), false)
+                return wrap_time(time)
             },
         }
     }
@@ -20829,8 +21029,8 @@ impl Network {
 
 
     // `tellraw`, `TellRawCommand`: the message, resolved for each player named in turn, sent
-    // them as a system message (CAL-165).
-    fn tellraw(mut self, source: Source, targets: own Selector, message: own Component) ! Failure {
+    // them as a system message, giving how many (CAL-165).
+    fn tellraw(mut self, source: Source, targets: own Selector, message: own Component) -> i32 ! Failure {
         let who = try self.players_selected(source, targets)
         if who.is_empty() {
             fail Failure.alone(Component.translatable("argument.entity.notfound.player", []))
@@ -20839,12 +21039,13 @@ impl Network {
             let text = try self.resolve_text(source, message, some(slot), 0)
             self.tell_slot(slot, text)
         }
+        return i32.wrap(who.len())
     }
 
     // `title`, `TitleCommand`: to each player named in turn, what it does, a text resolved for
     // them; then the source told, and the operators, `CommandResponseTracker.sendFeedback`: of
-    // the player where there's one, else of how many (CAL-165).
-    fn title(mut self, source: Source, targets: own Selector, action: own TitleAction) ! Failure {
+    // the player where there's one, else of how many, which it gives (CAL-165).
+    fn title(mut self, source: Source, targets: own Selector, action: own TitleAction) -> i32 ! Failure {
         let who = try self.players_selected(source, targets)
         if who.is_empty() {
             fail Failure.alone(Component.translatable("argument.entity.notfound.player", []))
@@ -20885,6 +21086,7 @@ impl Network {
             Component.translatable_args("commands.title.{kind}.multiple", [Argument.Number(Tag.Int(i32.wrap(who.len())))])
         }
         self.success(source, message, true)
+        return i32.wrap(who.len())
     }
 
     // `ComponentUtils.resolve` of `c` for `source`, a score's `*` being the player in `entity`
@@ -21213,13 +21415,10 @@ impl Network {
     }
 
     // `calcite flyspeed`: the player's flying speed set to `speed` times vanilla's, and sent, or
-    // told them (D239).
-    fn fly_speed(mut self, source: Source, speed: f32?) {
-        let slot = source.entity else {
-            self.command_failed(source, Failure.alone(Component.translatable("permissions.requires.player", [])))
-            return
-        }
-        var con = self.connections[slot].take() else return
+    // told them (D239). It gives 1 (D566).
+    fn fly_speed(mut self, source: Source, speed: f32?) -> i32 ! Failure {
+        let slot = source.entity else fail Failure.alone(Component.translatable("permissions.requires.player", []))
+        var con = self.connections[slot].take() else return 1
         if let s = speed {
             con.player.abilities.flying_speed = FLYING_SPEED * s
             let abilities = con.player.abilities
@@ -21230,6 +21429,7 @@ impl Network {
             self.system_message(mut con, Component.literal("Your flying speed is {times} times vanilla's"))
         }
         self.connections[slot] = some(con)
+        return 1
     }
 
     // What a source is known by among the pregen choices: the console, or a player's UUID, by
@@ -21252,8 +21452,8 @@ impl Network {
     // `pregen`, as Chunky's commands: starting, pausing, carrying on with and cancelling the
     // tasks, a dimension's each, saying how they go, and choosing what the source's next one
     // pregenerates, which each source has its own of, Chunky's default until it changes it
-    // (CAL-71, D275). What starts or stops a task is told the operators too.
-    fn pregen_command(mut self, source: Source, c: own PregenCommand) ! Failure {
+    // (CAL-71, D275). What starts or stops a task is told the operators too. It gives 1 (D566).
+    fn pregen_command(mut self, source: Source, c: own PregenCommand) -> i32 ! Failure {
         let key = self.source_key(source)
         var choice = self.choices.get(key) ?? Choice.new()
         match c {
@@ -21407,13 +21607,14 @@ impl Network {
             },
         }
         self.choices.insert(key, choice)
+        return 1
     }
 
     // `calcite dimension`: each player named, or the one who ran it, sent on their way to the
     // dimension `id` names, as a portal would take them, to the place `destination` gives, and
     // moved there once it's loaded (`travel`). Where the world hasn't the dimension, it's
-    // `DimensionArgument`'s failure (CAL-69).
-    fn dimension_command(mut self, source: Source, id: Identifier, targets: own Selector?) ! Failure {
+    // `DimensionArgument`'s failure (CAL-69). It gives 1 (D566).
+    fn dimension_command(mut self, source: Source, id: Identifier, targets: own Selector?) -> i32 ! Failure {
         let to = self.world.dimension_of(id) else fail Failure.alone(Component.translatable("argument.dimension.invalid", [Component.literal(id.to_string())]))
         var who = List<usize>()
         if let t = targets {
@@ -21447,6 +21648,7 @@ impl Network {
             self.levels[to].dispatch()
             self.travels.push(Travel { entity_id: entity_id, to: to, x: x, z: z, told: if me { none } else { some(source) } })
         }
+        return 1
     }
 
     // Where a player at `x`, `z` in the dimension at `from` goes in the one at `to`, as a portal
@@ -26326,6 +26528,33 @@ fn objective_shown(o: Objective) -> Component {
     var inner = text_of(o.display_name.copy())
     inner.style.hover_event = some(HoverEvent.ShowText(Box(Component.literal(o.name.copy()))))
     return Component.translatable("chat.square_brackets", [inner])
+}
+
+// `TimeCommand.wrapTime` (D566): ticks as an int, what's left over dividing them by
+// `Integer.MAX_VALUE`.
+fn wrap_time(ticks: i64) -> i32 {
+    return i32.wrap(ticks % 2147483647)
+}
+
+// The tag `execute store` puts at a path (D566), of the type named, the value scaled, `v`, cast
+// as Java casts it: to an int or a long saturating, to a short or a byte through an int.
+fn stored_tag(kind: String, v: f64) -> Tag {
+    if kind == "int" {
+        return Tag.Int(i32.saturate(v))
+    }
+    if kind == "float" {
+        return Tag.Float(f32.nearest(v))
+    }
+    if kind == "short" {
+        return Tag.Short(i16.wrap(i32.saturate(v)))
+    }
+    if kind == "long" {
+        return Tag.Long(i64.saturate(v))
+    }
+    if kind == "double" {
+        return Tag.Double(v)
+    }
+    return Tag.Byte(i8.wrap(i32.saturate(v)))
 }
 
 // What `CommandResponseTracker` makes of the holders tracked, each by their name as the source's
