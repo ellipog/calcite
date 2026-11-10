@@ -269,12 +269,16 @@ REWARDS_PACK = {
 # returns 7 before it says all it would; `rig:retfail`, which fails; `rig:retrun`, which returns
 # what a command gives; `rig:add` and `rig:double`, `#rig:both`, which give 2 and 3; `rig:count`,
 # which calls itself till it's counted to 10; `rig:deep`, which calls itself till the command
-# quota stops it; `rig:macro`, which needs arguments; `rig:bad`, which can't be read for its `/`;
-# and `#rig:broken`, which can't be built for a function there isn't.
+# quota stops it; `rig:macro`, which says its argument, which `#minecraft:tick` skips, as it has
+# none; `rig:macro2`, a command then a macro line naming one variable twice; `rig:macrotp`, whose
+# line may not read once made; `rig:macroret`, which returns its argument; `#rig:macros`, a macro
+# function and a plain one; `rig:bad`, which can't be read for its `/`; and `#rig:broken`, which
+# can't be built for a function there isn't (D567, D568).
 FUNCS_PACK = {
     "pack.mcmeta": json.dumps({"pack": {"description": "The rig's functions", "min_format": 121, "max_format": 121}}),
     "data/minecraft/tags/function/load.json": json.dumps({"values": ["rig:load"]}),
-    "data/minecraft/tags/function/tick.json": json.dumps({"values": ["rig:tick"]}),
+    "data/minecraft/tags/function/tick.json": json.dumps({"values": ["rig:tick", "rig:macro"]}),
+    "data/rig/tags/function/macros.json": json.dumps({"values": ["rig:macro", "rig:hello"]}),
     "data/rig/tags/function/both.json": json.dumps({"values": ["rig:add", "rig:double"]}),
     "data/rig/tags/function/broken.json": json.dumps({"values": ["rig:hello", "rig:nope"]}),
     "data/rig/function/load.mcfunction": "scoreboard objectives add fn dummy\nscoreboard players set #loaded fn 1\n",
@@ -290,6 +294,9 @@ FUNCS_PACK = {
                                           "execute if score #n fn matches ..9 run \\\n    function rig:count\n",
     "data/rig/function/deep.mcfunction": "scoreboard players add #deep fn 1\nfunction rig:deep\n",
     "data/rig/function/macro.mcfunction": "$say $(x)\n",
+    "data/rig/function/macro2.mcfunction": "say plain\n$say $(a) and $(b) and $(a)\n",
+    "data/rig/function/macrotp.mcfunction": "$tp @s $(x) ~ ~\n",
+    "data/rig/function/macroret.mcfunction": "$return $(v)\n",
     "data/rig/function/bad.mcfunction": "/say hi\n",
 }
 
