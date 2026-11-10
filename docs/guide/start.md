@@ -16,6 +16,8 @@ Each night the newest commit on `main` whose tests passed is built for Windows a
 
 A nightly has passed Calcite's tests and nothing more, so back up a world before you open it with one. Each archive unpacks to a folder, `calcite`, with the server, its `LICENSE`, `NOTICE` and a short readme. Start the server in that folder, or copy it to the folder you want the server's files in, and go on at [Start it](#start-it).
 
+The download page can also [set the server up first](https://calcitemc.com/download#setup). Pick a preset, such as survival with friends or a flat creative world, change what you like, list the players who may join, and the archive comes with `server.properties`, `whitelist.json`, `ops.json`, `calcite.properties` and a `server-icon.png` in it, unpacking to a folder named after the server. It's put together in your browser.
+
 On Linux the build needs a glibc at least as new as the one the release notes name.
 
 ## What you need to build it
@@ -82,7 +84,8 @@ A file or a pipe, which is how hosting panels run a server, gets vanilla's exact
 
 The whitelist is on, as vanilla's is by default, and Calcite has no command to change it yet. Either:
 
-- turn it off, with `white-list=false` in `server.properties`; or
+- turn it off, with `white-list=false` in `server.properties`;
+- list the players when you [set it up on the download page](https://calcitemc.com/download#setup), which looks each name up with Mojang and writes `whitelist.json`, and `ops.json` for those you mark op; or
 - add each player to `whitelist.json`, as vanilla writes it:
 
   ```json

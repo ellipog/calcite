@@ -36,7 +36,7 @@ The site is then at http://localhost:3000. Under `next dev` it also serves two i
 | `/docs` and `/docs/*` | `docs/guide/*.md`, `docs/pregen.md` and `plugins/api/HOST_API.md`, in the order `docs/guide/README.md` lists them |
 | `/plugins` | Sections of `plugins/api/HOST_API.md` and `plugins/samples/README.md`, and the samples' code |
 | `/roadmap` | `docs/PLAN.md`'s table and phase sections, and the status line in the top-level `README.md` |
-| `/download` | The nightly release's `nightly.json`, which `.github/workflows/nightly.yml` publishes beside the archives, read at most once an hour; the buttons link the archives' fixed addresses |
+| `/download` | The nightly release's `nightly.json`, which `.github/workflows/nightly.yml` publishes beside the archives, read at most once an hour; the buttons link the archives' fixed addresses. Its setup is `src/components/site/setup/` and `src/lib/setup/`, with Calcite's own defaults from `src/server/config.calx` by way of `src/lib/data.ts` |
 
 ### Benchmark numbers
 
@@ -60,6 +60,25 @@ To add a page, write it in `docs/guide/` with front matter and add it to the lis
 Everything drawn is cobalt on paper, with every lighter blue a Bayer pattern. Text alone has six more blues, solid, as `--text-color-*` in `src/app/globals.css`, so they make `text-*` utilities and no fills or borders. Cobalt stays the signature: the mark, the name, headings, links, labels, buttons, nav and numbers. Running text, which is `p`, `li`, `td`, `dd`, `blockquote` and `figcaption`, takes the deep blue (`--read`) by itself, and inside `text-paper` both go to paper. The brand guide's Colour section lists each blue, what it's for and its contrast on paper, all at least 4.5:1.
 
 `CodeBlock` highlights code in those blues when its `lang` is one `src/lib/highlight.ts` reads: Calx, shell, PowerShell, `.properties`, TOML or JSON. It's a small tokenizer, a line at a time, with Calx's keywords taken from `calx/compiler/src/lexer.h`. Keywords and the keys of `.properties`, TOML and JSON are cobalt, names being called are 500, strings are toward ice, numbers and annotations azure, types indigo, punctuation soft and comments faint. Other languages, and `text`, are drawn plain.
+
+### The download page's setup
+
+Under the two plain downloads, "Set it up first" (`src/components/site/setup/setup.tsx`) makes a server's files before it's downloaded. It starts from a preset (vanilla, friends, creative, hardcore, public, flat test) and offers the settings a new server needs on its first day, each a key Calcite reads: the name, the MOTD with `&` colour codes, the icon, game mode, difficulty, hardcore, players at once, spawn protection, the world's type, seed and folder, structures, the view and simulation distances, online mode, the whitelist, the port, pausing when empty, the login throttle and the console dashboard. A preset sets how the game plays and who gets in, never the name, the MOTD, the icon, the players or the port. `src/lib/setup/settings.ts` holds the presets and writes the files:
+
+- `server.properties`, with the keys the setup decides, sorted as vanilla writes them, and the MOTD's section signs and anything past ASCII as `\u` escapes, which read the same whether the file is read as UTF-8 or ISO-8859-1. Calcite adds every other key when it first starts.
+- `whitelist.json` with every player listed, and `ops.json` with those marked op, at level 4, each only when there's someone in it. In online mode each player's UUID is their account's; in offline mode it's made from the name, as vanilla's `UUIDUtil.createOfflinePlayerUUID` makes it (`offlineId()`, with MD5 from `src/lib/setup/md5.ts`).
+- `calcite.properties`, only when the dashboard or the throttle isn't at its default: Calcite's own default file, with those two values in place, so its comments come too. `scripts/data.ts` copies that default text from `default_text()` in `src/server/config.calx` into `src/lib/data.ts`, since the page is regenerated where only `site/` is deployed.
+- `server-icon.png`: any image, scaled to 64 × 64 on a canvas, either filling the square with its middle cut out or fitted whole on a clear ground, and without smoothing when it's that small already, as pixel art is.
+
+The download buttons sit beside the settings, sticky on a wide screen, and again under them, where a phone reaches them.
+
+Beside the settings, the server is drawn as the game's server list shows it, with the MOTD's colours and formats, and each file is shown as it'll be written. A name typed under Players is looked up as typing stops, through `/api/player/[name]` (`src/app/api/player/[name]/route.ts`), since Mojang's API sends no CORS headers. That route asks Mojang for the account's UUID and its skin, for the face, which the page cuts out of the skin with CSS so it needn't read the image across origins. Answers are kept a day, and a name with no account ten minutes. Players that come from a link are looked up for their faces, and a UUID from the link stays even if the name has since passed to another account.
+
+The download is the real nightly with the files added, put together in the browser by `src/lib/setup/archive.ts`. GitHub's release downloads send no CORS headers either, so `/download/archive/[file]` (`src/app/(site)/download/archive/[file]/route.ts`) passes the two archives through, and nothing the setup sets is sent to it. The zip's entries are copied as they're compressed, renamed from `calcite/` to the server's folder, and the files are stored after them with a new central directory. The tar.gz is unzipped with the browser's `DecompressionStream`, its headers renamed and their checksums made again, the files appended as ustar entries and the whole zipped again with `CompressionStream`. The executable's mode stays as it was. "Just the files" zips the files alone, for a server that's already set up.
+
+"Copy a link to this setup" puts what differs from vanilla's defaults in the address's fragment, which a browser never sends to a server, as base64url JSON; the icon stays out, being too big for an address. Opening such a link fills the setup in and scrolls to it, each value checked against its type and range as it's read.
+
+The archive route streams about 11 MB a download. Whether a host's functions pass a response that size through has to be checked on a preview deploy before this goes live (CAL-235).
 
 ### The home page's world
 

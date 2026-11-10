@@ -89,11 +89,13 @@ export function Fieldset({ legend, children, className }: { legend: ReactNode; c
 }
 
 // A row of choices, one solid; the chosen one fills in through the matrix. Radios underneath, so
-// it works without script and with arrow keys; FocusRing draws round the visible part.
-export function Segmented({ label, name, options, defaultValue, onChange }: { label: string; name: string; options: string[]; defaultValue?: string; onChange?: (v: string) => void }) {
+// it works without script and with arrow keys; FocusRing draws round the visible part. Given
+// `value`, it shows that and leaves the choosing to `onChange`. Disabled, it can't be changed or
+// pointed at, and nothing else changes: no dots behind its words.
+export function Segmented({ label, name, options, defaultValue, value, disabled, onChange, className }: { label: string; name: string; options: string[]; defaultValue?: string; value?: string; disabled?: boolean; onChange?: (v: string) => void; className?: string }) {
 	const id = `seg-${name}`;
 	return (
-		<div className="grid max-w-[340px] gap-1.5">
+		<div className={cn('grid max-w-[340px] gap-1.5', disabled && '[&_label]:pointer-events-none', className)} aria-disabled={disabled || undefined}>
 			<span className="label" id={id}>
 				{label}
 			</span>
@@ -104,7 +106,8 @@ export function Segmented({ label, name, options, defaultValue, onChange }: { la
 							type="radio"
 							name={name}
 							value={o}
-							defaultChecked={o === (defaultValue ?? options[0])}
+							{...(value !== undefined ? { checked: o === value } : { defaultChecked: o === (defaultValue ?? options[0]) })}
+								disabled={disabled}
 							onChange={() => onChange?.(o)}
 							data-ring="next"
 							className="peer absolute m-0 size-px opacity-0"

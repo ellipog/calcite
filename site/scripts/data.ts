@@ -105,7 +105,20 @@ const data = {
 	},
 	light: { commit: lightCommit, runs: light },
 	bots: { commit: short(botsW.commit), runs: botsW.runs, scenario: botsW.scenario, windows: bots(botsW), linux: bots(botsL) },
+	calciteProperties: calciteProperties(),
 };
+
+// The calcite.properties Calcite writes on its first start, from default_text() in
+// src/server/config.calx. The download page's setup ships it with the values picked, and that page
+// is regenerated where only site/ is deployed, so it can't read src/ itself.
+function calciteProperties() {
+	const src = readFileSync('../src/server/config.calx', 'utf8').replace(/\r\n/g, '\n');
+	const body = src.slice(src.indexOf('pub fn default_text()'));
+	const end = body.indexOf('\n}');
+	const lines = [...body.slice(0, end).matchAll(/push_str\("((?:[^"\\]|\\.)*)"\)|String\("((?:[^"\\]|\\.)*)"\)/g)].map((m) => (m[1] ?? m[2]).replace(/\\n$/, '').replace(/\\"/g, '"').replace(/\\\\/g, '\\'));
+	if (lines.length < 10 || !lines.some((l) => l.startsWith('login-throttle='))) throw new Error('src/server/config.calx: default_text moved; fix calciteProperties in site/scripts/data.ts');
+	return lines.join('\n') + '\n';
+}
 
 writeFileSync(
 	'src/lib/data.ts',

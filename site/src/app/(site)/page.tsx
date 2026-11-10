@@ -6,8 +6,8 @@ import { Flyover } from '@/components/flyover';
 import { GenSteps } from '@/components/site/gen-steps';
 import { TickBand } from '@/components/site/tick-band';
 import { Band, Kicker, PhaseStrip, SectionHead, Stats } from '@/components/site/parts';
-import { ButtonLink } from '@/components/ui/button';
-import { Tag } from '@/components/ui/feedback';
+import { buttonClass, ButtonLink } from '@/components/ui/button';
+import { Disclosure, Tag } from '@/components/ui/feedback';
 import { CodeBlock } from '@/components/ui/overlay';
 import { Tabs } from '@/components/ui/tabs';
 import { cn } from '@/lib/cn';
@@ -113,7 +113,7 @@ export default function Home() {
 							{SITE.lead}
 						</p>
 						<div className="mt-6 flex flex-wrap gap-2.5">
-							<ButtonLink href="/docs/start">Get started</ButtonLink>
+							<ButtonLink href="/download">Download</ButtonLink>
 							<ButtonLink href="/benchmarks" variant="secondary">
 								Benchmarks
 							</ButtonLink>
@@ -278,16 +278,33 @@ export default function Home() {
 					<SectionHead
 						className="mb-0"
 						title="Get started"
-						lead={<p>Install Calx, build Calcite with one command, and start it in a folder of its own, as you would vanilla&apos;s server. The guide has each step, and what to set up after.</p>}
+						lead={<p>Download last night&apos;s build for Windows or Linux and start it in a folder of its own, as you would vanilla&apos;s server. Or set it up first, and the download comes with its settings, its whitelist and its icon in it.</p>}
 						more={
 							<Link href="/docs/start" className="link">
 								Getting started
 							</Link>
 						}
 					/>
-					<Tabs
-						label="Your system"
-						tabs={[
+					<div className="grid min-w-0 content-start gap-6">
+						<div className="flex flex-wrap gap-2.5">
+							<a href={SITE.nightly + 'calcite-windows-x64.zip'} className={buttonClass()}>
+								Download for Windows
+							</a>
+							<a href={SITE.nightly + 'calcite-linux-x64.tar.gz'} className={buttonClass({ variant: 'secondary' })}>
+								Download for Linux
+							</a>
+						</div>
+						<p className="text-[17px] leading-normal">
+							<Link href="/download#setup" className="link">
+								Set it up first
+							</Link>
+							: start from a preset, list who may join, give it a name and an icon, and the download comes ready to start.
+						</p>
+						<Disclosure summary="Or build it from source">
+							<p className="mb-4 max-w-[62ch] text-[15px] leading-normal">Install Calx, then build Calcite with one command.</p>
+							<Tabs
+								label="Your system"
+								tabs={[
 							{
 								title: 'Windows',
 								content: (
@@ -307,7 +324,9 @@ export default function Home() {
 								),
 							},
 						]}
-					/>
+							/>
+						</Disclosure>
+					</div>
 				</div>
 			</Band>
 		</>

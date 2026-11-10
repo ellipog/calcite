@@ -1,10 +1,12 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { Band, PageHead, SectionHead } from '@/components/site/parts';
+import { Setup } from '@/components/site/setup/setup';
 import { buttonClass } from '@/components/ui/button';
-import { Callout } from '@/components/ui/feedback';
+import { Callout, Disclosure } from '@/components/ui/feedback';
 import { CodeBlock } from '@/components/ui/overlay';
 import { Panel } from '@/components/ui/text';
+import { DATA } from '@/lib/data';
 import { JsonLd, trail } from '@/lib/ld';
 import { meta } from '@/lib/meta';
 import { PAGES } from '@/lib/pages';
@@ -59,6 +61,7 @@ const mb = (bytes: number) => `${(bytes / 1048576).toFixed(1)} MB`;
 
 export default async function Download() {
 	const n = await nightly();
+	const size = (file: string) => n?.assets.find((a) => a.name === file)?.size;
 	return (
 		<>
 			<JsonLd things={[trail([[PAGES.download.title, PAGES.download.path]])]} />
@@ -88,13 +91,17 @@ export default async function Download() {
 									Download for {b.system}
 									{asset && <span className="font-mono text-xs font-normal">{mb(asset.size)}</span>}
 								</a>
-								<CodeBlock code={b.start} lang={b.lang} comment={null} />
-								{asset && (
-									<p className="font-mono text-xs leading-normal break-all">
-										<span className="label mr-2">sha-256</span>
-										{asset.sha256}
-									</p>
-								)}
+								<Disclosure summary="How to start it">
+									<div className="grid gap-4 pt-1 pb-1">
+										<CodeBlock code={b.start} lang={b.lang} comment={null} />
+										{asset && (
+											<p className="font-mono text-xs leading-normal break-all">
+												<span className="label mr-2">sha-256</span>
+												{asset.sha256}
+											</p>
+										)}
+									</div>
+								</Disclosure>
 							</Panel>
 						);
 					})}
@@ -117,9 +124,26 @@ export default async function Download() {
 					<a href={SITE.nightlyRelease} className="link">
 						the release on GitHub
 					</a>
-					.
+					. Or{' '}
+					<a href="#setup" className="link">
+						set it up first
+					</a>
+					, and the download comes with its settings in it.
 				</p>
 			</section>
+
+			<Band id="setup">
+				<SectionHead
+					split
+					title="Set it up first"
+					lead={
+						<p>
+							Pick how the server should run, and the download comes ready: server.properties, the whitelist and ops, Calcite&apos;s own settings and the icon, in the folder it unpacks to. It&apos;s all put together in your browser, so nothing you set is sent anywhere, except the names you look up, which go to Mojang.
+						</p>
+					}
+				/>
+				<Setup defaults={DATA.calciteProperties} sizes={{ windows: size('calcite-windows-x64.zip'), linux: size('calcite-linux-x64.tar.gz') }} />
+			</Band>
 
 			<Band>
 				<SectionHead
@@ -131,7 +155,7 @@ export default async function Download() {
 					{[
 						['Settings', 'It writes server.properties with every setting vanilla has, at its default, and calcite.properties with its own.'],
 						["Vanilla's data", "It reads vanilla's data from Minecraft 26.3's client jar: the game's copy if a launcher has installed it, or else just the part of the jar that holds it, downloaded from Mojang and checked against its pinned hash."],
-						['Players', 'The whitelist is on, as vanilla’s is by default. Turn it off with white-list=false, or list each player in whitelist.json, then restart it.'],
+						['Players', 'The whitelist is on, as vanilla’s is by default. List the players in the setup above, or turn it off with white-list=false, or list each player in whitelist.json, then restart it.'],
 					].map(([title, text]) => (
 						<div key={title} className="grid content-start gap-2 rule p-5">
 							<h3 className="font-display text-lg leading-tight font-bold">{title}</h3>
