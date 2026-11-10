@@ -17,9 +17,10 @@ of its own and each test's files go in a temp folder of its own. A test that tal
 or writes to a fixed folder under build/, is only built then, and run alone once the rest are
 done, debug then release: its clients wait for the server's answers only so long, which a machine
 busy with builds can outlast, and its two runs would share the folder. calx keeps the programs it
-builds, so `calx run` then runs the one just built. `--shard K/N` runs the K-th of N parts, the
-builds dealt out heaviest first to the lightest part, so CI's jobs share them evenly; every part
-works out the same deal.
+builds, so `calx run` then runs the one just built. Its debug and release builds are dealt each
+on its own, weighed with what its run costs. `--shard K/N` runs the K-th of N parts, the builds
+dealt out heaviest first to the lightest part, so CI's jobs share them evenly; every part works
+out the same deal.
 
     py -I src/test/run.py [--jobs N] [--shard K/N] [TEST ...]
 """
@@ -47,6 +48,11 @@ OUT = re.compile(r"//\s*out:\s?(.*)$")
 IMPORT = re.compile(r"^import ([A-Za-z_][\w.]*?)(?:\.\{|\s*$)", re.M)
 # A test that's run alone: one that talks over sockets, or names a folder under build/.
 ALONE = re.compile(r'"build/|listen\("127|connect\("127|\.poll\(')
+# What a test run alone costs on top of its build, as weight: the seconds each of its runs took
+# on CI's Windows runners, the slowest, on 2026-11-10, at about as much weight a second as a
+# part's builds got through there. A part waits for its tests run alone, so they're dealt by it.
+RUN_SECONDS = {"play": 176, "login": 80, "configuration": 32, "server": 31, "replay": 4}
+WEIGHT_PER_SECOND = 10000
 MODES = ([], ["--release"])
 EXE = ".exe" if sys.platform == "win32" else ""
 
@@ -123,21 +129,19 @@ def tasks(calx, tmp):
         source = test.read_text(encoding="utf-8")
         weight = weights.of(source)
         if ALONE.search(source):
-            built = {}
+            extra = RUN_SECONDS.get(test.stem, 0) * WEIGHT_PER_SECOND
+            for mode in MODES:
+                built = {}
 
-            def make(rel=rel, built=built):
-                results = []
-                for m in MODES:
-                    r = build(calx, rel, m, Path(tmp) / f"{Path(rel).stem}{'-release' if m else ''}{EXE}")
-                    built[bool(m)] = r.returncode == 0
-                    if r.returncode != 0:
-                        results.append((f"{rel} builds", m, False, r))
-                return results
+                def make(rel=rel, mode=mode, built=built):
+                    r = build(calx, rel, mode, Path(tmp) / f"{Path(rel).stem}{'-release' if mode else ''}{EXE}")
+                    built["ok"] = r.returncode == 0
+                    return [] if r.returncode == 0 else [(f"{rel} builds", mode, False, r)]
 
-            def alone(rel=rel, built=built):
-                return [(rel, m, passed(r), r) for m in MODES if built.get(bool(m)) for r in [run(calx, rel, m)]]
+                def alone(rel=rel, mode=mode, built=built):
+                    return [(rel, mode, passed(r), r) for r in [run(calx, rel, mode)]] if built.get("ok") else []
 
-            out.append(Task(rel, 2 * weight, make, alone))
+                out.append(Task(f"{rel} {'release' if mode else 'debug'}", weight + extra, make, alone))
         else:
             for mode in MODES:
                 out.append(Task(f"{rel} {'release' if mode else 'debug'}", weight,
