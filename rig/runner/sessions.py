@@ -2056,6 +2056,25 @@ def compare_storage(config):
     return same
 
 
+def compare_scheduled(config):
+    """Whether both servers saved the functions `schedule` has waiting the same (D569),
+    `data/minecraft/scheduled_events.dat`, its root with its keys in the order written, printing
+    what differs. Nothing's printed where neither saved any."""
+    kept = {}
+    for side in ("vanilla", "calcite"):
+        path = SESSIONS / config / side / "world" / "data" / "minecraft" / "scheduled_events.dat"
+        kept[side] = ordered(nbt.read(path)) if path.is_file() else None
+    if kept["vanilla"] is None and kept["calcite"] is None:
+        return True
+    same = kept["vanilla"] == kept["calcite"]
+    events = len(nbt.read(SESSIONS / config / "vanilla" / "world" / "data" / "minecraft" / "scheduled_events.dat")
+                 .get("data", {}).get("events", [])) if kept["vanilla"] is not None else 0
+    print(f"saved schedule {'PASS' if same else 'differs'}    {events} events")
+    if not same:
+        print(f"  [{config}] scheduled_events:\n      vanilla: {kept['vanilla']}\n      calcite: {kept['calcite']}")
+    return same
+
+
 def compare_book(config, name):
     """Whether both servers saved the player `name`'s recipe book the same, their data's
     `recipeBook` (CAL-164): its tabs' settings, and the recipes known and highlighted, each list
@@ -2177,7 +2196,8 @@ def main():
                 + [compare_saved(c, MATE) for c in configs if CONFIGS[c].mate is not None and scenarios[c]]
                 + [compare_progress(c) for c in configs if scenarios[c]]
                 + [compare_scoreboard(c) for c in configs if scenarios[c]]
-                + [compare_storage(c) for c in configs if scenarios[c]])
+                + [compare_storage(c) for c in configs if scenarios[c]]
+                + [compare_scheduled(c) for c in configs if scenarios[c]])
     for c in configs:
         if CONFIGS[c].fixture is not None and scenarios[c]:
             compare_chunks(c, args.show)
