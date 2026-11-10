@@ -298,6 +298,15 @@ FUNCS_PACK = {
     "data/rig/function/macrotp.mcfunction": "$tp @s $(x) ~ ~\n",
     "data/rig/function/macroret.mcfunction": "$return $(v)\n",
     "data/rig/function/bad.mcfunction": "/say hi\n",
+    "data/rig/function/pred.mcfunction": "execute store result score #pred fn if predicate rig:player\n"
+                                         "execute store result score #always fn if predicate rig:always\n",
+    "data/rig/predicate/always.json": json.dumps({"type": "minecraft:random_chance", "chance": 1.0}),
+    "data/rig/predicate/never.json": json.dumps({"type": "minecraft:inverted", "term": "rig:always"}),
+    "data/rig/predicate/coin.json": json.dumps({"type": "minecraft:random_chance", "chance": 0.5}),
+    "data/rig/predicate/player.json": json.dumps({"type": "minecraft:entity_properties", "entity": "this",
+                                                  "predicate": {"minecraft:entity_type": "minecraft:player"}}),
+    "data/rig/predicate/overworld.json": json.dumps({"type": "minecraft:location_check",
+                                                     "predicate": {"dimension": "minecraft:overworld"}}),
 }
 
 C = nbt.COMPOUND

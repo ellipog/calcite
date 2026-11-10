@@ -9,7 +9,7 @@ module command.dispatcher
 
 import chat.component.{Argument as TextArgument, Component, Contents, Style}
 import command.coordinates.{Coordinates, block_pos, rotation, vec3}
-import command.reader.{Reader}
+import command.reader.{Reader, is_identifier_unit}
 import protocol.wire.{Reader as WireReader}
 import command.selector.{Ints, Selector, read_entities, read_ints}
 import command.tree.{NODES, node_facts, node_names, node_parents, node_properties, node_redirects, suggestion_names}
@@ -19,6 +19,7 @@ import nbt.snbt.{SyntaxError, compound_at, from_units, tag_at, units_of}
 import nbt.tag.{Tag}
 import registry.builtin.{builtin_entries, builtin_names}
 import registry.components.{ItemCodecs}
+import registry.loot_tables.{LootCodecs}
 import registry.registry.{Registry}
 import resources.identifier.{Identifier}
 import world.modes.{GameType}
@@ -105,6 +106,10 @@ pub enum ArgType {
     BlockPredicate
     /// `minecraft:function`: a function's ID, or after `#` a tag's, `FunctionArgument` (D567).
     Function
+    /// `minecraft:loot_predicate`, `minecraft:loot_modifier` and `minecraft:loot_table`: an entry
+    /// of the reloadable registry named, by its ID, or given inline, as SNBT,
+    /// `ResourceOrIdArgument` (D570).
+    Loot(String)
     /// A type Calcite doesn't read yet, by its name.
     Unread(String)
 }
@@ -159,6 +164,9 @@ pub struct Tree {
     /// The blocks a `block_state` argument names, which the server gives it once its registries
     /// are loaded (CAL-165).
     pub blocks: Shared<BlockNames>? = none
+    /// The codecs loot arguments read what's given inline with, which the server gives it once
+    /// its registries are loaded (D570).
+    pub loot: Shared<LootCodecs>? = none
 }
 
 /// The blocks, with their states, and those whose states have block entities, by their IDs; and
@@ -384,6 +392,9 @@ pub enum Value {
     BlockTest(BlockTest)
     /// A function's ID, or a tag's where it's a tag (D567).
     Function(Identifier, bool)
+    /// A loot predicate, item modifier or table: the ID of the entry named, as `Tag.Str`, or
+    /// what was given inline, as its codec writes it (D570).
+    Loot(Tag)
 }
 
 /// A score holder argument as written, `ScoreHolderArgument.Result` (CAL-165): a selector, or a
@@ -1297,7 +1308,7 @@ fn read_node(t: Tree, at: usize, r: mut Reader, context: mut Context, level: i32
             r.at += units_of(t.nodes[at].name).len()
         },
         Kind.Argument(reads) => {
-            let value = try read_argument(reads, mut r, level, types, t.resources, t.items, t.blocks)
+            let value = try read_argument(reads, mut r, level, types, t.resources, t.items, t.blocks, t.loot)
             context.arguments.push(Argument { name: t.nodes[at].name.copy(), start: start, end: r.at, value: value })
         },
         Kind.Root => {},
@@ -1309,7 +1320,7 @@ fn read_node(t: Tree, at: usize, r: mut Reader, context: mut Context, level: i32
 }
 
 // An argument of the type `reads`, as its `parse` reads it from the reader's place.
-fn read_argument(reads: ArgType, r: mut Reader, level: i32, types: Registry, resources: List<ResourceNames>, items: Shared<ItemCodecs>?, blocks: Shared<BlockNames>?) -> Value ! SyntaxError {
+fn read_argument(reads: ArgType, r: mut Reader, level: i32, types: Registry, resources: List<ResourceNames>, items: Shared<ItemCodecs>?, blocks: Shared<BlockNames>?, loot: Shared<LootCodecs>?) -> Value ! SyntaxError {
     let start = r.at
     match reads {
         ArgType.Bool => return Value.Bool(try r.read_boolean()),
@@ -1582,6 +1593,34 @@ fn read_argument(reads: ArgType, r: mut Reader, level: i32, types: Registry, res
                 r.skip()
             }
             return Value.Function(try r.read_identifier(), tag)
+        },
+        ArgType.Loot(registry) => {
+            // `ResourceOrIdArgument.parse`: its grammar's identifier, else a tag as SNBT; then the
+            // entry the identifier names, which must be there, else `no_such_element`, or what
+            // the registry's codec reads of the tag, else `failed_to_parse`, each after what was
+            // read. A registry the tree wasn't given doesn't read yet.
+            var known: List<Identifier>? = none
+            for n in resources {
+                if n.registry == registry {
+                    known = some(n.names.copy())
+                }
+            }
+            let names = known else fail SyntaxError { message: Component.literal("Calcite can't read {registry} entries yet"), input: r.text.copy(), cursor: r.at }
+            let codecs = loot else fail SyntaxError { message: Component.literal("Calcite can't read {registry} entries yet"), input: r.text.copy(), cursor: r.at }
+            if let id = loot_identifier(mut r) {
+                for n in names {
+                    if n.namespace == id.namespace and n.path == id.path {
+                        return Value.Loot(Tag.Str(id.to_string()))
+                    }
+                }
+                fail r.error_here("argument.resource_or_id.no_such_element", [Component.literal(id.to_string()), Component.literal(registry)])
+            }
+            let (tag, end) = try tag_at(r.units, r.text, r.at)
+            r.at = end
+            return match codecs.value.read(registry, tag) {
+                ok(v) => Value.Loot(v),
+                err(why) => fail r.error_here("argument.resource_or_id.failed_to_parse", [Component.literal(why)]),
+            }
         },
         ArgType.Unread(name) => fail SyntaxError { message: Component.literal("Calcite can't read {name} arguments yet"), input: r.text.copy(), cursor: r.at },
     }
@@ -2098,6 +2137,15 @@ fn arg_type(name: String, properties: List<u8>) -> ArgType {
     if name == "block_predicate" {
         return ArgType.BlockPredicate
     }
+    if name == "loot_predicate" {
+        return ArgType.Loot(String("minecraft:predicate"))
+    }
+    if name == "loot_modifier" {
+        return ArgType.Loot(String("minecraft:item_modifier"))
+    }
+    if name == "loot_table" {
+        return ArgType.Loot(String("minecraft:loot_table"))
+    }
     if name == "resource" {
         // Its registry's name, as the packet writes a string.
         var w = WireReader.new(properties.copy())
@@ -2107,6 +2155,29 @@ fn arg_type(name: String, properties: List<u8>) -> ArgType {
         }
     }
     return ArgType.Unread(name.copy())
+}
+
+// `IdentifierParseRule`: past any whitespace, `Identifier.readNonEmpty`, or none, the reader back
+// where it was, where there's none there or what's there isn't one, as the grammar then tries
+// its other choice from there (D570).
+fn loot_identifier(r: mut Reader) -> Identifier? {
+    let start = r.at
+    r.skip_whitespace()
+    let from = r.at
+    while r.can_read() and is_identifier_unit(r.peek()) {
+        r.skip()
+    }
+    if r.at == from {
+        r.at = start
+        return none
+    }
+    match Identifier.parse(from_units(r.units, from, r.at)) {
+        ok(id) => return some(id),
+        err(_) => {
+            r.at = start
+            return none
+        },
+    }
 }
 
 // `size` bytes from `at`, high first, as a `u64`.
