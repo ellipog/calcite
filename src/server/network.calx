@@ -39,9 +39,12 @@ import protocol.wire.{DecodeError, Reader, Writer, Wire, Packet, write_packet}
 import random.any.{AnyRandom}
 import random.legacy.{LegacyRandom}
 import random.worldgen.{WorldgenRandom}
+import pack.repository.{Repository, discover}
+import pack.vanilla.{data_path, vanilla_data}
 import registry.builtin.{builtin_entries, builtin_names}
 import registry.codec.{same}
 import registry.components.{ItemCodecs}
+import registry.load.{reload_registries}
 import registry.loot_tables.{LootCodecs}
 import registry.registries.{Registries}
 import registry.registry.{Registry}
@@ -55,11 +58,11 @@ import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, Message
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
 import server.commands.{Condition, DataAction, ItemAction, ItemFrom, ItemTarget, SlotsGiven, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, FunctionArgs, ScheduleAction, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
-import server.configuration.{Configuration}
+import server.configuration.{Configuration, update_tags}
 import server.layout.{Layout, Placed}
 import server.level.{ChunkPacket, Dropped, Heard, Level, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
 import server.link.{FileRead, Input, Link, Report}
-import server.functions.{Function, instantiate, read_function}
+import server.functions.{Function, FunctionFiles, instantiate, read_function}
 import server.log.{Entry, Look}
 import server.pregen.{Choice, Run, Shape, Task as PregenTask, blocks, saved_data as pregen_data, saved_id as pregen_saved_id}
 import server.sending.{Outbox, Sending}
@@ -150,7 +153,7 @@ import world.scheduled.{Scheduled as ScheduledRun, saved_id as scheduled_id}
 import world.scoreboard.{Change, Objective, RULE_ALWAYS, RULE_OTHER_TEAMS, RULE_OWN_TEAM, ScoreSent, Team, color_name, color_rgb, format_on_wire, read_only, saved_id as scoreboard_id, slot_name, team_pushes}
 import world.random_ticks.{TickPlace, Viewer}
 import world.advancements.{Advancements, DisplayInfo, Listener, PlayerAdvancements}
-import world.recipes.{RecipeBook, Stonecutting}
+import world.recipes.{RecipeBook, Recipes, Stonecutting}
 import world.spawners.{SpawnerPlayer, SpawnerView, Spawners, trader_id}
 import world.spawn.{BORDER_HALF, Candidate, DEFAULT_RESPAWN_RADIUS, SpawnSearch, border_distance, candidate_count, fits, fixup_height, search_radius}
 import world.stats.{PlayerStats, stat_ids}
@@ -1511,6 +1514,11 @@ pub struct Network {
     function_names: Registry? = none
     ticking: List<usize> = List<usize>()
     post_reload: bool = false
+    // Whether the functions `/reload` read are yet to take the library's place, which they do
+    // once nothing running holds the places of those it has: the command queue, and the loops
+    // that run `#minecraft:tick`'s and those scheduled, `function_loops` deep (D572).
+    library_due: bool = false
+    function_loops: i32 = 0
     // The configuration and play packets that wait for the next tick, in the order they came on
     // every connection, as `PacketProcessor` holds them (CAL-150).
     scheduled: Deque<Scheduled> = Deque<Scheduled>()
@@ -5596,28 +5604,12 @@ impl Network {
         // The recipes' property sets and the stonecutter's recipes (CAL-146). Then their
         // permission level, as `sendPlayerPermissionLevel` sends it, an entity event from 24 up,
         // and the commands it lets them use.
-        var sets = List<ItemSet>()
-        var stonecutter = Stonecutting()
-        if let shared = self.world.recipes.copy() {
-            for (key, items) in shared.value.item_sets {
-                sets.push(ItemSet { key: key.copy(), items: items.copy() })
-            }
-            stonecutter = shared.value.stonecutter.copy()
-        }
-        self.send(mut con, ClientboundUpdateRecipes { item_sets: sets, stonecutter: stonecutter }, State.Play)
+        let update = self.update_recipes()
+        self.send(mut con, update, State.Play)
         let level = con.player.level
         self.send(mut con, ClientboundEntityEvent { entity_id: id, event: i8.wrap(24 + level) }, State.Play)
         self.send(mut con, tree(level), State.Play)
-        self.send(mut con, ClientboundRecipeBookSettings { crafting: closed_tab(), furnace: closed_tab(), blast_furnace: closed_tab(), smoker: closed_tab() }, State.Play)
-        // `sendInitialRecipeBook`: what they know, highlighted where they're yet to look at it.
-        var known = BookRecipes {}
-        if let shared = self.world.recipes.copy() {
-            var w = Writer.new()
-            let count = con.player.recipe_book.write_known(shared.value, mut w)
-            let problem = w.problem()
-            known = BookRecipes { count: count, bytes: w.into_bytes(), problem: problem }
-        }
-        self.send(mut con, ClientboundRecipeBookAdd { recipes: known, replace: true }, State.Play)
+        self.send_recipe_book(mut con)
         self.send_scoreboard(mut con)
         let joined = Component.translatable("multiplayer.player.joined", [self.player_name(profile)]).colored("yellow")
         self.broadcast_system(joined, Look.Quiet)
@@ -18265,6 +18257,7 @@ impl Network {
                     err(f) => done = some(f),
                 }
             },
+            Parsed.Reload => result = self.reload(source),
             Parsed.Unrun(_) => done = some(Failure.alone(Component.literal("Calcite doesn't run this command yet"))),
         }
         if let f = done {
@@ -18351,6 +18344,7 @@ impl Network {
         if self.functions.is_empty() {
             return
         }
+        self.function_loops += 1
         if self.post_reload {
             self.post_reload = false
             var load = List<usize>()
@@ -18367,12 +18361,17 @@ impl Network {
         for f in ticking {
             self.run_function(f)
         }
+        self.function_loops -= 1
+        if self.library_due and self.function_loops == 0 {
+            self.replace_library()
+        }
     }
 
     // `TimerQueue.tick` (D569): each event due by `now`, in turn, taken off then run: a function,
     // `FunctionCallback`, where there's one of its ID, or each of a tag's, `FunctionTagCallback`,
     // each run alone by the game loop's source.
     fn tick_schedule(mut self, now: i64) {
+        self.function_loops += 1
         while let run = self.world.scheduled.next_due(now) {
             var called = List<usize>()
             if let names = self.function_names {
@@ -18393,6 +18392,205 @@ impl Network {
                 self.run_function(f)
             }
         }
+        self.function_loops -= 1
+        if self.library_due and self.function_loops == 0 {
+            self.replace_library()
+        }
+    }
+
+    // `replaceLibrary` (D572): the functions `/reload` read in the library's place, read as the
+    // first tick reads them, so those of `#minecraft:tick` are what runs from then, and those of
+    // `#minecraft:load` run at the next tick's start, `postReload`.
+    fn replace_library(mut self) {
+        self.library_due = false
+        self.functions.clear()
+        self.functions_loaded = 0
+        self.function_names = none
+        self.ticking.clear()
+        self.read_functions()
+    }
+
+    // `reload` (D572), as `ReloadCommand` runs it: the packs found again, as
+    // `PackRepository.reload` finds them, those on still on, in their order, then each found
+    // that's neither on nor off, in the repository's, as `discoverNewPacks` adds them; then
+    // `commands.reload.success` to the source and the admins, and the packs loaded,
+    // `reloadPacks`. Gives 0.
+    fn reload(mut self, source: Source) -> i32 {
+        let found = self.found_packs()
+        self.success(source, Component.translatable("commands.reload.success", []), true)
+        let repository = found else return 0
+        let names = self.packs_to_load(repository)
+        self.reload_packs(source, repository, names)
+        return 0
+    }
+
+    // The packs found again, as `PackRepository.reload` finds them, what that logs logged; none
+    // for a world that wasn't given where its packs are, as a test's (D572).
+    fn found_packs(mut self) -> Repository? {
+        let setup = self.world.packs_setup.copy() else return none
+        var allow = self.world.allow.take() else return none
+        var lines = List<Entry>()
+        var found: Repository? = none
+        match vanilla_data(data_path(), mut lines) {
+            ok(zip) => found = some(discover(zip, setup, mut allow, mut lines)),
+            err(message) => lines.push(Entry.error(message)),
+        }
+        self.world.allow = some(allow)
+        for e in lines {
+            self.logs.push(e.copy())
+        }
+        return found
+    }
+
+    // What `discoverNewPacks` loads (D572): the packs on, as the world keeps them, then each of
+    // `repository`'s that's neither on nor off, in its order.
+    fn packs_to_load(self, repository: Repository) -> List<String> {
+        var names = List<String>()
+        var off = List<String>()
+        if let d = self.level_data {
+            if let p = d.packs {
+                names = p.enabled.copy()
+                off = p.disabled.copy()
+            }
+        }
+        for p in repository.packs {
+            if not off.contains(p.id) and not names.contains(p.id) {
+                names.push(p.id.copy())
+            }
+        }
+        return names
+    }
+
+    // `reloadResources` (D572): the packs `names` opened, in that order, and what the server has
+    // of them loaded again: every registry's tags and the reloadable registries, as
+    // `reload_registries` loads them, the functions, the advancements and the recipes. If they
+    // can't be, nothing changes: it's logged, `Failed to execute reload`, and the source told,
+    // `commands.reload.failure`. Otherwise they're the server's, and the packs on the world's, as
+    // `level.dat` keeps them; every player is saved, `saveAll`; then, as
+    // `PlayerList.reloadResources`, each player's advancements are read again from what was
+    // saved, `PlayerAdvancements.reload`, so they're all sent again as their tick ends, and each
+    // is sent the tags, the recipes' property sets and the stonecutter's, and their recipe book.
+    // Their recipe book is kept by its recipes' IDs, those there are, and so is what each of
+    // their crafting grids last made. The functions take the library's place once nothing
+    // running holds the places of those it has, `replaceLibrary`.
+    fn reload_packs(mut self, source: Source, repository: own Repository, names: List<String>) {
+        let old = self.world.registries.copy() else return
+        var lines = List<Entry>()
+        let selection = repository.reselect(names)
+        let packs = selection.packs.copy()
+        let resources = repository.open(selection, mut lines)
+        let made = reload_registries(resources, old.value, some(self.lang.copy()), mut lines)
+        let loaded = made else {
+            for e in lines {
+                self.logs.push(e.copy())
+            }
+            // Vanilla's log has the exception and its trace below it.
+            self.logs.push(Entry.warn("Failed to execute reload"))
+            self.command_failed(source, Failure.alone(Component.translatable("commands.reload.failure", [])))
+            return
+        }
+        let registries = Shared(loaded)
+        let functions = FunctionFiles.read(resources, mut lines)
+        let advancements = Shared(Advancements.of(registries.value, mut lines))
+        let recipes = Shared(Recipes.of(registries.value, Streams.new(), mut lines))
+        for e in lines {
+            self.logs.push(e.copy())
+        }
+        if let kept = self.level_data.take() {
+            var data = kept
+            data.packs = some(packs)
+            self.level_data = some(data)
+        }
+        self.save_players()
+        let was_advancements = self.world.advancements.copy()
+        let was_recipes = self.world.recipes.copy()
+        self.world.registries = some(registries.copy())
+        self.world.advancements = some(advancements.copy())
+        self.world.recipes = some(recipes.copy())
+        self.world.functions = functions
+        self.library_due = true
+        // What's made from the registries is made again from these: the commands, the item
+        // codecs and the loot, which the levels share.
+        self.commands = none
+        if self.items != none {
+            self.items = some(ItemCodecs.new(registries.copy()))
+        }
+        if self.loot != none {
+            self.loot = none
+            let fresh = self.loot_of()
+            for d in 0..self.levels.len() {
+                if self.levels[d].loot != none {
+                    self.levels[d].loot = fresh.copy()
+                }
+            }
+        }
+        self.configuration.retag(registries.value)
+        let tags = update_tags(registries.value)
+        let offset = unsafe { self.clock.local_offset() }
+        for i in 0..self.connections.len() {
+            if not self.playing(i) {
+                continue
+            }
+            var con = self.connections[i].take() else continue
+            if let a = was_advancements {
+                let members = con.player.advancements.to_json(a.value, offset)
+                var path = String()
+                if let p = con.profile {
+                    if let files = self.progress_files {
+                        path = files.file(p.id.to_string())
+                    }
+                }
+                var warned = List<Entry>()
+                con.player.advancements = PlayerAdvancements.loaded(advancements.value, some(Json.Object(members)), path, mut warned)
+                for e in warned {
+                    self.logs.push(e.copy())
+                }
+            }
+            if let r = was_recipes {
+                let packed = con.player.recipe_book.pack(r.value)
+                var unlogged = List<Entry>()
+                con.player.recipe_book = RecipeBook.loaded(recipes.value, packed, mut unlogged)
+                con.player.menu.used = same_recipe(con.player.menu.used, r.value, recipes.value)
+                if let open = con.player.container.take() {
+                    var o = open
+                    o.menu.used = same_recipe(o.menu.used, r.value, recipes.value)
+                    con.player.container = some(o)
+                }
+            }
+            self.send(mut con, tags.copy(), State.Play)
+            let update = self.update_recipes()
+            self.send(mut con, update, State.Play)
+            self.send_recipe_book(mut con)
+            self.connections[i] = some(con)
+        }
+    }
+
+    // The recipes' property sets and the stonecutter's recipes, as a player's sent them as they
+    // join (CAL-146) and on `/reload` (D572).
+    fn update_recipes(self) -> ClientboundUpdateRecipes {
+        var sets = List<ItemSet>()
+        var stonecutter = Stonecutting()
+        if let shared = self.world.recipes {
+            for (key, items) in shared.value.item_sets {
+                sets.push(ItemSet { key: key.copy(), items: items.copy() })
+            }
+            stonecutter = shared.value.stonecutter.copy()
+        }
+        return ClientboundUpdateRecipes { item_sets: sets, stonecutter: stonecutter }
+    }
+
+    // `sendInitialRecipeBook`: the book's settings, then what the player knows, highlighted
+    // where they're yet to look at it, as they join and on `/reload` (D572).
+    fn send_recipe_book(mut self, con: mut Connection) {
+        self.send(mut con, ClientboundRecipeBookSettings { crafting: closed_tab(), furnace: closed_tab(), blast_furnace: closed_tab(), smoker: closed_tab() }, State.Play)
+        var known = BookRecipes {}
+        if let shared = self.world.recipes.copy() {
+            var w = Writer.new()
+            let count = con.player.recipe_book.write_known(shared.value, mut w)
+            let problem = w.problem()
+            known = BookRecipes { count: count, bytes: w.into_bytes(), problem: problem }
+        }
+        self.send(mut con, ClientboundRecipeBookAdd { recipes: known, replace: true }, State.Play)
     }
 
     // `schedule`, `ScheduleCommand` (D569): a function or a tag's to run in so many ticks, at
@@ -19166,6 +19364,9 @@ impl Network {
         }
         self.queue_depth = 0
         self.queue_running = false
+        if self.library_due and self.function_loops == 0 {
+            self.replace_library()
+        }
     }
 
     // `ExecutionContext.queueNext` (D567): `action` in `frame`, to go in front of what's queued
@@ -27710,6 +27911,16 @@ fn no_such_slot(which: str, name: String?) -> Component {
 // the crafting grid's, 500 to 503.
 fn player_has_slot(id: i32) -> bool {
     return (id >= 0 and id < 36) or (id >= 98 and id <= 106 and id != 104) or (id >= 200 and id < 227) or id == 499 or (id >= 500 and id < 504)
+}
+
+// The place among `now` of the recipe at `at` among `was`, by its ID, or none where `now` hasn't
+// it (D572).
+fn same_recipe(at: usize?, was: Recipes, now: Recipes) -> usize? {
+    let i = at else return none
+    if i >= was.all.len() {
+        return none
+    }
+    return now.find(was.all[i].id.to_string())
 }
 
 // The compound `base` with `nbt`, a compound, merged into it, `CompoundTag.merge`.

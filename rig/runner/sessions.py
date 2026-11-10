@@ -1931,17 +1931,28 @@ def compare_progress(config, name=None):
     printing what differs. A server that saved none, as when the bot never left, says so."""
     name = name or BOT
     saved = {}
+    times = {}
     for side in ("vanilla", "calcite"):
         path = SESSIONS / config / side / "world" / "players" / "advancements" / f"{offline_uuid(name)}.json"
         if not path.is_file():
             print(f"saved progress differs  [{config}] {side} saved no advancements for {name}")
             return False
-        saved[side] = json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=progress_kept)
+        text = path.read_text(encoding="utf-8")
+        saved[side] = json.loads(text, object_pairs_hook=progress_kept)
+        times[side] = sessiondiff.first_obtained(json.loads(text))
     vanilla, calcite = saved["vanilla"], saved["calcite"]
     same = vanilla == calcite
+    # After a `reload`, the order is by when each was first obtained, to the second, which the
+    # wall clock decides for those obtained together (D572).
+    clocked = (not same and len(vanilla) == len(calcite) and dict(vanilla) == dict(calcite)
+               and sessiondiff.ordered_by_the_clock([k for k, _ in vanilla], [k for k, _ in calcite],
+                                                    times["vanilla"], times["calcite"]))
+    same = same or clocked
     count = sum(1 for k, _ in vanilla if k != "DataVersion")
     who = "" if name == BOT else f" ({name})"
     print(f"saved progress {'PASS' if same else 'differs'}    {count} advancements{who}")
+    if clocked:
+        print(f"  [{config}] the order differs only where the wall clock's seconds order them")
     if not same:
         kept = dict(calcite)
         for k, v in vanilla:

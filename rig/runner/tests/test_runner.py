@@ -239,6 +239,16 @@ class Sessions(unittest.TestCase):
             report = sessiondiff.run(root, ["c"], ["join"], root / "differences", out=printed.append, complete=True)
             return report, printed
 
+    def test_progress_ordered_by_the_clock(self):
+        # After a reload, advancements obtained within a second may swap places; others may not.
+        def progress(**firsts):
+            return {k: {"criteria": {"c": f"2026-11-10 09:14:{s:02d} +0000"}, "done": True} for k, s in firsts.items()}
+        vanilla = sessiondiff.first_obtained(progress(a=48, b=48, c=50))
+        calcite = sessiondiff.first_obtained(progress(a=11, b=10, c=13))
+        self.assertTrue(sessiondiff.ordered_by_the_clock(["a", "b", "c"], ["b", "a", "c"], vanilla, calcite))
+        self.assertFalse(sessiondiff.ordered_by_the_clock(["a", "b", "c"], ["c", "a", "b"], vanilla, calcite))
+        self.assertTrue(sessiondiff.ordered_by_the_clock(["a", "b", "c"], ["a", "b", "c"], vanilla, calcite))
+
     def test_same_sessions_pass(self):
         session = [
             {"mark": "step configuration"},
@@ -252,6 +262,16 @@ class Sessions(unittest.TestCase):
         report, _ = self.compare(session, later)
         self.assertTrue(report.passed)
         self.assertFalse(report.findings)
+
+    def test_keep_alives_a_step_apart(self):
+        # A keep-alive goes by the wall clock, so one a step before or after the other server's
+        # is the same; two steps apart, it isn't.
+        alive = self.packet("play", "keep_alive", {"id": 1})
+        vanilla = [{"mark": "step join"}, alive, {"mark": "step a"}, {"mark": "step b"}, alive, {"mark": "step c"}, {"mark": "step d"}]
+        calcite = [{"mark": "step join"}, {"mark": "step a"}, alive, {"mark": "step b"}, {"mark": "step c"}, {"mark": "step d"}, alive]
+        report, _ = self.compare(vanilla, calcite)
+        self.assertEqual(sorted((f.key, f.what) for f in report.findings), [
+            ("session:join/b/keep_alive", "only vanilla sends it"), ("session:join/d/keep_alive", "only Calcite sends it")])
 
     def test_sky_under_the_world(self):
         # A chunk whose sky layer under the world is 2048 bytes of 0 matches one whose layer

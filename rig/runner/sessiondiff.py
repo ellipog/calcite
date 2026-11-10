@@ -49,6 +49,7 @@ import difflib
 import json
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import differences as registry
 
@@ -295,6 +296,33 @@ def obtained_only(value):
     if isinstance(value, list):
         return [obtained_only(v) for v in value]
     return value
+
+
+def first_obtained(progress):
+    """Each advancement's earliest criterion time in a progress file's object, in seconds since
+    the epoch, by its ID, or `None` for one with none."""
+    out = {}
+    for k, v in progress.items():
+        if isinstance(v, dict):
+            times = [datetime.strptime(t, "%Y-%m-%d %H:%M:%S %z").timestamp() for t in v.get("criteria", {}).values()]
+            out[k] = min(times) if times else None
+    return out
+
+
+def ordered_by_the_clock(vanilla, calcite, vanilla_times, calcite_times):
+    """Whether two orders of the same advancements differ only in pairs that each server
+    obtained within a second of each other: `/reload` reads the progress files again, which
+    sorts them by when each was first obtained, to the second, so the wall clock's seconds
+    order those obtained at the same moment (D572)."""
+    at = {k: i for i, k in enumerate(calcite)}
+    for i, a in enumerate(vanilla):
+        for b in vanilla[i + 1:]:
+            if at[a] < at[b]:
+                continue
+            for times in (vanilla_times, calcite_times):
+                if times.get(a) is None or times.get(b) is None or abs(times[a] - times[b]) > 1:
+                    return False
+    return True
 
 
 def enchantments_sorted(value):
@@ -645,8 +673,28 @@ def compare_entities(vanilla_steps, calcite_steps, scenario, findings, counts):
         line_up(who, [p for p in a if p[1].kind not in STATE], [p for p in b if p[1].kind not in STATE], MORE_MOVES)
 
 
+def keep_alives_lined_up(vanilla_steps, calcite_steps):
+    """Calcite's steps with each keep-alive it sends a step before or after vanilla's moved to
+    vanilla's step: they go by the wall clock, every 15 seconds from a player's join, which is
+    300 ticks and so falls at a step's start, on either side of it on either server."""
+    by_name = {s.name: s for s in calcite_steps}
+    for kind in ("play/keep_alive", "configuration/keep_alive"):
+        for i, va in enumerate(vanilla_steps):
+            ca = by_name.get(va.name)
+            if ca is None or kind not in va.clock or kind in ca.clock:
+                continue
+            for j in (i - 1, i + 1):
+                if not 0 <= j < len(vanilla_steps):
+                    continue
+                near = by_name.get(vanilla_steps[j].name)
+                if near is not None and kind in near.clock and kind not in vanilla_steps[j].clock:
+                    ca.clock[kind] = near.clock.pop(kind)
+                    break
+
+
 def compare(vanilla_steps, calcite_steps, scenario, findings, counts):
     compare_entities(vanilla_steps, calcite_steps, scenario, findings, counts)
+    keep_alives_lined_up(vanilla_steps, calcite_steps)
     by_name = {s.name: s for s in calcite_steps}
     for va in vanilla_steps:
         ca = by_name.get(va.name)
