@@ -307,6 +307,12 @@ FUNCS_PACK = {
                                                   "predicate": {"minecraft:entity_type": "minecraft:player"}}),
     "data/rig/predicate/overworld.json": json.dumps({"type": "minecraft:location_check",
                                                      "predicate": {"dimension": "minecraft:overworld"}}),
+    "data/rig/slot_source/hands.json": json.dumps({"type": "minecraft:slot_range", "slots": "weapon.*"}),
+    "data/rig/slot_source/firsts.json": json.dumps({"type": "minecraft:group", "terms": [
+        {"type": "minecraft:slot_range", "slots": "hotbar.0"}, {"type": "minecraft:slot_range", "slots": "inventory.0"}]}),
+    "data/rig/item_modifier/five.json": json.dumps({"type": "minecraft:set_count", "count": 5}),
+    "data/rig/item_modifier/some.json": json.dumps({"type": "minecraft:set_count",
+                                                  "count": {"type": "minecraft:uniform", "min": 1, "max": 9}}),
 }
 
 C = nbt.COMPOUND
