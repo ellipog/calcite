@@ -2101,6 +2101,29 @@ def compare_scheduled(config):
     return same
 
 
+def compare_made_packs(config):
+    """Whether both servers wrote the packs `datapack create` made the same (D573): each folder
+    in the world's `datapacks` that no configuration put there, by its name, with its
+    `pack.mcmeta`, byte for byte, printing what differs. Nothing's printed where neither made
+    any."""
+    given = set(CONFIGS[config].datapacks or {})
+    made = {}
+    for side in ("vanilla", "calcite"):
+        folder = SESSIONS / config / side / "world" / "datapacks"
+        made[side] = {p.name: (p / "pack.mcmeta").read_bytes() if (p / "pack.mcmeta").is_file() else None
+                      for p in sorted(folder.iterdir()) if p.is_dir() and p.name not in given} if folder.is_dir() else {}
+    if not made["vanilla"] and not made["calcite"]:
+        return True
+    same = made["vanilla"] == made["calcite"]
+    print(f"saved packs    {'PASS' if same else 'differs'}    {len(made['vanilla'])} made")
+    if not same:
+        for name in sorted(set(made["vanilla"]) | set(made["calcite"])):
+            if made["vanilla"].get(name) != made["calcite"].get(name):
+                print(f"  [{config}] {name}/pack.mcmeta:\n      vanilla: {made['vanilla'].get(name)!r}\n"
+                      f"      calcite: {made['calcite'].get(name)!r}")
+    return same
+
+
 def compare_book(config, name):
     """Whether both servers saved the player `name`'s recipe book the same, their data's
     `recipeBook` (CAL-164): its tabs' settings, and the recipes known and highlighted, each list
@@ -2223,7 +2246,8 @@ def main():
                 + [compare_progress(c) for c in configs if scenarios[c]]
                 + [compare_scoreboard(c) for c in configs if scenarios[c]]
                 + [compare_storage(c) for c in configs if scenarios[c]]
-                + [compare_scheduled(c) for c in configs if scenarios[c]])
+                + [compare_scheduled(c) for c in configs if scenarios[c]]
+                + [compare_made_packs(c) for c in configs if scenarios[c]])
     for c in configs:
         if CONFIGS[c].fixture is not None and scenarios[c]:
             compare_chunks(c, args.show)
