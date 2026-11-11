@@ -6,6 +6,7 @@ cases:
   - session:mites/*/commands
   - session:end/*/commands
   - session:crystals/*/commands
+  - session:gateways/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
@@ -16,4 +17,4 @@ cases:
 
 **Why:** a client only offers and checks the commands it's sent, so Calcite's own commands have to be in the tree for players who may use them. Players below level 2 get vanilla's packet exactly, as the `talk` session shows.
 
-The `select`, `mites`, `end` and `crystals` sessions' bot is an operator, so its commands packet at the join shows this.
+The `select`, `mites`, `end`, `crystals` and `gateways` sessions' bot is an operator, so its commands packet at the join shows this.

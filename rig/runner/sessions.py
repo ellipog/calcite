@@ -106,7 +106,8 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
-                   "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals"]
+                   "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
+                   "gateways"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate"}
@@ -1758,6 +1759,9 @@ CONFIGS["end"] = Config({"difficulty": "normal"}, view=4, scenarios=("end",), wo
 # (CAL-182); the water keeps the blocks about it, and creative mode the bot. Then an arrow and an
 # ender pearl falling onto another each, which they break, and a splash potion onto another (D591).
 CONFIGS["crystals"] = replace(CONFIGS["end"], scenarios=("crystals",))
+# `end`'s world with an end gateway the bot sets by its spawn, 2380 ticks old, its age read as it
+# ticks, and its cooldown begun at 2400, its block event sent (D592).
+CONFIGS["gateways"] = replace(CONFIGS["end"], scenarios=("gateways",))
 # Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
 # Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.
 LEVEL_RANDOM_SEED = 1103
