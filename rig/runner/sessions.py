@@ -1782,7 +1782,7 @@ CONFIGS["eyes"] = replace(CONFIGS["end"], scenarios=("eyes",))
 # plain world, not the round trip's, as its sand falls as an entity, which Calcite's doesn't yet,
 # and every entity after has another ID. Taped, as each launch's pitch is drawn from the level's
 # random.
-CONFIGS["throws"] = replace(CONFIGS["terrain"], scenarios=("throws",), world=PLAIN_WORLD, ops=("Bot",), tape=True)
+CONFIGS["eye-throws"] = replace(CONFIGS["terrain"], scenarios=("throws",), world=PLAIN_WORLD, ops=("Bot",), tape=True)
 # Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
 # Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.
 LEVEL_RANDOM_SEED = 1103
