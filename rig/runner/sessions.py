@@ -1509,6 +1509,15 @@ CONFIGS = {
     "villagers": Config({}, view=3, scenarios=("villagers",), world=FIXTURES / "villagers" / "world", fixture="villagers",
                         rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
                         player=THORNS),
+    # A zombie going through a village at night (D605): as `villagers`, on normal, on the
+    # village-zombie fixture's world, where Rot, a zombie, finds the bed Vi claims in her box above
+    # the grass, a village's point of interest that's taken, `MoveThroughVillageGoal`, and walks
+    # toward it as near as he gets, under her box, then not again, as he's been; the bot, in
+    # creative mode with nothing, isn't his target.
+    "village-zombie": Config({"difficulty": "normal"}, view=3, scenarios=("villagers",),
+                             world=FIXTURES / "village-zombie" / "world", fixture="village-zombie",
+                             rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0))),
+                             player=PLACE_CREATIVE),
     # Professions (CAL-160): as `villagers`, on the professions fixture's world, where Di, a
     # farmer with no job site, loses her profession and takes a fletching table; Fa, holding Ed's
     # composter with less experience, forgets it and loses her profession, takes it and loses it
