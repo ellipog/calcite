@@ -106,7 +106,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
-                   "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites"]
+                   "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate"}
@@ -164,6 +164,10 @@ class Config:
     # Saved data put in the world's data/minecraft folder, which both servers read as they start:
     # each file's root by its name, such as `scoreboard` (CAL-164).
     saved: dict | None = None
+    # Saved data put in a dimension's data/minecraft folder: each file's root by the dimension's
+    # folder under `dimensions` and its name, such as `minecraft/the_end/ender_dragon_fight`
+    # (D586).
+    dim_saved: dict | None = None
 
 
 def stack(item, count=1, components=None):
@@ -736,6 +740,20 @@ NIGHT = {
     "Rotation": nbt.List(nbt.FLOAT, [nbt.Float(0.0), nbt.Float(0.0)]),
     "Dimension": "minecraft:overworld",
     "playerGameType": nbt.Int(1),
+}
+# The bot's data in `end` (D586): in survival mode at the spawn, hurt and hungry, fast for a while,
+# holding a stone, all of which the respawn after the End's credits keeps.
+END_PLAYER = {
+    "DataVersion": nbt.Int(5023),
+    "Pos": nbt.List(nbt.DOUBLE, [nbt.Double(0.5), nbt.Double(-60.0), nbt.Double(0.5)]),
+    "Rotation": nbt.List(nbt.FLOAT, [nbt.Float(0.0), nbt.Float(0.0)]),
+    "Dimension": "minecraft:overworld",
+    "playerGameType": nbt.Int(0),
+    "Health": nbt.Float(15.0),
+    "foodLevel": nbt.Int(15),
+    "Inventory": nbt.List(nbt.COMPOUND, [{"Slot": nbt.Byte(0), "id": "minecraft:stone", "count": nbt.Int(5)}]),
+    "active_effects": nbt.List(nbt.COMPOUND, [{"id": "minecraft:speed", "amplifier": nbt.Byte(0), "duration": nbt.Int(4000),
+                                              "ambient": nbt.Byte(0), "show_particles": nbt.Byte(1), "show_icon": nbt.Byte(1)}]),
 }
 # The bot's data in `choke`: in survival mode at the bottom of the choke fixture's water, out of
 # air, starving, its food's timer at 30, with 100 health, which it has room for (D426).
@@ -1718,6 +1736,22 @@ MATE = "Mate"
 VANILLA_COMMANDS = [("gamerule respawn_radius 0", "respawn_radius")]
 # The data version both servers save, which a game rules file the rig writes is in.
 DATA_VERSION = 5023
+# The End's dragon fight over, as vanilla saves it once its dragon's killed: its state known, so
+# its arena isn't scanned, its dragon killed, as it has been before (D586).
+FIGHT_OVER = {"data": {"needs_state_scanning": nbt.Byte(0), "dragon_killed": nbt.Byte(1), "previously_killed": nbt.Byte(1)},
+              "DataVersion": nbt.Int(DATA_VERSION)}
+# The bot, an operator, through end portals on the end fixture's world, the End's dragon fight over,
+# with no mobs spawning (D586): into the End, out of it to the credits the first time, after which
+# it respawns keeping all it has, and to where its spawn's set the second. Two chunks about it, so
+# the End's spikes and their crystals, which Calcite doesn't make yet, are out of its sight. Taped,
+# as the platform's drops are drawn from the End's random; where it's seen the credits is compared,
+# and where its spawn's set, its health, food and effects.
+CONFIGS["end"] = Config({"difficulty": "normal"}, view=2, scenarios=("end",), world=FIXTURES / "end" / "world", fixture="end",
+                        rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
+                               ("minecraft:respawn_radius", nbt.Int(0))),
+                        ops=("Bot",), tape=True, player=END_PLAYER,
+                        keys=("seenCredits", "respawn", "Health", "foodLevel", "active_effects"),
+                        dim_saved={"minecraft/the_end/ender_dragon_fight": FIGHT_OVER})
 # Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
 # Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.
 LEVEL_RANDOM_SEED = 1103
@@ -1802,6 +1836,9 @@ def prepare(folder, config, port, vanilla):
             at.write_text(text, encoding="utf-8")
     for name, saved in (c.saved or {}).items():
         nbt.write(folder / "world" / "data" / "minecraft" / f"{name}.dat", saved)
+    for path, saved in (c.dim_saved or {}).items():
+        namespace, dimension, name = path.split("/")
+        nbt.write(folder / "world" / "dimensions" / namespace / dimension / "data" / "minecraft" / f"{name}.dat", saved)
     rules =folder / "world" / "data" / "minecraft" / "game_rules.dat"
     if rules.is_file():
         saved = nbt.read(rules)
