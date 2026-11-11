@@ -10,6 +10,7 @@ cases:
   - session:eyes/*/commands
   - session:throws/*/commands
   - session:locate/*/commands
+  - session:compass/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too

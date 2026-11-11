@@ -107,7 +107,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
-                   "gateways", "eyes", "throws", "locate"]
+                   "gateways", "eyes", "throws", "locate", "compass"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate"}
@@ -1774,6 +1774,10 @@ CONFIGS["gateways"] = replace(CONFIGS["end"], scenarios=("gateways",))
 # air, looking at the frame and up, which starts its use, as the world has no structures (D597);
 # then summoning eyes of ender, which fly on till their life runs out (D598).
 CONFIGS["eyes"] = replace(CONFIGS["end"], scenarios=("eyes",))
+# `end`'s world with the bot using compasses on a lodestone it sets, which track it, and lodestone
+# compasses in its inventory losing their targets as they tick, where the lodestone's broken, out
+# of the world and far off, or keeping them, in another dimension or not tracking (D603).
+CONFIGS["compass"] = replace(CONFIGS["end"], scenarios=("compass",))
 # The plain world, which generates structures, as `terrain` has it, without its entities and with
 # no mobs spawning, its spawn at the origin, with the bot, an operator, throwing eyes of ender
 # there (D599): each finds the nearest stronghold, `findNearestMapStructure` over the rings, and
