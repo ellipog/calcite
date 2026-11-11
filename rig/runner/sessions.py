@@ -1763,7 +1763,8 @@ CONFIGS["crystals"] = replace(CONFIGS["end"], scenarios=("crystals",))
 # ticks, and its cooldown begun at 2400, its block event sent (D592); then the bot through one,
 # its exit exact, again, its exit found above the tallest block about it, and through one with
 # another on it, whose block event is sent twice (D593); then an item, a pig and an arrow
-# through one (D594).
+# through one (D594); then, in the End, an item and the bot through gateways with no
+# exit, which make one (D595).
 CONFIGS["gateways"] = replace(CONFIGS["end"], scenarios=("gateways",))
 # Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
 # Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.

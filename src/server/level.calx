@@ -53,6 +53,7 @@ import nbt.tag.{Tag}
 import protocol.play.{BlockEntityInfo, ClientboundBlockEntityData, ClientboundLevelChunkWithLight, LightData}
 import protocol.state.{State}
 import protocol.wire.{Writer, write_packet}
+import random.legacy.{LegacyRandom}
 import random.source.{RandomSource}
 import random.taped.{TapedRandom}
 import registry.songs.{JukeboxSong, Songs}
@@ -101,10 +102,11 @@ import world.pos.{BlockPos, ChunkPos}
 import world.spawn.{respawn_pos, standing_y}
 import world.tickets.{FULL_LEVEL, Holders, Ticket, TicketStorage, TicketType}
 import world.ticks.{ChunkTicks, LevelTicks, ScheduledTick}
-import worldgen.access.{BlockAccess}
+import worldgen.access.{BlockAccess, FeatureAccess}
 import worldgen.biome_manager.{corner}
 import worldgen.block_entities.{fresh, loaded as loaded_block_entity}
 import registry.components.{ItemCodecs}
+import worldgen.end.{known_exit, place_end_gateway, place_end_island}
 import worldgen.facts.{FLOWING_LAVA, Facts, LAVA_FLUID, horizontal, opposite, step_x, step_y, step_z}
 import worldgen.generator.{GenSetup, setup_data}
 import worldgen.interval.{Thrown}
@@ -662,6 +664,11 @@ pub struct Level {
     /// `isAllowedToEnterPortal`, as the network sets them each tick (D594).
     pub the_end: bool = false
     pub portals_closed: bool = false
+    // Whether its chunks' entities load, as the network's levels' do, and the chunks whose
+    // entities are in, `areEntitiesLoaded`, without which a block entity doesn't tick nor a
+    // scheduled tick run there (D595). A test's level loads none, and ticks without.
+    pub entities_load: bool = false
+    entities_in: OpenHashSet<i64> = OpenHashSet<i64>()
     /// The world's jukebox songs, which the network gives it once the world's registries are
     /// read, and none until then (CAL-143).
     pub songs: Songs = Songs()
@@ -1659,11 +1666,17 @@ impl Level {
         return some((e.x - 5, e.z - 5, e.x + 5, e.z + 5))
     }
 
-    // `findTallestBlock(level, around, dist, false)` (D593): of the columns within `dist` across
-    // of `around` but its own, each from the top of the world down to above the tallest found so
-    // far, the first block whose collision shape's whole and isn't bedrock; the tallest, the first
-    // of those as high, else `around`.
+    // `findTallestBlock(level, around, dist, false)` (D593), `tallest_over` with nothing more.
     fn tallest_block(self, around: BlockPos, dist: i32) -> BlockPos {
+        return self.tallest_over(around, dist, false, Set<i64>())
+    }
+
+    // `findTallestBlock(level, around, dist, bedrock_too)` (D593, D595): of the columns within
+    // `dist` across of `around`, its own too where `bedrock_too`, each from the top of the world
+    // down to above the tallest found so far, the first block whose collision shape's whole and
+    // that isn't bedrock but where `bedrock_too`; the tallest, the first of those as high, else
+    // `around`. The blocks packed in `stone` read as end stone, an island yet to be placed.
+    fn tallest_over(self, around: BlockPos, dist: i32, bedrock_too: bool, stone: Set<i64>) -> BlockPos {
         let some_env = self.env.copy()
         let shared = some_env else return around
         let Env { facts: f, .. } = shared.value
@@ -1673,7 +1686,7 @@ impl Level {
         var tallest: BlockPos? = none
         for xd in -dist..dist + 1 {
             for zd in -dist..dist + 1 {
-                if xd == 0 and zd == 0 {
+                if xd == 0 and zd == 0 and not bedrock_too {
                     continue
                 }
                 let floor = match tallest {
@@ -1682,10 +1695,14 @@ impl Level {
                 }
                 var y = max_y
                 while y > floor {
-                    let (bx, bz) = (around.x + xd, around.z + zd)
-                    let state = self.collision_state(bx, y, bz) ?? f.ids.air_state
-                    if f.collision_full_block(state) and f.block(state) != bedrock {
-                        tallest = some(BlockPos { x: bx, y: y, z: bz })
+                    let at = BlockPos { x: around.x + xd, y: y, z: around.z + zd }
+                    var whole = stone.contains(at.pack())
+                    if not whole {
+                        let state = self.collision_state(at.x, y, at.z) ?? f.ids.air_state
+                        whole = f.collision_full_block(state) and (bedrock_too or f.block(state) != bedrock)
+                    }
+                    if whole {
+                        tallest = some(at)
                         break
                     }
                     y -= 1
@@ -1693,6 +1710,222 @@ impl Level {
             }
         }
         return tallest ?? around
+    }
+
+    /// `getHighestFilledSectionIndex` of the chunk at `pos`, -1 where it's only air, none where
+    /// it isn't full (D595).
+    pub fn highest_filled(self, pos: ChunkPos) -> i32? {
+        if not self.full(pos) {
+            return none
+        }
+        let k = pos.pack()
+        if self.columns.live.contains(k) {
+            return some(self.columns.live[k].highest_filled_section())
+        }
+        match self.columns.slots[k] {
+            Body.Saved(s) => return some(s.chunk.value.highest_filled_section()),
+            Body.Flat => {
+                if let f = self.columns.flat {
+                    return some(f.chunk.highest_filled_section())
+                }
+            },
+            Body.Loading => {},
+        }
+        return none
+    }
+
+    // The block at x, y, z, void air above and below the world, air where its chunk isn't
+    // full (D595).
+    fn block_or_air(self, f: Facts, x: i32, y: i32, z: i32) -> u32 {
+        if y < self.min_section * 16 or y >= (self.min_section + self.sections) * 16 {
+            return f.ids.void_air_state
+        }
+        return self.collision_state(x, y, z) ?? f.ids.air_state
+    }
+
+    // `findValidSpawnInChunk` of the chunk at `c` (D595): whether, from the chunk's least x and z
+    // at 30 to its most and the top of its highest section that isn't only air, either way up
+    // as `betweenClosed` takes them, there's end stone with two blocks above it whose collision
+    // shapes aren't whole. Vanilla keeps the closest to the middle of the world as the walk's
+    // cursor, which goes on to the walk's last block, so it finds that, the most of each, where
+    // there's any.
+    fn valid_spawn_in(self, f: Facts, c: ChunkPos) -> BlockPos? {
+        let top = self.highest_filled(c) ?? -1
+        let bottom = self.min_section * 16
+        let section_y = if top == -1 { bottom } else { bottom + top * 16 }
+        let high = section_y + 16 - 1
+        let (y0, y1) = (high.min(30), high.max(30))
+        let (x0, z0) = (c.x * 16, c.z * 16)
+        let end_stone = f.block_named(String("minecraft:end_stone")) ?? u32.MAX
+        for z in z0..z0 + 16 {
+            for y in y0..y1 + 1 {
+                for x in x0..x0 + 16 {
+                    if f.block(self.block_or_air(f, x, y, z)) != end_stone {
+                        continue
+                    }
+                    if f.collision_full_block(self.block_or_air(f, x, y + 1, z)) {
+                        continue
+                    }
+                    if f.collision_full_block(self.block_or_air(f, x, y + 2, z)) {
+                        continue
+                    }
+                    return some(BlockPos { x: x0 + 15, y: y1, z: z0 + 15 })
+                }
+            }
+        }
+        return none
+    }
+
+    /// What making an exit for the end gateway at x, z with none reads and comes to,
+    /// `findOrCreateValidTeleportPos` (D595), `exact` where the gateway's exact. First along the
+    /// line from the middle of the world through it, 1024 out, back 16 at a time past chunks that
+    /// aren't only air, at most 16 times, then on past those that are, at most 16, each chunk read
+    /// as it's come to, `findExitPortalXZPosTentative`; in the chunk it stops in, a block to stand
+    /// on, `findValidSpawnInChunk`, else an island of end stone placed at 75 there, its random
+    /// seeded by where it goes; about that, 16 each way, the tallest block, bedrock too, where the
+    /// gateway goes 10 above; then, where it isn't exact, what `findExitPosition` reads about
+    /// that, 5 each way. The chunks it'd read next that aren't full are what it `needs`, where
+    /// it's as far as it gets.
+    pub fn exit_plan(self, f: Facts, x: i32, z: i32, exact: bool) -> ExitPlan {
+        var plan = ExitPlan { needs: List<ChunkPos>(), spawn: BlockPos { x: 0, y: 0, z: 0 }, exit: BlockPos { x: 0, y: 0, z: 0 }, island: none }
+        let (gx, gz) = (f64(x), f64(z))
+        let length = (gx * gx + 0.0 * 0.0 + gz * gz).sqrt()
+        let (dx, dz) = if length < f64(1.0e-5f32) { (0.0, 0.0) } else { (gx / length, gz / length) }
+        var px = dx * 1024.0
+        var pz = dz * 1024.0
+        var back = 16
+        loop {
+            let c = tentative_chunk(px, pz)
+            let top = self.highest_filled(c) else {
+                plan.needs.push(c)
+                return plan
+            }
+            if top == -1 or back <= 0 {
+                break
+            }
+            back -= 1
+            px = px + dx * -16.0
+            pz = pz + dz * -16.0
+        }
+        var on = 16
+        loop {
+            let c = tentative_chunk(px, pz)
+            let top = self.highest_filled(c) else {
+                plan.needs.push(c)
+                return plan
+            }
+            if top != -1 or on <= 0 {
+                break
+            }
+            on -= 1
+            px = px + dx * 16.0
+            pz = pz + dz * 16.0
+        }
+        var stone = Set<i64>()
+        match self.valid_spawn_in(f, tentative_chunk(px, pz)) {
+            some(p) => plan.spawn = p,
+            none => {
+                let at = BlockPos { x: i32.saturate((px + 0.5).floor()), y: 75, z: i32.saturate((pz + 0.5).floor()) }
+                plan.spawn = at
+                plan.island = some(at)
+                var placed = Placed { at: List<BlockPos>() }
+                var rand = LegacyRandom.new(at.pack())
+                match place_end_island(f, mut placed, mut rand, at.x, at.y, at.z) {
+                    ok(_) => {},
+                    err(_) => {},
+                }
+                for p in placed.at {
+                    stone.insert(p.pack())
+                    let c = p.chunk()
+                    if not self.full(c) and not plan.needs.contains(c) {
+                        plan.needs.push(c)
+                    }
+                }
+                if not plan.needs.is_empty() {
+                    return plan
+                }
+            },
+        }
+        let s = plan.spawn
+        self.unfull_in(mut plan.needs, s.x - 16, s.z - 16, s.x + 16, s.z + 16)
+        if not plan.needs.is_empty() {
+            return plan
+        }
+        let t = self.tallest_over(s, 16, true, stone)
+        plan.exit = BlockPos { x: t.x, y: t.y + 10, z: t.z }
+        if not exact {
+            let e = plan.exit
+            self.unfull_in(mut plan.needs, e.x - 5, e.z - 5, e.x + 5, e.z + 5)
+        }
+        return plan
+    }
+
+    // The chunks of the blocks from x0, z0 to x1, z1 that aren't full, added to `needs` (D595).
+    fn unfull_in(self, needs: mut List<ChunkPos>, x0: i32, z0: i32, x1: i32, z1: i32) {
+        for cx in (x0 >> 4)..((x1 >> 4) + 1) {
+            for cz in (z0 >> 4)..((z1 >> 4) + 1) {
+                let c = ChunkPos { x: cx, z: cz }
+                if not self.full(c) and not needs.contains(c) {
+                    needs.push(c)
+                }
+            }
+        }
+    }
+
+    /// The chunks the end gateway at x, y, z would read next as it makes itself an exit, that
+    /// aren't full yet, `exit_plan`, where it's one with none in the End; none where it isn't
+    /// (D595).
+    pub fn exit_needs(self, x: i32, y: i32, z: i32) -> List<ChunkPos>? {
+        if not self.the_end {
+            return none
+        }
+        let tags = self.gateway_tag(x, y, z) else return none
+        if gateway_exit_of(tags) != none {
+            return none
+        }
+        let some_env = self.env.copy()
+        let shared = some_env else return none
+        let Env { facts: f, .. } = shared.value
+        return some(self.exit_plan(f, x, z, gateway_exact(tags)).needs)
+    }
+
+    /// `getPortalPosition`'s making of an exit for the end gateway at x, y, z with none, in the
+    /// End (D595): where `exit_plan` reads no chunk that isn't full, the island it found it
+    /// needs placed, `EndIslandFeature`; the tallest block about where it's to be found again,
+    /// 16 each way, bedrock too, and 10 above it the exit's gateway placed, `spawnGatewayPortal`,
+    /// its own exit this one, not exact, `knownExit`; then this one's exit set to that,
+    /// `setExitPosition`, as exact as it was. Whether it made one.
+    pub fn make_gateway_exit(mut self, x: i32, y: i32, z: i32) -> bool {
+        if not self.the_end {
+            return false
+        }
+        let tags = self.gateway_tag(x, y, z) else return false
+        if gateway_exit_of(tags) != none {
+            return false
+        }
+        let some_env = self.env.copy()
+        let shared = some_env else return false
+        let Env { facts: f, .. } = shared.value
+        let plan = self.exit_plan(f, x, z, gateway_exact(tags))
+        if not plan.needs.is_empty() {
+            self.unimplemented(String("An end gateway's exit made where the chunks it reads aren't full"))
+            return false
+        }
+        if let at = plan.island {
+            var rand = LegacyRandom.new(at.pack())
+            match place_end_island(f, mut self, mut rand, at.x, at.y, at.z) {
+                ok(_) => {},
+                err(thrown) => self.unimplemented(thrown.message),
+            }
+        }
+        let t = self.tallest_over(plan.spawn, 16, true, Set<i64>())
+        let exit = BlockPos { x: t.x, y: t.y + 10, z: t.z }
+        match place_end_gateway(f, mut self, known_exit(x, y, z, false), exit.x, exit.y, exit.z) {
+            ok(_) => {},
+            err(thrown) => self.unimplemented(thrown.message),
+        }
+        self.set_block_entity_value(x, y, z, "exit_portal", Tag.IntArray([exit.x, exit.y, exit.z]))
+        return true
     }
 
     /// `BlockInput.place`'s block entity (D592): the one at x, y, z, where there's one, loaded
@@ -2346,10 +2579,26 @@ impl Level {
     }
 
     // `BoundTickingBlockEntity.tick`'s `isTicking` and `shouldTickBlocksAt`: whether a block
-    // entity at `pos` ticks, within the border, in a chunk whose blocks tick, with its entities.
+    // entity at `pos` ticks, within the border, in a chunk whose blocks tick, with its entities
+    // in, `areEntitiesLoaded` (D595).
     fn ticks_block_entity(self, pos: BlockPos) -> bool {
         let chunk = pos.chunk()
-        return self.place.in_border(pos.x, pos.z) and self.dm.in_block_ticking_range(chunk.pack()) and self.sendable(chunk)
+        return self.place.in_border(pos.x, pos.z) and self.dm.in_block_ticking_range(chunk.pack()) and self.sendable(chunk) and self.entities_are_in(chunk.pack())
+    }
+
+    /// The entities of the chunk at `k` in, `true`, as `processPendingLoads` takes them in, or
+    /// not, as they're asked for or unloaded (D595).
+    pub fn entities_loaded(mut self, k: i64, loaded: bool) {
+        if loaded {
+            self.entities_in.insert(k)
+        } else {
+            self.entities_in.remove(k)
+        }
+    }
+
+    // `areEntitiesLoaded` of the chunk at `k`: always in a level whose entities don't load (D595).
+    fn entities_are_in(self, k: i64) -> bool {
+        return not self.entities_load or self.entities_in.contains(k)
     }
 
     // `updateBlockEntityTicker` for a block entity new at `pos`, of the type `kind`, whose ticker
@@ -3707,7 +3956,8 @@ impl Level {
         return ScheduledTick { kind: kind, x: x, y: y, z: z, trigger: self.game_time + i64(delay), priority: priority, sub: sub }
     }
 
-    // The chunks of `chunks` whose ticks run, as `isPositionTickingWithEntitiesLoaded` has it.
+    // The chunks of `chunks` whose ticks run, as `isPositionTickingWithEntitiesLoaded` has it,
+    // their entities in too (D595).
     fn ticking_of(self, chunks: List<i64>) -> OpenHashSet<i64> {
         var out = OpenHashSet<i64>()
         for k in chunks {
@@ -5745,6 +5995,60 @@ fn gateway_exit_of(tags: JavaHashMap<String, Tag>) -> BlockPos? {
 // Whether an end gateway takes what goes into it to its exit as it is, `ExactTeleport` (D593).
 fn gateway_exact(tags: JavaHashMap<String, Tag>) -> bool {
     return tags.contains("ExactTeleport") and (tags["ExactTeleport"].number_int() ?? 0) != 0
+}
+
+/// What making an exit for an end gateway with none reads and comes to, `exit_plan` (D595): the
+/// chunks it'd read next that aren't full, where it's as far as it gets; where it found to put
+/// it, `findOrCreateValidTeleportPos` before its tallest block; where the exit's gateway goes; and
+/// where an island's placed first, if one is.
+pub struct ExitPlan {
+    pub needs: List<ChunkPos>
+    pub spawn: BlockPos
+    pub exit: BlockPos
+    pub island: BlockPos?
+}
+
+// The chunk `findExitPortalXZPosTentative` reads at x, z, `getChunk` of each over 16, rounded
+// down (D595).
+fn tentative_chunk(x: f64, z: f64) -> ChunkPos {
+    return ChunkPos { x: i32.saturate((x / 16.0).floor()), z: i32.saturate((z / 16.0).floor()) }
+}
+
+// Where a feature would set its blocks, kept and set nowhere, so what it'd place is known before
+// it is (D595).
+struct Placed {
+    at: List<BlockPos>
+}
+
+impl FeatureAccess for Placed {
+    fn feature_set(mut self, facts: Facts, x: i32, y: i32, z: i32, state: u32, flags: i32) -> bool {
+        self.at.push(BlockPos { x: x, y: y, z: z })
+        return true
+    }
+
+    fn feature_gateway_exit(mut self, facts: Facts, x: i32, y: i32, z: i32, exit: List<i32>, exact: bool) ! Thrown {
+    }
+}
+
+// Where a feature sets blocks in the running level (D595): `setBlock` with its flags, and an end
+// gateway's exit set where its block entity's there, `setExitPosition`, as it saves,
+// `ExactTeleport` only where it's exact.
+impl FeatureAccess for Level {
+    fn feature_set(mut self, facts: Facts, x: i32, y: i32, z: i32, state: u32, flags: i32) -> bool {
+        return self.set_block_limited(x, y, z, state, flags, UPDATE_LIMIT)
+    }
+
+    fn feature_gateway_exit(mut self, facts: Facts, x: i32, y: i32, z: i32, exit: List<i32>, exact: bool) ! Thrown {
+        if self.gateway_tag(x, y, z) == none {
+            return
+        }
+        self.set_block_entity_value(x, y, z, "exit_portal", Tag.IntArray(exit.copy()))
+        if exact {
+            self.set_block_entity_value(x, y, z, "ExactTeleport", Tag.Byte(1))
+        } else {
+            self.remove_block_entity_value(x, y, z, "ExactTeleport")
+        }
+    }
 }
 
 impl Gateways for Level {
