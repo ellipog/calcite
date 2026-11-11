@@ -1699,9 +1699,10 @@ CONFIGS["talk"] = replace(CONFIGS["duel"], scenarios=("talk",), saved={"scoreboa
 # `msg` (CAL-165), and runs the functions of FUNCS_PACK (D567). Taped, as weather's lengths,
 # blocks' drops and summoned mobs are drawn from the levels' randoms, which line up only once
 # seeded again (D316). Where the bot respawns, which its bed sets, and its sleep's ticks are
-# compared too (D574), and its portal's cooldown and where it went into the Nether (D577).
+# compared too (D574), and its portal's cooldown and where it went into the Nether (D577), and
+# the ender pearl still flying as it leaves, saved with it (D580).
 CONFIGS["select"] = replace(CONFIGS["talk"], scenarios=("select",), ops=("Bot",), tape=True, datapacks={"funcs": FUNCS_PACK},
-                            keys=("respawn", "SleepTimer", "PortalCooldown", "entered_nether_pos"))
+                            keys=("respawn", "SleepTimer", "PortalCooldown", "entered_nether_pos", "ender_pearls"))
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
 BOT = "Bot"
