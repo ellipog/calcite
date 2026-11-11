@@ -137,6 +137,7 @@ import world.entity_data.{ABSORPTION, AIR_SUPPLY, ARROW_COUNT, ITEM_STACK, THROW
 import world.player_status.{Status, heal, read_status, set_health, tick_food, tick_regeneration, write_status}
 import world.digging.{ABORT_DESTROY_BLOCK, ACTIONS, CHANGE_DESTROY_DIRECTION, DESTROY_PROGRESS, DESTROY_PROGRESS_SOUND, DROP_ALL_ITEMS, DROP_ITEM, Digging, RELEASE_USE_ITEM, STAB, START_DESTROY_BLOCK, STOP_DESTROY_BLOCK, SWAP_ITEM_WITH_OFFHAND, attack, break_block, can_destroy, destroy_progress, durability_change, entity_in_reach, eye_in_water, game_master, has_correct_tool, in_reach, java_int, within_range, may_break_in_adventure, may_use_in_adventure, mining_damage, player_destroy, shrunk, emptied, with_damage, enchanted_value, is_damaged, mends_in}
 import world.block_level.{BeaconPulse, SOUND_BLOCKS, destroy_block as level_destroy_block, remove_block, update_output_signal}
+import world.block_entity_ticks.{trigger_cooldown}
 import world.beds.{BedRule}
 import world.dismount.{anchor_stand_up_position, stand_up_position}
 import world.block_updates.{after_removal, tilt_leaf}
@@ -15078,8 +15079,12 @@ impl Network {
                 Touched.Campfire(amount) => self.player_hurt_by(mut con, "campfire", amount),
                 Touched.Cactus => self.player_hurt_by(mut con, "cactus", 1.0f32),
                 Touched.Missing(what) => self.levels[d].unimplemented(what.copy()),
-                Touched.Portal(at) => set_as_inside_portal(mut con, at, false),
+                Touched.Portal(at) => set_as_inside_portal(mut con, at, false, false),
                 Touched.EndPortal(at) => self.end_portal_touched(mut con, at),
+                Touched.Gateway(g) => {
+                    let (at, cursor) = g
+                    self.gateway_touched(mut con, d, at, cursor)
+                },
                 Touched.Nothing => {},
             }
             // `onInsideBlock`: `ENTER_BLOCK` of the block, after what it did at once (CAL-164).
@@ -15179,16 +15184,18 @@ impl Network {
         con.player.portal_cooldown = 10
         if p.end {
             self.end_portal_travel(mut con)
+        } else if p.gateway {
+            self.gateway_travel(mut con, p)
         } else if let exit = self.portal_exit(mut con) {
             self.portal_travel(mut con, exit)
         }
         con.player.portal_known = none
     }
 
-    // `getPortalTransitionTime` of the portal `p` the player's in: an end portal's none, `Portal`'s
-    // own (D586), a nether portal's `portal_delay_of`.
+    // `getPortalTransitionTime` of the portal `p` the player's in: an end portal's and an end
+    // gateway's none, `Portal`'s own (D586, D593), a nether portal's `portal_delay_of`.
     fn portal_wait(self, con: Connection, p: PortalProcess) -> i32 {
-        return if p.end { 0 } else { self.portal_delay_of(con) }
+        return if p.end or p.gateway { 0 } else { self.portal_delay_of(con) }
     }
 
     // `getPortalTransitionTime` of a nether portal for the player (D577): the game rule
@@ -15362,6 +15369,9 @@ impl Network {
         if let p = con.player.portal {
             if p.end {
                 return self.end_portal_ready(mut con)
+            }
+            if p.gateway {
+                return self.gateway_ready(con, p)
             }
         }
         let t = traveller_of(con) else return true
@@ -15574,7 +15584,140 @@ impl Network {
             self.show_end_credits(mut con)
             return
         }
-        set_as_inside_portal(mut con, at, true)
+        set_as_inside_portal(mut con, at, true, false)
+    }
+
+    // The end gateway the player went into at `at` in the level `d`, `EndGatewayBlock.entityInside`
+    // (D593): where they may go through it, `canUsePortal`, and its block entity's there and isn't
+    // cooling down, they're in it, `setAsInsidePortal`, and its cooldown's begun,
+    // `triggerCooldown`, its block event kept where the walk's cursor ended, `cursor`, as
+    // vanilla's is, which runs only where there's another gateway.
+    fn gateway_touched(mut self, con: mut Connection, d: usize, at: (i32, i32, i32), cursor: (i32, i32, i32)) {
+        if not can_use_portal(con) {
+            return
+        }
+        let (x, y, z) = at
+        if self.gateway_tag(d, x, y, z) == none or self.levels[d].gateway_cooldown(x, y, z) > 0 {
+            return
+        }
+        set_as_inside_portal(mut con, at, false, true)
+        let shared = self.levels[d].shared_env() else return
+        let Env { facts: f, .. } = shared.value
+        let state = self.block_at(d, f, x, y, z) ?? f.ids.air_state
+        match trigger_cooldown(f, mut self.levels[d], state, x, y, z, cursor) {
+            ok => {},
+            err(thrown) => self.levels[d].unimplemented(thrown.message),
+        }
+    }
+
+    // What the end gateway's block entity at x, y, z in the level `d` saves, where there's one
+    // (D593).
+    fn gateway_tag(self, d: usize, x: i32, y: i32, z: i32) -> JavaHashMap<String, Tag>? {
+        let saved = self.levels[d].block_entity_tag(x, y, z) else return none
+        let Tag.Compound(m) = saved else return none
+        if not m.contains("id") or m["id"] != Tag.Str(String("minecraft:end_gateway")) {
+            return none
+        }
+        return some(m)
+    }
+
+    // Where the end gateway at x, y, z in the level `d` takes what goes into it,
+    // `TheEndGatewayBlockEntity.getPortalPosition` (D593): none where it has no exit, but in the
+    // End, where it finds one and makes it, `findOrCreateValidTeleportPos`, which is said to be
+    // missing; else its exit where it's exact, `ExactTeleport`, else above the tallest block about
+    // it, `findExitPosition`.
+    fn gateway_exit(mut self, d: usize, x: i32, y: i32, z: i32) -> BlockPos? {
+        let tags = self.gateway_tag(d, x, y, z) else return none
+        var exit: BlockPos? = none
+        if tags.contains("exit_portal") {
+            if let Tag.IntArray(p) = tags["exit_portal"] {
+                if p.len() == 3 {
+                    exit = some(BlockPos { x: p[0], y: p[1], z: p[2] })
+                }
+            }
+        }
+        let e = exit else {
+            if self.dim_is(d, "the_end") {
+                self.levels[d].unimplemented(String("An end gateway with no exit, which finds one and makes it, `findOrCreateValidTeleportPos`"))
+            }
+            return none
+        }
+        let exact = tags.contains("ExactTeleport") and (tags["ExactTeleport"].number_int() ?? 0) != 0
+        if exact {
+            return some(e)
+        }
+        let t = self.tallest_block(d, BlockPos { x: e.x, y: e.y + 2, z: e.z }, 5)
+        return some(BlockPos { x: t.x, y: t.y + 1, z: t.z })
+    }
+
+    // `findTallestBlock(level, around, dist, false)` in the level `d` (D593): of the columns within
+    // `dist` across of `around` but its own, each from the top of the world down to above the
+    // tallest found so far, the first block whose collision shape's whole and isn't bedrock; the
+    // tallest, the first of those as high, else `around`.
+    fn tallest_block(mut self, d: usize, around: BlockPos, dist: i32) -> BlockPos {
+        let shared = self.levels[d].shared_env() else return around
+        let Env { facts: f, .. } = shared.value
+        let bedrock = f.block_named(String("minecraft:bedrock")) ?? u32.MAX
+        let min_y = self.world.dims[d].min_y
+        let max_y = min_y + self.world.dims[d].height - 1
+        var tallest: BlockPos? = none
+        for xd in -dist..dist + 1 {
+            for zd in -dist..dist + 1 {
+                if xd == 0 and zd == 0 {
+                    continue
+                }
+                let floor = match tallest {
+                    some(t) => t.y,
+                    none => min_y,
+                }
+                var y = max_y
+                while y > floor {
+                    let (bx, bz) = (around.x + xd, around.z + zd)
+                    let state = self.block_at(d, f, bx, y, bz) ?? f.ids.air_state
+                    if f.collision_full_block(state) and f.block(state) != bedrock {
+                        tallest = some(BlockPos { x: bx, y: y, z: bz })
+                        break
+                    }
+                    y -= 1
+                }
+            }
+        }
+        return tallest ?? around
+    }
+
+    // Whether what the end gateway the player's in, `p`, reads on its way is loaded, as
+    // `portal_ready` asks (D593): where its exit isn't exact, the chunks of the columns
+    // `findExitPosition` looks down, 5 each way of it.
+    fn gateway_ready(mut self, con: Connection, p: PortalProcess) -> bool {
+        let d = con.player.dim
+        let tags = self.gateway_tag(d, p.x, p.y, p.z) else return true
+        if not tags.contains("exit_portal") or (tags.contains("ExactTeleport") and (tags["ExactTeleport"].number_int() ?? 0) != 0) {
+            return true
+        }
+        let Tag.IntArray(e) = tags["exit_portal"] else return true
+        if e.len() != 3 {
+            return true
+        }
+        return self.area_full(d, e[0] - 5, e[2] - 5, e[0] + 5, e[2] + 5)
+    }
+
+    // `EndGatewayBlock.getPortalDestination` of the end gateway the player's in, `p`, and their
+    // teleport there, `ServerPlayer.teleport` within their level (D593): where it has an exit,
+    // `gateway_exit`, and they may go into its level, `isAllowedToEnterPortal`, the bottom middle
+    // of it, `atBottomCenterOf`, their turn and motion kept, `Relative.union(DELTA, ROTATION)`,
+    // where they are kept, `resetPosition`; then a portal ticket put 3 about its chunk,
+    // `PLACE_PORTAL_TICKET`.
+    fn gateway_travel(mut self, con: mut Connection, p: PortalProcess) {
+        let d = con.player.dim
+        let pos = self.gateway_exit(d, p.x, p.y, p.z) else return
+        if self.dim_is(d, "the_nether") and not self.world.nether_portals {
+            return
+        }
+        self.teleport_by(mut con, f64(pos.x) + 0.5, f64(pos.y), f64(pos.z) + 0.5, 0.0f32, 0.0f32, GATEWAY_RELATIVES)
+        reset_position(mut con)
+        self.levels[d].load_portal(ChunkPos { x: pos.x >> 4, z: pos.z >> 4 })
+        self.level_lines()
+        self.levels[d].dispatch()
     }
 
     // `showEndCredits` of the player (D586): out of their level at once, as one that changes
@@ -30296,6 +30439,10 @@ const END_SPAWN_X: i32 = 100
 const END_SPAWN_Y: i32 = 50
 const END_SPAWN_Z: i32 = 0
 const END_RELATIVES: i32 = 496
+// A player's teleport through an end gateway keeps their turn and motion,
+// `Relative.union(DELTA, ROTATION)`: the yaw, the pitch, the motion along each axis, and its
+// turning with them, `ROTATE_DELTA` (D593).
+const GATEWAY_RELATIVES: i32 = 8 | 16 | 32 | 64 | 128 | 256
 
 // Whether the player may go through a portal, `canUsePortal(false)` (D577): alive and awake, as
 // they ride nothing yet.
@@ -30306,9 +30453,10 @@ fn can_use_portal(con: Connection) -> bool {
 // `setAsInsidePortal` of the nether portal block at `at` the player went into, where they may go
 // through it, `canUsePortal` (D577): on their portal's cooldown, it's set again, 10, as long as
 // they stay in; else, in no portal, they're in this one from there, `PortalProcessor`; in it but
-// not yet this tick, from there now. An end portal where `end`, which is another portal than a
-// nether portal they were in, `isSamePortal` (D586).
-fn set_as_inside_portal(con: mut Connection, at: (i32, i32, i32), end: bool) {
+// not yet this tick, from there now. An end portal where `end`, or an end gateway where
+// `gateway` (D593), which is another portal than one of another kind they were in,
+// `isSamePortal` (D586).
+fn set_as_inside_portal(con: mut Connection, at: (i32, i32, i32), end: bool, gateway: bool) {
     if not can_use_portal(con) {
         return
     }
@@ -30317,9 +30465,9 @@ fn set_as_inside_portal(con: mut Connection, at: (i32, i32, i32), end: bool) {
         return
     }
     let (x, y, z) = at
-    var p = con.player.portal.take() ?? PortalProcess { x: x, y: y, z: z, inside: false, end: end }
-    if p.end != end {
-        p = PortalProcess { x: x, y: y, z: z, inside: false, end: end }
+    var p = con.player.portal.take() ?? PortalProcess { x: x, y: y, z: z, inside: false, end: end, gateway: gateway }
+    if p.end != end or p.gateway != gateway {
+        p = PortalProcess { x: x, y: y, z: z, inside: false, end: end, gateway: gateway }
     }
     if not p.inside {
         p.x = x

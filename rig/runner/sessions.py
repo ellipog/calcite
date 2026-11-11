@@ -1760,7 +1760,9 @@ CONFIGS["end"] = Config({"difficulty": "normal"}, view=4, scenarios=("end",), wo
 # ender pearl falling onto another each, which they break, and a splash potion onto another (D591).
 CONFIGS["crystals"] = replace(CONFIGS["end"], scenarios=("crystals",))
 # `end`'s world with an end gateway the bot sets by its spawn, 2380 ticks old, its age read as it
-# ticks, and its cooldown begun at 2400, its block event sent (D592).
+# ticks, and its cooldown begun at 2400, its block event sent (D592); then the bot through one,
+# its exit exact, again, its exit found above the tallest block about it, and through one with
+# another on it, whose block event is sent twice (D593).
 CONFIGS["gateways"] = replace(CONFIGS["end"], scenarios=("gateways",))
 # Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
 # Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.
