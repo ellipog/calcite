@@ -12,6 +12,7 @@ cases:
   - session:locate/*/commands
   - session:compass/*/commands
   - session:bossbars/*/commands
+  - session:dragon/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
