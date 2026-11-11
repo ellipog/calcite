@@ -106,7 +106,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
-                   "traders", "frost", "soul", "splash", "linger", "talk", "select"]
+                   "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate"}
@@ -1703,6 +1703,9 @@ CONFIGS["talk"] = replace(CONFIGS["duel"], scenarios=("talk",), saved={"scoreboa
 # the ender pearl still flying as it leaves, saved with it (D580).
 CONFIGS["select"] = replace(CONFIGS["talk"], scenarios=("select",), ops=("Bot",), tape=True, datapacks={"funcs": FUNCS_PACK},
                             keys=("respawn", "SleepTimer", "PortalCooldown", "entered_nether_pos", "ender_pearls"))
+# `night`, where monsters spawn, with the bot an operator, in creative mode, throwing thirty ender
+# pearls straight down, some of which make endermites where it stands (D583), which then go about.
+CONFIGS["mites"] = replace(CONFIGS["night"], scenarios=("mites",), ops=("Bot",))
 # The bot's name in `join`, which the whitelist lets in. The default `white-list=true` stays, so
 # `stranger`, whom it doesn't list, is turned away.
 BOT = "Bot"

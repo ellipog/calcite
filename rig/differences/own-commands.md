@@ -3,6 +3,7 @@ title: Game masters and owners get Calcite's own commands too
 kind: identity
 cases:
   - session:select/*/commands
+  - session:mites/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
@@ -13,4 +14,4 @@ cases:
 
 **Why:** a client only offers and checks the commands it's sent, so Calcite's own commands have to be in the tree for players who may use them. Players below level 2 get vanilla's packet exactly, as the `talk` session shows.
 
-The `select` session's bot is an operator, so its commands packet at the join shows this.
+The `select` and `mites` sessions' bot is an operator, so its commands packet at the join shows this.
