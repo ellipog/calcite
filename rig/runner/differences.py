@@ -4,7 +4,7 @@ import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 
-KINDS = {"bug", "exploit", "identity", "performance", "platform"}
+KINDS = {"bug", "exploit", "feature", "identity", "performance", "platform"}
 
 
 class DifferenceError(Exception):

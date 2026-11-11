@@ -26,7 +26,7 @@ What vanilla does, what Calcite does instead, and why.
 | Field | Meaning |
 | --- | --- |
 | `title` | One line saying what Calcite does differently |
-| `kind` | `bug` (a vanilla bug Calcite fixes), `exploit` (one it closes), `identity` (where Calcite says what it is), `performance` (an unobservable shortcut that the rig can still see), or `platform` (where vanilla depends on its JVM or OS) |
+| `kind` | `bug` (a vanilla bug Calcite fixes), `exploit` (one it closes), `feature` (where Calcite does more than vanilla, as a search that finds what vanilla's gives up on), `identity` (where Calcite says what it is), `performance` (an unobservable shortcut that the rig can still see), or `platform` (where vanilla depends on its JVM or OS) |
 | `cases` | The cases it covers, as `probe:case-id` globs, or `session:SCENARIO/STEP/KIND` for the protocol suites. At least one |
 
 The body says what vanilla does, what Calcite does, and why the difference is worth it. Link the decision if there is one.

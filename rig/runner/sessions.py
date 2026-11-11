@@ -107,7 +107,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
-                   "gateways", "eyes", "throws"]
+                   "gateways", "eyes", "throws", "locate"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate"}
@@ -1783,6 +1783,11 @@ CONFIGS["eyes"] = replace(CONFIGS["end"], scenarios=("eyes",))
 # and every entity after has another ID. Taped, as each launch's pitch is drawn from the level's
 # random.
 CONFIGS["eye-throws"] = replace(CONFIGS["terrain"], scenarios=("throws",), world=PLAIN_WORLD, ops=("Bot",), tape=True)
+# The plain world, with the bot, an operator, at its spawn, having `locate structure` find
+# structures of each kind of placement, far and near, one the Overworld doesn't place and two
+# there are none of (D600): Calcite's search finds the nearest anywhere, vanilla's the nearest of
+# the first square of sectors with any, out to 100.
+CONFIGS["locate"] = replace(CONFIGS["eye-throws"], scenarios=("locate",), tape=False)
 # Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
 # Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.
 LEVEL_RANDOM_SEED = 1103
