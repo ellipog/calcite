@@ -107,7 +107,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
-                   "gateways"]
+                   "gateways", "eyes"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate"}
@@ -1766,6 +1766,9 @@ CONFIGS["crystals"] = replace(CONFIGS["end"], scenarios=("crystals",))
 # through one (D594); then, in the End, an item and the bot through gateways with no
 # exit, which make one (D595).
 CONFIGS["gateways"] = replace(CONFIGS["end"], scenarios=("gateways",))
+# `end`'s world with the bot filling the last frame of an end portal's ring it sets, which opens
+# the portal, and again once it's set that frame without its eye (D596).
+CONFIGS["eyes"] = replace(CONFIGS["end"], scenarios=("eyes",))
 # Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
 # Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.
 LEVEL_RANDOM_SEED = 1103
