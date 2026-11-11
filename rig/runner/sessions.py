@@ -1767,7 +1767,8 @@ CONFIGS["crystals"] = replace(CONFIGS["end"], scenarios=("crystals",))
 # exit, which make one (D595).
 CONFIGS["gateways"] = replace(CONFIGS["end"], scenarios=("gateways",))
 # `end`'s world with the bot filling the last frame of an end portal's ring it sets, which opens
-# the portal, and again once it's set that frame without its eye (D596).
+# the portal, and again once it's set that frame without its eye (D596); then using an eye in the
+# air, looking at the frame and up, which starts its use, as the world has no structures (D597).
 CONFIGS["eyes"] = replace(CONFIGS["end"], scenarios=("eyes",))
 # Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
 # Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.
