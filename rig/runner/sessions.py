@@ -107,7 +107,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
-                   "gateways", "eyes"]
+                   "gateways", "eyes", "throws"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate"}
@@ -122,6 +122,9 @@ SORTED_KEYS = {"attributes": "id", "active_effects": "id"}
 # The world the round trip has vanilla make and save (rig/runner/roundtrip.py), from the seed
 # `calcite` with real terrain, its chunks full from -6 to 5 around the origin.
 SAVED_WORLD = CALCITE / "build" / "rig" / "roundtrip" / "vanilla" / "world"
+# The same seed's world with the same chunks loaded and saved, and nothing put in it, which
+# roundtrip.py's `make_plain` has vanilla make the first time a configuration loads it (D599).
+PLAIN_WORLD = CALCITE / "build" / "rig" / "roundtrip" / "plain" / "world"
 # The fixture worlds vanilla builds from rig/fixtures/'s commands (rig/runner/fixtures.py), each in
 # a folder of its name with its world in it.
 FIXTURES = CALCITE / "build" / "rig" / "fixtures"
@@ -1771,6 +1774,15 @@ CONFIGS["gateways"] = replace(CONFIGS["end"], scenarios=("gateways",))
 # air, looking at the frame and up, which starts its use, as the world has no structures (D597);
 # then summoning eyes of ender, which fly on till their life runs out (D598).
 CONFIGS["eyes"] = replace(CONFIGS["end"], scenarios=("eyes",))
+# The plain world, which generates structures, as `terrain` has it, without its entities and with
+# no mobs spawning, its spawn at the origin, with the bot, an operator, throwing eyes of ender
+# there (D599): each finds the nearest stronghold, `findNearestMapStructure` over the rings, and
+# flies toward it till its life runs out, dropped as an item where it survives; the last in
+# survival leaves its hand empty, still in use till it lets go; then one in creative mode. The
+# plain world, not the round trip's, as its sand falls as an entity, which Calcite's doesn't yet,
+# and every entity after has another ID. Taped, as each launch's pitch is drawn from the level's
+# random.
+CONFIGS["throws"] = replace(CONFIGS["terrain"], scenarios=("throws",), world=PLAIN_WORLD, ops=("Bot",), tape=True)
 # Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
 # Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.
 LEVEL_RANDOM_SEED = 1103
@@ -2275,6 +2287,9 @@ def main():
             import fixtures
             fixtures.make(CONFIGS[c].fixture)
         world = CONFIGS[c].world
+        if world == PLAIN_WORLD and not (world / "level.dat").is_file() and not args.compare_only:
+            import roundtrip
+            roundtrip.make_plain()
         if world is not None and not (world / "level.dat").is_file():
             print(f"{c}: skipped, since there's no {world.relative_to(CALCITE)}; run py -I rig/runner/roundtrip.py", flush=True)
             configs.remove(c)

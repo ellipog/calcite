@@ -116,7 +116,7 @@ import world.clip.{clip_outline}
 import world.difficulty.{LocalDifficulty, moon_brightness}
 import world.mob.{CHICKEN, COW, CREEPER, DONKEY, ENDERMAN, ENDERMITE, HORSE, INTERACT_PASS, INTERACT_SERVER, MOOSHROOM, Making, Mob, Occasion, PIG, SHEEP, SKELETON, SLIME, SPIDER, VILLAGER, WITCH, ZOMBIE, ZOMBIE_HORSE, ZOMBIE_VILLAGER, bed_sleep_height, bed_yaw, held_name, species_named, type_name}
 import world.variants.{MobFacts}
-import world.loot.{Attacked, Located, LocatedEntry, Loot, LootEntity, LootParams, PostAttack, condition_holds, modify_stack, disk_blocks, disk_holds, distance_holds, doubles_match, enchanted_amount, equipment_drop_chance, float_sample, ints_hold, item_holds, location_entries, location_holds, post_attack_effects, random_sequence, roll_table, spawned_effects, state_holds, tick_entries, tick_holds, trade_offers, trade_sequence, weapon_effects}
+import world.loot.{Attacked, Located, LocatedEntry, Loot, LootEntity, LootParams, PostAttack, condition_holds, modify_stack, disk_blocks, disk_holds, distance_holds, doubles_match, doubles_match_sqr, enchanted_amount, equipment_drop_chance, float_sample, ints_hold, item_holds, location_entries, location_holds, post_attack_effects, random_sequence, roll_table, spawned_effects, state_holds, tick_entries, tick_holds, trade_offers, trade_sequence, weapon_effects}
 import world.item_tracker.{PathStep, Tracker, Sent, delta_bytes, lp_vec3_bytes, path_bytes, section_of}
 import world.movement.{MovementStates, Mover, meets}
 import math.mth.{RAD_TO_DEG, floor as mth_floor, round_double, round_float, table_atan2, table_cos, table_sin}
@@ -1761,8 +1761,10 @@ pub struct Network {
     // (CAL-143).
     server_swing: bool = false
     // Whether the item the player used, not on a block or an entity, came to `SUCCESS`, which
-    // swings their hand for those who see them (D579).
+    // swings their hand for those who see them (D579), or to `SUCCESS_SERVER`, which swings it
+    // for them too, as an eye of ender thrown does (D599).
     use_swung: bool = false
+    use_swung_self: bool = false
     // The UUID and entity ID of the player throwing what's being added, out of the connections
     // as they throw it, its owner as those who see it are told (D579).
     thrower: ((i64, i64), i32)? = none
@@ -9582,6 +9584,17 @@ impl Network {
                 self.send_level_events(d)
                 self.put_entities(d, es)
                 _ = self.make_drop(d, Dropped.Item(s.x, s.y, s.z, s.stack.copy()), none)
+                return self.take_entities(d)
+            },
+            Shown.Survived(s) => {
+                // An eye of ender's stack, as it survives (D599): an item made as `new
+                // ItemEntity(level, x, y, z, stack)` makes one, with no pickup delay.
+                self.send_level_events(d)
+                self.put_entities(d, es)
+                self.entity_ids += 1
+                let made = self.entity_ids
+                let seed = self.entity_seed(made)
+                self.add_item(d, ItemEntity.new(made, seed, s.x, s.y, s.z, s.stack.copy()), none)
                 return self.take_entities(d)
             },
             Shown.Tossed(t) => {
@@ -28142,9 +28155,15 @@ impl Network {
         }
         let (kind, duration) = self.interact_animation(con, hand)
         self.use_swung = false
+        self.use_swung_self = false
         self.use_held(mut con, hand)
         let d = con.player.dim
         self.send_level_events_with(d, mut con)
+        if self.use_swung_self {
+            self.use_swung_self = false
+            let me = con.player.entity_id
+            self.send_seen_and_self(mut con, encode_play(ClientboundSwingAnimation { entity_id: me, hand: hand, kind: kind, duration: duration }))
+        }
         if self.use_swung {
             self.use_swung = false
             let seen = self.seers_of(con)
@@ -28180,7 +28199,7 @@ impl Network {
             return
         }
         if item == "minecraft:ender_eye" {
-            self.use_ender_eye(mut con, hand)
+            self.use_ender_eye(mut con, hand, held)
             return
         }
         if own_use(item.copy()) {
@@ -28284,7 +28303,7 @@ impl Network {
     // it, which goes on till they let go, as it takes no ticks to use, and the nearest stronghold
     // is looked for, `findNearestMapStructure`, which a world without structures has none of, so
     // nothing more's done. A world with them, whose search and thrown eye wait for it, says so.
-    fn use_ender_eye(mut self, con: mut Connection, hand: i32) {
+    fn use_ender_eye(mut self, con: mut Connection, hand: i32, held: Tag) {
         let d = con.player.dim
         let shared = self.levels[d].shared_env() else return
         let Env { facts: f, .. } = shared.value
@@ -28306,9 +28325,92 @@ impl Network {
             }
         }
         self.start_using(mut con, hand, 0)
-        if self.structures_on {
-            self.levels[d].unimplemented(String("An eye of ender's search for the nearest stronghold, and its throw, in a world with structures"))
+        if not self.structures_on {
+            return
         }
+        let (bx, by, bz) = (i32.saturate(con.player.x.floor()), i32.saturate(con.player.y.floor()), i32.saturate(con.player.z.floor()))
+        var lines = List<Entry>()
+        let found = self.levels[d].locate(String("minecraft:eye_of_ender_located"), bx, by, bz, mut lines)
+        for e in lines {
+            self.logs.push(e.copy())
+        }
+        for missing in found.missing {
+            self.levels[d].unimplemented(missing.copy())
+        }
+        for p in found.problems {
+            self.logs.push(Entry.warn(p.copy()))
+        }
+        let (px, py, pz) = found.at else return
+        self.throw_eye(mut con, hand, held, px, py, pz)
+    }
+
+    // The rest of `EnderEyeItem.use` of the eye `held` in the player's hand `hand`, the nearest
+    // stronghold found at px, py, pz (D599): an eye of ender of one of it from half their height,
+    // `getY(0.5)`, sent toward that corner, `signalTo`; its `PROJECTILE_SHOOT`, which only
+    // vibrations hear, as a pearl's; added to the level, `addFreshEntity`; their
+    // `USED_ENDER_EYE` criteria, `used_ender_eye`; its launch heard where they are, of the neutral
+    // source, its pitch drawn from the level's random between 0.33 and 0.5; one of it used unless
+    // they're in creative, `consume`, what's left sent as their menu's changes are; its
+    // `ITEM_USED`; and their hand swung for them too, `SUCCESS_SERVER`.
+    fn throw_eye(mut self, con: mut Connection, hand: i32, held: Tag, px: i32, py: i32, pz: i32) {
+        let d = con.player.dim
+        let (x, y, z) = (con.player.x, con.player.y, con.player.z)
+        self.entity_ids += 1
+        let id = self.entity_ids
+        let seed = self.entity_seed(id)
+        let half = pose_height(con.player.entity_data.number(POSE_ID)) * 0.5
+        var eye = EyeOfEnder.thrown(id, seed, x, y + half, z, held.copy())
+        eye.signal_to(f64(px), f64(py), f64(pz))
+        self.add_eye(d, eye)
+        if not con.player.removed {
+            self.item_sees(d, id, mut con)
+        }
+        self.used_ender_eye(mut con, px, pz)
+        var random = self.levels[d].lend_level_random()
+        let pitch = 0.33f32 + random.next_float() * (0.5f32 - 0.33f32)
+        self.levels[d].give_back_level_random(random)
+        self.levels[d].play_sound_from_source(String("entity.ender_eye.launch"), x, y, z, NEUTRAL_SOURCE, 1.0f32, pitch)
+        self.send_level_events_with(d, mut con)
+        if not con.player.abilities.instabuild {
+            let left = shrunk(held.copy(), 1)
+            // What they use is their hand's stack itself, `useItem`, so it's used up with it,
+            // air, as their empty hand is (D599).
+            if left == none and using_item(con) {
+                con.player.use_item = none
+            }
+            set_held(mut con, hand, left)
+            // Their every slot's sent them only where they aren't using what they hold,
+            // `sendAllDataToRemote`; here the slot goes as their menu's changes do (D599).
+            if not using_item(con) {
+                self.send_inventory(mut con)
+            }
+        }
+        con.player.stats.award(String("minecraft:used"), stack_item(some(held.copy())), 1)
+        self.use_swung_self = true
+    }
+
+    // `CriteriaTriggers.USED_ENDER_EYE.trigger` for the player, the stronghold found at fx, fz
+    // (D599): each criterion listening whose `distance` holds of the square of how far across
+    // they are from it, `matchesSqr`, and whose player's condition holds, awarded.
+    fn used_ender_eye(mut self, con: mut Connection, fx: i32, fz: i32) {
+        let listening = con.player.advancements.listening(String("minecraft:used_ender_eye"))
+        if listening.is_empty() {
+            return
+        }
+        let xd = con.player.x - f64(fx)
+        let zd = con.player.z - f64(fz)
+        let sqr = xd * xd + zd * zd
+        var matched = List<Listener>()
+        for (key, conditions) in listening {
+            let distance = field_of(conditions, "distance")
+            if distance != Tag.End and not doubles_match_sqr(distance, sqr) {
+                continue
+            }
+            if self.player_holds(con, conditions) {
+                matched.push(key.copy())
+            }
+        }
+        self.award_all(mut con, matched)
     }
 
     // `EnderpearlItem.use` of the pearl `held` in the player's hand `hand` (D579), as
@@ -28599,12 +28701,18 @@ impl Network {
     // still in that hand, `isSameItem`, it's what they use now, and its use ticks,
     // `updateUsingItem`: a consumable's particles and sound every fourth tick once it's begun,
     // `shouldEmitParticlesAndSounds`, of 5 particles; then a tick less of it, and where none's
-    // left, its use completed, `complete_using`. Where the item's gone, they stop using it.
+    // left, its use completed, `complete_using`. Where the item's gone, they stop using it; but
+    // where what they use was used up in their hand, as an eye of ender's last throw uses it, it's
+    // air, as their empty hand is, so they go on using it, with nothing to tick (D599).
     fn player_using(mut self, con: mut Connection) {
         if not using_item(con) {
             return
         }
         let held = held_in(con, used_hand(con)) else {
+            if con.player.use_item == none {
+                con.player.use_remaining -= 1
+                return
+            }
             stop_using(mut con)
             return
         }

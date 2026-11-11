@@ -24,6 +24,11 @@ It runs in build/rig/roundtrip/, with Mojang's EULA accepted in its scratch fold
    difference.
 
 It exits with 1 if there's a difference. --reuse skips step 1 and uses the last run's world.
+
+`make_plain` has vanilla make the plain world in `plain/`: from the same seed, with the same chunks
+loaded and saved, and nothing put in it, no player's data and nothing the console sets, which the
+`throws` session loads, as the sand and water step 1 puts in fall and flow at its start, where
+Calcite's sand doesn't fall yet (D599). sessions.py has it made the first time that session runs.
 """
 
 import argparse
@@ -146,6 +151,27 @@ def loaded(server, dim, x, z, at):
         if time.monotonic() > end:
             sys.exit(f"roundtrip: {dim} never loaded {x}, {z}")
         time.sleep(0.5)
+
+
+def make_plain():
+    """The plain world: vanilla's from the seed, with `FORCED` loaded and saved, nothing put in it
+    (D599)."""
+    folder = ROOT / "plain"
+    port = free_port()
+    prepare(folder, port)
+    began = time.monotonic()
+    server = Server(vanilla_argv(adapter()), folder, "vanilla")
+    try:
+        at = server.wait_for("Done (")
+        for dim, x0, z0, x1, z1 in FORCED:
+            at = command(server, f"execute in {dim} run forceload add {x0} {z0} {x1} {z1}", "to be force loaded", at)
+        for dim, x0, z0, x1, z1 in FORCED:
+            for x, z in ((x0, z0), (x1, z1), (x0, z1), (x1, z0)):
+                at = loaded(server, dim, x, z, at)
+        at = command(server, "save-all flush", "Saved the game", at)
+    finally:
+        server.stop()
+    print(f"  vanilla made the plain world in {time.monotonic() - began:.1f}s", flush=True)
 
 
 def make(bot):
