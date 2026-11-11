@@ -102,7 +102,7 @@ import world.crystal.{EndCrystal, exploded}
 import world.thrown.{Doser, PearlHit, Splash, ThrownItem}
 import world.item_entity.{INFINITE_PICKUP_DELAY, ItemEntity}
 import world.combat.{Blame, CombatEntry, CombatTracker, LADDER_FALL, OTHER_CLIMBABLE_FALL, SCAFFOLDING_FALL, TWISTING_VINES_FALL, VINES_FALL, WATER_FALL, WEEPING_VINES_FALL, display_name_typed, entity_display_name, item_display_name, stack_display_name}
-import world.inside.{BlockEffect, Collector, doused, FIRE_IGNITE, fluid_effects, inside_blocks, Movement, PortalProcess, Touched, Travel as PortalWay}
+import world.inside.{BlockEffect, Collector, doused, FIRE_IGNITE, fluid_effects, GatewayExit, inside_blocks, Movement, PortalProcess, Touched, Travel as PortalWay}
 import world.drops.{pop_resource}
 import world.beacon.{beacon_data, beacon_effect, valid_effects}
 import world.consume_effects.{ConsumeEffect, death_effects}
@@ -728,6 +728,7 @@ struct Traveller {
     spectator: bool
     entry: (i32, i32, i32)
     end: bool
+    gateway: bool = false
 }
 
 // Where a portal takes a player (D577): the dimension, the place and the turn it adds to theirs;
@@ -3073,6 +3074,10 @@ impl Network {
         let fast = self.world.dims[d].environment.flag(fast_lava(), self.world.clocks, self.world.dims[d].weather.rain_level(), self.world.dims[d].weather.thunder_level())
         self.levels[d].lava_delay = if fast { 10 } else { 30 }
         self.levels[d].fast_lava = fast
+        // Whether it's the End, and whether portals may take what's in it, as its entities' end
+        // gateways ask (D594).
+        self.levels[d].the_end = self.dim_is(d, "the_end")
+        self.levels[d].portals_closed = self.dim_is(d, "the_nether") and not self.world.nether_portals
         // What the level's block ticks read of it this tick, random and scheduled (D338, D339).
         self.levels[d].place = self.tick_place(d)
         // The block ticks due, then the fluid ticks, as `ServerLevel.tick` runs them once the
@@ -9538,6 +9543,21 @@ impl Network {
                 self.entity_travel(d, id, way)
                 return self.take_entities(d)
             },
+            // An end gateway it went into, whose cooldown begins (D594).
+            Shown.Gateway(g) => {
+                let (at, cursor) = g
+                self.gateway_cooled(d, at, cursor)
+            },
+            // Its way through one within its level, `teleportSameDimension` (D594): those that see
+            // it told at once where they're told, where it is, how it's moving and turned, nothing
+            // relative, `ClientboundTeleportEntityPacket`, then a portal ticket put 3 about its
+            // chunk, `PLACE_PORTAL_TICKET`.
+            Shown.Moved(m) => {
+                if m.told and es.trackers.contains(m.id) {
+                    self.send_to_seen(es.trackers[m.id].seen_by, encode_play(ClientboundTeleportEntity { entity_id: m.id, x: m.x, y: m.y, z: m.z, delta_x: m.vx, delta_y: m.vy, delta_z: m.vz, y_rot: m.y_rot, x_rot: m.x_rot, relatives: 0, on_ground: m.on_ground }))
+                }
+                self.levels[d].load_portal(ChunkPos { x: i32.saturate(m.x.floor()) >> 4, z: i32.saturate(m.z.floor()) >> 4 })
+            },
         }
         return es
     }
@@ -15248,7 +15268,7 @@ impl Network {
                         known = some(k.known.copy())
                     }
                 }
-                let t = Traveller { from: d, x: p.x, y: p.y, z: p.z, width: p.width, height: p.height, fall: p.fall, descending: false, spectator: false, entry: (p.portal.x, p.portal.y, p.portal.z), end: p.portal.end }
+                let t = Traveller { from: d, x: p.x, y: p.y, z: p.z, width: p.width, height: p.height, fall: p.fall, descending: false, spectator: false, entry: (p.portal.x, p.portal.y, p.portal.z), end: p.portal.end, gateway: p.portal.gateway }
                 if not self.portal_ready_for(t, mut known) {
                     waiting = true
                 }
@@ -15382,10 +15402,14 @@ impl Network {
     }
 
     // `portal_ready` for what the portal takes, `t`, whatever it is (D578), the chunks kept as it
-    // begins in `known`; an end portal's, `end_ready_for` (D587).
+    // begins in `known`; an end portal's, `end_ready_for` (D587); an end gateway's,
+    // `gateway_ready_at` (D594).
     fn portal_ready_for(mut self, t: Traveller, known: mut (usize, Set<i64>)?) -> bool {
         if t.end {
             return self.end_ready_for(t.from)
+        }
+        if t.gateway {
+            return self.gateway_ready_at(t.from, t.entry)
         }
         let (px, _, pz) = t.entry
         let from = t.from
@@ -15597,10 +15621,17 @@ impl Network {
             return
         }
         let (x, y, z) = at
-        if self.gateway_tag(d, x, y, z) == none or self.levels[d].gateway_cooldown(x, y, z) > 0 {
+        if not self.levels[d].gateway_open(x, y, z) {
             return
         }
         set_as_inside_portal(mut con, at, false, true)
+        self.gateway_cooled(d, at, cursor)
+    }
+
+    // `triggerCooldown` of the end gateway at `at` in the level `d` that something went into
+    // (D593, D594), its block event kept where the walk's cursor ended, `cursor`.
+    fn gateway_cooled(mut self, d: usize, at: (i32, i32, i32), cursor: (i32, i32, i32)) {
+        let (x, y, z) = at
         let shared = self.levels[d].shared_env() else return
         let Env { facts: f, .. } = shared.value
         let state = self.block_at(d, f, x, y, z) ?? f.ids.air_state
@@ -15610,95 +15641,35 @@ impl Network {
         }
     }
 
-    // What the end gateway's block entity at x, y, z in the level `d` saves, where there's one
-    // (D593).
-    fn gateway_tag(self, d: usize, x: i32, y: i32, z: i32) -> JavaHashMap<String, Tag>? {
-        let saved = self.levels[d].block_entity_tag(x, y, z) else return none
-        let Tag.Compound(m) = saved else return none
-        if not m.contains("id") or m["id"] != Tag.Str(String("minecraft:end_gateway")) {
-            return none
-        }
-        return some(m)
-    }
-
     // Where the end gateway at x, y, z in the level `d` takes what goes into it,
     // `TheEndGatewayBlockEntity.getPortalPosition` (D593): none where it has no exit, but in the
     // End, where it finds one and makes it, `findOrCreateValidTeleportPos`, which is said to be
     // missing; else its exit where it's exact, `ExactTeleport`, else above the tallest block about
     // it, `findExitPosition`.
     fn gateway_exit(mut self, d: usize, x: i32, y: i32, z: i32) -> BlockPos? {
-        let tags = self.gateway_tag(d, x, y, z) else return none
-        var exit: BlockPos? = none
-        if tags.contains("exit_portal") {
-            if let Tag.IntArray(p) = tags["exit_portal"] {
-                if p.len() == 3 {
-                    exit = some(BlockPos { x: p[0], y: p[1], z: p[2] })
-                }
-            }
+        match self.levels[d].gateway_exit(x, y, z) {
+            GatewayExit.Nowhere => return none,
+            GatewayExit.Missing(what) => {
+                self.levels[d].unimplemented(what)
+                return none
+            },
+            GatewayExit.At((ex, ey, ez)) => return some(BlockPos { x: ex, y: ey, z: ez }),
         }
-        let e = exit else {
-            if self.dim_is(d, "the_end") {
-                self.levels[d].unimplemented(String("An end gateway with no exit, which finds one and makes it, `findOrCreateValidTeleportPos`"))
-            }
-            return none
-        }
-        let exact = tags.contains("ExactTeleport") and (tags["ExactTeleport"].number_int() ?? 0) != 0
-        if exact {
-            return some(e)
-        }
-        let t = self.tallest_block(d, BlockPos { x: e.x, y: e.y + 2, z: e.z }, 5)
-        return some(BlockPos { x: t.x, y: t.y + 1, z: t.z })
-    }
-
-    // `findTallestBlock(level, around, dist, false)` in the level `d` (D593): of the columns within
-    // `dist` across of `around` but its own, each from the top of the world down to above the
-    // tallest found so far, the first block whose collision shape's whole and isn't bedrock; the
-    // tallest, the first of those as high, else `around`.
-    fn tallest_block(mut self, d: usize, around: BlockPos, dist: i32) -> BlockPos {
-        let shared = self.levels[d].shared_env() else return around
-        let Env { facts: f, .. } = shared.value
-        let bedrock = f.block_named(String("minecraft:bedrock")) ?? u32.MAX
-        let min_y = self.world.dims[d].min_y
-        let max_y = min_y + self.world.dims[d].height - 1
-        var tallest: BlockPos? = none
-        for xd in -dist..dist + 1 {
-            for zd in -dist..dist + 1 {
-                if xd == 0 and zd == 0 {
-                    continue
-                }
-                let floor = match tallest {
-                    some(t) => t.y,
-                    none => min_y,
-                }
-                var y = max_y
-                while y > floor {
-                    let (bx, bz) = (around.x + xd, around.z + zd)
-                    let state = self.block_at(d, f, bx, y, bz) ?? f.ids.air_state
-                    if f.collision_full_block(state) and f.block(state) != bedrock {
-                        tallest = some(BlockPos { x: bx, y: y, z: bz })
-                        break
-                    }
-                    y -= 1
-                }
-            }
-        }
-        return tallest ?? around
     }
 
     // Whether what the end gateway the player's in, `p`, reads on its way is loaded, as
-    // `portal_ready` asks (D593): where its exit isn't exact, the chunks of the columns
-    // `findExitPosition` looks down, 5 each way of it.
+    // `portal_ready` asks (D593), `gateway_ready_at`.
     fn gateway_ready(mut self, con: Connection, p: PortalProcess) -> bool {
-        let d = con.player.dim
-        let tags = self.gateway_tag(d, p.x, p.y, p.z) else return true
-        if not tags.contains("exit_portal") or (tags.contains("ExactTeleport") and (tags["ExactTeleport"].number_int() ?? 0) != 0) {
-            return true
-        }
-        let Tag.IntArray(e) = tags["exit_portal"] else return true
-        if e.len() != 3 {
-            return true
-        }
-        return self.area_full(d, e[0] - 5, e[2] - 5, e[0] + 5, e[2] + 5)
+        return self.gateway_ready_at(con.player.dim, (p.x, p.y, p.z))
+    }
+
+    // Whether what the end gateway at `at` in the level `d` reads where it takes what goes into
+    // it is loaded (D593, D594): the chunks of the columns about its exit where it isn't exact,
+    // `gateway_reads`, which `findExitPosition` reads.
+    fn gateway_ready_at(mut self, d: usize, at: (i32, i32, i32)) -> bool {
+        let (x, y, z) = at
+        let (x0, z0, x1, z1) = self.levels[d].gateway_reads(x, y, z) else return true
+        return self.area_full(d, x0, z0, x1, z1)
     }
 
     // `EndGatewayBlock.getPortalDestination` of the end gateway the player's in, `p`, and their
