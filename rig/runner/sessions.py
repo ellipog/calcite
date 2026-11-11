@@ -107,10 +107,10 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
-                   "gateways", "eyes", "throws", "locate", "compass"]
+                   "gateways", "eyes", "throws", "locate", "compass", "bossbars"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
-MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate"}
+MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate", "bossbars": "bossbars-mate"}
 # What the bot's saved data is compared by, after a configuration that gives it some: what's in
 # its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
 # whose order is that of vanilla's map of them, by their identity hashes, so they're compared by
@@ -423,6 +423,25 @@ TALK = {
             {"Name": "pals", "DisplayName": "Pals", "TeamColor": "aqua",
              "Players": nbt.List(nbt.STRING, ["Bot", "Mate"])},
         ]),
+    },
+    "DataVersion": nbt.Int(5023),
+}
+
+# The boss bars `bossbars` starts with (D606): `calcite:saved`, shown, red with 10 notches, its
+# value 30 of 60, darkening the screen, whose players the bot is among, so it's shown it as it
+# joins; `calcite:hidden`, unseen, playing boss music and making fog, with Mate among its players
+# and someone who isn't there; and `calcite:plain`, with only its name, so unseen. The bot's and
+# Mate's UUIDs, `offline_uuid`'s, as `UUIDUtil.CODEC` saves them.
+BOT_INTS = [-1155928273, 798308776, -1951547997, -315148217]
+MATE_INTS = [105469737, -1056885334, -1415735622, -1521856055]
+SAVED_BARS = {
+    "data": {
+        "calcite:saved": {"Name": {"text": "Saved", "color": "gold"}, "Visible": nbt.Byte(1), "Value": nbt.Int(30),
+                          "Max": nbt.Int(60), "Color": "red", "Overlay": "notched_10", "DarkenScreen": nbt.Byte(1),
+                          "Players": nbt.List(nbt.INT_ARRAY, [nbt.IntArray(BOT_INTS)])},
+        "calcite:hidden": {"Name": "Hidden", "PlayBossMusic": nbt.Byte(1), "CreateWorldFog": nbt.Byte(1),
+                           "Players": nbt.List(nbt.INT_ARRAY, [nbt.IntArray(MATE_INTS), nbt.IntArray([1, 2, 3, 4])])},
+        "calcite:plain": {"Name": "Plain"},
     },
     "DataVersion": nbt.Int(5023),
 }
@@ -1734,6 +1753,11 @@ CONFIGS["talk"] = replace(CONFIGS["duel"], scenarios=("talk",), saved={"scoreboa
 # the ender pearl still flying as it leaves, saved with it (D580).
 CONFIGS["select"] = replace(CONFIGS["talk"], scenarios=("select",), ops=("Bot",), tape=True, datapacks={"funcs": FUNCS_PACK},
                             keys=("respawn", "SleepTimer", "PortalCooldown", "entered_nether_pos", "ender_pearls"))
+# `talk` with the bot an operator, making and changing boss bars with `bossbar`, with Mate there,
+# on a world whose saved boss bars are SAVED_BARS (D606). Taped, as a bar's UUID is drawn from the
+# level's random, as `bossbar add` makes it.
+CONFIGS["bossbars"] = replace(CONFIGS["talk"], scenarios=("bossbars",), ops=("Bot",), tape=True,
+                              saved={"scoreboard": TALK, "custom_boss_events": SAVED_BARS})
 # `night`, where monsters spawn, with the bot an operator, in creative mode, throwing thirty ender
 # pearls straight down, some of which make endermites where it stands (D583), which then go about.
 CONFIGS["mites"] = replace(CONFIGS["night"], scenarios=("mites",), ops=("Bot",))
@@ -2193,6 +2217,35 @@ def compare_scheduled(config):
     return same
 
 
+def boss_bars_kept(world):
+    """A world's boss bars as they're compared (D606): `data/minecraft/custom_boss_events.dat`, its
+    root with its keys in the order written, each bar's players sorted, as vanilla saves them
+    through `Set.copyOf`, whose order it draws afresh each run; None where there's none."""
+    path = world / "data" / "minecraft" / "custom_boss_events.dat"
+    if not path.is_file():
+        return None
+    root = nbt.read(path)
+    for bar in root.get("data", {}).values():
+        if isinstance(bar, dict) and isinstance(bar.get("Players"), list):
+            bar["Players"].sort(key=list)
+    return ordered(root)
+
+
+def compare_boss_bars(config):
+    """Whether both servers saved the boss bars the same (D606), printing what differs. Nothing's
+    printed where neither saved any."""
+    kept = {side: boss_bars_kept(SESSIONS / config / side / "world") for side in ("vanilla", "calcite")}
+    if kept["vanilla"] is None and kept["calcite"] is None:
+        return True
+    same = kept["vanilla"] == kept["calcite"]
+    path = SESSIONS / config / "vanilla" / "world" / "data" / "minecraft" / "custom_boss_events.dat"
+    bars = len(nbt.read(path).get("data", {})) if path.is_file() else 0
+    print(f"saved bars     {'PASS' if same else 'differs'}    {bars} bars")
+    if not same:
+        print(f"  [{config}] custom_boss_events:\n      vanilla: {kept['vanilla']}\n      calcite: {kept['calcite']}")
+    return same
+
+
 def compare_made_packs(config):
     """Whether both servers wrote the packs `datapack create` made the same (D573): each folder
     in the world's `datapacks` that no configuration put there, by its name, with its
@@ -2342,6 +2395,7 @@ def main():
                 + [compare_scoreboard(c) for c in configs if scenarios[c]]
                 + [compare_storage(c) for c in configs if scenarios[c]]
                 + [compare_scheduled(c) for c in configs if scenarios[c]]
+                + [compare_boss_bars(c) for c in configs if scenarios[c]]
                 + [compare_made_packs(c) for c in configs if scenarios[c]])
     for c in configs:
         if CONFIGS[c].fixture is not None and scenarios[c]:

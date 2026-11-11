@@ -11,6 +11,7 @@ cases:
   - session:throws/*/commands
   - session:locate/*/commands
   - session:compass/*/commands
+  - session:bossbars/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too

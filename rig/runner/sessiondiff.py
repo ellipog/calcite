@@ -116,6 +116,10 @@ KNOWN_RECIPES = "play/recipe_book_add"
 # each run; they're compared in their text's order, and the bytes aren't (CAL-164).
 ENCHANTED = ("ItemEnchantments{enchantments={", "ItemEnchantments{storedEnchantments={")
 SUITES = {"status": "status", "login": "login", "configuration": "configuration"}
+# A boss bar's packet, whose UUID vanilla draws afresh, `UUID.randomUUID`, for each bar it reads
+# from its saved file: each UUID is named by the order it first came in, `bar 0` and on, so a
+# session's bars line up and their UUIDs needn't, and their bytes aren't compared (D606).
+BOSS_EVENT = "play/boss_event"
 # Packets lined up by where they are as well as by kind: a block's event and a sound, which
 # pistons and clocks send over and over (CAL-125).
 PLACED = {"play/block_event", "play/sound"}
@@ -168,6 +172,7 @@ def load(path):
     """A session's steps, from SessionDump's .jsonl."""
     steps = [Step("start")]
     me = None
+    bars = {}
     for line in path.read_text(encoding="utf-8").splitlines():
         r = json.loads(line)
         step = steps[-1]
@@ -182,6 +187,9 @@ def load(path):
         value = r.get("value")
         if kind in DRAWN:
             value = without(value, DRAWN[kind])
+        if kind == BOSS_EVENT and isinstance(value, dict) and "id" in value:
+            value = dict(value, id=f"bar {bars.setdefault(value['id'], len(bars))}")
+            r["sha256"] = ""
         if kind == ADVANCEMENTS:
             value = advancements_sorted(obtained_only(without(value, {"y"})))
             r["sha256"] = ""
