@@ -56,7 +56,7 @@ import random.taped.{TapedRandom}
 import resources.identifier.{Identifier}
 import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
-import server.chunk_jobs.{ChunkContext, ChunkJobs, Done}
+import server.chunk_jobs.{ChunkContext, ChunkJobs, Done, Loaded}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
 import server.commands.{Condition, DataAction, DataPackAction, PackPlace, ItemAction, ItemFrom, ItemTarget, SlotsGiven, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, FunctionArgs, ScheduleAction, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
 import server.configuration.{Configuration, update_tags}
@@ -92,12 +92,13 @@ import world.clocks.{saved_id as clocks_id}
 import world.chunk.{MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, WORLD_SURFACE}
 import world.collision.{Aabb, CollisionStates, eye_height, pose_box, pose_height, pose_size}
 import world.entities.{Entities, PearlOwner, PortalDue}
-import world.body.{Body, BodyFacts, EntitySound, NEUTRAL_SOURCE, PLAYERS_SOURCE, bool_or, on_pos_of, push_between, splash_draws, support_of}
+import world.body.{Body, BodyFacts, EntitySound, NEUTRAL_SOURCE, PLAYERS_SOURCE, bool_or, insecure_uuid, on_pos_of, push_between, splash_draws, support_of, uuid_tag}
 import world.currents.{fluids_at, push as current_push}
 import world.damage.{BYPASSES_ARMOR, BYPASSES_COOLDOWN, BYPASSES_EFFECTS, BYPASSES_ENCHANTMENTS, BYPASSES_INVULNERABILITY, BYPASSES_RESISTANCE, DAMAGES_HELMET, Damage, DamageTypes, IS_FIRE, NO_ANGER, NO_IMPACT, NO_KNOCKBACK, resists}
 import world.experience_orb.{ExperienceOrb, Follower, Mask, orb_values}
 import world.arrow.{ALLOWED, Arrow, ArrowHit, BlockStruck, CREATIVE_ONLY}
 import world.cloud.{Dose, EffectCloud}
+import world.crystal.{EndCrystal}
 import world.thrown.{Doser, PearlHit, Splash, ThrownItem}
 import world.item_entity.{INFINITE_PICKUP_DELAY, ItemEntity}
 import world.combat.{Blame, CombatEntry, CombatTracker, LADDER_FALL, OTHER_CLIMBABLE_FALL, SCAFFOLDING_FALL, TWISTING_VINES_FALL, VINES_FALL, WATER_FALL, WEEPING_VINES_FALL, display_name_typed, entity_display_name, item_display_name, stack_display_name}
@@ -1034,6 +1035,7 @@ enum ReadEntity {
     Arrow(Arrow)
     Thrown(ThrownItem)
     Cloud(EffectCloud)
+    Crystal(EndCrystal)
     Kept(Tag)
 }
 
@@ -1764,6 +1766,10 @@ pub struct Network {
     // they attack, made once their connection's back among the others, `attack_deferred`, so
     // the players it hurts are heard by them as by everyone (CAL-162).
     attacking: (usize, i32)? = none
+    // The chunk, of a level and packed, whose generation's entities are being added as it comes
+    // to be full, which vanilla's are as the chunk's promoted, `postLoadProtoChunk`, before it can
+    // be ready to send; so they pair with whoever's view has it as it isn't sent yet (D589).
+    coming_full: (usize, i64)? = none
     // What placing blocks reads of vanilla's tables, made the first time a block's used (CAL-139).
     placing: PlaceFacts? = none
     streams: Streams? = none
@@ -2303,7 +2309,8 @@ impl Network {
                 // What the workers made of what the IO thread read is made again here, from it.
                 var made = List<Entry>()
                 let loaded = self.levels[d].make(pos, bytes, mut made)
-                if not self.levels[d].read_chunk(pos, io, loaded, made) {
+                let given = self.fresh_ids(d, pos, loaded)
+                if not self.levels[d].read_chunk(pos, io, given, made) {
                     self.link.diverged("the IO thread read chunk {pos.x}, {pos.z} of dimension {d}, which the server didn't ask for")
                 }
                 self.level_lines()
@@ -3635,6 +3642,11 @@ impl Network {
             self.track_cloud(d, id)
             return
         }
+        if es.list.is_crystal(id) {
+            self.put_entities(d, es)
+            self.track_crystal(d, id)
+            return
+        }
         let lent = es.list.lend(id)
         let kept = es.trackers.remove(id)
         self.put_entities(d, es)
@@ -3839,6 +3851,60 @@ impl Network {
         var after = self.take_entities(d)
         after.trackers.insert(id, tr)
         after.list.give_back_thrown(p)
+        self.put_entities(d, after)
+    }
+
+    // An end crystal's tracker, as a cloud's runs (D589): where it needs syncing or its values
+    // changed, with its motion sent only where it's to be synced, `dontTrackDeltas`.
+    fn track_crystal(mut self, d: usize, id: i32) {
+        var es = self.take_entities(d)
+        let lent = es.list.lend_crystal(id)
+        let kept = es.trackers.remove(id)
+        self.put_entities(d, es)
+        var c = lent else {
+            self.keep_tracker(d, id, kept)
+            return
+        }
+        var tr = kept else {
+            var back = self.take_entities(d)
+            back.list.give_back_crystal(c)
+            self.put_entities(d, back)
+            return
+        }
+        let now = section_of(c.body)
+        let (sx, sy, sz) = now
+        let (ox, oy, oz) = tr.section
+        let moved = sx != ox or sy != oy or sz != oz
+        if moved {
+            tr.section = now
+            for slot in self.level_slots(d) {
+                var con = self.connections[slot].take() else continue
+                self.crystal_seen(mut tr, c, mut con)
+                self.connections[slot] = some(con)
+            }
+        }
+        if moved or c.body.needs_sync or c.body.sync_velocity or self.levels[d].entity_ticking(ChunkPos { x: sx, z: sz }) {
+            var out = List<Sent>()
+            let dirty = c.data.is_dirty()
+            tr.send_thrown_changes(mut c.body, dirty, mut out)
+            for sent in out {
+                match sent {
+                    Sent.Dirty => {
+                        if let packed = c.data.pack_dirty() {
+                            tr.values = c.data.pack_non_default()
+                            self.send_to_seen(tr.seen_by, encode_play(ClientboundSetEntityData { entity_id: id, items: packed }))
+                        }
+                    },
+                    _ => {
+                        let packet = self.sent_packet(id, sent)
+                        self.send_to_seen(tr.seen_by, packet)
+                    },
+                }
+            }
+        }
+        var after = self.take_entities(d)
+        after.trackers.insert(id, tr)
+        after.list.give_back_crystal(c)
         self.put_entities(d, after)
     }
 
@@ -8942,6 +9008,9 @@ impl Network {
         // within it, which Calcite doesn't have them do (D587).
         let end_target = if self.dim_is(d, "the_end") { self.respawn_level() } else { self.the_end() }
         es.list.end_portal_open = end_target != none and end_target != some(d) and (self.world.nether_portals or not self.dim_is(end_target ?? 0, "the_nether"))
+        // Whether it has a dragon fight, in which end crystals set the air they're in alight
+        // (D589).
+        es.list.fight = self.world.dims[d].fight != none
         // The players ender pearls may be owned by, wherever they are, alive or not, and whether
         // a dead one's pearls go (D579).
         var owners = List<PearlOwner>()
@@ -9224,6 +9293,12 @@ impl Network {
             Shown.Dosed(dose) => {
                 self.send_level_events(d)
                 return self.cloud_doses(es, d, dose)
+            },
+            Shown.Kindled((x, y, z)) => {
+                // An end crystal's fire, as its tick ends (D589).
+                self.send_level_events(d)
+                self.levels[d].kindle(x, y, z)
+                self.send_level_events(d)
             },
             Shown.Fired(shot) => {
                 self.send_level_events(d)
@@ -11983,6 +12058,9 @@ impl Network {
             } else if let cloud = es.list.lend_cloud(id) {
                 self.cloud_seen(mut tr, cloud, mut con)
                 es.list.give_back_cloud(cloud)
+            } else if let crystal = es.list.lend_crystal(id) {
+                self.crystal_seen(mut tr, crystal, mut con)
+                es.list.give_back_crystal(crystal)
             }
             es.trackers.insert(id, tr)
         }
@@ -12017,6 +12095,9 @@ impl Network {
             } else if let cloud = es.list.lend_cloud(id) {
                 self.cloud_seen(mut tr, cloud, mut con)
                 es.list.give_back_cloud(cloud)
+            } else if let crystal = es.list.lend_crystal(id) {
+                self.crystal_seen(mut tr, crystal, mut con)
+                es.list.give_back_crystal(crystal)
             }
             es.trackers.insert(id, tr)
         }
@@ -12108,6 +12189,11 @@ impl Network {
         if not con.player.sender.sees(pos) or not con.player.sender.near(pos) {
             return false
         }
+        // A chunk whose generation's entities come in as it comes to be full isn't ready yet in
+        // vanilla, whatever Calcite's ticking has of it (D589).
+        if self.coming_full == some((con.player.dim, pos.pack())) {
+            return true
+        }
         return not self.levels[con.player.dim].sendable(pos)
     }
 
@@ -12189,6 +12275,26 @@ impl Network {
         if self.comes_to_see(mut tr, c.body, mut con) {
             self.pair_cloud(mut con, tr, c)
         }
+    }
+
+    // `updatePlayer` of an end crystal's tracker for the player `con` (D589).
+    fn crystal_seen(mut self, tr: mut Tracker, c: EndCrystal, con: mut Connection) {
+        if self.comes_to_see(mut tr, c.body, mut con) {
+            self.pair_crystal(mut con, tr, c)
+        }
+    }
+
+    // `addPairing` of an end crystal (D589), as a cloud's: its `add_entity` from its tracker, with
+    // no data, then its values as they were last sent where any aren't their defaults.
+    fn pair_crystal(mut self, con: mut Connection, tr: Tracker, c: EndCrystal) {
+        let kind = self.entity_type("minecraft:end_crystal")
+        let body = tr.add_entity_body(c.body, kind)
+        self.send(mut con, ClientboundBundleDelimiter {}, State.Play)
+        self.send(mut con, ClientboundAddEntity { entity_id: c.body.id, body: body }, State.Play)
+        if let values = tr.values {
+            self.send(mut con, ClientboundSetEntityData { entity_id: c.body.id, items: values.copy() }, State.Play)
+        }
+        self.send(mut con, ClientboundBundleDelimiter {}, State.Play)
     }
 
     // `addPairing` of an area effect cloud (D529): its `add_entity` from its tracker, with no
@@ -12878,6 +12984,16 @@ impl Network {
             }
             return none
         }
+        if type_id == "minecraft:end_crystal" {
+            // An end crystal (D589).
+            self.entity_ids += 1
+            let id = self.entity_ids
+            let seed = self.entity_seed(id)
+            if let c = EndCrystal.loaded(id, seed, tag, mut lines) {
+                return some(ReadEntity.Crystal(c))
+            }
+            return none
+        }
         if type_id == "minecraft:ender_pearl" and codecs_ready {
             // A thrown ender pearl (D579), its stack read with `ItemStack.CODEC`, an ender pearl
             // where it's empty or unread.
@@ -13086,6 +13202,7 @@ impl Network {
             ReadEntity.Arrow(a) => self.add_arrow(d, a.copy()),
             ReadEntity.Thrown(thrown) => self.add_thrown(d, thrown.copy()),
             ReadEntity.Cloud(c) => self.add_cloud(d, c.copy()),
+            ReadEntity.Crystal(c) => self.add_crystal(d, c.copy()),
             ReadEntity.Kept(_) => {},
         }
     }
@@ -13246,8 +13363,10 @@ impl Network {
             }
             self.put_entities(d, es)
             if full {
+                self.coming_full = some((d, k))
                 self.add_world_entities(d, pos)
                 self.add_generated(d, pos)
+                self.coming_full = none
             }
             if full and fresh {
                 self.ask_entities(d, pos)
@@ -13668,6 +13787,26 @@ impl Network {
         es.tracked.insert(id, false)
         es.trackers.insert(id, tr)
         es.list.add_cloud(cloud)
+        self.put_entities(d, es)
+    }
+
+    // `addFreshEntity` of the end crystal `c` in the level `d`, as `add_cloud` adds a cloud (D589),
+    // its tracker made with its values that aren't their defaults.
+    fn add_crystal(mut self, d: usize, c: own EndCrystal) {
+        self.entries += 1
+        var crystal = c
+        crystal.body.entered = self.entries
+        let id = crystal.body.id
+        var tr = Tracker.of_crystal(crystal.body, crystal.data.pack_non_default())
+        var es = self.take_entities(d)
+        for slot in self.level_slots(d) {
+            var con = self.connections[slot].take() else continue
+            self.crystal_seen(mut tr, crystal, mut con)
+            self.connections[slot] = some(con)
+        }
+        es.tracked.insert(id, false)
+        es.trackers.insert(id, tr)
+        es.list.add_crystal(crystal)
         self.put_entities(d, es)
     }
 
@@ -15638,6 +15777,12 @@ impl Network {
                 _ = portal_set(mut it.body, exit, way)
                 it.body.portal_process = some(way.portal)
                 self.add_cloud(to, it)
+            },
+            ReadEntity.Crystal(c) => {
+                var it = c
+                _ = portal_set(mut it.body, exit, way)
+                it.body.portal_process = some(way.portal)
+                self.add_crystal(to, it)
             },
             ReadEntity.Kept(_) => {
                 self.levels[d].unimplemented(String("An entity a nether portal took that can't be read again where it leads"))
@@ -17996,6 +18141,12 @@ impl Network {
             // `Player.attack` on an area effect cloud, which takes no hurt, `hurtServer` (D529).
             self.put_entities(d, es)
             self.levels[d].unimplemented(String("A player's attack on an area effect cloud"))
+            return true
+        }
+        if es.list.is_crystal(id) {
+            // `Player.attack` on an end crystal, which it breaks, `hurtServer` (D589).
+            self.put_entities(d, es)
+            self.levels[d].unimplemented(String("A player's attack on an end crystal"))
             return true
         }
         if not es.list.is_mob(id) {
@@ -24354,6 +24505,7 @@ impl Network {
             ReadEntity.Arrow(a) => uuid = a.body.uuid,
             ReadEntity.Thrown(p) => uuid = p.body.uuid,
             ReadEntity.Cloud(c) => uuid = c.body.uuid,
+            ReadEntity.Crystal(c) => uuid = c.body.uuid,
             ReadEntity.Kept(_) => fail Failure.alone(Component.literal("Calcite can't summon {name} yet")),
         }
         if let ReadEntity.Item(_) = made {} else {
@@ -24364,6 +24516,7 @@ impl Network {
                 ReadEntity.Arrow(a) => custom = custom_name_in(a.body),
                 ReadEntity.Thrown(p) => custom = custom_name_in(p.body),
                 ReadEntity.Cloud(c) => custom = custom_name_in(c.body),
+                ReadEntity.Crystal(c) => custom = custom_name_in(c.body),
                 _ => {},
             }
             shown = entity_display_name(name.copy(), Uuid.new(uuid.0, uuid.1), custom)
@@ -24408,6 +24561,11 @@ impl Network {
                 var it = c
                 snap_body(mut it.body, x, y, z)
                 self.add_cloud(d, it)
+            },
+            ReadEntity.Crystal(c) => {
+                var it = c
+                snap_body(mut it.body, x, y, z)
+                self.add_crystal(d, it)
             },
             ReadEntity.Kept(_) => {},
         }
@@ -28928,15 +29086,55 @@ impl Network {
         }
     }
 
-    // Takes what each dimension logged, and the IDs the entities of each chunk it took in fresh
-    // took as they were made, which vanilla's worker draws as it decorates, `create`: as each
-    // chunk taken in is, at once, before anything else is made (D588).
+    // Takes what each dimension logged.
     fn level_lines(mut self) {
         for d in 0..self.levels.len() {
             for e in self.levels[d].take_lines() {
                 self.logs.push(e.copy())
             }
-            self.entity_ids += self.levels[d].take_fresh_entities()
+        }
+    }
+
+    // The chunk `loaded` the level `d` asked for at `pos`, as it's handed over: where the
+    // generator made it fresh, so decorated, each entity its decorations made with an ID drawn,
+    // as vanilla's worker makes one, `EntityType.create`, and the UUID its random draws as it's
+    // made, `createInsecureUUID`, from that ID's seed, as the rig's agent seeds vanilla's. The
+    // level asks only for chunks at a level vanilla decorates them at, 34 or less, where Calcite's
+    // generator decorates more about them in its ranks' order (D214), and some again after they
+    // were dropped (D588). A replay, which generates it again, draws the same (D589).
+    fn fresh_ids(mut self, d: usize, pos: ChunkPos, loaded: own Loaded) -> Loaded {
+        if not self.levels[d].asked_read(pos) {
+            return loaded
+        }
+        match loaded {
+            Loaded.Saved(s) => {
+                var saved = s
+                if not saved.fresh {
+                    return Loaded.Saved(saved)
+                }
+                let held = saved.rest.copy() else return Loaded.Saved(saved)
+                let entities = held.entities()
+                if entities.is_empty() {
+                    return Loaded.Saved(saved)
+                }
+                var given = List<Tag>()
+                for tag in entities {
+                    self.entity_ids += 1
+                    let id = self.entity_ids
+                    var random = LegacyRandom.new(self.entity_seed(id))
+                    let uuid = insecure_uuid(mut random)
+                    if let Tag.Compound(m) = tag {
+                        var named = m.copy()
+                        named.insert(String("UUID"), uuid_tag(uuid))
+                        given.push(Tag.Compound(named))
+                    } else {
+                        given.push(tag.copy())
+                    }
+                }
+                saved.rest = some(held.with_entities(given))
+                return Loaded.Saved(saved)
+            },
+            other => return other,
         }
     }
 
@@ -28969,7 +29167,8 @@ impl Network {
                 },
                 Done.Chunk(pos, io, bytes, made, loaded) => {
                     self.link.chunk_read(dim, pos, io, bytes)
-                    _ = self.levels[dim].read_chunk(pos, io, loaded, made)
+                    let given = self.fresh_ids(dim, pos, loaded)
+                    _ = self.levels[dim].read_chunk(pos, io, given, made)
                 },
                 Done.Withdrawn(pos, io, made) => {
                     self.link.chunk_withdrawn(dim, pos, io, made)

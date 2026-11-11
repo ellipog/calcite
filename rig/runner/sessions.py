@@ -1742,11 +1742,11 @@ FIGHT_OVER = {"data": {"needs_state_scanning": nbt.Byte(0), "dragon_killed": nbt
               "DataVersion": nbt.Int(DATA_VERSION)}
 # The bot, an operator, through end portals on the end fixture's world, the End's dragon fight over,
 # with no mobs spawning (D586): into the End, out of it to the credits the first time, after which
-# it respawns keeping all it has, and to where its spawn's set the second. Two chunks about it, so
-# the End's spikes and their crystals, which Calcite doesn't make yet, are out of its sight. Taped,
-# as the platform's drops are drawn from the End's random; where it's seen the credits is compared,
-# and where its spawn's set, its health, food and effects.
-CONFIGS["end"] = Config({"difficulty": "normal"}, view=2, scenarios=("end",), world=FIXTURES / "end" / "world", fixture="end",
+# it respawns keeping all it has, and to where its spawn's set the second. Four chunks about it, so
+# the crystal on the spike at 42, 0 is in its sight, those on the two others in chunks at x = 2
+# too far off (D589). Taped, as the platform's drops are drawn from the End's random; where it's
+# seen the credits is compared, and where its spawn's set, its health, food and effects.
+CONFIGS["end"] = Config({"difficulty": "normal"}, view=4, scenarios=("end",), world=FIXTURES / "end" / "world", fixture="end",
                         rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                                ("minecraft:respawn_radius", nbt.Int(0))),
                         ops=("Bot",), tape=True, player=END_PLAYER,
