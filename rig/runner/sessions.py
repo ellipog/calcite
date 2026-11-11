@@ -106,7 +106,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
-                   "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end"]
+                   "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate"}
@@ -1752,6 +1752,11 @@ CONFIGS["end"] = Config({"difficulty": "normal"}, view=4, scenarios=("end",), wo
                         ops=("Bot",), tape=True, player=END_PLAYER,
                         keys=("seenCredits", "respawn", "Health", "foodLevel", "active_effects"),
                         dim_saved={"minecraft/the_end/ender_dragon_fight": FIGHT_OVER})
+# `end`'s world with the bot hitting an end crystal it summons in water in the Overworld (D590):
+# in survival mode, invulnerable, which the hit doesn't hurt; then in creative mode with an iron
+# sword, which breaks it, sweeping. Vanilla's crystal explodes, which Calcite's doesn't yet
+# (CAL-182); the water keeps the blocks about it, and creative mode the bot.
+CONFIGS["crystals"] = replace(CONFIGS["end"], scenarios=("crystals",))
 # Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
 # Calcite's by level-random-seed. With --tape, each writes their draws to tape.txt in its folder.
 LEVEL_RANDOM_SEED = 1103
