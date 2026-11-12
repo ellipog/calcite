@@ -108,7 +108,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
                    "gateways", "eyes", "throws", "locate", "compass", "bossbars", "dragon", "dragon-flight",
-                   "dragon-charge", "dragon-breath"]
+                   "dragon-charge", "dragon-breath", "dragon-fireball"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate", "bossbars": "bossbars-mate"}
@@ -1834,6 +1834,10 @@ CONFIGS["dragon-charge"] = replace(CONFIGS["end"], scenarios=("dragon-charge",),
 # breathes at it twice, its breath's clouds hurting it (D617).
 CONFIGS["dragon-breath"] = replace(CONFIGS["dragon-charge"], scenarios=("dragon-breath",),
                                    player=dict(CONFIGS["dragon-charge"].player, Health=nbt.Float(20.0)))
+# `dragon-breath`'s world and bot, at the spawn, summoning dragon fireballs that fall onto the
+# ground, fly at an armor stand and at it, each leaving its cloud of dragon's breath, and one that
+# stays still (D618).
+CONFIGS["dragon-fireball"] = replace(CONFIGS["dragon-breath"], scenarios=("dragon-fireball",))
 # The plain world, which generates structures, as `terrain` has it, without its entities and with
 # no mobs spawning, its spawn at the origin, with the bot, an operator, throwing eyes of ender
 # there (D599): each finds the nearest stronghold, `findNearestMapStructure` over the rings, and
