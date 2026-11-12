@@ -108,7 +108,8 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
                    "gateways", "eyes", "throws", "locate", "compass", "bossbars", "dragon", "dragon-flight",
-                   "dragon-charge", "dragon-breath", "dragon-fireball", "dragon-strafe", "dragon-death"]
+                   "dragon-charge", "dragon-breath", "dragon-fireball", "dragon-strafe", "dragon-death",
+                   "forceload"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate", "bossbars": "bossbars-mate"}
@@ -1850,6 +1851,9 @@ CONFIGS["dragon-strafe"] = replace(CONFIGS["dragon-breath"], scenarios=("dragon-
 CONFIGS["dragon-death"] = replace(CONFIGS["dragon-strafe"], scenarios=("dragon-death",),
                                   player=dict(CONFIGS["dragon-strafe"].player,
                                               Pos=nbt.List(nbt.DOUBLE, [nbt.Double(20.5), nbt.Double(-60.0), nbt.Double(0.5)])))
+# `end`'s world with the bot, an operator, forcing chunks and letting them go with `forceload`,
+# asking which are, and forcing one in the Nether, which keeps the Nether ticking (D622).
+CONFIGS["forceload"] = replace(CONFIGS["end"], scenarios=("forceload",))
 # The plain world, which generates structures, as `terrain` has it, without its entities and with
 # no mobs spawning, its spawn at the origin, with the bot, an operator, throwing eyes of ender
 # there (D599): each finds the nearest stronghold, `findNearestMapStructure` over the rings, and

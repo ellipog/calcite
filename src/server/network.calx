@@ -58,7 +58,7 @@ import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done, Loaded}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
-import server.commands.{BossBarAction, Condition, DataAction, DataPackAction, PackPlace, ItemAction, ItemFrom, ItemTarget, SlotsGiven, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, FunctionArgs, ScheduleAction, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
+import server.commands.{BossBarAction, Condition, DataAction, ForceLoadAction, DataPackAction, PackPlace, ItemAction, ItemFrom, ItemTarget, SlotsGiven, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, FunctionArgs, ScheduleAction, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
 import server.configuration.{Configuration, update_tags}
 import server.layout.{Layout, Placed}
 import server.level.{ChunkPacket, Dropped, EMPTY_TICKS, Heard, Level, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
@@ -21771,6 +21771,12 @@ impl Network {
                     err(f) => done = some(f),
                 }
             },
+            Parsed.ForceLoad(action) => {
+                match self.forceload_command(source, action) {
+                    ok(r) => result = r,
+                    err(f) => done = some(f),
+                }
+            },
             Parsed.Unrun(_) => done = some(Failure.alone(Component.literal("Calcite doesn't run this command yet"))),
         }
         if let f = done {
@@ -26095,6 +26101,123 @@ impl Network {
         return i32.wrap(who.len())
     }
 
+    // `forceload`, `ForceLoadCommand` (D622), in the source's level: `add` and `remove` of the
+    // chunks from one column to another, `changeForceLoad`; `remove all`, `removeAll`; and
+    // `query`, of a column, `queryForceLoad`, or of them all, `listForceLoad`.
+    fn forceload_command(mut self, source: Source, action: own ForceLoadAction) -> i32 ! Failure {
+        let d = source.dim
+        let dimension = self.world.dims[d].id.to_string()
+        match action {
+            ForceLoadAction.Change(from, to, add) => {
+                let (fx, fz) = self.column_of(source, from)
+                let (tx, tz) = match to {
+                    some(t) => self.column_of(source, t),
+                    none => (fx, fz),
+                }
+                return try self.change_force_load(source, d, fx, fz, tx, tz, add)
+            },
+            ForceLoadAction.RemoveAll => {
+                // `removeAll`: each forced chunk let go, in their set's order; told to all the
+                // operators; it gives 0.
+                for k in self.levels[d].forced_chunks() {
+                    let c = forced_chunk(k)
+                    _ = self.levels[d].set_forced(ChunkPos { x: c.x, z: c.z }, false)
+                }
+                self.level_lines()
+                self.levels[d].dispatch()
+                self.success(source, Component.translatable_args(String("commands.forceload.removed.all"), [Argument.Text(Component.literal(dimension))]), true)
+                return 0
+            },
+            ForceLoadAction.Query(at) => {
+                let c = at else {
+                    // `listForceLoad`: the forced chunks, by their packed longs, low to high,
+                    // `sorted`; none, its failure told, `sendFailure`, which isn't thrown.
+                    var chunks = self.levels[d].forced_chunks()
+                    chunks.sort()
+                    let count = chunks.len()
+                    if count == 0 {
+                        self.source_failure(source, Component.translatable_args(String("commands.forceload.added.none"), [Argument.Text(Component.literal(dimension))]))
+                        return 0
+                    }
+                    // `Joiner.on(", ")`.
+                    var list = String()
+                    for k in chunks {
+                        if not list.is_empty() {
+                            list = "{list}, "
+                        }
+                        list = "{list}{chunk_name(forced_chunk(k))}"
+                    }
+                    if count == 1 {
+                        self.success(source, Component.translatable_args(String("commands.forceload.list.single"), [Argument.Text(Component.literal(dimension)), Argument.Text(Component.literal(list))]), false)
+                    } else {
+                        self.success(source, Component.translatable_args(String("commands.forceload.list.multiple"), [Argument.Number(Tag.Int(i32.wrap(count))), Argument.Text(Component.literal(dimension)), Argument.Text(Component.literal(list))]), false)
+                    }
+                    return i32.wrap(count)
+                }
+                let (x, z) = self.column_of(source, c)
+                let chunk = ChunkPos { x: x >> 4, z: z >> 4 }
+                let args: List<Argument> = [Argument.Text(Component.literal(chunk_name(chunk))), Argument.Text(Component.literal(dimension))]
+                if not self.levels[d].is_forced(chunk.pack()) {
+                    fail Failure.alone(Component.translatable_args(String("commands.forceload.query.failure"), args))
+                }
+                self.success(source, Component.translatable_args(String("commands.forceload.query.success"), args), false)
+                return 1
+            },
+        }
+    }
+
+    // `changeForceLoad` (D622): within 30,000,000 of the middle, else `argument.pos.outofworld`;
+    // no more than 256 chunks, else `commands.forceload.toobig`; each chunk from the least corner
+    // to the most, x then z, forced or let go, `setChunkForced`. None that changed is
+    // `commands.forceload.added.failure` or `removed.failure`; one is told by its chunk, more by
+    // how many, with the corners' chunks, to all the operators, `CommandResponseTracker`. It
+    // gives how many changed.
+    fn change_force_load(mut self, source: Source, d: usize, fx: i32, fz: i32, tx: i32, tz: i32, add: bool) -> i32 ! Failure {
+        let (min_x, min_z) = (fx.min(tx), fz.min(tz))
+        let (max_x, max_z) = (fx.max(tx), fz.max(tz))
+        if min_x < -30000000 or min_z < -30000000 or max_x >= 30000000 or max_z >= 30000000 {
+            fail Failure.alone(Component.translatable("argument.pos.outofworld", []))
+        }
+        let (cx0, cz0, cx1, cz1) = (min_x >> 4, min_z >> 4, max_x >> 4, max_z >> 4)
+        let count = (i64(cx1) - i64(cx0) + 1) * (i64(cz1) - i64(cz0) + 1)
+        if count > 256 {
+            fail Failure.alone(Component.translatable_args(String("commands.forceload.toobig"), [Argument.Number(Tag.Int(256)), Argument.Number(Tag.Long(count))]))
+        }
+        var changed = 0
+        var only: ChunkPos? = none
+        for x in cx0..cx1 + 1 {
+            for z in cz0..cz1 + 1 {
+                let c = ChunkPos { x: x, z: z }
+                if self.levels[d].set_forced(c, add) {
+                    changed += 1
+                    only = if changed == 1 { some(c) } else { none }
+                }
+            }
+        }
+        self.level_lines()
+        self.levels[d].dispatch()
+        let word = if add { "added" } else { "removed" }
+        if changed == 0 {
+            fail Failure.alone(Component.translatable("commands.forceload.{word}.failure", []))
+        }
+        let dimension = Argument.Text(Component.literal(self.world.dims[d].id.to_string()))
+        if let c = only {
+            self.success(source, Component.translatable_args("commands.forceload.{word}.single", [Argument.Text(Component.literal(chunk_name(c))), dimension]), true)
+        } else {
+            let least = Argument.Text(Component.literal(chunk_name(ChunkPos { x: cx0, z: cz0 })))
+            let most = Argument.Text(Component.literal(chunk_name(ChunkPos { x: cx1, z: cz1 })))
+            self.success(source, Component.translatable_args("commands.forceload.{word}.multiple", [Argument.Number(Tag.Int(changed)), dimension, least, most]), true)
+        }
+        return changed
+    }
+
+    // `ColumnPosArgument.getColumnPos` of `at` for `source` (D622): the block the place it gives
+    // from where the source is is in, `getBlockPos`, by its x and z.
+    fn column_of(self, source: Source, at: Coordinates) -> (i32, i32) {
+        let (px, _, pz) = self.point_of(source, at)
+        return (mth_floor(px), mth_floor(pz))
+    }
+
     // `BlockPosArgument.getLoadedBlockPos` of `at` for `source` (CAL-165): the block the place
     // the coordinates give from where the source is and looks is in, local ones from its anchor,
     // `point_of`, `BlockPos.containing`, with its level, which must have its chunk,
@@ -27798,6 +27921,22 @@ impl Network {
                 if let c = where_ {
                     self.failure(mut con, c)
                 }
+                self.connections[slot] = some(con)
+            },
+        }
+    }
+
+    // `CommandSourceStack.sendFailure` of `message`, which isn't thrown (D622): in red, to the
+    // player, or logged by the console, unless the source is silent.
+    fn source_failure(mut self, source: Source, message: own Component) {
+        if source.silent {
+            return
+        }
+        match source.output {
+            Output.Console => self.tell_server(message, true),
+            Output.Player(slot) => {
+                var con = self.connections[slot].take() else return
+                self.failure(mut con, message)
                 self.connections[slot] = some(con)
             },
         }
@@ -33821,4 +33960,14 @@ fn team_formatted(t: Team) -> Component {
     out.style.hover_event = some(HoverEvent.ShowText(Box(Component.translatable("chat.type.team.hover", []))))
     out.style.click_event = some(ClickEvent.SuggestCommand("/teammsg "))
     return out
+}
+
+// A chunk as `ChunkPos.toString` writes it, `[x, z]` (D622).
+fn chunk_name(c: ChunkPos) -> String {
+    return "[{c.x}, {c.z}]"
+}
+
+// The chunk packed in `k`, `ChunkPos.unpack` (D622).
+fn forced_chunk(k: i64) -> ChunkPos {
+    return ChunkPos { x: i32.wrap(k), z: i32.wrap(k >> 32) }
 }
