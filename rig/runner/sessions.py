@@ -1819,6 +1819,8 @@ CONFIGS["dragon"] = replace(CONFIGS["end"], scenarios=("dragon",))
 # its holding pattern, land and take off again (D613).
 CONFIGS["dragon-flight"] = replace(CONFIGS["end"], scenarios=("dragon-flight",),
                                    rules=CONFIGS["end"].rules + (("minecraft:mob_griefing", nbt.Byte(0)),))
+# `dragon-flight`'s scenario with mob griefing on: the dragon breaks the ground it lands on (D614).
+CONFIGS["dragon-griefing"] = replace(CONFIGS["end"], scenarios=("dragon-flight",))
 # The plain world, which generates structures, as `terrain` has it, without its entities and with
 # no mobs spawning, its spawn at the origin, with the bot, an operator, throwing eyes of ender
 # there (D599): each finds the nearest stronghold, `findNearestMapStructure` over the rings, and
