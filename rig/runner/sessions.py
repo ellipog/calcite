@@ -109,7 +109,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
                    "gateways", "eyes", "throws", "locate", "compass", "bossbars", "dragon", "dragon-flight",
                    "dragon-charge", "dragon-breath", "dragon-fireball", "dragon-strafe", "dragon-death",
-                   "forceload"]
+                   "forceload", "fight"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate", "bossbars": "bossbars-mate"}
@@ -174,6 +174,8 @@ class Config:
     # folder under `dimensions` and its name, such as `minecraft/the_end/ender_dragon_fight`
     # (D586).
     dim_saved: dict | None = None
+    # The End's chunks compared as both servers saved them, `(x0, z0, x1, z1)` inclusive (D625).
+    end_chunks: tuple | None = None
 
 
 def stack(item, count=1, components=None):
@@ -1801,6 +1803,10 @@ FIGHT_ON = {"data": {"needs_state_scanning": nbt.Byte(0), "dragon_killed": nbt.B
 # `end` with the fight not over (D624): its boss bar shown to the bot as it comes onto the platform
 # and taken from it once it's gone, each time.
 CONFIGS["fight-bar"] = replace(CONFIGS["end"], dim_saved={"minecraft/the_end/ender_dragon_fight": FIGHT_ON})
+# `end`'s world with the End's dragon fight new (D625): the bot forces the End's chunks about the
+# arena, then goes in, and the fight scans its arena, finds no exit portal and makes it, inactive,
+# in the End's chunks about 0, 0, which are compared as saved.
+CONFIGS["fight"] = replace(CONFIGS["end"], scenarios=("fight",), dim_saved=None, end_chunks=(-1, -1, 0, 0))
 # `end`'s world with the bot hitting an end crystal it summons in water in the Overworld (D590):
 # in survival mode, invulnerable, which the hit doesn't hurt; then in creative mode with an iron
 # sword, which breaks it, sweeping. Vanilla's crystal explodes, which Calcite's doesn't yet
@@ -2408,6 +2414,27 @@ def compare_chunks(config, show):
         print(f"  [{config}] {line[:400]}")
 
 
+def compare_end_chunks(config, show):
+    """Prints what differs in what both servers saved of the End's chunks a configuration names,
+    `end_chunks`, each block's state, block entity, tick, heightmap and light (D625)."""
+    limit = show if show > 0 else 10 ** 9
+    v = savediff.chunks(SESSIONS / config / "vanilla" / "world", "minecraft/the_end")
+    c = savediff.chunks(SESSIONS / config / "calcite" / "world", "minecraft/the_end")
+    x0, z0, x1, z1 = CONFIGS[config].end_chunks
+    lines = []
+    for cx in range(x0, x1 + 1):
+        for cz in range(z0, z1 + 1):
+            a, b = v.get((cx, cz)), c.get((cx, cz))
+            if a is None or b is None:
+                if a is not None or b is not None:
+                    lines.append(f"chunk {cx}, {cz}: only {'vanilla' if a is not None else 'Calcite'} saved it")
+                continue
+            lines += [f"chunk {cx}, {cz}: {d}" for d in savediff.chunk_differences(cx, cz, a, b, limit)]
+    print(f"saved End      {'PASS' if not lines else 'differs'}    {len(lines)} differ")
+    for line in lines[:limit]:
+        print(f"  [{config}] {line[:400]}")
+
+
 def dump(a, files):
     """Runs SessionDump on the recorded sessions, which writes a .jsonl beside each."""
     argv = a["argv"][:-1] + ["calcite.rig.vanilla.SessionDump"] + [str(f) for f in files]
@@ -2475,6 +2502,8 @@ def main():
     for c in configs:
         if CONFIGS[c].fixture is not None and scenarios[c]:
             compare_chunks(c, args.show)
+        if CONFIGS[c].end_chunks is not None and scenarios[c]:
+            compare_end_chunks(c, args.show)
     return 0 if report.passed and saved else 1
 
 

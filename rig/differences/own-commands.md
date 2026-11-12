@@ -20,6 +20,7 @@ cases:
   - session:dragon-strafe/*/commands
   - session:dragon-death/*/commands
   - session:forceload/*/commands
+  - session:fight/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
