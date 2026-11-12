@@ -21,6 +21,7 @@ cases:
   - session:dragon-death/*/commands
   - session:forceload/*/commands
   - session:fight/*/commands
+  - session:fight-kill/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too

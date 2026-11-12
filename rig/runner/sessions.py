@@ -109,7 +109,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
                    "gateways", "eyes", "throws", "locate", "compass", "bossbars", "dragon", "dragon-flight",
                    "dragon-charge", "dragon-breath", "dragon-fireball", "dragon-strafe", "dragon-death",
-                   "forceload", "fight"]
+                   "forceload", "fight", "fight-kill"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate", "bossbars": "bossbars-mate"}
@@ -174,7 +174,8 @@ class Config:
     # folder under `dimensions` and its name, such as `minecraft/the_end/ender_dragon_fight`
     # (D586).
     dim_saved: dict | None = None
-    # The End's chunks compared as both servers saved them, `(x0, z0, x1, z1)` inclusive (D625).
+    # The End's chunks compared as both servers saved them, `(x0, z0, x1, z1)` inclusive (D625), or
+    # a tuple of such (D627).
     end_chunks: tuple | None = None
 
 
@@ -1807,6 +1808,18 @@ CONFIGS["fight-bar"] = replace(CONFIGS["end"], dim_saved={"minecraft/the_end/end
 # arena, then goes in, and the fight scans its arena, finds no exit portal and makes it, inactive,
 # in the End's chunks about 0, 0, which are compared as saved.
 CONFIGS["fight"] = replace(CONFIGS["end"], scenarios=("fight",), dim_saved=None, end_chunks=(-1, -1, 0, 0))
+# The End's dragon fight new but for its dragon (D627): of a UUID no dragon has, none killed in it
+# before, and two gateways left, the last the second, at 91, 75, 29, by the platform.
+FIGHT_KILL = {"data": {"dragon_killed": nbt.Byte(0), "previously_killed": nbt.Byte(0),
+                       "dragon_uuid": nbt.IntArray([1, 2, 3, 4]), "gateways": nbt.IntArray([5, 1])},
+              "DataVersion": nbt.Int(DATA_VERSION)}
+# `fight` with that fight (D627): once its arena's scanned and the exit portal made, the bot
+# summons its dragon dead above the podium, and the fight hears it's killed once it's died; the
+# podium's chunks, the two east of them its light reaches the edge of, and the gateway's are
+# compared as saved.
+CONFIGS["fight-kill"] = replace(CONFIGS["end"], scenarios=("fight-kill",),
+                                dim_saved={"minecraft/the_end/ender_dragon_fight": FIGHT_KILL},
+                                end_chunks=((-1, -1, 0, 0), (5, 1, 5, 1), (1, -1, 1, 0)))
 # `end`'s world with the bot hitting an end crystal it summons in water in the Overworld (D590):
 # in survival mode, invulnerable, which the hit doesn't hurt; then in creative mode with an iron
 # sword, which breaks it, sweeping. Vanilla's crystal explodes, which Calcite's doesn't yet
@@ -2420,16 +2433,17 @@ def compare_end_chunks(config, show):
     limit = show if show > 0 else 10 ** 9
     v = savediff.chunks(SESSIONS / config / "vanilla" / "world", "minecraft/the_end")
     c = savediff.chunks(SESSIONS / config / "calcite" / "world", "minecraft/the_end")
-    x0, z0, x1, z1 = CONFIGS[config].end_chunks
+    ends = CONFIGS[config].end_chunks
     lines = []
-    for cx in range(x0, x1 + 1):
-        for cz in range(z0, z1 + 1):
-            a, b = v.get((cx, cz)), c.get((cx, cz))
-            if a is None or b is None:
-                if a is not None or b is not None:
-                    lines.append(f"chunk {cx}, {cz}: only {'vanilla' if a is not None else 'Calcite'} saved it")
-                continue
-            lines += [f"chunk {cx}, {cz}: {d}" for d in savediff.chunk_differences(cx, cz, a, b, limit)]
+    for x0, z0, x1, z1 in (ends if isinstance(ends[0], tuple) else (ends,)):
+        for cx in range(x0, x1 + 1):
+            for cz in range(z0, z1 + 1):
+                a, b = v.get((cx, cz)), c.get((cx, cz))
+                if a is None or b is None:
+                    if a is not None or b is not None:
+                        lines.append(f"chunk {cx}, {cz}: only {'vanilla' if a is not None else 'Calcite'} saved it")
+                    continue
+                lines += [f"chunk {cx}, {cz}: {d}" for d in savediff.chunk_differences(cx, cz, a, b, limit)]
     print(f"saved End      {'PASS' if not lines else 'differs'}    {len(lines)} differ")
     for line in lines[:limit]:
         print(f"  [{config}] {line[:400]}")
