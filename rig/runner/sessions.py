@@ -108,7 +108,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
                    "gateways", "eyes", "throws", "locate", "compass", "bossbars", "dragon", "dragon-flight",
-                   "dragon-charge"]
+                   "dragon-charge", "dragon-breath"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate", "bossbars": "bossbars-mate"}
@@ -1828,6 +1828,11 @@ CONFIGS["dragon-charge"] = replace(CONFIGS["end"], scenarios=("dragon-charge",),
                                    rules=CONFIGS["end"].rules + (("minecraft:mob_griefing", nbt.Byte(0)),),
                                    player=dict(END_PLAYER, active_effects=nbt.List(nbt.COMPOUND, [
                                        effect("resistance", -1, 3, ambient=False, show_particles=False, show_icon=False)])))
+# `end`'s world with mob griefing off, the bot in survival with resistance IV for ever and full
+# health on the ground by the egg's place, where an ender dragon with AI lands, sees it, roars and
+# breathes at it twice, its breath's clouds hurting it (D617).
+CONFIGS["dragon-breath"] = replace(CONFIGS["dragon-charge"], scenarios=("dragon-breath",),
+                                   player=dict(CONFIGS["dragon-charge"].player, Health=nbt.Float(20.0)))
 # The plain world, which generates structures, as `terrain` has it, without its entities and with
 # no mobs spawning, its spawn at the origin, with the bot, an operator, throwing eyes of ender
 # there (D599): each finds the nearest stronghold, `findNearestMapStructure` over the rings, and
