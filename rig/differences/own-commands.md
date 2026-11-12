@@ -17,6 +17,7 @@ cases:
   - session:dragon-charge/*/commands
   - session:dragon-breath/*/commands
   - session:dragon-fireball/*/commands
+  - session:dragon-strafe/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too

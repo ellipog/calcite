@@ -108,7 +108,7 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
                    "gateways", "eyes", "throws", "locate", "compass", "bossbars", "dragon", "dragon-flight",
-                   "dragon-charge", "dragon-breath", "dragon-fireball"]
+                   "dragon-charge", "dragon-breath", "dragon-fireball", "dragon-strafe"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate", "bossbars": "bossbars-mate"}
@@ -1838,6 +1838,13 @@ CONFIGS["dragon-breath"] = replace(CONFIGS["dragon-charge"], scenarios=("dragon-
 # ground, fly at an armor stand and at it, each leaving its cloud of dragon's breath, and one that
 # stays still (D618).
 CONFIGS["dragon-fireball"] = replace(CONFIGS["dragon-breath"], scenarios=("dragon-fireball",))
+# `dragon-breath`'s world and bot, but with 1000 health, as the clouds of the fireballs it's shot
+# at last 600 ticks where it stands, at the spawn by the egg's place, where an ender dragon with AI
+# in its holding pattern strafes it, shooting fireballs at it (D619).
+CONFIGS["dragon-strafe"] = replace(CONFIGS["dragon-breath"], scenarios=("dragon-strafe",),
+                                   player=dict(CONFIGS["dragon-breath"].player, Health=nbt.Float(1000.0),
+                                               attributes=nbt.List(nbt.COMPOUND, [{"id": "minecraft:max_health",
+                                                                                   "base": nbt.Double(1000.0)}])))
 # The plain world, which generates structures, as `terrain` has it, without its entities and with
 # no mobs spawning, its spawn at the origin, with the bot, an operator, throwing eyes of ender
 # there (D599): each finds the nearest stronghold, `findNearestMapStructure` over the rings, and
