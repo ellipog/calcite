@@ -1792,6 +1792,15 @@ CONFIGS["end"] = Config({"difficulty": "normal"}, view=4, scenarios=("end",), wo
                         ops=("Bot",), tape=True, player=END_PLAYER,
                         keys=("seenCredits", "respawn", "Health", "foodLevel", "active_effects"),
                         dim_saved={"minecraft/the_end/ender_dragon_fight": FIGHT_OVER})
+# The End's dragon fight not over (D624): its state known, its dragon, killed before, not killed,
+# of a UUID no dragon has, so its boss bar's shown to the players about its arena, and it looks for
+# its dragon again only once its arena's been loaded for 1200 ticks, more than a session is there.
+FIGHT_ON = {"data": {"needs_state_scanning": nbt.Byte(0), "dragon_killed": nbt.Byte(0), "previously_killed": nbt.Byte(1),
+                     "dragon_uuid": nbt.IntArray([1, 2, 3, 4])},
+            "DataVersion": nbt.Int(DATA_VERSION)}
+# `end` with the fight not over (D624): its boss bar shown to the bot as it comes onto the platform
+# and taken from it once it's gone, each time.
+CONFIGS["fight-bar"] = replace(CONFIGS["end"], dim_saved={"minecraft/the_end/ender_dragon_fight": FIGHT_ON})
 # `end`'s world with the bot hitting an end crystal it summons in water in the Overworld (D590):
 # in survival mode, invulnerable, which the hit doesn't hurt; then in creative mode with an iron
 # sword, which breaks it, sweeping. Vanilla's crystal explodes, which Calcite's doesn't yet
