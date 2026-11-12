@@ -1265,12 +1265,13 @@ CONFIGS = {
     # which leaves a cloud where it lands that doses what's in it each second, shrinking as it
     # does: poison at Moo, the cow; healing at Rot, the zombie, which hurts him; regeneration and
     # then harming at its own feet; and slowness away to the north, whose cloud is still there as
-    # it leaves at 480, saved with the chunks.
+    # it leaves at 480, saved with the chunks. Its levels' randoms are seeded again at 101, as
+    # `splash`'s are, as each throw's sound draws its pitch from one (CAL-245).
     "linger": Config({"difficulty": "normal"}, view=3, scenarios=("linger",), world=FIXTURES / "splash" / "world",
                      fixture="splash",
                      rules=(("minecraft:spawn_mobs", nbt.Byte(0)), ("minecraft:show_advancement_messages", nbt.Byte(0)),
                             ("minecraft:respawn_radius", nbt.Int(0))),
-                     player=LINGER, keys=("active_effects", "Health", "AbsorptionAmount")),
+                     player=LINGER, keys=("active_effects", "Health", "AbsorptionAmount"), tape=True),
     # The bot, in creative mode with stone in its hand, stands at the beacons fixture's spawn, on
     # normal at noon, among beacons that pulse their effects onto it every 80 ticks (D520): speed,
     # jump boost but not its regeneration, two levels short, resistance through bedrock, strength
