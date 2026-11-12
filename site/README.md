@@ -169,12 +169,10 @@ Every page also sends `Strict-Transport-Security` for the domain and its subdoma
 
 ## Deploying
 
-The site is built to deploy on Vercel, but any host that runs Next.js 16 works. On Vercel:
+The site is self-hosted on Elliot's VPS behind Cloudflare; any host that runs Next.js 16 works.
 
-- **Root directory:** `site`.
-- **Include files outside the root directory in the build step:** on. The site reads `../docs`, `../bench`, `../cases`, `../plugins`, `../rig` and `../src` as it builds, so the whole repo has to be checked out.
-- **Install command:** `bun install`. **Build command:** `bun run build`.
-- **Environment:** nothing. The site's address, `https://calcitemc.com`, is `SITE.url` in `src/lib/site.ts`; canonical links, the sitemap, robots.txt and the cards' addresses use it from every build, preview deploys and local ones included.
-- **Ignored build step:** `vercel.json` runs `scripts/ignore-build.sh`, which skips the build unless something the site is built from changed since the branch's last deploy: `site/`, or what it reads of the rest of the repo, the table above's sources. `docs/decisions.md`, which nearly every commit adds to, isn't among them, since it only names the decisions a page cites, and a page that cites a new one changes itself. Without an earlier deploy to compare with, it builds.
+- **What it needs:** the whole repo checked out, since the site reads `../docs`, `../bench`, `../cases`, `../plugins`, `../rig` and `../src` as it builds. Then `bun install` and `bun run build` in `site/`, and `next start` to serve it.
+- **Environment:** nothing. The site's address, `https://calcitemc.com`, is `SITE.url` in `src/lib/site.ts`; canonical links, the sitemap, robots.txt and the cards' addresses use it from every build, local ones included.
+- **When it deploys:** the VPS checks main every minute and builds only when something the site is built from changed since the last deploy: `site/`, or what it reads of the rest of the repo, the table above's sources. `docs/decisions.md`, which nearly every commit adds to, isn't among them, since it only names the decisions a page cites, and a page that cites a new one changes itself. A new build starts beside the running one and takes over only once it answers, so a deploy has no downtime, and a build that fails leaves the live site as it was.
 
 Every page is static except `/roadmap` and `/download`, which are regenerated in the background when they're more than an hour old.

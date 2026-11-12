@@ -3,7 +3,7 @@ import { docs } from '@/lib/repo';
 
 // Each page of the docs has its card, its title over the world. The cards are made as the site
 // builds, one for each page generateStaticParams names, and no other slug is served: the docs are
-// read from the repo outside site/, which Vercel has as it builds but not as it serves. So the alt
+// read from the repo outside site/, which a host may have as it builds but not as it serves. So the alt
 // text is the same for every page. generateImageMetadata would give each its own, but with it Next
 // leaves the slug to request time, where the card can't read its page and answers 500 (CAL-171).
 

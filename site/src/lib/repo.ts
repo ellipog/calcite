@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 import { join, posix } from 'node:path';
 
-/** The repo, one up from site/. Vercel checks out the whole repo, so it's there as it builds. */
+/** The repo, one up from site/. The build checks out the whole repo, so it's there as it builds. */
 export const ROOT = join(process.cwd(), '..');
 export const read = (path: string) => readFileSync(join(ROOT, path), 'utf8').replace(/\r\n/g, '\n');
 
