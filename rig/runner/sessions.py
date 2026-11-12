@@ -107,7 +107,8 @@ OTHER_SCENARIOS = ["watch", "watch-late", "creative", "clicks", "dig", "dig-crea
                    "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
                    "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
                    "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
-                   "gateways", "eyes", "throws", "locate", "compass", "bossbars", "dragon", "dragon-flight"]
+                   "gateways", "eyes", "throws", "locate", "compass", "bossbars", "dragon", "dragon-flight",
+                   "dragon-charge"]
 # The scenario a second player's packets are recorded as, by the scenario the bot runs it in
 # (CAL-162, CAL-165).
 MATE_SCENARIOS = {"duel": "duel-mate", "talk": "talk-mate", "select": "select-mate", "bossbars": "bossbars-mate"}
@@ -1821,6 +1822,12 @@ CONFIGS["dragon-flight"] = replace(CONFIGS["end"], scenarios=("dragon-flight",),
                                    rules=CONFIGS["end"].rules + (("minecraft:mob_griefing", nbt.Byte(0)),))
 # `dragon-flight`'s scenario with mob griefing on: the dragon breaks the ground it lands on (D614).
 CONFIGS["dragon-griefing"] = replace(CONFIGS["end"], scenarios=("dragon-flight",))
+# `end`'s world with mob griefing off, the bot in survival with resistance IV for ever on a pillar
+# an ender dragon with AI lands by and then charges, its wings and head striking it (D615).
+CONFIGS["dragon-charge"] = replace(CONFIGS["end"], scenarios=("dragon-charge",),
+                                   rules=CONFIGS["end"].rules + (("minecraft:mob_griefing", nbt.Byte(0)),),
+                                   player=dict(END_PLAYER, active_effects=nbt.List(nbt.COMPOUND, [
+                                       effect("resistance", -1, 3, ambient=False, show_particles=False, show_icon=False)])))
 # The plain world, which generates structures, as `terrain` has it, without its entities and with
 # no mobs spawning, its spawn at the origin, with the bot, an operator, throwing eyes of ender
 # there (D599): each finds the nearest stronghold, `findNearestMapStructure` over the rings, and

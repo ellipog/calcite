@@ -14,6 +14,7 @@ cases:
   - session:bossbars/*/commands
   - session:dragon/*/commands
   - session:dragon-flight/*/commands
+  - session:dragon-charge/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
