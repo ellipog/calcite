@@ -8,6 +8,7 @@ import java.lang.classfile.CodeElement;
 import java.lang.classfile.CodeTransform;
 import java.lang.classfile.MethodModel;
 import java.lang.classfile.MethodTransform;
+import java.lang.classfile.Opcode;
 import java.lang.classfile.instruction.InvokeInstruction;
 import java.lang.classfile.instruction.ReturnInstruction;
 import java.lang.constant.ClassDesc;
@@ -24,12 +25,12 @@ import java.security.ProtectionDomain;
  * makes to a tape.
  *
  * <p>Started as {@code -javaagent:agent.jar=seed=N[,tape=PATH][,reseed=T][,trace=PATH]}. Each
- * {@code ServerLevel}'s constructor, as it returns, calls {@link Levels#made}, which seeds the
- * level's random with {@code mixStafford13(N ^ name.hashCode())}, with the name the dimension's,
- * such as {@code minecraft:overworld}, and sets the entity counter back to 0 as the Overworld's is
- * made. With {@code reseed=T}, {@code ServerLevel.tick} calls {@link Levels#ticking} as it starts,
- * which seeds the level's random so again the first time its tick starts at game time T or later
- * (D316).
+ * {@code ServerLevel}'s constructor, once {@code Level}'s returns, calls {@link Levels#made},
+ * which seeds the level's random with {@code mixStafford13(N ^ name.hashCode())}, with the name
+ * the dimension's, such as {@code minecraft:overworld}, and sets the entity counter back to 0 as
+ * the Overworld's is made, before anything else draws from it (D623). With {@code reseed=T},
+ * {@code ServerLevel.tick} calls {@link Levels#ticking} as it starts, which seeds the level's
+ * random so again the first time its tick starts at game time T or later (D316).
  * {@code LegacyRandomSource.next}, which every draw of a level's random comes down to, hands
  * {@link Tape#drew} each value it returns, which writes those of a level's random to the tape.
  * {@code Entity}'s constructor, once it's given the entity its ID and before it calls
@@ -49,6 +50,7 @@ import java.security.ProtectionDomain;
  */
 public final class Agent {
     private static final String LEVEL = "net/minecraft/server/level/ServerLevel";
+    private static final String BASE = "net/minecraft/world/level/Level";
     private static final String LEGACY = "net/minecraft/world/level/levelgen/LegacyRandomSource";
     private static final String ENTITY = "net/minecraft/world/entity/Entity";
     private static final String PLAYER = "net/minecraft/server/level/ServerPlayer";
@@ -113,18 +115,23 @@ public final class Agent {
         }
     }
 
-    // Each of ServerLevel's constructors hands the level to Levels.made before it returns, its tick
-    // hands it to Levels.ticking as it starts, and tickNonPassenger hands it and the entity to
-    // Trace.ticked as it returns.
+    // ServerLevel's constructor hands the level to Levels.made once Level's constructor, which
+    // makes its random, returns, and before the rest of it: the End's dragon fight draws its boss
+    // bar's UUID from the level's random as it's made, as Calcite's does from the seeded one
+    // (D623). Its tick hands it to Levels.ticking as it starts, and tickNonPassenger hands it and
+    // the entity to Trace.ticked as it returns.
     private static byte[] level(ClassFile cf, byte[] bytes) {
         MethodTypeDesc withLevel = MethodTypeDesc.of(ConstantDescs.CD_void, ClassDesc.ofInternalName(LEVEL));
         ClassDesc levels = ClassDesc.of("calcite.rig.vanilla.agent.Levels");
+        int[] hooked = {0};
         CodeTransform made = (b, e) -> {
-            if (e instanceof ReturnInstruction) {
+            b.with(e);
+            if (e instanceof InvokeInstruction i && i.opcode() == Opcode.INVOKESPECIAL && i.name().equalsString("<init>")
+                    && i.owner().asInternalName().equals(BASE)) {
                 b.aload(0);
                 b.invokestatic(levels, "made", withLevel);
+                hooked[0]++;
             }
-            b.with(e);
         };
         CodeTransform ticking = new CodeTransform() {
             @Override
@@ -159,7 +166,11 @@ public final class Agent {
                 cb.with(ce);
             }
         };
-        return cf.transformClass(cf.parse(bytes), both);
+        byte[] out = cf.transformClass(cf.parse(bytes), both);
+        if (hooked[0] != 1) {
+            throw new IllegalStateException("ServerLevel's constructors call Level's " + hooked[0] + " times, not once");
+        }
+        return out;
     }
 
     // Entity's constructor hands the entity to Entities.made once it's given the entity its ID,

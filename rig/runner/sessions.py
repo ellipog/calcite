@@ -2289,6 +2289,28 @@ def compare_boss_bars(config):
     return same
 
 
+def fight_kept(world):
+    """The End's dragon fight as it's compared (D623): its `ender_dragon_fight.dat`, its root
+    with its keys in the order written; None where there's none."""
+    path = world / "dimensions" / "minecraft" / "the_end" / "data" / "minecraft" / "ender_dragon_fight.dat"
+    if not path.is_file():
+        return None
+    return ordered(nbt.read(path))
+
+
+def compare_fight(config):
+    """Whether both servers saved the End's dragon fight the same (D623), printing what differs.
+    Nothing's printed where neither saved it."""
+    kept = {side: fight_kept(SESSIONS / config / side / "world") for side in ("vanilla", "calcite")}
+    if kept["vanilla"] is None and kept["calcite"] is None:
+        return True
+    same = kept["vanilla"] == kept["calcite"]
+    print(f"saved fight    {'PASS' if same else 'differs'}")
+    if not same:
+        print(f"  [{config}] ender_dragon_fight:\n      vanilla: {kept['vanilla']}\n      calcite: {kept['calcite']}")
+    return same
+
+
 def compare_made_packs(config):
     """Whether both servers wrote the packs `datapack create` made the same (D573): each folder
     in the world's `datapacks` that no configuration put there, by its name, with its
@@ -2439,6 +2461,7 @@ def main():
                 + [compare_storage(c) for c in configs if scenarios[c]]
                 + [compare_scheduled(c) for c in configs if scenarios[c]]
                 + [compare_boss_bars(c) for c in configs if scenarios[c]]
+                + [compare_fight(c) for c in configs if scenarios[c]]
                 + [compare_made_packs(c) for c in configs if scenarios[c]])
     for c in configs:
         if CONFIGS[c].fixture is not None and scenarios[c]:
