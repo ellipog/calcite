@@ -1,0 +1,569 @@
+module cases.items.gen
+
+// Writes cases/items/generated.json: item stacks read as vanilla reads them with
+// `ItemStack.CODEC`, from a data pack's JSON, or from SNBT through `NbtOps`, as a save's are, or
+// with `ItemStack.OPTIONAL_STREAM_CODEC` from the network, and written to NBT or the network, or
+// hashed as a slot's `HashedStack` is, with the vanilla data pack's registries and the items'
+// default components bound, as a server has them (CAL-77, D362, D363, D364, D365, D373). The
+// `from-wire` cases are vanilla's own bytes for the `to-wire` ones, taken from the goldens once
+// they're recorded, so a new one needs recording twice.
+//
+//     calx cases/items/gen.calx
+//
+// A JSON case's value is written as Python's `json.dumps` wrote it with no arguments, with `, `
+// and `: ` between and every character past ASCII escaped, which `pyjson.spaced_ascii` does.
+
+import std.bytes
+import std.bytes.{base64}
+import std.fs.{is_file, read_text}
+import std.json
+import std.json.{Json}
+import cases.components.{bad_components, item_components}
+import cases.kit.{arr, file, obj, s, with}
+import rig.runner.cases.{write_file}
+import tools.pyjson.{compact, spaced_ascii}
+import tools.repo.{die, under}
+
+/// JSON written out, as the Python wrote its dicts and lists.
+fn j(text: String) -> Json {
+    return match json.parse(text.copy()) {
+        ok(v) => v,
+        err(e) => die("{text}: {e}"),
+    }
+}
+
+fn member(key: str, v: own Json) -> (String, Json) {
+    return (String(key), v)
+}
+
+fn field(v: Json, key: str) -> Json {
+    return (v.get(String(key)) ?? Json.Null).copy()
+}
+
+fn text_of(v: Json, key: str) -> String {
+    return field(v, key).as_str() ?? String("")
+}
+
+/// A stack from a data pack's JSON, written as `json.dumps` writes it.
+fn add_value(out: mut List<Json>, id: own String, value: Json) {
+    let input = obj([member("from", s("json")), member("value", s(spaced_ascii(value))), member("to", s("nbt"))])
+    out.push(obj([member("id", s(id)), member("input", input)]))
+}
+
+fn add(out: mut List<Json>, id: str, value: str) {
+    add_value(mut out, String(id), j(String(value)))
+}
+
+/// The same stacks as NBT, as a save has them, read through `NbtOps` (D363).
+fn nbt(out: mut List<Json>, id: String, text: own String) {
+    let input = obj([member("from", s("snbt")), member("value", s(text)), member("to", s("nbt"))])
+    out.push(obj([member("id", s("snbt-{id}")), member("input", input)]))
+}
+
+fn quote(text: String) -> String {
+    return "\"{text.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+}
+
+/// `value`, JSON, as SNBT: a boolean as a byte, a whole number as an int, or a long past an int,
+/// another number as a double, and every key quoted.
+fn snbt(value: Json) -> String {
+    return match value {
+        Json.Bool(on) => String(if on { "1b" } else { "0b" }),
+        Json.Int(i) => if i >= -2147483648 and i < 2147483648 { "{i}" } else { "{i}L" },
+        Json.Float(_) => "{compact(value)}d",
+        Json.Str(text) => quote(text),
+        Json.Array(xs) => {
+            var parts: List<String> = []
+            for x in xs {
+                parts.push(snbt(x))
+            }
+            "[{parts.join(",")}]"
+        }
+        Json.Object(m) => {
+            var parts: List<String> = []
+            for (k, x) in m {
+                parts.push("{quote(k)}:{snbt(x)}")
+            }
+            "\{{parts.join(",")}\}"
+        }
+        _ => die("no SNBT for {compact(value)}"),
+    }
+}
+
+/// The stack `value` with only the first of its enchantments and stored enchantments, and whether
+/// that's another stack.
+fn one_enchantment(value: Json) -> (Json, bool) {
+    let components = field(value, "components")
+    let Json.Object(m) = components else {
+        return (value.copy(), false)
+    }
+    var changed = false
+    var kept: List<(String, Json)> = []
+    for (k, v) in m {
+        let bare = if k.starts_with("minecraft:") { k[10..k.len()] } else { k.copy() }
+        if bare == "enchantments" or bare == "stored_enchantments" {
+            if let Json.Object(levels) = v {
+                if levels.len() > 1 {
+                    for (name, level) in levels {
+                        kept.push((k.copy(), obj([(name.copy(), level.copy())])))
+                        break
+                    }
+                    changed = true
+                    continue
+                }
+            }
+        }
+        kept.push((k.copy(), v.copy()))
+    }
+    return (with(value.copy(), "components", obj(kept)), changed)
+}
+
+fn varint(value: i64) -> List<u8> {
+    var v = u64.wrap(value) & 0xFFFFFFFF
+    var data: List<u8> = []
+    loop {
+        if v < 0x80 {
+            data.push(u8.wrap(v))
+            return data
+        }
+        data.push(u8.wrap((v & 0x7F) | 0x80))
+        v >>= 7
+    }
+}
+
+/// `text` as `ByteBufCodecs.STRING_UTF8` sends it: its length in bytes, then its UTF-8.
+fn utf(text: String) -> List<u8> {
+    let data = text.to_bytes()
+    var out = varint(i64.wrap(data.len()))
+    out.extend(data)
+    return out
+}
+
+fn cat(parts: List<List<u8>>) -> List<u8> {
+    var out: List<u8> = []
+    for p in parts {
+        out.extend(p.copy())
+    }
+    return out
+}
+
+/// Stacks off the network, made by hand, read into NBT and sent again.
+fn wire(out: mut List<Json>, id: str, data: List<u8>) {
+    let blob = base64(data.copy())
+    for to in ["nbt", "wire"] {
+        out.push(obj([member("id", s("wire-{id}-{to}")), member("input", obj([member("from", s("wire")), member("to", s(String(to)))])), member("blobs", arr([s(blob.copy())]))]))
+    }
+}
+
+/// A stack of `item` with one component of type `kind` set to `data`.
+fn one(item: List<u8>, kind: i64, data: List<u8>) -> List<u8> {
+    return cat([[1], item.copy(), [1, 0], varint(kind), data.copy()])
+}
+
+/// The stacks vanilla sends for the `to-wire` cases, read from the network as `from-wire` cases:
+/// from the goldens, else kept from the case file as it was.
+fn from_vanilla(made: List<Json>) -> List<Json> {
+    let golden = under("golden/26.3/items.jsonl")
+    var blobs = LinkedMap<String, Json>()
+    if is_file(golden) {
+        let text = read_text(golden.copy())! ?? String("")
+        for line in text.split("\n") {
+            if line.trim().is_empty() {
+                continue
+            }
+            let record = j(line.copy())
+            let id = text_of(record, "id")
+            if id.starts_with("to-wire-") {
+                if let Json.Array(xs) = field(record, "blobs") {
+                    if not xs.is_empty() {
+                        blobs.insert(id.copy(), xs[0].copy())
+                    }
+                }
+            }
+        }
+    }
+    var old = LinkedMap<String, Json>()
+    let previous = file("items", "generated.json")
+    if is_file(previous) {
+        let whole = j(read_text(previous.copy())! ?? String(""))
+        if let Json.Array(xs) = field(whole, "cases") {
+            for c in xs {
+                let id = text_of(c, "id")
+                if id.starts_with("from-wire-") {
+                    old.insert(id.copy(), c.copy())
+                }
+            }
+        }
+    }
+    var derived: List<Json> = []
+    for c in made {
+        let id = text_of(c, "id")
+        if not id.starts_with("to-wire-") {
+            continue
+        }
+        let name = id[8..id.len()]
+        for to in ["nbt", "wire"] {
+            let cid = "from-wire-{name}-{to}"
+            if let blob = blobs.find(id) {
+                derived.push(obj([member("id", s(cid.copy())), member("input", obj([member("from", s("wire")), member("to", s(String(to)))])), member("blobs", arr([blob.copy()]))]))
+            } else if let kept = old.find(cid) {
+                derived.push(kept.copy())
+            }
+        }
+    }
+    return derived
+}
+
+fn cases() -> List<Json> {
+    var out: List<Json> = []
+
+    add(mut out, "plain", #"{"id": "minecraft:stone"}"#)
+    add(mut out, "short-id", #"{"id": "stone", "count": 64}"#)
+    add(mut out, "no-id", #"{"count": 2}"#)
+    add(mut out, "not-object", #""minecraft:stone""#)
+    add(mut out, "air", #"{"id": "minecraft:air"}"#)
+    add(mut out, "unknown", #"{"id": "w:nope"}"#)
+    add(mut out, "count-zero", #"{"id": "minecraft:stone", "count": 0}"#)
+    add(mut out, "count-100", #"{"id": "minecraft:stone", "count": 100}"#)
+    add(mut out, "count-float", #"{"id": "minecraft:stone", "count": 2.5}"#)
+    add(mut out, "count-string", #"{"id": "minecraft:stone", "count": "2"}"#)
+    add(mut out, "empty-components", #"{"id": "minecraft:stone", "components": {}}"#)
+    // A stack no bigger than its item's stack size, with its components.
+    add(mut out, "pearls-16", #"{"id": "minecraft:ender_pearl", "count": 16}"#)
+    add(mut out, "pearls-17", #"{"id": "minecraft:ender_pearl", "count": 17}"#)
+    add(mut out, "sword-2", #"{"id": "minecraft:diamond_sword", "count": 2}"#)
+    add(mut out, "stack-size-patch", #"{"id": "minecraft:stone", "count": 11, "components": {"max_stack_size": 10}}"#)
+    add(mut out, "stack-size-removed", #"{"id": "minecraft:stone", "count": 2, "components": {"!max_stack_size": {}}}"#)
+    add(mut out, "stack-size-raised", #"{"id": "minecraft:ender_pearl", "count": 40, "components": {"max_stack_size": 50}}"#)
+    add(mut out, "damageable-stacks", #"{"id": "minecraft:stone", "components": {"max_damage": 10}}"#)
+    add(mut out, "damageable-one", #"{"id": "minecraft:stone", "components": {"max_damage": 10, "max_stack_size": 1}}"#)
+    add(mut out, "sword-stacks", #"{"id": "minecraft:diamond_sword", "components": {"max_stack_size": 5}}"#)
+    add(mut out, "sword-undamageable", #"{"id": "minecraft:diamond_sword", "count": 2, "components": {"!max_damage": {}, "max_stack_size": 2}}"#)
+    add(mut out, "sword-damaged", #"{"id": "minecraft:diamond_sword", "components": {"damage": 30, "enchantments": {"sharpness": 2}}}"#)
+    // What a stack holds must fit too: a container's and charged projectiles' stacks, and a
+    // bundle's, which weigh no more than one.
+    add(mut out, "container-fits", #"{"id": "minecraft:shulker_box", "components": {"container": [{"slot": 0, "item": {"id": "minecraft:stone", "count": 64}}]}}"#)
+    add(mut out, "container-too-many", #"{"id": "minecraft:shulker_box", "components": {"container": [{"slot": 0, "item": {"id": "minecraft:diamond_sword", "count": 2}}]}}"#)
+    add(mut out, "projectiles-too-many", #"{"id": "minecraft:crossbow", "components": {"charged_projectiles": [{"id": "minecraft:firework_rocket", "count": 99}]}}"#)
+    add(mut out, "bundle-full", #"{"id": "minecraft:bundle", "components": {"bundle_contents": [{"id": "minecraft:stone", "count": 32}, {"id": "minecraft:ender_pearl", "count": 8}]}}"#)
+    add(mut out, "bundle-over", #"{"id": "minecraft:bundle", "components": {"bundle_contents": [{"id": "minecraft:stone", "count": 64}, {"id": "minecraft:dirt"}]}}"#)
+    add(mut out, "bundle-nested", #"{"id": "minecraft:bundle", "components": {"bundle_contents": [ {"id": "minecraft:red_bundle", "components": {"bundle_contents": [{"id": "minecraft:stone", "count": 60}]}}, {"id": "minecraft:stone", "count": 3}]}}"#)
+    add(mut out, "bundle-nested-over", #"{"id": "minecraft:bundle", "components": {"bundle_contents": [ {"id": "minecraft:red_bundle", "components": {"bundle_contents": [{"id": "minecraft:stone", "count": 60}]}}, {"id": "minecraft:stone", "count": 1}]}}"#)
+    add(mut out, "bundle-hive", #"{"id": "minecraft:bundle", "components": {"bundle_contents": [ {"id": "minecraft:bee_nest", "components": {"bees": [{"entity_data": {"id": "minecraft:bee"}, "ticks_in_hive": 0, "min_ticks_in_hive": 0}]}}]}}"#)
+    add(mut out, "bundle-hive-over", #"{"id": "minecraft:bundle", "components": {"bundle_contents": [ {"id": "minecraft:bee_nest", "components": {"bees": [{"entity_data": {"id": "minecraft:bee"}, "ticks_in_hive": 0, "min_ticks_in_hive": 0}]}}, {"id": "minecraft:feather"}]}}"#)
+    add(mut out, "bundle-sword-pair", #"{"id": "minecraft:bundle", "components": {"bundle_contents": [{"id": "minecraft:diamond_sword", "count": 2}]}}"#)
+    // A patch as applying it to the item's default components leaves it: the same as the item's
+    // own left out, taking away one the item hasn't left out, and the rest in the order given.
+    add(mut out, "defaults-same", #"{"id": "minecraft:paper", "components": { "max_stack_size": 64, "lore": [], "enchantments": {}, "rarity": "common", "item_model": "minecraft:paper", "item_name": {"translate": "item.minecraft.paper"}, "repair_cost": 0, "break_sound": "minecraft:entity.item.break"}}"#)
+    add(mut out, "defaults-other", #"{"id": "minecraft:paper", "components": { "item_model": "minecraft:stone", "item_name": {"translate": "block.minecraft.paper"}, "rarity": "rare", "repair_cost": 1}}"#)
+    add(mut out, "defaults-taken", #"{"id": "minecraft:apple", "components": {"!food": {}, "!lore": {}, "!damage": {}, "!max_damage": {}, "!consumable": {}}}"#)
+    add(mut out, "defaults-food-same", #"{"id": "minecraft:apple", "components": {"food": {"nutrition": 4, "saturation": 2.4}}}"#)
+    add(mut out, "defaults-food-other", #"{"id": "minecraft:apple", "components": {"food": {"nutrition": 5, "saturation": 2.4}}}"#)
+    add(mut out, "defaults-tool-same", #"{"id": "minecraft:diamond_pickaxe", "count": 1, "components": {"max_damage": 1561, "damage": 0, "max_stack_size": 1}}"#)
+    add(mut out, "defaults-block-name", #"{"id": "minecraft:stone", "components": {"item_name": {"translate": "block.minecraft.stone"}, "custom_name": "S"}}"#)
+    add(mut out, "defaults-many", #"{"id": "minecraft:paper", "components": { "max_stack_size": 16, "max_damage": 9, "damage": 1, "unbreakable": {}, "repair_cost": 3, "custom_name": "A", "item_name": "B", "item_model": "w:m", "lore": ["c"], "rarity": "epic", "enchantment_glint_override": false, "glider": {}, "minimum_attack_charge": 0.5, "use_effects": {"can_sprint": true}, "tooltip_style": "w:t", "enchantments": {"unbreaking": 1}, "intangible_projectile": {}}}"#)
+    // Text that's none of a string, a list and an object, or a list none of whose parts read.
+    add(mut out, "name-number", #"{"id": "minecraft:paper", "components": {"custom_name": 5}}"#)
+    add(mut out, "name-bool", #"{"id": "minecraft:paper", "components": {"custom_name": true}}"#)
+    add(mut out, "name-empty-list", #"{"id": "minecraft:paper", "components": {"custom_name": []}}"#)
+    add(mut out, "name-list-one-bad", #"{"id": "minecraft:paper", "components": {"custom_name": ["a", 5]}}"#)
+    add(mut out, "name-list-all-bad", #"{"id": "minecraft:paper", "components": {"custom_name": [5, false]}}"#)
+    add(mut out, "lore-number", #"{"id": "minecraft:paper", "components": {"lore": [1]}}"#)
+    // Every component type, as the packs cases have them, on an item it may be on.
+    let components = item_components()
+    for (i, c) in components.enumerate() {
+        add_value(mut out, "components-{i}", obj([member("id", s(item_for(i))), member("components", c.copy())]))
+    }
+    for (name, c) in bad_components() {
+        add_value(mut out, "bad-{name}", obj([member("id", s("minecraft:paper")), member("components", c.copy())]))
+    }
+
+    nbt(mut out, "plain", #"{id:"minecraft:stone"}"#)
+    nbt(mut out, "short", #"{id:stone,count:64}"#)
+    nbt(mut out, "count-byte", #"{id:stone,count:5b}"#)
+    nbt(mut out, "count-short", #"{id:stone,count:7s}"#)
+    nbt(mut out, "count-long", #"{id:stone,count:3L}"#)
+    nbt(mut out, "count-long-wraps", #"{id:stone,count:4294967298L}"#)
+    nbt(mut out, "count-float", #"{id:stone,count:2.9f}"#)
+    nbt(mut out, "count-double", #"{id:stone,count:3.99d}"#)
+    nbt(mut out, "count-negative-float", #"{id:stone,count:-0.5f}"#)
+    nbt(mut out, "count-huge-float", #"{id:stone,count:1.0E10f}"#)
+    nbt(mut out, "count-string", #"{id:stone,count:"2"}"#)
+    nbt(mut out, "count-array", #"{id:stone,count:[I;2]}"#)
+    nbt(mut out, "count-zero", #"{id:stone,count:0b}"#)
+    nbt(mut out, "id-number", #"{id:5}"#)
+    nbt(mut out, "id-list", #"{id:[stone]}"#)
+    nbt(mut out, "no-id", #"{count:2}"#)
+    nbt(mut out, "not-compound", #""minecraft:stone""#)
+    nbt(mut out, "list", #"[{id:stone}]"#)
+    nbt(mut out, "number", #"5b"#)
+    nbt(mut out, "air", #"{id:air}"#)
+    nbt(mut out, "unknown", #"{id:"w:nope"}"#)
+    nbt(mut out, "components-not-compound", #"{id:stone,components:[]}"#)
+    nbt(mut out, "components-string", #"{id:stone,components:"x"}"#)
+    // Components with NBT's own types.
+    nbt(mut out, "stack-size-byte", #"{id:paper,components:{max_stack_size:10b}}"#)
+    nbt(mut out, "stack-size-double", #"{id:paper,components:{max_stack_size:10.7d}}"#)
+    nbt(mut out, "stack-size-same", #"{id:paper,components:{max_stack_size:64b}}"#)
+    nbt(mut out, "glint-byte", #"{id:paper,components:{enchantment_glint_override:1b}}"#)
+    nbt(mut out, "glint-zero", #"{id:paper,components:{enchantment_glint_override:0b}}"#)
+    nbt(mut out, "glint-half", #"{id:paper,components:{enchantment_glint_override:0.5f}}"#)
+    nbt(mut out, "glint-int", #"{id:paper,components:{enchantment_glint_override:2}}"#)
+    nbt(mut out, "glint-string", #"{id:paper,components:{enchantment_glint_override:"true"}}"#)
+    nbt(mut out, "glint-list", #"{id:paper,components:{enchantment_glint_override:[1b]}}"#)
+    nbt(mut out, "damage-byte", #"{id:diamond_sword,components:{damage:5b}}"#)
+    nbt(mut out, "damage-negative", #"{id:diamond_sword,components:{damage:-1}}"#)
+    nbt(mut out, "removed", #"{id:apple,components:{"!food":{},"!minecraft:consumable":{}, "!lore":{}}}"#)
+    nbt(mut out, "unknown-component", #"{id:paper,components:{"w:x":1}}"#)
+    nbt(mut out, "transient", #"{id:paper,components:{"minecraft:creative_slot_lock":{}}}"#)
+    nbt(mut out, "custom-data", #"{id:paper,components:{custom_data:{a:1b,b:[I;1,2],c:[B;],d:[L;5L],e:[],f:{},g:1.5f,h:2.5d,i:"s",j:[1,2],k:3s,l:4L,m:[B;1B,-2B],n:[I;],o:[L;],p:[[1b],[2s]],q:["a",1]}}}"#)
+    nbt(mut out, "custom-data-list", #"{id:paper,components:{custom_data:[1]}}"#)
+    nbt(mut out, "custom-data-string", #"{id:paper,components:{custom_data:"{a:1}"}}"#)
+    nbt(mut out, "custom-data-bad-string", #"{id:paper,components:{custom_data:"{a:"}}"#)
+    nbt(mut out, "name-string", #"{id:paper,components:{custom_name:"Hi"}}"#)
+    nbt(mut out, "name-compound", #"{id:paper,components:{custom_name:{text:"Hi",bold:1b,italic:0b,color:"red"}}}"#)
+    nbt(mut out, "name-list", #"{id:paper,components:{custom_name:["a",{text:"b",underlined:1b}]}}"#)
+    nbt(mut out, "name-bold-two", #"{id:paper,components:{custom_name:{text:"Hi",bold:2b}}}"#)
+    nbt(mut out, "name-bold-string", #"{id:paper,components:{custom_name:{text:"Hi",bold:"true"}}}"#)
+    nbt(mut out, "name-number", #"{id:paper,components:{custom_name:5}}"#)
+    nbt(mut out, "name-empty-list", #"{id:paper,components:{custom_name:[]}}"#)
+    nbt(mut out, "name-list-one-bad", #"{id:paper,components:{custom_name:["a",5]}}"#)
+    nbt(mut out, "name-list-all-bad", #"{id:paper,components:{custom_name:[5,0b]}}"#)
+    nbt(mut out, "name-bold-big", #"{id:paper,components:{custom_name:{text:"Hi",bold:256}}}"#)
+    nbt(mut out, "name-italic-half", #"{id:paper,components:{custom_name:{text:"Hi",italic:0.5f}}}"#)
+    nbt(mut out, "lore", #"{id:paper,components:{lore:["a",{text:"b"},[c,d]]}}"#)
+    nbt(mut out, "lore-empty", #"{id:paper,components:{lore:[]}}"#)
+    nbt(mut out, "lore-empty-array", #"{id:paper,components:{lore:[I;]}}"#)
+    nbt(mut out, "lore-array", #"{id:paper,components:{lore:[I;1]}}"#)
+    nbt(mut out, "lore-string", #"{id:paper,components:{lore:"a"}}"#)
+    nbt(mut out, "profile-name", #"{id:player_head,components:{profile:{name:"Steve"}}}"#)
+    nbt(mut out, "profile-string", #"{id:player_head,components:{profile:"Steve"}}"#)
+    nbt(mut out, "profile-id", #"{id:player_head,components:{profile:{id:[I;1,2,3,4],name:"Al"}}}"#)
+    nbt(mut out, "profile-id-list", #"{id:player_head,components:{profile:{id:[1,2,3,4]}}}"#)
+    nbt(mut out, "profile-id-bytes", #"{id:player_head,components:{profile:{id:[B;1B,2B,3B,4B]}}}"#)
+    nbt(mut out, "profile-id-longs", #"{id:player_head,components:{profile:{id:[L;1L,2L,3L,4L]}}}"#)
+    nbt(mut out, "profile-id-three", #"{id:player_head,components:{profile:{id:[I;1,2,3]}}}"#)
+    nbt(mut out, "profile-id-five", #"{id:player_head,components:{profile:{id:[I;1,2,3,4,5]}}}"#)
+    nbt(mut out, "profile-id-empty", #"{id:player_head,components:{profile:{id:[I;]}}}"#)
+    nbt(mut out, "profile-id-strings", #"{id:player_head,components:{profile:{id:["a","b","c","d"]}}}"#)
+    nbt(mut out, "profile-id-number", #"{id:player_head,components:{profile:{id:5}}}"#)
+    nbt(mut out, "profile-properties", #"{id:player_head,components:{profile:{name:"Al",properties:[{name:"textures",value:"v",signature:"s"}]}}}"#)
+    nbt(mut out, "dyed-color", #"{id:leather_helmet,components:{dyed_color:16711680}}"#)
+    nbt(mut out, "dyed-color-byte", #"{id:leather_helmet,components:{dyed_color:5b}}"#)
+    nbt(mut out, "enchantments", #"{id:diamond_sword,components:{enchantments:{"minecraft:sharpness":2b,unbreaking:3s}}}"#)
+    nbt(mut out, "enchantments-high", #"{id:diamond_sword,components:{enchantments:{sharpness:300}}}"#)
+    nbt(mut out, "enchantments-list", #"{id:diamond_sword,components:{enchantments:[sharpness]}}"#)
+    nbt(mut out, "container", #"{id:shulker_box,components:{container:[{slot:0b,item:{id:stone,count:3b}},{slot:5,item:{id:dirt}}]}}"#)
+    nbt(mut out, "container-bad-item", #"{id:shulker_box,components:{container:[{slot:0b,item:{id:5}}]}}"#)
+    nbt(mut out, "bundle", #"{id:bundle,components:{bundle_contents:[{id:stone,count:32b},{id:ender_pearl,count:8s}]}}"#)
+    nbt(mut out, "projectiles", #"{id:crossbow,components:{charged_projectiles:[{id:arrow,count:1b}]}}"#)
+    nbt(mut out, "attributes", #"{id:diamond_sword,components:{attribute_modifiers:[{type:"attack_damage",id:"w:a",amount:1.5d,operation:"add_value",slot:"mainhand"},{type:"armor",id:"w:b",amount:2,operation:"add_value"}]}}"#)
+    nbt(mut out, "food", #"{id:apple,components:{food:{nutrition:4,saturation:2.4f}}}"#)
+    nbt(mut out, "food-same-double", #"{id:apple,components:{food:{nutrition:4b,saturation:2.4d}}}"#)
+    nbt(mut out, "food-other", #"{id:apple,components:{food:{nutrition:5b,saturation:2.4f,can_always_eat:1b}}}"#)
+    nbt(mut out, "custom-model-data", #"{id:paper,components:{custom_model_data:{floats:[1.0f,2.5d,3],flags:[1b,0b,5],strings:["a"],colors:[I;1,2]}}}"#)
+    nbt(mut out, "firework", #"{id:firework_star,components:{firework_explosion:{shape:"star",colors:[I;1,2],fade_colors:[3],has_trail:1b}}}"#)
+    nbt(mut out, "lodestone", #"{id:compass,components:{lodestone_tracker:{target:{dimension:"minecraft:overworld",pos:[I;1,2,3]},tracked:0b}}}"#)
+    nbt(mut out, "lodestone-pos-list", #"{id:compass,components:{lodestone_tracker:{target:{dimension:"minecraft:overworld",pos:[1,2,3]}}}}"#)
+    nbt(mut out, "lodestone-pos-short", #"{id:compass,components:{lodestone_tracker:{target:{dimension:"minecraft:overworld",pos:[I;1,2]}}}}"#)
+    nbt(mut out, "debug-stick", #"{id:debug_stick,components:{debug_stick_state:{"minecraft:oak_log":"axis"}}}"#)
+    nbt(mut out, "debug-stick-bad", #"{id:debug_stick,components:{debug_stick_state:{"minecraft:oak_log":"nope"}}}"#)
+    nbt(mut out, "map-id", #"{id:filled_map,components:{map_id:5b}}"#)
+    nbt(mut out, "map-color", #"{id:filled_map,components:{map_color:16711680L}}"#)
+    nbt(mut out, "book", #"{id:written_book,components:{written_book_content:{title:"T",author:"A",generation:1b,pages:["a",{raw:"b"},{raw:{text:"c",bold:1b}},{raw:"d",filtered:"e"}],resolved:1b}}}"#)
+    nbt(mut out, "book-title-filtered", #"{id:written_book,components:{written_book_content:{title:{raw:"T",filtered:"U"},author:"A"}}}"#)
+    nbt(mut out, "writable-book", #"{id:writable_book,components:{writable_book_content:{pages:["a",{raw:"b"}]}}}"#)
+    nbt(mut out, "entity-data", #"{id:pig_spawn_egg,components:{entity_data:{id:"minecraft:pig",Health:5.0f}}}"#)
+    nbt(mut out, "entity-data-no-id", #"{id:pig_spawn_egg,components:{entity_data:{Health:5.0f,Tags:[a]}}}"#)
+    nbt(mut out, "entity-data-id-number", #"{id:pig_spawn_egg,components:{entity_data:{id:5}}}"#)
+    nbt(mut out, "block-entity-data", #"{id:chest,components:{block_entity_data:{id:"minecraft:chest",Items:[],Lock:{}}}}"#)
+    nbt(mut out, "bees", #"{id:bee_nest,components:{bees:[{entity_data:{id:"minecraft:bee"},ticks_in_hive:5s,min_ticks_in_hive:6b}]}}"#)
+    nbt(mut out, "block-state", #"{id:oak_log,components:{block_state:{axis:"x"}}}"#)
+    nbt(mut out, "block-state-number", #"{id:oak_log,components:{block_state:{axis:1}}}"#)
+    nbt(mut out, "unbreakable", #"{id:diamond_sword,components:{unbreakable:{}}}"#)
+    nbt(mut out, "unbreakable-list", #"{id:diamond_sword,components:{unbreakable:[]}}"#)
+    nbt(mut out, "tooltip-display", #"{id:paper,components:{tooltip_display:{hide_tooltip:1b,hidden_components:[damage,"minecraft:lore",damage]}}}"#)
+    nbt(mut out, "can-break", #"{id:diamond_pickaxe,components:{can_break:{blocks:"minecraft:stone"}}}"#)
+    nbt(mut out, "can-break-list", ##"{id:diamond_pickaxe,components:{can_break:[{blocks:["stone","#minecraft:logs"]}]}}"##)
+    nbt(mut out, "potion", #"{id:potion,components:{potion_contents:{potion:"minecraft:swiftness",custom_color:5b,custom_effects:[{id:"minecraft:speed",amplifier:1b,duration:200s,show_icon:0b}]}}}"#)
+    nbt(mut out, "suspicious-stew", #"{id:suspicious_stew,components:{suspicious_stew_effects:[{id:"minecraft:speed",duration:5L}]}}"#)
+    nbt(mut out, "rarity-number", #"{id:paper,components:{rarity:1}}"#)
+    nbt(mut out, "instrument", #"{id:goat_horn,components:{instrument:"minecraft:ponder_goat_horn"}}"#)
+    nbt(mut out, "trim", #"{id:diamond_chestplate,components:{trim:{material:"minecraft:gold",pattern:"minecraft:coast"}}}"#)
+    nbt(mut out, "banner", #"{id:white_banner,components:{banner_patterns:[{pattern:"minecraft:stripe_top",color:"red"}],base_color:"blue"}}"#)
+    nbt(mut out, "pot", #"{id:decorated_pot,components:{pot_decorations:[brick,"minecraft:angler_pottery_sherd"]}}"#)
+    nbt(mut out, "sign", #"{id:oak_sign,components:{block_entity_data:{id:"minecraft:sign",front_text:{messages:["a","b","c","d"]}}}}"#)
+    nbt(mut out, "note-block-sound", #"{id:player_head,components:{note_block_sound:"minecraft:block.note_block.harp"}}"#)
+    nbt(mut out, "consumable", #"{id:paper,components:{consumable:{consume_seconds:2,animation:"eat",has_consume_particles:0b,on_consume_effects:[{type:"minecraft:teleport_randomly",diameter:8.5d}]}}}"#)
+    nbt(mut out, "tool", ##"{id:paper,components:{tool:{rules:[{blocks:"#minecraft:logs",speed:4,correct_for_drops:1b}],default_mining_speed:2b,damage_per_block:3L}}}"##)
+    nbt(mut out, "equippable", #"{id:paper,components:{equippable:{slot:"head",dispensable:0b,swappable:1b,damage_on_hurt:1b,equip_on_interact:0b}}}"#)
+    nbt(mut out, "weapon", #"{id:paper,components:{weapon:{item_damage_per_attack:2b,disable_blocking_for_seconds:1.5d}}}"#)
+    nbt(mut out, "ominous", #"{id:ominous_bottle,components:{ominous_bottle_amplifier:3b}}"#)
+    nbt(mut out, "ominous-high", #"{id:ominous_bottle,components:{ominous_bottle_amplifier:5}}"#)
+    nbt(mut out, "item-name", #"{id:paper,components:{item_name:{translate:"item.minecraft.paper"},item_model:"minecraft:paper"}}"#)
+    nbt(mut out, "repair-cost", #"{id:paper,components:{repair_cost:0b,max_damage:5s,damage:0L}}"#)
+    nbt(mut out, "many", #"{id:paper,count:3b,components:{max_stack_size:16b,lore:["c"],custom_name:"A",rarity:"epic",enchantment_glint_override:0b,repair_cost:3,enchantments:{unbreaking:1b},glider:{},tooltip_style:"w:t",custom_data:{x:1b}}}"#)
+
+    // Every component type and broken patch the `packs` cases have, written as SNBT. Vanilla
+    // caches what it encodes most components to, and writes a value equal to one it wrote before
+    // as that one was, so a profile, whose properties are equal in any order, is given a name of
+    // its own here, or it would come out in the order the JSON case's did (D363).
+    for (i, c) in components.enumerate() {
+        var patch = c.copy()
+        if let Json.Object(_) = field(c, "profile") {
+            patch = with(c.copy(), "profile", with(field(c, "profile"), "name", s("Snbt")))
+        }
+        nbt(mut out, "components-{i}", snbt(obj([member("id", s(item_for(i))), member("components", patch)])))
+    }
+    for (name, c) in bad_components() {
+        nbt(mut out, "bad-{name}", snbt(obj([member("id", s("minecraft:paper")), member("components", c.copy())])))
+    }
+
+    // Every JSON stack sent over the network with `ItemStack.OPTIONAL_STREAM_CODEC` (D364), with
+    // one enchantment where it has more: vanilla holds them in a hash map keyed by holders, whose
+    // hash is their identity, so it sends several in an order that changes from run to run (D365).
+    let sent = out.copy()
+    for c in sent {
+        let input = field(c, "input")
+        if text_of(input, "from") == "json" and text_of(input, "to") == "nbt" {
+            var text = text_of(input, "value")
+            let (single, changed) = one_enchantment(j(text.copy()))
+            if changed {
+                text = spaced_ascii(single)
+            }
+            let wired = with(with(input.copy(), "to", s("wire")), "value", s(text))
+            out.push(obj([member("id", s("to-wire-{text_of(c, "id")}")), member("input", wired)]))
+        }
+    }
+
+    // Stacks off the network, made by hand: empty ones, air, what doesn't read, and patches that
+    // applying them to the item's defaults changes.
+    let stone = varint(1)
+    let paper = varint(1145)
+    let apple = varint(1007)
+    let sword = varint(1050)
+    wire(mut out, "empty", [0])
+    wire(mut out, "negative", varint(-1))
+    wire(mut out, "air", [1, 0, 0, 0])
+    wire(mut out, "air-patch", [1, 0, 1, 0, 1, 5])
+    wire(mut out, "truncated", [1])
+    wire(mut out, "truncated-patch", cat([[1], stone.copy(), [1]]))
+    wire(mut out, "unknown-item", cat([[1], varint(99999), [0, 0]]))
+    wire(mut out, "unknown-component", cat([[1], stone.copy(), [1, 0], varint(9999)]))
+    wire(mut out, "left", cat([[1], stone.copy(), [0, 0, 7]]))
+    wire(mut out, "plain", cat([[1], stone.copy(), [0, 0]]))
+    wire(mut out, "count-64", cat([[64], stone.copy(), [0, 0]]))
+    wire(mut out, "count-100", cat([varint(100), stone.copy(), [0, 0]]))
+    wire(mut out, "count-big", cat([varint(1000000), stone.copy(), [0, 0]]))
+    wire(mut out, "stack-size-zero", cat([[1], stone.copy(), [1, 0, 1, 0]]))
+    wire(mut out, "stack-size-same", cat([[1], paper.copy(), [1, 0, 1, 64]]))
+    wire(mut out, "stack-size-twice", cat([[1], stone.copy(), [2, 0, 1, 5, 1, 6]]))
+    wire(mut out, "removed-absent", cat([[1], stone.copy(), [0, 1, 23]]))
+    wire(mut out, "removed-present", cat([[1], apple.copy(), [0, 1, 23]]))
+    wire(mut out, "damage-negative", cat([[1], sword.copy(), [1, 0, 3], varint(-5)]))
+    wire(mut out, "name", cat([[1], stone.copy(), [1, 0, 6, 8, 0, 2, 72, 105]]))
+    wire(mut out, "name-bad-nbt", cat([[1], stone.copy(), [1, 0, 6, 99]]))
+    wire(mut out, "rarity-out-of-range", cat([[1], paper.copy(), [1, 0, 12, 9]]))
+    wire(mut out, "rarity-epic", cat([[1], paper.copy(), [1, 0, 12, 3]]))
+    wire(mut out, "lore-too-many", cat([[1], paper.copy(), [1, 0, 11], varint(257)]))
+
+    // The other types' stream codecs (D365): enums' IDs out of range, wrapped, clamped or not
+    // there; tags and entries; stacks inside stacks and their patches; sets and maps read into
+    // hash maps; both sides of an either; and what the decoders throw.
+    let potion = varint(1271)
+    let bundle = varint(1153)
+    let head = varint(1386)
+    let sign = varint(1102)
+    let crossbow = varint(1491)
+    var lines: List<u8> = []
+    for ch in [97u8, 98, 99, 100] {
+        lines.extend([8, 0, 1, ch])
+    }
+    var uuid: List<u8> = []
+    for k in 1u8..17 {
+        uuid.push(k)
+    }
+    var attribute: List<u8> = []
+    bytes.put_f64_be(mut attribute, 2.0)
+    wire(mut out, "horse-wrapped", one(paper, 108, varint(-1)))
+    wire(mut out, "horse-far", one(paper, 108, varint(1000)))
+    wire(mut out, "salmon-clamped", one(paper, 93, varint(7)))
+    wire(mut out, "rabbit-evil", one(paper, 99, varint(99)))
+    wire(mut out, "rabbit-unknown", one(paper, 99, varint(50)))
+    wire(mut out, "fish-betty", one(paper, 95, varint(1025)))
+    wire(mut out, "fish-unknown", one(paper, 95, varint(2)))
+    wire(mut out, "tag-unknown", one(paper, 33, cat([[0], utf(String("minecraft:nope"))])))
+    wire(mut out, "tag-known", one(paper, 33, cat([[0], utf(String("minecraft:repairs_iron_armor"))])))
+    wire(mut out, "holders-none", one(paper, 33, [1]))
+    wire(mut out, "holders-negative", one(paper, 33, varint(-5)))
+    wire(mut out, "holders-two", one(paper, 33, cat([[3], stone.copy(), paper.copy()])))
+    wire(mut out, "bundle-count-zero", one(bundle, 52, cat([[1], stone.copy(), [0, 0, 0]])))
+    wire(mut out, "bundle-air", one(bundle, 52, [1, 0, 1, 0, 0]))
+    wire(mut out, "bundle-count-negative", one(bundle, 52, cat([[1], stone.copy(), varint(-3), [0, 0]])))
+    wire(mut out, "bundle-patch-negative", one(bundle, 52, cat([[1], stone.copy(), [1], varint(-1), [0]])))
+    wire(mut out, "bundle-patched", one(bundle, 52, cat([[1], stone.copy(), [1, 3, 1, 3, 5, 11, 1, 8, 0, 1, 120, 3, 7, 0]])))
+    wire(mut out, "patch-negative", cat([[1], stone.copy(), varint(-1), [0]]))
+    wire(mut out, "patch-negative-removed", cat([[1], apple.copy(), varint(-1), [1, 23]]))
+    wire(mut out, "block-state", one(paper, 78, cat([[3], utf(String("waterlogged")), utf(String("false")), utf(String("facing")), utf(String("north")), utf(String("lit")), utf(String("true"))])))
+    wire(mut out, "block-state-twice", one(paper, 78, cat([[2], utf(String("lit")), utf(String("true")), utf(String("lit")), utf(String("false"))])))
+    wire(mut out, "tooltip-twice", one(paper, 18, [0, 3, 3, 11, 3]))
+    wire(mut out, "profile-whole", one(head, 72, cat([[1], uuid.copy(), utf(String("Alex")), [1], utf(String("textures")), utf(String("v")), [1], utf(String("s")), [0, 0, 0, 1, 1]])))
+    wire(mut out, "profile-part", one(head, 72, cat([[0, 1], utf(String("Al")), [1], uuid.copy(), [0, 0, 0, 0, 0]])))
+    wire(mut out, "profile-name", one(head, 72, cat([[0, 1], utf(String("Steve")), [0, 0, 0, 0, 0, 0]])))
+    wire(mut out, "profile-long-name", one(head, 72, cat([[0, 1], utf("A".repeat(17)), [0, 0, 0, 0, 0, 0]])))
+    wire(mut out, "sign-filtered-same", one(sign, 118, cat([lines.copy(), [1], lines.copy(), [0, 0]])))
+    wire(mut out, "potion-hidden", one(potion, 53, [0, 0, 1, 0, 1, 20, 0, 1, 1, 1, 2, 40, 0, 1, 1, 0, 0]))
+    wire(mut out, "potion-amplifier-big", one(potion, 53, cat([[0, 0, 1, 0], varint(300), [20, 0, 1, 1, 0, 0]])))
+    wire(mut out, "consume-unknown", one(paper, 24, cat([[0x3F, 0xCC, 0xCC, 0xCD, 1, 0], utf(String("w:s")), [0, 1, 1, 99]])))
+    wire(mut out, "consume-direct-sound", one(paper, 24, cat([[0x3F, 0xCC, 0xCC, 0xCD, 2, 0], utf(String("w:s")), [1, 0x41, 0x20, 0, 0, 1, 0]])))
+    wire(mut out, "entity-data", one(paper, 60, cat([[11, 10, 8, 0, 2], [105, 100], [0, 3], [119, 58, 120], [3, 0, 1], [120], [0, 0, 0, 5, 0]])))
+    wire(mut out, "custom-data-not-compound", one(paper, 0, [8, 0, 1, 120]))
+    wire(mut out, "can-break-state", one(paper, 15, cat([[1, 1, 2, 1, 1, 1], utf(String("facing")), [1], utf(String("north")), [0, 0, 0]])))
+    wire(mut out, "can-break-tests", one(paper, 15, [1, 0, 0, 0, 1, 3, 5, 1, 1, 0, 10, 0]))
+    wire(mut out, "attribute-override", one(paper, 16, cat([[1, 1], utf(String("w:a")), attribute.copy(), [0, 0, 2, 8, 0, 1, 88]])))
+    wire(mut out, "map-post-processing", one(paper, 50, [1]))
+    wire(mut out, "creative-slot-lock", one(paper, 20, []))
+    wire(mut out, "charged-too-many", one(crossbow, 51, varint(1025)))
+    wire(mut out, "lore-negative", one(paper, 11, varint(-1)))
+    wire(mut out, "lore-bad-text", one(paper, 11, [1, 3, 0, 0, 0, 5]))
+    wire(mut out, "tooltip-negative", one(paper, 18, cat([[0], varint(-1)])))
+    wire(mut out, "block-state-negative", one(paper, 78, varint(-1)))
+    wire(mut out, "enchantments-negative", one(paper, 13, varint(-1)))
+    wire(mut out, "profile-properties-negative", one(head, 72, cat([[0, 0, 0], varint(-1), [0, 0, 0, 0]])))
+    wire(mut out, "container-empty-last", one(varint(656), 77, [3, 0, 1, 1, 1, 0, 0, 0]))
+    wire(mut out, "fireworks-flight-big", one(paper, 71, cat([varint(300), [0]])))
+
+    // Vanilla's own bytes for each stack above, read back, from the goldens where they've been
+    // recorded, else as the case file had them.
+    let derived = from_vanilla(out)
+    out.extend(derived)
+
+    // Each stack above, hashed as a slot's `HashedStack` is: each component its patch sets,
+    // written with its codec to `HashOps.CRC32C_INSTANCE`, which the client and server check each
+    // other's slots by (CAL-136).
+    let all = out.copy()
+    for c in all {
+        let input = field(c, "input")
+        if text_of(input, "to") == "nbt" {
+            var hashed: List<(String, Json)> = [member("id", s("hash-{text_of(c, "id")}")), member("input", with(input.copy(), "to", s("hash")))]
+            if let blobs = c.get(String("blobs")) {
+                hashed.push(member("blobs", blobs.copy()))
+            }
+            out.push(obj(hashed))
+        }
+    }
+    return out
+}
+
+/// The item each of the packs' component patches is put on: one it may be on.
+fn item_for(i: usize) -> String {
+    let items = ["minecraft:paper", "minecraft:paper", "minecraft:apple", "minecraft:paper", "minecraft:paper", "minecraft:paper", "minecraft:diamond_sword", "minecraft:potion", "minecraft:diamond_pickaxe", "minecraft:paper", "minecraft:paper", "minecraft:potion", "minecraft:potion", "minecraft:potion"]
+    if i < items.len() {
+        return String(items[i])
+    }
+    return String("minecraft:paper")
+}
+
+pub fn main() {
+    write_file(file("items", "generated.json"), String("items"), String("cases/items/gen.calx"), cases(), 1)
+}

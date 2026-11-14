@@ -155,6 +155,7 @@ calx cases/features/orders.calx   # cases/features/orders.json
 calx cases/structures/gen.calx   # cases/structures/generated.json
 calx cases/datafix/gen.calx      # cases/datafix/generated.json
 calx cases/block_entity/gen.calx # cases/block_entity/generated.json
+calx cases/items/gen.calx        # cases/items/generated.json
 calx cases/environment/gen.calx  # cases/environment/generated.json
 calx cases/stats/gen.calx        # cases/stats/generated.json
 calx cases/text/gen.calx         # cases/text/contents.json
