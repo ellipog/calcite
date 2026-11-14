@@ -1,0 +1,257 @@
+/// Checks explosions' parts in `world.explosion` (CAL-182) on a flat level whose blocks and loot
+/// are vanilla's, read from the server jar at oracle/jars/ as the rig's adapter loads them, so
+/// it's run from the repository's root: an explosion in water reaches nothing, its rays worn out
+/// at once, yet draws its 1,352 floats; one of radius 4 over the grass reaches the grass and dirt
+/// under it, never the bedrock, and nothing past where its rays can go; its blocks broken drop
+/// dirt, merged into stacks of 16 at most, as many as there were blocks, and the shuffle draws one
+/// fewer than there are places; fire draws a third for each place and lands only on air over a
+/// block solid to render; and how much of a box it sees, what it hurts and how hard it pushes.
+module test.explosion
+
+import random.legacy.{LegacyRandom}
+import random.taped.{TapedRandom}
+import rig.registries.{load_vanilla}
+import server.chunk_jobs.{ChunkContext, Loaded}
+import server.level.{Dropped, Level, SPAWN_RADIUS}
+import registry.registries.{Registries}
+import storage.chunk.{ChunkFormat}
+import world.chunk.{BlockStates}
+import world.collision.{Aabb}
+import world.explosion.{Calculator, Explosion, Interaction, blow_blocks, blown_places, damage_amount, direction, knockback_power, reach_part, seen_percent, set_fires}
+import world.flat.{FlatBlocks, FlatChunk, FlatWorld}
+import world.level_writer.{UPDATE_ALL}
+import world.loot.{Loot}
+import world.menu.{count_of}
+import world.movement.{MovementStates, Mover}
+import world.pos.{BlockPos, ChunkPos}
+import world.random_sequences.{RandomSequences}
+import worldgen.facts.{Facts}
+import worldgen.providers.{GenContext}
+import worldgen.survive.{Env}
+
+fn check(got: bool, what: String) {
+    if not got {
+        panic(what)
+    }
+}
+
+// The flat world: bedrock, two dirt and grass, by vanilla's IDs, air from y -60.
+fn flat_chunk() -> FlatChunk {
+    var world = FlatWorld.new(FlatBlocks { bedrock: 88, dirt: 10, grass_block: 9, biome: 0 }, BlockStates.new([1], [1], 1))
+    let made = world.take_chunk() else panic("the flat world has no chunk")
+    return made
+}
+
+// A flat level of the registries `r`, its spawn's chunks full and given the facts and the loot,
+// with a player at its middle, and its random seeded 0.
+fn flat_level(f: Facts, r: Registries) -> Level {
+    var level = Level.new(10, 10)
+    level.ground(flat_chunk())
+    let format = ChunkFormat.new(r.copy())!
+    level.open(none, ChunkContext { format: format, table: BlockStates.new([1], [1], 1), min_section: -4, sections: 24, sky_light: true }, none)
+    let spawn = ChunkPos { x: 0, z: 0 }
+    level.load_spawn(spawn)
+    let reach = SPAWN_RADIUS + 1
+    for x in -reach..reach + 1 {
+        for z in -reach..reach + 1 {
+            check(level.read_chunk(ChunkPos { x: x, z: z }, [], Loaded.Generate, []), "a spawn chunk wasn't asked for")
+        }
+    }
+    check(level.full_around(spawn, SPAWN_RADIUS), "the spawn isn't full")
+    level.add_player(spawn, 1)
+    level.pump()
+    level.set_env(Env { facts: f.copy(), ctx: GenContext { min_y: -64, depth: 384, sea: -63 }, sky_light: true, gen_depth: 384 })
+    level.loot = some(Shared(Loot.new(Shared(r.copy()))))
+    level.sequences = some(RandomSequences())
+    level.set_random(TapedRandom.new(0))
+    return level
+}
+
+fn named(f: Facts, name: str) -> u32 {
+    return match f.named_block(String(name)) {
+        ok(b) => f.default_state(b),
+        err(_) => panic("no block {name}"),
+    }
+}
+
+fn name_at(f: Facts, level: Level, x: i32, y: i32, z: i32) -> String {
+    return f.codec.blocks.name(f.block(level.spawn_state(x, y, z))).copy()
+}
+
+// A random seeded 0, as the level's is, after `floats` floats and `ints` draws of `nextInt(n)`
+// for `n` from `places` down to 2, `Util.shuffle`'s: the next long it gives.
+fn expected_next(floats: i32, places: usize) -> i64 {
+    var r = LegacyRandom.new(0)
+    for _ in 0..floats {
+        _ = r.next_float()
+    }
+    var i = places
+    while i > 1 {
+        _ = r.next_int_below(i32.wrap(i))
+        i -= 1
+    }
+    return r.next_long()
+}
+
+// Water all about the middle: each ray starts in water, which wears 30 off its power at once, so
+// nothing's reached, yet every ray drew its power.
+fn in_water(f: Facts, r: Registries) {
+    var level = flat_level(f, r)
+    let water = named(f, "water")
+    for x in -2..3 {
+        for y in -60..-56 {
+            for z in -2..3 {
+                check(level.set_block(x, y, z, water, UPDATE_ALL), "water wasn't set")
+            }
+        }
+    }
+    let e = Explosion { x: 0.5, y: -58.5, z: 0.5, radius: 6.0f32, interaction: Interaction.Destroy, calculator: Calculator.Plain }
+    let places = blown_places(f, mut level, e)
+    check(places.is_empty(), "water let an explosion reach {places.len()} places")
+    check(level.next_long() == expected_next(1352, 0), "the explosion in water didn't draw 1,352 floats")
+}
+
+// Radius 4 half a block over the grass: the grass under it and the dirt, but no bedrock, and
+// nothing farther than its rays reach, 1.3 times its radius worn by 0.225 each step of 0.3.
+fn over_grass(f: Facts, r: Registries) {
+    var level = flat_level(f, r)
+    let e = Explosion { x: 0.5, y: -59.5, z: 0.5, radius: 4.0f32, interaction: Interaction.Destroy, calculator: Calculator.Plain }
+    var places = blown_places(f, mut level, e)
+    let farthest = 4.0 * 1.3 / 0.22500001 * 0.3 + 1.8
+    var broken = 0
+    var seen_grass = false
+    for p in places {
+        let (dx, dy, dz) = (f64(p.x) + 0.5 - e.x, f64(p.y) + 0.5 - e.y, f64(p.z) + 0.5 - e.z)
+        check((dx * dx + dy * dy + dz * dz).sqrt() <= farthest, "{p.x}, {p.y}, {p.z} is past the rays' reach")
+        let name = name_at(f, level, p.x, p.y, p.z)
+        check(name != "minecraft:bedrock", "bedrock was reached")
+        if name == "minecraft:grass_block" or name == "minecraft:dirt" {
+            broken += 1
+        }
+        if p.x == 0 and p.y == -61 and p.z == 0 {
+            seen_grass = true
+        }
+    }
+    check(seen_grass, "the grass under the explosion wasn't reached")
+    check(broken > 0, "no grass or dirt was reached")
+    let count = places.len()
+
+    blow_blocks(f, mut level, e, mut places)
+    check(places.len() == count, "breaking the blocks changed the places")
+    for p in places {
+        check(name_at(f, level, p.x, p.y, p.z) == "minecraft:air", "{p.x}, {p.y}, {p.z} wasn't broken")
+    }
+    var dirt = 0
+    var stacks = 0
+    for d in level.take_dropped() {
+        let Dropped.Item(_, _, _, stack) = d.copy() else panic("an explosion dropped an orb")
+        let n = count_of(some(stack.copy()))
+        check(n >= 1 and n <= 16, "a stack of {n}")
+        check(stack.to_snbt().contains("minecraft:dirt"), "it dropped {stack.to_snbt()}")
+        dirt += n
+        stacks += 1
+    }
+    check(dirt == broken, "{broken} grass and dirt dropped {dirt} dirt")
+    check(stacks == (broken + 15) / 16, "{broken} dirt came in {stacks} stacks, not filled to 16")
+    for line in level.take_lines() {
+        panic("unimplemented: {line.message}")
+    }
+    // Each stack popped draws three doubles, after the shuffle.
+    var want = LegacyRandom.new(0)
+    for _ in 0..1352 {
+        _ = want.next_float()
+    }
+    var i = count
+    while i > 1 {
+        _ = want.next_int_below(i32.wrap(i))
+        i -= 1
+    }
+    for _ in 0..stacks * 3 {
+        _ = want.next_double()
+    }
+    check(level.next_long() == want.next_long(), "the explosion drew other than its rays, its shuffle and its pops")
+}
+
+// Fire: a draw of `nextInt(3)` for each place, in order, and fire only on air over what's solid to
+// render, the grass, not in the air above air; each fire set draws its tick's delay.
+fn fires(f: Facts, r: Registries) {
+    var level = flat_level(f, r)
+    var places = List<BlockPos>()
+    for x in -3..4 {
+        for z in -3..4 {
+            places.push(BlockPos { x: x, y: -60, z: z })
+            places.push(BlockPos { x: x, y: -58, z: z })
+        }
+    }
+    set_fires(f, mut level, places)
+    var want = LegacyRandom.new(0)
+    var lit = 0
+    for p in places {
+        let drawn = want.next_int_below(3)
+        let name = name_at(f, level, p.x, p.y, p.z)
+        if drawn == 0 and p.y == -60 {
+            check(name == "minecraft:fire", "{p.x}, {p.y}, {p.z} drew 0 over grass and is {name}")
+            // Its tick scheduled as it's placed, `getFireTickDelay`.
+            _ = want.next_int_below(10)
+            lit += 1
+        } else {
+            check(name == "minecraft:air", "{p.x}, {p.y}, {p.z} is {name}")
+        }
+    }
+    check(lit > 0, "nothing was lit")
+    check(level.next_long() == want.next_long(), "fire drew other than a third for each place")
+}
+
+// How much of a box the explosion sees: all of one in the open, none of one under the ground, and
+// part of one with grass between some of its points and the middle.
+fn sight(f: Facts, r: Registries) {
+    let level = flat_level(f, r)
+    let m = MovementStates.new(f)
+    let mover = Mover { y: -60.0, fall: 0.0 }
+    let open = Aabb { min_x: 2.2, min_y: -60.0, min_z: 0.2, max_x: 2.8, max_y: -58.2, max_z: 0.8 }
+    check(seen_percent(f, m, level, mover, (0.5, -59.5, 0.5), open) == 1.0f32, "a box in the open isn't seen whole")
+    let buried = Aabb { min_x: 2.2, min_y: -63.5, min_z: 0.2, max_x: 2.8, max_y: -62.5, max_z: 0.8 }
+    check(seen_percent(f, m, level, mover, (0.5, -59.5, 0.5), buried) == 0.0f32, "a box under the ground is seen")
+    let half = Aabb { min_x: 2.2, min_y: -61.0, min_z: 0.2, max_x: 2.8, max_y: -59.2, max_z: 0.8 }
+    let seen = seen_percent(f, m, level, mover, (0.5, -59.5, 0.5), half)
+    check(seen > 0.0f32 and seen < 1.0f32, "a box half in the ground is seen {seen}")
+}
+
+// What it hurts and how hard it pushes: 57 at its middle for radius 4, seen whole, 1 at the edge
+// of its reach; out of reach past twice its radius; and the push along the way to the eyes.
+fn hurt() {
+    let e = Explosion { x: 0.5, y: 64.0, z: 0.5, radius: 4.0f32, calculator: Calculator.Plain }
+    check(damage_amount(e, 0.0, 1.0f32) == 57.0f32, "point blank isn't 57")
+    check(damage_amount(e, 64.0, 1.0f32) == 1.0f32, "the edge isn't 1")
+    check(damage_amount(e, 16.0, 0.5f32) == 9.75f32, "halfway, half seen, isn't 9.75")
+    check(reach_part(e, 64.0) == 1.0 and reach_part(e, 65.0) > 1.0, "the reach isn't twice the radius")
+    let (dx, dy, dz) = direction(e, (3.5, 68.0, 0.5))
+    check(dx == 0.6 and dy == 0.8 and dz == 0.0, "the way to the eyes is {dx}, {dy}, {dz}")
+    let (nx, ny, nz) = direction(e, (0.5, 64.0, 0.5))
+    check(nx == 0.0 and ny == 0.0 and nz == 0.0, "the way from the middle isn't none")
+    check(knockback_power(0.5, 1.0f32, 1.0f32, 0.0) == 0.5, "half the reach pushes 0.5")
+    check(knockback_power(0.5, 1.0f32, 1.0f32, 1.0) == 0.0, "full resistance pushes")
+    let wind = Explosion { x: 0.5, y: 64.0, z: 0.5, radius: 1.2f32, interaction: Interaction.Trigger, calculator: Calculator.Simple(true, false, some(1.22f32), none), wind_charge: true }
+    check(wind.small() and not wind.affects_blocklike() and wind.triggers(), "a wind charge's explosion")
+    let breeze = Explosion { x: 0.5, y: 64.0, z: 0.5, radius: 3.0f32, interaction: Interaction.Trigger, calculator: Calculator.Plain, breeze_charge: true, mob_griefing: false }
+    check(not breeze.triggers() and not breeze.small(), "a breeze's with mob griefing off")
+    let tnt = Explosion { x: 0.5, y: 64.0, z: 0.5, radius: 4.0f32, interaction: Interaction.DestroyWithDecay, calculator: Calculator.Plain, mob_griefing: false }
+    check(not tnt.small() and tnt.affects_blocklike() and not tnt.triggers(), "TNT's")
+}
+
+fn main() {
+    let loaded = load_vanilla()!
+    let r = loaded.registries.copy()
+    let blocks = r.find_builtin(String("block")) ?? panic("no blocks")
+    let fluids = r.find_builtin(String("fluid")) ?? panic("no fluids")
+    let f = match Facts.new(r.builtin[blocks].copy(), r.builtin[fluids].copy(), BlockStates.new([1], [1], 1)) {
+        ok(made) => made,
+        err(e) => panic("the block facts: {e}"),
+    }
+    in_water(f, r)
+    over_grass(f, r)
+    fires(f, r)
+    sight(f, r)
+    hurt()
+    println("ok")
+}

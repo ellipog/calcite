@@ -1,0 +1,483 @@
+/// Explosions, as vanilla's `ServerExplosion` makes them (CAL-182).
+///
+/// Its rays, 1,352 of them, one through each place on the faces of a cube 16 across, each with a
+/// power drawn from the level's random, step 0.3 blocks at a time out from its middle, worn down
+/// by each block they pass, its explosion resistance or its fluid's, whichever's more, and by
+/// each step; every block one reaches with power left goes in a Java `HashSet`, in whose order
+/// they're then taken, `calculateExplodedPositions`. Where it acts on blocks, they're shuffled by
+/// the level's random and broken one at a time, `onExplosionHit`, what they drop collected and
+/// merged to stacks of 16 at most, and popped once all are broken, `interactWithBlocks`. Where it
+/// makes fire, each of them that a draw of a third picks, air over a block solid to render, is
+/// set alight, `createFire`. What it does to entities, `hurtEntities`, is its level's to do: this
+/// has how much of an entity it sees, `getSeenPercent`, how much that hurts and how hard it pushes.
+module world.explosion
+
+import math.mth.{floor}
+import nbt.tag.{Tag}
+import random.source.{RandomSource, shuffle}
+import world.block_facts.{explosion_resistances}
+import world.block_level.{BlockLevel}
+import world.block_updates.{fire_state}
+import world.clip.{clip_collider}
+import world.collision.{Aabb, CollisionBlocks}
+import world.drops.{DropLevel, explosion_drops, pop_resource, spawn_after_break}
+import world.level_writer.{UPDATE_LIMIT}
+import world.menu.{count_of, same_components, with_count}
+import world.movement.{MovementStates, Mover}
+import world.pos.{BlockPos}
+import worldgen.access.{BlockAccess}
+import worldgen.facts.{EMPTY_FLUID, Facts}
+
+/// What an explosion does to the blocks it reaches, `Explosion.BlockInteraction`, as
+/// `Level.ExplosionInteraction` and the game rules make it: nothing, breaks them, breaks them
+/// with their drops decaying, or triggers them, as a wind charge's does.
+pub enum Interaction {
+    Keep
+    Destroy
+    DestroyWithDecay
+    Trigger
+}
+
+/// What's behind an explosion, `Level.ExplosionInteraction`, which with the game rules says what
+/// it does to blocks: nothing, a block's, a mob's, TNT's, or a trigger's.
+pub enum Cause {
+    Nothing
+    Block
+    Mob
+    Tnt
+    Trigger
+}
+
+/// The game rules explosions read: whether what blocks, mobs and TNT blow up drops decaying,
+/// `block_explosion_drop_decay`, `mob_explosion_drop_decay` and `tnt_explosion_drop_decay`, and
+/// whether TNT can be lit, `tnt_explodes`.
+pub struct ExplosionRules {
+    pub block_decay: bool = true
+    pub mob_decay: bool = true
+    pub tnt_decay: bool = false
+    pub tnt_explodes: bool = true
+}
+
+impl ExplosionRules {
+    /// What an explosion `cause` makes does to blocks, as `ServerLevel.explode` has it: a mob's
+    /// only with `mob_griefing`.
+    pub fn interaction(self, cause: Cause, mob_griefing: bool) -> Interaction {
+        return match cause {
+            Cause.Nothing => Interaction.Keep,
+            Cause.Block => destroy(self.block_decay),
+            Cause.Mob => if mob_griefing { destroy(self.mob_decay) } else { Interaction.Keep },
+            Cause.Tnt => destroy(self.tnt_decay),
+            Cause.Trigger => Interaction.Trigger,
+        }
+    }
+}
+
+// `getDestroyType`: blocks broken, their drops decaying where `decay`.
+fn destroy(decay: bool) -> Interaction {
+    return if decay { Interaction.DestroyWithDecay } else { Interaction.Destroy }
+}
+
+/// What wears an explosion's rays down and which blocks they blow, `ExplosionDamageCalculator`
+/// and those that change it.
+pub enum Calculator {
+    /// Its own, and `EntityBasedExplosionDamageCalculator`, which asks the entity the explosion
+    /// came from, whose answers are its own but for wither skulls and TNT minecarts.
+    Plain
+    /// A respawn anchor's in water, `RespawnAnchorBlock.explode`: water's resistance at the
+    /// anchor's place, whatever's there.
+    Anchor(BlockPos)
+    /// `PrimedTnt.USED_PORTAL_DAMAGE_CALCULATOR`, a TNT's that went through a portal: the block
+    /// given, nether portals, neither wears its rays down nor is blown.
+    Portal(u32)
+    /// `SimpleExplosionDamageCalculator`, a wind charge's and the `explode` enchantment effect's:
+    /// whether it blows blocks, whether it hurts entities, how hard it pushes them where not as
+    /// hard as it would, and the blocks it can't blow, where it has them, which stand as hard as
+    /// bedrock, and nothing else wears its rays down.
+    Simple(bool, bool, f32?, List<u32>?)
+}
+
+/// An explosion: its middle, its radius, whether it makes fire, what it does to blocks and what
+/// decides that; the entity it came from, `source`, by ID, none for none, and whether that's a
+/// wind charge, `WIND_CHARGE`, or a breeze's, `BREEZE_WIND_CHARGE`; whether who's behind it,
+/// `getIndirectSourceEntity`, is a player, which has the blocks it breaks drop their experience;
+/// and the game rule `mob_griefing`.
+pub struct Explosion {
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    pub radius: f32
+    pub fire: bool = false
+    pub interaction: Interaction = Interaction.Destroy
+    pub calculator: Calculator
+    pub source: i32? = none
+    pub wind_charge: bool = false
+    pub breeze_charge: bool = false
+    pub by_player: bool = false
+    pub mob_griefing: bool = true
+}
+
+impl Explosion {
+    /// `interactsWithBlocks`: whether it does anything to blocks.
+    pub fn interacts(self) -> bool {
+        return self.interaction != Interaction.Keep
+    }
+
+    /// `canTriggerBlocks`: whether it triggers them, as a wind charge's opens doors, a breeze's
+    /// only with `mob_griefing`.
+    pub fn triggers(self) -> bool {
+        if self.interaction != Interaction.Trigger {
+            return false
+        }
+        return if self.breeze_charge { self.mob_griefing } else { true }
+    }
+
+    /// `shouldAffectBlocklikeEntities`: whether it touches items, armor stands and what hangs on
+    /// blocks: never a wind charge's; else with `mob_griefing`, or where it breaks blocks.
+    pub fn affects_blocklike(self) -> bool {
+        let not_wind = not self.wind_charge and not self.breeze_charge
+        if self.mob_griefing {
+            return not_wind
+        }
+        let breaks = self.interaction == Interaction.Destroy or self.interaction == Interaction.DestroyWithDecay
+        return breaks and not_wind
+    }
+
+    /// `isSmall`: under a radius of 2, or doing nothing to blocks, which has it shown with its
+    /// small particle.
+    pub fn small(self) -> bool {
+        return self.radius < 2.0f32 or not self.interacts()
+    }
+
+    /// The radius doubled, `radius * 2.0F`, how far its hurt reaches.
+    pub fn reach(self) -> f32 {
+        return self.radius * 2.0f32
+    }
+}
+
+// How far a ray steps, `xd * 0.3F`, the float 0.3 widened.
+fn step() -> f64 {
+    return f64(0.3f32)
+}
+
+/// `calculateExplodedPositions`: the places the explosion `e`'s rays reach with power left, in
+/// the order its `HashSet` gives them, each ray's power drawn from the level's random, 1,352
+/// floats in all. A ray stops at the world's edge, below its bottom or above its top, or 30
+/// million blocks out.
+pub fn blown_places<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, level: mut L, e: Explosion) -> List<BlockPos> {
+    let resistances = explosion_resistances()
+    let air = f.ids.air_state
+    var blown = JavaHashSet<BlockPos>()
+    for xx in 0..16 {
+        for yy in 0..16 {
+            for zz in 0..16 {
+                if xx != 0 and xx != 15 and yy != 0 and yy != 15 and zz != 0 and zz != 15 {
+                    continue
+                }
+                var xd = f64(f32.nearest(xx) / 15.0f32 * 2.0f32 - 1.0f32)
+                var yd = f64(f32.nearest(yy) / 15.0f32 * 2.0f32 - 1.0f32)
+                var zd = f64(f32.nearest(zz) / 15.0f32 * 2.0f32 - 1.0f32)
+                let d = (xd * xd + yd * yd + zd * zd).sqrt()
+                xd /= d
+                yd /= d
+                zd /= d
+                var power = e.radius * (0.7f32 + level.next_float() * 0.6f32)
+                var xp = e.x
+                var yp = e.y
+                var zp = e.z
+                while power > 0.0f32 {
+                    let x = floor(xp)
+                    let y = floor(yp)
+                    let z = floor(zp)
+                    if not level.in_height(y) or x < -30000000 or z < -30000000 or x >= 30000000 or z >= 30000000 {
+                        break
+                    }
+                    let state = state_at(f, mut level, x, y, z, air)
+                    if let r = resistance(f, resistances, e.calculator, x, y, z, state) {
+                        power -= (r + 0.3f32) * 0.3f32
+                    }
+                    if power > 0.0f32 and blows(f, e.calculator, state) {
+                        blown.insert(BlockPos { x: x, y: y, z: z })
+                    }
+                    xp += xd * step()
+                    yp += yd * step()
+                    zp += zd * step()
+                    power -= 0.22500001f32
+                }
+            }
+        }
+    }
+    var out = List<BlockPos>()
+    for p in blown {
+        out.push(p)
+    }
+    return out
+}
+
+// The state at x, y, z, `air` where it can't be read, which is said.
+fn state_at<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, x: i32, y: i32, z: i32, air: u32) -> u32 {
+    return match level.state(f, x, y, z) {
+        ok(s) => s,
+        err(thrown) => {
+            level.unimplemented(thrown.message)
+            air
+        },
+    }
+}
+
+/// `getBlockExplosionResistance` of the block `state` at x, y, z, as `calculator` has it: none
+/// for air with no fluid in it, else the block's resistance, `resistances` by block ID, or its
+/// fluid's, water's and lava's 100, whichever's more.
+pub fn resistance(f: Facts, resistances: List<f32>, calculator: Calculator, x: i32, y: i32, z: i32, state: u32) -> f32? {
+    match calculator {
+        Calculator.Anchor(at) => {
+            if at.x == x and at.y == y and at.z == z {
+                return some(100.0f32)
+            }
+        },
+        Calculator.Portal(portal) => {
+            if f.block(state) == portal {
+                return none
+            }
+        },
+        Calculator.Simple(_, _, _, immune) => {
+            if let blocks = immune {
+                return if blocks.contains(f.block(state)) { some(3600000.0f32) } else { none }
+            }
+        },
+        Calculator.Plain => {},
+    }
+    let fluid = f.fluid(state)
+    if f.is_air(state) and fluid == EMPTY_FLUID {
+        return none
+    }
+    let block = resistances[usize(f.block(state))]
+    let liquid = if fluid == EMPTY_FLUID { 0.0f32 } else { 100.0f32 }
+    return some(if block >= liquid { block } else { liquid })
+}
+
+// `shouldBlockExplode` of the block `state`, as `calculator` has it.
+fn blows(f: Facts, calculator: Calculator, state: u32) -> bool {
+    return match calculator {
+        Calculator.Portal(portal) => f.block(state) != portal,
+        Calculator.Simple(explodes, _, _, _) => explodes,
+        _ => true,
+    }
+}
+
+/// A stack the blocks an explosion broke dropped, and the place it pops at, that of the first of
+/// them that dropped it, `StackCollector`.
+struct Collected {
+    x: i32
+    y: i32
+    z: i32
+    stack: Tag?
+}
+
+/// `interactWithBlocks`: the places `places` shuffled by the level's random, then each block
+/// there hit, `onExplosionHit`, in their new order, and what they dropped popped, a stack at a
+/// time, at the place of the first that dropped it. The places are left in their new order, which
+/// `set_fires` goes through.
+pub fn blow_blocks<L: BlockAccess + BlockLevel + DropLevel + RandomSource>(f: Facts, level: mut L, e: Explosion, places: mut List<BlockPos>) {
+    shuffle(mut places, mut level)
+    var stacks = List<Collected>()
+    for p in places {
+        hit_block(f, mut level, e, p, mut stacks)
+    }
+    for c in stacks {
+        pop_resource(mut level, c.x, c.y, c.z, c.stack.copy())
+    }
+}
+
+// `onExplosionHit` of the block at `p`: but where it's air, or the explosion only triggers
+// blocks, its experience where a player's behind the explosion, `spawnAfterBreak`, and what it
+// drops collected, `getDrops`, but TNT's, which drops nothing, `dropFromExplosion`; then it's
+// air, `setBlockAndUpdate`; then TNT's primed, `wasExploded`. What a trigger does, what a
+// creaking heart does with its creaking, and what's to come of TNT are said to be missing; a
+// beehive's bees would be angered, `angerNearbyBees`, but Calcite has no bees.
+fn hit_block<L: BlockAccess + BlockLevel + DropLevel + RandomSource>(f: Facts, level: mut L, e: Explosion, p: BlockPos, stacks: mut List<Collected>) {
+    let air = f.ids.air_state
+    let state = state_at(f, mut level, p.x, p.y, p.z, air)
+    let block = f.block(state)
+    if e.triggers() and triggered(f, block) {
+        level.unimplemented(String("A block a wind charge triggers, `onExplosionHit`"))
+    }
+    if f.is_a(block, "CreakingHeartBlock") and e.affects_blocklike() {
+        level.unimplemented(String("A creaking heart's creaking an explosion takes, `removeProtector`"))
+    }
+    if f.is_air(state) or e.interaction == Interaction.Trigger {
+        return
+    }
+    let tnt = f.is_a(block, "TntBlock")
+    if not tnt {
+        let be = if f.has_block_entity(state) { level.block_entity_tag(p.x, p.y, p.z) } else { none }
+        spawn_after_break(f, mut level, state, p.x, p.y, p.z, none, e.by_player)
+        let radius = if e.interaction == Interaction.DestroyWithDecay { some(e.radius) } else { none }
+        for s in explosion_drops(f, mut level, state, p.x, p.y, p.z, be, e.source != none, radius) {
+            collect(level, mut stacks, s.copy(), p)
+        }
+    }
+    _ = level.set_block_limited(p.x, p.y, p.z, air, 3, UPDATE_LIMIT)
+    if tnt {
+        level.unimplemented(String("TNT an explosion primes, `TntBlock.wasExploded`"))
+    }
+}
+
+// Whether the block's one whose `onExplosionHit` does something where an explosion triggers
+// blocks: a candle, a bell, a button, a door, a fence gate, a lever or a trapdoor.
+fn triggered(f: Facts, block: u32) -> bool {
+    let kinds: List<str> = ["AbstractCandleBlock", "BellBlock", "ButtonBlock", "DoorBlock", "FenceGateBlock", "LeverBlock", "TrapDoorBlock"]
+    for k in kinds {
+        if f.is_a(block, k) {
+            return true
+        }
+    }
+    return false
+}
+
+// `addOrAppendStack`: as much of `stack` as each stack collected takes, in their order, `tryMerge`,
+// till there's none left; what's left, collected at `p`.
+fn collect<L: DropLevel>(level: L, stacks: mut List<Collected>, stack: own Tag?, p: BlockPos) {
+    var input = stack
+    for i in 0..stacks.len() {
+        let (merged, left) = try_merge(level, stacks[i].stack.copy(), input.copy())
+        stacks[i].stack = merged
+        input = left
+        if count_of(input) <= 0 {
+            return
+        }
+    }
+    stacks.push(Collected { x: p.x, y: p.y, z: p.z, stack: input })
+}
+
+// `StackCollector.tryMerge` of `input` into `to`: where they're mergable, `ItemEntity.areMergable`,
+// `ItemEntity.merge(to, input, 16)`. `to` and `input` after.
+fn try_merge<L: DropLevel>(level: L, to: own Tag?, input: own Tag?) -> (Tag?, Tag?) {
+    let shared = level.world_loot() else return (to, input)
+    let into = to.copy() else return (to, input)
+    let from = input.copy() else return (to, input)
+    let had = count_of(to)
+    let coming = count_of(input)
+    if coming + had > shared.value.items.max_stack_size(from) {
+        return (to, input)
+    }
+    if not same_components(to, input) {
+        return (to, input)
+    }
+    let most = shared.value.items.max_stack_size(into)
+    let room = (if most < 16 { most } else { 16 }) - had
+    let delta = if room < coming { room } else { coming }
+    return (with_count(into, had + delta), with_count(from, coming - delta))
+}
+
+/// `createFire`: for each of `places`, in their order, a draw of `nextInt(3)`; where it's 0 and
+/// the place is air over a block solid to render, fire, as `BaseFireBlock.getState` has it
+/// there, `setBlockAndUpdate`.
+pub fn set_fires<L: BlockAccess + BlockLevel + RandomSource>(f: Facts, level: mut L, places: List<BlockPos>) {
+    let air = f.ids.air_state
+    for p in places {
+        if level.next_int_below(3) != 0 {
+            continue
+        }
+        if not f.is_air(state_at(f, mut level, p.x, p.y, p.z, air)) {
+            continue
+        }
+        if not f.solid_render(state_at(f, mut level, p.x, p.y - 1, p.z, air)) {
+            continue
+        }
+        match fire_state(f, level, p.x, p.y, p.z) {
+            ok(fire) => {
+                _ = level.set_block_limited(p.x, p.y, p.z, fire, 3, UPDATE_LIMIT)
+            },
+            err(thrown) => level.unimplemented(thrown.message),
+        }
+    }
+}
+
+/// `getSeenPercent`: of the points spread over the box `bb`, how many see the explosion's middle
+/// `center`, the line from each to it meeting no block's collision shape as `mover` sees them,
+/// `clip` with `ClipContext.Block.COLLIDER` and `Fluid.NONE`; 0 for a box with a side less than
+/// nothing.
+pub fn seen_percent<B: CollisionBlocks>(f: Facts, m: MovementStates, blocks: B, mover: Mover, center: (f64, f64, f64), bb: Aabb) -> f32 {
+    let xs = 1.0 / ((bb.max_x - bb.min_x) * 2.0 + 1.0)
+    let ys = 1.0 / ((bb.max_y - bb.min_y) * 2.0 + 1.0)
+    let zs = 1.0 / ((bb.max_z - bb.min_z) * 2.0 + 1.0)
+    let x_offset = (1.0 - (1.0 / xs).floor() * xs) / 2.0
+    let z_offset = (1.0 - (1.0 / zs).floor() * zs) / 2.0
+    if xs < 0.0 or ys < 0.0 or zs < 0.0 {
+        return 0.0f32
+    }
+    var hits = 0
+    var count = 0
+    var xx = 0.0
+    while xx <= 1.0 {
+        var yy = 0.0
+        while yy <= 1.0 {
+            var zz = 0.0
+            while zz <= 1.0 {
+                let x = bb.min_x + xx * (bb.max_x - bb.min_x)
+                let y = bb.min_y + yy * (bb.max_y - bb.min_y)
+                let z = bb.min_z + zz * (bb.max_z - bb.min_z)
+                if clip_collider(f, m, blocks, mover, (x + x_offset, y, z + z_offset), center).missed {
+                    hits += 1
+                }
+                count += 1
+                zz += zs
+            }
+            yy += ys
+        }
+        xx += xs
+    }
+    return f32.nearest(hits) / f32.nearest(count)
+}
+
+/// How far an entity at `dist_sqr` from the explosion's middle, squared, is, in its reach,
+/// `sqrt(distanceToSqr(center)) / doubleRadius`: past 1 it's out of reach.
+pub fn reach_part(e: Explosion, dist_sqr: f64) -> f64 {
+    return dist_sqr.sqrt() / f64(e.reach())
+}
+
+/// `ExplosionDamageCalculator.getEntityDamageAmount`: what the explosion hurts an entity
+/// `dist_sqr` from its middle, squared, that sees `exposure` of it.
+pub fn damage_amount(e: Explosion, dist_sqr: f64, exposure: f32) -> f32 {
+    let reach = e.reach()
+    let dist = dist_sqr.sqrt() / f64(reach)
+    let pow = (1.0 - dist) * f64(exposure)
+    return f32.nearest((pow * pow + pow) / 2.0 * 7.0 * f64(reach) + 1.0)
+}
+
+/// `shouldDamageEntity`: whether the explosion hurts the entities it reaches, which all but a
+/// simple calculator's that doesn't do.
+pub fn damages(e: Explosion) -> bool {
+    return match e.calculator {
+        Calculator.Simple(_, hurts, _, _) => hurts,
+        _ => true,
+    }
+}
+
+/// `getKnockbackMultiplier` of an entity, `creative_flying` where it's a player flying: 1, but a
+/// simple calculator's own where it has one, and none for a player flying.
+pub fn knockback_multiplier(e: Explosion, creative_flying: bool) -> f32 {
+    return match e.calculator {
+        Calculator.Simple(_, _, knockback, _) => if creative_flying { 0.0f32 } else { knockback ?? 1.0f32 },
+        _ => 1.0f32,
+    }
+}
+
+/// The way from the explosion's middle to `origin`, an entity's eyes, or a primed TNT's feet,
+/// made a unit long, `normalize`, none where it's nearer than 1.0E-5F.
+pub fn direction(e: Explosion, origin: (f64, f64, f64)) -> (f64, f64, f64) {
+    let (ox, oy, oz) = origin
+    let (dx, dy, dz) = (ox - e.x, oy - e.y, oz - e.z)
+    let len = (dx * dx + dy * dy + dz * dz).sqrt()
+    if len < f64(1.0e-5f32) {
+        return (0.0, 0.0, 0.0)
+    }
+    return (dx / len, dy / len, dz / len)
+}
+
+/// How hard the explosion pushes an entity `dist` of its reach out, `reach_part`, that sees
+/// `exposure` of it, with `multiplier` and its explosion knockback resistance `resistance`:
+/// `(1 - dist) * exposure * multiplier * (1 - resisted)`.
+pub fn knockback_power(dist: f64, exposure: f32, multiplier: f32, resisted: f64) -> f64 {
+    return (1.0 - dist) * f64(exposure) * f64(multiplier) * (1.0 - resisted)
+}
