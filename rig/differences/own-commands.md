@@ -7,6 +7,7 @@ cases:
   - session:end/*/commands
   - session:crystals/*/commands
   - session:tnt/*/commands
+  - session:blasts/*/commands
   - session:gateways/*/commands
   - session:eyes/*/commands
   - session:throws/*/commands
@@ -33,4 +34,4 @@ cases:
 
 **Why:** a client only offers and checks the commands it's sent, so Calcite's own commands have to be in the tree for players who may use them. Players below level 2 get vanilla's packet exactly, as the `talk` session shows.
 
-The `select`, `mites`, `end`, `crystals`, `tnt`, `gateways`, `eyes` and `throws` sessions' bot is an operator, so its commands packet at the join shows this.
+The `select`, `mites`, `end`, `crystals`, `tnt`, `blasts`, `gateways`, `eyes` and `throws` sessions' bot is an operator, so its commands packet at the join shows this.
