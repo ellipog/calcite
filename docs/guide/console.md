@@ -44,7 +44,7 @@ The console takes what a vanilla console does, between ticks, so a hosting panel
 | `stop` | Tells each player the server closed, saves, and stops |
 | `gamemode <mode> [<player>]` | As vanilla's; `gmc`, `gms`, `gma` and `gmsp` are short for it |
 | `pregen ...` | Generates an area ahead of time ([Pregenerating chunks](../pregen.md)) |
-| `calcite flyspeed [<speed>]` | A player's flying speed as a multiple of vanilla's, up to 1,000, for testing |
+| `calcite flyspeed [<speed>]` | A player's flying speed as a multiple of vanilla's, up to 1,000, for testing. While they fly, how far a move may go before it's too quick grows with it, so a fast flight isn't sent back |
 | `calcite dimension <dimension> [<player>]` | Takes a player to another dimension, for testing |
 
 The rest of vanilla's come in Phase 6. Anything else gets vanilla's answer to a command it doesn't know.
