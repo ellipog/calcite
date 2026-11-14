@@ -323,6 +323,9 @@ final class BlockFlags {
         // copies them from its block's properties too; that's checked.
         StringBuilder destroySpeeds = new StringBuilder();
         StringBuilder needsTool = new StringBuilder();
+        // Each block's explosion resistance, `Block.getExplosionResistance`, which an explosion's
+        // rays are worn down by (CAL-182); a block's own, not its states'.
+        StringBuilder explosionResistances = new StringBuilder();
         // The sounds a block that a signal opens or presses plays, on and off (CAL-124): a door's,
         // a trapdoor's and a button's and a pressure plate's from its `BlockSetType`, a fence gate's
         // from its `WoodType`, each by the sound event's name.
@@ -398,6 +401,7 @@ final class BlockFlags {
                 }
             }
             destroySpeeds.append(id == 0 ? "" : ", ").append(speed);
+            explosionResistances.append(id == 0 ? "" : ", ").append(block.getExplosionResistance());
             if (tool) {
                 needsTool.append(needsTool.isEmpty() ? "" : ", ").append(id);
             }
@@ -602,6 +606,7 @@ final class BlockFlags {
         json.append("  \"push_reactions\": [").append(pushReactions).append("],\n");
         json.append("  \"unbreakable_blocks\": [").append(unbreakable).append("],\n");
         json.append("  \"destroy_speeds\": [").append(destroySpeeds).append("],\n");
+        json.append("  \"explosion_resistances\": [").append(explosionResistances).append("],\n");
         json.append("  \"needs_tool_blocks\": [").append(needsTool).append("],\n");
         json.append("  \"toggle_sounds\": [").append(toggles).append("],\n");
         json.append("  \"button_ticks\": [").append(buttonTicks).append("],\n");
