@@ -1,0 +1,1482 @@
+module rig.runner.sessions
+
+// The protocol suites (P4.8, CAL-42): the rig's protocol bot runs the same scenarios against
+// vanilla 26.3 and against Calcite, and the two sessions are compared packet by packet.
+//
+//     calx rig/runner/sessions.calx [--config NAME] [--scenario NAME] [--compare-only] [--show N]
+//                                   [--tape] [--trace]
+//
+// For each configuration (rig/runner/session_configs.calx), a set of server.properties, this
+// starts vanilla in a fresh folder under build/rig/sessions/, sets what vanilla draws at random to
+// fixed values from its console, waits for it to pause, empty, so the bot joins at the same game
+// time on both (D315), runs src/rig/session.calx once for each scenario, and stops it; then the
+// same for Calcite's release build. Vanilla runs from the jar's own classes, which
+// oracle/adapter.calx unpacks, with Mojang's EULA accepted in its scratch folder only. The
+// vanilla adapter's SessionDump reads both servers' packets with vanilla's codecs, and the
+// comparison lines them up a step at a time (rig/runner/sessiondiff.calx; rig/README.md,
+// "Protocol suites"). It exits with 1 if the login, configuration or status suite has a
+// difference no file in rig/differences/ explains, or what both saved differs.
+//
+// --compare-only reads and compares what the last run recorded, without starting either server.
+// --tape has the rig's agent write each draw of vanilla's levels' randoms to tape.txt in its
+// folder, and Calcite write its own there with --rng-tape, and lines the two up level by level
+// (rig/runner/tapediff.calx, D312). Both seed their levels' randoms again at RESEED, once the
+// player's chunks are in, so the tapes line up from there whatever each drew while they loaded
+// (D316). --trace has each write its living entities' states to entities.txt in its folder, as
+// each of their ticks is done, a line each: vanilla's by the rig's agent and Calcite's with
+// --entity-trace, to line a mob's moves up far finer than its packets show them
+// (rig/runner/traces.calx, CAL-159). It was sessions.py (CAL-253).
+
+import std.cli.{cli}
+import std.fs.{Kind, copy, exists, glob, is_dir, is_file, list, make_dir_all, read, read_text, remove_dir_all, walk}
+import std.json
+import std.json.{Json}
+import std.nbt.{NbtFile, Tag}
+import std.path
+import std.process.{Command, exit}
+import std.text.python.{repr_str}
+import std.time.{Instant}
+import rig.runner.fixtures
+import rig.runner.roundtrip
+import rig.runner.savediff
+import rig.runner.session_configs.{Config, PLAIN_WORLD, SCENARIOS, configs}
+import rig.runner.sessiondiff
+import rig.runner.servers.{BOT, DATA_VERSION, MATE, PAUSE, RESEED, Server, adapter, adapter_argv, adapter_cwd, base_props, build, free_port, merged, offline_uuid, players_json, properties, put, sessions_dir, set, vanilla_argv}
+import rig.runner.tapediff
+import tools.pyjson
+import tools.pynbt.{cut, elements, py_str_or_none, same_or_none}
+import tools.repo.{die, native, under}
+
+/// How long a scenario's bot may run, in seconds, by the wall clock: `select` runs near nine
+/// minutes of steps (D559, D565, D566, D574, D577).
+const BOT_SECONDS: i64 = 660
+
+/// Scenarios only the configurations that name them run: `watch`, where the bot joins and stays
+/// put a fixed number of game ticks, for a world that never goes quiet; `watch-late`, the same but
+/// never saying its client's loaded, so both servers take it as loaded 60 ticks on (D431); and the
+/// rest, each what it does in src/rig/session.calx, where each has its comment. sessions.py left
+/// out `crafts`, so `--scenario crafts` was refused.
+pub fn other_scenarios() -> List<String> {
+    var out: List<String> = []
+    for s in ["watch", "watch-late", "creative", "clicks", "crafts", "dig", "dig-creative", "place", "place-creative", "use", "use-items",
+        "use-books", "use-containers", "items", "items-saved", "orbs", "feed", "attack", "sweep", "enchant", "protect", "fall",
+        "checks", "stand-hits", "thorns", "mace", "swim", "duel", "zombie", "arrows", "skeleton",
+        "spider", "creeper", "enderman", "ender", "armadillo", "brush", "villager", "villagers", "compost", "asleep",
+        "breed", "hearsay", "bell", "bane", "tipped", "dosed", "lifted", "undying", "eaten", "beacons", "beacon-menu",
+        "traders", "frost", "soul", "splash", "linger", "talk", "select", "mites", "end", "crystals",
+        "gateways", "eyes", "throws", "locate", "compass", "bossbars", "dragon", "dragon-flight",
+        "dragon-charge", "dragon-breath", "dragon-fireball", "dragon-strafe", "dragon-death",
+        "forceload", "fight", "fight-kill"] {
+        out.push(String(s))
+    }
+    return out
+}
+
+/// The scenario a second player's packets are recorded as, by the scenario the bot runs it in
+/// (CAL-162, CAL-165).
+pub fn mate_scenario(scenario: String) -> String? {
+    for (s, m) in [("duel", "duel-mate"), ("talk", "talk-mate"), ("select", "select-mate"), ("bossbars", "bossbars-mate")] {
+        if scenario == s {
+            return some(String(m))
+        }
+    }
+    return none
+}
+
+/// What the bot's saved data is compared by, after a configuration that gives it some: what's in
+/// its inventory and on it, the slot it holds and its game mode (CAL-135), and its attributes,
+/// whose order is that of vanilla's map of them, by their identity hashes, so they're compared
+/// sorted (D375); and its ender chest's items (CAL-144).
+const PLAYER_KEYS: [str; 6] = ["Inventory", "equipment", "SelectedItemSlot", "playerGameType", "attributes", "EnderItems"]
+/// The keys whose lists are compared sorted: the attributes, and the effects too, where a
+/// configuration compares them, which vanilla saves as its map of them by their holders' identity
+/// hashes gives them (D514).
+const SORTED_KEYS: [str; 2] = ["attributes", "active_effects"]
+
+/// The custom stats that count the ticks a player's been in, as `doTick` awards them. A bot joins
+/// by the wall clock, saying its client's loaded once its chunks are in, which starts its hurts in
+/// a wall (D431), and some scenarios leave by it too, so these can be a few ticks apart on the two
+/// servers where all else is the same; they're told, but don't fail the comparison.
+const TIMED_STATS: [str; 5] = ["minecraft:play_time", "minecraft:total_world_time", "minecraft:time_since_death",
+    "minecraft:time_since_rest", "minecraft:sneak_time"]
+
+/// The chunks of a fixture's world whose saves are compared, as savediff compares them: those the
+/// fixtures are built in, around the spawn, from -1, -1 to 0, 0 (CAL-145).
+const FIXTURE_CHUNKS: (i64, i64, i64, i64) = (-1, -1, 0, 0)
+
+// ---- Files ----
+
+fn session(config: String, side: str) -> String {
+    return path.join(path.join(sessions_dir(), config), side)
+}
+
+fn world_of(config: String, side: str) -> String {
+    return path.join(session(config, side), "world")
+}
+
+fn made_dir(dir: String) {
+    match make_dir_all(dir.copy()) {
+        ok => {},
+        err(e) => die("sessions: {dir}: {e}"),
+    }
+}
+
+/// The root of a gzipped, zlib-compressed or plain NBT file.
+fn read_nbt(file: String) -> Tag {
+    return match NbtFile.open(file.copy()) {
+        ok(f) => f.root,
+        err(e) => die("sessions: {file}: {e}"),
+    }
+}
+
+/// Writes `root` as a gzipped NBT file with an empty root name, making its folder.
+fn write_nbt(file: String, root: Tag) {
+    made_dir(path.parent_dir(file.copy()) ?? String("."))
+    match NbtFile.new(root.copy()).save(file.copy()) {
+        ok => {},
+        err(e) => die("sessions: writing {file}: {e}"),
+    }
+}
+
+fn text_of(file: String) -> String {
+    return match read_text(file.copy()) {
+        ok(t) => t ?? String(""),
+        err(e) => die("sessions: {file}: {e}"),
+    }
+}
+
+fn json_of(file: String) -> Json {
+    return match json.parse(text_of(file.copy())) {
+        ok(v) => v,
+        err(e) => die("sessions: {file}: {e}"),
+    }
+}
+
+/// Copies a world into `to`, without the lock, which vanilla held, and the players' data, so
+/// neither server's player starts where the round trip's bot was, and without the entities, each
+/// folder of them, if `entities` is false.
+fn copy_world(from: String, to: String, entities: bool) {
+    let found = match walk(from.copy()) {
+        ok(es) => es,
+        err(e) => die("sessions: {from}: {e}"),
+    }
+    made_dir(to.copy())
+    for e in found {
+        if e.path.len() <= from.len() + 1 {
+            continue
+        }
+        let rel = e.path[from.len() + 1..]
+        let parts = rel.split("/")
+        if parts[0] == "session.lock" or parts[0] == "players" {
+            continue
+        }
+        if not entities and parts.contains(String("entities")) {
+            continue
+        }
+        let dst = path.join(to.copy(), rel.copy())
+        match e.kind {
+            Kind.Dir => made_dir(dst),
+            Kind.File => {
+                match copy(e.path.copy(), dst.copy()) {
+                    ok => {},
+                    err(why) => die("sessions: copying {e.path}: {why}"),
+                }
+            }
+            _ => {},
+        }
+    }
+}
+
+/// A side's folder for `config`, fresh: the world copied and given what the configuration puts
+/// in it, and the server's files.
+pub fn prepare(folder: String, c: Config, port: i64, vanilla: bool) {
+    if exists(folder.copy()) {
+        match remove_dir_all(folder.copy()) {
+            ok => {},
+            err(e) => die("sessions: {folder}: {e}"),
+        }
+    }
+    made_dir(folder.copy())
+    var props = merged(base_props(), c.props.copy())
+    set(mut props, String("view-distance"), "{c.view}")
+    set(mut props, String("simulation-distance"), "{c.view}")
+    set(mut props, String("server-port"), "{port}")
+    let world = path.join(folder.copy(), "world")
+    if let w = c.world {
+        copy_world(under(w.copy()), world.copy(), c.entities)
+        if let spawn = c.spawn {
+            let level_file = path.join(world.copy(), "level.dat")
+            var level = read_nbt(level_file.copy())
+            var data = level.get(String("Data")) ?? Tag.End
+            var at = data.get(String("spawn")) ?? Tag.End
+            _ = at.insert(String("pos"), Tag.IntArray(spawn.copy()))
+            _ = data.insert(String("spawn"), at)
+            _ = level.insert(String("Data"), data)
+            write_nbt(level_file, level)
+        }
+    }
+    if let p = c.player {
+        write_nbt(path.join(world.copy(), "players/data/{offline_uuid(String(BOT))}.dat"), p.copy())
+    }
+    if let m = c.mate {
+        write_nbt(path.join(world.copy(), "players/data/{offline_uuid(String(MATE))}.dat"), m.copy())
+    }
+    for (pack, files) in c.datapacks {
+        for (name, text) in files {
+            let at = path.join(world.copy(), "datapacks/{pack}/{name}")
+            made_dir(path.parent_dir(at.copy()) ?? String("."))
+            put(at, text.copy())
+        }
+    }
+    for (name, saved) in c.saved {
+        write_nbt(path.join(world.copy(), "data/minecraft/{name}.dat"), saved.copy())
+    }
+    for (name, saved) in c.dim_saved {
+        let parts = name.split("/")
+        write_nbt(path.join(world.copy(), "dimensions/{parts[0]}/{parts[1]}/data/minecraft/{parts[2]}.dat"), saved.copy())
+    }
+    let rules = path.join(world.copy(), "data/minecraft/game_rules.dat")
+    if is_file(rules.copy()) {
+        var saved = read_nbt(rules.copy())
+        var data = saved.get(String("data")) ?? Tag.End
+        _ = data.insert(String("minecraft:respawn_radius"), Tag.Int(0))
+        for r in c.rules {
+            _ = data.insert(r.name.copy(), r.value.copy())
+        }
+        _ = saved.insert(String("data"), data)
+        write_nbt(rules, saved)
+    } else if not vanilla {
+        var data = Tag.Compound(LinkedMap<String, Tag>())
+        _ = data.insert(String("minecraft:respawn_radius"), Tag.Int(0))
+        var saved = Tag.Compound(LinkedMap<String, Tag>())
+        _ = saved.insert(String("data"), data)
+        _ = saved.insert(String("DataVersion"), Tag.Int(DATA_VERSION))
+        write_nbt(rules, saved)
+    }
+    put(path.join(folder.copy(), "server.properties"), properties(props))
+    var listed: List<String> = [String(BOT)]
+    if c.mate != none {
+        listed.push(String(MATE))
+    }
+    put(path.join(folder.copy(), "whitelist.json"), players_json(listed, false))
+    if not c.ops.is_empty() {
+        put(path.join(folder.copy(), "ops.json"), players_json(c.ops.copy(), true))
+    }
+    if vanilla {
+        // Elliot accepted Mojang's EULA for the rig's own scratch servers (CAL-42).
+        put(path.join(folder, "eula.txt"), String("eula=true\n"))
+    } else {
+        put(path.join(folder, "calcite.properties"), String("console-dashboard=off\nrecord-inputs=false\nlevel-random-seed=1103\n"))
+    }
+}
+
+/// Records `config`'s scenarios on one side: its server started in a fresh folder, set up and
+/// paused, the bot run once for each, and the server stopped.
+pub fn record(config: String, c: Config, side: str, argv: List<String>, bot: String, scenarios: List<String>) {
+    let folder = session(config.copy(), side)
+    let port = free_port()
+    prepare(folder.copy(), c.copy(), port, side == "vanilla")
+    let began = unsafe { Instant.now() }
+    var server = Server.start(argv, folder.copy(), String(side))
+    var at = server.wait_for(String("Done ("), 0, 180)
+    if side == "vanilla" {
+        // Vanilla's spawn search spreads the player about the spawn by its random; Calcite's is
+        // set to the spawn by its game_rules.dat.
+        var commands: List<(String, String)> = [(String("gamerule respawn_radius 0"), String("respawn_radius"))]
+        commands.extend(c.commands)
+        for (command, reply) in commands {
+            server.send(command.copy())
+            at = server.wait_for(reply.copy(), at, 180)
+        }
+    }
+    at = server.wait_for("Server empty for {PAUSE} seconds, pausing", at, 180)
+    println("  {side}: up in {unsafe { Instant.now() }.secs_since(began):.1}s on port {port}, paused")
+    for scenario in scenarios {
+        var bot_argv: List<String> = [bot.copy(), "{port}", "{c.view}", scenario.copy(), path.join(folder.copy(), "{scenario}.bin")]
+        if let m = mate_scenario(scenario.copy()) {
+            bot_argv.push(path.join(folder.copy(), "{m}.bin"))
+        }
+        let got = server.beside(bot_argv, BOT_SECONDS)
+        if got.code != some(0i32) {
+            let why = if got.timed_out { " (it ran out of time)" } else { "" }
+            server.abort("sessions: the bot failed {scenario} against {side}{why}:\n{got.stdout}{got.stderr}")
+        }
+        println("  {side}: {scenario}: {got.stdout.trim()}")
+        // Where the bot left by the server's clock, at the same game time on both servers, the
+        // server runs PAUSE seconds empty, by its own ticks, once the players who joined have
+        // left, and pauses: what it does after the scenario and what it saves are then the same
+        // on both, not however long the stop took to come by the wall clock (D506). A bot that
+        // left by the wall clock left at other game times on each anyway.
+        if got.stdout.contains(" left at game time ") and server.said(String("joined the game"), at) {
+            at = server.wait_for("Server empty for {PAUSE} seconds, pausing", at, 180)
+        }
+    }
+    server.stop()
+}
+
+// ---- Tags compared with their kinds ----
+
+/// Whether two tags are the same with their kinds, as sessions.py's `typed` and `ordered`
+/// compared them: numbers of the same kind and value, strings, lists and arrays of the same kind
+/// with the same elements in order, and compounds with the same keys, whose values are the same,
+/// with their keys in the same order too if `in_order`. An empty list's kind isn't kept by
+/// std.nbt, so empty lists of any kind are the same (CLX-355).
+pub fn same_kind(a: Tag, b: Tag, in_order: bool) -> bool {
+    if a.id() != b.id() {
+        return false
+    }
+    return match a {
+        Tag.Compound(_) => {
+            let ka = a.keys()
+            let kb = b.keys()
+            if ka.len() != kb.len() {
+                return false
+            }
+            if in_order and ka != kb {
+                return false
+            }
+            for k in ka {
+                let x = a.get(k.copy()) ?? Tag.End
+                let y = b.get(k.copy()) else {
+                    return false
+                }
+                if not same_kind(x, y, in_order) {
+                    return false
+                }
+            }
+            true
+        }
+        Tag.List(xs) => {
+            let ys = match b {
+                Tag.List(l) => l.copy(),
+                _ => [],
+            }
+            if xs.len() != ys.len() {
+                return false
+            }
+            for i in 0..xs.len() {
+                if not same_kind(xs[i].copy(), ys[i].copy(), in_order) {
+                    return false
+                }
+            }
+            true
+        }
+        Tag.Float(x) => match b {
+            Tag.Float(y) => x == y,
+            _ => false,
+        }
+        Tag.Double(x) => match b {
+            Tag.Double(y) => x == y,
+            _ => false,
+        }
+        _ => a.to_snbt() == b.to_snbt(),
+    }
+}
+
+fn same_kind_or_none(a: Tag?, b: Tag?, in_order: bool) -> bool {
+    let x = a else {
+        return b == none
+    }
+    let y = b else {
+        return false
+    }
+    return same_kind(x, y, in_order)
+}
+
+/// A list's elements sorted by their SNBT, as sessions.py sorted their typed values by `repr`.
+fn sorted_elements(t: Tag) -> Tag {
+    var xs = match t {
+        Tag.List(l) => l.copy(),
+        _ => return t.copy(),
+    }
+    xs.sort_by(|p, q| p.to_snbt().cmp(q.to_snbt()))
+    return Tag.List(xs)
+}
+
+fn sorted_or_none(t: Tag?) -> Tag? {
+    if let x = t {
+        return some(sorted_elements(x.copy()))
+    }
+    return none
+}
+
+fn snbt_or_none(t: Tag?) -> String {
+    if let x = t {
+        return x.to_snbt()
+    }
+    return String("None")
+}
+
+fn compound(t: Tag?) -> Tag {
+    if let x = t {
+        if let Tag.Compound(_) = x {
+            return x.copy()
+        }
+    }
+    return Tag.Compound(LinkedMap<String, Tag>())
+}
+
+fn who(name: str) -> String {
+    if name == BOT {
+        return String("")
+    }
+    return " ({name})"
+}
+
+// ---- What both servers saved ----
+
+/// Whether both servers saved the bot's PLAYER_KEYS and the configuration's own keys the same,
+/// or the player `name`'s, printing what differs.
+fn compare_saved(config: String, c: Config, name: str) -> bool {
+    var saved: List<Tag> = []
+    for side in ["vanilla", "calcite"] {
+        let file = path.join(world_of(config.copy(), side), "players/data/{offline_uuid(String(name))}.dat")
+        if not is_file(file.copy()) {
+            println("saved player   differs  [{config}] {side} saved no data for {name}")
+            return false
+        }
+        saved.push(read_nbt(file))
+    }
+    var keys: List<String> = []
+    for k in PLAYER_KEYS {
+        keys.push(String(k))
+    }
+    keys.extend(c.keys)
+    var differ: List<String> = []
+    for k in keys {
+        var sorted_key = false
+        for s in SORTED_KEYS {
+            if k == s {
+                sorted_key = true
+            }
+        }
+        let a = if sorted_key { sorted_or_none(saved[0].get(k.copy())) } else { saved[0].get(k.copy()) }
+        let b = if sorted_key { sorted_or_none(saved[1].get(k.copy())) } else { saved[1].get(k.copy()) }
+        if not same_kind_or_none(a, b, false) {
+            differ.push(k.copy())
+        }
+    }
+    let state = if differ.is_empty() { "PASS" } else { "differs" }
+    println("saved player   {state}    {keys.len() - differ.len()} match, {differ.len()} differ{who(name)}")
+    for k in differ {
+        println("  [{config}] {k}:\n      vanilla: {py_str_or_none(saved[0].get(k.copy()))}\n      calcite: {py_str_or_none(saved[1].get(k.copy()))}")
+    }
+    return differ.is_empty()
+}
+
+/// A progress file's value as sessions.py kept it to compare: each object as its members, in
+/// order, each criterion's time only that it was obtained, as `when` is the server's clock as it
+/// was awarded: a member that's a string is `true`.
+pub fn kept(v: Json, member: bool) -> Json {
+    return match v {
+        Json.Object(m) => {
+            var pairs: List<Json> = []
+            for (k, x) in m {
+                pairs.push(Json.Array([Json.Str(k.copy()), kept(x.copy(), true)]))
+            }
+            Json.Array(pairs)
+        }
+        Json.Array(xs) => {
+            var out: List<Json> = []
+            for x in xs {
+                out.push(kept(x.copy(), false))
+            }
+            Json.Array(out)
+        }
+        Json.Str(_) => if member { Json.Bool(true) } else { v.copy() },
+        _ => v.copy(),
+    }
+}
+
+/// Python's `repr` of the value `kept` makes, its members as tuples: `[('done', True)]`.
+pub fn kept_repr(v: Json, member: bool) -> String {
+    return match v {
+        Json.Object(m) => {
+            var parts: List<String> = []
+            for (k, x) in m {
+                parts.push("({repr_str(k.copy())}, {kept_repr(x.copy(), true)})")
+            }
+            "[{parts.join(String(", "))}]"
+        }
+        Json.Array(xs) => {
+            var parts: List<String> = []
+            for x in xs {
+                parts.push(kept_repr(x.copy(), false))
+            }
+            "[{parts.join(String(", "))}]"
+        }
+        Json.Str(_) => if member { String("True") } else { pyjson.py_repr(v.copy()) },
+        _ => pyjson.py_repr(v.copy()),
+    }
+}
+
+/// A number as Python held it: a bool as 0 or 1, as `True == 1`.
+fn number(v: Json) -> f64? {
+    return match v {
+        Json.Bool(b) => some(if b { 1.0 } else { 0.0 }),
+        Json.Int(_) => v.as_f64(),
+        Json.UInt(_) => v.as_f64(),
+        Json.Big(_) => v.as_f64(),
+        Json.Float(_) => v.as_f64(),
+        _ => none,
+    }
+}
+
+/// Whether Python's `==` took what `json.loads` made of the two as the same: numbers by value,
+/// and objects with the same members in any order.
+pub fn json_same(a: Json, b: Json) -> bool {
+    if let x = number(a.copy()) {
+        if let i = a.as_i64() {
+            if let j = b.as_i64() {
+                return i == j
+            }
+        }
+        if let y = number(b.copy()) {
+            return x == y
+        }
+        return false
+    }
+    return match a {
+        Json.Null => b.is_null(),
+        Json.Str(s) => b.as_str() == some(s.copy()),
+        Json.Array(xs) => match b {
+            Json.Array(ys) => {
+                if xs.len() != ys.len() {
+                    return false
+                }
+                for i in 0..xs.len() {
+                    if not json_same(xs[i].copy(), ys[i].copy()) {
+                        return false
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+        Json.Object(m) => match b {
+            Json.Object(n) => {
+                if m.len() != n.len() {
+                    return false
+                }
+                for (k, x) in m {
+                    let y = n.find(k.copy()) else {
+                        return false
+                    }
+                    if not json_same(x.copy(), y.copy()) {
+                        return false
+                    }
+                }
+                true
+            }
+            _ => false,
+        }
+        _ => false,
+    }
+}
+
+fn json_same_or_none(a: Json?, b: Json?) -> bool {
+    let x = a else {
+        return b == none
+    }
+    let y = b else {
+        return false
+    }
+    return json_same(x, y)
+}
+
+fn json_str(v: Json?) -> String {
+    if let x = v {
+        return pyjson.py_str(x)
+    }
+    return String("None")
+}
+
+fn members(v: Json) -> LinkedMap<String, Json> {
+    if let Json.Object(m) = v {
+        return m.copy()
+    }
+    return LinkedMap<String, Json>()
+}
+
+/// Whether both servers saved the bot's advancements the same (CAL-164),
+/// `players/advancements/<uuid>.json`: each advancement with progress, in the order they were
+/// started, each with its criteria obtained, in their `HashMap`'s order, and whether it's done,
+/// printing what differs; then its recipe book and statistics. A server that saved none, as when
+/// the bot never left, says so.
+fn compare_progress(config: String, name: str) -> bool {
+    var saved: List<Json> = []
+    for side in ["vanilla", "calcite"] {
+        let file = path.join(world_of(config.copy(), side), "players/advancements/{offline_uuid(String(name))}.json")
+        if not is_file(file.copy()) {
+            println("saved progress differs  [{config}] {side} saved no advancements for {name}")
+            return false
+        }
+        saved.push(json_of(file))
+    }
+    let vanilla = members(saved[0].copy())
+    let calcite = members(saved[1].copy())
+    let vk = keys_of(vanilla.copy())
+    let ck = keys_of(calcite.copy())
+    var same = json_same(kept(saved[0].copy(), false), kept(saved[1].copy(), false))
+    // After a `reload`, the order is by when each was first obtained, to the second, which the
+    // wall clock decides for those obtained together (D572).
+    var as_dicts = vanilla.len() == calcite.len()
+    if as_dicts {
+        for (k, v) in vanilla {
+            let c = member_of(calcite.copy(), k.copy()) else {
+                as_dicts = false
+                break
+            }
+            if not json_same(kept(v.copy(), true), kept(c.copy(), true)) {
+                as_dicts = false
+                break
+            }
+        }
+    }
+    let clocked = not same and as_dicts and sessiondiff.ordered_by_the_clock(vk.copy(), ck.copy(),
+        sessiondiff.first_obtained(saved[0].copy()), sessiondiff.first_obtained(saved[1].copy()))
+    same = same or clocked
+    var count = 0
+    for k in vk {
+        if k != "DataVersion" {
+            count += 1
+        }
+    }
+    let state = if same { "PASS" } else { "differs" }
+    println("saved progress {state}    {count} advancements{who(name)}")
+    if clocked {
+        println("  [{config}] the order differs only where the wall clock's seconds order them")
+    }
+    if not same {
+        for (k, v) in vanilla {
+            let c = member_of(calcite.copy(), k.copy())
+            var differs = true
+            if let x = c {
+                differs = not json_same(kept(v.copy(), true), kept(x.copy(), true))
+            }
+            if differs {
+                let theirs = if let x = c { kept_repr(x.copy(), true) } else { String("None") }
+                println("  [{config}] {k}:\n      vanilla: {kept_repr(v.copy(), true)}\n      calcite: {theirs}")
+            }
+        }
+        for k in ck {
+            if member_of(vanilla.copy(), k.copy()) == none {
+                println("  [{config}] {k}: only Calcite saved it")
+            }
+        }
+        if vk != ck {
+            println("  [{config}] the order differs")
+        }
+    }
+    let book = compare_book(config.copy(), name)
+    let stats = compare_stats(config.copy(), name)
+    return book and stats and same
+}
+
+fn timed(kind: String, k: String) -> bool {
+    if kind != "minecraft:custom" {
+        return false
+    }
+    for t in TIMED_STATS {
+        if k == t {
+            return true
+        }
+    }
+    return false
+}
+
+fn sorted_keys(a: LinkedMap<String, Json>, b: LinkedMap<String, Json>) -> List<String> {
+    var all = Set<String>()
+    for k in keys_of(a.copy()) {
+        all.insert(k.copy())
+    }
+    for k in keys_of(b.copy()) {
+        all.insert(k.copy())
+    }
+    var out: List<String> = []
+    for k in all {
+        out.push(k.copy())
+    }
+    out.sort()
+    return out
+}
+
+fn same_set(a: List<String>, b: List<String>) -> bool {
+    var x = a.copy()
+    var y = b.copy()
+    x.sort()
+    y.sort()
+    return x == y
+}
+
+/// Whether both servers saved the player `name`'s statistics the same (CAL-164),
+/// `players/stats/<uuid>.json`: each type's stats and their counts, and the order each type's are
+/// in, a `HashMap`'s of their names, printing what differs. The types themselves can go in any
+/// order, as vanilla groups them in a `HashMap` keyed by identity, in another order each run. The
+/// time stats, `TIMED_STATS`, need only be saved by both; where their counts differ it's told. A
+/// server that saved none says so.
+fn compare_stats(config: String, name: str) -> bool {
+    var saved: List<Json> = []
+    for side in ["vanilla", "calcite"] {
+        let file = path.join(world_of(config.copy(), side), "players/stats/{offline_uuid(String(name))}.json")
+        if not is_file(file.copy()) {
+            println("saved stats    differs  [{config}] {side} saved no statistics for {name}")
+            return false
+        }
+        saved.push(json_of(file))
+    }
+    let vs = members(saved[0].get(String("stats")) ?? Json.Object(LinkedMap<String, Json>()))
+    let cs = members(saved[1].get(String("stats")) ?? Json.Object(LinkedMap<String, Json>()))
+    let vd = saved[0].get(String("DataVersion"))
+    let cd = saved[1].get(String("DataVersion"))
+    var same = same_set(keys_of(vs.copy()), keys_of(cs.copy())) and json_same_or_none(vd.copy(), cd.copy())
+    let kinds = sorted_keys(vs.copy(), cs.copy())
+    for kind in kinds {
+        let a = members(member_of(vs.copy(), kind.copy()) ?? Json.Null)
+        let b = members(member_of(cs.copy(), kind.copy()) ?? Json.Null)
+        if not same_set(keys_of(a.copy()), keys_of(b.copy())) or keys_of(a.copy()) != keys_of(b.copy()) {
+            same = false
+        } else {
+            for (k, x) in a {
+                if not timed(kind.copy(), k.copy()) and not json_same(x.copy(), member_of(b.copy(), k.copy()) ?? Json.Null) {
+                    same = false
+                }
+            }
+        }
+    }
+    var count = 0usize
+    for (_, v) in vs {
+        count += v.len()
+    }
+    let state = if same { "PASS" } else { "differs" }
+    println("saved stats    {state}    {count} stats{who(name)}")
+    for kind in kinds {
+        let a = members(member_of(vs.copy(), kind.copy()) ?? Json.Null)
+        let b = members(member_of(cs.copy(), kind.copy()) ?? Json.Null)
+        for k in sorted_keys(a.copy(), b.copy()) {
+            let x = member_of(a.copy(), k.copy())
+            let y = member_of(b.copy(), k.copy())
+            if not json_same_or_none(x.copy(), y.copy()) {
+                let late = if timed(kind.copy(), k.copy()) and x != none and y != none { " (timing)" } else { "" }
+                println("  [{config}] {kind} {k}: vanilla {json_str(x)}, calcite {json_str(y)}{late}")
+            }
+        }
+        if same_set(keys_of(a.copy()), keys_of(b.copy())) and keys_of(a.copy()) != keys_of(b.copy()) {
+            println("  [{config}] {kind}: the order differs")
+        }
+    }
+    if not json_same_or_none(vd.copy(), cd.copy()) {
+        println("  [{config}] DataVersion: vanilla {json_str(vd)}, calcite {json_str(cd)}")
+    }
+    return same
+}
+
+/// A list's elements sorted, strings by their text and anything else by its SNBT.
+fn sorted_strings(t: Tag) -> Tag {
+    var xs = match t {
+        Tag.List(l) => l.copy(),
+        _ => return t.copy(),
+    }
+    xs.sort_by(|p, q| (p.as_str() ?? p.to_snbt()).cmp(q.as_str() ?? q.to_snbt()))
+    return Tag.List(xs)
+}
+
+/// A recipe book as it's compared: each of its lists sorted.
+fn book_kept(t: Tag?) -> Tag? {
+    let b = t else {
+        return none
+    }
+    if let Tag.Compound(_) = b {
+        var out = b.copy()
+        for k in b.keys() {
+            let v = b.get(k.copy()) ?? Tag.End
+            if let Tag.List(_) = v {
+                _ = out.insert(k.copy(), sorted_strings(v))
+            }
+        }
+        return some(out)
+    }
+    return some(b.copy())
+}
+
+/// Whether both servers saved the player `name`'s recipe book the same, their data's
+/// `recipeBook` (CAL-164): its tabs' settings, and the recipes known and highlighted, each list
+/// sorted, as vanilla's come from sets hashed by identity, in another order each run.
+fn compare_book(config: String, name: str) -> bool {
+    var books: List<Tag?> = []
+    for side in ["vanilla", "calcite"] {
+        let file = path.join(world_of(config.copy(), side), "players/data/{offline_uuid(String(name))}.dat")
+        if not is_file(file.copy()) {
+            println("saved book     differs  [{config}] {side} saved no data for {name}")
+            return false
+        }
+        books.push(book_kept(read_nbt(file).get(String("recipeBook"))))
+    }
+    let same = same_or_none(books[0].copy(), books[1].copy())
+    var known = 0usize
+    if let b = books[0].copy() {
+        if let r = b.get(String("recipes")) {
+            known = r.len()
+        }
+    }
+    let state = if same { "PASS" } else { "differs" }
+    println("saved book     {state}    {known} recipes known")
+    if not same {
+        println("  [{config}] recipeBook:\n      vanilla: {py_str_or_none(books[0].copy())}\n      calcite: {py_str_or_none(books[1].copy())}")
+    }
+    return same
+}
+
+/// A saved scoreboard's data as it's compared: its scores sorted, as vanilla keeps each holder's
+/// by its objectives' identity hashes, in another order each run.
+fn scoreboard_kept(root: Tag) -> Tag {
+    var data = compound(root.get(String("data")))
+    if let scores = data.get(String("PlayerScores")) {
+        if let Tag.List(_) = scores {
+            _ = data.insert(String("PlayerScores"), sorted_elements(scores))
+        }
+    }
+    return data
+}
+
+/// Whether both servers saved the scoreboard the same (CAL-164), `data/minecraft/scoreboard.dat`,
+/// which a new world's is too, empty: its objectives, scores, display slots and teams, each in its
+/// map's order but the scores, printing what differs.
+fn compare_scoreboard(config: String) -> bool {
+    var roots: List<Tag?> = []
+    for side in ["vanilla", "calcite"] {
+        let file = path.join(world_of(config.copy(), side), "data/minecraft/scoreboard.dat")
+        roots.push(if is_file(file.copy()) { some(read_nbt(file)) } else { none })
+    }
+    var kept_data: List<Tag?> = []
+    for r in roots {
+        if let x = r {
+            kept_data.push(some(scoreboard_kept(x.copy())))
+        } else {
+            kept_data.push(none)
+        }
+    }
+    let vd = if let x = roots[0].copy() { x.get(String("DataVersion")) } else { none }
+    let cd = if let x = roots[1].copy() { x.get(String("DataVersion")) } else { none }
+    let same = if roots[0] == none or roots[1] == none {
+        roots[0] == none and roots[1] == none
+    } else {
+        same_kind_or_none(kept_data[0].copy(), kept_data[1].copy(), false) and same_or_none(vd.copy(), cd.copy())
+    }
+    var scores = 0usize
+    if let k = kept_data[0].copy() {
+        if let s = k.get(String("PlayerScores")) {
+            scores = s.len()
+        }
+    }
+    let state = if same { "PASS" } else { "differs" }
+    println("saved scores   {state}    {scores} scores")
+    if not same {
+        if roots[0] == none or roots[1] == none {
+            let only = if roots[0] == none { "Calcite" } else { "vanilla" }
+            println("  [{config}] only {only} saved a scoreboard")
+        } else {
+            let a = kept_data[0].copy() ?? Tag.End
+            let b = kept_data[1].copy() ?? Tag.End
+            var keys = Set<String>()
+            for k in a.keys() {
+                keys.insert(k.copy())
+            }
+            for k in b.keys() {
+                keys.insert(k.copy())
+            }
+            var sorted: List<String> = []
+            for k in keys {
+                sorted.push(k.copy())
+            }
+            sorted.sort()
+            for k in sorted {
+                if not same_kind_or_none(a.get(k.copy()), b.get(k.copy()), false) {
+                    println("  [{config}] {k}:\n      vanilla: {snbt_or_none(a.get(k.copy()))}\n      calcite: {snbt_or_none(b.get(k.copy()))}")
+                }
+            }
+            if not same_or_none(vd.copy(), cd.copy()) {
+                println("  [{config}] DataVersion: vanilla {py_str_or_none(vd)}, calcite {py_str_or_none(cd)}")
+            }
+        }
+    }
+    return same
+}
+
+/// A world's command storage as it's compared (CAL-165): each namespace's
+/// `data/<namespace>/command_storage.dat`, by namespace.
+fn storage_kept(world: String) -> LinkedMap<String, Tag> {
+    var out = LinkedMap<String, Tag>()
+    let found = match glob(path.join(world, "data/*/command_storage.dat")) {
+        ok(fs) => fs,
+        err(e) => die("sessions: {e}"),
+    }
+    for f in found {
+        let dir = path.parent_dir(f.copy()) ?? String("")
+        out.insert(path.file_name(dir) ?? String(""), read_nbt(f.copy()))
+    }
+    return out
+}
+
+/// Whether both servers saved command storage the same (CAL-165), each namespace's compounds
+/// with their keys in the order written, which is that of the maps `CompoundTag.copy` makes,
+/// printing what differs. Nothing's printed where neither saved any.
+fn compare_storage(config: String) -> bool {
+    let v = storage_kept(world_of(config.copy(), "vanilla"))
+    let c = storage_kept(world_of(config.copy(), "calcite"))
+    if v.len() == 0 and c.len() == 0 {
+        return true
+    }
+    var namespaces = Set<String>()
+    for k in keys_of(v.copy()) {
+        namespaces.insert(k.copy())
+    }
+    for k in keys_of(c.copy()) {
+        namespaces.insert(k.copy())
+    }
+    var sorted: List<String> = []
+    for k in namespaces {
+        sorted.push(k.copy())
+    }
+    sorted.sort()
+    var same = true
+    for ns in sorted {
+        if not same_kind_or_none(tag_member(v.copy(), ns.copy()), tag_member(c.copy(), ns.copy()), true) {
+            same = false
+        }
+    }
+    let state = if same { "PASS" } else { "differs" }
+    println("saved storage  {state}    {v.len()} namespaces")
+    if not same {
+        for ns in sorted {
+            if not same_kind_or_none(tag_member(v.copy(), ns.copy()), tag_member(c.copy(), ns.copy()), true) {
+                println("  [{config}] {ns}:\n      vanilla: {snbt_or_none(tag_member(v.copy(), ns.copy()))}\n      calcite: {snbt_or_none(tag_member(c.copy(), ns.copy()))}")
+            }
+        }
+    }
+    return same
+}
+
+/// A saved file's root, or none where there's none.
+fn saved_root(world: String, rel: str) -> Tag? {
+    let file = path.join(world, rel)
+    if not is_file(file.copy()) {
+        return none
+    }
+    return some(read_nbt(file))
+}
+
+/// Whether both servers saved the functions `schedule` has waiting the same (D569),
+/// `data/minecraft/scheduled_events.dat`, its root with its keys in the order written, printing
+/// what differs. Nothing's printed where neither saved any.
+fn compare_scheduled(config: String) -> bool {
+    let rel = "data/minecraft/scheduled_events.dat"
+    let v = saved_root(world_of(config.copy(), "vanilla"), rel)
+    let c = saved_root(world_of(config.copy(), "calcite"), rel)
+    if v == none and c == none {
+        return true
+    }
+    let same = same_kind_or_none(v.copy(), c.copy(), true)
+    var events = 0usize
+    if let x = v.copy() {
+        events = compound(x.get(String("data"))).get(String("events")).map(|e| e.len()) ?? 0
+    }
+    let state = if same { "PASS" } else { "differs" }
+    println("saved schedule {state}    {events} events")
+    if not same {
+        println("  [{config}] scheduled_events:\n      vanilla: {snbt_or_none(v)}\n      calcite: {snbt_or_none(c)}")
+    }
+    return same
+}
+
+fn ints(t: Tag) -> List<i64> {
+    var out: List<i64> = []
+    if let xs = pynbt_elements(t) {
+        for x in xs {
+            out.push(x.as_int() ?? 0)
+        }
+    }
+    return out
+}
+
+fn pynbt_elements(t: Tag) -> List<Tag>? {
+    return elements(t)
+}
+
+/// A world's boss bars as they're compared (D606): `data/minecraft/custom_boss_events.dat`, its
+/// root with its keys in the order written, each bar's players sorted, as vanilla saves them
+/// through `Set.copyOf`, whose order it draws afresh each run; none where there's none.
+fn boss_bars_kept(world: String) -> Tag? {
+    var root = saved_root(world, "data/minecraft/custom_boss_events.dat") else {
+        return none
+    }
+    if let data = root.get(String("data")) {
+        if let Tag.Compound(_) = data {
+            var out = data.copy()
+            for k in data.keys() {
+                var bar = data.get(k.copy()) ?? Tag.End
+                if let Tag.Compound(_) = bar {
+                    if let players = bar.get(String("Players")) {
+                        if let Tag.List(l) = players {
+                            var xs = l.copy()
+                            xs.sort_by(|p, q| ints(p.copy()).cmp(ints(q.copy())))
+                            _ = bar.insert(String("Players"), Tag.List(xs))
+                            _ = out.insert(k.copy(), bar)
+                        }
+                    }
+                }
+            }
+            _ = root.insert(String("data"), out)
+        }
+    }
+    return some(root)
+}
+
+/// Whether both servers saved the boss bars the same (D606), printing what differs. Nothing's
+/// printed where neither saved any.
+fn compare_boss_bars(config: String) -> bool {
+    let v = boss_bars_kept(world_of(config.copy(), "vanilla"))
+    let c = boss_bars_kept(world_of(config.copy(), "calcite"))
+    if v == none and c == none {
+        return true
+    }
+    let same = same_kind_or_none(v.copy(), c.copy(), true)
+    var bars = 0usize
+    if let x = saved_root(world_of(config.copy(), "vanilla"), "data/minecraft/custom_boss_events.dat") {
+        bars = compound(x.get(String("data"))).len()
+    }
+    let state = if same { "PASS" } else { "differs" }
+    println("saved bars     {state}    {bars} bars")
+    if not same {
+        println("  [{config}] custom_boss_events:\n      vanilla: {snbt_or_none(v)}\n      calcite: {snbt_or_none(c)}")
+    }
+    return same
+}
+
+/// Whether both servers saved the End's dragon fight the same (D623), its
+/// `ender_dragon_fight.dat`, its root with its keys in the order written, printing what differs.
+/// Nothing's printed where neither saved it.
+fn compare_fight(config: String) -> bool {
+    let rel = "dimensions/minecraft/the_end/data/minecraft/ender_dragon_fight.dat"
+    let v = saved_root(world_of(config.copy(), "vanilla"), rel)
+    let c = saved_root(world_of(config.copy(), "calcite"), rel)
+    if v == none and c == none {
+        return true
+    }
+    let same = same_kind_or_none(v.copy(), c.copy(), true)
+    let state = if same { "PASS" } else { "differs" }
+    println("saved fight    {state}")
+    if not same {
+        println("  [{config}] ender_dragon_fight:\n      vanilla: {snbt_or_none(v)}\n      calcite: {snbt_or_none(c)}")
+    }
+    return same
+}
+
+/// Python's `repr` of bytes: `b'...'`, with `\\`, the quote, `\t`, `\n` and `\r` escaped, and any
+/// byte past printable ASCII as `\xhh`.
+pub fn bytes_repr(bytes: List<u8>) -> String {
+    let single = bytes.contains(39u8)
+    let double = bytes.contains(34u8)
+    let quote = if single and not double { 34u8 } else { 39u8 }
+    let q = String.from_utf8([quote]) ?? String("'")
+    var out = "b{q}"
+    for b in bytes {
+        if b == 92u8 {
+            out.push_str("\\\\")
+        } else if b == quote {
+            out.push_str("\\{q}")
+        } else if b == 9u8 {
+            out.push_str("\\t")
+        } else if b == 10u8 {
+            out.push_str("\\n")
+        } else if b == 13u8 {
+            out.push_str("\\r")
+        } else if b < 32u8 or b >= 127u8 {
+            out.push_str("\\x{b:02x}")
+        } else {
+            out.push_str(String.from_utf8([b]) ?? String("?"))
+        }
+    }
+    out.push_str(q)
+    return out
+}
+
+/// The packs a side made, each one's `pack.mcmeta` as Python's `repr` of its bytes wrote them, or
+/// `None` where it has none.
+fn made_packs(config: String, side: str, given: List<String>) -> LinkedMap<String, String> {
+    var out = LinkedMap<String, String>()
+    let folder = path.join(world_of(config, side), "datapacks")
+    if not is_dir(folder.copy()) {
+        return out
+    }
+    let names = match list(folder.copy()) {
+        ok(ns) => ns,
+        err(e) => die("sessions: {folder}: {e}"),
+    }
+    for name in names {
+        let dir = path.join(folder.copy(), name.copy())
+        if not is_dir(dir.copy()) or given.contains(name.copy()) {
+            continue
+        }
+        let meta = path.join(dir, "pack.mcmeta")
+        if is_file(meta.copy()) {
+            let bytes = match read(meta.copy()) {
+                ok(b) => b,
+                err(e) => die("sessions: {meta}: {e}"),
+            }
+            out.insert(name.copy(), bytes_repr(bytes))
+        } else {
+            out.insert(name.copy(), String("None"))
+        }
+    }
+    return out
+}
+
+/// A pack's `pack.mcmeta` as `made_packs` keeps it, `None` where there's no such pack, as
+/// Python's `dict.get` gave it.
+fn mcmeta_repr(m: LinkedMap<String, String>, name: String) -> String {
+    if let x = m.find(name) {
+        return x.copy()
+    }
+    return String("None")
+}
+
+fn keys_of<V>(m: LinkedMap<String, V>) -> List<String> {
+    var out: List<String> = []
+    for (k, _) in m {
+        out.push(k.copy())
+    }
+    return out
+}
+
+/// A copy of member `k`'s value, if there's one.
+fn member_of(m: LinkedMap<String, Json>, k: String) -> Json? {
+    if let v = m.find(k) {
+        return some(v.copy())
+    }
+    return none
+}
+
+fn tag_member(m: LinkedMap<String, Tag>, k: String) -> Tag? {
+    if let v = m.find(k) {
+        return some(v.copy())
+    }
+    return none
+}
+
+fn chunk_at(m: Map<(i64, i64), Tag>, k: (i64, i64)) -> Tag? {
+    if let v = m.find(k) {
+        return some(v.copy())
+    }
+    return none
+}
+
+/// Whether both servers wrote the packs `datapack create` made the same (D573): each folder in
+/// the world's `datapacks` that no configuration put there, by its name, with its `pack.mcmeta`,
+/// byte for byte, printing what differs. Nothing's printed where neither made any.
+fn compare_made_packs(config: String, c: Config) -> bool {
+    var given: List<String> = []
+    for (pack, _) in c.datapacks {
+        given.push(pack.copy())
+    }
+    let v = made_packs(config.copy(), "vanilla", given.copy())
+    let k = made_packs(config.copy(), "calcite", given)
+    if v.len() == 0 and k.len() == 0 {
+        return true
+    }
+    var names = Set<String>()
+    for n in keys_of(v.copy()) {
+        names.insert(n.copy())
+    }
+    for n in keys_of(k.copy()) {
+        names.insert(n.copy())
+    }
+    var sorted: List<String> = []
+    for n in names {
+        sorted.push(n.copy())
+    }
+    sorted.sort()
+    var same = true
+    for n in sorted {
+        if mcmeta_repr(v.copy(), n.copy()) != mcmeta_repr(k.copy(), n.copy()) {
+            same = false
+        }
+    }
+    let state = if same { "PASS" } else { "differs" }
+    println("saved packs    {state}    {v.len()} made")
+    if not same {
+        for n in sorted {
+            if mcmeta_repr(v.copy(), n.copy()) != mcmeta_repr(k.copy(), n.copy()) {
+                println("  [{config}] {n}/pack.mcmeta:\n      vanilla: {mcmeta_repr(v.copy(), n.copy())}\n      calcite: {mcmeta_repr(k.copy(), n.copy())}")
+            }
+        }
+    }
+    return same
+}
+
+/// Prints what differs in what both servers saved of a fixture configuration's chunks, each
+/// block's state, block entity, tick, heightmap and light (CAL-145). Reported, not gated. A
+/// `show` of 0 shows them all, as it does the packets' (D407).
+fn compare_chunks(config: String, show: usize) {
+    let limit = if show > 0 { show } else { 1000000000 }
+    let lines = savediff.compare(world_of(config.copy(), "vanilla"), world_of(config.copy(), "calcite"), FIXTURE_CHUNKS, limit)
+    let state = if lines.is_empty() { "PASS" } else { "differs" }
+    println("saved chunks   {state}    {lines.len()} differ")
+    for (i, line) in lines.enumerate() {
+        if i < limit {
+            println("  [{config}] {cut(line.copy(), 400)}")
+        }
+    }
+}
+
+/// Prints what differs in what both servers saved of the End's chunks a configuration names,
+/// `end_chunks`, each block's state, block entity, tick, heightmap and light (D625).
+fn compare_end_chunks(config: String, c: Config, show: usize) {
+    let limit = if show > 0 { show } else { 1000000000 }
+    let v = savediff.chunks(world_of(config.copy(), "vanilla"), String("minecraft/the_end"), String("region"))
+    let k = savediff.chunks(world_of(config.copy(), "calcite"), String("minecraft/the_end"), String("region"))
+    var lines: List<String> = []
+    for (x0, z0, x1, z1) in c.end_chunks {
+        for cx in x0..x1 + 1 {
+            for cz in z0..z1 + 1 {
+                let a = chunk_at(v.copy(), (cx, cz))
+                let b = chunk_at(k.copy(), (cx, cz))
+                if a == none or b == none {
+                    if a != none or b != none {
+                        let only = if a != none { "vanilla" } else { "Calcite" }
+                        lines.push("chunk {cx}, {cz}: only {only} saved it")
+                    }
+                    continue
+                }
+                for d in savediff.chunk_differences(cx, cz, (a ?? Tag.End).copy(), (b ?? Tag.End).copy(), limit) {
+                    lines.push("chunk {cx}, {cz}: {d}")
+                }
+            }
+        }
+    }
+    let state = if lines.is_empty() { "PASS" } else { "differs" }
+    println("saved End      {state}    {lines.len()} differ")
+    for (i, line) in lines.enumerate() {
+        if i < limit {
+            println("  [{config}] {cut(line.copy(), 400)}")
+        }
+    }
+}
+
+/// The last `n` characters of `s`, as Python's `s[-n:]` gives them.
+fn last_chars(s: String, n: usize) -> String {
+    var runes: List<String> = []
+    for r in s.chars() {
+        runes.push("{r}")
+    }
+    let from = if runes.len() > n { runes.len() - n } else { 0 }
+    return runes[from..].join(String(""))
+}
+
+/// Runs SessionDump on the recorded sessions, which writes a .jsonl beside each.
+fn dump(a: Json, files: List<String>) {
+    let argv = adapter_argv(a.copy())
+    var args = argv[1..argv.len() - 1]
+    args.push(String("calcite.rig.vanilla.SessionDump"))
+    for f in files {
+        args.push(native(f.copy()))
+    }
+    let got = match Command.new(argv[0].copy()).args(args).dir(adapter_cwd(a)).output() {
+        ok(o) => o,
+        err(e) => die("sessions: running SessionDump: {e}"),
+    }
+    if not got.status.success() {
+        die("sessions: SessionDump failed:\n{got.text()}{last_chars(got.error_text(), 4000)}")
+    }
+}
+
+/// The protocol suites (P4.8, CAL-42): the rig's protocol bot runs the same scenarios against
+/// vanilla 26.3 and against Calcite, and the two sessions are compared packet by packet.
+@cli(name: "sessions")
+struct Args {
+    /// Only this configuration.
+    config: List<String>
+    /// Only this scenario.
+    scenario: List<String>
+    /// Compare the last run's sessions.
+    compare_only: bool
+    /// Differences shown for each packet, 0 for all.
+    show: i64 = 3
+    /// Write both servers' levels' draws to tape.txt, and line them up.
+    tape: bool
+    /// Write both servers' living entities' states to entities.txt.
+    trace: bool
+}
+
+fn choose(what: str, given: List<String>, choices: List<String>) {
+    for g in given {
+        if not choices.contains(g.copy()) {
+            var quoted: List<String> = []
+            for c in choices {
+                quoted.push(repr_str(c.copy()))
+            }
+            eprintln("sessions: error: argument --{what}: invalid choice: {repr_str(g.copy())} (choose from {quoted.join(String(", "))})")
+            exit(2)
+        }
+    }
+}
+
+pub fn main() {
+    let args = Args.parse()
+    let all = configs()
+    var names: List<String> = []
+    for (n, _) in all {
+        names.push(n.copy())
+    }
+    var sorted_names = names.copy()
+    sorted_names.sort()
+    choose("config", args.config.copy(), sorted_names)
+    var every_scenario: List<String> = []
+    for s in SCENARIOS {
+        every_scenario.push(String(s))
+    }
+    every_scenario.extend(other_scenarios())
+    choose("scenario", args.scenario.copy(), every_scenario)
+    let show = if args.show < 0 { 0usize } else { usize.wrap(args.show) }
+    var chosen = if args.config.is_empty() { names.copy() } else { args.config.copy() }
+    var complete = args.config.is_empty() and args.scenario.is_empty()
+    var kept_configs: List<String> = []
+    for c in chosen {
+        let cfg = all[c.copy()].copy()
+        if let fixture = cfg.fixture {
+            if not args.compare_only {
+                fixtures.make(fixture.copy(), false)
+            }
+        }
+        if let w = cfg.world {
+            let level = path.join(under(w.copy()), "level.dat")
+            if w == PLAIN_WORLD and not is_file(level.copy()) and not args.compare_only {
+                roundtrip.make_plain()
+            }
+            if not is_file(level) {
+                println("{c}: skipped, since there's no {w}; run calx rig/runner/roundtrip.calx")
+                complete = false
+                continue
+            }
+        }
+        kept_configs.push(c.copy())
+    }
+    chosen = kept_configs
+    var scenarios = LinkedMap<String, List<String>>()
+    for c in chosen {
+        let cfg = all[c.copy()].copy()
+        var mine: List<String> = []
+        let wanted = if args.scenario.is_empty() { cfg.scenarios.copy() } else { args.scenario.copy() }
+        for s in wanted {
+            if cfg.scenarios.contains(s.copy()) {
+                mine.push(s.copy())
+            }
+        }
+        scenarios.insert(c.copy(), mine)
+    }
+    let a = adapter()
+    if not args.compare_only {
+        let server = build("src/calcite.calx", "calcite")
+        let bot = build("src/rig/session.calx", "session")
+        for c in chosen {
+            let cfg = all[c.copy()].copy()
+            let mine = scenarios[c.copy()].copy()
+            if mine.is_empty() {
+                continue
+            }
+            println("{c}:")
+            let taped = args.tape or cfg.tape
+            record(c.copy(), cfg.copy(), "vanilla", vanilla_argv(a.copy(), taped, args.trace), bot.copy(), mine.copy())
+            var calcite_argv: List<String> = [server.copy()]
+            if taped {
+                calcite_argv.extend([String("--rng-tape"), String("tape.txt"), String("--rng-reseed"), "{RESEED}"])
+            }
+            if args.trace {
+                calcite_argv.extend([String("--entity-trace"), String("entities.txt")])
+            }
+            record(c.copy(), cfg.copy(), "calcite", calcite_argv, bot.copy(), mine)
+            if taped {
+                println("{c}: the levels' draws, vanilla's against Calcite's (D312):")
+                _ = tapediff.compare(tapediff.read(path.join(session(c.copy(), "vanilla"), "tape.txt")),
+                    tapediff.read(path.join(session(c.copy(), "calcite"), "tape.txt")), show, some(RESEED + 1))
+            }
+        }
+    }
+    // What a second player recorded is compared as a scenario of its own (CAL-162).
+    for c in chosen {
+        var mine = scenarios[c.copy()].copy()
+        for s in scenarios[c.copy()] {
+            if let m = mate_scenario(s.copy()) {
+                mine.push(m)
+            }
+        }
+        scenarios.insert(c.copy(), mine)
+    }
+    var files: List<String> = []
+    for c in chosen {
+        for side in ["vanilla", "calcite"] {
+            for s in scenarios[c.copy()] {
+                files.push(path.join(session(c.copy(), side), "{s}.bin"))
+            }
+        }
+    }
+    if files.is_empty() {
+        die("sessions: no configuration has those scenarios")
+    }
+    dump(a, files)
+    let report = sessiondiff.run(sessions_dir(), chosen.copy(), scenarios.copy(), under("rig/differences"), show, complete)
+    for line in report.lines {
+        println(line)
+    }
+    var results: List<bool> = []
+    for c in chosen {
+        if all[c.copy()].player != none and not scenarios[c.copy()].is_empty() {
+            results.push(compare_saved(c.copy(), all[c.copy()].copy(), BOT))
+        }
+    }
+    for c in chosen {
+        if all[c.copy()].mate != none and not scenarios[c.copy()].is_empty() {
+            results.push(compare_saved(c.copy(), all[c.copy()].copy(), MATE))
+        }
+    }
+    let ran = chosen.filter(|c| not scenarios[c.copy()].is_empty())
+    for c in ran {
+        results.push(compare_progress(c.copy(), BOT))
+    }
+    for c in ran {
+        results.push(compare_scoreboard(c.copy()))
+    }
+    for c in ran {
+        results.push(compare_storage(c.copy()))
+    }
+    for c in ran {
+        results.push(compare_scheduled(c.copy()))
+    }
+    for c in ran {
+        results.push(compare_boss_bars(c.copy()))
+    }
+    for c in ran {
+        results.push(compare_fight(c.copy()))
+    }
+    for c in ran {
+        results.push(compare_made_packs(c.copy(), all[c.copy()].copy()))
+    }
+    for c in ran {
+        let cfg = all[c.copy()].copy()
+        if cfg.fixture != none {
+            compare_chunks(c.copy(), show)
+        }
+        if not cfg.end_chunks.is_empty() {
+            compare_end_chunks(c.copy(), cfg, show)
+        }
+    }
+    var saved = true
+    for r in results {
+        if not r {
+            saved = false
+        }
+    }
+    if not (report.passed and saved) {
+        exit(1)
+    }
+}

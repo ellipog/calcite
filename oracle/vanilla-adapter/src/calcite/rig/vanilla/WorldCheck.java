@@ -33,7 +33,7 @@ import org.apache.logging.log4j.core.appender.AbstractAppender;
 import org.apache.logging.log4j.core.config.Property;
 
 /**
- * The round trip's check (G5.2, `rig/runner/roundtrip.py`): a world vanilla saved, and the same
+ * The round trip's check (G5.2, `rig/runner/roundtrip.calx`): a world vanilla saved, and the same
  * world after Calcite loaded and saved it, read file by file with vanilla's own readers.
  *
  * <pre>java calcite.rig.vanilla.WorldCheck EXPECTED ACTUAL</pre>

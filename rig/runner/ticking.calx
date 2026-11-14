@@ -1,0 +1,436 @@
+module rig.runner.ticking
+
+// Checks what a chunk does as it starts to tick against vanilla (D329, CAL-91): its
+// post-processing, `LevelChunk.postProcessGeneration`, and its first ticks; and the chunks a save
+// left part-way, as their generation goes on (D333, D334, CAL-113).
+//
+//     calx rig/runner/ticking.calx [--reuse] [--show N]
+//
+// Both servers load the world the round trip has vanilla make and save
+// (rig/runner/roundtrip.calx), whose chunks from -6 to 5 are full, and more to the north and east,
+// where vanilla loaded the spawn's. Those vanilla ticked it post-processed before it saved them.
+// Those at the edge it didn't, so they still have the blocks their generation marked,
+// `PostProcessing`: aquifers' water and lava, mushrooms, ice, glow lichen, leaves. Round the full
+// chunks, the save has a ring with its features, waiting for its light, then one with only its
+// terrain, then one with only its biomes: among the chunks from -8 to 7, at -7 and -8 on the west,
+// 6 and 7 on the south, at the north-west corner, and on the east south of 0. The rig's bot joins
+// each server at the origin with a view of 10, as rig/runner/sessions.calx records a session, so
+// the chunks from -8 to 7 are all sent, each server finishing the part-way rings first, from
+// where it saved them (D334).
+//
+// Each chunk packet's blocks are decoded, so how a palette is written (D271) doesn't count, with
+// the blocks each `block_update` and `section_blocks_update` after it sets, as the client keeps
+// them, so what each block's ticks set after the chunk was sent counts (D337), and the blocks of
+// the chunks from -8 to 7 are compared. A block that differs in a way that waits on something not
+// in Calcite yet is counted under it, by the card it waits on; any other fails the check.
+//
+// It runs vanilla from the adapter (oracle/adapter.calx), with Mojang's EULA accepted in the
+// rig's scratch folder only (CAL-42), and needs the reports datagen writes to generated/26.3/
+// (oracle/datagen/README.md). --reuse compares the last recording again. Neither side's packets
+// are dumped to JSON, which for this many block updates runs to gigabytes. It was ticking.py
+// (CAL-253).
+
+import std.cli.{cli}
+import std.fs.{read, read_text}
+import std.json
+import std.json.{Json}
+import std.path
+import std.process.{exit}
+import rig.runner.servers.{adapter, build, sessions_dir, vanilla_argv}
+import rig.runner.session_configs.{SAVED_WORLD, base}
+import rig.runner.sessions.{record}
+import tools.repo.{die, under}
+
+const CONFIG: str = "ticking"
+/// The chunks compared: those the save has full, and the two rings it left part-way round them.
+const LOW: i64 = -8
+const HIGH: i64 = 7
+/// The Overworld's sections, from y -64.
+const SECTIONS: usize = 24
+const MIN_Y: i64 = -64
+/// `ConnectionProtocol`'s number for play, as the bot records it (src/rig/session.calx).
+const PLAY: u8 = 4
+/// The blocks that fall, which come down as entities.
+const FALLING: [str; 7] = ["sand", "red_sand", "gravel", "suspicious_sand", "suspicious_gravel", "anvil", "dragon_egg"]
+
+fn base_name(name: String) -> String {
+    if let at = name.find("[") {
+        return name[..at]
+    }
+    return name.copy()
+}
+
+fn falls(name: String) -> bool {
+    for f in FALLING {
+        if name == f {
+            return true
+        }
+    }
+    return false
+}
+
+/// What waits on something not in Calcite yet, or comes of the levels' draws, which part from
+/// vanilla's here, with no tape to seed them again, by vanilla's block and Calcite's. Since the
+/// blocks set after a chunk is sent count, some come of how long each server ran.
+fn why_known(v: String, c: String) -> String? {
+    let bv = base_name(v.copy())
+    let bc = base_name(c.copy())
+    let snow = (bv == "snow" and bc == "air") or (bv == "air" and bc == "snow")
+    let grass = (v == "grass_block[snowy=true]" and c == "grass_block[snowy=false]") or (v == "grass_block[snowy=false]" and c == "grass_block[snowy=true]")
+    if snow or grass {
+        return some(String("precipitation's snow, laid where each server's own draws put it, and the grass under it (D340)"))
+    }
+    if (bv == "grass_block" and bc == "dirt") or (bv == "dirt" and bc == "grass_block") {
+        return some(String("random ticks, whose draws part from vanilla's while Calcite has few blocks' (CAL-106)"))
+    }
+    if (v == "air" and falls(bc.copy())) or (falls(bv) and not falls(bc)) {
+        return some(String("falling blocks, which come down as entities"))
+    }
+    return none
+}
+
+fn varint(b: List<u8>, at: mut usize) -> u64 {
+    var v: u64 = 0
+    var shift: u64 = 0
+    loop {
+        let x = b[at]
+        at += 1
+        v = v | ((u64(x) & 127) << shift)
+        shift += 7
+        if x & 128 == 0 {
+            return v
+        }
+    }
+}
+
+fn be_u32(b: List<u8>, at: usize) -> u64 {
+    var v: u64 = 0
+    for k in 0..4usize {
+        v = (v << 8) | u64(b[at + k])
+    }
+    return v
+}
+
+fn be_u64(b: List<u8>, at: usize) -> u64 {
+    var v: u64 = 0
+    for k in 0..8usize {
+        v = (v << 8) | u64(b[at + k])
+    }
+    return v
+}
+
+/// `v`'s low `bits` bits as a signed number.
+fn signed(v: u64, bits: u64) -> i64 {
+    let low = v & ((1u64 << bits) - 1)
+    if low >> (bits - 1) != 0 {
+        return i64.wrap(low) - i64.wrap(1u64 << bits)
+    }
+    return i64.wrap(low)
+}
+
+/// A paletted container's values, as 26.3 sends it: its bits, its palette unless it's single or
+/// global, then its longs, with no index across two.
+fn container(b: List<u8>, at: mut usize, entries: usize, indirect_bits: u64) -> List<u64> {
+    let bits = u64(b[at])
+    at += 1
+    var out: List<u64> = []
+    if bits == 0 {
+        let v = varint(b, mut at)
+        for _ in 0..entries {
+            out.push(v)
+        }
+        return out
+    }
+    var palette: List<u64> = []
+    let indirect = bits <= indirect_bits
+    if indirect {
+        let n = varint(b, mut at)
+        for _ in 0..n {
+            palette.push(varint(b, mut at))
+        }
+    }
+    let per = usize.wrap(64 / bits)
+    let longs = (entries + per - 1) / per
+    let mask = (1u64 << bits) - 1
+    for k in 0..longs {
+        let w = be_u64(b, at + 8 * k)
+        for j in 0..per {
+            if out.len() == entries {
+                break
+            }
+            let i = (w >> (u64(j) * bits)) & mask
+            if indirect {
+                out.push(palette[usize.wrap(i)])
+            } else {
+                out.push(i)
+            }
+        }
+    }
+    at += 8 * longs
+    return out
+}
+
+/// The block at x, y, z set to `state` in the chunk it's in, if that was sent.
+fn set_block(out: mut Map<(i64, i64), List<List<u64>>>, x: i64, y: i64, z: i64, state: u64) {
+    let s = (y - MIN_Y) >> 4
+    if s < 0 or s >= i64.wrap(u64(SECTIONS)) {
+        return
+    }
+    if let sections = mut out.find((x >> 4, z >> 4)) {
+        sections[usize.wrap(s)][usize.wrap(((y & 15) << 8) | ((z & 15) << 4) | (x & 15))] = state
+    }
+}
+
+/// Each chunk the side was sent, by its position: its sections' block states, by ID, with the
+/// blocks set since by `block_update` and `section_blocks_update`, in the order they came.
+fn chunks(side: str, chunk_id: u64, block_id: u64, section_id: u64) -> Map<(i64, i64), List<List<u64>>> {
+    let file = path.join(path.join(path.join(sessions_dir(), CONFIG), side), "join.bin")
+    let b = match read(file.copy()) {
+        ok(bytes) => bytes,
+        err(e) => die("ticking: {file}: {e}"),
+    }
+    var out = Map<(i64, i64), List<List<u64>>>()
+    var at = 0usize
+    while at < b.len() {
+        let state = b[at]
+        let n = usize.wrap(be_u32(b, at + 1))
+        let body = at + 5
+        at += 5 + n
+        if state != PLAY {
+            continue
+        }
+        var p = body
+        let kind = varint(b, mut p)
+        if kind == block_id {
+            // `BlockPos.asLong`: x in the top 26 bits, z in the next 26, y in the low 12.
+            let packed = be_u64(b, p)
+            var q = p + 8
+            let block = varint(b, mut q)
+            set_block(mut out, signed(packed >> 38, 26), signed(packed, 12), signed(packed >> 12, 26), block)
+            continue
+        }
+        if kind == section_id {
+            // `SectionPos.asLong`: x in the top 22 bits, z in the next 22, y in the low 20; then
+            // each block as its state over its place in the section, x, z and y, 4 bits each.
+            let packed = be_u64(b, p)
+            let sx = signed(packed >> 42, 22)
+            let sy = signed(packed, 20)
+            let sz = signed(packed >> 20, 22)
+            var q = p + 8
+            let count = varint(b, mut q)
+            for _ in 0..count {
+                let v = varint(b, mut q)
+                let local = i64.wrap(v & 4095)
+                set_block(mut out, sx * 16 + (local >> 8), sy * 16 + (local & 15), sz * 16 + ((local >> 4) & 15), v >> 12)
+            }
+            continue
+        }
+        if kind != chunk_id {
+            continue
+        }
+        let cx = signed(be_u32(b, p), 32)
+        let cz = signed(be_u32(b, p + 4), 32)
+        p += 8
+        let maps = varint(b, mut p)
+        for _ in 0..maps {
+            _ = varint(b, mut p)
+            let longs = varint(b, mut p)
+            p += 8 * usize.wrap(longs)
+        }
+        _ = varint(b, mut p)
+        var states: List<List<u64>> = []
+        for _ in 0..SECTIONS {
+            p += 4
+            states.push(container(b, mut p, 4096, 8))
+            _ = container(b, mut p, 64, 3)
+        }
+        out.insert((cx, cz), states)
+    }
+    return out
+}
+
+fn report(name: str) -> Json {
+    let file = under("generated/26.3/datagen/reports/{name}")
+    let text = match read_text(file.copy()) {
+        ok(t) => t ?? String(""),
+        err(e) => die("ticking: {file}: {e}"),
+    }
+    return match json.parse(text) {
+        ok(v) => v,
+        err(e) => die("ticking: {file}: {e}"),
+    }
+}
+
+/// Each block state's name by its ID, as blocks.json has them: `name[key=value,...]`, its
+/// properties in order of their names.
+fn state_names() -> Map<u64, String> {
+    var names = Map<u64, String>()
+    let Json.Object(blocks) = report("blocks.json") else {
+        die("ticking: blocks.json isn't an object")
+    }
+    for (block, info) in blocks {
+        let short = if block.starts_with("minecraft:") { block[10..] } else { block.copy() }
+        let states = info.get(String("states")) ?? Json.Array([])
+        for i in 0..states.len() {
+            let s = states.at(i) ?? Json.Null
+            let id = (s.get(String("id")) ?? Json.Null).as_u64() ?? 0
+            var name = short.copy()
+            if let props = s.get(String("properties")) {
+                var keys = props.keys()
+                if not keys.is_empty() {
+                    keys.sort()
+                    var parts: List<String> = []
+                    for k in keys {
+                        parts.push("{k}={(props.get(k.copy()) ?? Json.Null).as_str() ?? String("")}")
+                    }
+                    name = "{name}[{parts.join(String(","))}]"
+                }
+            }
+            names.insert(id, name)
+        }
+    }
+    return names
+}
+
+fn packet_id(play: Json, name: str) -> u64 {
+    let entry = play.get(String(name)) else {
+        die("ticking: packets.json has no {name}")
+    }
+    return (entry.get(String("protocol_id")) ?? Json.Null).as_u64() ?? 0
+}
+
+fn name_of(names: Map<u64, String>, id: u64) -> String {
+    if let n = names.find(id) {
+        return n.copy()
+    }
+    return "{id}"
+}
+
+/// A count of each thing, which comes first in the order it was first counted, as Python's
+/// `Counter.most_common` keeps ties.
+struct Tally {
+    keys: List<String>
+    counts: Map<String, i64>
+    first_at: Map<String, (i64, i64, i64)>
+}
+
+impl Tally {
+    fn add(mut self, key: own String, at: (i64, i64, i64)) {
+        if let n = mut self.counts.find(key.copy()) {
+            n += 1
+            return
+        }
+        self.keys.push(key.copy())
+        self.counts.insert(key.copy(), 1)
+        self.first_at.insert(key, at)
+    }
+
+    /// The keys, most counted first, ties in the order they were first counted.
+    fn most_common(self) -> List<(String, i64)> {
+        var out: List<(String, i64)> = []
+        for k in self.keys {
+            out.push((k.copy(), self.counts[k.copy()]))
+        }
+        out.sort_by(|a, b| b.1.cmp(a.1))
+        return out
+    }
+
+    fn total(self) -> i64 {
+        var n: i64 = 0
+        for k in self.keys {
+            n += self.counts[k.copy()]
+        }
+        return n
+    }
+}
+
+/// Checks what a chunk does as it starts to tick against vanilla (D329, CAL-91).
+@cli(name: "ticking")
+struct Args {
+    /// Compare the last recording again.
+    reuse: bool
+    /// The differences shown of each kind.
+    show: i64 = 10
+}
+
+pub fn main() {
+    let args = Args.parse()
+    let names = state_names()
+    let packets = report("packets.json")
+    let play = (packets.get(String("play")) ?? Json.Null).get(String("clientbound")) ?? Json.Null
+    let chunk_id = packet_id(play.copy(), "minecraft:level_chunk_with_light")
+    let block_id = packet_id(play.copy(), "minecraft:block_update")
+    let section_id = packet_id(play, "minecraft:section_blocks_update")
+    if not args.reuse {
+        let server = build("src/calcite.calx", "calcite")
+        let bot = build("src/rig/session.calx", "session")
+        var c = base([])
+        c.view = 10
+        c.scenarios = [String("join")]
+        c.world = some(String(SAVED_WORLD))
+        c.spawn = some([0i32, 100, 0])
+        c.entities = false
+        record(String(CONFIG), c.copy(), "vanilla", vanilla_argv(adapter(), false, false), bot.copy(), [String("join")])
+        record(String(CONFIG), c, "calcite", [server], bot, [String("join")])
+    }
+    let v = chunks("vanilla", chunk_id, block_id, section_id)
+    let k = chunks("calcite", chunk_id, block_id, section_id)
+    var compared: List<(i64, i64)> = []
+    for x in LOW..HIGH + 1 {
+        for z in LOW..HIGH + 1 {
+            if v.contains((x, z)) and k.contains((x, z)) {
+                compared.push((x, z))
+            }
+        }
+    }
+    let wanted = (HIGH - LOW + 1) * (HIGH - LOW + 1)
+    if i64.wrap(u64(compared.len())) != wanted {
+        die("ticking: only {compared.len()} of the chunks from {LOW} to {HIGH} were sent to both")
+    }
+    var known = Tally { keys: [], counts: Map<String, i64>(), first_at: Map<String, (i64, i64, i64)>() }
+    var unknown = Tally { keys: [], counts: Map<String, i64>(), first_at: Map<String, (i64, i64, i64)>() }
+    var pairs = Map<String, (String, String)>()
+    for (x, z) in compared {
+        let a = v[(x, z)].copy()
+        let b = k[(x, z)].copy()
+        for s in 0..SECTIONS {
+            if a[s] == b[s] {
+                continue
+            }
+            for i in 0..4096usize {
+                if a[s][i] == b[s][i] {
+                    continue
+                }
+                let va = name_of(names.copy(), a[s][i])
+                let ca = name_of(names.copy(), b[s][i])
+                let ii = i64.wrap(u64(i))
+                let at = (x * 16 + (ii & 15), MIN_Y + i64.wrap(u64(s)) * 16 + (ii >> 8), z * 16 + ((ii >> 4) & 15))
+                if let why = why_known(va.copy(), ca.copy()) {
+                    known.add(why, at)
+                } else {
+                    let key = "{va}\n{ca}"
+                    pairs.insert(key.copy(), (va, ca))
+                    unknown.add(key, at)
+                }
+            }
+        }
+    }
+    println("ticking: {compared.len()} chunks from {LOW} to {HIGH}, sent to both and compared")
+    for (why, n) in known.most_common() {
+        println("  {n:>6} waiting on {why}")
+    }
+    let show = if args.show < 0 { 0usize } else { usize.wrap(args.show) }
+    for (i, (key, n)) in unknown.most_common().enumerate() {
+        if i >= show {
+            break
+        }
+        let (va, ca) = pairs[key.copy()].copy()
+        let (ax, ay, az) = unknown.first_at[key.copy()]
+        println("  {n:>6} differ: vanilla {va}, Calcite {ca}, at ({ax}, {ay}, {az})")
+    }
+    if unknown.total() > 0 {
+        eprintln("ticking: {unknown.total()} blocks differ")
+        exit(1)
+    }
+    println("ticking: PASS, every block the same but those waiting on what isn't in Calcite yet")
+}

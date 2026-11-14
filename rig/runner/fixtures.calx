@@ -1,0 +1,276 @@
+module rig.runner.fixtures
+
+// Fixture worlds (CAL-116): small worlds vanilla 26.3 builds from console commands, which a
+// protocol session then has both servers load, so what's built runs the same on each and is
+// compared packet by packet and draw by draw (rig/README.md, "Fixture worlds").
+//
+//     calx rig/runner/fixtures.calx [NAME ...] [--force]
+//
+// A fixture is a file of commands in rig/fixtures/, NAME.txt, one to a line, with `#` comments.
+// Vanilla's server makes a flat world in build/rig/fixtures/NAME/, from the seed the sessions
+// use, force loads chunk (0, 0), freezes its ticks, so each tick a block set schedules waits in
+// the save, and types the commands, each answered as it should be or it stops. Then it lets the
+// chunk go, saves and stops, and build/rig/fixtures/NAME/world is the fixture's world, with only
+// its full chunks: those vanilla only began around the forced one, which it would go on with
+// where it left them and Calcite makes afresh, the same blocks with their palettes in another
+// order, are taken out of its region files, so each server makes them anew. A world already
+// built from the same commands is kept, unless --force; rig/runner/sessions.calx builds the
+// fixtures its configurations load as it starts. It was fixtures.py (CAL-253).
+
+import std.bytes.{hex}
+import std.cli.{cli}
+import std.fs.{exists, glob, is_file, make_dir_all, read, read_text, remove_dir_all, write}
+import std.hash.{sha256}
+import std.nbt.{NbtFile}
+import std.path
+import std.text.python.{repr_str}
+import std.time.{Instant}
+import rig.runner.servers.{Server, adapter, base_props, fixtures_dir, free_port, merged, properties, put, set, vanilla_argv}
+import tools.repo.{die, under}
+
+/// What vanilla answers each command with, by its first word.
+const ANSWERS: [(str, str); 9] = [
+    ("setblock", "Changed the block"),
+    ("fill", "Successfully filled"),
+    ("fillbiome", "biome entr"),
+    ("setworldspawn", "Set the world spawn point"),
+    ("summon", "Summoned new"),
+    ("time", "Set minecraft:overworld to"),
+    ("difficulty", "The difficulty has been set to"),
+    ("forceload", "to be force loaded"),
+    // Its center's and its size's, set at once; not "Nothing changed. The world border ...".
+    ("worldborder", "the world border"),
+]
+
+fn first_word(line: String) -> String {
+    let words = line.split_whitespace()
+    if words.is_empty() {
+        return String("")
+    }
+    return words[0].copy()
+}
+
+fn known(word: String) -> String? {
+    for (w, a) in ANSWERS {
+        if word == w {
+            return some(String(a))
+        }
+    }
+    return none
+}
+
+/// What the console answers `line` with: a `forceload remove`'s, which lets chunks a fixture
+/// forced to build in go once it's built, "for force loading" (CAL-159).
+fn answer(line: String) -> String {
+    let words = line.split_whitespace()
+    if words.len() >= 2 and words[0] == "forceload" and words[1] == "remove" {
+        return String("for force loading")
+    }
+    return known(first_word(line)) ?? String("")
+}
+
+/// The fixture's source, rig/fixtures/NAME.txt.
+fn source(name: String) -> String {
+    return under("rig/fixtures/{name}.txt")
+}
+
+/// The fixture's commands, without its comments and blank lines.
+pub fn commands(name: String) -> List<String> {
+    let file = source(name)
+    let text = match read_text(file.copy()) {
+        ok(t) => t ?? String(""),
+        err(e) => die("fixtures: {file}: {e}"),
+    }
+    var out: List<String> = []
+    for line in text.lines() {
+        let t = line.trim()
+        if not t.is_empty() and not t.starts_with("#") {
+            out.push(t)
+        }
+    }
+    return out
+}
+
+/// The SHA-256 of the commands, a line between each, in hex: what commands.sha256 holds.
+fn digest(name: String) -> String {
+    return hex(sha256(commands(name).join(String("\n")).to_bytes()))
+}
+
+/// Whether the fixture's world is there, built from the commands it has now.
+fn built(name: String) -> bool {
+    let folder = path.join(fixtures_dir(), name.copy())
+    let stamp = path.join(folder.copy(), "commands.sha256")
+    if not is_file(path.join(folder, "world/level.dat")) or not is_file(stamp.copy()) {
+        return false
+    }
+    let text = match read_text(stamp) {
+        ok(t) => t ?? String(""),
+        err(_) => String(""),
+    }
+    return text.trim() == digest(name)
+}
+
+fn be_int(data: List<u8>, at: usize, n: usize) -> i64 {
+    var v: i64 = 0
+    for k in 0..n {
+        v = v * 256 + i64(data[at + k])
+    }
+    return v
+}
+
+/// Takes each chunk that isn't full out of the world's region files, leaving its sectors unused;
+/// the chunks kept and taken.
+fn keep_full(world: String) -> (i64, i64) {
+    var kept: i64 = 0
+    var taken: i64 = 0
+    let regions = match glob(path.join(world, "dimensions/*/*/region/*.mca")) {
+        ok(found) => found,
+        err(e) => die("fixtures: {e}"),
+    }
+    for region in regions {
+        var data = match read(region.copy()) {
+            ok(b) => b,
+            err(e) => die("fixtures: {region}: {e}"),
+        }
+        if data.len() < 8192 {
+            continue
+        }
+        let name = path.file_name(region.copy()) ?? region.copy()
+        for i in 0..1024usize {
+            let sector = be_int(data.copy(), i * 4, 3)
+            if sector == 0 {
+                continue
+            }
+            let at = usize.wrap(sector) * 4096
+            let length = be_int(data.copy(), at, 4)
+            let kind = data[at + 4]
+            if kind != 2 {
+                die("fixtures: {name} keeps chunk {i} compressed as {kind}, not zlib")
+            }
+            var end = at + 4 + usize.wrap(length)
+            if end > data.len() {
+                end = data.len()
+            }
+            let chunk = match NbtFile.decode(data[at + 5..end]) {
+                ok(f) => f,
+                err(e) => die("fixtures: {name}: chunk {i}: {e}"),
+            }
+            let status = chunk.root.get(String("Status"))
+            if status != none and (status ?? chunk.root.copy()).as_str() == some(String("minecraft:full")) {
+                kept += 1
+                continue
+            }
+            for k in 0..4usize {
+                data[i * 4 + k] = 0
+                data[4096 + i * 4 + k] = 0
+            }
+            taken += 1
+        }
+        match write(region.copy(), data) {
+            ok => {},
+            err(e) => die("fixtures: {region}: {e}"),
+        }
+    }
+    return (kept, taken)
+}
+
+fn ask(server: mut Server, text: String, reply: String, at: usize) -> usize {
+    server.send(text)
+    return server.wait_for(reply, at, 30)
+}
+
+/// Builds the fixture's world, unless it's built from the same commands and not `force`.
+pub fn make(name: String, force: bool) {
+    if not force and built(name.copy()) {
+        return
+    }
+    let typed = commands(name.copy())
+    for line in typed {
+        if known(first_word(line.copy())) == none {
+            die("fixtures: {name}: no answer known for {repr_str(line.copy())}")
+        }
+    }
+    let folder = path.join(fixtures_dir(), name.copy())
+    if exists(folder.copy()) {
+        match remove_dir_all(folder.copy()) {
+            ok => {},
+            err(e) => die("fixtures: {folder}: {e}"),
+        }
+    }
+    match make_dir_all(folder.copy()) {
+        ok => {},
+        err(e) => die("fixtures: {folder}: {e}"),
+    }
+    // The flat world the sessions' own is, which doesn't pause, so the console's heard all along.
+    var props = merged(base_props(), [(String("spawn-protection"), String("0")), (String("pause-when-empty-seconds"), String("0"))])
+    set(mut props, String("server-port"), "{free_port()}")
+    put(path.join(folder.copy(), "server.properties"), properties(props))
+    // Elliot accepted Mojang's EULA for the rig's own scratch servers (CAL-42).
+    put(path.join(folder.copy(), "eula.txt"), String("eula=true\n"))
+    let began = unsafe { Instant.now() }
+    var server = Server.start(vanilla_argv(adapter(), false, false), folder.copy(), "vanilla building {name}")
+    var at = server.wait_for(String("Done ("), 0, 180)
+    at = ask(mut server, String("forceload add 0 0"), String("to be force loaded"), at)
+    loop {
+        server.send(String("execute if loaded 0 0 0"))
+        at = server.wait_for(String("Test "), at, 60)
+        if server.lines[at - 1].contains("Test passed") {
+            break
+        }
+        if unsafe { Instant.now() }.secs_since(began) > 120.0 {
+            server.abort("fixtures: {name}: chunk (0, 0) never loaded")
+        }
+        _ = server.pump(200)
+    }
+    at = ask(mut server, String("tick freeze"), String("The game is frozen"), at)
+    for line in typed {
+        at = ask(mut server, line.copy(), answer(line.copy()), at)
+    }
+    at = ask(mut server, String("forceload remove all"), String("Unmarked all force loaded chunks"), at)
+    // The fixture's own forced chunks, which the builder's took out with its own, kept in the
+    // world it saves (D428).
+    for line in typed {
+        if first_word(line.copy()) == "forceload" {
+            at = ask(mut server, line.copy(), answer(line.copy()), at)
+        }
+    }
+    _ = ask(mut server, String("save-all flush"), String("Saved the game"), at)
+    server.stop()
+    let (kept, taken) = keep_full(path.join(folder.copy(), "world"))
+    put(path.join(folder, "commands.sha256"), "{digest(name.copy())}\n")
+    let secs = unsafe { Instant.now() }.secs_since(began)
+    println("  {name}: vanilla built it from {typed.len()} commands in {secs:.1}s; {kept} full chunks kept, {taken} begun taken out")
+}
+
+/// Fixture worlds (CAL-116): small worlds vanilla 26.3 builds from console commands, which a
+/// protocol session then has both servers load.
+@cli(name: "fixtures")
+struct Args {
+    /// The fixtures to build, all of rig/fixtures/ if none.
+    @positional
+    names: List<String>
+    /// Build them again even if they're built.
+    force: bool
+}
+
+pub fn main() {
+    let args = Args.parse()
+    var names = args.names.copy()
+    if names.is_empty() {
+        let found = match glob(under("rig/fixtures/*.txt")) {
+            ok(f) => f,
+            err(e) => die("fixtures: {e}"),
+        }
+        for f in found {
+            let file = path.file_name(f.copy()) ?? f.copy()
+            names.push(file[..file.len() - 4])
+        }
+        names.sort()
+    }
+    for name in names {
+        if not is_file(source(name.copy())) {
+            die("fixtures: there's no rig/fixtures/{name}.txt")
+        }
+        make(name.copy(), args.force)
+    }
+}

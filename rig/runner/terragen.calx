@@ -1,0 +1,1226 @@
+module rig.runner.terragen
+
+// Checks Calcite's worldgen with Terralith and Terratonic against vanilla's (CAL-92): both servers
+// generate the same sample of chunks from the same seed and packs, and the chunks they save are
+// compared: each section's blocks and biomes, the heightmaps, the block entities, the block and
+// fluid ticks, the blocks marked for post-processing, and the structures' starts and references.
+// It was rig/runner/terragen.py, and gives what it gave (CAL-253).
+//
+//     calx rig/runner/terragen.calx [--reuse | --calcite] [--areas N] [--no-packs] [--orders]
+//                                   [--part-way]
+//
+// It runs in build/rig/terragen/, with Mojang's EULA accepted in its scratch folder only (CAL-42).
+// The packs are bench/packs.calx's, fetched and checked against their SHA-512s there, and the seed
+// is C2ME's, as the benchmark's is.
+//
+// 1. `vanilla/`: vanilla's server freezes its ticks first, so no block or fluid tick a feature
+//    leaves runs, force-loads the middle 8 by 8 chunks of each sample area, 12 by 12, waits until
+//    each is loaded, saves and stops. A chunk loaded so ticks, and vanilla post-processes it as it
+//    starts to, so what's compared is the ring of chunks 2 out from those, at the area's edge,
+//    which a force-loaded chunk needs full and which never tick: as a pregenerated chunk is.
+// 2. `calcite/`: Calcite's server pregenerates each area, and stops. With --part-way, it
+//    pregenerates the middle 10 by 10 of each first and stops, so the ring is saved lit around
+//    them, at `minecraft:light`, its mobs still to spawn; then it starts again and pregenerates the
+//    whole, carrying on from what it saved (CAL-161).
+// 3. Each chunk of the rings is read from both worlds' region files and compared, its blocks and
+//    biomes decoded, so a palette's order doesn't count, and its ticks, blocks to update and block
+//    entities by position, so their order doesn't either.
+//
+// The mobs each area's chunks spawned as they generated, `spawnMobsForChunkGeneration`, are
+// compared too, from each world's entity files, each as it's saved but for what's drawn from a
+// random of its own, its UUID and a chicken's egg time, and with its attributes sorted, which
+// vanilla saves in the order of a hash map keyed by identity (CAL-161): the same in a ring chunk
+// whose heightmaps are, so its surface is, unless vanilla's has a type Calcite doesn't make yet,
+// which ends a chunk's spawning in Calcite.
+//
+// Light and the times a chunk keeps aren't compared. Where features from neighbouring chunks
+// meet, what's left depends on the order the chunks were decorated in, which vanilla doesn't fix
+// and Calcite fixes as its own (D29, D214): ore and stone blobs over each other, dripstone and
+// sculk, trees, and the ticks, blocks to update and block entities that go with them (D288). So
+// what's compared is in two parts:
+//
+// - what must be the same: each chunk's status, its biomes, its structures' references, its
+//   starts but for the flags pieces set as they're placed, and the block entities both have, as
+//   they're saved;
+// - what the order moves: the blocks, heightmaps, ticks and blocks to update, and which block
+//   entities there are, counted.
+//
+// It writes both to build/rig/terragen/report.json, and exits with 1 if anything that must be the
+// same isn't. --orders has vanilla make the sample a second time, force-loading one chunk at a
+// time from the far corner, in vanilla2/, and counts what that moves too, for scale. --reuse
+// compares the last run's worlds again, and --calcite makes Calcite's again against the last
+// run's vanilla ones. --no-packs does it all without the packs, in build/rig/terragen/plain/.
+
+import std.cli.{cli}
+import std.fs.{copy, exists, is_dir, is_file, make_dir_all, remove_dir_all}
+import std.json.{Json}
+import std.nbt.{Tag}
+import std.nbt.region.{RegionFile}
+import std.path
+import std.process.{exit}
+import std.text.python.{repr_float_into, repr_str}
+import std.time.{Instant}
+import bench.packs.{SEED, fetch, packs_dir, pins}
+import rig.runner.savediff.{state_name}
+import rig.runner.servers.{Server, adapter, build, free_port, put, vanilla_argv}
+import rig.runner.sessions.{json_same}
+import tools.pyjson
+import tools.pyjson.{indented_one_ascii}
+import tools.pynbt.{cut, elements, py_str_or_none, repr_strings, same, same_or_none}
+import tools.repo.{die, native, under}
+
+// Each area's side in chunks, and how far in from its edge the chunks force-loaded start.
+const SIDE: i64 = 12
+const INSET: i64 = 2
+
+/// The sample's areas, by the block at their low corner: the spawn's, the benchmark's measured
+/// area's, and two far from both, in each quarter's direction.
+fn all_areas() -> List<(i64, i64)> {
+    return [(0, 0), (1000000, 1000000), (-20000, 35000), (300000, -500000), (-123456, -654321), (777777, 4096)]
+}
+
+/// Where a run keeps its worlds, and whether they have the packs.
+struct Run {
+    root: String
+    packs: bool
+}
+
+fn region_dir(run: Run, world: str) -> String {
+    return path.join(path.join(run.root.copy(), world), "world/dimensions/minecraft/overworld/region")
+}
+
+fn entities_dir(run: Run, world: str) -> String {
+    return path.join(path.join(run.root.copy(), world), "world/dimensions/minecraft/overworld/entities")
+}
+
+/// The chunks compared: the area's edge, 2 out from those force-loaded.
+fn chunks_of(area: (i64, i64)) -> List<(i64, i64)> {
+    var out: List<(i64, i64)> = []
+    for dz in 0..SIDE {
+        for dx in 0..SIDE {
+            if dx == 0 or dx == SIDE - 1 or dz == 0 or dz == SIDE - 1 {
+                out.push(((area.0 >> 4) + dx, (area.1 >> 4) + dz))
+            }
+        }
+    }
+    return out
+}
+
+/// Every chunk of the area, whose mobs are compared.
+fn area_of(area: (i64, i64)) -> List<(i64, i64)> {
+    var out: List<(i64, i64)> = []
+    for dz in 0..SIDE {
+        for dx in 0..SIDE {
+            out.push(((area.0 >> 4) + dx, (area.1 >> 4) + dz))
+        }
+    }
+    return out
+}
+
+fn forced_of(area: (i64, i64)) -> List<(i64, i64)> {
+    var out: List<(i64, i64)> = []
+    for dz in INSET..SIDE - INSET {
+        for dx in INSET..SIDE - INSET {
+            out.push(((area.0 >> 4) + dx, (area.1 >> 4) + dz))
+        }
+    }
+    return out
+}
+
+fn made_dir(dir: String) {
+    match make_dir_all(dir.copy()) {
+        ok => {},
+        err(e) => die("terragen: {dir}: {e}"),
+    }
+}
+
+fn prepare(run: Run, folder: String, port: i64, eula: bool) {
+    if exists(folder.copy()) {
+        match remove_dir_all(folder.copy()) {
+            ok => {},
+            err(e) => die("terragen: removing {folder}: {e}"),
+        }
+    }
+    let packs = path.join(folder.copy(), "world/datapacks")
+    made_dir(packs.copy())
+    if run.packs {
+        for pin in pins() {
+            match copy(path.join(packs_dir(), pin.file), path.join(packs.copy(), pin.file)) {
+                ok => {},
+                err(e) => die("terragen: copying {pin.file}: {e}"),
+            }
+        }
+    }
+    put(path.join(folder.copy(), "server.properties"), "online-mode=false\nserver-ip=127.0.0.1\nserver-port={port}\nlevel-seed={SEED}\nview-distance=2\nsimulation-distance=2\nspawn-protection=0\n")
+    if eula {
+        // Elliot accepted Mojang's EULA for the rig's own scratch servers (CAL-42).
+        put(path.join(folder, "eula.txt"), String("eula=true\n"))
+    }
+}
+
+fn vanilla(run: Run, areas: List<(i64, i64)>, name: str, one_by_one: bool) {
+    let folder = path.join(run.root.copy(), name)
+    prepare(run.copy(), folder.copy(), free_port(), true)
+    let began = unsafe { Instant.now() }
+    var server = Server.start(vanilla_argv(adapter(), false, false), folder, String("vanilla"))
+    var at = server.wait_for(String("Done ("), 0, 600)
+    server.send(String("tick freeze"))
+    at = server.wait_for(String("The game is frozen"), at, 180)
+    if not one_by_one {
+        for area in areas {
+            let bx = ((area.0 >> 4) + INSET) * 16
+            let bz = ((area.1 >> 4) + INSET) * 16
+            let span = (SIDE - 2 * INSET) * 16 - 1
+            server.send("forceload add {bx} {bz} {bx + span} {bz + span}")
+            at = server.wait_for(String("to be force loaded"), at, 180)
+        }
+    }
+    for area in areas {
+        var forced = forced_of(area)
+        if one_by_one {
+            forced.reverse()
+        }
+        for (cx, cz) in forced {
+            if one_by_one {
+                server.send("forceload add {cx * 16} {cz * 16}")
+                at = server.wait_for(String("force loaded"), at, 180)
+            }
+            let start = unsafe { Instant.now() }
+            loop {
+                server.send("execute if loaded {cx * 16} 0 {cz * 16}")
+                at = server.wait_for(String("Test "), at, 60)
+                if server.lines[at - 1].contains("Test passed") {
+                    break
+                }
+                if unsafe { Instant.now() }.secs_since(start) > 600.0 {
+                    server.abort("terragen: vanilla never loaded chunk {cx}, {cz}")
+                }
+                // Python slept a quarter of a second here; this reads the console meanwhile.
+                _ = server.pump(250)
+            }
+        }
+    }
+    server.send(String("save-all flush"))
+    _ = server.wait_for(String("Saved the game"), at, 600)
+    server.stop()
+    let secs = unsafe { Instant.now() }.secs_since(began)
+    println("  vanilla made {areas.len()} areas in {name}/ in {secs:.1} s")
+}
+
+fn calcite(run: Run, areas: List<(i64, i64)>, part_way: bool) {
+    let exe_path = build("src/calcite.calx", "calcite")
+    let folder = path.join(run.root.copy(), "calcite")
+    prepare(run.copy(), folder.copy(), free_port(), false)
+    put(path.join(folder.copy(), "calcite.properties"), String("console-dashboard=off\nrecord-inputs=false\n"))
+    let began = unsafe { Instant.now() }
+    let half = SIDE * 8
+    // The square of each area's chunks, its middle first where it's made part-way.
+    let radii: List<i64> = if part_way { [half - 16, half] } else { [half] }
+    for radius in radii {
+        var server = Server.start([exe_path.copy()], folder.copy(), String("calcite"))
+        var at = server.wait_for(String("Done ("), 0, 600)
+        for area in areas {
+            server.send("pregen center {(area.0 >> 4) * 16 + half} {(area.1 >> 4) * 16 + half}")
+            server.send("pregen radius {radius}")
+            server.send(String("pregen start"))
+            at = server.wait_for(String(" done: "), at, 3600)
+        }
+        server.stop()
+    }
+    let secs = unsafe { Instant.now() }.secs_since(began)
+    println("  Calcite made its chunks in {secs:.1} s")
+}
+
+/// The chunk's root compound from the region files in `dir`, or none if it isn't saved.
+fn chunk(dir: String, cx: i64, cz: i64) -> Tag? {
+    let file = path.join(dir, "r.{cx >> 5}.{cz >> 5}.mca")
+    if not is_file(file.copy()) {
+        return none
+    }
+    var region = match RegionFile.open_read(file.copy()) {
+        ok(r) => r,
+        err(e) => die("terragen: {file}: {e}"),
+    }
+    let got = match region.read(i32.wrap(cx), i32.wrap(cz)) {
+        ok(t) => t,
+        err(e) => die("terragen: chunk {cx}, {cz}: {e}"),
+    }
+    match region.close() {
+        ok => {},
+        err(_) => {},
+    }
+    return got
+}
+
+/// A compound's member, if it's a compound that has one.
+fn member(t: Tag, key: str) -> Tag? {
+    return t.get(String(key))
+}
+
+/// A list's elements, or none if it isn't one or isn't there.
+fn listed(t: Tag?, key: str) -> List<Tag> {
+    if let x = t {
+        if let m = member(x, key) {
+            return elements(m) ?? List<Tag>()
+        }
+    }
+    return []
+}
+
+fn whole(t: Tag?) -> i64 {
+    if let x = t {
+        if let i = x.as_int() {
+            return i
+        }
+    }
+    return 0
+}
+
+/// A paletted container's indices, packed as 26.3 packs them: no index across two longs, and 0s
+/// past the data's end.
+fn unpack(data: List<Tag>, bits: usize, count: usize) -> List<usize> {
+    let per = 64 / bits
+    let mask = (1u64 << u64(bits)) - 1
+    var out: List<usize> = []
+    for t in data {
+        let v = u64.wrap(t.as_int() ?? 0)
+        for j in 0..per {
+            out.push(usize.wrap((v >> u64(j * bits)) & mask))
+            if out.len() == count {
+                return out
+            }
+        }
+    }
+    while out.len() < count {
+        out.push(0)
+    }
+    return out
+}
+
+fn bit_length(n: usize) -> usize {
+    var bits = 0usize
+    var m = n
+    while m > 0 {
+        bits += 1
+        m >>= 1
+    }
+    return bits
+}
+
+/// A section's blocks or biomes: its palette, and each place's index into it.
+struct Paletted {
+    palette: List<String>
+    idx: List<usize>
+}
+
+impl Paletted {
+    fn at(self, i: usize) -> String {
+        return self.palette[self.idx[i]].copy()
+    }
+
+    fn same_at(self, other: Paletted, i: usize) -> bool {
+        return self.palette[self.idx[i]] == other.palette[other.idx[i]]
+    }
+}
+
+fn uniform(name: String, count: usize) -> Paletted {
+    var idx: List<usize> = []
+    for _ in 0..count {
+        idx.push(0)
+    }
+    return Paletted { palette: [name.copy()], idx: idx }
+}
+
+fn decoded(container: Tag, count: usize, least: usize, blocks: bool) -> Paletted {
+    var palette: List<String> = []
+    for s in listed(some(container.copy()), "palette") {
+        palette.push(if blocks { state_name(s) } else { py_str_or_none(some(s.copy())) })
+    }
+    let data = listed(some(container.copy()), "data")
+    if palette.is_empty() {
+        die("terragen: a section with an empty palette")
+    }
+    if data.is_empty() or palette.len() == 1 {
+        return uniform(palette[0].copy(), count)
+    }
+    let needed = bit_length(palette.len() - 1)
+    let bits = if needed > least { needed } else { least }
+    return Paletted { palette: palette, idx: unpack(data, bits, count) }
+}
+
+/// A section of a chunk: its blocks and biomes, decoded, where it has them.
+struct Section {
+    blocks: Paletted?
+    biomes: Paletted?
+}
+
+/// Each section's blocks and biomes, by its Y.
+fn sections(c: Tag) -> Map<i64, Section> {
+    var out = Map<i64, Section>()
+    for sec in listed(some(c.copy()), "sections") {
+        let y = whole(member(sec, "Y"))
+        var blocks: Paletted? = none
+        var biomes: Paletted? = none
+        if let b = member(sec, "block_states") {
+            blocks = some(decoded(b, 4096, 4, true))
+        }
+        if let b = member(sec, "biomes") {
+            biomes = some(decoded(b, 64, 0, false))
+        }
+        out.insert(y, Section { blocks: blocks, biomes: biomes })
+    }
+    return out
+}
+
+/// An NBT value as nbt.py read it and JSON holds it, its compounds' keys sorted.
+fn plain(t: Tag) -> Json {
+    return match t {
+        Tag.Byte(v) => Json.Int(i64(v)),
+        Tag.Short(v) => Json.Int(i64(v)),
+        Tag.Int(v) => Json.Int(i64(v)),
+        Tag.Long(v) => Json.Int(v),
+        Tag.Float(v) => Json.Float(f64(v)),
+        Tag.Double(v) => Json.Float(v),
+        Tag.String(s) => Json.Str(s.copy()),
+        Tag.End => Json.Null,
+        Tag.Compound(_) => {
+            var keys = t.keys()
+            keys.sort()
+            var m = LinkedMap<String, Json>()
+            for k in keys {
+                let v = t.get(k.copy()) ?? Tag.End
+                m.insert(k.copy(), plain(v))
+            }
+            Json.Object(m)
+        }
+        _ => {
+            var xs: List<Json> = []
+            for x in elements(t) ?? List<Tag>() {
+                xs.push(plain(x))
+            }
+            Json.Array(xs)
+        }
+    }
+}
+
+/// `json.dumps(value)`, as Python wrote it: `, ` and `: `, all but ASCII escaped.
+fn dumped(v: Json) -> String {
+    return pyjson.spaced_ascii(v)
+}
+
+
+// The fields a structure piece sets as it's placed, the first time a chunk it's in is decorated
+// or as it places a chest, a spawner or a mob, which the order of decoration decides.
+const PLACED_FLAGS: [str; 14] = ["hps", "Witch", "Cat", "placedMainChest", "placedHiddenChest", "placedTrap1", "placedTrap2",
+    "hasPlacedChest0", "hasPlacedChest1", "hasPlacedChest2", "hasPlacedChest3", "HPos", "Chest", "Mob"]
+
+/// A start without the flags its pieces set as they're placed, nor the height of a shipwreck
+/// that's adjusted it, `height_adjusted`, which `ShipwreckPiece.postProcess` works out from the
+/// heights around it the first time it's placed, so the order decides it too.
+fn unplaced(start: Tag) -> Json {
+    var out = start.copy()
+    let Tag.List(children) = member(start, "Children") ?? Tag.End else {
+        return plain(out)
+    }
+    var pieces: List<Tag> = []
+    for c in children {
+        var piece = c.copy()
+        for flag in PLACED_FLAGS {
+            _ = piece.remove(String(flag))
+        }
+        if let h = member(piece.copy(), "height_adjusted") {
+            if h.as_bool() ?? true {
+                _ = piece.remove(String("TPY"))
+                if let bb = member(piece.copy(), "BB") {
+                    let xs = elements(bb) ?? List<Tag>()
+                    if xs.len() == 6 {
+                        let kept: List<Tag> = [xs[0].copy(), xs[2].copy(), xs[3].copy(), xs[5].copy()]
+                        _ = piece.insert(String("BB"), Tag.List(kept))
+                    }
+                }
+            }
+        }
+        pieces.push(piece)
+    }
+    _ = out.insert(String("Children"), Tag.List(pieces))
+    return plain(out)
+}
+
+/// A tick as a sorted tuple: its block or fluid, place, delay and priority.
+struct Tick {
+    id: String
+    x: i64
+    y: i64
+    z: i64
+    t: i64
+    p: i64
+}
+
+fn tick_cmp(a: Tick, b: Tick) -> Ordering {
+    let by_id = a.id.cmp(b.id.copy())
+    if by_id != Ordering.Equal {
+        return by_id
+    }
+    return (a.x, a.y, a.z, a.t, a.p).cmp((b.x, b.y, b.z, b.t, b.p))
+}
+
+fn tick_repr(t: Tick) -> String {
+    return "({repr_str(t.id.copy())}, {t.x}, {t.y}, {t.z}, {t.t}, {t.p})"
+}
+
+/// A chunk's ticks, as a sorted list, so their order doesn't count.
+fn ticks(c: Tag, key: str) -> List<Tick> {
+    var out: List<Tick> = []
+    for t in listed(some(c.copy()), key) {
+        out.push(Tick {
+            id: py_str_or_none(member(t.copy(), "i")),
+            x: whole(member(t.copy(), "x")),
+            y: whole(member(t.copy(), "y")),
+            z: whole(member(t.copy(), "z")),
+            t: whole(member(t.copy(), "t")),
+            p: whole(member(t, "p")),
+        })
+    }
+    out.sort_by(|a, b| tick_cmp(a.copy(), b.copy()))
+    return out
+}
+
+fn ticks_same(a: List<Tick>, b: List<Tick>) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for i in 0..a.len() {
+        if tick_cmp(a[i].copy(), b[i].copy()) != Ordering.Equal {
+            return false
+        }
+    }
+    return true
+}
+
+/// `sorted(set(a) - set(b))`'s first 3, as Python wrote the list.
+fn only_repr(a: List<Tick>, b: List<Tick>) -> String {
+    var out: List<String> = []
+    var last: Tick? = none
+    for x in a {
+        if let l = last {
+            if tick_cmp(l, x.copy()) == Ordering.Equal {
+                continue
+            }
+        }
+        last = some(x.copy())
+        var found = false
+        for y in b {
+            if tick_cmp(x.copy(), y.copy()) == Ordering.Equal {
+                found = true
+                break
+            }
+        }
+        if not found and out.len() < 3 {
+            out.push(tick_repr(x.copy()))
+        }
+    }
+    return "[{out.join(String(", "))}]"
+}
+
+/// Each section's blocks marked for post-processing, sorted, with no empty sections at the end.
+fn marks(c: Tag) -> List<List<i64>> {
+    var out: List<List<i64>> = []
+    for section in listed(some(c.copy()), "PostProcessing") {
+        var xs: List<i64> = []
+        for o in elements(section) ?? List<Tag>() {
+            xs.push(o.as_int() ?? 0)
+        }
+        xs.sort()
+        out.push(xs)
+    }
+    while out.len() > 0 and out[out.len() - 1].is_empty() {
+        _ = out.pop()
+    }
+    return out
+}
+
+fn marks_count(m: List<List<i64>>) -> usize {
+    var n = 0usize
+    for x in m {
+        n += x.len()
+    }
+    return n
+}
+
+fn section_marks(m: List<List<i64>>, i: usize) -> List<i64> {
+    if i < m.len() {
+        return m[i].copy()
+    }
+    return []
+}
+
+/// A compound's keys, sorted, or none for anything else.
+fn sorted_keys(t: Tag?) -> List<String> {
+    var keys = (t.copy() ?? Tag.End).keys()
+    keys.sort()
+    return keys
+}
+
+/// A start's references as `{k: sorted(x) for k, x in refs.items()}`.
+fn references(st: Tag?) -> LinkedMap<String, List<i64>> {
+    var out = LinkedMap<String, List<i64>>()
+    let refs = member(st.copy() ?? Tag.End, "References") ?? Tag.End
+    for k in refs.keys() {
+        var xs: List<i64> = []
+        for x in elements(refs.get(k.copy()) ?? Tag.End) ?? List<Tag>() {
+            xs.push(x.as_int() ?? 0)
+        }
+        xs.sort()
+        out.insert(k.copy(), xs)
+    }
+    return out
+}
+
+fn references_same(a: LinkedMap<String, List<i64>>, b: LinkedMap<String, List<i64>>) -> bool {
+    if a.len() != b.len() {
+        return false
+    }
+    for (k, x) in a {
+        if not b.contains(k.copy()) {
+            return false
+        }
+        if b[k.copy()] != x {
+            return false
+        }
+    }
+    return true
+}
+
+fn ints_repr(xs: List<i64>) -> String {
+    var parts: List<String> = []
+    for x in xs {
+        parts.push("{x}")
+    }
+    return "[{parts.join(String(", "))}]"
+}
+
+fn references_repr(m: LinkedMap<String, List<i64>>) -> String {
+    var parts: List<String> = []
+    for (k, xs) in m {
+        parts.push("{repr_str(k.copy())}: {ints_repr(xs.copy())}")
+    }
+    return "\{{parts.join(String(", "))}\}"
+}
+
+fn pos_repr(p: (i64, i64, i64)) -> String {
+    return "({p.0}, {p.1}, {p.2})"
+}
+
+/// A chunk's block entities by position.
+fn block_entities(c: Tag) -> Map<(i64, i64, i64), Tag> {
+    var out = Map<(i64, i64, i64), Tag>()
+    for b in listed(some(c.copy()), "block_entities") {
+        let at = (whole(member(b.copy(), "x")), whole(member(b.copy(), "y")), whole(member(b.copy(), "z")))
+        out.insert(at, b.copy())
+    }
+    return out
+}
+
+fn positions(a: Map<(i64, i64, i64), Tag>, b: Map<(i64, i64, i64), Tag>) -> List<(i64, i64, i64)> {
+    var out: List<(i64, i64, i64)> = []
+    for (k, _) in a {
+        out.push(k)
+    }
+    for (k, _) in b {
+        if not a.contains(k) {
+            out.push(k)
+        }
+    }
+    out.sort()
+    return out
+}
+
+/// What differs between vanilla's chunk and Calcite's.
+struct Compared {
+    diffs: List<String>
+    moved: List<String>
+    blocks: i64
+}
+
+/// What differs between vanilla's chunk and Calcite's: lines of what must be the same, and of
+/// what the order of decoration moves, with the blocks that differ.
+fn compare(cx: i64, cz: i64, vc: Tag?, cc: Tag?) -> Compared {
+    let v = vc else {
+        return Compared { diffs: [String("vanilla didn't save it")], moved: [], blocks: 0 }
+    }
+    let c = cc else {
+        return Compared { diffs: [String("Calcite didn't save it")], moved: [], blocks: 0 }
+    }
+    var diffs: List<String> = []
+    var moved: List<String> = []
+    if not same_or_none(member(v.copy(), "Status"), member(c.copy(), "Status")) {
+        diffs.push("status: vanilla {py_str_or_none(member(v.copy(), "Status"))}, Calcite {py_str_or_none(member(c.copy(), "Status"))}")
+    }
+    let vs = sections(v.copy())
+    let cs = sections(c.copy())
+    var ys: List<i64> = []
+    for (y, _) in vs {
+        ys.push(y)
+    }
+    for (y, _) in cs {
+        if not vs.contains(y) {
+            ys.push(y)
+        }
+    }
+    ys.sort()
+    var blocks_off = 0i64
+    var biomes_off = 0i64
+    var first: String? = none
+    for y in ys {
+        let vsec = if vs.contains(y) { vs[y].copy() } else { Section { blocks: none, biomes: none } }
+        let csec = if cs.contains(y) { cs[y].copy() } else { Section { blocks: none, biomes: none } }
+        if vsec.blocks != none or csec.blocks != none {
+            let vb = vsec.blocks.copy() ?? uniform(String("minecraft:air"), 4096)
+            let cb = csec.blocks.copy() ?? uniform(String("minecraft:air"), 4096)
+            for i in 0..4096usize {
+                if not vb.same_at(cb.copy(), i) {
+                    blocks_off += 1
+                    if first == none {
+                        let x = i64.wrap(u64(i & 15))
+                        let z = i64.wrap(u64((i >> 4) & 15))
+                        let by = i64.wrap(u64(i >> 8))
+                        first = some("({cx * 16 + x}, {y * 16 + by}, {cz * 16 + z}): vanilla {vb.at(i)}, Calcite {cb.at(i)}")
+                    }
+                }
+            }
+        }
+        if let vbi = vsec.biomes {
+            if let cbi = csec.biomes {
+                for i in 0..64usize {
+                    if not vbi.same_at(cbi.copy(), i) {
+                        biomes_off += 1
+                    }
+                }
+            }
+        }
+    }
+    if blocks_off > 0 {
+        moved.push("blocks: {blocks_off} differ, the first at {first ?? String("None")}")
+    }
+    if biomes_off > 0 {
+        diffs.push("biomes: {biomes_off} quarts differ")
+    }
+    let vh = member(v.copy(), "Heightmaps")
+    let ch = member(c.copy(), "Heightmaps")
+    let vnames = sorted_keys(vh.copy())
+    let cnames = sorted_keys(ch.copy())
+    for name in vnames.copy() {
+        if cnames.contains(name.copy()) {
+            if not same_or_none((vh.copy() ?? Tag.End).get(name.copy()), (ch.copy() ?? Tag.End).get(name.copy())) {
+                moved.push("heightmap {name} differs")
+            }
+        }
+    }
+    var either: List<(String, bool)> = []
+    for name in vnames.copy() {
+        if not cnames.contains(name.copy()) {
+            either.push((name.copy(), true))
+        }
+    }
+    for name in cnames.copy() {
+        if not vnames.contains(name.copy()) {
+            either.push((name.copy(), false))
+        }
+    }
+    either.sort_by(|a, b| a.0.cmp(b.0.copy()))
+    for (name, in_vanilla) in either {
+        diffs.push("heightmap {name} only in {if in_vanilla { "vanilla" } else { "Calcite" }}")
+    }
+    let vbe = block_entities(v.copy())
+    let cbe = block_entities(c.copy())
+    for pos in positions(vbe.copy(), cbe.copy()) {
+        if not cbe.contains(pos) {
+            moved.push("block entity at {pos_repr(pos)}: only vanilla's, {py_str_or_none(member(vbe[pos].copy(), "id"))}")
+        } else if not vbe.contains(pos) {
+            moved.push("block entity at {pos_repr(pos)}: only Calcite's, {py_str_or_none(member(cbe[pos].copy(), "id"))}")
+        } else if not same(vbe[pos].copy(), cbe[pos].copy()) {
+            diffs.push("block entity at {pos_repr(pos)} differs: vanilla {cut(dumped(plain(vbe[pos].copy())), 300)}, Calcite {cut(dumped(plain(cbe[pos].copy())), 300)}")
+        }
+    }
+    for kind in ["block_ticks", "fluid_ticks"] {
+        let vt = ticks(v.copy(), kind)
+        let ct = ticks(c.copy(), kind)
+        if not ticks_same(vt.copy(), ct.copy()) {
+            moved.push("{kind}: {vt.len()} in vanilla's, {ct.len()} in Calcite's; only vanilla's {only_repr(vt.copy(), ct.copy())}, only Calcite's {only_repr(ct.copy(), vt.copy())}")
+        }
+    }
+    let vp = marks(v.copy())
+    let cp = marks(c.copy())
+    if vp != cp {
+        let most = if vp.len() > cp.len() { vp.len() } else { cp.len() }
+        var at = 0usize
+        for i in 0..most {
+            if section_marks(vp.copy(), i) != section_marks(cp.copy(), i) {
+                at = i
+                break
+            }
+        }
+        moved.push("PostProcessing: {marks_count(vp.copy())} marks in vanilla's, {marks_count(cp.copy())} in Calcite's, first differing in section {at}")
+    }
+    let vst = member(v.copy(), "structures")
+    let cst = member(c.copy(), "structures")
+    let vkeys = sorted_keys(vst.copy())
+    let ckeys = sorted_keys(cst.copy())
+    if vkeys != ckeys {
+        diffs.push("structures: vanilla's has {repr_strings(vkeys.copy())}, Calcite's {repr_strings(ckeys.copy())}")
+    }
+    let vref = references(vst.copy())
+    let cref = references(cst.copy())
+    if not references_same(vref.copy(), cref.copy()) {
+        diffs.push("structure references: vanilla {references_repr(vref.copy())}, Calcite {references_repr(cref.copy())}")
+    }
+    let vstart = member(vst.copy() ?? Tag.End, "starts")
+    let cstart = member(cst.copy() ?? Tag.End, "starts")
+    let vsk = sorted_keys(vstart.copy())
+    let csk = sorted_keys(cstart.copy())
+    if vsk != csk {
+        diffs.push("structure starts: vanilla {repr_strings(vsk.copy())}, Calcite {repr_strings(csk.copy())}")
+    } else {
+        for k in vsk {
+            let a = (vstart.copy() ?? Tag.End).get(k.copy()) ?? Tag.End
+            let b = (cstart.copy() ?? Tag.End).get(k.copy()) ?? Tag.End
+            let ua = unplaced(a.copy())
+            let ub = unplaced(b.copy())
+            if not json_same(ua.copy(), ub.copy()) {
+                diffs.push("structure start {k} differs: vanilla {cut(dumped(ua), 400)}, Calcite {cut(dumped(ub), 400)}")
+            } else if not same(a, b) {
+                moved.push("structure start {k}: its pieces' placed flags or heights differ")
+            }
+        }
+    }
+    return Compared { diffs: diffs, moved: moved, blocks: blocks_off }
+}
+
+// What an entity draws from a random of its own as it's made, which depends on its ID, and so on
+// the order vanilla's threads made the chunks in.
+const OWN_RANDOM: [str; 2] = ["UUID", "EggLayTime"]
+
+/// An entity as it's compared, with what it's sorted by.
+struct Mob {
+    tag: Json
+    id: String
+    pos: List<f64>
+}
+
+fn floats_cmp(a: List<f64>, b: List<f64>) -> Ordering {
+    let n = if a.len() < b.len() { a.len() } else { b.len() }
+    for i in 0..n {
+        if a[i] < b[i] {
+            return Ordering.Less
+        }
+        if a[i] > b[i] {
+            return Ordering.Greater
+        }
+    }
+    return a.len().cmp(b.len())
+}
+
+/// An entity chunk's entities as they're saved, but for `OWN_RANDOM`, with their attributes
+/// sorted, and sorted by type and place, so no order counts.
+fn mobs(c: Tag?) -> List<Json> {
+    var found: List<Mob> = []
+    for e in listed(c, "Entities") {
+        var t = e.copy()
+        for key in OWN_RANDOM {
+            _ = t.remove(String(key))
+        }
+        if let Tag.List(attrs) = member(t.copy(), "attributes") ?? Tag.End {
+            var sorted = attrs.copy()
+            sorted.sort_by(|a, b| py_str_or_none(member(a.copy(), "id")).cmp(py_str_or_none(member(b.copy(), "id"))))
+            _ = t.insert(String("attributes"), Tag.List(sorted))
+        }
+        let id = if let i = member(t.copy(), "id") { py_str_or_none(some(i)) } else { String("") }
+        var pos: List<f64> = []
+        for p in listed(some(t.copy()), "Pos") {
+            pos.push(p.as_float() ?? 0.0)
+        }
+        found.push(Mob { tag: plain(t), id: id, pos: pos })
+    }
+    found.sort_by(|a, b| {
+        let by_id = a.id.cmp(b.id.copy())
+        if by_id != Ordering.Equal { by_id } else { floats_cmp(a.pos.copy(), b.pos.copy()) }
+    })
+    var out: List<Json> = []
+    for m in found {
+        out.push(m.tag.copy())
+    }
+    return out
+}
+
+fn json_member(t: Json, key: str) -> Json {
+    return t.get(String(key)) ?? Json.Null
+}
+
+fn id_of(t: Json) -> String {
+    if let s = json_member(t.copy(), "id").as_str() {
+        return s
+    }
+    return String("None")
+}
+
+/// `round(x, 3)`, as Python rounds it: to the nearest of the 3-place decimals.
+fn round3(x: f64) -> f64 {
+    return f64.parse("{x:.3}") ?? x
+}
+
+/// Entities as their types and places, for the report.
+fn short(tags: List<Json>) -> List<String> {
+    var out: List<String> = []
+    for t in tags {
+        var places = String("[")
+        let pos = json_member(t.copy(), "Pos")
+        for i in 0..pos.len() {
+            if i > 0 {
+                places.push_str(", ")
+            }
+            repr_float_into(mut places, round3((pos.at(i) ?? Json.Null).as_f64() ?? 0.0))
+        }
+        places.push_str("]")
+        out.push("{id_of(t.copy())} at {places}")
+    }
+    return out
+}
+
+fn first_n(xs: List<String>, n: usize) -> List<String> {
+    return if xs.len() > n { xs[0..n].copy() } else { xs.copy() }
+}
+
+/// What differs between vanilla's mobs in a chunk and Calcite's, or none.
+fn compare_mobs(vm: List<Json>, cm: List<Json>) -> String? {
+    if json_same(Json.Array(vm.copy()), Json.Array(cm.copy())) {
+        return none
+    }
+    var vids: List<Json> = []
+    var cids: List<Json> = []
+    var vpos: List<Json> = []
+    var cpos: List<Json> = []
+    for t in vm {
+        vids.push(json_member(t.copy(), "id"))
+        vpos.push(json_member(t.copy(), "Pos"))
+    }
+    for t in cm {
+        cids.push(json_member(t.copy(), "id"))
+        cpos.push(json_member(t.copy(), "Pos"))
+    }
+    if not json_same(Json.Array(vids), Json.Array(cids)) or not json_same(Json.Array(vpos), Json.Array(cpos)) {
+        return some("vanilla's {repr_strings(first_n(short(vm.copy()), 6))}, Calcite's {repr_strings(first_n(short(cm.copy()), 6))}")
+    }
+    let n = if vm.len() < cm.len() { vm.len() } else { cm.len() }
+    for i in 0..n {
+        let a = vm[i].copy()
+        let b = cm[i].copy()
+        if json_same(a.copy(), b.copy()) {
+            continue
+        }
+        var keys: List<String> = []
+        if let Json.Object(am) = a.copy() {
+            for (k, _) in am {
+                keys.push(k.copy())
+            }
+        }
+        if let Json.Object(bm) = b.copy() {
+            for (k, _) in bm {
+                if not keys.contains(k.copy()) {
+                    keys.push(k.copy())
+                }
+            }
+        }
+        keys.sort()
+        var said: List<String> = []
+        for k in keys {
+            let x = a.get(k.copy()) ?? Json.Null
+            let y = b.get(k.copy()) ?? Json.Null
+            let missing_x = a.get(k.copy()) == none
+            let missing_y = b.get(k.copy()) == none
+            // `a.get(k) != b.get(k)`: a member one has and the other hasn't is None there.
+            let differs = missing_x or missing_y or not json_same(x.copy(), y.copy())
+            if differs and said.len() < 4 {
+                said.push("{k}: vanilla {cut(dumped(x), 160)}, Calcite {cut(dumped(y), 160)}")
+            }
+        }
+        let one: List<Json> = [a.copy()]
+        return some("{id_of(a.copy())} at {short(one)[0]}: {said.join(String("; "))}")
+    }
+    return none
+}
+
+fn chunk_json(cx: i64, cz: i64) -> Json {
+    return Json.Array([Json.Int(cx), Json.Int(cz)])
+}
+
+fn strings_json(xs: List<String>) -> Json {
+    var out: List<Json> = []
+    for x in xs {
+        out.push(Json.Str(x.copy()))
+    }
+    return Json.Array(out)
+}
+
+/// The mobs of each area's chunks, vanilla's against Calcite's: how many chunks have any in each,
+/// how many are the same, and those that differ, in a ring chunk whose surface the order doesn't
+/// move, `moved` the rest, where vanilla has no type Calcite doesn't make, which must be the same,
+/// and the rest.
+fn mob_tally(areas: List<(i64, i64)>, vdir: String, cdir: String, moved: List<(i64, i64)>) -> Json {
+    var made: List<String> = []
+    var found: List<(i64, i64, List<Json>, List<Json>)> = []
+    var seen: List<(i64, i64)> = []
+    for area in areas.copy() {
+        for (cx, cz) in area_of(area) {
+            let vm = mobs(chunk(vdir.copy(), cx, cz))
+            let cm = mobs(chunk(cdir.copy(), cx, cz))
+            for t in cm.copy() {
+                let id = id_of(t)
+                if not made.contains(id.copy()) {
+                    made.push(id)
+                }
+            }
+            if not seen.contains((cx, cz)) {
+                seen.push((cx, cz))
+                found.push((cx, cz, vm, cm))
+            }
+        }
+    }
+    var ring: List<(i64, i64)> = []
+    for area in areas {
+        ring.extend(chunks_of(area))
+    }
+    var vanilla_chunks = 0i64
+    var calcite_chunks = 0i64
+    var vanilla_mobs = 0i64
+    var calcite_mobs = 0i64
+    var same_chunks = 0i64
+    var wrong: List<Json> = []
+    var other: List<Json> = []
+    for (cx, cz, vm, cm) in found {
+        if not vm.is_empty() {
+            vanilla_chunks += 1
+        }
+        if not cm.is_empty() {
+            calcite_chunks += 1
+        }
+        vanilla_mobs += i64.wrap(u64(vm.len()))
+        calcite_mobs += i64.wrap(u64(cm.len()))
+        let diff = compare_mobs(vm.copy(), cm.copy()) else {
+            if not vm.is_empty() {
+                same_chunks += 1
+            }
+            continue
+        }
+        var unmade: List<String> = []
+        for t in vm.copy() {
+            let id = id_of(t)
+            if not made.contains(id.copy()) and not unmade.contains(id.copy()) {
+                unmade.push(id)
+            }
+        }
+        unmade.sort()
+        var row = LinkedMap<String, Json>()
+        row.insert(String("chunk"), chunk_json(cx, cz))
+        row.insert(String("difference"), Json.Str(diff))
+        if not unmade.is_empty() {
+            row.insert(String("unmade"), strings_json(unmade.copy()))
+        }
+        if ring.contains((cx, cz)) and not moved.contains((cx, cz)) and unmade.is_empty() {
+            wrong.push(Json.Object(row))
+        } else {
+            other.push(Json.Object(row))
+        }
+    }
+    var out = LinkedMap<String, Json>()
+    out.insert(String("vanilla_chunks"), Json.Int(vanilla_chunks))
+    out.insert(String("calcite_chunks"), Json.Int(calcite_chunks))
+    out.insert(String("vanilla_mobs"), Json.Int(vanilla_mobs))
+    out.insert(String("calcite_mobs"), Json.Int(calcite_mobs))
+    out.insert(String("same"), Json.Int(same_chunks))
+    out.insert(String("wrong"), Json.Array(wrong))
+    out.insert(String("other"), Json.Array(other))
+    return Json.Object(out)
+}
+
+fn row_json(cx: i64, cz: i64, differences: List<String>) -> Json {
+    var row = LinkedMap<String, Json>()
+    row.insert(String("chunk"), chunk_json(cx, cz))
+    row.insert(String("differences"), strings_json(differences))
+    return Json.Object(row)
+}
+
+/// What differs between vanilla's chunks and `other`'s: the chunks with what must be the same
+/// and isn't, those the order moves, how many blocks it moves, and how many are the same whole.
+fn tally(areas: List<(i64, i64)>, vdir: String, odir: String) -> Json {
+    var wrong: List<Json> = []
+    var moved: List<Json> = []
+    var blocks = 0i64
+    var moved_chunks = 0i64
+    var same_chunks = 0i64
+    for area in areas {
+        for (cx, cz) in chunks_of(area) {
+            let got = compare(cx, cz, chunk(vdir.copy(), cx, cz), chunk(odir.copy(), cx, cz))
+            if not got.diffs.is_empty() {
+                wrong.push(row_json(cx, cz, got.diffs.copy()))
+            }
+            if not got.moved.is_empty() {
+                moved.push(row_json(cx, cz, got.moved.copy()))
+                moved_chunks += 1
+            }
+            if got.diffs.is_empty() and got.moved.is_empty() {
+                same_chunks += 1
+            }
+            blocks += got.blocks
+        }
+    }
+    var out = LinkedMap<String, Json>()
+    out.insert(String("wrong"), Json.Array(wrong))
+    out.insert(String("moved"), Json.Array(moved))
+    out.insert(String("blocks"), Json.Int(blocks))
+    out.insert(String("moved_chunks"), Json.Int(moved_chunks))
+    out.insert(String("same"), Json.Int(same_chunks))
+    return Json.Object(out)
+}
+
+fn int_of(t: Json, key: str) -> i64 {
+    return json_member(t, key).as_i64() ?? 0
+}
+
+fn rows(t: Json, key: str) -> List<Json> {
+    let xs = json_member(t, key)
+    var out: List<Json> = []
+    for i in 0..xs.len() {
+        out.push(xs.at(i) ?? Json.Null)
+    }
+    return out
+}
+
+fn row_chunk(r: Json) -> (i64, i64) {
+    let c = json_member(r, "chunk")
+    return ((c.at(0) ?? Json.Null).as_i64() ?? 0, (c.at(1) ?? Json.Null).as_i64() ?? 0)
+}
+
+fn row_strings(r: Json, key: str) -> List<String> {
+    var out: List<String> = []
+    for x in rows(r, key) {
+        out.push(x.as_str() ?? String(""))
+    }
+    return out
+}
+
+@cli(name: "terragen")
+struct Args {
+    /// Compare the last run's worlds again.
+    reuse: bool
+    /// Make Calcite's worlds again, against the last run's vanilla ones.
+    calcite: bool
+    /// How many of the sample's areas.
+    areas: i64 = 6
+    /// Vanilla's worldgen alone, in build/rig/terragen/plain/.
+    no_packs: bool
+    /// Have vanilla make the sample again in another order, for scale.
+    orders: bool
+    /// Have Calcite make each area's middle first, stop and carry on.
+    part_way: bool
+}
+
+pub fn main() {
+    let args = Args.parse()
+    let base = under("build/rig/terragen")
+    let run = if args.no_packs { Run { root: path.join(base, "plain"), packs: false } } else { Run { root: base, packs: true } }
+    var areas = all_areas()
+    let wanted = if args.areas < 0 { 0usize } else { usize.wrap(args.areas) }
+    if wanted < areas.len() {
+        areas = areas[0..wanted].copy()
+    }
+    made_dir(run.root.copy())
+    if args.calcite {
+        calcite(run.copy(), areas.copy(), args.part_way)
+    } else if not args.reuse {
+        if run.packs {
+            _ = fetch()
+        }
+        vanilla(run.copy(), areas.copy(), "vanilla", false)
+        if args.orders {
+            vanilla(run.copy(), areas.copy(), "vanilla2", true)
+        }
+        calcite(run.copy(), areas.copy(), args.part_way)
+    }
+    let vdir = region_dir(run.copy(), "vanilla")
+    var report = LinkedMap<String, Json>()
+    let mine = tally(areas.copy(), vdir.copy(), region_dir(run.copy(), "calcite"))
+    report.insert(String("calcite"), mine.copy())
+    let v2 = region_dir(run.copy(), "vanilla2")
+    if is_dir(v2.copy()) and (args.orders or args.reuse) {
+        report.insert(String("vanilla2"), tally(areas.copy(), vdir.copy(), v2))
+    }
+    var moved: List<(i64, i64)> = []
+    for r in rows(mine.copy(), "moved") {
+        var heights = false
+        for d in row_strings(r.copy(), "differences") {
+            if d.starts_with("heightmap") {
+                heights = true
+            }
+        }
+        if heights {
+            moved.push(row_chunk(r))
+        }
+    }
+    let m = mob_tally(areas.copy(), entities_dir(run.copy(), "vanilla"), entities_dir(run.copy(), "calcite"), moved)
+    report.insert(String("mobs"), m.copy())
+    let file = path.join(run.root.copy(), "report.json")
+
+    put(file.copy(), "{indented_one_ascii(Json.Object(report.copy()))}\n")
+    var total = 0usize
+    for area in areas {
+        total += chunks_of(area).len()
+    }
+    for (name, t) in report {
+        if name == "mobs" {
+            continue
+        }
+        let who = if name == "calcite" { "Calcite" } else { "vanilla in another order" }
+        let wrong_n = rows(t.copy(), "wrong").len()
+        println("terragen: {who}: {total - wrong_n} of {total} chunks have what must be vanilla's; {int_of(t.copy(), "same")} are vanilla's whole; the order moves {int_of(t.copy(), "blocks")} blocks in {int_of(t.copy(), "moved_chunks")} chunks")
+    }
+    let wrong = rows(mine, "wrong")
+    for (i, r) in wrong.enumerate() {
+        if i >= 20 {
+            break
+        }
+        let (cx, cz) = row_chunk(r.copy())
+        println("  chunk {cx}, {cz}:")
+        for (j, d) in row_strings(r.copy(), "differences").enumerate() {
+            if j >= 6 {
+                break
+            }
+            println("    {d}")
+        }
+    }
+    let mob_wrong = rows(m.copy(), "wrong")
+    let mob_other = rows(m.copy(), "other")
+    println("terragen: mobs: {int_of(m.copy(), "vanilla_mobs")} in {int_of(m.copy(), "vanilla_chunks")} of vanilla's chunks, {int_of(m.copy(), "calcite_mobs")} in {int_of(m.copy(), "calcite_chunks")} of Calcite's; {int_of(m.copy(), "same")} chunks the same; {mob_wrong.len()} differ that must not, {mob_other.len()} where the blocks differ or vanilla has a type Calcite doesn't make")
+    var shown: List<Json> = []
+    for (i, r) in mob_wrong.enumerate() {
+        if i < 12 {
+            shown.push(r.copy())
+        }
+    }
+    for (i, r) in mob_other.enumerate() {
+        if i < 8 {
+            shown.push(r.copy())
+        }
+    }
+    for r in shown {
+        let (cx, cz) = row_chunk(r.copy())
+        var unmade = String("")
+        if r.get(String("unmade")) != none {
+            unmade = " (unmade {row_strings(r.copy(), "unmade").join(String(", "))})"
+        }
+        println("  chunk {cx}, {cz}{unmade}: {json_member(r, "difference").as_str() ?? String("")}")
+    }
+    println("terragen: what differs is in {native(file)}")
+    if not wrong.is_empty() or not mob_wrong.is_empty() {
+        exit(1)
+    }
+}

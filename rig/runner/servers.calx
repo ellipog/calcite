@@ -1,0 +1,388 @@
+module rig.runner.servers
+
+// What the rig's tools that start vanilla's server and Calcite's share (CAL-253), as sessions.py
+// had it for fixtures.py, roundtrip.py and the rest: where they keep their folders, the vanilla
+// adapter's command line with the rig's agent, a server whose console is read as it runs, a free
+// port, and the files a server's folder is given.
+
+import std.fs.{append_text, is_file, read_text, write_text}
+import std.json
+import std.json.{Json}
+import std.path
+import std.process.{Child, Command, Stdio}
+import std.text.python.{repr_str}
+import std.text.utf8.{decode_lossy_unicode}
+import std.time.{Instant}
+import std.uuid.{Uuid}
+import tools.pyjson.{indented_ascii}
+import tools.repo.{die, exe, find_calx, platform, root, under}
+
+/// The bot's name, which the protocol bot logs in with.
+pub const BOT: str = "Bot"
+/// The second player's, in the scenarios that have one (CAL-162).
+pub const MATE: str = "Mate"
+/// Each server pauses once it's been empty this many seconds, and the bot runs only once it has,
+/// so the bot joins both at the same game time and their ticks line up from there (D315).
+pub const PAUSE: i64 = 2
+/// Both servers' levels' randoms are seeded from this (D311): vanilla's by the rig's agent and
+/// Calcite's by level-random-seed.
+pub const LEVEL_RANDOM_SEED: i64 = 1103
+/// With a tape, the game time at which both seed each level's random again (D316): 3 seconds
+/// after the bot joins, at PAUSE seconds, `(PAUSE + 3) * 20`, by when vanilla's workers have made
+/// the player's chunks. A level is seeded as its tick starts at RESEED or later; the Overworld's
+/// tick moves the time on before its chunks draw, so its draws from the new seed are taped from
+/// RESEED + 1, and the tapes are lined up from there.
+pub const RESEED: i64 = 100
+/// The data version both servers save with.
+pub const DATA_VERSION: i32 = 5023
+
+/// What both servers of a session are given; everything else is the default. The flat world has
+/// no structures, so vanilla places no village; peaceful spawns no monsters, which vanilla places
+/// at random. Each pauses once it's been empty PAUSE seconds (D315).
+pub fn base_props() -> List<(String, String)> {
+    var out: List<(String, String)> = []
+    for (k, v) in [("online-mode", "false"), ("server-ip", "127.0.0.1"), ("level-type", "minecraft\\:flat"),
+        ("generate-structures", "false"), ("level-seed", "calcite"), ("difficulty", "peaceful"), ("view-distance", "4"),
+        ("simulation-distance", "4"), ("pause-when-empty-seconds", "2")] {
+        out.push((String(k), String(v)))
+    }
+    return out
+}
+
+/// Where the protocol suites' sessions are recorded, a folder for each configuration.
+pub fn sessions_dir() -> String {
+    return under("build/rig/sessions")
+}
+
+/// Where the fixture worlds are built (rig/runner/fixtures.calx).
+pub fn fixtures_dir() -> String {
+    return under("build/rig/fixtures")
+}
+
+/// Where the rig's own builds of Calcite and its bots go, for this system.
+pub fn build_dir() -> String {
+    return under("build/rig/{platform()}")
+}
+
+/// The UUID an offline server gives a name, Java's `UUID.nameUUIDFromBytes`.
+pub fn offline_uuid(name: String) -> String {
+    return "{Uuid.from_name("OfflinePlayer:{name}".to_bytes())}"
+}
+
+/// A port on 127.0.0.1 nothing listens on, which the system picked (rig/runner/free_port.calx).
+pub fn free_port() -> i64 {
+    let got = match Command.new(find_calx()).args([String("rig/runner/free_port.calx")]).dir(root()).read() {
+        ok(text) => text,
+        err(e) => die("sessions: finding a free port: {e}"),
+    }
+    let port = i64.parse(got.trim()) else {
+        die("sessions: free_port.calx said {repr_str(got)}, not a port")
+    }
+    return port
+}
+
+/// Builds `source` with calx in release, as `out` under the rig's build folder, and gives its path.
+pub fn build(source: str, out: str) -> String {
+    let exe_path = path.join(build_dir(), "{out}{exe()}")
+    let calx = find_calx()
+    match Command.new(calx).args([String("build"), String("--release"), String(source), String("-o"), exe_path.copy()]).dir(root()).run() {
+        ok => {},
+        err(e) => die("sessions: building {source}: {e}"),
+    }
+    return exe_path
+}
+
+/// The vanilla adapter's description of itself, which oracle/adapter.calx writes: the command
+/// line that runs the server jar's classes, the folder to run it in, and the rig's agent.
+pub fn adapter() -> Json {
+    let file = under("oracle/vanilla-adapter/build/{platform()}/adapter.json")
+    if not is_file(file.copy()) {
+        die("sessions: the vanilla adapter isn't built; run calx oracle/adapter.calx")
+    }
+    let text = match read_text(file.copy()) {
+        ok(t) => t ?? String(""),
+        err(e) => die("sessions: {file}: {e}"),
+    }
+    return match json.parse(text) {
+        ok(v) => v,
+        err(e) => die("sessions: {file}: {e}"),
+    }
+}
+
+/// The adapter's command line, its arguments as text.
+pub fn adapter_argv(a: Json) -> List<String> {
+    var out: List<String> = []
+    let argv = a.get(String("argv")) ?? Json.Array([])
+    for i in 0..argv.len() {
+        out.push((argv.at(i) ?? Json.Null).as_str() ?? String(""))
+    }
+    return out
+}
+
+/// The folder the adapter's command line runs in.
+pub fn adapter_cwd(a: Json) -> String {
+    return (a.get(String("cwd")) ?? Json.Null).as_str() ?? root()
+}
+
+/// The adapter's java and class path, running vanilla's server with its own logging, and the
+/// rig's agent, which seeds its levels' randoms, with `tape` writes their draws (D311), and with
+/// `trace` its living entities' states (CAL-159).
+pub fn vanilla_argv(a: Json, tape: bool, trace: bool) -> List<String> {
+    let agent_path = (a.get(String("agent")) ?? Json.Null).as_str() else {
+        die("sessions: the vanilla adapter was built without the agent; run calx oracle/adapter.calx")
+    }
+    let argv = adapter_argv(a)
+    var cp = String("")
+    for i in 0..argv.len() {
+        if argv[i] == "-cp" and i + 1 < argv.len() {
+            cp = argv[i + 1].copy()
+            break
+        }
+    }
+    var agent = "-javaagent:{agent_path}=seed={LEVEL_RANDOM_SEED}"
+    if tape {
+        agent = "{agent},tape=tape.txt,reseed={RESEED}"
+    }
+    if trace {
+        agent = "{agent},trace=entities.txt"
+    }
+    // Math.sin and Math.cos as StrictMath's, which Calcite's are, where HotSpot's intrinsics can
+    // differ in the last bit: a dropped item's motion turns through them (CAL-148).
+    return [argv[0].copy(), String("-Xmx2G"), String("-Dfile.encoding=UTF-8"), String("-XX:+UnlockDiagnosticVMOptions"),
+        String("-XX:-UseLibmIntrinsic"), agent, String("-cp"), cp, String("net.minecraft.server.Main"), String("--nogui")]
+}
+
+/// `base`'s properties with `more`'s put in, each in its place if `base` has it and after them if
+/// not, as Python's `dict(base, **more)` makes them.
+pub fn merged(base: List<(String, String)>, more: List<(String, String)>) -> List<(String, String)> {
+    var out = base.copy()
+    for (k, v) in more {
+        set(mut out, k.copy(), v.copy())
+    }
+    return out
+}
+
+/// Puts `value` at `key`, in its place if it's there and at the end if not.
+pub fn set(props: mut List<(String, String)>, key: own String, value: own String) {
+    for i in 0..props.len() {
+        if props[i].0 == key {
+            props[i] = (key, value)
+            return
+        }
+    }
+    props.push((key, value))
+}
+
+/// A server.properties file's text, `key=value` a line.
+pub fn properties(props: List<(String, String)>) -> String {
+    var out = String("")
+    for (k, v) in props {
+        out.push_str("{k}={v}\n")
+    }
+    return out
+}
+
+/// Writes `text` to `file`, or stops with why it couldn't.
+pub fn put(file: String, text: String) {
+    match write_text(file.copy(), text) {
+        ok => {},
+        err(e) => die("sessions: writing {file}: {e}"),
+    }
+}
+
+/// whitelist.json's text, or ops.json's: each player's UUID and name, with `level` and
+/// `bypassesPlayerLimit` for an operator, as Python's `json.dumps(indent=2)` wrote it.
+pub fn players_json(names: List<String>, op: bool) -> String {
+    var listed: List<Json> = []
+    for n in names {
+        var m = LinkedMap<String, Json>()
+        m.insert(String("uuid"), Json.Str(offline_uuid(n.copy())))
+        m.insert(String("name"), Json.Str(n.copy()))
+        if op {
+            m.insert(String("level"), Json.Int(4))
+            m.insert(String("bypassesPlayerLimit"), Json.Bool(false))
+        }
+        listed.push(Json.Object(m))
+    }
+    return "{indented_ascii(Json.Array(listed))}\n"
+}
+
+/// How a program the rig ran ended: its status, or none if it was killed, and what it wrote.
+pub struct Ran {
+    pub code: i32?
+    pub stdout: String
+    pub stderr: String
+    pub timed_out: bool
+}
+
+/// A server process whose console is read as it runs, each line kept and written to console.txt
+/// in its folder. Python read it on a thread of its own; here it's read whenever the tool waits
+/// on it, and while a bot runs against it, so it never waits on a full pipe.
+pub struct Server {
+    pub name: String
+    pub lines: List<String>
+    log: String
+    logged: usize
+    stopped: bool
+    child: Child
+}
+
+impl Server {
+    /// Starts `argv` in `folder`, its errors with its output.
+    pub fn start(argv: List<String>, folder: String, name: own String) -> Server {
+        let log = path.join(folder.copy(), "console.txt")
+        put(log.copy(), String(""))
+        let command = Command.new(argv[0].copy()).args(argv[1..]).dir(folder).stdin(Stdio.Pipe).stdout(Stdio.Pipe).stderr(Stdio.Stdout)
+        let child = match command.spawn() {
+            ok(c) => c,
+            err(e) => die("sessions: starting {name}: {e}"),
+        }
+        return Server { name: name, lines: [], log: log, logged: 0, stopped: false, child: child }
+    }
+
+    /// Reads what the server has written, waiting at most `ms` for the first line, and gives
+    /// whether a line came.
+    pub fn pump(mut self, ms: u64) -> bool {
+        var got = false
+        var wait = ms
+        var n = 0
+        while let line = self.child.read_line(wait) {
+            self.lines.push(line)
+            got = true
+            wait = 0
+            n += 1
+            if n >= 10000 {
+                break
+            }
+        }
+        self.flush_log()
+        return got
+    }
+
+    /// Writes the lines read since the last time to console.txt.
+    fn flush_log(mut self) {
+        if self.logged < self.lines.len() {
+            let text = "{self.lines[self.logged..].join(String("\n"))}\n"
+            match append_text(self.log.copy(), text) {
+                ok => {},
+                err(_) => {},
+            }
+            self.logged = self.lines.len()
+        }
+    }
+
+    /// Stops the server, then the tool, with `message`.
+    pub fn abort(mut self, message: String) -> never {
+        self.stop()
+        die(message)
+    }
+
+    /// The last `n` lines it wrote, a line each.
+    pub fn tail(self, n: usize) -> String {
+        let from = if self.lines.len() > n { self.lines.len() - n } else { 0 }
+        return self.lines[from..].join(String("\n"))
+    }
+
+    /// Waits until a line from `after` on has `text` in it, and gives the count of lines up to
+    /// and with it. Stops the tool if `timeout` seconds go by first, or the server ends.
+    pub fn wait_for(mut self, text: String, after: usize, timeout: i64) -> usize {
+        let began = unsafe { Instant.now() }
+        var i = after
+        loop {
+            while i < self.lines.len() {
+                if self.lines[i].contains(text.copy()) {
+                    return i + 1
+                }
+                i += 1
+            }
+            let spent = unsafe { Instant.now() }.secs_since(began)
+            if spent >= f64.nearest(timeout) or (self.child.ended() and not self.pump(0)) {
+                let message = "sessions: {self.name} never said {repr_str(text.copy())}:\n{self.tail(20)}"
+                self.abort(message)
+            }
+            _ = self.pump(100)
+        }
+    }
+
+    /// Whether the server's said `text` since line `after`, without waiting for more.
+    pub fn said(mut self, text: String, after: usize) -> bool {
+        _ = self.pump(0)
+        for i in after..self.lines.len() {
+            if self.lines[i].contains(text.copy()) {
+                return true
+            }
+        }
+        return false
+    }
+
+    /// Types `command` into its console.
+    pub fn send(self, command: String) {
+        match self.child.write_text("{command}\n") {
+            ok => {},
+            err(e) => {
+                let tail = self.tail(20)
+                self.child.kill()
+                die("sessions: {self.name} took no `{command}`: {e}\n{tail}")
+            }
+        }
+    }
+
+    /// Types `stop`, and kills it if it hasn't ended in 60 seconds, reading what it writes
+    /// meanwhile. Once it's stopped, stopping it again does nothing.
+    pub fn stop(mut self) {
+        if self.stopped {
+            return
+        }
+        self.stopped = true
+        match self.child.write_text(String("stop\n")) {
+            ok => {},
+            err(_) => {},
+        }
+        let began = unsafe { Instant.now() }
+        loop {
+            _ = self.pump(100)
+            if self.child.ended() {
+                if let _ = self.child.try_wait() {
+                    break
+                }
+            }
+            if unsafe { Instant.now() }.secs_since(began) > 60.0 {
+                self.child.kill()
+                break
+            }
+        }
+        let rest = self.child.wait()
+        for line in decode_lossy_unicode(rest.stdout, 0, rest.stdout.len()).lines() {
+            self.lines.push(line.copy())
+        }
+        self.flush_log()
+    }
+
+    /// Runs `argv` in the repository's root while the server's console is read, killing it once
+    /// `seconds` have gone by, and gives how it ended and what it wrote.
+    pub fn beside(mut self, argv: List<String>, seconds: i64) -> Ran {
+        let command = Command.new(argv[0].copy()).args(argv[1..]).dir(root()).stdin(Stdio.Null).stdout(Stdio.Pipe).stderr(Stdio.Pipe)
+        var b = match command.spawn() {
+            ok(c) => c,
+            err(e) => self.abort("sessions: starting {argv[0]}: {e}"),
+        }
+        let began = unsafe { Instant.now() }
+        var out: List<u8> = []
+        var timed_out = false
+        loop {
+            if let _ = b.try_wait() {
+                break
+            }
+            out.extend(b.read(0))
+            _ = self.pump(100)
+            if unsafe { Instant.now() }.secs_since(began) > f64.nearest(seconds) {
+                b.kill()
+                timed_out = true
+                break
+            }
+        }
+        let got = b.wait()
+        out.extend(got.stdout)
+        return Ran { code: got.status.code, stdout: decode_lossy_unicode(out, 0, out.len()), stderr: got.error_text(), timed_out: timed_out }
+    }
+}

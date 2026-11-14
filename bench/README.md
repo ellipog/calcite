@@ -130,7 +130,7 @@ The stage times come from the server: `--stage-times FILE` keeps the seconds its
 
 With `--no-packs`, `terralith.py`'s runs have no packs, so they time vanilla's own worldgen, on the same seed and areas.
 
-Whether what Calcite generates with the packs is vanilla's is checked by the rig's [`terragen.py`](../rig/README.md#worldgen-with-packs), on a sample of chunks: every one of its 264 has what must be vanilla's.
+Whether what Calcite generates with the packs is vanilla's is checked by the rig's [`terragen.calx`](../rig/README.md#worldgen-with-packs), on a sample of chunks: every one of its 264 has what must be vanilla's.
 
 ### Results
 

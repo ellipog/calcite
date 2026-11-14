@@ -52,7 +52,7 @@ import net.minecraft.world.item.ItemStack;
 
 /**
  * Reads the sessions the rig's protocol bot recorded (P4.8) with vanilla's own codecs, and writes
- * each packet out as a tree of plain values, so `rig/runner/sessions.py` can compare what vanilla
+ * each packet out as a tree of plain values, so `rig/runner/sessions.calx` can compare what vanilla
  * and Calcite sent field by field.
  *
  * <p>A session holds records one after another, as `src/rig/session.calx` writes them: the
