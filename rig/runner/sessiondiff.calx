@@ -1,0 +1,1758 @@
+module rig.runner.sessiondiff
+
+// Compares two servers' sessions packet by packet (P4.8): what the protocol bot was sent by
+// vanilla and by Calcite, as the vanilla adapter's SessionDump read it with vanilla's codecs.
+//
+// A session is cut into the bot's steps, and each step's packets are lined up by kind, as `diff`
+// lines up text, a block event or a sound by where it is too (`PLACED`), so a run of a piston's
+// sounds and events, the same kinds over and over, lines up event by event. The lining up is
+// Python's `difflib`'s (tools/difflib.calx), which these sessions' findings were first read with.
+// Two lined-up packets match when their values are the same tree and, unless vanilla doesn't fix
+// the order (`UNORDERED`), the same bytes. Four things are taken out of the line first, since when
+// or in what order they come depends on timing rather than on the server:
+//
+// - Clock packets. `set_time` and keep-alives come every so many ticks or milliseconds. Each
+//   side's are compared by their values with the times taken out, once a step.
+// - Chunks. Vanilla sends the chunks that are ready, nearest first, and they get ready on worker
+//   threads, so how many go in a batch and in what order changes from run to run. A step's chunks
+//   are compared as a set, by position, where its first batch began.
+// - Block changes. Vanilla broadcasts the chunks whose blocks changed in a tick from a
+//   `ReferenceOpenHashSet` of their holders, by identity, so in another order between chunks each
+//   run, and a light update comes as its light thread gets to the change. A step's
+//   `block_update`, `section_blocks_update` and `light_update` packets are compared as a multiset,
+//   those left over paired by where they are, to show what differs (D341), with the
+//   `block_entity_data` each block change brings, which comes as its tick does (D350).
+// - What isn't a packet. The bot's mark that the server closed the connection is lined up like a
+//   packet, as `<closed>`.
+// - Entities. What an entity other than the bot is sent comes on its own clock, from the tick it
+//   came in, as its tracker runs every so many ticks, so a step that ends a second after the bot
+//   last heard anything else ends between two of them where the clock has it. Each entity's
+//   packets, `ENTITY`, are lined up across the session instead, by its ID (CAL-148): what it is,
+//   `STATE`, its coming, its data, its going and its pickup, in the order it was sent them; and
+//   apart from those, its moves, in theirs. Two entities that came in different ticks, which is as
+//   the bot's packets fell between the server's ticks, meet, merge or are picked up a tick or two
+//   apart on each server, so where an entity's state comes among its moves, and how many moves
+//   it's sent before it goes, isn't the server's to fix: one side's moves may go on past the
+//   other's by as many as `MORE_MOVES`.
+//
+// Fields vanilla draws afresh each run (`drawn`) are left out of both sides' values. And the sky's
+// light under the world is read as vanilla's light leaves it either way (CAL-122): the section
+// below the world's bottom is all 0, but whether its layer is kept as 2048 bytes of 0,
+// `repeatFirstLayer` of the bottom section's, or empty, `new DataLayer()`, is down to whether its
+// chunk's sections were set up before a neighbour's set up its own, which goes by which of the
+// chunks being read vanilla's workers finish first, and changes from run to run. A chunk sends
+// such a layer as one of 0 in `skyYMask`, so each side's is read as empty, in `emptySkyYMask`, as
+// the other would have it.
+//
+// Each packet that differs is keyed `session:SCENARIO/STEP/KIND`, which a file in
+// rig/differences/ can cover. The steps of login and configuration, and the status scenario, are
+// the suites G4.2 and P4.2 need, and fail on any difference no file covers.
+//
+// Values are compared as Python compared what `json.loads` made of them, as the first version of
+// this, sessiondiff.py, did: 1 and 1.0 and true are the same number, and an object's members in
+// any order the same object.
+
+import std.fs.{read_text}
+import std.json
+import std.json.{Json}
+import std.path
+import rig.runner.differences
+import tools.difflib.{opcodes}
+import tools.pyjson.{py_repr, py_str, sorted_ascii, spaced_ascii}
+import tools.repo.{die}
+
+const CLOCK: [str; 3] = ["play/set_time", "play/keep_alive", "configuration/keep_alive"]
+// What's lined up by entity rather than by step (CAL-148), and the fields each names the entity
+// in.
+const ENTITY: [str; 9] = ["play/add_entity", "play/set_entity_data", "play/set_entity_motion", "play/move_entity_pos", "play/move_entity_pos_rot", "play/move_entity_rot", "play/entity_position_sync", "play/remove_entities", "play/take_item_entity"]
+const ENTITY_IDS: [str; 3] = ["entityId", "id", "itemId"]
+const STATE: [str; 4] = ["play/add_entity", "play/set_entity_data", "play/remove_entities", "play/take_item_entity"]
+// How many more moves one side's entity may be sent before it goes, or the bot leaves: three of
+// an item's tracker's runs, each its motion and where it is.
+const MORE_MOVES: usize = 6
+// The fields of a clock packet that hold the time.
+const CLOCK_TIMES: [str; 3] = ["gameTime", "totalTicks", "id"]
+const CHUNKS: [str; 3] = ["play/chunk_batch_start", "play/chunk_batch_finished", "play/level_chunk_with_light"]
+const CHANGES: [str; 4] = ["play/block_update", "play/section_blocks_update", "play/light_update", "play/block_entity_data"]
+// Packets whose bytes vanilla itself doesn't fix: their values must match, but not their bytes.
+// PacketCheck lists the first three. A chunk's heightmaps are a HashMap, from `Collectors.toMap`,
+// keyed by an enum, which hashes by identity, so vanilla writes them in another order each run;
+// the client reads them into an EnumMap.
+// An entity's attributes come from `AttributeMap`'s set of those that changed, or of them all,
+// which go by the instances' identity hashes, so vanilla sends them in another order each run;
+// they're compared by their attributes' names (D375).
+// The recipes' property sets are a HashMap keyed by `ResourceKey`s, which hash by identity, each
+// set `Set.copyOf` of item holders, which do too, so vanilla writes both in another order each
+// run; the client reads them into a map and sets, and SessionDump sorts them. The stonecutter's
+// recipes are a list, whose order the values keep (D385).
+// The login's levels are `levelKeys()`, a LinkedHashMap's keys put in as `createLevels` goes
+// through the dimensions registry's `entrySet`, a HashMap's by `ResourceKey`, which hashes by
+// identity, so after the overworld the Nether and the End come in either order (CAL-147).
+const UNORDERED: [str; 7] = ["configuration/update_tags", "play/update_tags", "play/set_time", "play/level_chunk_with_light", "play/update_attributes", "play/update_recipes", "play/login"]
+// A living entity's effects' particles, `DATA_EFFECT_PARTICLES`, come from its `activeEffects`, a
+// HashMap keyed by the effects' holders, which hash by identity, so vanilla sends two or more in
+// another order each run; a list of them is compared sorted, and its bytes aren't (D513).
+const PARTICLE_TYPE: str = "#minecraft:particle_type/"
+// A player's effects are their `activeEffects`, the same map, so vanilla tells them a run of
+// them, as they join or as they're ticked, in another order each run; a run of
+// `update_mob_effect` or `remove_mob_effect` packets is compared sorted (D514).
+const RUNS: [str; 2] = ["play/update_mob_effect", "play/remove_mob_effect"]
+// An advancement update's layout down a tab, each added advancement's `y`, comes of vanilla's
+// `TreeNodePosition` walking each advancement's children in the order of a set hashed by
+// identity, so it's another each run, where its `x`, its depth, isn't; and when each criterion
+// was obtained is the server's clock as it was awarded. Neither is compared, only whether each
+// was obtained. And the advancements added, those removed and the progress sent come from
+// `HashSet`s and a `HashMap` filled as that walk goes, whose entries in one bucket keep the order
+// they went in, so another each run too; each is compared in order of its IDs (CAL-164).
+const ADVANCEMENTS: str = "play/update_advancements"
+// The recipe book a player joins with, `sendInitialRecipeBook`, is what they know, `known`, a set
+// hashed by identity, so vanilla sends it in another order each run; it's compared in order of
+// the displays' numbers, and its bytes aren't (CAL-164).
+const KNOWN_RECIPES: str = "play/recipe_book_add"
+// An item's enchantments, as SessionDump writes `ItemEnchantments`, are an
+// `Object2IntOpenHashMap` keyed by their holders, which hash by identity, so vanilla writes two or
+// more in another order each run; they're compared in their text's order, and the bytes aren't
+// (CAL-164).
+const ENCHANTED: [str; 2] = [#"ItemEnchantments{enchantments={"#, #"ItemEnchantments{storedEnchantments={"#]
+// A boss bar's packet, whose UUID vanilla draws afresh, `UUID.randomUUID`, for each bar it reads
+// from its saved file: each UUID is named by the order it first came in, `bar 0` and on, so a
+// session's bars line up and their UUIDs needn't, and their bytes aren't compared (D606).
+const BOSS_EVENT: str = "play/boss_event"
+// Packets lined up by where they are as well as by kind: a block's event and a sound, which
+// pistons and clocks send over and over (CAL-125).
+const PLACED: [str; 2] = ["play/block_event", "play/sound"]
+// Packets with a chunk's light, whose sky layer under the world is read as empty where it's all 0
+// (CAL-122), and how SessionDump writes a layer that's all 0.
+const LIT: [str; 2] = ["play/level_chunk_with_light", "play/light_update"]
+pub const ZERO_LAYER: str = "2048 bytes, sha256 e5a00aa9991ac8a5"
+
+fn among<const N: usize>(kind: String, kinds: [str; N]) -> bool {
+    for k in kinds {
+        if kind == k {
+            return true
+        }
+    }
+    return false
+}
+
+fn listed(name: String, names: List<str>) -> bool {
+    for k in names {
+        if name == k {
+            return true
+        }
+    }
+    return false
+}
+
+/// Fields vanilla draws afresh each run, which can't match: the session ID the server draws as it
+/// starts, which every login gets; the time on a chat message without a signature, which is the
+/// server's clock as it reads the message; a sound's seed, which `Level.playSound` draws from
+/// `threadSafeRandom`, seeded afresh as the server starts (CAL-125); and a player's latency, how
+/// many milliseconds their client took to answer a keep-alive, `handleKeepAlive`, which on one
+/// machine is 0 or 1 as the clock's milliseconds turn over (D558).
+fn drawn(kind: String) -> List<str>? {
+    if kind == "login/login_finished" {
+        return some(["sessionId"])
+    } else if kind == "play/player_chat" {
+        return some(["timeStamp"])
+    } else if kind == "play/sound" {
+        return some(["seed"])
+    } else if kind == "play/player_info_update" {
+        return some(["latency"])
+    }
+    return none
+}
+
+// --- values as Python had them ---------------------------------------------------------------
+
+/// Member `key` of `v`, or null, as Python's `dict.get`.
+fn g(v: Json, key: str) -> Json {
+    return v.get(String(key)) ?? Json.Null
+}
+
+fn is_dict(v: Json) -> bool {
+    return match v {
+        Json.Object(_) => true,
+        _ => false,
+    }
+}
+
+fn has(v: Json, key: str) -> bool {
+    if let Json.Object(m) = v {
+        return m.contains(String(key))
+    }
+    return false
+}
+
+/// Whether Python takes `v` as true.
+fn truthy(v: Json) -> bool {
+    return match v {
+        Json.Null => false,
+        Json.Bool(b) => b,
+        Json.Int(i) => i != 0,
+        Json.UInt(u) => u != 0,
+        Json.Big(_) => true,
+        Json.Float(f) => f != 0.0,
+        Json.Str(s) => not s.is_empty(),
+        Json.Array(xs) => not xs.is_empty(),
+        Json.Object(m) => m.len() > 0,
+    }
+}
+
+/// An integer's digits, for one Python takes as an integer: a bool is 0 or 1.
+fn integral(v: Json) -> String? {
+    return match v {
+        Json.Bool(b) => some(String(if b { "1" } else { "0" })),
+        Json.Int(i) => some("{i}"),
+        Json.UInt(u) => some("{u}"),
+        Json.Big(digits) => some(digits.copy()),
+        _ => none,
+    }
+}
+
+/// Whether Python's `==` takes the two as the same.
+fn py_eq(a: Json, b: Json) -> bool {
+    if let x = integral(a) {
+        if let y = integral(b) {
+            return x == y
+        }
+        if let Json.Float(f) = b {
+            // Python compares an int and a float exactly: the float must be that whole number.
+            return f.is_finite() and f.floor() == f and f.abs() < 9.0e18 and x == "{i64.saturate(f)}"
+        }
+        return false
+    }
+    if let Json.Float(f) = a {
+        if let Json.Float(h) = b {
+            return f == h
+        }
+        if let _ = integral(b) {
+            return py_eq(b, a)
+        }
+        return false
+    }
+    return match a {
+        Json.Null => b.is_null(),
+        Json.Str(s) => match b {
+            Json.Str(t) => s == t,
+            _ => false,
+        },
+        Json.Array(xs) => match b {
+            Json.Array(ys) => {
+                if xs.len() != ys.len() {
+                    return false
+                }
+                for i in 0..xs.len() {
+                    if not py_eq(xs[i], ys[i]) {
+                        return false
+                    }
+                }
+                true
+            }
+            _ => false,
+        },
+        Json.Object(m) => match b {
+            Json.Object(n) => {
+                if m.len() != n.len() {
+                    return false
+                }
+                for (k, x) in m {
+                    if let y = n.find(k) {
+                        if not py_eq(x, y) {
+                            return false
+                        }
+                    } else {
+                        return false
+                    }
+                }
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `dict(v, key=value)`: the member set in place, or added after the rest.
+fn set_key(v: own Json, key: str, value: own Json) -> Json {
+    if let Json.Object(m) = v {
+        var members = m
+        members.insert(String(key), value)
+        return Json.Object(members)
+    }
+    return v
+}
+
+/// `value` without the members named `names`, all the way down.
+fn without(value: Json, names: List<str>) -> Json {
+    return match value {
+        Json.Object(m) => {
+            var out = LinkedMap<String, Json>()
+            for (k, v) in m {
+                if not listed(k.copy(), names) {
+                    out.insert(k.copy(), without(v, names))
+                }
+            }
+            Json.Object(out)
+        }
+        Json.Array(xs) => {
+            var out: List<Json> = []
+            for x in xs {
+                out.push(without(x, names))
+            }
+            Json.Array(out)
+        }
+        _ => value.copy(),
+    }
+}
+
+/// `xs` sorted by `keys`, as Python's stable `sorted` sorts by a key.
+fn sorted_by(xs: List<Json>, keys: List<String>) -> List<Json> {
+    var order: List<usize> = []
+    for i in 0..xs.len() {
+        order.push(i)
+    }
+    for k in 1..order.len() {
+        var at = k
+        while at > 0 and keys[order[at - 1]] > keys[order[at]] {
+            order.swap(at - 1, at)
+            at -= 1
+        }
+    }
+    var out: List<Json> = []
+    for i in order {
+        out.push(xs[i].copy())
+    }
+    return out
+}
+
+// --- sessions ----------------------------------------------------------------------------------
+
+/// One packet, or a mark lined up as one: its kind, its value, its bytes' hash and its error.
+pub struct Entry {
+    pub kind: String
+    pub value: Json
+    pub sha: String
+    pub error: String
+}
+
+impl Entry {
+    fn text(self) -> String {
+        return sorted_ascii(self.value)
+    }
+}
+
+fn entry(kind: own String, value: own Json, sha: own String, error: own String) -> Entry {
+    return Entry { kind: kind, value: value, sha: sha, error: error }
+}
+
+/// A chunk's position, as SessionDump wrote it, and its packet.
+struct Chunk {
+    x: Json
+    z: Json
+    entry: Entry
+}
+
+/// One of the bot's steps.
+pub struct Step {
+    pub name: String
+    entries: List<Entry>
+    // Each entity's packets in the step, by its ID, but the bot's, in the order they came.
+    entities: LinkedMap<i64, List<Entry>>
+    clock: LinkedMap<String, Json>
+    chunks: LinkedMap<String, Chunk>
+    batches: i64
+    batched: i64
+    // The chunk packets sent, each, which a respawn sends again for the same places (D428).
+    sent: i64
+    changes: List<Entry>
+}
+
+fn new_step(name: own String) -> Step {
+    return Step { name: name, entries: List<Entry>(), entities: LinkedMap<i64, List<Entry>>(), clock: LinkedMap<String, Json>(), chunks: LinkedMap<String, Chunk>(), batches: 0, batched: 0, sent: 0, changes: List<Entry>() }
+}
+
+/// The entity a packet of `ENTITY` is for, or none.
+fn entity_of(kind: String, value: Json) -> i64? {
+    if not is_dict(value) {
+        return none
+    }
+    if kind == "play/remove_entities" {
+        if let Json.Array(ids) = g(value, "entityIds") {
+            if ids.len() == 1 {
+                return ids[0].as_i64()
+            }
+        }
+        return none
+    }
+    for name in ENTITY_IDS {
+        if let Json.Int(i) = g(value, name) {
+            return some(i)
+        }
+    }
+    return none
+}
+
+/// The key a chunk's position is kept by, as the Python's tuple was.
+fn place_of(x: Json, z: Json) -> String {
+    return "({py_repr(x)}, {py_repr(z)})"
+}
+
+/// A session's steps, from SessionDump's .jsonl.
+pub fn load(file: String) -> List<Step> {
+    let text = match read_text(file.copy()) {
+        ok(t) => t ?? die("sessiondiff: {file} isn't UTF-8"),
+        err(e) => die("sessiondiff: {file}: {e}"),
+    }
+    var steps: List<Step> = []
+    var step = new_step("start")
+    var me = Json.Null
+    var bars = LinkedMap<String, i64>()
+    for line in text.lines() {
+        let r = match json.parse(line.copy()) {
+            ok(v) => v,
+            err(e) => die("sessiondiff: {file}: {e}"),
+        }
+        if has(r, "mark") {
+            let mark = g(r, "mark").as_str() ?? die("sessiondiff: {file}: a mark that isn't text")
+            if mark.starts_with("step ") {
+                steps.push(step)
+                step = new_step(mark[5..mark.len()])
+            } else {
+                step.entries.push(entry("<{mark}>", Json.Null, "", ""))
+            }
+            continue
+        }
+        let kind = "{py_str(g(r, "state"))}/{py_str(g(r, "kind"))}"
+        var value = g(r, "value")
+        var sha = g(r, "sha256").as_str() ?? String("")
+        let error = g(r, "error").as_str() ?? String("")
+        if let names = drawn(kind.copy()) {
+            value = without(value, names)
+        }
+        if kind == BOSS_EVENT and has(value, "id") {
+            let bar = py_repr(g(value, "id"))
+            if not bars.contains(bar.copy()) {
+                let next = i64.wrap(bars.len())
+                bars.insert(bar.copy(), next)
+            }
+            value = set_key(value, "id", Json.Str("bar {bars[bar]}"))
+            sha = String("")
+        }
+        if kind == ADVANCEMENTS {
+            value = advancements_sorted(obtained_only(without(value, ["y"])))
+            sha = String("")
+        }
+        if kind == KNOWN_RECIPES and is_dict(value) and truthy(g(value, "replace")) {
+            var entries: List<Json> = []
+            if let Json.Array(xs) = g(value, "entries") {
+                entries = xs.copy()
+            }
+            var keys: List<i64> = []
+            for e in entries {
+                keys.push(display_number(e))
+            }
+            value = set_key(value, "entries", Json.Array(sorted_by_number(entries, keys)))
+            sha = String("")
+        }
+        let (enchanted, moved) = enchantments_sorted(value)
+        value = enchanted
+        if moved {
+            sha = String("")
+        }
+        if kind == "play/update_attributes" and is_dict(value) {
+            var attributes: List<Json> = []
+            if let Json.Array(xs) = g(value, "attributes") {
+                attributes = xs.copy()
+            }
+            var keys: List<String> = []
+            for e in attributes {
+                keys.push(py_str(g(e, "attribute")))
+            }
+            value = set_key(value, "attributes", Json.Array(sorted_by(attributes, keys)))
+        }
+        if kind == "play/set_entity_data" {
+            let (particles, sorted) = particles_sorted(value)
+            value = particles
+            if sorted {
+                sha = String("")
+            }
+        }
+        if among(kind.copy(), LIT) {
+            value = under_world_empty(value)
+        }
+        if among(kind.copy(), CLOCK) {
+            if not step.clock.contains(kind.copy()) {
+                step.clock.insert(kind.copy(), without(value, CLOCK_TIMES.to_list()))
+            }
+            continue
+        }
+        if among(kind.copy(), CHUNKS) {
+            if step.chunks.len() == 0 and step.batches == 0 {
+                step.entries.push(entry("<chunks>", Json.Null, "", ""))
+            }
+            if kind == "play/chunk_batch_start" {
+                step.batches += 1
+            } else if kind == "play/chunk_batch_finished" {
+                step.batched += g(value, "batchSize").as_i64() ?? 0
+            } else {
+                step.sent += 1
+                let x = g(value, "x")
+                let z = g(value, "z")
+                let chunk = Chunk { x: x.copy(), z: z.copy(), entry: entry(kind.copy(), without(value, ["x", "z"]), sha.copy(), error.copy()) }
+                step.chunks.insert(place_of(x, z), chunk)
+            }
+            continue
+        }
+        if among(kind.copy(), CHANGES) {
+            step.changes.push(entry(kind.copy(), value, sha, error))
+            continue
+        }
+        if kind == "play/login" and is_dict(value) {
+            me = g(value, "playerId")
+        }
+        if among(kind.copy(), ENTITY) {
+            if let who = entity_of(kind.copy(), value) {
+                if not py_eq(Json.Int(who), me) {
+                    if let es = mut step.entities.find(who) {
+                        es.push(entry(kind.copy(), value, sha, error))
+                    } else {
+                        step.entities.insert(who, [entry(kind.copy(), value, sha, error)])
+                    }
+                    continue
+                }
+            }
+        }
+        step.entries.push(entry(kind, value, sha, error))
+    }
+    steps.push(step)
+    var out: List<Step> = []
+    for s in steps {
+        var kept = s.copy()
+        kept.entries = runs_sorted(kept.entries)
+        if kept.name != "start" or not kept.entries.is_empty() or not kept.changes.is_empty() or kept.entities.len() > 0 {
+            out.push(kept)
+        }
+    }
+    return out
+}
+
+/// `entries` with each run of two or more of a kind in RUNS sorted.
+fn runs_sorted(entries: own List<Entry>) -> List<Entry> {
+    var out: List<Entry> = []
+    var i = 0usize
+    while i < entries.len() {
+        var j = i
+        while among(entries[i].kind.copy(), RUNS) and j < entries.len() and entries[j].kind == entries[i].kind {
+            j += 1
+        }
+        if j - i > 1 {
+            var group: List<Entry> = []
+            for k in i..j {
+                group.push(entries[k].copy())
+            }
+            for k in 1..group.len() {
+                var at = k
+                while at > 0 and group[at - 1].text() > group[at].text() {
+                    group.swap(at - 1, at)
+                    at -= 1
+                }
+            }
+            out.extend(group)
+            i = j
+        } else {
+            out.push(entries[i].copy())
+            i += 1
+        }
+    }
+    return out
+}
+
+/// A `set_entity_data`'s `value` with each of its lists of two or more particles sorted, and
+/// whether it had one.
+fn particles_sorted(value: Json) -> (Json, bool) {
+    let Json.Array(packed) = g(value, "packedItems") else {
+        return (value.copy(), false)
+    }
+    if not is_dict(value) {
+        return (value.copy(), false)
+    }
+    var items: List<Json> = []
+    var moved = false
+    for item in packed {
+        var kept = item.copy()
+        if is_dict(item) {
+            if let Json.Array(v) = g(item, "value") {
+                var all = v.len() > 1
+                for p in v {
+                    let type_text = if has(p, "type") { py_str(g(p, "type")) } else { String("") }
+                    if not is_dict(p) or not type_text.starts_with(PARTICLE_TYPE) {
+                        all = false
+                    }
+                }
+                if all {
+                    var keys: List<String> = []
+                    for p in v {
+                        keys.push(sorted_ascii(p))
+                    }
+                    kept = set_key(kept, "value", Json.Array(sorted_by(v, keys)))
+                    moved = true
+                }
+            }
+        }
+        items.push(kept)
+    }
+    return (set_key(value.copy(), "packedItems", Json.Array(items)), moved)
+}
+
+/// A recipe book entry's display's number, as SessionDump writes `RecipeDisplayId`, as Python's
+/// `int` reads it, or -1.
+fn display_number(e: Json) -> i64 {
+    if not is_dict(e) {
+        return -1
+    }
+    let contents = g(e, "contents")
+    if not has(contents, "id") {
+        return -1
+    }
+    let id = g(contents, "id")
+    if not has(id, "index") {
+        return -1
+    }
+    return match g(id, "index") {
+        Json.Int(i) => i,
+        Json.Bool(b) => if b { 1 } else { 0 },
+        Json.Float(f) => if f.is_nan() or f.is_infinite() { -1 } else { i64.saturate(f) },
+        Json.Str(s) => i64.parse(s.trim().replace("_", "")) ?? -1,
+        _ => -1,
+    }
+}
+
+fn sorted_by_number(xs: List<Json>, keys: List<i64>) -> List<Json> {
+    var order: List<usize> = []
+    for i in 0..xs.len() {
+        order.push(i)
+    }
+    for k in 1..order.len() {
+        var at = k
+        while at > 0 and keys[order[at - 1]] > keys[order[at]] {
+            order.swap(at - 1, at)
+            at -= 1
+        }
+    }
+    var out: List<Json> = []
+    for i in order {
+        out.push(xs[i].copy())
+    }
+    return out
+}
+
+/// An advancement update's `value` with what it adds, removes and sends progress of in order of
+/// their IDs.
+fn advancements_sorted(value: own Json) -> Json {
+    if not is_dict(value) {
+        return value
+    }
+    var out = value
+    for name in ["added", "removed", "progress"] {
+        if let Json.Array(xs) = g(out, name) {
+            var keys: List<String> = []
+            for x in xs {
+                if name == "added" {
+                    keys.push(spaced_ascii(if is_dict(x) { g(g(x, "advancement"), "id") } else { x.copy() }))
+                } else if name == "removed" {
+                    keys.push(spaced_ascii(x))
+                } else {
+                    var first = x.copy()
+                    if let Json.Array(p) = x {
+                        if not p.is_empty() {
+                            first = p[0].copy()
+                        }
+                    }
+                    keys.push(spaced_ascii(first))
+                }
+            }
+            out = set_key(out, name, Json.Array(sorted_by(xs, keys)))
+        }
+    }
+    return out
+}
+
+/// An advancement update's `value` with each criterion's `obtained` only whether it was.
+fn obtained_only(value: Json) -> Json {
+    return match value {
+        Json.Object(m) => {
+            var out = LinkedMap<String, Json>()
+            for (k, v) in m {
+                if k == "obtained" {
+                    out.insert(k.copy(), Json.Bool(not v.is_null()))
+                } else {
+                    out.insert(k.copy(), obtained_only(v))
+                }
+            }
+            Json.Object(out)
+        }
+        Json.Array(xs) => {
+            var out: List<Json> = []
+            for x in xs {
+                out.push(obtained_only(x))
+            }
+            Json.Array(out)
+        }
+        _ => value.copy(),
+    }
+}
+
+/// When a criterion was obtained, as a progress file writes it, `2026-11-10 09:14:48 +0000`, in
+/// seconds since the epoch, as Python's `strptime(t, "%Y-%m-%d %H:%M:%S %z").timestamp()` reads it.
+fn timestamp(text: String) -> f64 {
+    let bad = "sessiondiff: time data '{text}' does not match format '%Y-%m-%d %H:%M:%S %z'"
+    let (day, rest) = text.split_once(" ") ?? die(bad.copy())
+    let (clock, zone) = rest.split_once(" ") ?? die(bad.copy())
+    let ymd = day.split("-")
+    let hms = clock.split(":")
+    if ymd.len() != 3 or hms.len() != 3 {
+        die(bad.copy())
+    }
+    let year = i64.parse(ymd[0].copy()) ?? die(bad.copy())
+    let month = i64.parse(ymd[1].copy()) ?? die(bad.copy())
+    let mday = i64.parse(ymd[2].copy()) ?? die(bad.copy())
+    let hour = i64.parse(hms[0].copy()) ?? die(bad.copy())
+    let minute = i64.parse(hms[1].copy()) ?? die(bad.copy())
+    let second = i64.parse(hms[2].copy()) ?? die(bad.copy())
+    var offset = 0i64
+    if zone != "Z" {
+        let digits = zone.replace(":", "")
+        if digits.len() != 5 or not (digits.starts_with("+") or digits.starts_with("-")) {
+            die(bad.copy())
+        }
+        let hh = i64.parse(digits[1..3]) ?? die(bad.copy())
+        let mm = i64.parse(digits[3..5]) ?? die(bad.copy())
+        offset = (hh * 60 + mm) * 60
+        if digits.starts_with("-") {
+            offset = -offset
+        }
+    }
+    // Days from 1970-01-01 to the date, by the proleptic Gregorian calendar.
+    let y = if month <= 2 { year - 1 } else { year }
+    let era = y.floor_div(400)
+    let yoe = y - era * 400
+    let mp = (month + 9).floor_mod(12)
+    let doy = (153 * mp + 2) / 5 + mday - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    let days = era * 146097 + doe - 719468
+    return f64.nearest(days * 86400 + hour * 3600 + minute * 60 + second - offset)
+}
+
+/// Each advancement's earliest criterion time in a progress file's object, in seconds since the
+/// epoch, by its ID, or none for one with none.
+pub fn first_obtained(progress: Json) -> LinkedMap<String, f64?> {
+    var out = LinkedMap<String, f64?>()
+    if let Json.Object(m) = progress {
+        for (k, v) in m {
+            if not is_dict(v) {
+                continue
+            }
+            var first: f64? = none
+            if let Json.Object(criteria) = g(v, "criteria") {
+                for (_, t) in criteria {
+                    let at = timestamp(t.as_str() ?? die("sessiondiff: a criterion's time that isn't text"))
+                    if let f = first {
+                        if at < f {
+                            first = some(at)
+                        }
+                    } else {
+                        first = some(at)
+                    }
+                }
+            }
+            out.insert(k.copy(), first)
+        }
+    }
+    return out
+}
+
+/// Whether two orders of the same advancements differ only in pairs that each server obtained
+/// within a second of each other: `/reload` reads the progress files again, which sorts them by
+/// when each was first obtained, to the second, so the wall clock's seconds order those obtained
+/// at the same moment (D572).
+pub fn ordered_by_the_clock(vanilla: List<String>, calcite: List<String>, vanilla_times: LinkedMap<String, f64?>, calcite_times: LinkedMap<String, f64?>) -> bool {
+    var at = Map<String, usize>()
+    for (i, k) in calcite.enumerate() {
+        at.insert(k.copy(), i)
+    }
+    for i in 0..vanilla.len() {
+        for j in i + 1..vanilla.len() {
+            let a = vanilla[i].copy()
+            let b = vanilla[j].copy()
+            let ia = at.get(a.copy()) ?? die("sessiondiff: {a} isn't in Calcite's order")
+            let ib = at.get(b.copy()) ?? die("sessiondiff: {b} isn't in Calcite's order")
+            if ia < ib {
+                continue
+            }
+            for times in [vanilla_times.copy(), calcite_times.copy()] {
+                let ta = times.get(a.copy()) ?? none
+                let tb = times.get(b.copy()) ?? none
+                if let x = ta {
+                    if let y = tb {
+                        if (x - y).abs() > 1.0 {
+                            return false
+                        }
+                        continue
+                    }
+                }
+                return false
+            }
+        }
+    }
+    return true
+}
+
+/// `value` with each item's enchantments in its text in order, and whether it has two or more of
+/// an item's, whose bytes may then be in another order.
+fn enchantments_sorted(value: Json) -> (Json, bool) {
+    return match value {
+        Json.Object(m) => {
+            var out = LinkedMap<String, Json>()
+            var moved = false
+            for (k, v) in m {
+                let (e, changed) = enchantments_sorted(v)
+                out.insert(k.copy(), e)
+                moved = moved or changed
+            }
+            (Json.Object(out), moved)
+        }
+        Json.Array(xs) => {
+            var out: List<Json> = []
+            var moved = false
+            for v in xs {
+                let (e, changed) = enchantments_sorted(v)
+                out.push(e)
+                moved = moved or changed
+            }
+            (Json.Array(out), moved)
+        }
+        Json.Str(s) => {
+            var any = false
+            for head in ENCHANTED {
+                if s.contains(head) {
+                    any = true
+                }
+            }
+            if any {
+                let (sorted, several) = sorted_enchantments_text(s.copy())
+                (Json.Str(sorted), several)
+            } else {
+                (value.copy(), false)
+            }
+        }
+        _ => (value.copy(), false),
+    }
+}
+
+/// `text` with the entries of each `ItemEnchantments` map in it sorted, and whether one has two or
+/// more. The text is walked byte by byte: what it looks for is ASCII, which no byte of another
+/// character is, and UTF-8's order is the characters'.
+fn sorted_enchantments_text(given: own String) -> (String, bool) {
+    var text = given
+    var several = false
+    for head in ENCHANTED {
+        var at = 0usize
+        loop {
+            let found = text[at..text.len()].find(head)
+            let offset = found else {
+                break
+            }
+            let i = at + offset
+            let start = i + head.len()
+            var depth = 1
+            var j = start
+            var parts: List<String> = []
+            var last = start
+            while j < text.len() and depth > 0 {
+                let c = text.byte_at(j)
+                if c == 0x7B or c == 0x5B {
+                    depth += 1
+                } else if c == 0x7D or c == 0x5D {
+                    depth -= 1
+                } else if c == 0x2C and depth == 1 and text[j..text.len()].starts_with(", ") {
+                    parts.push(text[last..j])
+                    last = j + 2
+                }
+                j += 1
+            }
+            parts.push(if j - 1 >= last { text[last..j - 1] } else { String("") })
+            several = several or parts.len() > 1
+            parts.sort()
+            let inner = parts.join(", ")
+            text = "{text[0..start]}{inner}{text[j - 1..text.len()]}"
+            at = start + inner.len()
+        }
+    }
+    return (text, several)
+}
+
+/// The sections a light mask, as SessionDump writes a `BitSet`, `{0, 1, 2}`, holds.
+fn mask(text: String) -> List<i64> {
+    let trimmed = text.trim()
+    if trimmed.len() < 2 {
+        return []
+    }
+    let inner = trimmed[1..trimmed.len() - 1].trim()
+    var out: List<i64> = []
+    if inner.is_empty() {
+        return out
+    }
+    for s in inner.split(",") {
+        out.push(i64.parse(s.trim()) ?? die("sessiondiff: {text} isn't a mask"))
+    }
+    return out
+}
+
+fn mask_text(bits: List<i64>) -> String {
+    var sorted = bits.copy()
+    sorted.sort()
+    var parts: List<String> = []
+    for b in sorted {
+        parts.push("{b}")
+    }
+    return "\{{parts.join(", ")}\}"
+}
+
+/// The packet's light with its sky layer under the world, section 0, read as empty where it's all
+/// 0, as vanilla's light makes it one way or the other from run to run (CAL-122).
+fn under_world_empty(value: own Json) -> Json {
+    if not is_dict(value) {
+        return value
+    }
+    let light = g(value, "lightData")
+    if not is_dict(light) {
+        return value
+    }
+    let Json.Str(sky_text) = g(light, "skyYMask") else {
+        return value
+    }
+    let sky = mask(sky_text)
+    let Json.Array(updates) = g(light, "skyUpdates") else {
+        return value
+    }
+    if sky.is_empty() or sky[0] != 0 or updates.is_empty() {
+        return value
+    }
+    if let Json.Str(first) = updates[0] {
+        if first != ZERO_LAYER {
+            return value
+        }
+    } else {
+        return value
+    }
+    let empty_text = if has(light, "emptySkyYMask") { g(light, "emptySkyYMask").as_str() ?? die("sessiondiff: an emptySkyYMask that isn't text") } else { String("\{\}") }
+    var empty = Set<i64>()
+    for b in mask(empty_text) {
+        empty.insert(b)
+    }
+    empty.insert(0)
+    var bits: List<i64> = []
+    for b in empty {
+        bits.push(b)
+    }
+    var rest: List<Json> = []
+    for k in 1..updates.len() {
+        rest.push(updates[k].copy())
+    }
+    var lit = set_key(light.copy(), "skyYMask", Json.Str(mask_text(sky[1..sky.len()])))
+    lit = set_key(lit, "emptySkyYMask", Json.Str(mask_text(bits)))
+    lit = set_key(lit, "skyUpdates", Json.Array(rest))
+    return set_key(value, "lightData", lit)
+}
+
+/// Where two trees differ, as paths, up to `limit` of them, or a few past it, as the Python's
+/// checked the limit only as it went into a value.
+fn paths(a: Json, b: Json, at: String, out: mut List<String>, limit: usize) {
+    if out.len() >= limit {
+        return
+    }
+    let here = if at.is_empty() { String(".") } else { at.copy() }
+    if let Json.Object(m) = a {
+        if let Json.Object(n) = b {
+            var keys: List<String> = []
+            for (k, _) in m {
+                keys.push(k.copy())
+            }
+            for (k, _) in n {
+                if not m.contains(k.copy()) {
+                    keys.push(k.copy())
+                }
+            }
+            for k in keys {
+                if k == "@" {
+                    let x = a.get(k.copy()) ?? Json.Null
+                    let y = b.get(k.copy()) ?? Json.Null
+                    if not py_eq(x, y) {
+                        out.push("{here}: {py_str(x)} vs {py_str(y)}")
+                    }
+                    continue
+                }
+                if not n.contains(k.copy()) {
+                    out.push("{at}.{k}: only vanilla has it")
+                } else if not m.contains(k.copy()) {
+                    out.push("{at}.{k}: only Calcite has it")
+                } else {
+                    paths(m[k], n[k], "{at}.{k}", mut out, limit)
+                }
+            }
+            return
+        }
+    }
+    if let Json.Array(xs) = a {
+        if let Json.Array(ys) = b {
+            if xs.len() != ys.len() {
+                out.push("{at}: {xs.len()} items vs {ys.len()}")
+            }
+            let both = if xs.len() < ys.len() { xs.len() } else { ys.len() }
+            for i in 0..both {
+                paths(xs[i], ys[i], "{at}[{i}]", mut out, limit)
+                if out.len() >= limit {
+                    break
+                }
+            }
+            return
+        }
+    }
+    if not py_eq(a, b) {
+        out.push("{here}: {short(a)} vs {short(b)}")
+    }
+}
+
+fn differences_of(a: Json, b: Json) -> List<String> {
+    var out: List<String> = []
+    paths(a, b, String(""), mut out, 12)
+    return out
+}
+
+/// A value as `json.dumps` writes it, cut at 120 characters.
+fn short(v: Json) -> String {
+    let s = spaced_ascii(v)
+    if s.len() <= 120 {
+        return s
+    }
+    return "{s[0..120]}..."
+}
+
+// --- comparing ---------------------------------------------------------------------------------
+
+/// A packet that differs, keyed as a difference file covers it.
+pub struct Finding {
+    pub key: String
+    pub suite: String
+    pub what: String
+    pub detail: List<String>
+    pub covered_by: String
+    pub config: String
+}
+
+/// A suite's packets that matched and that differed.
+pub struct Tally {
+    pub matched: i64
+    pub differed: i64
+}
+
+/// The findings so far, and each suite's tally.
+struct Found {
+    findings: List<Finding>
+    counts: LinkedMap<String, Tally>
+}
+
+fn tally(found: mut Found, suite: String) {
+    if not found.counts.contains(suite.copy()) {
+        found.counts.insert(suite.copy(), Tally { matched: 0, differed: 0 })
+    }
+}
+
+fn matched(found: mut Found, suite: String, n: i64) {
+    tally(mut found, suite.copy())
+    if let t = mut found.counts.find(suite) {
+        t.matched += n
+    }
+}
+
+fn differed(found: mut Found, suite: String, n: i64) {
+    tally(mut found, suite.copy())
+    if let t = mut found.counts.find(suite) {
+        t.differed += n
+    }
+}
+
+/// A packet's kind without its state, as a finding's key ends.
+fn bare(kind: String) -> String {
+    if let (_, rest) = kind.split_once("/") {
+        return rest
+    }
+    return kind.copy()
+}
+
+/// A finding in step `step` of `scenario`.
+fn found_in(found: mut Found, scenario: String, step: String, suite: String, kind: String, what: own String, detail: own List<String>) {
+    found.findings.push(Finding { key: "session:{scenario}/{step}/{bare(kind)}", suite: suite.copy(), what: what, detail: detail, covered_by: String(""), config: String("") })
+    differed(mut found, suite, 1)
+}
+
+fn suite_of(scenario: String, step: String) -> String {
+    if scenario == "status" {
+        return String("status")
+    }
+    if step == "status" or step == "login" or step == "configuration" {
+        return step.copy()
+    }
+    return String("play")
+}
+
+/// What's wrong with Calcite's packet `b` where vanilla sent `a`, or nothing.
+fn compare_entries(a: Entry, b: Entry) -> List<String> {
+    if not a.error.is_empty() or not b.error.is_empty() {
+        if not a.error.is_empty() and not b.error.is_empty() {
+            if a.error == b.error {
+                return []
+            }
+            return ["vanilla's: {a.error}", "Calcite's: {b.error}"]
+        }
+        if not b.error.is_empty() {
+            return ["Calcite's: {b.error}"]
+        }
+        return ["vanilla's: {a.error}"]
+    }
+    if a.text() != b.text() {
+        return differences_of(a.value, b.value)
+    }
+    if a.sha != b.sha and not among(a.kind.copy(), UNORDERED) and drawn(a.kind.copy()) == none {
+        return ["the same values in other bytes, such as a map in another order"]
+    }
+    return []
+}
+
+/// What a packet's lined up by: its kind, and, for one of `PLACED`, where it is.
+fn line_key(e: Entry) -> String {
+    if not among(e.kind.copy(), PLACED) or not is_dict(e.value) {
+        return e.kind.copy()
+    }
+    var at = g(e.value, "pos")
+    if not truthy(at) {
+        at = Json.Object(LinkedMap<String, Json>())
+        for k in ["x", "y", "z"] {
+            at = set_key(at, k, g(e.value, k))
+        }
+    }
+    return "{e.kind} {sorted_ascii(without(at, ["@"]))}"
+}
+
+/// Where a block change is: a block's position, a section's, or a light update's chunk.
+fn where_of(e: Entry) -> String {
+    let v = if is_dict(e.value) { e.value.copy() } else { Json.Object(LinkedMap<String, Json>()) }
+    var at = g(v, "pos")
+    if not truthy(at) {
+        at = g(v, "sectionPos")
+    }
+    if not truthy(at) {
+        at = Json.Object(LinkedMap<String, Json>())
+        for k in ["x", "z"] {
+            at = set_key(at, k, g(v, k))
+        }
+    }
+    return sorted_ascii(without(at, ["@"]))
+}
+
+fn compare_step(scenario: String, va: Step, ca: Step, found: mut Found) {
+    let suite = suite_of(scenario.copy(), va.name.copy())
+    tally(mut found, suite.copy())
+    let a = va.entries.copy()
+    let b = ca.entries.copy()
+    var ka: List<String> = []
+    for e in a {
+        ka.push(line_key(e))
+    }
+    var kb: List<String> = []
+    for e in b {
+        kb.push(line_key(e))
+    }
+    for op in opcodes(ka, kb) {
+        if op.tag == "equal" {
+            for t in 0..op.i2 - op.i1 {
+                let x = a[op.i1 + t].copy()
+                let y = b[op.j1 + t].copy()
+                if x.kind == "<chunks>" {
+                    compare_chunks(scenario.copy(), va, ca, mut found, suite.copy())
+                    continue
+                }
+                let problem = compare_entries(x, y)
+                if not problem.is_empty() {
+                    found_in(mut found, scenario.copy(), va.name.copy(), suite.copy(), x.kind.copy(), String("differs"), problem)
+                } else {
+                    matched(mut found, suite.copy(), 1)
+                }
+            }
+            continue
+        }
+        for k in op.i1..op.i2 {
+            let kind = a[k].kind.copy()
+            let what = if not kind.starts_with("<") { String("only vanilla sends it") } else { "only vanilla's session has {kind}" }
+            found_in(mut found, scenario.copy(), va.name.copy(), suite.copy(), kind, what, [])
+        }
+        for k in op.j1..op.j2 {
+            let kind = b[k].kind.copy()
+            let what = if not kind.starts_with("<") { String("only Calcite sends it") } else { "only Calcite's session has {kind}" }
+            found_in(mut found, scenario.copy(), va.name.copy(), suite.copy(), kind, what, [])
+        }
+    }
+    if not va.changes.is_empty() or not ca.changes.is_empty() {
+        compare_changes(scenario.copy(), va, ca, mut found, suite.copy())
+    }
+    var kinds: List<String> = []
+    for (k, _) in va.clock {
+        kinds.push(k.copy())
+    }
+    for (k, _) in ca.clock {
+        if not va.clock.contains(k.copy()) {
+            kinds.push(k.copy())
+        }
+    }
+    kinds.sort()
+    for kind in kinds {
+        if not ca.clock.contains(kind.copy()) {
+            found_in(mut found, scenario.copy(), va.name.copy(), suite.copy(), kind.copy(), String("only vanilla sends it"), [])
+        } else if not va.clock.contains(kind.copy()) {
+            found_in(mut found, scenario.copy(), va.name.copy(), suite.copy(), kind.copy(), String("only Calcite sends it"), [])
+        } else if sorted_ascii(va.clock[kind]) != sorted_ascii(ca.clock[kind]) {
+            found_in(mut found, scenario.copy(), va.name.copy(), suite.copy(), kind.copy(), String("differs, with the times taken out"), differences_of(va.clock[kind], ca.clock[kind]))
+        } else {
+            matched(mut found, suite.copy(), 1)
+        }
+    }
+}
+
+/// A step's block changes as a multiset: each of vanilla's matched with one of Calcite's with the
+/// same value, then those left paired by where they are, in the order each side sent them, and
+/// the rest each side's own.
+fn compare_changes(scenario: String, va: Step, ca: Step, found: mut Found, suite: String) {
+    let step = va.name.copy()
+    var by_value = Map<String, List<usize>>()
+    for (i, e) in ca.changes.enumerate() {
+        let key = "{e.kind}\n{e.text()}"
+        if let is = mut by_value.find(key.copy()) {
+            is.push(i)
+        } else {
+            by_value.insert(key, [i])
+        }
+    }
+    var used: List<bool> = []
+    for _ in ca.changes {
+        used.push(false)
+    }
+    var left_v: List<usize> = []
+    for (i, x) in va.changes.enumerate() {
+        let key = "{x.kind}\n{x.text()}"
+        var taken: usize? = none
+        if let is = mut by_value.find(key) {
+            if not is.is_empty() {
+                taken = some(is.remove(0))
+            }
+        }
+        let k = taken else {
+            left_v.push(i)
+            continue
+        }
+        used[k] = true
+        let problem = compare_entries(x, ca.changes[k])
+        if not problem.is_empty() {
+            found_in(mut found, scenario.copy(), step.copy(), suite.copy(), x.kind.copy(), String("differs"), problem)
+        } else {
+            matched(mut found, suite.copy(), 1)
+        }
+    }
+    // Calcite's left, by where they are, in the order the places first come.
+    var by_place = LinkedMap<String, List<usize>>()
+    for (k, y) in ca.changes.enumerate() {
+        if used[k] {
+            continue
+        }
+        let key = "{y.kind}\n{where_of(y)}"
+        if let ks = mut by_place.find(key.copy()) {
+            ks.push(k)
+        } else {
+            by_place.insert(key, [k])
+        }
+    }
+    var only_v: List<usize> = []
+    for i in left_v {
+        let x = va.changes[i].copy()
+        let key = "{x.kind}\n{where_of(x)}"
+        var there: usize? = none
+        if let ks = mut by_place.find(key) {
+            if not ks.is_empty() {
+                there = some(ks.remove(0))
+            }
+        }
+        if let k = there {
+            var problem = compare_entries(x, ca.changes[k])
+            if problem.is_empty() {
+                problem = ["the same values"]
+            }
+            found_in(mut found, scenario.copy(), step.copy(), suite.copy(), x.kind.copy(), String("differs"), problem)
+        } else {
+            only_v.push(i)
+        }
+    }
+    var only_c: List<usize> = []
+    for (_, ks) in by_place {
+        only_c.extend(ks.copy())
+    }
+    for (side, changes, xs) in [(String("vanilla"), va.changes.copy(), only_v), (String("Calcite"), ca.changes.copy(), only_c)] {
+        var by_kind = LinkedMap<String, List<usize>>()
+        for i in xs {
+            let kind = changes[i].kind.copy()
+            if let ks = mut by_kind.find(kind.copy()) {
+                ks.push(i)
+            } else {
+                by_kind.insert(kind, [i])
+            }
+        }
+        var kinds: List<String> = []
+        for (k, _) in by_kind {
+            kinds.push(k.copy())
+        }
+        kinds.sort()
+        for kind in kinds {
+            let ys = by_kind[kind].copy()
+            let what = if ys.len() == 1 { "only {side} sends it" } else { "only {side} sends {ys.len()} of them" }
+            var detail: List<String> = []
+            for k in 0..ys.len() {
+                if k < 3 {
+                    detail.push("at {where_of(changes[ys[k]])}")
+                }
+            }
+            found_in(mut found, scenario.copy(), step.copy(), suite.copy(), kind.copy(), what, detail)
+            differed(mut found, suite.copy(), i64.wrap(ys.len()) - 1)
+        }
+    }
+}
+
+/// The order Python sorts two chunks' positions in: by x, then z.
+fn before(a: Chunk, b: Chunk) -> bool {
+    let ax = a.x.as_f64() ?? f64.NEG_INFINITY
+    let bx = b.x.as_f64() ?? f64.NEG_INFINITY
+    if ax != bx {
+        return ax < bx
+    }
+    return (a.z.as_f64() ?? f64.NEG_INFINITY) < (b.z.as_f64() ?? f64.NEG_INFINITY)
+}
+
+/// The keys of `chunks` that `others` has or hasn't, in order of their positions.
+fn chunk_keys(chunks: LinkedMap<String, Chunk>, others: LinkedMap<String, Chunk>, shared: bool) -> List<String> {
+    var keys: List<String> = []
+    for (k, _) in chunks {
+        if others.contains(k.copy()) == shared {
+            keys.push(k.copy())
+        }
+    }
+    for k in 1..keys.len() {
+        var at = k
+        while at > 0 and before(chunks[keys[at]], chunks[keys[at - 1]]) {
+            keys.swap(at - 1, at)
+            at -= 1
+        }
+    }
+    return keys
+}
+
+fn chunk_list(keys: List<String>) -> String {
+    var parts: List<String> = []
+    for k in 0..keys.len() {
+        if k < 12 {
+            parts.push(keys[k].copy())
+        }
+    }
+    return "[{parts.join(", ")}]"
+}
+
+fn compare_chunks(scenario: String, va: Step, ca: Step, found: mut Found, suite: String) {
+    let step = va.name.copy()
+    let kind = String("play/level_chunk_with_light")
+    if va.batched != va.sent or ca.batched != ca.sent or va.sent != ca.sent {
+        found_in(mut found, scenario.copy(), step.copy(), suite.copy(), String("play/chunk_batch_finished"), String("a batch's size isn't the chunks it held"), ["vanilla {va.batched} for {va.sent}, Calcite {ca.batched} for {ca.sent}"])
+    }
+    let only_v = chunk_keys(va.chunks, ca.chunks, false)
+    let only_c = chunk_keys(ca.chunks, va.chunks, false)
+    if not only_v.is_empty() or not only_c.is_empty() {
+        found_in(mut found, scenario.copy(), step.copy(), suite.copy(), kind.copy(), String("other chunks"), ["only vanilla's: {chunk_list(only_v)}", "only Calcite's: {chunk_list(only_c)}"])
+    }
+    let shared = chunk_keys(va.chunks, ca.chunks, true)
+    var bad: List<(String, List<String>)> = []
+    for pos in shared {
+        let problem = compare_entries(va.chunks[pos].entry, ca.chunks[pos].entry)
+        if not problem.is_empty() {
+            bad.push((pos.copy(), problem))
+        }
+    }
+    if not bad.is_empty() {
+        found_in(mut found, scenario.copy(), step.copy(), suite.copy(), kind.copy(), "chunk {bad[0].0} differs", bad[0].1.copy())
+    }
+    if bad.len() > 1 {
+        // The others, by what differs in them, so a few kinds of difference over many chunks read
+        // as a few lines.
+        var kinds = LinkedMap<String, List<String>>()
+        for k in 1..bad.len() {
+            let fields = fields_of(bad[k].1)
+            let c = va.chunks[bad[k].0].copy()
+            let at = "({py_str(c.x)},{py_str(c.z)})"
+            if let ps = mut kinds.find(fields.copy()) {
+                ps.push(at)
+            } else {
+                kinds.insert(fields, [at])
+            }
+        }
+        var order: List<String> = []
+        for (k, _) in kinds {
+            order.push(k.copy())
+        }
+        for k in 1..order.len() {
+            var at = k
+            while at > 0 and kinds[order[at - 1]].len() < kinds[order[at]].len() {
+                order.swap(at - 1, at)
+                at -= 1
+            }
+        }
+        var detail: List<String> = []
+        for k in order {
+            detail.push("{k}: {kinds[k].join(" ")}")
+        }
+        found_in(mut found, scenario.copy(), step.copy(), suite.copy(), kind.copy(), "{bad.len() - 1} more chunks differ", detail)
+    }
+    matched(mut found, suite.copy(), i64.wrap(shared.len()) - i64.wrap(bad.len()))
+}
+
+/// `text` without its indices, `[0]` and on.
+fn without_indices(text: String) -> String {
+    var out = String("")
+    var i = 0usize
+    while i < text.len() {
+        if text.byte_at(i) == 0x5B {
+            var j = i + 1
+            while j < text.len() and text.byte_at(j) >= 0x30 and text.byte_at(j) <= 0x39 {
+                j += 1
+            }
+            if j > i + 1 and j < text.len() and text.byte_at(j) == 0x5D {
+                i = j + 1
+                continue
+            }
+        }
+        out = "{out}{text[i..i + 1]}"
+        i += 1
+    }
+    return out
+}
+
+/// The fields a chunk's differences are in, two deep and without indices, as
+/// `.lightData.skyUpdates`, joined.
+fn fields_of(problem: List<String>) -> String {
+    var out: List<String> = []
+    for line in problem {
+        var at = line.copy()
+        if line.starts_with(".") {
+            if let (head, _) = line.split_once(": ") {
+                at = head
+            }
+        }
+        let parts = without_indices(at).split(".")
+        var kept: List<String> = []
+        for k in 0..parts.len() {
+            if k < 3 {
+                kept.push(parts[k].copy())
+            }
+        }
+        let field = kept.join(".")
+        if not out.contains(field.copy()) {
+            out.push(field)
+        }
+    }
+    out.sort()
+    return out.join(", ")
+}
+
+/// Each entity's packets across the session, by its ID, each with the place of its step.
+fn streams(steps: List<Step>) -> LinkedMap<i64, List<(usize, Entry)>> {
+    var out = LinkedMap<i64, List<(usize, Entry)>>()
+    for (n, s) in steps.enumerate() {
+        for (who, es) in s.entities {
+            var tagged: List<(usize, Entry)> = []
+            for e in es {
+                tagged.push((n, e.copy()))
+            }
+            if let all = mut out.find(who) {
+                all.extend(tagged)
+            } else {
+                out.insert(who, tagged)
+            }
+        }
+    }
+    return out
+}
+
+fn found_entity(found: mut Found, scenario: String, who: i64, kind: String, what: own String, detail: own List<String>) {
+    found.findings.push(Finding { key: "session:{scenario}/<entity>/{bare(kind)}", suite: String("play"), what: "entity {who}: {what}", detail: detail, covered_by: String(""), config: String("") })
+    differed(mut found, String("play"), 1)
+}
+
+fn line_up(scenario: String, who: i64, a: List<(usize, Entry)>, b: List<(usize, Entry)>, more: usize, names_v: List<String>, names_c: List<String>, found: mut Found) {
+    var ka: List<String> = []
+    for (_, e) in a {
+        ka.push(e.kind.copy())
+    }
+    var kb: List<String> = []
+    for (_, e) in b {
+        kb.push(e.kind.copy())
+    }
+    let ops = opcodes(ka, kb)
+    for (k, op) in ops.enumerate() {
+        if op.tag == "equal" {
+            for t in 0..op.i2 - op.i1 {
+                let problem = compare_entries(a[op.i1 + t].1, b[op.j1 + t].1)
+                if not problem.is_empty() {
+                    found_entity(mut found, scenario.copy(), who, a[op.i1 + t].1.kind.copy(), String("differs"), problem)
+                } else {
+                    matched(mut found, String("play"), 1)
+                }
+            }
+            continue
+        }
+        // One side's moves going on past the other's, a few of them, as it went later.
+        let longer = if op.i2 - op.i1 > op.j2 - op.j1 { op.i2 - op.i1 } else { op.j2 - op.j1 }
+        if k == ops.len() - 1 and (op.tag == "delete" or op.tag == "insert") and longer <= more {
+            continue
+        }
+        for i in op.i1..op.i2 {
+            found_entity(mut found, scenario.copy(), who, a[i].1.kind.copy(), "only vanilla sends it, in {names_v[a[i].0]}", [])
+        }
+        for j in op.j1..op.j2 {
+            found_entity(mut found, scenario.copy(), who, b[j].1.kind.copy(), "only Calcite sends it, in {names_c[b[j].0]}", [])
+        }
+    }
+}
+
+fn of_state(xs: List<(usize, Entry)>, state: bool) -> List<(usize, Entry)> {
+    var out: List<(usize, Entry)> = []
+    for (n, e) in xs {
+        if among(e.kind.copy(), STATE) == state {
+            out.push((n, e.copy()))
+        }
+    }
+    return out
+}
+
+/// Each entity's packets, in the order it was sent them, apart from the steps (CAL-148): a packet
+/// that differs, or one side's going on past the other's before the last steps.
+fn compare_entities(vanilla_steps: List<Step>, calcite_steps: List<Step>, scenario: String, found: mut Found) {
+    tally(mut found, String("play"))
+    let va = streams(vanilla_steps)
+    let ca = streams(calcite_steps)
+    var names_v: List<String> = []
+    for s in vanilla_steps {
+        names_v.push(s.name.copy())
+    }
+    var names_c: List<String> = []
+    for s in calcite_steps {
+        names_c.push(s.name.copy())
+    }
+    var whos: List<i64> = []
+    for (who, _) in va {
+        whos.push(who)
+    }
+    for (who, _) in ca {
+        if not va.contains(who) {
+            whos.push(who)
+        }
+    }
+    whos.sort()
+    for who in whos {
+        var a: List<(usize, Entry)> = []
+        if let xs = va.find(who) {
+            a = xs.copy()
+        }
+        var b: List<(usize, Entry)> = []
+        if let xs = ca.find(who) {
+            b = xs.copy()
+        }
+        line_up(scenario.copy(), who, of_state(a, true), of_state(b, true), 0, names_v, names_c, mut found)
+        line_up(scenario.copy(), who, of_state(a, false), of_state(b, false), MORE_MOVES, names_v, names_c, mut found)
+    }
+}
+
+/// Where each step of `steps` is by its name, the last of a name where two share one.
+fn by_name(steps: List<Step>) -> Map<String, usize> {
+    var out = Map<String, usize>()
+    for (i, s) in steps.enumerate() {
+        out.insert(s.name.copy(), i)
+    }
+    return out
+}
+
+/// Calcite's steps with each keep-alive it sends a step before or after vanilla's moved to
+/// vanilla's step: they go by the wall clock, every 15 seconds from a player's join, which is 300
+/// ticks and so falls at a step's start, on either side of it on either server.
+fn keep_alives_lined_up(vanilla_steps: List<Step>, calcite_steps: mut List<Step>) {
+    let names = by_name(calcite_steps)
+    for kind in ["play/keep_alive", "configuration/keep_alive"] {
+        for (i, va) in vanilla_steps.enumerate() {
+            let c = names.get(va.name.copy()) else {
+                continue
+            }
+            if not va.clock.contains(String(kind)) or calcite_steps[c].clock.contains(String(kind)) {
+                continue
+            }
+            for j in [i64.wrap(i) - 1, i64.wrap(i) + 1] {
+                if j < 0 or j >= i64.wrap(vanilla_steps.len()) {
+                    continue
+                }
+                let other = vanilla_steps[usize.wrap(j)].copy()
+                if let near = names.get(other.name.copy()) {
+                    if calcite_steps[near].clock.contains(String(kind)) and not other.clock.contains(String(kind)) {
+                        if let v = calcite_steps[near].clock.remove(String(kind)) {
+                            calcite_steps[c].clock.insert(String(kind), v)
+                        }
+                        break
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn compare(vanilla_steps: List<Step>, calcite: own List<Step>, scenario: String, found: mut Found) {
+    var calcite_steps = calcite
+    compare_entities(vanilla_steps, calcite_steps, scenario.copy(), mut found)
+    keep_alives_lined_up(vanilla_steps, mut calcite_steps)
+    let names = by_name(calcite_steps)
+    for va in vanilla_steps {
+        let suite = suite_of(scenario.copy(), va.name.copy())
+        if let c = names.get(va.name.copy()) {
+            compare_step(scenario.copy(), va, calcite_steps[c], mut found)
+        } else {
+            found.findings.push(Finding { key: "session:{scenario}/{va.name}/<step>", suite: suite.copy(), what: String("Calcite's session never got to this step"), detail: [], covered_by: String(""), config: String("") })
+            differed(mut found, suite, 1)
+        }
+    }
+    var vanilla_names = Set<String>()
+    for s in vanilla_steps {
+        vanilla_names.insert(s.name.copy())
+    }
+    for ca in calcite_steps {
+        if not vanilla_names.contains(ca.name.copy()) {
+            let suite = suite_of(scenario.copy(), ca.name.copy())
+            found.findings.push(Finding { key: "session:{scenario}/{ca.name}/<step>", suite: suite.copy(), what: String("only Calcite's session gets to this step"), detail: [], covered_by: String(""), config: String("") })
+            differed(mut found, suite, 1)
+        }
+    }
+}
+
+/// What a comparison found: each finding, each suite's tally, whether the gated suites passed, and
+/// the lines it printed.
+pub struct Report {
+    pub findings: List<Finding>
+    pub counts: LinkedMap<String, Tally>
+    pub passed: bool
+    pub lines: List<String>
+}
+
+/// Compares the sessions of each configuration and each of its scenarios, and writes the suites
+/// in the report's lines. With `complete`, every scenario ran, so a difference with session cases
+/// that covered nothing is noted, as the scoreboard notes one whose cases pass. `show` is how
+/// many lines of each finding's detail to write, or 0 for all.
+pub fn run(sessions: String, configs: List<String>, scenarios: LinkedMap<String, List<String>>, differences_dir: String, show: usize, complete: bool) -> Report {
+    let known = match differences.load(differences_dir.copy()) {
+        ok(ds) => ds,
+        err(e) => die(e),
+    }
+    var found = Found { findings: List<Finding>(), counts: LinkedMap<String, Tally>() }
+    for config in configs {
+        var names: List<String> = []
+        if let xs = scenarios.find(config.copy()) {
+            names = xs.copy()
+        }
+        for scenario in names {
+            let folder = path.join(sessions.copy(), config.copy())
+            let v = load(path.join(path.join(folder.copy(), "vanilla"), "{scenario}.jsonl"))
+            let c = load(path.join(path.join(folder.copy(), "calcite"), "{scenario}.jsonl"))
+            let before_this = found.findings.len()
+            compare(v, c, scenario.copy(), mut found)
+            for k in before_this..found.findings.len() {
+                found.findings[k].config = config.copy()
+            }
+        }
+    }
+    for k in 0..found.findings.len() {
+        for d in known {
+            if d.covers(found.findings[k].key.copy()) {
+                found.findings[k].covered_by = d.id.copy()
+                break
+            }
+        }
+    }
+    var lines: List<String> = []
+    var passed = true
+    for suite in ["status", "login", "configuration", "play"] {
+        let t = found.counts.get(String(suite)) else {
+            continue
+        }
+        var mine: List<Finding> = []
+        var open = 0usize
+        for f in found.findings {
+            if f.suite == suite {
+                mine.push(f.copy())
+                if f.covered_by.is_empty() {
+                    open += 1
+                }
+            }
+        }
+        let gate = suite != "play"
+        if gate and open > 0 {
+            passed = false
+        }
+        let state = if gate { if open == 0 { "PASS" } else { "FAIL" } } else { if open == 0 { "match" } else { "differs" } }
+        lines.push("{suite:<14} {state:<7} {t.matched} match, {mine.len() - open} deliberate, {open} differ")
+        for f in mine {
+            let note = if f.covered_by.is_empty() { String("") } else { " (deliberate: {f.covered_by})" }
+            lines.push("  [{f.config}] {f.key}: {f.what}{note}")
+            for (k, line) in f.detail.enumerate() {
+                if show == 0 or k < show {
+                    lines.push("      {line}")
+                }
+            }
+        }
+    }
+    if complete {
+        var used = Set<String>()
+        for f in found.findings {
+            used.insert(f.covered_by.copy())
+        }
+        for d in known {
+            var session = false
+            for c in d.cases {
+                if c.starts_with("session:") {
+                    session = true
+                }
+            }
+            if session and not used.contains(d.id.copy()) {
+                lines.push("note: {d.id} covers no session that differs, so it may be out of date")
+            }
+        }
+    }
+    lines.push("the login, configuration and status suites {if passed { "pass" } else { "fail" }}")
+    return Report { findings: found.findings, counts: found.counts, passed: passed, lines: lines }
+}
+
+/// The same scenarios for every configuration.
+pub fn every(configs: List<String>, scenarios: List<String>) -> LinkedMap<String, List<String>> {
+    var out = LinkedMap<String, List<String>>()
+    for c in configs {
+        out.insert(c.copy(), scenarios.copy())
+    }
+    return out
+}
