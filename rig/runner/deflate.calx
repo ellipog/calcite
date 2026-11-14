@@ -1,0 +1,195 @@
+module rig.runner.deflate
+
+// Deflate, zlib and gzip streams that come out the same on every machine and every build, for the
+// case generators (CAL-253).
+//
+// A case file has to come out the same wherever its generator runs, since the runner's tests rerun
+// every generator and compare, and `std.zlib` picks its own matches, which tuning it may change. So
+// generators compress with this instead, which writes what `rig/runner/deflate.py` wrote.
+//
+// `deflate` writes one block with deflate's fixed Huffman codes: greedy LZ77 matches from level 2
+// up, only literals at level 1, and stored blocks at level 0. Every inflater reads these, Java's
+// included. Checksums come from `std.zlib`'s `crc32` and `adler32`.
+
+import std.bytes
+import std.zlib.{adler32, crc32}
+
+const LENGTH_BASE: [u64; 29] = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258]
+const LENGTH_EXTRA: [u32; 29] = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0]
+const DISTANCE_BASE: [u64; 30] = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577]
+const DISTANCE_EXTRA: [u32; 30] = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13]
+const WINDOW: usize = 32768
+const LONGEST: usize = 258
+const STORED_MAX: usize = 65535
+
+/// Java's GZIPOutputStream's header: no name, no time, no flags, OS 255.
+pub fn gzip_header() -> List<u8> {
+    return [0x1F, 0x8B, 0x08, 0, 0, 0, 0, 0, 0, 0xFF]
+}
+
+/// Bits written from the lowest of each byte up, as deflate packs them.
+struct Bits {
+    out: List<u8>
+    word: u64
+    count: u32
+}
+
+impl Bits {
+    fn put(mut self, value: u64, width: u32) {
+        self.word |= value << u64(self.count)
+        self.count += width
+        while self.count >= 8 {
+            self.out.push(u8.wrap(self.word & 0xFF))
+            self.word >>= 8
+            self.count -= 8
+        }
+    }
+
+    /// A Huffman code, which deflate writes from its highest bit.
+    fn code(mut self, value: u64, width: u32) {
+        var reversed = 0u64
+        for i in 0u32..width {
+            if (value >> u64(i)) & 1 == 1 {
+                reversed |= 1u64 << u64(width - 1 - i)
+            }
+        }
+        self.put(reversed, width)
+    }
+
+    fn done(own self) -> List<u8> {
+        var out = self.out
+        if self.count > 0 {
+            out.push(u8.wrap(self.word & 0xFF))
+        }
+        return out
+    }
+}
+
+/// A literal, length or end symbol in the fixed codes.
+fn symbol(bits: mut Bits, value: u64) {
+    if value < 144 {
+        bits.code(0x30 + value, 8)
+    } else if value < 256 {
+        bits.code(0x190 + value - 144, 9)
+    } else if value < 280 {
+        bits.code(value - 256, 7)
+    } else {
+        bits.code(0xC0 + value - 280, 8)
+    }
+}
+
+fn match_of(bits: mut Bits, length: usize, distance: usize) {
+    let long = u64(length)
+    var i = 0usize
+    while i + 1 < LENGTH_BASE.len() and LENGTH_BASE[i + 1] <= long {
+        i += 1
+    }
+    symbol(mut bits, 257 + u64(i))
+    bits.put(long - LENGTH_BASE[i], LENGTH_EXTRA[i])
+    let far = u64(distance)
+    var j = 0usize
+    while j + 1 < DISTANCE_BASE.len() and DISTANCE_BASE[j + 1] <= far {
+        j += 1
+    }
+    bits.code(u64(j), 5)
+    bits.put(far - DISTANCE_BASE[j], DISTANCE_EXTRA[j])
+}
+
+fn key(data: List<u8>, at: usize) -> u32 {
+    return (u32(data[at]) << 16) | (u32(data[at + 1]) << 8) | u32(data[at + 2])
+}
+
+fn fixed(data: List<u8>, matches: bool) -> List<u8> {
+    var bits = Bits { out: [], word: 0, count: 0 }
+    bits.put(1, 1)    // the last block
+    bits.put(1, 2)    // with the fixed codes
+    // Where each three bytes were last seen.
+    var last = Map<u32, usize>()
+    let total = data.len()
+    var i = 0usize
+    while i < total {
+        var length = 0usize
+        var distance = 0usize
+        if matches and i + 3 <= total {
+            let here = key(data, i)
+            let seen = last.get(here) ?? total
+            last.insert(here, i)
+            if seen < total and i - seen <= WINDOW {
+                length = 3
+                distance = i - seen
+                let most = if LONGEST < total - i { LONGEST } else { total - i }
+                while length < most and data[seen + length] == data[i + length] {
+                    length += 1
+                }
+            }
+        }
+        if length > 0 {
+            match_of(mut bits, length, distance)
+            let end = if i + length < total - 2 { i + length } else { total - 2 }
+            for k in (i + 1)..end {
+                last.insert(key(data, k), k)
+            }
+            i += length
+        } else {
+            symbol(mut bits, u64(data[i]))
+            i += 1
+        }
+    }
+    symbol(mut bits, 256)
+    return bits.done()
+}
+
+fn stored(data: List<u8>) -> List<u8> {
+    if data.is_empty() {
+        return [1, 0, 0, 0xFF, 0xFF]
+    }
+    var out: List<u8> = []
+    var k = 0usize
+    while k < data.len() {
+        let end = if k + STORED_MAX < data.len() { k + STORED_MAX } else { data.len() }
+        let size = u16.wrap(end - k)
+        out.push(if k + STORED_MAX >= data.len() { 1 } else { 0 })
+        bytes.put_u16_le(mut out, size)
+        bytes.put_u16_le(mut out, size ^ 0xFFFF)
+        for at in k..end {
+            out.push(data[at])
+        }
+        k += STORED_MAX
+    }
+    return out
+}
+
+/// `data` as a raw deflate stream: stored at level 0, literals at 1, matches from 2 up (-1 is 6,
+/// as zlib's default).
+pub fn deflate(data: List<u8>, level: i64 = 6) -> List<u8> {
+    if level == 0 {
+        return stored(data)
+    }
+    return fixed(data, level != 1)
+}
+
+/// `data` as a zlib stream, its header's level as zlib marks it for `level`.
+pub fn zlib_stream(data: List<u8>, level: i64 = 6) -> List<u8> {
+    let at: i64 = if level == -1 { 6 } else { level }
+    let mark: u32 = if at <= 1 { 0 } else if at <= 5 { 1 } else if at == 6 { 2 } else { 3 }
+    var flags = mark << 6
+    flags += (31 - ((0x78u32 << 8) | flags) % 31) % 31
+    var out: List<u8> = [0x78, u8.wrap(flags)]
+    out.extend(deflate(data, at))
+    bytes.put_u32_be(mut out, adler32(data.copy()))
+    return out
+}
+
+/// `data` as one gzip member, as Java's GZIPOutputStream writes it.
+pub fn gzip_stream(data: List<u8>, level: i64 = 6) -> List<u8> {
+    return gzip_with(data, level, gzip_header())
+}
+
+/// `data` as one gzip member behind `header`.
+pub fn gzip_with(data: List<u8>, level: i64, header: List<u8>) -> List<u8> {
+    var out = header.copy()
+    out.extend(deflate(data, level))
+    bytes.put_u32_le(mut out, crc32(data.copy()))
+    bytes.put_u32_le(mut out, u32.wrap(data.len()))
+    return out
+}

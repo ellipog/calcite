@@ -1,0 +1,675 @@
+module cases.world_folder.gen
+
+// Writes cases/world_folder/generated.json: a world's folder opened and locked, its level.dat read
+// with the level.dat_old fallback, its version checked as a server checks it as it starts, saved,
+// players' data read as they join, saved data read and written, and the files left, as vanilla's
+// LevelStorageSource, PlayerDataStorage and SavedDataStorage do each.
+//
+//     calx cases/world_folder/gen.calx
+//
+// The level.dat files are made here: NBT written as NbtIo writes a file's root, gzipped as Java's
+// GZIPOutputStream frames it, by rig/runner/deflate.calx, which compresses the same on every
+// machine, then broken in the ways a file can be: cut off, with a wrong checksum or length, more
+// than one gzip member, a header with its optional fields, things after the stream, a root that
+// isn't a compound, more NBT than the quota, and folders where files should be.
+
+import std.bytes
+import std.bytes.{base64}
+import std.json.{Json}
+import std.zlib.{crc32}
+import cases.kit.{arr, file, n, obj, s, with}
+import rig.runner.cases.{write_file}
+import rig.runner.deflate.{deflate, gzip_stream, gzip_with}
+
+const END: u8 = 0
+const BYTE: u8 = 1
+const SHORT: u8 = 2
+const INT: u8 = 3
+const LONG: u8 = 4
+const FLOAT: u8 = 5
+const DOUBLE: u8 = 6
+const STRING: u8 = 8
+const LIST: u8 = 9
+const COMPOUND: u8 = 10
+const LONGS: u8 = 12
+const UUID: str = "069a79f4-44e9-4726-a5be-fca90e38aaf5"
+const WEATHER: str = "data/minecraft/weather.dat"
+// A backslash and `u`, which starts the JSON escapes below.
+const U: str = "\\u"
+
+/// A tag: its type and its payload.
+struct Tag {
+    kind: u8
+    data: List<u8>
+}
+
+fn dup(tag: Tag) -> Tag {
+    return Tag { kind: tag.kind, data: tag.data.copy() }
+}
+
+fn t(text: String) -> List<u8> {
+    return text.to_bytes()
+}
+
+fn cat(parts: List<List<u8>>) -> List<u8> {
+    var out: List<u8> = []
+    for p in parts {
+        out.extend(p.copy())
+    }
+    return out
+}
+
+fn utf(text: String) -> List<u8> {
+    let data = text.to_bytes()
+    var out: List<u8> = []
+    bytes.put_u16_be(mut out, u16.wrap(data.len()))
+    out.extend(data)
+    return out
+}
+
+fn le32(a: u32, b: u32) -> List<u8> {
+    var out: List<u8> = []
+    bytes.put_u32_le(mut out, a)
+    bytes.put_u32_le(mut out, b)
+    return out
+}
+
+fn byte_tag(v: i8) -> Tag {
+    return Tag { kind: BYTE, data: [u8.wrap(v)] }
+}
+
+fn short_tag(v: i16) -> Tag {
+    var d: List<u8> = []
+    bytes.put_i16_be(mut d, v)
+    return Tag { kind: SHORT, data: d }
+}
+
+fn int_tag(v: i32) -> Tag {
+    var d: List<u8> = []
+    bytes.put_i32_be(mut d, v)
+    return Tag { kind: INT, data: d }
+}
+
+fn long_tag(v: i64) -> Tag {
+    var d: List<u8> = []
+    bytes.put_i64_be(mut d, v)
+    return Tag { kind: LONG, data: d }
+}
+
+fn float_tag(v: f32) -> Tag {
+    var d: List<u8> = []
+    bytes.put_f32_be(mut d, v)
+    return Tag { kind: FLOAT, data: d }
+}
+
+fn double_tag(v: f64) -> Tag {
+    var d: List<u8> = []
+    bytes.put_f64_be(mut d, v)
+    return Tag { kind: DOUBLE, data: d }
+}
+
+fn str_tag(v: String) -> Tag {
+    return Tag { kind: STRING, data: utf(v) }
+}
+
+fn list_tag(inner: u8, items: List<Tag>) -> Tag {
+    var d: List<u8> = [inner]
+    bytes.put_i32_be(mut d, i32.wrap(items.len()))
+    for item in items {
+        d.extend(item.data.copy())
+    }
+    return Tag { kind: LIST, data: d }
+}
+
+fn compound(fields: List<(String, Tag)>) -> Tag {
+    var d: List<u8> = []
+    for (name, tag) in fields {
+        d.push(tag.kind)
+        d.extend(utf(name.copy()))
+        d.extend(tag.data.copy())
+    }
+    d.push(END)
+    return Tag { kind: COMPOUND, data: d }
+}
+
+fn f(name: str, tag: own Tag) -> (String, Tag) {
+    return (String(name), tag)
+}
+
+/// `fields` with `more` set, as a dict's `update` sets them: in place, or after the rest.
+fn updated(fields: own List<(String, Tag)>, more: List<(String, Tag)>) -> List<(String, Tag)> {
+    var out = fields
+    for (name, tag) in more {
+        var found = false
+        for i in 0..out.len() {
+            if out[i].0 == name {
+                out[i] = (name.copy(), dup(tag))
+                found = true
+                break
+            }
+        }
+        if not found {
+            out.push((name.copy(), dup(tag)))
+        }
+    }
+    return out
+}
+
+/// A file's root, as NbtIo.write writes it: its type, an empty name, its payload.
+fn root(tag: Tag) -> List<u8> {
+    return cat([[tag.kind], utf(""), tag.data.copy()])
+}
+
+/// level.dat's root: `Data`, holding the fields.
+fn level(fields: List<(String, Tag)>) -> List<u8> {
+    return root(compound([f("Data", compound(fields))]))
+}
+
+fn good_level(name: String) -> List<u8> {
+    let version = compound([f("Name", str_tag("26.3")), f("Id", int_tag(5023)), f("Series", str_tag("main")), f("Snapshot", byte_tag(0))])
+    let fields: List<(String, Tag)> = [f("LevelName", str_tag("world")), f("version", int_tag(19133)), f("DataVersion", int_tag(5023)), f("Version", version), f("GameType", int_tag(1)), f("Time", long_tag(313))]
+    return level(updated(fields, [f("LevelName", str_tag(name))]))
+}
+
+/// A compound 600 deep, past NBT's depth.
+fn deep_nbt() -> List<u8> {
+    var out = cat([[COMPOUND], utf("")])
+    for _ in 0..600 {
+        out.push(COMPOUND)
+        out.extend(utf("a"))
+    }
+    for _ in 0..601 {
+        out.push(END)
+    }
+    return out
+}
+
+fn case_of(name: own String, ops: own List<Json>, blobs: List<List<u8>>) -> Json {
+    var encoded: List<Json> = []
+    for b in blobs {
+        encoded.push(s(base64(b.copy())))
+    }
+    return obj([(String("id"), s(name)), (String("input"), obj([(String("ops"), arr(ops))])), (String("blobs"), arr(encoded))])
+}
+
+fn linux(c: own Json) -> Json {
+    return with(c, "system", s("linux"))
+}
+
+/// An op of its name alone.
+fn o(name: str) -> Json {
+    return arr([s(String(name))])
+}
+
+fn put(path: own String, blob: i64) -> Json {
+    return arr([s("put"), s(path), n(blob)])
+}
+
+fn dir(path: own String) -> Json {
+    return arr([s("dir"), s(path)])
+}
+
+fn link(at: own String, target: own String) -> Json {
+    return arr([s("link"), s(at), s(target)])
+}
+
+fn allow(blob: i64) -> Json {
+    return arr([s("allow"), n(blob)])
+}
+
+/// A new world, one there already, saved once and twice, and folders where files go.
+fn folder_cases(out: mut List<Json>) {
+    let first = gzip_stream(good_level("first"))
+    out.push(case_of("new", [o("open"), o("has"), o("close")], []))
+    out.push(case_of("saved", [put("level.dat", 0), o("open"), o("has"), o("load"), o("check"), o("save"), o("close")], [first.copy()]))
+    out.push(case_of("saved-twice", [put("level.dat", 0), o("open"), o("has"), o("load"), o("save"), o("save"), o("close")], [first.copy()]))
+    out.push(case_of("old-only", [put("level.dat_old", 0), o("open"), o("has"), o("load"), o("check"), o("close")], [first.copy()]))
+    out.push(case_of("both", [put("level.dat", 0), put("level.dat_old", 1), o("open"), o("has"), o("load"), o("close")], [first.copy(), gzip_stream(good_level("old"))]))
+    out.push(case_of("level-is-a-folder", [dir("level.dat"), put("level.dat_old", 0), o("open"), o("has"), o("load"), o("close")], [first.copy()]))
+    out.push(case_of("level-is-a-full-folder", [put("level.dat/inside", 1), put("level.dat_old", 0), o("open"), o("has"), o("load"), o("close")], [first.copy(), t("x")]))
+    out.push(case_of("old-is-a-folder", [put("level.dat", 1), dir("level.dat_old"), o("open"), o("has"), o("load"), o("close")], [first.copy(), t("broken")]))
+    out.push(case_of("save-over-folders", [put("level.dat", 0), dir("level.dat_old"), o("open"), o("has"), o("load"), o("save"), o("close")], [first.copy()]))
+    out.push(case_of("lock-kept", [put("session.lock", 0), o("open"), o("close")], [t("0123456789")]))
+    out.push(case_of("other-files-kept", [put("level.dat", 0), put("dimensions/minecraft/overworld/region/r.0.0.mca", 1), o("open"), o("has"), o("load"), o("save"), o("close")], [first.copy(), t("region")]))
+}
+
+/// level.dat files that can't be read, with level.dat_old to fall back on, and some that can be
+/// although they look broken.
+fn broken_cases(out: mut List<Json>) {
+    let data = good_level("broken")
+    let deflated = deflate(data)
+    let head: List<u8> = [0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF]
+    let size = u32.wrap(data.len())
+    let crc = crc32(data.copy())
+    let trailer = le32(crc, size)
+    let half = data.len() / 2
+    let member_a = gzip_stream(data[0..half])
+    let member_b = gzip_stream(data[half..data.len()])
+    let name_header = cat([[0x1F, 0x8B, 0x08, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF], t("level.dat"), [0]])
+    let extra_header = cat([[0x1F, 0x8B, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF], [4, 0], t("ab"), [0, 0]])
+    let comment_header = cat([[0x1F, 0x8B, 0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF], t("made by hand"), [0]])
+    let plain_header: List<u8> = [0x1F, 0x8B, 0x08, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF]
+    let plain_crc = crc32(plain_header.copy())
+    var header_crc: List<u8> = []
+    bytes.put_u16_le(mut header_crc, u16.wrap(plain_crc))
+    var wrong_crc: List<u8> = []
+    bytes.put_u16_le(mut wrong_crc, u16.wrap(u64(plain_crc) + 1))
+    // A long array that says it's longer than the quota allows, with nothing after.
+    var quota = cat([[COMPOUND], utf(""), [COMPOUND], utf("Data"), [LONGS], utf("Big")])
+    bytes.put_i32_be(mut quota, 20000000)
+    for _ in 0..16 {
+        quota.push(0)
+    }
+    let variants: List<(String, List<u8>)> = [
+        (String("not-gzip"), data.copy()),
+        (String("empty"), []),
+        (String("magic-only"), [0x1F, 0x8B]),
+        (String("header-only"), head.copy()),
+        (String("cut-in-stream"), cat([head.copy(), deflated[0..deflated.len() / 2]])),
+        (String("cut-trailer"), cat([head.copy(), deflated.copy()])),
+        (String("cut-half-trailer"), cat([head.copy(), deflated.copy(), trailer[0..4]])),
+        (String("wrong-crc"), cat([head.copy(), deflated.copy(), le32(crc ^ 1, size)])),
+        (String("wrong-length"), cat([head.copy(), deflated.copy(), le32(crc, size + 1)])),
+        (String("two-members"), cat([member_a.copy(), member_b.copy()])),
+        (String("two-members-wrong-crc"), cat([member_a[0..member_a.len() - 8], le32(crc32(data[0..half]) ^ 1, u32.wrap(half)), member_b.copy()])),
+        (String("garbage-after"), cat([gzip_stream(data.copy()), t("not gzip at all")])),
+        (String("member-after"), cat([gzip_stream(data.copy()), gzip_stream(good_level("second"))])),
+        (String("name-header"), gzip_with(data.copy(), 6, name_header)),
+        (String("extra-header"), gzip_with(data.copy(), 6, extra_header)),
+        (String("comment-header"), gzip_with(data.copy(), 6, comment_header)),
+        (String("header-crc"), gzip_with(data.copy(), 6, cat([plain_header.copy(), header_crc]))),
+        (String("wrong-header-crc"), gzip_with(data.copy(), 6, cat([plain_header.copy(), wrong_crc]))),
+        (String("reserved-flag"), gzip_with(data.copy(), 6, [0x1F, 0x8B, 0x08, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF])),
+        (String("not-deflate"), gzip_with(data.copy(), 6, [0x1F, 0x8B, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF])),
+        (String("root-list"), gzip_stream(root(list_tag(INT, [int_tag(1), int_tag(2), int_tag(3)])))),
+        (String("root-end"), gzip_stream([END])),
+        (String("root-int"), gzip_stream(root(int_tag(5)))),
+        (String("data-not-compound"), gzip_stream(root(compound([f("Data", int_tag(4))])))),
+        (String("no-data"), gzip_stream(root(compound([f("Other", compound([f("LevelName", str_tag("x"))]))])))),
+        (String("cut-nbt"), gzip_stream(data[0..data.len() - 3])),
+        (String("nbt-then-more"), gzip_stream(cat([data.copy(), [1, 2, 3]]))),
+        (String("bad-tag-type"), gzip_stream(cat([[COMPOUND], utf(""), [COMPOUND], utf("Data"), [42], utf("x"), [END, END]]))),
+        (String("over-quota"), gzip_stream(quota)),
+        (String("deep"), gzip_stream(deep_nbt())),
+    ]
+    let old = gzip_stream(good_level("fallback"))
+    for (name, blob) in variants {
+        out.push(case_of(name.copy(), [put("level.dat", 0), put("level.dat_old", 1), o("open"), o("has"), o("load"), o("close")], [blob.copy(), old.copy()]))
+    }
+    out.push(case_of("both-broken", [put("level.dat", 0), put("level.dat_old", 0), o("open"), o("has"), o("load"), o("close")], [data.copy()]))
+    out.push(case_of("broken-no-old", [put("level.dat", 0), o("open"), o("has"), o("load"), o("close")], [data.copy()]))
+    out.push(case_of("broken-then-saved", [put("level.dat", 0), put("level.dat_old", 1), o("open"), o("has"), o("load"), o("save"), o("close")], [data.copy(), old.copy()]))
+}
+
+fn check(out: mut List<Json>, name: str, fields: List<(String, Tag)>) {
+    out.push(case_of(String(name), [put("level.dat", 0), o("open"), o("has"), o("load"), o("check"), o("close")], [gzip_stream(level(fields))]))
+}
+
+fn version_fields() -> List<(String, Tag)> {
+    return [f("Name", str_tag("26.3")), f("Id", int_tag(5023)), f("Series", str_tag("main"))]
+}
+
+fn current() -> Tag {
+    return compound(version_fields())
+}
+
+/// The version checks `Main` makes before a world loads, as its summary reads them.
+fn version_cases(out: mut List<Json>) {
+    check(mut out, "current", [f("version", int_tag(19133)), f("DataVersion", int_tag(5023)), f("Version", current())])
+    check(mut out, "no-version", [f("DataVersion", int_tag(5023))])
+    check(mut out, "format-0", [f("version", int_tag(0)), f("DataVersion", int_tag(5023))])
+    check(mut out, "format-negative", [f("version", int_tag(-5)), f("DataVersion", int_tag(5023))])
+    check(mut out, "format-other", [f("version", int_tag(19134)), f("DataVersion", int_tag(5023))])
+    check(mut out, "format-string", [f("version", str_tag("19133")), f("DataVersion", int_tag(5023))])
+    check(mut out, "format-double", [f("version", double_tag(19133.9)), f("DataVersion", int_tag(5023))])
+    check(mut out, "format-long", [f("version", long_tag(19133 + (1i64 << 32))), f("DataVersion", int_tag(5023))])
+    check(mut out, "format-byte", [f("version", byte_tag(3)), f("DataVersion", int_tag(5023))])
+    check(mut out, "mcregion", [f("version", int_tag(19132)), f("DataVersion", int_tag(5023))])
+    check(mut out, "series-other", [f("version", int_tag(19133)), f("DataVersion", int_tag(5023)), f("Version", compound(updated(version_fields(), [f("Series", str_tag("ooo"))])))])
+    check(mut out, "series-number", [f("version", int_tag(19133)), f("DataVersion", int_tag(5023)), f("Version", compound(updated(version_fields(), [f("Series", int_tag(1))])))])
+    check(mut out, "series-missing", [f("version", int_tag(19133)), f("DataVersion", int_tag(5023)), f("Version", compound([f("Id", int_tag(5023))]))])
+    check(mut out, "version-not-compound", [f("version", int_tag(19133)), f("DataVersion", int_tag(5023)), f("Version", int_tag(7))])
+    check(mut out, "version-empty", [f("version", int_tag(19133)), f("DataVersion", int_tag(5023)), f("Version", compound([]))])
+    check(mut out, "data-older", [f("version", int_tag(19133)), f("DataVersion", int_tag(4671)), f("Version", current())])
+    check(mut out, "data-newer", [f("version", int_tag(19133)), f("DataVersion", int_tag(6000)), f("Version", current())])
+    check(mut out, "data-missing", [f("version", int_tag(19133)), f("Version", current())])
+    check(mut out, "data-string", [f("version", int_tag(19133)), f("DataVersion", str_tag("5023")), f("Version", current())])
+    check(mut out, "data-short", [f("version", int_tag(19133)), f("DataVersion", short_tag(5023)), f("Version", current())])
+    check(mut out, "data-float", [f("version", int_tag(19133)), f("DataVersion", float_tag(5023.5)), f("Version", current())])
+}
+
+fn player_path() -> String {
+    return "players/data/{UUID}.dat"
+}
+
+fn player_old() -> String {
+    return "players/data/{UUID}.dat_old"
+}
+
+fn player(more: List<(String, Tag)>) -> List<u8> {
+    let fields: List<(String, Tag)> = [f("DataVersion", int_tag(5023)), f("Health", float_tag(20.0)), f("Pos", list_tag(DOUBLE, [double_tag(0.5), double_tag(-60.0), double_tag(0.5)])), f("playerGameType", int_tag(0))]
+    return gzip_stream(root(compound(updated(fields, more))))
+}
+
+fn joins(head: List<Json>, tail: List<Json>) -> List<Json> {
+    var out = head.copy()
+    out.extend(tail.copy())
+    return out
+}
+
+/// A player's data read as they join: none yet, theirs, the old one when theirs can't be read,
+/// with a copy of theirs kept, and neither.
+fn player_cases(out: mut List<Json>) {
+    let join = arr([s("player_load"), s(String(UUID)), s("Notch")])
+    let load: List<Json> = [o("open"), join.copy(), o("close")]
+    let good = player([])
+    let old = player([f("Health", float_tag(7.5))])
+    let broken = t("not a player")
+    let data = root(compound([f("DataVersion", int_tag(5023)), f("Health", float_tag(1.0))]))
+    let zipped = gzip_stream(data.copy())
+    let wrong_crc = cat([zipped[0..zipped.len() - 8], le32(crc32(data.copy()) ^ 1, u32.wrap(data.len()))])
+    let deep = gzip_stream(deep_nbt())
+    out.push(case_of("player-new", load.copy(), []))
+    out.push(case_of("player-saved", joins([put(player_path(), 0)], load), [good.copy()]))
+    out.push(case_of("player-old-only", joins([put(player_old(), 0)], load), [old.copy()]))
+    out.push(case_of("player-broken", joins([put(player_path(), 0), put(player_old(), 1)], load), [broken.copy(), old.copy()]))
+    out.push(case_of("player-both-broken", joins([put(player_path(), 0), put(player_old(), 0)], load), [broken.copy()]))
+    out.push(case_of("player-broken-no-old", joins([put(player_path(), 0)], load), [broken.copy()]))
+    out.push(case_of("player-folder", joins([dir(player_path()), put(player_old(), 0)], load), [old.copy()]))
+    out.push(case_of("player-root-list", joins([put(player_path(), 0), put(player_old(), 1)], load), [gzip_stream(root(list_tag(INT, [int_tag(1)]))), old.copy()]))
+    out.push(case_of("player-deep", joins([put(player_path(), 0), put(player_old(), 1)], load), [deep.copy(), old.copy()]))
+    out.push(case_of("player-wrong-crc", joins([put(player_path(), 0)], load), [wrong_crc]))
+    out.push(case_of("player-newer", joins([put(player_path(), 0)], load), [player([f("DataVersion", int_tag(6000))])]))
+    out.push(case_of("player-someone-else", joins([put("players/data/853c80ef-3c37-49fd-aa49-938b674adae6.dat", 0)], load), [good.copy()]))
+    out.push(case_of("player-data-is-a-file", joins([put("players/data", 0)], load), [good.copy()]))
+    out.push(case_of("player-twice", [put(player_path(), 0), o("open"), join.copy(), join.copy(), o("close")], [good.copy()]))
+}
+
+fn saved_file(data: Tag?, version: i32, more: List<(String, Tag)>) -> List<u8> {
+    var fields: List<(String, Tag)> = []
+    if let d = data {
+        fields.push(f("data", dup(d)))
+    }
+    fields.push(f("DataVersion", int_tag(version)))
+    return root(compound(updated(fields, more)))
+}
+
+fn weather() -> Tag {
+    return compound([f("clear_weather_time", int_tag(0)), f("raining", byte_tag(1)), f("rain_time", int_tag(1200))])
+}
+
+fn map_id() -> Tag {
+    return compound([f("map", int_tag(3))])
+}
+
+fn saved_load(folder: own String, id: own String) -> Json {
+    return arr([s("saved_load"), s(folder), s(id)])
+}
+
+fn saved_save(blob: i64, folder: own String, id: own String) -> Json {
+    return arr([s("saved_save"), s(folder), s(id), n(blob)])
+}
+
+fn any_tag(tag: Tag) -> List<u8> {
+    return cat([[tag.kind], tag.data.copy()])
+}
+
+/// Saved data read and written as SavedDataStorage does: gzipped or not, as its first two bytes
+/// say, files that can't be read, a path whose `..` leaves the folder, a dimension's folder, and
+/// saves over files, folders in the way and files where folders go.
+fn saved_cases(out: mut List<Json>) {
+    let gz = gzip_stream(saved_file(some(weather()), 5023, []))
+    let plain = saved_file(some(weather()), 5023, [])
+    let deep = gzip_stream(deep_nbt())
+    let w = String(WEATHER)
+    let read = saved_load("", "minecraft:weather")
+    let write0 = saved_save(0, "", "minecraft:weather")
+    let write1 = saved_save(1, "", "minecraft:weather")
+    let loads: List<Json> = [o("open"), read.copy(), o("close")]
+    out.push(case_of("saved-data-none", loads.copy(), []))
+    out.push(case_of("saved-data-gzipped", joins([put(w.copy(), 0)], loads), [gz.copy()]))
+    out.push(case_of("saved-data-plain", joins([put(w.copy(), 0)], loads), [plain.copy()]))
+    out.push(case_of("saved-data-no-data", joins([put(w.copy(), 0)], loads), [gzip_stream(saved_file(none, 5023, []))]))
+    out.push(case_of("saved-data-int-data", joins([put(w.copy(), 0)], loads), [gzip_stream(saved_file(some(int_tag(7)), 5023, []))]))
+    out.push(case_of("saved-data-newer", joins([put(w.copy(), 0)], loads), [gzip_stream(saved_file(some(weather()), 6000, []))]))
+    out.push(case_of("saved-data-more-fields", joins([put(w.copy(), 0)], loads), [gzip_stream(saved_file(some(weather()), 5023, [f("extra", str_tag("kept"))]))]))
+    out.push(case_of("saved-data-trailing", joins([put(w.copy(), 0)], loads), [cat([plain.copy(), t("after")])]))
+    out.push(case_of("saved-data-broken", joins([put(w.copy(), 0)], loads), [t("not saved data")]))
+    out.push(case_of("saved-data-broken-gzip", joins([put(w.copy(), 0)], loads), [cat([[0x1F, 0x8B, 8, 0], t("junk")])]))
+    out.push(case_of("saved-data-cut-off", joins([put(w.copy(), 0)], loads), [plain[0..plain.len() - 3]]))
+    out.push(case_of("saved-data-empty", joins([put(w.copy(), 0)], loads), [[]]))
+    out.push(case_of("saved-data-one-byte", joins([put(w.copy(), 0)], loads), [[COMPOUND]]))
+    out.push(case_of("saved-data-end", joins([put(w.copy(), 0)], loads), [[END]]))
+    out.push(case_of("saved-data-root-list", joins([put(w.copy(), 0)], loads), [gzip_stream(root(list_tag(INT, [int_tag(1)])))]))
+    out.push(case_of("saved-data-deep", joins([put(w.copy(), 0)], loads), [deep.copy()]))
+    out.push(case_of("saved-data-folder", joins([dir(w.copy())], loads), []))
+    out.push(case_of("saved-data-namespace", [put("data/calcite/thing.dat", 0), o("open"), saved_load("", "calcite:thing"), o("close")], [gz.copy()]))
+    out.push(case_of("saved-data-nested", [put("data/minecraft/maps/last_id.dat", 0), o("open"), saved_load("", "minecraft:maps/last_id"), o("close")], [gzip_stream(saved_file(some(map_id()), 5023, []))]))
+    out.push(case_of("saved-data-out", [put("level.dat", 0), o("open"), saved_load("", "minecraft:../../level"), o("close")], [gz.copy()]))
+    out.push(case_of("saved-data-dimension", [put("dimensions/minecraft/the_nether/data/minecraft/chunk_tickets.dat", 0), o("open"), saved_load("minecraft:the_nether", "minecraft:chunk_tickets"), o("close")], [gz.copy()]))
+    out.push(case_of("saved-data-other-dimension", [put("dimensions/minecraft/the_nether/data/minecraft/chunk_tickets.dat", 0), o("open"), saved_load("minecraft:overworld", "minecraft:chunk_tickets"), o("close")], [gz.copy()]))
+    out.push(case_of("saved-data-save", [o("open"), write0.copy(), o("close")], [any_tag(weather())]))
+    out.push(case_of("saved-data-save-int", [o("open"), write0.copy(), o("close")], [any_tag(int_tag(5))]))
+    out.push(case_of("saved-data-save-over", [put(w.copy(), 0), o("open"), write1.copy(), o("close")], [plain.copy(), any_tag(weather())]))
+    out.push(case_of("saved-data-save-then-load", [o("open"), write0.copy(), read.copy(), o("close")], [any_tag(weather())]))
+    out.push(case_of("saved-data-save-nested", [o("open"), saved_save(0, "", "minecraft:maps/last_id"), o("close")], [any_tag(map_id())]))
+    out.push(case_of("saved-data-save-dimension", [o("open"), saved_save(0, "minecraft:the_end", "minecraft:raids"), o("close")], [any_tag(weather())]))
+    out.push(case_of("saved-data-save-folder-in-way", [dir(w.copy()), o("open"), write0.copy(), o("close")], [any_tag(weather())]))
+    out.push(case_of("saved-data-save-file-in-way", [put("data/minecraft", 0), o("open"), write1.copy(), o("close")], [t("a file"), any_tag(weather())]))
+    out.push(case_of("saved-data-save-data-is-a-file", [put("data", 0), o("open"), write1.copy(), o("close")], [t("a file"), any_tag(weather())]))
+    out.push(case_of("saved-data-save-out", [o("open"), saved_save(0, "", "minecraft:../../level"), o("close")], [any_tag(weather())]))
+}
+
+fn progress_load(kind: own String) -> Json {
+    return arr([s("progress_load"), s(kind), s(String(UUID))])
+}
+
+fn progress_save(blob: i64, kind: own String) -> Json {
+    return arr([s("progress_save"), s(kind), s(String(UUID)), n(blob)])
+}
+
+fn locate(name: own String, uuid: own String) -> Json {
+    return arr([s("stats_locate"), s(uuid), s(name)])
+}
+
+/// Players' advancements and statistics: files read as StrictJsonParser reads them through a
+/// buffered UTF-8 reader, with the data version each kind's codec would read, written pretty as
+/// their Gson writes them, and statistics under a player's name moved to their UUID's file.
+fn progress_cases(out: mut List<Json>) {
+    let advancements = "players/advancements/{UUID}.json"
+    let stats_path = "players/stats/{UUID}.json"
+    let uuid = String(UUID)
+    let good = t(#"{"minecraft:story/root":{"criteria":{"crafting_table":"2026-10-31 12:00:00 +0000"},"done":true},"DataVersion":5023}"#)
+    let stats = t(#"{"stats":{"minecraft:custom":{"minecraft:jump":3,"minecraft:play_time":1200}},"DataVersion":5023}"#)
+    // A 4-byte character across the reader's 8192-character buffer, and bytes that aren't UTF-8
+    // after it, then far after the document's end.
+    let wide: List<u8> = [0xF0, 0x9F, 0x98, 0x80]
+    let opening = t(#"{"a":""#)
+    let closing = t(#""}"#)
+    let pad = 8192 - opening.len() - 2
+    let across = cat([opening.copy(), t("x".repeat(pad)), wide.copy(), closing.copy()])
+    var across_bad = across.copy()
+    across_bad[8190] = 0xFF
+    var files: List<(String, List<u8>)> = [
+        (String("good"), good.copy()),
+        (String("empty"), []),
+        (String("spaces"), t(" \n\t\r ")),
+        (String("bom"), cat([[0xEF, 0xBB, 0xBF], good.copy()])),
+        (String("not-json"), t(#"{"a":"#)),
+        (String("trailing"), cat([good.copy(), t(" x")])),
+        (String("two-documents"), t("\{\}\{\}")),
+        (String("lenient"), t("\{a:1\}")),
+        (String("comment"), t(#"{"a":1 /* no */}"#)),
+        (String("single-quotes"), t("\{'a':1\}")),
+        (String("nan"), t(#"{"a":NaN}"#)),
+        (String("root-array"), t(#"[1,"two",null,true]"#)),
+        (String("root-string"), t(#""just text""#)),
+        (String("root-number"), t("42")),
+        (String("root-null"), t("null")),
+        (String("bad-utf8"), cat([opening.copy(), [0xFF], closing.copy()])),
+        (String("bad-utf8-far"), cat([t("\{\}{" ".repeat(9000)}"), [0xFF]])),
+        (String("syntax-before-far-bad"), cat([t("\{]{" ".repeat(9000)}"), [0xFF]])),
+        (String("null-before-bad"), cat([t("null "), [0xFF]])),
+        (String("truncated-char"), cat([opening.copy(), wide[0..2]])),
+        (String("overlong"), cat([opening.copy(), [0xC0, 0xAF], closing.copy()])),
+        (String("encoded-surrogate"), cat([opening.copy(), [0xED, 0xA0, 0x80], closing.copy()])),
+        (String("past-max"), cat([opening.copy(), [0xF4, 0x90, 0x80, 0x80], closing.copy()])),
+        (String("four-bytes"), cat([opening.copy(), wide.copy(), closing.copy()])),
+        (String("across-buffer"), across.copy()),
+        (String("across-buffer-bad"), across_bad),
+        (String("escapes"), t(#"{"a":"\"\\\/\b\f\n\r\t#{U}00e9#{U}2028#{U}d83d#{U}de00"}"#)),
+        (String("raw-controls"), t("\{\"a\":\"tab\there\"\}")),
+        (String("duplicate-keys"), t(#"{"a":1,"b":2,"a":3}"#)),
+        (String("deep-255"), t("{"[".repeat(255)}{"]".repeat(255)}")),
+        (String("deep-256"), t("{"[".repeat(256)}{"]".repeat(256)}")),
+        (String("long-number"), t("\{\"n\":{"1".repeat(1024)}\}")),
+        (String("numbers"), t(#"{"a":-0,"b":1.50,"c":1E+2,"d":0.1e-3}"#)),
+        (String("leading-zero"), t(#"{"a":01}"#)),
+        (String("html"), t(#"{"<a>":"&='"}"#)),
+    ]
+    let versions = [
+        ("old", "100"), ("negative", "-1"), ("fraction", "5023.9"), ("long", "4294972319"),
+        ("exponent", "5.023e3"), ("huge", "1e10000"), ("string", #""5023""#), ("true", "true"),
+        ("false", "false"), ("null", "null"), ("object", "\{\}"),
+    ]
+    for (name, v) in versions {
+        files.push(("version-{name}", t("\{\"DataVersion\":{v}\}")))
+    }
+    files.push((String("version-twice"), t(#"{"DataVersion":1,"DataVersion":2}"#)))
+    files.push((String("version-missing"), t(#"{"a":1}"#)))
+
+    let adv = progress_load("advancements")
+    let st = progress_load("stats")
+    out.push(case_of("progress-none", [o("open"), adv.copy(), st.copy(), o("close")], []))
+    out.push(case_of("progress-folder", [dir(advancements.copy()), dir(stats_path.copy()), o("open"), adv.copy(), st.copy(), o("close")], []))
+    out.push(case_of("progress-someone-else", [put("players/advancements/853c80ef-3c37-49fd-aa49-938b674adae6.json", 0), o("open"), adv.copy(), o("close")], [good.copy()]))
+    out.push(case_of("progress-stats-file", [put(stats_path.copy(), 0), o("open"), st.copy(), o("close")], [stats.copy()]))
+    for (name, blob) in files {
+        out.push(case_of("progress-{name}", [put(advancements.copy(), 0), put(stats_path.copy(), 0), o("open"), adv.copy(), st.copy(), o("close")], [blob.copy()]))
+    }
+
+    // Statistics kept under a player's name, from before 1.7.6.
+    let named = String("players/stats/notch.json")
+    let notch = locate("notch", uuid.copy())
+    out.push(case_of("locate-none", [o("open"), notch.copy(), o("close")], []))
+    out.push(case_of("locate-uuid", [put(stats_path.copy(), 0), o("open"), notch.copy(), o("close")], [stats.copy()]))
+    out.push(case_of("locate-moved", [put(named.copy(), 0), o("open"), notch.copy(), st.copy(), o("close")], [stats.copy()]))
+    out.push(case_of("locate-both", [put(stats_path.copy(), 0), put(named.copy(), 1), o("open"), notch.copy(), o("close")], [stats.copy(), good.copy()]))
+    out.push(case_of("locate-capitals", [put("players/stats/Notch.json", 0), o("open"), locate("Notch", uuid.copy()), o("close")], [stats.copy()]))
+    out.push(case_of("locate-name-folder", [dir(named.copy()), o("open"), notch.copy(), o("close")], []))
+    out.push(case_of("locate-dotted", [put("players/stats/a.b-c_9.json", 0), o("open"), locate("a.b-c_9", uuid.copy()), o("close")], [stats.copy()]))
+    out.push(case_of("locate-empty-name", [put("players/stats/.json", 0), o("open"), locate("", uuid.copy()), o("close")], [stats.copy()]))
+    out.push(case_of("locate-dots", [put("players/stats/...json", 0), o("open"), locate("..", uuid.copy()), o("close")], [stats.copy()]))
+    out.push(case_of("locate-slash", [put("players/x.json", 0), o("open"), locate("../x", uuid.copy()), o("close")], [stats.copy()]))
+    out.push(case_of("locate-uppercase-uuid", [put(stats_path.copy(), 0), o("open"), locate("notch", uuid.to_upper_root()), o("close")], [stats.copy()]))
+    out.push(case_of("locate-stats-is-a-file", [put("players/stats", 0), o("open"), notch.copy(), o("close")], [stats.copy()]))
+    out.push(case_of("locate-twice", [put(named.copy(), 0), o("open"), notch.copy(), notch.copy(), o("close")], [stats.copy()]))
+
+    // Saves, of what the codecs would give.
+    let rich = t(#"{"minecraft:recipes/misc/<x>":{"criteria":{"has_it":"2026-10-31 12:00:00 +0000"},"done":false},"list":[1,"two",null,true,[],{},{"x":null}],"gone":null,"n":{"a":-0,"b":1.50,"c":1E+2,"d":12345678901234567890}}"#)
+    let odd = t(#"{"s":"#{U}00e9 #{U}2028#{U}2029 #{U}d83d#{U}de00 #{U}0001#{U}001f\t\n\"\\ #{U}007f <>&='"}"#)
+    let jump = t(#"{"minecraft:custom":{"minecraft:jump":3}}"#)
+    let save0 = progress_save(0, "advancements")
+    let save1 = progress_save(1, "advancements")
+    let stats0 = progress_save(0, "stats")
+    let stats1 = progress_save(1, "stats")
+    out.push(case_of("progress-save", [o("open"), save0.copy(), o("close")], [rich.copy()]))
+    out.push(case_of("progress-save-empty", [o("open"), save0.copy(), stats0.copy(), o("close")], [t("\{\}")]))
+    out.push(case_of("progress-save-strings", [o("open"), save0.copy(), stats0.copy(), o("close")], [odd]))
+    out.push(case_of("progress-save-version-in-place", [o("open"), save0.copy(), o("close")], [t(#"{"DataVersion":1,"a":true}"#)]))
+    out.push(case_of("progress-save-version-string", [o("open"), save0.copy(), o("close")], [t(#"{"a":true,"DataVersion":"x"}"#)]))
+    out.push(case_of("progress-save-stats", [o("open"), stats0.copy(), o("close")], [jump.copy()]))
+    out.push(case_of("progress-save-stats-version", [o("open"), stats0.copy(), o("close")], [t(#"{"DataVersion":1}"#)]))
+    out.push(case_of("progress-save-over", [put(advancements.copy(), 0), o("open"), save1.copy(), o("close")], [t("x".repeat(500)), t(#"{"a":1}"#)]))
+    out.push(case_of("progress-save-then-load", [o("open"), save0.copy(), adv.copy(), stats1.copy(), st.copy(), o("close")], [rich.copy(), jump.copy()]))
+    out.push(case_of("progress-save-folder-in-way", [dir(advancements.copy()), dir(stats_path.copy()), o("open"), save0.copy(), stats0.copy(), o("close")], [t("\{\}")]))
+    out.push(case_of("progress-save-file-in-way", [put("players/advancements", 0), put("players/stats", 0), o("open"), save1.copy(), stats1.copy(), o("close")], [t("a file"), t("\{\}")]))
+    out.push(case_of("progress-save-players-is-a-file", [put("players", 0), o("open"), save1.copy(), stats1.copy(), o("close")], [t("a file"), t("\{\}")]))
+}
+
+/// Symbolic links in the world's folder, checked against allowed_symlinks.txt in the server's
+/// folder as `validateAndCreateAccess` checks them before it opens the world, and files of entries
+/// that can't be read or compiled. `<folder>` in a target or the file is the server's folder, with
+/// a separator after it. Making a link takes a privilege Windows doesn't give everyone, so cases
+/// with links are Linux's, and each finds one forbidden link at most, since the order a folder
+/// lists its names in is the file system's own.
+fn link_cases(out: mut List<Json>) {
+    let region = link("region", "<folder>elsewhere")
+    // Read as the server starts, with no links to check: only a file that can't be read logs.
+    let unused: List<(String, List<u8>)> = [
+        (String("allow-empty"), t("")),
+        (String("allow-comments"), t("# none\n\n")),
+        (String("allow-not-utf8"), cat([t("<folder>\n"), [0xFF], t("\n")])),
+        (String("allow-unterminated"), t("[glob")),
+        (String("allow-unknown-type"), t("[path]<folder>")),
+        (String("allow-bad-glob-unused"), t(#"[glob]{a{b}}"#)),
+        (String("allow-bad-regex-unused"), t("[regex](")),
+    ]
+    for (name, text) in unused {
+        out.push(case_of(name.copy(), [allow(0), o("open"), o("has"), o("close")], [text.copy()]))
+    }
+    // Links in the folder.
+    out.push(linux(case_of("link-none-allowed", [region.copy(), o("open")], [])))
+    out.push(linux(case_of("link-empty-file", [region.copy(), allow(0), o("open")], [[]])))
+    let allowed: List<(String, List<u8>)> = [
+        (String("prefix"), t("[prefix]<folder>")),
+        (String("plain-prefix"), t("# where links go\n<folder>else")),
+        (String("glob"), t("[glob]<folder>*")),
+        (String("glob-braces"), t(#"[glob]<folder>{other,elsewhere}"#)),
+        (String("regex"), t("[regex]<folder>.*where")),
+        (String("second-entry"), t("/nowhere\n[regex]x\n[glob]<folder>else*")),
+    ]
+    for (name, text) in allowed {
+        out.push(linux(case_of("link-allowed-{name}", [region.copy(), allow(0), o("open"), o("has")], [text.copy()])))
+    }
+    let forbidden: List<(String, List<u8>)> = [
+        (String("prefix"), t("[prefix]<folder>other")),
+        (String("glob"), t("[glob]<folder>*/*")),
+        (String("regex"), t("[regex]<folder>else")),
+        (String("case"), t("[prefix]<folder>ELSEWHERE")),
+        (String("glob-case"), t("[glob]<folder>ELSE*")),
+        (String("regex-case"), t("[regex]<folder>ELSEWHERE")),
+    ]
+    for (name, text) in forbidden {
+        out.push(linux(case_of("link-forbidden-{name}", [region.copy(), allow(0), o("open")], [text.copy()])))
+    }
+    let refused: List<(String, List<u8>)> = [
+        (String("not-utf8"), cat([t("[prefix]<folder>\n"), [0xC3], t("(")])),
+        (String("unterminated"), t("[prefix]<folder>\n[regex")),
+        (String("unknown-type"), t("[prefix]<folder>\n[Prefix]<folder>")),
+        (String("bad-glob"), t("[prefix]<folder>\n[glob]\{a\{b\}\}")),
+        (String("bad-glob-range"), t("[glob]<folder>[z-a]\n[prefix]<folder>")),
+        (String("bad-regex"), t("[prefix]<folder>\n[regex](")),
+    ]
+    for (name, text) in refused {
+        out.push(linux(case_of("link-refused-{name}", [region.copy(), allow(0), o("open")], [text.copy()])))
+    }
+    out.push(linux(case_of("link-glob-in-name", [link("a/b", "<folder>x/y"), allow(0), o("open")], [t("[glob]<folder>*")])))
+    out.push(linux(case_of("link-glob-across-names", [link("a/b", "<folder>x/y"), allow(0), o("open")], [t("[glob]<folder>**")])))
+    out.push(linux(case_of("link-relative-forbidden", [link("region", "../elsewhere"), allow(0), o("open")], [t("[prefix]<folder>")])))
+    out.push(linux(case_of("link-relative-allowed", [link("region", "../elsewhere"), allow(0), o("open")], [t("[prefix]..")])))
+    out.push(linux(case_of("link-unnormalized", [link("region", "<folder>./x/../elsewhere"), allow(0), o("open")], [t("[glob]<folder>*/*")])))
+    out.push(linux(case_of("link-deep", [link("dimensions/minecraft/the_nether/region", "<folder>nether"), o("open")], [])))
+    out.push(linux(case_of("link-one-of-two", [link("a", "<folder>yes"), link("b", "<folder>no"), allow(0), o("open")], [t("[prefix]<folder>yes")])))
+    // A link's folder isn't walked into, even when it's allowed.
+    out.push(linux(case_of("link-not-followed", [link("a", "<folder>world/inner"), link("inner/b", "<folder>no"), allow(0), o("open")], [t("[prefix]<folder>world/inner")])))
+    out.push(linux(case_of("link-into-world-saved", [put("real/file", 0), put("real.txt", 0), link("alias", "<folder>world/real"), link("alias.txt", "<folder>world/real.txt"), allow(1), o("open"), o("has"), o("close")], [t("held"), t("[prefix]<folder>world/real")])))
+    // The world's folder itself a link: allowed, and walked from its target as it's written.
+    out.push(linux(case_of("world-link-missing", [link("", "<folder>elsewhere"), o("open")], [])))
+    out.push(linux(case_of("world-link-relative-missing", [link("", "calcite-no-such-folder"), o("open")], [])))
+    out.push(linux(case_of("world-link-to-file", [allow(0), link("", "<folder>allowed_symlinks.txt"), o("open")], [t("# a file")])))
+    out.push(linux(case_of("world-link-to-universe", [link("", "<folder>."), o("open")], [])))
+    out.push(linux(case_of("world-link-to-universe-allowed", [link("", "<folder>."), allow(0), o("open"), o("has"), o("close")], [t("[prefix]<folder>")])))
+}
+
+pub fn main() {
+    var made: List<Json> = []
+    folder_cases(mut made)
+    broken_cases(mut made)
+    version_cases(mut made)
+    player_cases(mut made)
+    saved_cases(mut made)
+    progress_cases(mut made)
+    link_cases(mut made)
+    write_file(file("world_folder", "generated.json"), String("world_folder"), String("cases/world_folder/gen.calx"), made, 5)
+}

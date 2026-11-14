@@ -116,7 +116,7 @@ Runs one case on an adapter and compares it with vanilla's golden: the output fi
 
 ## Case files
 
-Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.md#case-files). Hand-written files cover edge cases. Generated ones (`generated.json`, `limits.json`) come from the `gen.calx` or, for those not yet ported (CAL-253), `gen.py` beside them, which is deterministic: run it again, on any machine, and the file comes out the same. The tests rerun every generator and compare (D249). So nothing a generator writes may depend on the machine: zip files have fixed times and are laid out by the generator, not `zipfile`, which marks each entry with the system it ran on, and every deflate, zlib or gzip stream comes from [`deflate.py`](runner/deflate.py), not Python's `zlib`, which compresses with whichever zlib Python was built with (zlib-ng on Windows from 3.14, classic zlib elsewhere, with different bytes). The generators that name vanilla's data read its ids from the pinned jar, so they need `oracle/fetch.calx` run first; the tests skip them without it.
+Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.md#case-files). Hand-written files cover edge cases. Generated ones (`generated.json`, `limits.json`) come from the `gen.calx` or, for those not yet ported (CAL-253), `gen.py` beside them, which is deterministic: run it again, on any machine, and the file comes out the same. The tests rerun every generator and compare (D249). So nothing a generator writes may depend on the machine: zip files have fixed times and are laid out by the generator, not `zipfile`, which marks each entry with the system it ran on, and every deflate, zlib or gzip stream comes from [`deflate.calx`](runner/deflate.calx), or [`deflate.py`](runner/deflate.py) for `packs/gen.py` until it's ported, which write the same bytes: one block of fixed Huffman codes, or stored blocks, not `std.zlib`'s matches, which tuning it may change, or Python's `zlib`, which compresses with whichever zlib Python was built with. The generators that name vanilla's data read its ids from the pinned jar, so they need `oracle/fetch.calx` run first; the tests skip them without it.
 
 A case whose blobs vanilla doesn't write in the same order every run says `"unordered": true`, and the runner ([`unordered.calx`](runner/unordered.calx)) sorts each compound in them by key before hashing (D192).
 
@@ -129,10 +129,10 @@ calx cases/collections/gen.calx  # cases/collections/generated.json and removal.
 calx cases/registries/gen.calx   # cases/registries/configuration.json
 calx cases/palette/gen.calx      # cases/palette/generated.json
 calx cases/chunk/gen.calx        # cases/chunk/generated.json
-py -I cases/region/gen.py        # cases/region/generated.json
+calx cases/region/gen.calx       # cases/region/generated.json
 calx cases/chunk_nbt/gen.calx    # cases/chunk_nbt/generated.json
 calx cases/level_data/gen.calx   # cases/level_data/generated.json
-py -I cases/world_folder/gen.py  # cases/world_folder/generated.json
+calx cases/world_folder/gen.calx # cases/world_folder/generated.json
 calx cases/allow_list/gen.calx   # cases/allow_list/generated.json
 calx cases/entities_poi/gen.calx # cases/entities_poi/generated.json
 calx cases/tickets/gen.calx      # cases/tickets/generated.json
@@ -632,7 +632,7 @@ The runner's tests never need the vanilla jar. They cover:
 - the differences registry and the store
 - a ping-only test adapter, end to end through `score`
 
-The generators' tests check that every `gen.calx`, and every `gen.py` not yet ported, writes its committed case file exactly, skipping those that read the jar where it isn't fetched. The Python ones also check the protocol suites' comparison, on sessions made up for it, the deflater and the save comparison.
+The generators' tests check that every `gen.calx`, and every `gen.py` not yet ported, writes its committed case file exactly, skipping those that read the jar where it isn't fetched. The Python ones also check the protocol suites' comparison, on sessions made up for it, `deflate.py` and the save comparison, and `test_deflate.calx` checks `deflate.calx`, the same streams and the same pinned bytes.
 
 The data converter and the jar fetch step have their own tests, which don't need the jar either ([`oracle/datagen/`](../oracle/datagen/README.md#tests)):
 
