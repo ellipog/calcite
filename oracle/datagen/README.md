@@ -142,11 +142,11 @@ Calcite compiles in what vanilla defines in code: everything in `tables/`. Codeg
 
 ## Calx modules
 
-[`calx_tables.py`](calx_tables.py) writes the Calx modules Calcite compiles in from `tables/` (D126):
+[`calx_tables.calx`](calx_tables.calx) writes the Calx modules Calcite compiles in from `tables/` (D126), with [`block_tables.calx`](block_tables.calx), which writes those from `block_flags.json`, and [`tablekit.calx`](tablekit.calx), what they share:
 
 ```sh
-py -I oracle/datagen/calx_tables.py            # write them from generated/26.3/tables
-py -I oracle/datagen/calx_tables.py --check    # fail if a committed one is out of date
+calx oracle/datagen/calx_tables.calx            # write them from generated/26.3/tables
+calx oracle/datagen/calx_tables.calx --check    # fail if a committed one is out of date
 ```
 
 | Module | From | What it holds |
@@ -170,14 +170,15 @@ They're committed, and hold only the names, IDs and facts about states the proto
 ## Tests
 
 ```sh
-py -I -m unittest discover -s oracle/datagen/tests -v
+py -I -m unittest discover -s oracle/datagen/tests -v    # the converter's
+calx test oracle/datagen/tests/test_calx_tables.calx     # the Calx modules'
 ```
 
-The tests use only the standard library and small made-up reports, so they never need the jar. They cover number text surviving conversion, the canonical layout, ID gap checks, the mixed-radix rule and what breaks it, property kinds, the fetch step's checks offline, and the Calx modules `calx_tables.py` writes. Where the tables have been generated, they also check that the committed modules are current. CI runs them with the rig's tests.
+The tests use only small made-up reports, so they never need the jar. The converter's cover number text surviving conversion, the canonical layout, ID gap checks, the mixed-radix rule and what breaks it, property kinds, and the fetch step's checks offline. The others cover the Calx modules `calx_tables.calx` writes, and the tables it refuses, each in a process of its own, as the tool stops there. Where the tables have been generated, they also check that the committed modules are current. CI runs the converter's with the rig's tests, and the others with Calcite's score.
 
 ## A new game version
 
 1. `calx oracle/fetch.calx --version <v> --pin` records the jar's URL, size and SHA-1 from Mojang's manifest in `versions.json`. Commit that.
 2. `py -I oracle/datagen/datagen.py --version <v>`. If the converter stops on a check, the game changed something codegen relies on: update the converter and this page together.
 3. `py -I oracle/datagen/datagen.py --version <v> --check`.
-4. `py -I oracle/datagen/calx_tables.py --version <v>`, then build Calcite and run its tests: a renamed or removed packet fails to compile where it's declared.
+4. `calx oracle/datagen/calx_tables.calx --version <v>`, then build Calcite and run its tests: a renamed or removed packet fails to compile where it's declared.

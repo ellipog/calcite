@@ -29,8 +29,8 @@ import net.minecraft.server.permissions.PermissionLevel;
 
 /**
  * Writes the dedicated server's command tree to the JSON file named by its argument, read by
- * oracle/datagen/calx_tables.py for src/command/tree.calx. Run by oracle/datagen/command_tree.calx
- * (CAL-165).
+ * oracle/datagen/calx_tables.calx for src/command/tree.calx. Run by
+ * oracle/datagen/command_tree.calx (CAL-165).
  *
  * <p>The data generator's {@code commands.json} sorts each node's children by name, but the
  * {@code commands} packet numbers the nodes breadth first in the order they were registered,

@@ -48,7 +48,7 @@ import net.minecraft.world.phys.AABB;
 
 /**
  * Writes what natural spawning asks of each entity type and block state to the JSON file named by
- * its argument, read by oracle/datagen/calx_tables.py for src/world/entity_facts.calx. Run by
+ * its argument, read by oracle/datagen/calx_tables.calx for src/world/entity_facts.calx. Run by
  * oracle/datagen/entity_facts.calx.
  *
  * <p>For each entity type, in ID order: its category, whether it can be summoned, is fire immune,
