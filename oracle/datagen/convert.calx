@@ -1,0 +1,511 @@
+module oracle.datagen.convert
+
+// Converts the data generator's reports into neutral tables for Calx codegen (P2.2).
+//
+//     calx oracle/datagen/convert.calx [--version 26.3]
+//
+// Reads generated/<version>/datagen/reports/ and writes generated/<version>/tables/. Every table is
+// checked while it's converted, so a game update that breaks an assumption Calcite's codegen relies
+// on stops here, not at runtime. oracle/datagen/README.md describes each table.
+//
+// Output is canonical, so two runs give the same bytes: UTF-8, LF, two-space indent, object keys
+// sorted, and every number written as the exact text the report has. Numbers are never parsed into
+// floats, because the reports mix float and double text ("1.8000001", "0.10000000149011612") and
+// the codegen has to read each one with the right precision: tools/rawjson.calx keeps their text.
+
+import std.bytes.{hex}
+import std.cli.{cli}
+import std.fs.{exists, glob, make_dir_all, read, read_text, remove_dir_all, rename, write_text}
+import std.hash.{sha256}
+import std.path
+import std.regex.{Regex}
+import std.zip.{Zip}
+import oracle.fetch.{ensure, pins}
+import tools.rawjson.{Raw, canonical, elements, field, int_of, member, members, num, object, parse, python_repr, strs, text_of, texts_of, truthy}
+import tools.repo.{die, under}
+
+/// The tables' format, which index.json gives.
+pub const FORMAT: i64 = 1
+
+fn check(condition: bool, message: String) ! String {
+    if not condition {
+        fail message.copy()
+    }
+}
+
+/// The JSON in `file`, its numbers as text, with no key given twice.
+pub fn load(file: String) -> Raw ! String {
+    let read_back = match read_text(file) {
+        ok(t) => t,
+        err(e) => fail "reading {file}: {e}",
+    }
+    let t = read_back else {
+        fail "{file} isn't UTF-8"
+    }
+    return match parse(t) {
+        ok(v) => v,
+        err(e) => fail "{file}: {e}",
+    }
+}
+
+/// A list as Python's `repr` writes a list of strings, for a message.
+fn listed(values: List<String>) -> String {
+    var parts: List<String> = []
+    for v in values {
+        parts.push(python_repr(v))
+    }
+    return "[{parts.join(", ")}]"
+}
+
+/// The names of `entries`, ordered by their `protocol_id`, checking the IDs run 0..n-1 with no
+/// gaps.
+pub fn by_id(entries: Raw, what: String) -> List<String> ! String {
+    var order: List<(i64, String)> = []
+    for (name, e) in try members(entries) {
+        order.push((try int_of(try field(e, "protocol_id")), name.copy()))
+    }
+    order.sort_by(|a, b| a.0.cmp(b.0))
+    var good = true
+    for (i, (id, _)) in order.enumerate() {
+        if id != i64.wrap(i) {
+            good = false
+        }
+    }
+    try check(good, "{what}: protocol IDs aren't 0..{i64.wrap(order.len()) - 1}")
+    var names: List<String> = []
+    for (_, name) in order {
+        names.push(name.copy())
+    }
+    return names
+}
+
+// Each converter takes the reports folder, or a report already read, and gives the table.
+
+/// registries.json, from the registries report.
+pub fn registries_of(raw: Raw) -> Raw ! String {
+    var out = LinkedMap<String, Raw>()
+    var ids: List<i64> = []
+    for (name, reg) in try members(raw) {
+        let id = try int_of(try field(reg, "protocol_id"))
+        let entries = try by_id(try field(reg, "entries"), name.copy())
+        out.insert(name.copy(), object([("id", num(id)), ("default", member(reg, "default") ?? Raw.Null), ("entries", strs(entries))]))
+        ids.push(id)
+    }
+    ids.sort()
+    var good = true
+    for (i, id) in ids.enumerate() {
+        if id != i64.wrap(i) {
+            good = false
+        }
+    }
+    try check(good, "registry IDs aren't 0..n-1")
+    return Raw.Object(out)
+}
+
+pub fn registries(reports: String) -> Raw ! String {
+    return try registries_of(try load(path.join(reports, "registries.json")))
+}
+
+fn int_value() -> Regex {
+    return match Regex.python("0|[1-9][0-9]*") {
+        ok(re) => re,
+        err(e) => die("convert: {e}"),
+    }
+}
+
+/// What kind of property values `values` are: `bool` for `true` and `false`, `int` for
+/// consecutive integers, with their least and most, and `enum` for the rest.
+pub fn property_kind(values: List<String>) -> LinkedMap<String, Raw> ! String {
+    var out = LinkedMap<String, Raw>()
+    if values.len() == 2 and values[0] == "true" and values[1] == "false" {
+        out.insert("kind", Raw.Str("bool"))
+        return out
+    }
+    var re = int_value()
+    var all_ints = true
+    for v in values {
+        if re.full_match(v) == none {
+            all_ints = false
+        }
+    }
+    if all_ints {
+        var ints: List<i64> = []
+        for v in values {
+            let n = i64.parse(v) else {
+                fail "{v} is too big"
+            }
+            ints.push(n)
+        }
+        var consecutive = true
+        for (i, n) in ints.enumerate() {
+            if n != ints[0] + i64.wrap(i) {
+                consecutive = false
+            }
+        }
+        try check(consecutive, "int property values {listed(values)} aren't consecutive")
+        out.insert("kind", Raw.Str("int"))
+        out.insert("min", num(ints[0]))
+        out.insert("max", num(ints[ints.len() - 1]))
+        return out
+    }
+    out.insert("kind", Raw.Str("enum"))
+    return out
+}
+
+// A property and its values as one text, which sorts as Python sorts the pair `(name, values)`:
+// neither holds a control character, so the separators sort before anything in them.
+fn property_key(name: String, values: List<String>) -> String {
+    return "{name}\u{0}{values.join("\u{1}")}"
+}
+
+fn plain(s: String) -> bool {
+    for i in 0..s.len() {
+        if s.byte_at(i) < 0x20 {
+            return false
+        }
+    }
+    return true
+}
+
+struct BlockRow {
+    id: i64
+    name: String
+    first: i64
+    count: i64
+    default_state: i64
+    refs: List<String>
+}
+
+/// blocks.json, from the blocks report, in registry order, with each block's states described by
+/// arithmetic instead of listed.
+///
+/// A block's states take the global IDs first_state .. first_state + state_count - 1. The state
+/// at first_state + i has, for its properties in name order, the mixed-radix digits of i, with the
+/// last property changing fastest (vanilla's StateDefinition keeps properties sorted by name and
+/// builds the states as their cartesian product). The report lists property keys in its own sorted
+/// order with "type" first, so the converter sorts them itself and checks every state against the
+/// rule.
+pub fn blocks_of(raw_report: Raw, regs: Raw) -> Raw ! String {
+    let raw = try members(raw_report)
+    let order = try texts_of(try field(try field(regs, "minecraft:block"), "entries"))
+    var listed_blocks = order.copy()
+    listed_blocks.sort()
+    var reported: List<String> = []
+    for (name, _) in raw {
+        reported.push(name.copy())
+    }
+    reported.sort()
+    try check(listed_blocks == reported, "blocks.json and the block registry list different blocks")
+    var table: List<(String, List<String>)> = []
+    var seen = Set<String>()
+    var rows: List<BlockRow> = []
+    var next_state = 0i64
+    for (block_id, name) in order.enumerate() {
+        let found_entry = raw.find(name) else {
+            fail "no {name} in blocks.json"
+        }
+        let entry = found_entry.copy()
+        let props = if let p = member(entry, "properties") { try members(p) } else { LinkedMap<String, Raw>() }
+        var names: List<String> = []
+        for (p, _) in props {
+            names.push(p.copy())
+        }
+        names.sort()
+        var ascii = true
+        for p in names {
+            for i in 0..p.len() {
+                if p.byte_at(i) >= 0x80 {
+                    ascii = false
+                }
+            }
+        }
+        try check(ascii, "{name}: non-ASCII property name")
+        var values: List<List<String>> = []
+        var refs: List<String> = []
+        for p in names {
+            let prop = props.find(p) else {
+                fail "no {p}"
+            }
+            let vals = try texts_of(prop)
+            try check(plain(p) and vals.all(|v| plain(v)), "{name}: a control character in property {p}")
+            let key = property_key(p, vals)
+            if not seen.contains(key) {
+                seen.insert(key.copy())
+                table.push((p.copy(), vals.copy()))
+            }
+            refs.push(key)
+            values.push(vals)
+        }
+        let states = try elements(try field(entry, "states"))
+        var count = 1i64
+        for v in values {
+            count *= i64.wrap(v.len())
+        }
+        try check(i64.wrap(states.len()) == count, "{name}: {states.len()} states, expected {count}")
+        let first = try int_of(try field(states[0], "id"))
+        try check(first == next_state, "{name}: states start at {first}, expected {next_state}")
+        var default_state: i64? = none
+        for (i, state) in states.enumerate() {
+            let id_value = try field(state, "id")
+            let id_text = if let Raw.Num(t) = id_value { t.copy() } else { String("?") }
+            try check(try int_of(id_value) == first + i64.wrap(i), "{name}: state {i} has ID {id_text}")
+            // The values the mixed-radix rule gives state i, the last property changing fastest.
+            var digit = Map<String, String>()
+            var rest = i
+            var k = names.len()
+            while k > 0 {
+                k -= 1
+                let vals = values[k].copy()
+                digit.insert(names[k].copy(), vals[rest % vals.len()].copy())
+                rest /= vals.len()
+            }
+            let given = if let p = member(state, "properties") { try members(p) } else { LinkedMap<String, Raw>() }
+            var same = given.len() == digit.len()
+            for (p, v) in given {
+                // A number's text is a Python `str`, so it equals the same string.
+                let have: String? = match v {
+                    Raw.Str(s) => some(s.copy()),
+                    Raw.Num(t) => some(t.copy()),
+                    _ => none,
+                }
+                var matches = false
+                if let w = digit.find(p) {
+                    if let h = have {
+                        matches = w == h
+                    }
+                }
+                if not matches {
+                    same = false
+                }
+            }
+            try check(same, "{name}: state {id_text} breaks the mixed-radix rule")
+            if truthy(member(state, "default") ?? Raw.Null) {
+                try check(default_state == none, "{name}: two default states")
+                default_state = some(first + i64.wrap(i))
+            }
+        }
+        let found_default = default_state else {
+            fail "{name}: no default state"
+        }
+        rows.push(BlockRow { id: i64.wrap(block_id), name: name.copy(), first: first, count: count, default_state: found_default, refs: refs })
+        next_state += count
+    }
+    table.sort_by(|a, b| property_key(a.0, a.1).cmp(property_key(b.0, b.1)))
+    var position = Map<String, i64>()
+    for (i, (n, v)) in table.enumerate() {
+        position.insert(property_key(n, v), i64.wrap(i))
+    }
+    var properties: List<Raw> = []
+    for (n, v) in table {
+        var m = LinkedMap<String, Raw>()
+        m.insert("name", Raw.Str(n.copy()))
+        m.insert("values", strs(v))
+        for (k, x) in try property_kind(v) {
+            m.insert(k.copy(), x.copy())
+        }
+        properties.push(Raw.Object(m))
+    }
+    var out: List<Raw> = []
+    for b in rows {
+        var places: List<Raw> = []
+        for key in b.refs {
+            places.push(num(position[key]))
+        }
+        out.push(object([("id", num(b.id)), ("name", Raw.Str(b.name.copy())), ("first_state", num(b.first)), ("state_count", num(b.count)), ("default_state", num(b.default_state)), ("properties", Raw.Array(places))]))
+    }
+    return object([("state_count", num(next_state)), ("properties", Raw.Array(properties)), ("blocks", Raw.Array(out))])
+}
+
+pub fn blocks(reports: String, regs: Raw) -> Raw ! String {
+    return try blocks_of(try load(path.join(reports, "blocks.json")), regs)
+}
+
+/// packets.json: each phase's packets in each direction, in ID order.
+pub fn packets(reports: String) -> Raw ! String {
+    var out = LinkedMap<String, Raw>()
+    for (phase, sides) in try members(try load(path.join(reports, "packets.json"))) {
+        var m = LinkedMap<String, Raw>()
+        for (direction, ids) in try members(sides) {
+            m.insert(direction.copy(), strs(try by_id(ids, "{phase} {direction}")))
+        }
+        out.insert(phase.copy(), Raw.Object(m))
+    }
+    return Raw.Object(out)
+}
+
+/// commands.json: the command tree as the report gives it. The report sorts each node's children
+/// by name, so it doesn't record the order commands register in.
+pub fn commands(reports: String) -> Raw ! String {
+    return try load(path.join(reports, "commands.json"))
+}
+
+fn json_files(folder: String) -> List<String> ! String {
+    return match glob(path.join(folder, "*.json")) {
+        ok(files) => files,
+        err(e) => fail "listing {folder}: {e}",
+    }
+}
+
+/// items.json: each item's default components, in ID order.
+pub fn items(reports: String, regs: Raw) -> Raw ! String {
+    let folder = path.join(reports, "minecraft/components/item")
+    let order = try texts_of(try field(try field(regs, "minecraft:item"), "entries"))
+    var files: List<String> = []
+    for f in try json_files(folder) {
+        files.push("minecraft:{path.file_stem(f) ?? String()}")
+    }
+    files.sort()
+    var listed_items = order.copy()
+    listed_items.sort()
+    try check(files == listed_items, "the item component reports and the item registry list different items")
+    var out: List<Raw> = []
+    for (item_id, name) in order.enumerate() {
+        let (_, short) = name.split_once(":") else {
+            fail "{name} has no namespace"
+        }
+        let raw = try load(path.join(folder, "{short}.json"))
+        var keys: List<String> = []
+        for (k, _) in try members(raw) {
+            keys.push(k.copy())
+        }
+        keys.sort()
+        try check(keys.len() == 1 and keys[0] == "components", "{name}: unexpected keys {listed(keys)}")
+        out.push(object([("id", num(i64.wrap(item_id))), ("name", Raw.Str(name.copy())), ("components", try field(raw, "components"))]))
+    }
+    return Raw.Array(out)
+}
+
+/// biome_parameters.json: the multi-noise biome parameter lists that are defined in code, not in
+/// the data pack.
+pub fn biome_parameters(reports: String) -> Raw ! String {
+    var out = LinkedMap<String, Raw>()
+    for f in try json_files(path.join(reports, "biome_parameters/minecraft")) {
+        out.insert("minecraft:{path.file_stem(f) ?? String()}", try load(f))
+    }
+    return Raw.Object(out)
+}
+
+/// What the jar's version.json says of the version.
+pub fn version_info(version: String) -> LinkedMap<String, Raw> ! String {
+    let jar = ensure(version.copy(), false)
+    let bytes = match read(jar) {
+        ok(b) => b,
+        err(e) => fail "reading {jar}: {e}",
+    }
+    let z = match Zip.open(bytes) {
+        ok(z) => z,
+        err(e) => fail "{jar}: {e}",
+    }
+    let held = match z.read_named("version.json") {
+        ok(b) => b,
+        err(e) => fail "{jar}: version.json: {e}",
+    }
+    let info_text = String.from_utf8(held) else {
+        fail "{jar}: version.json isn't UTF-8"
+    }
+    let info = match parse(info_text) {
+        ok(v) => v,
+        err(e) => fail "{jar}: version.json: {e}",
+    }
+    let id = try text_of(try field(info, "id"))
+    try check(id == version, "the jar is version {id}, not {version}")
+    var out = LinkedMap<String, Raw>()
+    out.insert("game_version", Raw.Str(id))
+    for key in ["world_version", "protocol_version", "pack_version", "java_version"] {
+        out.insert(String(key), try field(info, String(key)))
+    }
+    return out
+}
+
+/// Writes every table into `out`, replacing what's there, and gives the index.
+pub fn convert(version: String, reports: String, out: String) -> Raw ! String {
+    let regs = try registries(reports)
+    let tables: List<(String, Raw)> = [
+        ("registries.json", regs.copy()),
+        ("blocks.json", try blocks(reports, regs)),
+        ("items.json", try items(reports, regs)),
+        ("packets.json", try packets(reports)),
+        ("commands.json", try commands(reports)),
+        ("biome_parameters.json", try biome_parameters(reports)),
+        ("datapack_registries.json", try load(path.join(reports, "datapack.json"))),
+        ("management_api.json", try load(path.join(reports, "json-rpc-api-schema.json"))),
+    ]
+    let name = path.file_name(out) else {
+        fail "{out} has no name"
+    }
+    let parent = path.parent_dir(out) else {
+        fail "{out} has no folder"
+    }
+    let tmp = path.join(parent, "{name}.tmp")
+    if exists(tmp) {
+        if let err(e) = remove_dir_all(tmp) {
+            fail "removing {tmp}: {e}"
+        }
+    }
+    if let err(e) = make_dir_all(tmp) {
+        fail "making {tmp}: {e}"
+    }
+    var index = LinkedMap<String, Raw>()
+    index.insert("format", num(FORMAT))
+    for (k, v) in try version_info(version) {
+        index.insert(k.copy(), v.copy())
+    }
+    let all_pins = pins()
+    let pin = all_pins.find(version) else {
+        fail "{version} isn't pinned"
+    }
+    let sha1 = pin.get("sha1") else {
+        fail "{version}'s pin has no sha1"
+    }
+    let sha1_text = sha1.as_str() else {
+        fail "{version}'s sha1 isn't a string"
+    }
+    index.insert("jar_sha1", Raw.Str(sha1_text))
+    var hashes = LinkedMap<String, Raw>()
+    for (file, value) in tables {
+        let data = "{canonical(value)}\n"
+        if let err(e) = write_text(path.join(tmp, file), data.copy()) {
+            fail "writing {file}: {e}"
+        }
+        hashes.insert(file.copy(), Raw.Str(hex(sha256(data.to_bytes()))))
+    }
+    index.insert("tables", Raw.Object(hashes))
+    let written = Raw.Object(index)
+    if let err(e) = write_text(path.join(tmp, "index.json"), "{canonical(written)}\n") {
+        fail "writing index.json: {e}"
+    }
+    if exists(out) {
+        if let err(e) = remove_dir_all(out) {
+            fail "removing {out}: {e}"
+        }
+    }
+    if let err(e) = rename(tmp, out) {
+        fail "moving {tmp} to {out}: {e}"
+    }
+    return written
+}
+
+/// How many tables the index lists.
+pub fn table_count(index: Raw) -> usize {
+    if let Raw.Object(m) = member(index, "tables") {
+        return m.len()
+    }
+    return 0
+}
+
+/// Convert the data generator's reports into tables.
+@cli(name: "convert")
+struct Args {
+    /// The game version.
+    version: String = "26.3"
+}
+
+pub fn main() {
+    let args = Args.parse()
+    let base = under("generated/{args.version}")
+    let tables = path.join(base, "tables")
+    match convert(args.version, path.join(base, "datagen/reports"), tables) {
+        ok(index) => println("convert: wrote {table_count(index)} tables to {tables}"),
+        err(e) => die("convert: {e}"),
+    }
+}

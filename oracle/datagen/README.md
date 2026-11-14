@@ -8,31 +8,31 @@ description: How Calcite turns Mojang's server jar into the tables its codegen r
 Calcite's block states, registries, item defaults, packet IDs and command tree come from Mojang's own data generator, run on the official server jar (Phase 2). One command fetches the jar, runs the generator, and converts its reports into neutral tables that Calx codegen reads. None of that is committed: `generated/` is gitignored (D30). What Calcite compiles in from the tables is committed as Calx, so it builds without the jar ([below](#calx-modules)).
 
 ```sh
-py -I oracle/datagen/datagen.py            # fetch, generate and convert into generated/26.3/
-py -I oracle/datagen/datagen.py --check    # regenerate into a scratch folder and compare, byte for byte
-py -I oracle/datagen/convert.py            # convert again from the existing reports only
-calx oracle/fetch.calx [--check]           # fetch and verify the jar on its own
-calx oracle/fetch.calx --jar <path>        # or install a jar you already have, with no network
+calx oracle/datagen/datagen.calx            # fetch, generate and convert into generated/26.3/
+calx oracle/datagen/datagen.calx --check    # regenerate into a scratch folder and compare, byte for byte
+calx oracle/datagen/convert.calx            # convert again from the existing reports only
+calx oracle/fetch.calx [--check]            # fetch and verify the jar on its own
+calx oracle/fetch.calx --jar <path>         # or install a jar you already have, with no network
 ```
 
-`datagen.py` takes `--version` (default `26.3`) and `--java-home`. It finds JDK 25 the same way the [vanilla adapter's build](../vanilla-adapter/README.md#building) does. On Linux, use `python3` for `py`. A full run takes about 12 seconds on Windows.
+`datagen.calx` takes `--version` (default `26.3`) and `--java-home`. It finds JDK 25 the same way the [vanilla adapter's build](../vanilla-adapter/README.md#building) does. A full run takes about 12 seconds on Windows.
 
 ## What it does
 
-1. **Fetch.** [`../fetch.calx`](../fetch.calx) checks `oracle/jars/server-<version>.jar` against the SHA-1 pinned in [`../versions.json`](../versions.json), and downloads it from Mojang if it's missing or wrong (`P2.4`, D62). A jar you already have can be installed with `fetch.py --jar <path>`, as long as it's the pinned one.
+1. **Fetch.** [`../fetch.calx`](../fetch.calx) checks `oracle/jars/server-<version>.jar` against the SHA-1 pinned in [`../versions.json`](../versions.json), and downloads it from Mojang if it's missing or wrong (`P2.4`, D62). A jar you already have can be installed with `fetch.calx --jar <path>`, as long as it's the pinned one.
 2. **Generate.** Runs `java -DbundlerMainClass=net.minecraft.data.Main -jar server-<version>.jar --all --output generated/<version>/datagen` from `oracle/work/`, where the bundler unpacks its libraries. It uses the rig's reference JVM flags (D60). The log goes to `build/datagen/<version>.log`. The old output is deleted first, so nothing stale survives.
 3. **Drop the cache.** The generator's `.cache/` folder records a timestamp per run. It's the only output that changes between runs, and nothing reads it, so it's deleted.
-4. **Convert.** [`convert.py`](convert.py) checks the reports and writes the tables to `generated/<version>/tables/`, replacing the folder whole, so a failed conversion leaves the old tables in place.
+4. **Convert.** [`convert.calx`](convert.calx) checks the reports and writes the tables to `generated/<version>/tables/`, replacing the folder whole, so a failed conversion leaves the old tables in place. It reads them with [`tools/rawjson.calx`](../../tools/rawjson.calx), which keeps each number as the text it's written as and refuses a key given twice.
 
 ## Repeatability (gate G2)
 
-`--check` regenerates everything into `build/datagen/check/` and compares every file with `generated/<version>/`. On 26.3, two runs match byte for byte (10,047 files), and a Linux run (WSL, OpenJDK 25.0.4.1) matches a Windows run (Temurin 25.0.5).
+`--check` regenerates everything into `build/datagen/check/` and compares every file it writes, in `datagen/` and `tables/`, with `generated/<version>/`'s. On 26.3, two runs match byte for byte (10,047 files), and a Linux run (WSL, OpenJDK 25.0.4.1) matches a Windows run (Temurin 25.0.5).
 
 ## Layout
 
 | Path | What's there |
 | --- | --- |
-| `generated/26.3/datagen/reports/` | The generator's reports: the input to `convert.py` |
+| `generated/26.3/datagen/reports/` | The generator's reports: the input to `convert.calx` |
 | `generated/26.3/datagen/data/` | Vanilla's built-in data pack as the generator writes it. Calcite doesn't read this copy: at runtime it reads the data pack from the jar (D61) |
 | `generated/26.3/tables/` | The converted tables, described below |
 | `generated/26.3/block_flags.json` | What each block state is, from vanilla's state cache, by [`block_flags.calx`](block_flags.calx) ([below](#block_flagsjson)) |
@@ -170,15 +170,15 @@ They're committed, and hold only the names, IDs and facts about states the proto
 ## Tests
 
 ```sh
-py -I -m unittest discover -s oracle/datagen/tests -v    # the converter's
+calx test oracle/datagen/tests/test_convert.calx         # the converter's and the fetch step's
 calx test oracle/datagen/tests/test_calx_tables.calx     # the Calx modules'
 ```
 
-The tests use only small made-up reports, so they never need the jar. The converter's cover number text surviving conversion, the canonical layout, ID gap checks, the mixed-radix rule and what breaks it, property kinds, and the fetch step's checks offline. The others cover the Calx modules `calx_tables.calx` writes, and the tables it refuses, each in a process of its own, as the tool stops there. Where the tables have been generated, they also check that the committed modules are current. CI runs the converter's with the rig's tests, and the others with Calcite's score.
+The tests use only small made-up reports, so they never need the jar. The converter's cover number text surviving conversion, duplicate keys, the canonical layout, ID gap checks, the mixed-radix rule and what breaks it, and property kinds. The fetch step's run a copy of `fetch.calx` in a folder of its own, with a versions.json pinning a made-up jar, and check it offline: the pinned jar taken, a wrong one refused, a local one installed, and a version that isn't pinned refused. The others cover the Calx modules `calx_tables.calx` writes, and the tables it refuses, each in a process of its own, as the tool stops there. Where the tables have been generated, they also check that the committed modules are current. CI runs both with Calcite's score.
 
 ## A new game version
 
 1. `calx oracle/fetch.calx --version <v> --pin` records the jar's URL, size and SHA-1 from Mojang's manifest in `versions.json`. Commit that.
-2. `py -I oracle/datagen/datagen.py --version <v>`. If the converter stops on a check, the game changed something codegen relies on: update the converter and this page together.
-3. `py -I oracle/datagen/datagen.py --version <v> --check`.
+2. `calx oracle/datagen/datagen.calx --version <v>`. If the converter stops on a check, the game changed something codegen relies on: update the converter and this page together.
+3. `calx oracle/datagen/datagen.calx --version <v> --check`.
 4. `calx oracle/datagen/calx_tables.calx --version <v>`, then build Calcite and run its tests: a renamed or removed packet fails to compile where it's declared.

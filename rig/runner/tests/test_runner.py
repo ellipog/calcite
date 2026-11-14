@@ -119,7 +119,7 @@ class CaseFiles(unittest.TestCase):
         for gen in sorted((ROOT / "cases").glob("*/gen.py")):
             with self.subTest(gen=str(gen.relative_to(ROOT))):
                 if not jar.is_file() and jar.name in gen.read_text(encoding="utf-8"):
-                    self.skipTest(f"no {jar.relative_to(ROOT)}; oracle/fetch.py fetches it")
+                    self.skipTest(f"no {jar.relative_to(ROOT)}; oracle/fetch.calx fetches it")
                 before = {p: p.read_bytes() for p in (ROOT / "cases").rglob("*.json")}
                 try:
                     run = subprocess.run([sys.executable, "-I", str(gen)], capture_output=True, text=True)
