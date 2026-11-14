@@ -121,11 +121,12 @@ Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.
 A case whose blobs vanilla doesn't write in the same order every run says `"unordered": true`, and the runner ([`unordered.calx`](runner/unordered.calx)) sorts each compound in them by key before hashing (D192).
 
 ```sh
-py -I cases/rng/gen.py      # cases/rng/generated.json
-py -I cases/nbt/gen.py      # cases/nbt/limits.json
-py -I cases/math/gen.py     # cases/math, cases/strictmath and cases/mth
+calx cases/rng/gen.calx      # cases/rng/generated.json
+calx cases/nbt/gen.calx      # cases/nbt/limits.json
+calx cases/block_state/gen.calx  # cases/block_state/ranges.json
+calx cases/math/gen.calx     # cases/math, cases/strictmath and cases/mth
 py -I cases/collections/gen.py   # cases/collections/generated.json and removal.json
-py -I cases/registries/gen.py    # cases/registries/configuration.json
+calx cases/registries/gen.calx  # cases/registries/configuration.json
 py -I cases/palette/gen.py       # cases/palette/generated.json
 py -I cases/chunk/gen.py         # cases/chunk/generated.json
 py -I cases/region/gen.py        # cases/region/generated.json
