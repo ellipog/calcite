@@ -121,31 +121,31 @@ Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.
 A case whose blobs vanilla doesn't write in the same order every run says `"unordered": true`, and the runner ([`unordered.calx`](runner/unordered.calx)) sorts each compound in them by key before hashing (D192).
 
 ```sh
-calx cases/rng/gen.calx      # cases/rng/generated.json
-calx cases/nbt/gen.calx      # cases/nbt/limits.json
+calx cases/rng/gen.calx          # cases/rng/generated.json
+calx cases/nbt/gen.calx          # cases/nbt/limits.json
 calx cases/block_state/gen.calx  # cases/block_state/ranges.json
-calx cases/math/gen.calx     # cases/math, cases/strictmath and cases/mth
+calx cases/math/gen.calx         # cases/math, cases/strictmath and cases/mth
 py -I cases/collections/gen.py   # cases/collections/generated.json and removal.json
-calx cases/registries/gen.calx  # cases/registries/configuration.json
+calx cases/registries/gen.calx   # cases/registries/configuration.json
 py -I cases/palette/gen.py       # cases/palette/generated.json
-py -I cases/chunk/gen.py         # cases/chunk/generated.json
+calx cases/chunk/gen.calx        # cases/chunk/generated.json
 py -I cases/region/gen.py        # cases/region/generated.json
 py -I cases/chunk_nbt/gen.py     # cases/chunk_nbt/generated.json
-py -I cases/level_data/gen.py    # cases/level_data/generated.json
+calx cases/level_data/gen.calx   # cases/level_data/generated.json
 py -I cases/world_folder/gen.py  # cases/world_folder/generated.json
-py -I cases/allow_list/gen.py    # cases/allow_list/generated.json
+calx cases/allow_list/gen.calx   # cases/allow_list/generated.json
 py -I cases/entities_poi/gen.py  # cases/entities_poi/generated.json
 py -I cases/tickets/gen.py       # cases/tickets/generated.json
-py -I cases/ticks/gen.py         # cases/ticks/generated.json
-py -I cases/levels/gen.py        # cases/levels/generated.json
+calx cases/ticks/gen.calx        # cases/ticks/generated.json
+calx cases/levels/gen.calx       # cases/levels/generated.json
 py -I cases/distance/gen.py      # cases/distance/generated.json
-calx cases/light/gen.calx       # cases/light/generated.json
+calx cases/light/gen.calx        # cases/light/generated.json
 py -I cases/spawn/gen.py         # cases/spawn/generated.json
 py -I cases/packs/gen.py         # cases/packs/generated.json
 py -I cases/noise/gen.py         # cases/noise/generated.json
 py -I cases/density/gen.py       # cases/density/generated.json
 py -I cases/biomes/gen.py        # cases/biomes/generated.json
-py -I cases/terrain/gen.py       # cases/terrain/generated.json
+calx cases/terrain/gen.calx      # cases/terrain/generated.json
 py -I cases/surface/gen.py       # cases/surface/generated.json
 py -I cases/carvers/gen.py       # cases/carvers/generated.json
 py -I cases/features/gen.py      # cases/features/generated.json
@@ -156,7 +156,7 @@ py -I cases/structures/gen.py    # cases/structures/generated.json
 py -I cases/datafix/gen.py       # cases/datafix/generated.json
 py -I cases/block_entity/gen.py  # cases/block_entity/generated.json
 py -I cases/environment/gen.py   # cases/environment/generated.json
-py -I cases/stats/gen.py         # cases/stats/generated.json
+calx cases/stats/gen.calx        # cases/stats/generated.json
 ```
 
 The seed grid, `cases/features/grid.json`, is what Phase 5's gate runs the worldgen suites on in all three dimensions (`G5.1`, D267): ten seeds, the six every worldgen case file draws on, the generation bench's and three drawn, each with the Overworld, the Nether and the End as the `normal` preset makes them. In each, the 3×3 chunks about the origin and the 3×3 about a chunk up to 1,875 out are made by every stage with `structured`, in one shared world, and decorated in the order the server decorates them, by their colors' ranks (D214), so every stage is checked as the server chains them.
