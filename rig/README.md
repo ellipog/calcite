@@ -130,7 +130,7 @@ calx cases/registries/gen.calx   # cases/registries/configuration.json
 calx cases/palette/gen.calx      # cases/palette/generated.json
 calx cases/chunk/gen.calx        # cases/chunk/generated.json
 py -I cases/region/gen.py        # cases/region/generated.json
-py -I cases/chunk_nbt/gen.py     # cases/chunk_nbt/generated.json
+calx cases/chunk_nbt/gen.calx    # cases/chunk_nbt/generated.json
 calx cases/level_data/gen.calx   # cases/level_data/generated.json
 py -I cases/world_folder/gen.py  # cases/world_folder/generated.json
 calx cases/allow_list/gen.calx   # cases/allow_list/generated.json
