@@ -21,7 +21,7 @@ and Calcite write its own there with --rng-tape, and lines the two up level by l
 chunks are in, so the tapes line up from there whatever each drew while they loaded (D316).
 --trace has each write its living entities' states to entities.txt in its folder, as each of their
 ticks is done, a line each: vanilla's by the rig's agent and Calcite's with --entity-trace, to line
-a mob's moves up far finer than its packets show them (rig/runner/traces.py, CAL-159).
+a mob's moves up far finer than its packets show them (rig/runner/traces.calx, CAL-159).
 """
 
 import argparse
