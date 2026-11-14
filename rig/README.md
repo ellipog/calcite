@@ -143,11 +143,11 @@ calx cases/light/gen.calx        # cases/light/generated.json
 calx cases/spawn/gen.calx        # cases/spawn/generated.json
 py -I cases/packs/gen.py         # cases/packs/generated.json
 calx cases/noise/gen.calx        # cases/noise/generated.json
-py -I cases/density/gen.py       # cases/density/generated.json
+calx cases/density/gen.calx      # cases/density/generated.json
 calx cases/biomes/gen.calx       # cases/biomes/generated.json
 calx cases/terrain/gen.calx      # cases/terrain/generated.json
 calx cases/surface/gen.calx      # cases/surface/generated.json
-py -I cases/carvers/gen.py       # cases/carvers/generated.json
+calx cases/carvers/gen.calx      # cases/carvers/generated.json
 calx cases/features/gen.calx      # cases/features/generated.json
 calx cases/features/structured.calx # cases/features/structured.json
 calx cases/features/grid.calx     # cases/features/grid.json
