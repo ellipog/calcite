@@ -134,7 +134,7 @@ py -I cases/chunk_nbt/gen.py     # cases/chunk_nbt/generated.json
 calx cases/level_data/gen.calx   # cases/level_data/generated.json
 py -I cases/world_folder/gen.py  # cases/world_folder/generated.json
 calx cases/allow_list/gen.calx   # cases/allow_list/generated.json
-py -I cases/entities_poi/gen.py  # cases/entities_poi/generated.json
+calx cases/entities_poi/gen.calx # cases/entities_poi/generated.json
 calx cases/tickets/gen.calx      # cases/tickets/generated.json
 calx cases/ticks/gen.calx        # cases/ticks/generated.json
 calx cases/levels/gen.calx       # cases/levels/generated.json
@@ -152,11 +152,12 @@ py -I cases/features/gen.py      # cases/features/generated.json
 py -I cases/features/structured.py  # cases/features/structured.json
 py -I cases/features/grid.py     # cases/features/grid.json
 py -I cases/features/orders.py   # cases/features/orders.json
-py -I cases/structures/gen.py    # cases/structures/generated.json
-py -I cases/datafix/gen.py       # cases/datafix/generated.json
-py -I cases/block_entity/gen.py  # cases/block_entity/generated.json
+calx cases/structures/gen.calx   # cases/structures/generated.json
+calx cases/datafix/gen.calx      # cases/datafix/generated.json
+calx cases/block_entity/gen.calx # cases/block_entity/generated.json
 calx cases/environment/gen.calx  # cases/environment/generated.json
 calx cases/stats/gen.calx        # cases/stats/generated.json
+calx cases/text/gen.calx         # cases/text/contents.json
 ```
 
 The seed grid, `cases/features/grid.json`, is what Phase 5's gate runs the worldgen suites on in all three dimensions (`G5.1`, D267): ten seeds, the six every worldgen case file draws on, the generation bench's and three drawn, each with the Overworld, the Nether and the End as the `normal` preset makes them. In each, the 3×3 chunks about the origin and the 3×3 about a chunk up to 1,875 out are made by every stage with `structured`, in one shared world, and decorated in the order the server decorates them, by their colors' ranks (D214), so every stage is checked as the server chains them.
