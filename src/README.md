@@ -712,6 +712,6 @@ An example's `// out:` comments give the lines it must print, as in Calx's own d
 The network tests' clients are made from Calcite's own codecs, so a wrong idea of the format would pass on both ends. So [`test/play.calx`](test/play.calx) and [`test/configuration.calx`](test/configuration.calx) also write every packet their clients get to `build/packets/`, and `run.py` ends by reading them with vanilla's own codecs, from the 26.3 jar, once the [vanilla adapter](../oracle/vanilla-adapter/README.md) is built ([D145](../docs/decisions.md)). Each must decode, leave no bytes over and encode back to the same bytes; `set_time` and `update_tags`, whose order vanilla itself doesn't fix, are compared as values. Then the signed-chat test's packets, one file a client in `build/packets/chat/`, are read as vanilla's client reads chat: each player's chat session must validate against the test's Mojang key, and each signed message must pass the sender's validator, with its chain and its packed last-seen list ([D162](../docs/decisions.md)). Without the adapter, that step is skipped. CI builds it.
 
 ```sh
-py -I oracle/vanilla-adapter/build.py           # once, with JDK 25
-py -I oracle/vanilla-adapter/check_packets.py   # after the tests: ok or FAIL for each kind of packet
+calx oracle/adapter.calx         # once, with JDK 25
+calx oracle/check_packets.calx   # after the tests: ok or FAIL for each kind of packet
 ```

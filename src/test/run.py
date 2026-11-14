@@ -6,7 +6,7 @@
 - the server, src/calcite.calx, which runs until it's stopped, and the rig's adapter,
   src/rig/adapter.calx, which the rig runs, so they're only built.
 - vanilla's own codecs on every packet the network tests' clients were sent, if the vanilla
-  adapter is built (oracle/vanilla-adapter/check_packets.py, D145). Without it, that's skipped.
+  adapter is built (oracle/check_packets.calx, D145). Without it, that's skipped.
 
 Debug builds also check that everything allocated is freed (Calx's D79). calx is found as
 rig/calcite-adapter/launch.py finds it.
@@ -237,7 +237,7 @@ def main():
             for name, mode, ok, r in results:
                 report(name, mode, ok, r, seconds)
 
-    check = subprocess.run([sys.executable, "-I", str(CALCITE / "oracle" / "vanilla-adapter" / "check_packets.py")],
+    check = subprocess.run([calx, "oracle/check_packets.calx"],
                            cwd=CALCITE, capture_output=True, text=True, encoding="utf-8")
     if check.returncode == 2:
         print(f"skip vanilla reads the tests' packets: {check.stdout.strip()}")

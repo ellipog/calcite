@@ -8,7 +8,7 @@ For each configuration, a set of server.properties, this starts vanilla in a fre
 build/rig/sessions/, sets what vanilla draws at random to fixed values from its console, waits for
 it to pause, empty, so the bot joins at the same game time on both (D315), runs
 src/rig/session.calx once for each scenario, and stops it; then the same for Calcite's release
-build. Vanilla runs from the jar's own classes, which oracle/vanilla-adapter/build.py unpacks,
+build. Vanilla runs from the jar's own classes, which oracle/adapter.calx unpacks,
 with Mojang's EULA accepted in its scratch folder only. The vanilla adapter's SessionDump reads
 both servers' packets with vanilla's codecs, and the comparison lines them up a step at a time
 (rig/README.md, "Protocol suites"). It exits with 1 if the login, configuration or status suite
@@ -1931,7 +1931,7 @@ def build_calcite(calx):
 
 def adapter():
     if not ADAPTER.is_file():
-        sys.exit(f"sessions: the vanilla adapter isn't built; run py -I oracle/vanilla-adapter/build.py")
+        sys.exit(f"sessions: the vanilla adapter isn't built; run calx oracle/adapter.calx")
     return json.loads(ADAPTER.read_text(encoding="utf-8"))
 
 
@@ -1940,7 +1940,7 @@ def vanilla_argv(a, tape=False, trace=False):
     rig's agent, which seeds its levels' randoms, with `tape` writes their draws (D311), and with
     `trace` its living entities' states (CAL-159)."""
     if "agent" not in a:
-        sys.exit("sessions: the vanilla adapter was built without the agent; run py -I oracle/vanilla-adapter/build.py")
+        sys.exit("sessions: the vanilla adapter was built without the agent; run calx oracle/adapter.calx")
     argv = a["argv"]
     cp = argv[argv.index("-cp") + 1]
     agent = f"-javaagent:{a['agent']}=seed={LEVEL_RANDOM_SEED}" + (f",tape=tape.txt,reseed={RESEED}" if tape else "")

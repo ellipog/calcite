@@ -1,0 +1,350 @@
+module oracle.adapter
+
+// The vanilla adapter: building it against a local server jar, and running its checks.
+//
+//     calx oracle/adapter.calx [--version 26.3] [--java-home PATH]
+//
+// Fetches oracle/jars/server-<version>.jar if it's missing and checks it against its pin
+// (oracle/fetch.calx), reads the bundler's library list from it, extracts the inner server jar and
+// its libraries into oracle/work/ (checking each SHA-256 against the list), compiles the adapter in
+// oracle/vanilla-adapter/src with JDK 25, and writes oracle/vanilla-adapter/build/<platform>/
+// adapter.json: the command line the rig's runner starts the adapter with. Each platform builds
+// into its own folder, so a Windows checkout can also be built and run from WSL.
+//
+// Nothing from the jar leaves oracle/work/ and build/, which are both gitignored.
+//
+// The other tools run one of the adapter's classes in place of its main class with `run_class`:
+// BlockFlags, EntityFacts, CommandTree, PacketCheck and the rest.
+
+import std.bytes.{hex}
+import std.cli.{cli}
+import std.env.{os}
+import std.fs.{exists, glob, is_file, make_dir_all, read, read_text, remove_dir_all, rename, write, write_text}
+import std.hash.{Algorithm, file_digest, sha256}
+import std.json.{Json, parse, pretty}
+import std.path
+import std.process.{Command, Output, exit}
+import std.zip.{Writer, Zip}
+import oracle.fetch.{ensure}
+import oracle.jdk.{REQUIRED_JAVA, find_java_home, java, javac}
+import tools.repo.{die, native, platform, under}
+
+fn here() -> String {
+    return under("oracle/vanilla-adapter")
+}
+
+fn build_dir() -> String {
+    return under("oracle/vanilla-adapter/build/{platform()}")
+}
+
+/// Where adapter.json is for this system.
+pub fn json_path() -> String {
+    return "{build_dir()}/adapter.json"
+}
+
+/// What a class path's entries go between: `;` on Windows, `:` elsewhere.
+pub fn path_separator() -> String {
+    return if os() == "windows" { ";" } else { ":" }
+}
+
+/// The adapter as adapter.json describes it: the command line that starts it, whose last
+/// argument is its main class, and the folder it runs in.
+pub struct Adapter {
+    pub argv: List<String>
+    pub cwd: String
+    pub game_version: String
+    pub doc: Json
+}
+
+/// The adapter build/<platform>/adapter.json describes, or none if it isn't built.
+pub fn load() -> Adapter? {
+    let file = json_path()
+    if not is_file(file) {
+        return none
+    }
+    let text = match read_text(file) {
+        ok(t) => t ?? String(),
+        err(e) => die("adapter: reading {file}: {e}"),
+    }
+    let doc = match parse(text) {
+        ok(j) => j,
+        err(e) => die("adapter: {file}: {e}"),
+    }
+    var argv: List<String> = []
+    if let Json.Object(m) = doc {
+        if let Json.Array(list) = m["argv"] {
+            for a in list {
+                argv.push(a.as_str() ?? String())
+            }
+        }
+    }
+    let cwd = doc.get("cwd") ?? Json.Null
+    let version = doc.get("game_version") ?? Json.Null
+    return some(Adapter { argv: argv, cwd: cwd.as_str() ?? String("."), game_version: version.as_str() ?? String(), doc: doc })
+}
+
+/// The adapter that's built, or the end of the program with a message that it isn't.
+pub fn require(tool: String) -> Adapter {
+    if let a = load() {
+        return a
+    }
+    die("{tool}: the vanilla adapter isn't built; run calx oracle/adapter.calx")
+}
+
+/// Runs `calcite.rig.vanilla.<main_class>` with `args`, in place of the adapter's main class, and
+/// gives what it wrote.
+pub fn run_class(a: Adapter, main_class: String, args: List<String>) -> Output {
+    var argv: List<String> = []
+    for i in 0..a.argv.len() - 1 {
+        argv.push(a.argv[i].copy())
+    }
+    argv.push("calcite.rig.vanilla.{main_class}")
+    for arg in args {
+        argv.push(arg.copy())
+    }
+    var c = Command.new(argv[0].copy()).dir(a.cwd.copy())
+    for i in 1..argv.len() {
+        c = c.arg(argv[i].copy())
+    }
+    return match c.output() {
+        ok(o) => o,
+        err(e) => die("adapter: starting {main_class}: {e}"),
+    }
+}
+
+/// The last `n` bytes of `text`, or all of it, starting on a whole rune.
+pub fn tail(text: String, n: usize) -> String {
+    if text.len() <= n {
+        return text.copy()
+    }
+    var start = text.len() - n
+    while start < text.len() and text.byte_at(start) & 0xC0 == 0x80 {
+        start += 1
+    }
+    return text[start..].copy()
+}
+
+/// What a generator wrote: the file read back, where it is from the repository's root, and what
+/// the adapter's class printed.
+pub struct Generated {
+    pub doc: Json
+    pub rel: String
+    pub out: Output
+}
+
+/// Runs the adapter's `main_class` to write generated/<version>/<name>, as the data generator's
+/// steps that ask the game itself do, and reads the file back. Ends the program with status 2 if
+/// the adapter isn't built, and 1 if the class fails or wrote another version's file.
+pub fn generate(tool: String, main_class: String, name: String, version: String) -> Generated {
+    let a = load() ?? {
+        eprintln("{tool}: the vanilla adapter isn't built; run calx oracle/adapter.calx")
+        exit(2)
+    }
+    let rel = "generated/{version}/{name}"
+    let file = under(rel)
+    if let folder = path.parent_dir(file) {
+        if let err(e) = make_dir_all(folder) {
+            die("{tool}: making {folder}: {e}")
+        }
+    }
+    let r = run_class(a, main_class, [file.copy()])
+    if not r.status.success() {
+        eprint(tail(r.error_text(), 4000))
+        exit(1)
+    }
+    let text = match read_text(file) {
+        ok(t) => t ?? String(),
+        err(e) => die("{tool}: reading {file}: {e}"),
+    }
+    let doc = match parse(text) {
+        ok(j) => j,
+        err(e) => die("{tool}: {file}: {e}"),
+    }
+    let made = doc.get("game_version") ?? Json.Null
+    if made.as_str() != some(version.copy()) {
+        die("{tool}: the adapter is {made.as_str() ?? String()}, not {version}")
+    }
+    return Generated { doc: doc, rel: rel, out: r }
+}
+
+fn sha256_of(file: String) -> String {
+    return match file_digest(Algorithm.Sha256, file) {
+        ok(d) => hex(d),
+        err(e) => die("build: reading {file}: {e}"),
+    }
+}
+
+/// A bundler list: one `sha256<TAB>id<TAB>path` entry per line.
+fn read_list(bundle: Zip, name: String) -> List<(String, String)> {
+    let bytes = match bundle.read_named(name) {
+        ok(b) => b,
+        err(e) => die("build: {name}: {e}"),
+    }
+    var entries: List<(String, String)> = []
+    for line in (String.from_utf8(bytes) ?? String()).lines() {
+        if line.trim().is_empty() {
+            continue
+        }
+        let parts = line.split("\t")
+        if parts.len() != 3 {
+            die("build: {name} has a line that isn't sha256, id and path: {line}")
+        }
+        entries.push((parts[0].copy(), parts[2].copy()))
+    }
+    return entries
+}
+
+/// Extracts one bundled file unless a copy with the right hash is there.
+fn extract(bundle: Zip, member: String, dest: String, digest: String) {
+    if is_file(dest) and sha256_of(dest) == digest {
+        return
+    }
+    if let folder = path.parent_dir(dest) {
+        if let err(e) = make_dir_all(folder) {
+            die("build: making {folder}: {e}")
+        }
+    }
+    let bytes = match bundle.read_named(member) {
+        ok(b) => b,
+        err(e) => die("build: {member}: {e}"),
+    }
+    if hex(sha256(bytes.copy())) != digest {
+        die("build: {member} doesn't match the bundler's SHA-256")
+    }
+    let tmp = "{dest}.tmp"
+    if let err(e) = write(tmp, bytes) {
+        die("build: writing {tmp}: {e}")
+    }
+    if let err(e) = rename(tmp, dest) {
+        die("build: moving {tmp}: {e}")
+    }
+}
+
+/// The server jar's inner jar and libraries, extracted into oracle/work/, as a class path.
+fn unpack(version: String) -> List<String> {
+    let jar = ensure(version, true)
+    let raw = match read(jar) {
+        ok(b) => b,
+        err(e) => die("build: reading {jar}: {e}"),
+    }
+    let bundle = match Zip.open(raw) {
+        ok(z) => z,
+        err(e) => die("build: {jar}: {e}"),
+    }
+    var classpath: List<String> = []
+    for (folder, list) in [("versions", "META-INF/versions.list"), ("libraries", "META-INF/libraries.list")] {
+        for (digest, rel) in read_list(bundle, list) {
+            let dest = under("oracle/work/{folder}/{rel}")
+            extract(bundle, "META-INF/{folder}/{rel}", dest, digest)
+            classpath.push(dest)
+        }
+    }
+    return classpath
+}
+
+/// The agent's jar, build/<platform>/agent.jar: its manifest, which names the class whose premain
+/// starts it, and the classes of calcite.rig.vanilla.agent. The game's classes stay on the class
+/// path the server runs with, from which the agent's hooks find them.
+fn write_agent(classes: String) -> String {
+    let jar = "{build_dir()}/agent.jar"
+    var w = Writer.new()
+    w.add("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\r\nPremain-Class: calcite.rig.vanilla.agent.Agent\r\n\r\n".to_bytes())
+    let found = match glob("{classes}/calcite/rig/vanilla/agent/*.class") {
+        ok(f) => f,
+        err(e) => die("build: listing the agent's classes: {e}"),
+    }
+    for f in found {
+        let bytes = match read(f) {
+            ok(b) => b,
+            err(e) => die("build: reading {f}: {e}"),
+        }
+        w.add("calcite/rig/vanilla/agent/{path.file_name(f) ?? String()}", bytes)
+    }
+    if let err(e) = write(jar, w.finish()) {
+        die("build: writing {jar}: {e}")
+    }
+    return jar
+}
+
+fn strings(list: List<String>) -> Json {
+    var out: List<Json> = []
+    for s in list {
+        out.push(Json.Str(s.copy()))
+    }
+    return Json.Array(out)
+}
+
+/// Build the vanilla adapter against a local server jar.
+@cli(name: "adapter")
+struct Args {
+    /// The game version.
+    version: String = "26.3"
+    /// The JDK to build with.
+    java_home: String?
+}
+
+pub fn main() {
+    let args = Args.parse()
+    let classpath = unpack(args.version)
+    let home = find_java_home(args.java_home)
+
+    let classes = "{build_dir()}/classes"
+    if exists(classes) {
+        if let err(e) = remove_dir_all(classes) {
+            die("build: removing {classes}: {e}")
+        }
+    }
+    if let err(e) = make_dir_all(classes) {
+        die("build: making {classes}: {e}")
+    }
+    let sources = match glob("{here()}/src/**/*.java") {
+        ok(f) => f,
+        err(e) => die("build: listing the sources: {e}"),
+    }
+    let cp = classpath.join(path_separator())
+    // Lint everything but: annotations the libraries reference without shipping (classfile),
+    // the deprecated vanilla methods probes call on purpose (deprecation), and serialVersionUID
+    // (serial).
+    let flags: List<String> = ["--release", "{REQUIRED_JAVA}", "-encoding", "UTF-8", "-Xlint:all,-processing,-classfile,-deprecation,-serial", "-Werror", "-cp", cp.copy(), "-d", classes.copy()]
+    match Command.new(javac(home)).args(flags).args(sources).status() {
+        ok(s) => {
+            if not s.success() {
+                die("build: javac failed")
+            }
+        }
+        err(e) => die("build: starting javac: {e}"),
+    }
+    let agent = write_agent(classes)
+
+    // The paths are written with the system's separator, as the programs that read them expect:
+    // log4j reads `C:/...` as a URL, finds no protocol `c:`, and falls back to logging only errors,
+    // which drops what vanilla prints to its standard error, as it logs that.
+    var native_cp: List<String> = []
+    for entry in classpath {
+        native_cp.push(native(entry))
+    }
+    let full_cp = "{native(classes)}{path_separator()}{native_cp.join(path_separator())}"
+    var m = LinkedMap<String, Json>()
+    m.insert("adapter", Json.Str("vanilla"))
+    m.insert("game_version", Json.Str(args.version.copy()))
+    // Logs go to stderr: stdout carries only frames.
+    m.insert("argv", strings([native(java(home)), "-Dlog4j2.configurationFile={native("{here()}/log4j2.xml")}", "-Dfile.encoding=UTF-8", "-cp", full_cp, "calcite.rig.vanilla.Main"]))
+    // The game creates files relative to the working directory.
+    m.insert("cwd", Json.Str(native(under("oracle/work"))))
+    // JVM flags for each vanilla configuration the rig records (D60). `strict-math` is the
+    // reference: with HotSpot's LIBM intrinsics off, Math gives StrictMath's results.
+    var configs = LinkedMap<String, Json>()
+    configs.insert("strict-math", strings(["-XX:+UnlockDiagnosticVMOptions", "-XX:-UseLibmIntrinsic"]))
+    configs.insert("intrinsics", strings([]))
+    m.insert("configs", Json.Object(configs))
+    m.insert("default_config", Json.Str("strict-math"))
+    // The rig's Java agent (D311), for a vanilla server started with
+    // -javaagent:<agent>=seed=N[,tape=PATH][,reseed=T]: its levels' randoms seeded, their draws
+    // taped, and seeded again at game time T (D316).
+    m.insert("agent", Json.Str(native(agent)))
+    let file = json_path()
+    if let err(e) = write_text(file, "{pretty(Json.Object(m), 2)}\n") {
+        die("build: writing {file}: {e}")
+    }
+    println("build: wrote {file}")
+}

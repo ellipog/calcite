@@ -22,7 +22,7 @@ from -8 to 7 are compared. A block that differs in a way that waits on
 something not in Calcite yet is counted under it, by the card it waits on; any other fails the
 check.
 
-It runs vanilla from the adapter (oracle/vanilla-adapter/build.py), with Mojang's EULA accepted in
+It runs vanilla from the adapter (oracle/adapter.calx), with Mojang's EULA accepted in
 the rig's scratch folder only (CAL-42), and needs the reports datagen writes to generated/26.3/
 (oracle/datagen/README.md). --reuse compares the last recording again. Neither side's packets are
 dumped to JSON, which for this many block updates runs to gigabytes.

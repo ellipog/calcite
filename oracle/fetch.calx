@@ -1,0 +1,334 @@
+module oracle.fetch
+
+// Fetches Mojang's server jar for a game version and checks it against a pinned SHA-1 (D30, P2.4),
+// and pins the stretch of the client jar that holds the vanilla data, which Calcite reads (D140).
+//
+//     calx oracle/fetch.calx [--version 26.3]          download if missing, then verify
+//     calx oracle/fetch.calx [--version 26.3] --check  verify only, never download
+//     calx oracle/fetch.calx [--version 26.3] --jar P  install a local jar, if it matches the pin
+//     calx oracle/fetch.calx --version X --pin         look X up in Mojang's manifest and pin it
+//
+// The jar goes to oracle/jars/server-<version>.jar, which is gitignored: nothing from Mojang is
+// ever committed. What is committed is oracle/versions.json, the jar's URL, size and SHA-1 per
+// version, so every checkout builds against the same bytes and a jar that's already there is
+// checked offline. Pinning reads Mojang's version manifest, then the version's metadata, checking
+// the SHA-1 the manifest gives for it. It pins the client jar too, which it downloads to
+// oracle/jars/client-<version>.jar, and the stretch of it Calcite reads: from the first file it
+// needs, data/ and the two language files, to the end of the last, with that stretch's SHA-256.
+//
+// The vanilla adapter's build and the data generator both call `ensure`.
+
+import std.bytes.{hex}
+import std.cli.{cli}
+import std.fs.{copy, is_file, make_dir_all, read, read_text, rename, write, write_text}
+import std.hash.{Algorithm, file_digest, sha1, sha256}
+import std.http.{fetch as http_get}
+import std.json.{Json, parse, pretty, sort_keys}
+import std.zip.{Zip}
+import tools.repo.{die, under}
+
+const MANIFEST: str = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
+
+/// The files Calcite reads from the vanilla data: the data pack and the server's language.
+const LANGUAGE: [str; 2] = ["assets/minecraft/lang/en_us.json", "assets/minecraft/lang/deprecated.json"]
+
+fn jars() -> String {
+    return under("oracle/jars")
+}
+
+fn versions() -> String {
+    return under("oracle/versions.json")
+}
+
+/// The server jar of a version: oracle/jars/server-<version>.jar.
+pub fn jar_path(version: String) -> String {
+    return under("oracle/jars/server-{version}.jar")
+}
+
+/// The client jar of a version: oracle/jars/client-<version>.jar.
+pub fn client_path(version: String) -> String {
+    return under("oracle/jars/client-{version}.jar")
+}
+
+fn get(url: String) -> List<u8> {
+    let resp = match http_get(url, 60000) {
+        ok(r) => r,
+        err(e) => die("fetch: {url}: {e}"),
+    }
+    if resp.status != 200 {
+        die("fetch: {url} answered with status {resp.status}")
+    }
+    return resp.body
+}
+
+fn file_sha1(file: String) -> String {
+    return match file_digest(Algorithm.Sha1, file) {
+        ok(d) => hex(d),
+        err(e) => die("fetch: reading {file}: {e}"),
+    }
+}
+
+/// The pins in oracle/versions.json, by version, or none if there's no file.
+pub fn pins() -> LinkedMap<String, Json> {
+    let file = versions()
+    if not is_file(file) {
+        return LinkedMap<String, Json>()
+    }
+    let text = match read_text(file) {
+        ok(t) => t ?? String(),
+        err(e) => die("fetch: reading {file}: {e}"),
+    }
+    return match parse(text) {
+        ok(Json.Object(m)) => m,
+        ok(_) => die("fetch: {file} isn't an object"),
+        err(e) => die("fetch: {file}: {e}"),
+    }
+}
+
+fn text_at(v: Json, pointer: String) -> String {
+    if let found = v.pointer(pointer) {
+        if let s = found.as_str() {
+            return s
+        }
+    }
+    die("fetch: no {pointer} in the pin")
+}
+
+fn number_at(v: Json, pointer: String) -> u64 {
+    if let found = v.pointer(pointer) {
+        if let n = found.as_u64() {
+            return n
+        }
+    }
+    die("fetch: no {pointer} in the pin")
+}
+
+fn wanted(name: String) -> bool {
+    return name.starts_with("data/") or name == LANGUAGE[0] or name == LANGUAGE[1]
+}
+
+fn u16_le(b: List<u8>, at: usize) -> usize {
+    return usize(b[at]) | (usize(b[at + 1]) << 8)
+}
+
+/// {offset, length, sha256} of the bytes of the jar from the first local header of a file Calcite
+/// reads to the end of the last one's data, data descriptor included.
+fn data_stretch(jar: String) -> Json {
+    let raw = match read(jar) {
+        ok(b) => b,
+        err(e) => die("fetch: reading {jar}: {e}"),
+    }
+    let z = match Zip.open(raw.copy()) {
+        ok(z) => z,
+        err(e) => die("fetch: {jar}: {e}"),
+    }
+    var first: usize? = none
+    var end = 0usize
+    for e in z.entries() {
+        if not wanted(e.name) {
+            continue
+        }
+        let at = e.offset
+        let sig = u32(raw[at]) | (u32(raw[at + 1]) << 8) | (u32(raw[at + 2]) << 16) | (u32(raw[at + 3]) << 24)
+        if sig != 0x04034B50 {
+            die("fetch: {e.name} has no local header at {at}")
+        }
+        let flags = u16_le(raw, at + 6)
+        var stop = at + 30 + u16_le(raw, at + 26) + u16_le(raw, at + 28) + e.compressed
+        if flags & 8 != 0 {
+            let marked = stop + 4 <= raw.len() and raw[stop] == 0x50 and raw[stop + 1] == 0x4B and raw[stop + 2] == 0x07 and raw[stop + 3] == 0x08
+            stop += if marked { 16usize } else { 12usize }
+        }
+        first = some(if let f = first { f.min(at) } else { at })
+        end = end.max(stop)
+    }
+    let start = first ?? die("fetch: {jar} holds none of the vanilla data")
+    var m = LinkedMap<String, Json>()
+    m.insert("offset", Json.UInt(u64(start)))
+    m.insert("length", Json.UInt(u64(end - start)))
+    m.insert("sha256", Json.Str(hex(sha256(raw[start..end].copy()))))
+    return Json.Object(m)
+}
+
+fn download_pin(d: Json, what: String) -> Json {
+    var m = LinkedMap<String, Json>()
+    m.insert("sha1", Json.Str(text_at(d, "/sha1")))
+    m.insert("size", Json.UInt(number_at(d, "/size")))
+    m.insert("url", Json.Str(text_at(d, "/url")))
+    if m.len() != 3 {
+        die("fetch: the {what} download is incomplete")
+    }
+    return Json.Object(m)
+}
+
+/// The server jar's {sha1, size, url} from Mojang's manifest, with the metadata's SHA-1 checked,
+/// and the client's under `client`.
+fn lookup(version: String) -> LinkedMap<String, Json> {
+    let manifest = match parse(String.from_utf8(get(MANIFEST)) ?? String()) {
+        ok(j) => j,
+        err(e) => die("fetch: Mojang's manifest: {e}"),
+    }
+    var entry: Json? = none
+    if let Json.Object(top) = manifest {
+        if let Json.Array(list) = top["versions"] {
+            for v in list {
+                if v.get("id") == some(Json.Str(version.copy())) {
+                    entry = some(v.copy())
+                    break
+                }
+            }
+        }
+    }
+    let found = entry ?? die("fetch: Mojang's manifest has no version {version}")
+    let meta = get(text_at(found, "/url"))
+    if hex(sha1(meta.copy())) != text_at(found, "/sha1") {
+        die("fetch: {version}'s metadata doesn't match the manifest's SHA-1")
+    }
+    let doc = match parse(String.from_utf8(meta) ?? String()) {
+        ok(j) => j,
+        err(e) => die("fetch: {version}'s metadata: {e}"),
+    }
+    let server = doc.pointer("/downloads/server")
+    let client = doc.pointer("/downloads/client")
+    if server == none or client == none {
+        die("fetch: version {version} has no server or no client download")
+    }
+    var pin = match download_pin(server!, "server") {
+        Json.Object(m) => m,
+        _ => LinkedMap<String, Json>(),
+    }
+    pin.insert("client", download_pin(client!, "client"))
+    return pin
+}
+
+fn put(jar: String, data: List<u8>) {
+    if let err(e) = make_dir_all(jars()) {
+        die("fetch: making {jars()}: {e}")
+    }
+    let tmp = "{jar}.tmp"
+    if let err(e) = write(tmp, data) {
+        die("fetch: writing {tmp}: {e}")
+    }
+    if let err(e) = rename(tmp, jar) {
+        die("fetch: moving {tmp} to {jar}: {e}")
+    }
+}
+
+fn download(url: String, size: u64, sha: String, what: String) -> List<u8> {
+    eprintln("fetch: downloading {url} ({size:,} bytes)")
+    let data = get(url)
+    if u64(data.len()) != size or hex(sha1(data.copy())) != sha {
+        die("fetch: {what} doesn't match its size and SHA-1")
+    }
+    return data
+}
+
+/// The path of the version's client jar, checked against `client`'s SHA-1, downloading it if it
+/// isn't there.
+fn ensure_client(version: String, client: Json) -> String {
+    let jar = client_path(version)
+    let sha = text_at(client, "/sha1")
+    if is_file(jar) and file_sha1(jar) == sha {
+        return jar
+    }
+    put(jar, download(text_at(client, "/url"), number_at(client, "/size"), sha, "the client download"))
+    return jar
+}
+
+fn pin_version(version: String) {
+    var all = pins()
+    var pin = lookup(version)
+    let client = pin["client"].copy()
+    let stretch = data_stretch(ensure_client(version, client.copy()))
+    var with_data = match client {
+        Json.Object(m) => m,
+        _ => LinkedMap<String, Json>(),
+    }
+    with_data.insert("data", stretch)
+    pin.insert("client", Json.Object(with_data))
+    let sha = text_at(Json.Object(pin.copy()), "/sha1")
+    all.insert(version.copy(), Json.Object(pin))
+    let file = versions()
+    if let err(e) = write_text(file, "{pretty(sort_keys(Json.Object(all)), 2)}\n") {
+        die("fetch: writing {file}: {e}")
+    }
+    println("fetch: pinned {version} to SHA-1 {sha} in versions.json")
+}
+
+fn pinned(version: String) -> Json {
+    let all = pins()
+    if let want = all.find(version) {
+        return want.copy()
+    }
+    die("fetch: {version} isn't pinned in {versions()}. Run `calx oracle/fetch.calx --version {version} --pin`.")
+}
+
+/// The path of the version's jar, verified against its pin, downloading it if needed.
+pub fn ensure(version: String, may_download: bool) -> String {
+    let want = pinned(version)
+    let sha = text_at(want, "/sha1")
+    let jar = jar_path(version)
+    if is_file(jar) {
+        if file_sha1(jar) == sha {
+            return jar
+        }
+        if not may_download {
+            die("fetch: {jar} doesn't match the pinned SHA-1 {sha}")
+        }
+        eprintln("fetch: {jar} doesn't match the pinned SHA-1; downloading it again")
+    } else if not may_download {
+        die("fetch: {jar} is missing. Run `calx oracle/fetch.calx --version {version}`.")
+    }
+    put(jar, download(text_at(want, "/url"), number_at(want, "/size"), sha, "the download"))
+    return jar
+}
+
+/// Copies a local jar into place, with no network, if it matches the version's pin.
+fn install(version: String, source: String) -> String {
+    let sha = text_at(pinned(version), "/sha1")
+    if not is_file(source) {
+        die("fetch: {source} doesn't exist")
+    }
+    if file_sha1(source) != sha {
+        die("fetch: {source} doesn't match the pinned SHA-1 {sha}; it's a different jar")
+    }
+    if let err(e) = make_dir_all(jars()) {
+        die("fetch: making {jars()}: {e}")
+    }
+    let jar = jar_path(version)
+    let tmp = "{jar}.tmp"
+    if let err(e) = copy(source, tmp) {
+        die("fetch: copying {source}: {e}")
+    }
+    if let err(e) = rename(tmp, jar) {
+        die("fetch: moving {tmp} to {jar}: {e}")
+    }
+    return jar
+}
+
+/// Fetch and verify Mojang's server jar.
+@cli(name: "fetch")
+struct Args {
+    /// The game version.
+    version: String = "26.3"
+    /// Only verify the jar that's there.
+    check: bool
+    /// Pin the version from Mojang's manifest.
+    pin: bool
+    /// Install a local jar instead of downloading one.
+    jar: String?
+}
+
+pub fn main() {
+    let args = Args.parse()
+    let modes = (if args.check { 1 } else { 0 }) + (if args.pin { 1 } else { 0 }) + (if args.jar == none { 0 } else { 1 })
+    if modes > 1 {
+        die("fetch: --check, --pin and --jar can't go together")
+    }
+    if args.pin {
+        pin_version(args.version)
+        return
+    }
+    let jar = if let source = args.jar { install(args.version, source) } else { ensure(args.version, not args.check) }
+    println("fetch: {jar} matches the pinned SHA-1 {text_at(pinned(args.version), "/sha1")}")
+}

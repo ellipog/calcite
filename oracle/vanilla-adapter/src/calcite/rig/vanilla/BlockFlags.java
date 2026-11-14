@@ -36,7 +36,7 @@ import net.minecraft.world.phys.shapes.VoxelShape;
 /**
  * Writes what each block state is, as vanilla's state cache holds it, to the JSON file named by
  * its argument: one number a state, in state ID order, read by oracle/datagen/calx_tables.py
- * (oracle/datagen/README.md). Run by oracle/datagen/block_flags.py.
+ * (oracle/datagen/README.md). Run by oracle/datagen/block_flags.calx.
  *
  * <p>It also writes the faces light sees: for each state, the shape {@code
  * LightEngine.getOcclusionShape} gives on each of its six sides, as a number for each different

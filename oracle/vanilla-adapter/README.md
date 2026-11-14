@@ -11,11 +11,11 @@ Nothing from the jar is committed. The build reads it from the gitignored `oracl
 
 ## Building
 
-You need JDK 25. The build gets the 26.3 server jar itself: [`../fetch.py`](../fetch.py) downloads it to `oracle/jars/server-26.3.jar` if it's missing, and checks it against the SHA-1 pinned in [`../versions.json`](../versions.json) either way (`P2.4`, D62).
+You need JDK 25. The build is [`../adapter.calx`](../adapter.calx), a Calx program like all of Calcite's tools (CAL-253). It gets the 26.3 server jar itself: [`../fetch.calx`](../fetch.calx) downloads it to `oracle/jars/server-26.3.jar` if it's missing, and checks it against the SHA-1 pinned in [`../versions.json`](../versions.json) either way (`P2.4`, D62).
 
 ```sh
-py -I build.py                         # finds JDK 25 from CALCITE_JAVA_HOME, JAVA_HOME or PATH
-py -I build.py --java-home <jdk-25>    # or name it
+calx oracle/adapter.calx                         # finds JDK 25 from CALCITE_JAVA_HOME, JAVA_HOME or PATH
+calx oracle/adapter.calx --java-home <jdk-25>    # or name it
 ```
 
 The build:
@@ -24,7 +24,7 @@ The build:
 2. Reads `META-INF/versions.list` and `META-INF/libraries.list` from the bundler jar.
 3. Extracts the inner server jar and its 39 libraries into `oracle/work/versions/` and `oracle/work/libraries/`, checking each against the bundler's SHA-256. Files that are already there with the right hash are kept.
 4. Compiles `src/` with `javac --release 25`, with warnings as errors.
-5. Writes `build/<platform>/adapter.json`: the command line the runner starts the adapter with, and the JVM flags for each vanilla configuration the rig records (D60). Each platform gets its own folder, so one checkout can be built from Windows and from WSL.
+5. Writes `build/<platform>/adapter.json`: the command line the runner starts the adapter with, and the JVM flags for each vanilla configuration the rig records (D60). Each platform gets its own folder, so one checkout can be built from Windows and from WSL. Its paths use the system's own separator: log4j reads `C:/...` as a URL with the protocol `c:`, fails, and falls back to logging only errors. That drops everything vanilla prints to its standard error, which it logs at `INFO`, and it changes the identity hashes vanilla's maps are ordered by, such as the game rules in `command_tree.json`.
 
 | Configuration | JVM flags |
 | --- | --- |
@@ -41,7 +41,7 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 
 ## Checking Calcite's packets
 
-[`PacketCheck`](src/calcite/rig/vanilla/PacketCheck.java) is a second entry point, not a probe ([D145](../../docs/decisions.md)). Calcite's network tests write every packet their clients get to `build/packets/`, and [`check_packets.py`](check_packets.py) runs `PacketCheck` on them with the adapter's command line. It reads each packet with the codec vanilla's client reads it with: `StatusProtocols`, `LoginProtocols`, `ConfigurationProtocols` or `GameProtocols`, bound to the vanilla data pack's registries. A packet passes if it decodes, leaves no bytes over and encodes back to the same bytes. `set_time`, `update_tags` and `login` are compared as values instead, since their maps and the login's set of dimensions are keyed by identity-hashed objects and vanilla's order changes from run to run. It prints a line for each kind of packet and exits with 1 if any failed. `src/test/run.py` runs it at its end.
+[`PacketCheck`](src/calcite/rig/vanilla/PacketCheck.java) is a second entry point, not a probe ([D145](../../docs/decisions.md)). Calcite's network tests write every packet their clients get to `build/packets/`, and [`../check_packets.calx`](../check_packets.calx) runs `PacketCheck` on them with the adapter's command line. It reads each packet with the codec vanilla's client reads it with: `StatusProtocols`, `LoginProtocols`, `ConfigurationProtocols` or `GameProtocols`, bound to the vanilla data pack's registries. A packet passes if it decodes, leaves no bytes over and encodes back to the same bytes. `set_time`, `update_tags` and `login` are compared as values instead, since their maps and the login's set of dimensions are keyed by identity-hashed objects and vanilla's order changes from run to run. It prints a line for each kind of packet and exits with 1 if any failed. `src/test/run.py` runs it at its end.
 
 [`ChatCheck`](src/calcite/rig/vanilla/ChatCheck.java) then reads signed chat the way vanilla's client does ([D162](../../docs/decisions.md)). `test.play`'s signed-chat test also writes what each of its clients is sent to a file of its own in `build/packets/chat/`, with the test's Mojang public key as `services.der`. For each client, `ChatCheck` follows the game packets in order. `login` says whether the server enforces secure chat. `player_info_update` with `initialize_chat` gives a player's chat session, which must pass `RemoteChatSession.Data.validate` against the test's Mojang key, as it does in vanilla's `ClientPacketListener`. Each `player_chat` must carry the next global index; its last-seen list is unpacked with the client's `MessageSignatureCache`; and its signature is checked by the sender's `SignedMessageValidator`, with the sender's link chain. A key expires by the message's own time, since the test's clock is fixed in 2025. It says how many messages each client took and how many were signed, and exits with 1 if vanilla would refuse any.
 
@@ -73,8 +73,8 @@ The runner starts it from `build/<platform>/adapter.json`. To start it by hand, 
 | `BlockFlags.java` | Not a probe: writes each block state's flags from vanilla's state cache, the faces light sees of each, and the faces a fluid sees, checked against vanilla's own `canPassThroughWall` as they're written (D327), and each block's note block instrument (D332), fire's ignite and burn odds (D339), piston push reaction and whether it's unbreakable (D352), and the sounds a door, trapdoor, fence gate, button or pressure plate plays on and off, from its `BlockSetType` or `WoodType` (D353), each button's `ticksToStayPressed` and each weighted pressure plate's `maxWeight` (D354), and each block's destroy speed and whether it needs the right tool for its drops, each checked the same for every state of its block (D376), and what placing reads: the classes declaring each block's `getStateForPlacement`, `canBeReplaced`, `setPlacedBy`, `useItemOn` and `useWithoutItem`, each block item's block, class and wall block with its attachment direction, each block's item, and each state's place sound with its sound type's volume and pitch (D378), and what entities move against: each state's collision shape with an empty context, each block's friction, speed and jump factors and bounce, and cases of vanilla's own `VoxelShape.collide` near each shape (D388), and the states whose suffocation is their block's own, with what it says at the origin of an empty world (D425), run by `oracle/datagen/block_flags.py` |
 | `EntityFacts.java` | Not a probe: writes what natural spawning asks of each entity type and block state, each type's spawn placement read from `SpawnPlacements`' class initializer (D317), and each attribute's default, range and whether it's synced, with the attributes a player has and their bases (D375), and what pathfinding reads of each block state, by `PathFacts` (D409), run by `oracle/datagen/entity_facts.py` |
 | `PathFacts.java` | Not a probe: each block state's path facts for `EntityFacts`, `isPathfindable` asked with no fluid in `#water` or `#lava` and with every fluid in both, and the class `getPathTypeFromState` asks about; then, with vanilla's tags loaded, each state's path type worked out from them checked against vanilla's own (D409) |
-| `PacketCheck.java` | Vanilla reading Calcite's packets, run by `check_packets.py` |
-| `ChatCheck.java` | Vanilla's client checking the signed chat in `build/packets/chat/`, run by `check_packets.py` |
+| `PacketCheck.java` | Vanilla reading Calcite's packets, run by `oracle/check_packets.calx` |
+| `ChatCheck.java` | Vanilla's client checking the signed chat in `build/packets/chat/`, run by `oracle/check_packets.calx` |
 | `SessionDump.java` | Vanilla reading the protocol bot's sessions, as trees, run by `rig/runner/sessions.py` |
 | `agent/Agent.java` | The rig's Java agent: its arguments, and the seven classes it changes as they load |
 | `agent/Entities.java` | What it does as each entity's made: its random seeded from its ID, and its UUID drawn again (D390); and as its brain's made, each `ShufflingList`'s random seeded ([D482](../../docs/decisions.md)); and `InsideBrownianWalk`'s shuffle drawn from a random of the mob's own ([D499](../../docs/decisions.md)) |

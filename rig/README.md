@@ -59,7 +59,7 @@ The vanilla adapter builds into `oracle/vanilla-adapter/build/<platform>/`, and 
 
 ### `record`
 
-Starts the vanilla adapter (build it first with `py -I oracle/vanilla-adapter/build.py`), runs every case, and writes:
+Starts the vanilla adapter (build it first with `calx oracle/adapter.calx`), runs every case, and writes:
 
 - `golden/26.3/<probe>.jsonl`: every full result, one per line, with blobs in base64
 - `expected/26.3/<probe>.json`: each case's hash, the configuration, and the adapter's `about` (JVM, flags and OS)

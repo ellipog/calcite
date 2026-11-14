@@ -59,7 +59,7 @@ class Session:
     def __init__(self, name, jvm_args=(), log_name=None, config=None):
         spec_path = ADAPTERS.get(name, Path(name))
         if not spec_path.is_file():
-            hint = " Run oracle/vanilla-adapter/build.py first." if name == "vanilla" else ""
+            hint = " Run calx oracle/adapter.calx first." if name == "vanilla" else ""
             die(f"no adapter at {spec_path}.{hint}")
         self.spec = json.loads(spec_path.read_text(encoding="utf-8"))
         # A configuration is a set of JVM flags the adapter is recorded under (D60).
@@ -136,7 +136,7 @@ def vanilla_configs(choice):
     """The vanilla configurations a command runs under: one by name, or `all`."""
     spec_path = ADAPTERS["vanilla"]
     if not spec_path.is_file():
-        die(f"no adapter at {spec_path}. Run oracle/vanilla-adapter/build.py first.")
+        die(f"no adapter at {spec_path}. Run calx oracle/adapter.calx first.")
     names = list(json.loads(spec_path.read_text(encoding="utf-8")).get("configs", {}))
     if choice == "all":
         return names
