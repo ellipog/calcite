@@ -1,4 +1,4 @@
-# Plays a real client a little, for realclient.py: F3, a screenshot, a walk and a jump, another
+# Plays a real client a little, for realclient.calx: F3, a screenshot, a walk and a jump, another
 # screenshot, a chat message, and a last screenshot. With -Shot, only a screenshot with the debug
 # screen on. With -Fly, a flight instead: `/calcite flyspeed` typed in the chat, a double jump to
 # fly, a climb, then forward for -Seconds; it says "flying" as it starts forward and "stopped" as

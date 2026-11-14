@@ -354,7 +354,7 @@ export default function Benchmarks() {
 									'# 100 players',
 									'py -I bench/run.py --record',
 									'# a real client, joining and flying',
-									'py -I bench/client.py --record',
+									'calx bench/client.calx --record',
 									'# worldgen with the packs: Calcite, then vanilla, Paper and C2ME',
 									'py -I bench/terralith.py --record',
 									'py -I bench/others.py --record',

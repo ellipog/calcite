@@ -163,11 +163,11 @@ At 16 and 32 threads the measured run takes 10.5 and 8.1 s, too short to have tw
 ## A real client
 
 ```sh
-py -I bench/client.py                 # a join and flights at 25 and 100 times vanilla's flying speed, not recorded
-py -I bench/client.py --record        # the same, written to bench/results/client-<platform>.json
+calx bench/client.calx                # a join and flights at 25 and 100 times vanilla's flying speed, not recorded
+calx bench/client.calx --record       # the same, written to bench/results/client-<platform>.json
 ```
 
-The bots pace themselves as the server lets them. A real player's client asks for chunks as fast as it takes them in, renders them, and flies over them, so what a player gets is measured with Mojang's own 26.3 client, through the rig's [`realclient.py`](../rig/README.md#a-real-client) ([D162](../docs/decisions.md)). For each speed, [`client.py`](client.py) starts the release server on a new world, with C2ME's seed, and the client joins at render and view distance 32:
+The bots pace themselves as the server lets them. A real player's client asks for chunks as fast as it takes them in, renders them, and flies over them, so what a player gets is measured with Mojang's own 26.3 client, through the rig's [`realclient.calx`](../rig/README.md#a-real-client) ([D162](../docs/decisions.md)). For each speed, [`client.py`](client.py) starts the release server on a new world, with C2ME's seed, and the client joins at render and view distance 32:
 
 1. Its join is timed through the rig's relay: the chunks it's sent, and when it had 95% of them and all.
 2. Once the chunks have stopped coming for 3 seconds, and 15 more have passed, the server's memory is read as a still player's.

@@ -1,0 +1,974 @@
+module rig.runner.chunkwatch
+
+// Watches chunks reach a real client (CAL-99): a relay between the client and a server that reads
+// the frames each way, as an offline server sends them, and times what comes. It was
+// rig/runner/chunkwatch.py, and gives the report it gave (CAL-253).
+//
+//     calx rig/runner/chunkwatch.calx --listen PORT --server HOST:PORT [--mbit N] [--ms N]
+//                                     [--out FILE] [--dump FILE] [--view N]
+//
+// realclient.calx runs it in its own process with --watch, and talks to it on its standard input,
+// a command a line: `mark KIND` starts a phase named KIND on each connection that's playing,
+// `quiet` has it answer `quiet SECONDS`, how long ago the last chunk was handed on, or `quiet
+// none`, and `stop`, or the input's end, has it write its report and end. The client connects to
+// the relay, the relay to the server, and every byte goes through as it came. On the way it reads
+// each frame: the handshake, login, configuration and play, with the compression the server turns
+// on, so it works with any server, Calcite or vanilla, in offline mode. An online server's frames
+// are encrypted, so they're passed through unread.
+//
+// From the frames it times, for the join and for each respawn packet after it, each a phase:
+//
+// - the chunks the client was sent, `level_chunk_with_light`, and their bytes as framed;
+// - each `chunk_batch_finished`, and each `chunk_batch_received` the client answers it with,
+//   which it sends once it has the batch, with the chunks a tick it asks for; it answers each
+//   batch once, in order, so the nth answer is the nth batch's;
+// - when the last chunk of the phase was sent, and when the client answered the batch it was in:
+//   the client had every chunk then; and when it had half of them, 90% and 95%, which leave out
+//   the last few that took longer to make;
+// - with --mbit, how long what the server sent waited for the link behind what it sent before,
+//   which anything it sent then, such as another player's move, waited too.
+//
+// With --mbit, what the server sends goes to the client at that many megabits a second at most,
+// and with --ms, each way N milliseconds late, as a home link would, so the times are those of a
+// player at the other end of one. The bytes go in pieces of 4 KB, one after another at the rate,
+// each late by the latency however many are on the way, so a batch takes the client as long to
+// come as it would on such a link. Times are from the relay's clock, as it hands the bytes on.
+//
+// With --dump, each `level_chunk_with_light` the client's sent is written to the file as it was
+// before it was compressed, its packet ID and all, after its length as 4 bytes little-endian, so
+// compressors can be compared on the chunks a real client was sent.
+//
+// With --view N, it also follows the player: where the client says it is, from its moves and the
+// server's teleports, and which chunks it has, each it was sent until the server has it forget
+// it. Four times a second, as the player moves, it counts the chunks of the circle of N chunks
+// about the player's that the client has, and how far the nearest it doesn't is. A phase's report
+// then says how much of its view the client had while it moved, and how fast it went, so a flight
+// shows whether the chunks kept up (CAL-94). realclient.calx starts a phase of its own, `flight`,
+// as the player starts to fly forward, and `after` as they stop.
+
+import std.cli.{cli}
+import std.fs.{append, read_text, write}
+import std.io.{Lines, flush}
+import std.json.{Json}
+import std.math.{hypot}
+import std.net.{Conn, Event, Net, Waker}
+import std.thread.{Task}
+import std.time.{Instant}
+import std.zlib.{Format, decompress}
+import tools.pyjson.{indented_one_ascii}
+import tools.repo.{die, under}
+
+const PIECE: usize = 4096
+
+/// A state's packet names in ID order, each way.
+struct Names {
+    serverbound: List<String>
+    clientbound: List<String>
+}
+
+/// The names in a `return [...]` list, from `at` on, and where the list ends.
+fn names_from(text: String, at: usize) -> (List<String>, usize) {
+    let open = text[at..].find("return [") ?? die("chunkwatch: src/protocol/ids.calx isn't as it was")
+    let from = at + open + 8
+    let close = text[from..].find("]") ?? die("chunkwatch: src/protocol/ids.calx isn't as it was")
+    var out: List<String> = []
+    for part in text[from..from + close].split(",") {
+        let name = part.trim().replace("\"", "")
+        if not name.is_empty() {
+            out.push(name)
+        }
+    }
+    return (out, from + close)
+}
+
+/// Each state's packet names in ID order, each way, read from src/protocol/ids.calx, which
+/// oracle/datagen writes from vanilla's packets.json.
+fn packet_ids() -> Map<String, Names> {
+    let text = match read_text(under("src/protocol/ids.calx")) {
+        ok(t) => t ?? String(""),
+        err(e) => die("chunkwatch: src/protocol/ids.calx: {e}"),
+    }
+    var ids = Map<String, Names>()
+    for state in ["Handshake", "Status", "Login", "Configuration", "Play"] {
+        let at = text.find("State.{state} => \{") ?? die("chunkwatch: no {state} in src/protocol/ids.calx")
+        let (server, after) = names_from(text.copy(), at)
+        let (client, _) = names_from(text.copy(), after)
+        ids.insert(String(state), Names { serverbound: server, clientbound: client })
+    }
+    return ids
+}
+
+/// The name of packet `id` in `state`, one way, or `#id` for one it doesn't have.
+fn name_of(ids: Map<String, Names>, state: String, serverbound: bool, id: i64) -> String {
+    if id >= 0 and ids.contains(state.copy()) {
+        let i = usize.wrap(id)
+        if serverbound {
+            if i < ids[state.copy()].serverbound.len() {
+                return ids[state.copy()].serverbound[i].copy()
+            }
+        } else if i < ids[state.copy()].clientbound.len() {
+            return ids[state.copy()].clientbound[i].copy()
+        }
+    }
+    return "#{id}"
+}
+
+/// A varint read: its value and where it ended, or that the data ended first, or that it ran
+/// past 5 bytes.
+struct Var {
+    value: i64
+    at: usize
+    short: bool
+    bad: bool
+}
+
+fn varint(data: List<u8>, from: usize) -> Var {
+    var value = 0i64
+    var shift = 0i64
+    var at = from
+    loop {
+        if at >= data.len() {
+            return Var { value: 0, at: at, short: true, bad: false }
+        }
+        let b = data[at]
+        at += 1
+        value |= i64(b & 0x7F) << shift
+        if b & 0x80 == 0 {
+            break
+        }
+        shift += 7
+        if shift > 35 {
+            return Var { value: 0, at: at, short: false, bad: true }
+        }
+    }
+    let v = value & 0xFFFFFFFF
+    return Var { value: if v >= 1 << 31 { v - (1 << 32) } else { v }, at: at, short: false, bad: false }
+}
+
+fn be(data: List<u8>, at: usize, n: usize) -> u64? {
+    if at + n > data.len() {
+        return none
+    }
+    var v = 0u64
+    for i in 0..n {
+        v = (v << 8) | u64(data[at + i])
+    }
+    return some(v)
+}
+
+/// One phase of a connection: the join, a respawn, or one the caller marked.
+struct Phase {
+    kind: String
+    at: f64
+    chunks: i64
+    chunk_bytes: i64
+    bytes: i64
+    batches: List<(f64, i64)>
+    answers: List<(f64, f64)>
+    last_chunk: f64?
+    last_batch: usize?
+    first_batch: usize
+    forgotten: i64
+}
+
+/// How much of the view about the player the client had: when, where, how many, and how far
+/// the nearest it didn't have was.
+struct Sample {
+    t: f64
+    x: f64
+    z: f64
+    had: i64
+    nearest: f64?
+}
+
+/// What one connection's frames come to, each way, as phases.
+struct Watch {
+    view: i64
+    have: Set<(i64, i64)>
+    samples: List<Sample>
+    sampled: f64
+    circle: List<(f64, i64, i64)>
+    serverbound: String
+    clientbound: String
+    threshold: i64
+    encrypted: bool
+    phases: List<Phase>
+    batches: List<f64>
+    answers: List<f64>
+    queued: List<(f64, f64)>
+}
+
+fn new_watch(view: i64) -> Watch {
+    var circle: List<(f64, i64, i64)> = []
+    for dx in -view..view + 1 {
+        for dz in -view..view + 1 {
+            if dx * dx + dz * dz <= view * view {
+                circle.push((hypot(f64.nearest(dx), f64.nearest(dz)), dx, dz))
+            }
+        }
+    }
+    circle.sort_by(|a, b| {
+        if a.0 < b.0 { Ordering.Less } else if a.0 > b.0 { Ordering.Greater } else { (a.1, a.2).cmp((b.1, b.2)) }
+    })
+    return Watch {
+        view: view, have: Set<(i64, i64)>(), samples: [], sampled: -1.0, circle: circle,
+        serverbound: String("Handshake"), clientbound: String("Handshake"), threshold: -1,
+        encrypted: false, phases: [], batches: [], answers: [], queued: [],
+    }
+}
+
+/// The chunk packets written to --dump, kept to be appended a megabyte at a time.
+struct Dump {
+    path: String?
+    pending: List<u8>
+}
+
+impl Dump {
+    fn add(mut self, body: List<u8>) {
+        if self.path == none {
+            return
+        }
+        let n = u32.wrap(u64(body.len()))
+        self.pending.push(u8.wrap(n & 0xFF))
+        self.pending.push(u8.wrap((n >> 8) & 0xFF))
+        self.pending.push(u8.wrap((n >> 16) & 0xFF))
+        self.pending.push(u8.wrap(n >> 24))
+        self.pending.extend(body)
+        if self.pending.len() > 1048576 {
+            self.flush_out()
+        }
+    }
+
+    fn flush_out(mut self) {
+        if let p = self.path.copy() {
+            if not self.pending.is_empty() {
+                match append(p.copy(), self.pending.copy()) {
+                    ok => {},
+                    err(e) => die("chunkwatch: {p}: {e}"),
+                }
+                self.pending = []
+            }
+        }
+    }
+}
+
+impl Watch {
+    fn phase(mut self, kind: own String, t: f64) {
+        self.phases.push(Phase {
+            kind: kind, at: t, chunks: 0, chunk_bytes: 0, bytes: 0, batches: [], answers: [],
+            last_chunk: none, last_batch: none, first_batch: self.batches.len(), forgotten: 0,
+        })
+    }
+
+    fn state(self, serverbound: bool) -> String {
+        return if serverbound { self.serverbound.copy() } else { self.clientbound.copy() }
+    }
+
+    /// A whole frame, without its length, `size` bytes on the wire with it, handed on at `t`.
+    /// False if it couldn't be read, as an encrypted one can't.
+    fn frame(mut self, ids: Map<String, Names>, dump: mut Dump, serverbound: bool, frame: List<u8>, size: i64, t: f64) -> bool {
+        if self.encrypted {
+            return true
+        }
+        var body = frame.copy()
+        if self.threshold >= 0 {
+            let length = varint(frame, 0)
+            if length.short or length.bad {
+                return false
+            }
+            if length.value != 0 {
+                body = match decompress(frame[length.at..].copy(), Format.Zlib, 1 << 26) {
+                    ok(b) => b,
+                    err(_) => return false,
+                }
+            } else {
+                body = frame[length.at..].copy()
+            }
+        }
+        let id = varint(body, 0)
+        if id.short or id.bad {
+            return false
+        }
+        let at = id.at
+        let state = self.state(serverbound)
+        let name = name_of(ids, state.copy(), serverbound, id.value)
+        if not self.phases.is_empty() and not serverbound {
+            let last = self.phases.len() - 1
+            self.phases[last].bytes += size
+            if name == "level_chunk_with_light" {
+                dump.add(body.copy())
+            }
+        }
+        if state == "Handshake" and name == "intention" {
+            // The protocol version, the address, the port, then where it's going.
+            let version = varint(body, at)
+            let length = varint(body, version.at)
+            if version.short or version.bad or length.short or length.bad or length.value < 0 {
+                return false
+            }
+            let intent = varint(body, length.at + usize.wrap(length.value) + 2)
+            if intent.short or intent.bad {
+                return false
+            }
+            let next = if intent.value == 1 { "Status" } else { "Login" }
+            self.serverbound = String(next)
+            self.clientbound = String(next)
+        } else if state == "Login" and name == "hello" and not serverbound {
+            self.encrypted = true
+        } else if state == "Login" and name == "login_compression" {
+            let threshold = varint(body, at)
+            if threshold.short or threshold.bad {
+                return false
+            }
+            self.threshold = threshold.value
+        } else if state == "Login" and name == "login_finished" {
+            self.clientbound = String("Configuration")
+        } else if state == "Login" and name == "login_acknowledged" {
+            self.serverbound = String("Configuration")
+        } else if state == "Configuration" and name == "finish_configuration" {
+            if serverbound {
+                self.serverbound = String("Play")
+            } else {
+                self.clientbound = String("Play")
+            }
+        } else if state == "Play" {
+            return self.play(serverbound, name, body[at..].copy(), size, t)
+        }
+        return true
+    }
+
+    fn play(mut self, serverbound: bool, name: String, rest: List<u8>, size: i64, t: f64) -> bool {
+        if not serverbound and name == "login" {
+            self.phase(String("join"), t)
+            return true
+        }
+        if not serverbound and name == "respawn" {
+            // Another dimension: the client lets every chunk it had go.
+            self.have = Set<(i64, i64)>()
+            self.phase(String("respawn"), t)
+            return true
+        }
+        if self.phases.is_empty() {
+            return true
+        }
+        let p = self.phases.len() - 1
+        if not serverbound {
+            if name == "level_chunk_with_light" {
+                let x = be(rest, 0, 4) else { return false }
+                let z = be(rest, 4, 4) else { return false }
+                self.phases[p].chunks += 1
+                self.phases[p].chunk_bytes += size
+                self.phases[p].last_chunk = some(t)
+                self.have.insert((i64(i32.wrap(x)), i64(i32.wrap(z))))
+            } else if name == "chunk_batch_finished" {
+                let n = varint(rest, 0)
+                if n.short or n.bad {
+                    return false
+                }
+                self.phases[p].batches.push((t, n.value))
+                if n.value != 0 {
+                    self.phases[p].last_batch = some(self.batches.len())
+                }
+                self.batches.push(t)
+            } else if name == "forget_level_chunk" {
+                self.phases[p].forgotten += 1
+                // A chunk's position as one long, its x in the low half.
+                let packed = be(rest, 0, 8) else { return false }
+                let x = i64(i32.wrap(packed & 0xFFFFFFFF))
+                let z = i64(i32.wrap(packed >> 32))
+                self.have.remove((x, z))
+            } else if name == "player_position" {
+                // A teleport: its ID, then where to, which the server's are, not relative.
+                let id = varint(rest, 0)
+                if id.short or id.bad {
+                    return false
+                }
+                let x = be(rest, id.at, 8) else { return false }
+                let z = be(rest, id.at + 16, 8) else { return false }
+                self.moved(f64.from_bits(x), f64.from_bits(z), t)
+            }
+        } else if name == "chunk_batch_received" and rest.len() >= 4 {
+            let bits = be(rest, 0, 4) ?? 0
+            let rate = f64(f32.from_bits(u32.wrap(bits)))
+            self.phases[p].answers.push((t, rate))
+            self.answers.push(t)
+        } else if name == "move_player_pos" or name == "move_player_pos_rot" {
+            let x = be(rest, 0, 8) else { return false }
+            let z = be(rest, 16, 8) else { return false }
+            self.moved(f64.from_bits(x), f64.from_bits(z), t)
+        }
+        return true
+    }
+
+    /// The player is at `x`, `z`: four times a second, how much of the view about them the
+    /// client has.
+    fn moved(mut self, x: f64, z: f64, t: f64) {
+        if self.view == 0 or t - self.sampled < 0.25 {
+            return
+        }
+        self.sampled = t
+        let cx = i64.saturate(x.floor()) >> 4
+        let cz = i64.saturate(z.floor()) >> 4
+        var had = 0i64
+        var nearest: f64? = none
+        for (distance, dx, dz) in self.circle {
+            if self.have.contains((cx + dx, cz + dz)) {
+                had += 1
+            } else if nearest == none {
+                nearest = some(distance)
+            }
+        }
+        self.samples.push(Sample { t: t, x: x, z: z, had: had, nearest: nearest })
+    }
+
+    fn report(self) -> Json {
+        var out: List<Json> = []
+        for (i, p) in self.phases.enumerate() {
+            let end = if i + 1 < self.phases.len() { self.phases[i + 1].at } else { f64.INFINITY }
+            var waits: List<f64> = []
+            for (t, q) in self.queued {
+                if p.at <= t and t < end {
+                    waits.push(q)
+                }
+            }
+            waits.sort_by(|a, b| float_cmp(a, b))
+            var had: f64? = none
+            if let b = p.last_batch {
+                if b < self.answers.len() {
+                    had = some(self.answers[b])
+                }
+            }
+            // When the client had each share of the phase's chunks: the answer to the batch that
+            // took it that far.
+            var shares: List<Json> = []
+            for share in [50i64, 90, 95] {
+                var got = 0i64
+                var at: Json = Json.Null
+                for (j, (_, n)) in p.batches.enumerate() {
+                    got += n
+                    if got * 100 >= share * p.chunks {
+                        let g = p.first_batch + j
+                        if g < self.answers.len() {
+                            at = Json.Float(round_to(self.answers[g] - p.at, 3))
+                        }
+                        break
+                    }
+                }
+                shares.push(at)
+            }
+            var m = LinkedMap<String, Json>()
+            m.insert(String("phase"), Json.Str(p.kind.copy()))
+            m.insert(String("chunks"), Json.Int(p.chunks))
+            m.insert(String("chunk_kib"), Json.Float(round_to(f64.nearest(p.chunk_bytes) / 1024.0, 1)))
+            m.insert(String("bytes_a_chunk"), Json.Int(if p.chunks > 0 { round_even(f64.nearest(p.chunk_bytes) / f64.nearest(p.chunks)) } else { 0 }))
+            m.insert(String("mib_sent"), Json.Float(round_to(f64.nearest(p.bytes) / 1048576.0, 2)))
+            m.insert(String("batches"), Json.Int(i64.wrap(u64(p.batches.len()))))
+            m.insert(String("last_chunk_s"), if let l = p.last_chunk { Json.Float(round_to(l - p.at, 3)) } else { Json.Null })
+            m.insert(String("client_had_all_s"), if let h = had { Json.Float(round_to(h - p.at, 3)) } else { Json.Null })
+            m.insert(String("client_had_half_s"), shares[0].copy())
+            m.insert(String("client_had_90_s"), shares[1].copy())
+            m.insert(String("client_had_95_s"), shares[2].copy())
+            // How long what the server sent waited for the link, in milliseconds: the median, the
+            // 95th percentile and the most.
+            if waits.is_empty() {
+                m.insert(String("link_wait_ms"), Json.Null)
+            } else {
+                let n = waits.len()
+                m.insert(String("link_wait_ms"), Json.Array([
+                    Json.Float(round_to(waits[n / 2] * 1000.0, 1)),
+                    Json.Float(round_to(waits[n * 95 / 100] * 1000.0, 1)),
+                    Json.Float(round_to(waits[n - 1] * 1000.0, 1)),
+                ]))
+            }
+            if p.answers.is_empty() {
+                m.insert(String("asked_a_tick"), Json.Null)
+            } else {
+                var lo = p.answers[0].1
+                var hi = p.answers[0].1
+                for (_, r) in p.answers {
+                    if r < lo {
+                        lo = r
+                    }
+                    if r > hi {
+                        hi = r
+                    }
+                }
+                m.insert(String("asked_a_tick"), Json.Array([Json.Float(round_to(lo, 1)), Json.Float(round_to(hi, 1))]))
+            }
+            m.insert(String("forgotten"), Json.Int(p.forgotten))
+            // Each batch's time and chunks, and each answer's time and the chunks a tick it asked
+            // for, from the phase's start.
+            var batch_times: List<Json> = []
+            for (t, n) in p.batches {
+                batch_times.push(Json.Array([Json.Float(round_to(t - p.at, 3)), Json.Int(n)]))
+            }
+            m.insert(String("batch_times"), Json.Array(batch_times))
+            var answer_times: List<Json> = []
+            for (t, r) in p.answers {
+                answer_times.push(Json.Array([Json.Float(round_to(t - p.at, 3)), Json.Float(round_to(r, 1))]))
+            }
+            m.insert(String("answer_times"), Json.Array(answer_times))
+            self.view_report(mut m, p.copy(), end)
+            out.push(Json.Object(m))
+        }
+        return Json.Array(out)
+    }
+
+    /// With a view, how much of it the client had in the phase, as the player moved.
+    fn view_report(self, m: mut LinkedMap<String, Json>, p: Phase, end: f64) {
+        var samples: List<Sample> = []
+        for s in self.samples {
+            if p.at <= s.t and s.t < end {
+                samples.push(s)
+            }
+        }
+        if self.view == 0 or samples.len() < 2 {
+            return
+        }
+        let size = f64.nearest(i64.wrap(u64(self.circle.len())))
+        var shares: List<f64> = []
+        var missing: List<f64> = []
+        for s in samples {
+            shares.push(f64.nearest(s.had) / size * 100.0)
+            if let n = s.nearest {
+                missing.push(n)
+            }
+        }
+        missing.sort_by(|a, b| float_cmp(a, b))
+        var blocks = 0.0
+        for i in 1..samples.len() {
+            blocks += hypot(samples[i].x - samples[i - 1].x, samples[i].z - samples[i - 1].z)
+        }
+        let seconds = samples[samples.len() - 1].t - samples[0].t
+        var total = 0.0
+        var least = shares[0]
+        for s in shares {
+            total += s
+            if s < least {
+                least = s
+            }
+        }
+        let count = f64.nearest(i64.wrap(u64(shares.len())))
+        m.insert(String("view_chunks"), Json.Int(i64.wrap(u64(self.circle.len()))))
+        m.insert(String("seconds"), Json.Float(round_to(seconds, 1)))
+        m.insert(String("blocks_a_second"), if seconds != 0.0 { Json.Float(round_to(blocks / seconds, 1)) } else { Json.Int(0) })
+        m.insert(String("chunks_a_second"), if seconds != 0.0 { Json.Float(round_to(f64.nearest(p.chunks) / seconds, 1)) } else { Json.Int(0) })
+        // The share of the view the client had, in percent: the mean and the least, and how many
+        // samples had all of it.
+        m.insert(String("had_of_view"), Json.Array([Json.Float(round_to(total / count, 1)), Json.Float(round_to(least, 1))]))
+        m.insert(String("whole_view_samples"), Json.Str("{samples.len() - missing.len()} of {samples.len()}"))
+        // How far the nearest chunk missing was, in chunks, where one was: the median and the
+        // least.
+        if missing.is_empty() {
+            m.insert(String("nearest_missing"), Json.Null)
+        } else {
+            m.insert(String("nearest_missing"), Json.Array([Json.Float(round_to(missing[missing.len() / 2], 1)), Json.Float(round_to(missing[0], 1))]))
+        }
+        // Each sample: when, from the phase's start, the share of the view, and the nearest
+        // missing.
+        var each: List<Json> = []
+        for s in samples {
+            let nearest = if let n = s.nearest { Json.Float(round_to(n, 1)) } else { Json.Null }
+            each.push(Json.Array([Json.Float(round_to(s.t - p.at, 2)), Json.Float(round_to(f64.nearest(s.had) / size * 100.0, 1)), nearest]))
+        }
+        m.insert(String("view_samples"), Json.Array(each))
+    }
+}
+
+fn float_cmp(a: f64, b: f64) -> Ordering {
+    return if a < b { Ordering.Less } else if a > b { Ordering.Greater } else { Ordering.Equal }
+}
+
+/// `round(x, places)`, as Python rounds a float: to the nearest of the decimals with that many
+/// places.
+pub fn round_to(x: f64, places: usize) -> f64 {
+    let text = if places == 1 { "{x:.1}" } else if places == 2 { "{x:.2}" } else { "{x:.3}" }
+    return f64.parse(text) ?? x
+}
+
+/// `round(x)`, as Python rounds a float to an int: halves to the even one.
+fn round_even(x: f64) -> i64 {
+    let low = x.floor()
+    let diff = x - low
+    let n = i64.saturate(low)
+    if diff > 0.5 {
+        return n + 1
+    }
+    if diff < 0.5 {
+        return n
+    }
+    return if n % 2 == 0 { n } else { n + 1 }
+}
+
+/// One way of a connection, as a link carries it: what's read from `src` is cut into pieces of at
+/// most PIECE bytes, each sent at the link's rate once the one before it is, then late by its
+/// latency, and handed on to `dst` once it's due, its frames read as it is.
+struct Way {
+    serverbound: bool
+    rate: f64?
+    delay: f64
+    // What's been handed on but isn't a whole frame yet, from `pos` on.
+    buffer: List<u8>
+    pos: usize
+    free_at: f64
+    // What's to be handed on, and when, from `head` on.
+    due: List<(f64, List<u8>)>
+    head: usize
+    ended: bool
+}
+
+fn new_way(serverbound: bool, mbit: f64?, ms: f64) -> Way {
+    let rate = if let m = mbit { if m > 0.0 { some(m * 1000000.0 / 8.0) } else { none } } else { none }
+    return Way { serverbound: serverbound, rate: rate, delay: ms / 1000.0, buffer: [], pos: 0, free_at: 0.0, due: [], head: 0, ended: false }
+}
+
+/// Bytes read from one side, as the link carries them: due at once, or in pieces at the rate and
+/// late by the latency, each piece's wait for the link kept in `queued`.
+fn cut(way: mut Way, queued: mut List<(f64, f64)>, data: own List<u8>, now: f64) {
+    if way.rate == none and way.delay == 0.0 {
+        way.due.push((now, data))
+        return
+    }
+    var at = 0usize
+    while at < data.len() {
+        let to = if at + PIECE < data.len() { at + PIECE } else { data.len() }
+        let piece = data[at..to].copy()
+        var sent = now
+        if let rate = way.rate {
+            let start = if way.free_at > now { way.free_at } else { now }
+            queued.push((now, start - now))
+            way.free_at = start + f64.nearest(i64.wrap(u64(piece.len()))) / rate
+            sent = way.free_at
+        }
+        way.due.push((sent + way.delay, piece))
+        at = to
+    }
+}
+
+/// Reads the whole frames handed on so far.
+fn read_frames(way: mut Way, watch: mut Watch, ids: Map<String, Names>, dump: mut Dump, data: List<u8>, t: f64) {
+    way.buffer.extend(data)
+    loop {
+        let length = varint(way.buffer, way.pos)
+        if length.short or length.bad or length.value < 0 {
+            break
+        }
+        let n = usize.wrap(length.value)
+        if way.buffer.len() < length.at + n {
+            break
+        }
+        let frame = way.buffer[length.at..length.at + n].copy()
+        let size = i64.wrap(u64(length.at + n - way.pos))
+        way.pos = length.at + n
+        if not watch.frame(ids, mut dump, way.serverbound, frame, size, t) {
+            watch.encrypted = true
+        }
+    }
+    if way.pos == way.buffer.len() {
+        way.buffer = []
+        way.pos = 0
+    } else if way.pos > 65536 {
+        way.buffer = way.buffer[way.pos..].copy()
+        way.pos = 0
+    }
+}
+
+/// Hands on what's due one way, reading its frames first, so compression the server turns on is
+/// on before the client answers; and gives how long until the next is due, if any is.
+fn hand_on_way(way: mut Way, watch: mut Watch, ids: Map<String, Names>, dump: mut Dump, net: Net, dst: Conn, began: Instant) -> f64? {
+    while way.head < way.due.len() {
+        let now = unsafe { Instant.now() }.secs_since(began)
+        let due = way.due[way.head].0
+        if due > now {
+            return some(due - now)
+        }
+        let data = way.due[way.head].1.copy()
+        way.head += 1
+        read_frames(mut way, mut watch, ids, mut dump, data, now)
+        net.write(dst, data)
+    }
+    way.due = []
+    way.head = 0
+    return none
+}
+
+/// A client's connection and the relay's to the server for it.
+struct Link {
+    client: Conn
+    upstream: Conn
+    up_open: bool
+    closed: bool
+    ids: Map<String, Names>
+    watch: Watch
+    up: Way
+    down: Way
+}
+
+fn sooner(a: f64?, b: f64?) -> f64? {
+    if let x = a {
+        if let y = b {
+            return some(if x < y { x } else { y })
+        }
+        return a
+    }
+    return b
+}
+
+impl Link {
+    fn received(mut self, from_client: bool, data: own List<u8>, now: f64) {
+        if from_client {
+            cut(mut self.up, mut self.watch.queued, data, now)
+        } else {
+            cut(mut self.down, mut self.watch.queued, data, now)
+        }
+    }
+
+    /// Hands on what's due each way, and closes both sides once one has ended and what came
+    /// from it is handed on; gives how long until the next is due, if any is.
+    fn hand_on(mut self, net: Net, dump: mut Dump, began: Instant) -> f64? {
+        if self.closed or not self.up_open {
+            return none
+        }
+        let a = hand_on_way(mut self.up, mut self.watch, self.ids, mut dump, net, self.upstream, began)
+        let b = hand_on_way(mut self.down, mut self.watch, self.ids, mut dump, net, self.client, began)
+        if (self.up.ended and self.up.due.is_empty()) or (self.down.ended and self.down.due.is_empty()) {
+            self.closed = true
+            net.close(self.client)
+            net.close(self.upstream)
+            return none
+        }
+        return sooner(a, b)
+    }
+}
+
+struct Relay {
+    net: Net
+    ids: Map<String, Names>
+    dump: Dump
+    host: String
+    port: u16
+    mbit: f64?
+    ms: f64
+    view: i64
+    links: List<Link>
+    began: Instant
+}
+
+impl Relay {
+    fn now(self) -> f64 {
+        return unsafe { Instant.now() }.secs_since(self.began)
+    }
+
+    fn link_of(self, c: Conn) -> usize? {
+        for (i, l) in self.links.enumerate() {
+            if not l.closed and (l.client.id() == c.id() or l.upstream.id() == c.id()) {
+                return some(i)
+            }
+        }
+        return none
+    }
+
+    fn accepted(mut self, c: Conn) {
+        let upstream = match self.net.connect(self.host.copy(), self.port) {
+            ok(u) => u,
+            err(e) => {
+                eprintln("chunkwatch: connecting to the server: {e}")
+                self.net.close(c)
+                return
+            }
+        }
+        self.links.push(Link {
+            client: c, upstream: upstream, up_open: false, closed: false, ids: self.ids.copy(),
+            watch: new_watch(self.view), up: new_way(true, none, self.ms), down: new_way(false, self.mbit, self.ms),
+        })
+    }
+
+    fn received(mut self, i: usize, from_client: bool, data: own List<u8>) {
+        let now = self.now()
+        self.links[i].received(from_client, data, now)
+    }
+
+    /// Hands on what's due on every connection; gives how long until the next is due, if any is.
+    fn hand_on(mut self) -> f64? {
+        var next: f64? = none
+        for i in 0..self.links.len() {
+            next = sooner(next, self.links[i].hand_on(self.net, mut self.dump, self.began))
+        }
+        return next
+    }
+
+    fn closed(mut self, c: Conn) {
+        let i = self.link_of(c) else {
+            return
+        }
+        // What's come from the side that ended is handed on, then both are closed.
+        if self.links[i].client.id() == c.id() {
+            self.links[i].up.ended = true
+        } else {
+            self.links[i].down.ended = true
+            if not self.links[i].up_open {
+                // The server never answered.
+                self.links[i].closed = true
+                self.net.close(self.links[i].client)
+            }
+        }
+    }
+
+    /// Starts a phase named `kind` now on each connection that's playing.
+    fn mark(mut self, kind: String) {
+        let t = self.now()
+        for i in 0..self.links.len() {
+            if not self.links[i].watch.phases.is_empty() {
+                self.links[i].watch.phase(kind.copy(), t)
+            }
+        }
+    }
+
+    /// How long ago the last chunk any connection was sent was handed on, or none.
+    fn quiet(self) -> f64? {
+        var last: f64? = none
+        for l in self.links {
+            for p in l.watch.phases {
+                if let t = p.last_chunk {
+                    if last == none or t > (last ?? t) {
+                        last = some(t)
+                    }
+                }
+            }
+        }
+        if let t = last {
+            return some(self.now() - t)
+        }
+        return none
+    }
+
+    /// Each connection that got to play, its phases.
+    fn report(self) -> Json {
+        var out: List<Json> = []
+        for l in self.links {
+            if not l.watch.phases.is_empty() {
+                out.push(l.watch.report())
+            }
+        }
+        return Json.Array(out)
+    }
+}
+
+/// Reads the commands on standard input, a line each, and wakes the relay's poll for each.
+struct Commands {
+    out: Sender<String>
+    waker: Waker
+}
+
+impl Task for Commands {
+    fn run(own self) {
+        var lines = Lines()
+        while let line = lines.next() {
+            self.out.send(line)
+            self.waker.wake()
+        }
+        self.out.send(String("stop"))
+        self.waker.wake()
+    }
+}
+
+@cli(name: "chunkwatch")
+struct Args {
+    /// The port to listen on, on 127.0.0.1.
+    listen: i64
+    /// The server, as HOST:PORT.
+    server: String
+    /// The most the server's side sends, in megabits a second.
+    mbit: f64?
+    /// Milliseconds each way is late.
+    ms: f64 = 0.0
+    /// A file the report's written to as JSON, as it's stopped.
+    out: String?
+    /// A file each chunk packet's written to, as it was before it was compressed.
+    dump: String?
+    /// Follow the player, and how much of the view of this many chunks about them the client has.
+    view: i64 = 0
+}
+
+pub fn main() {
+    let args = Args.parse()
+    let colon = args.server.find_last(":") ?? die("chunkwatch: --server is HOST:PORT")
+    let host = args.server[..colon]
+    let port = u16.parse(args.server[colon + 1..]) ?? die("chunkwatch: --server is HOST:PORT")
+    let net = Net.new()!
+    let listen = u16.parse("{args.listen}") ?? die("chunkwatch: --listen is a port")
+    match net.listen(String("127.0.0.1"), listen) {
+        ok(_) => {},
+        err(e) => die("chunkwatch: listening on {listen}: {e}"),
+    }
+    if let d = args.dump.copy() {
+        match write(d.copy(), List<u8>()) {
+            ok => {},
+            err(e) => die("chunkwatch: {d}: {e}"),
+        }
+    }
+    var relay = Relay {
+        net: net, ids: packet_ids(), dump: Dump { path: args.dump.copy(), pending: [] }, host: host, port: port,
+        mbit: args.mbit, ms: args.ms, view: args.view, links: [], began: unsafe { Instant.now() },
+    }
+    var commands = Receiver<String>()
+    let reader = Commands { out: commands.sender(), waker: net.waker()! }
+    _ = unsafe { Thread.spawn(reader) }
+    println("relaying 127.0.0.1:{listen} to {args.server}; type stop, or end the input, to stop and report")
+    flush()
+    var events = List<Event>()
+    var running = true
+    while running {
+        let next = relay.hand_on()
+        let timeout = if let n = next { i64.saturate((n * 1000.0).ceil()) } else { 1000 }
+        net.poll(timeout, mut events)
+        for e in events {
+            match e {
+                Accepted(c) => relay.accepted(c),
+                Connected(c) => {
+                    if let i = relay.link_of(c) {
+                        relay.links[i].up_open = true
+                    }
+                }
+                Received(c) => {
+                    if let i = relay.link_of(c) {
+                        var data = List<u8>()
+                        _ = net.read(c, mut data)
+                        let from_client = relay.links[i].client.id() == c.id()
+                        relay.received(i, from_client, data)
+                    }
+                }
+                Closed(c) => relay.closed(c),
+                Woken => {},
+            }
+        }
+        while let command = commands.next() {
+            let line = command.trim()
+            if line == "stop" {
+                running = false
+            } else if line == "quiet" {
+                if let q = relay.quiet() {
+                    println("quiet {q}")
+                } else {
+                    println("quiet none")
+                }
+                flush()
+            } else if line.starts_with("mark ") {
+                relay.mark(line[5..].trim())
+            }
+        }
+    }
+    _ = relay.hand_on()
+    relay.dump.flush_out()
+    let report = "{indented_one_ascii(relay.report())}"
+    if let out = args.out.copy() {
+        match write(out.copy(), report.to_bytes()) {
+            ok => {},
+            err(e) => die("chunkwatch: {out}: {e}"),
+        }
+    } else {
+        println(report)
+    }
+    println("stopped")
+    flush()
+}
