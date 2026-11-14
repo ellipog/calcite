@@ -3,7 +3,7 @@ import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 
-// Prints, for categories.py, the runs of code points Java's Character.getType puts in
+// Prints, for categories.calx, the runs of code points Java's Character.getType puts in
 // NON_SPACING_MARK, as "mn <first>;<last>" lines in hex, and the runs of UTF-16 units
 // Character.isLetterOrDigit(char) takes, as "ld <first>;<last>" lines. Black-box: it only calls
 // the JDK's public API.
