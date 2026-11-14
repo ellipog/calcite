@@ -1,0 +1,494 @@
+module src.test.run
+
+// Runs Calcite's Calx tests, in debug and release builds:
+//
+// - every .calx file in this folder but this one. Each panics on a wrong result and prints `ok` at
+//   its end.
+// - every ```calx block in src/README.md, whose `// out: ...` comments give the lines it prints, so
+//   the docs' examples can't go stale (D41).
+// - the server, src/calcite.calx, which runs until it's stopped, and the rig's adapter,
+//   src/rig/adapter.calx, which the rig runs, so they're only built.
+// - vanilla's own codecs on every packet the network tests' clients were sent, if the vanilla
+//   adapter is built (oracle/check_packets.calx, D145). Without it, that's skipped.
+//
+// Debug builds also check that everything allocated is freed (Calx's D79). calx is found as
+// tools/repo.calx finds it.
+//
+// The builds run side by side, `--jobs` at once, the heaviest first, as a build's weight is the
+// lines of every module it reaches. They're free to overlap, as calx links each program under a
+// name of its own and each test's files go in a temp folder of its own. A test that talks over
+// sockets, or writes to a fixed folder under build/, is only built then, and run alone once the
+// rest are done, debug then release: its clients wait for the server's answers only so long, which
+// a machine busy with builds can outlast, and its two runs would share the folder. calx keeps the
+// programs it builds, so `calx run` then runs the one just built. Its debug and release builds are
+// dealt each on its own, weighed with what its run costs. `--shard K/N` runs the K-th of N parts,
+// the builds dealt out heaviest first to the lightest part, so CI's jobs share them evenly; every
+// part works out the same deal.
+//
+//     calx src/test/run.calx [--jobs N] [--shard K/N] [TEST ...]
+
+import std.cli.{cli}
+import std.fs.{glob, read_text, remove_dir_all, remove_file, temp_dir, write_text}
+import std.io.{flush}
+import std.path
+import std.process.{Command, Output, exit, processors}
+import std.regex.{Regex}
+import std.thread.{Task}
+import std.time.{Instant}
+import tools.repo.{die, exe, find_calx, root, under}
+
+// What a test run alone costs on top of its build, as weight: the seconds each of its runs took on
+// CI's Windows runners, the slowest, on 2026-11-10, at about as much weight a second as a part's
+// builds got through there. A part waits for its tests run alone, so they're dealt by it.
+const WEIGHT_PER_SECOND: u64 = 10000
+
+fn run_seconds(stem: String) -> u64 {
+    return match stem {
+        "play" => 176,
+        "login" => 80,
+        "configuration" => 32,
+        "server" => 31,
+        "replay" => 4,
+        _ => 0,
+    }
+}
+
+fn regex(pattern: String) -> Regex {
+    return match Regex.python(pattern) {
+        ok(re) => re,
+        err(e) => die("run: {pattern}: {e}"),
+    }
+}
+
+fn read(rel: String) -> String {
+    return match read_text(under(rel)) {
+        ok(t) => t ?? String(),
+        err(e) => die("run: reading {rel}: {e}"),
+    }
+}
+
+fn newlines(text: String) -> u64 {
+    var n = 0u64
+    for b in text.to_bytes() {
+        if b == 10 {
+            n += 1
+        }
+    }
+    return n
+}
+
+/// The lines of each module, read once, and of every module a source reaches through its imports:
+/// what a build of it costs, near enough, as calx checks and compiles all of them.
+struct Weights {
+    lines: Map<String, u64>
+    imports: Map<String, List<String>>
+    import_re: Regex
+}
+
+impl Weights {
+    fn new() -> Weights {
+        return Weights { lines: Map<String, u64>(), imports: Map<String, List<String>>(), import_re: regex(#"(?m)^import ([A-Za-z_][\w.]*?)(?:\.\{|\s*$)"#) }
+    }
+
+    fn imported(mut self, text: String) -> List<String> {
+        var out: List<String> = []
+        for c in self.import_re.captures_all(text) {
+            out.push(c.get(1) ?? String())
+        }
+        return out
+    }
+
+    fn module_lines(mut self, name: String) -> u64 {
+        if not self.lines.contains(name) {
+            let file = under("src/{name.replace(".", "/")}.calx")
+            let text = match read_text(file) {
+                ok(t) => t ?? String(),
+                err(_) => String(),
+            }
+            self.lines.insert(name.copy(), newlines(text))
+            let found = self.imported(text)
+            self.imports.insert(name.copy(), found)
+        }
+        return self.lines[name]
+    }
+
+    fn of(mut self, source: String) -> u64 {
+        var total = newlines(source)
+        var seen = Set<String>()
+        var todo = self.imported(source)
+        while let name = todo.pop() {
+            if seen.contains(name) {
+                continue
+            }
+            seen.insert(name.copy())
+            total += self.module_lines(name)
+            for next in self.imports[name] {
+                todo.push(next.copy())
+            }
+        }
+        return total
+    }
+}
+
+/// What a job does.
+enum Kind {
+    /// `calx run` a test, and check it ends with `ok`.
+    Test
+    /// Builds a test that's run alone later.
+    BuildAlone
+    /// Writes a docs example as a module and runs it, debug then release, checking its lines.
+    Example
+    /// Builds a program that isn't run.
+    OnlyBuild
+}
+
+/// Something to build, and check: its label, its weight, and what it does.
+struct Job {
+    label: String
+    weight: u64
+    kind: Kind
+    rel: String
+    release: bool
+    target: String
+    source: String
+    want: List<String>
+    name: String
+}
+
+/// One result to report: what passed or failed, in which build, and what the program said.
+struct Res {
+    name: String
+    release: bool
+    ok: bool
+    out: Output
+}
+
+/// What a worker did with job `index`.
+struct Done {
+    index: usize
+    results: List<Res>
+    built: bool
+    seconds: f64
+}
+
+fn mode_args(release: bool) -> List<String> {
+    return if release { ["--release"] } else { [] }
+}
+
+fn output_of(c: Command, what: String) -> Output {
+    return match c.output() {
+        ok(o) => o,
+        err(e) => die("run: starting {what}: {e}"),
+    }
+}
+
+fn run(calx: String, rel: String, release: bool) -> Output {
+    let c = Command.new(calx.copy()).arg("run").args(mode_args(release)).arg(rel.copy()).dir(root())
+    return output_of(c, "calx run {rel}")
+}
+
+fn build(calx: String, rel: String, release: bool, target: String) -> Output {
+    let c = Command.new(calx.copy()).arg("build").args(mode_args(release)).args([rel.copy(), "-o", target.copy()]).dir(root())
+    return output_of(c, "calx build {rel}")
+}
+
+/// Whether a test passed: it exited with 0, and its last line is `ok`.
+fn passed(r: Output) -> bool {
+    let lines = r.text().lines()
+    return r.status.success() and lines.len() > 0 and lines[lines.len() - 1] == "ok"
+}
+
+fn trimmed_lines(text: String) -> List<String> {
+    var out: List<String> = []
+    for line in text.lines() {
+        out.push(line.trim_end().copy())
+    }
+    return out
+}
+
+fn work(calx: String, job: Job) -> (List<Res>, bool) {
+    var results: List<Res> = []
+    var built = false
+    match job.kind {
+        Kind.Test => {
+            let r = run(calx, job.rel, job.release)
+            results.push(Res { name: job.rel.copy(), release: job.release, ok: passed(r), out: r })
+        }
+        Kind.BuildAlone => {
+            let r = build(calx, job.rel, job.release, job.target)
+            built = r.status.success()
+            if not built {
+                results.push(Res { name: "{job.rel} builds", release: job.release, ok: false, out: r })
+            }
+        }
+        Kind.Example => {
+            let rel = "src/test/{job.name}.calx"
+            if let err(e) = write_text(under(rel), job.source.copy()) {
+                die("run: writing {rel}: {e}")
+            }
+            for release in [false, true] {
+                let r = run(calx, rel, release)
+                let good = r.status.success() and trimmed_lines(r.text()) == job.want
+                results.push(Res { name: job.label.copy(), release: release, ok: good, out: r })
+            }
+            if let err(e) = remove_file(under(rel)) {
+                die("run: removing {rel}: {e}")
+            }
+        }
+        Kind.OnlyBuild => {
+            let r = build(calx, job.rel, job.release, job.target)
+            results.push(Res { name: "{job.rel} builds", release: job.release, ok: r.status.success(), out: r })
+        }
+    }
+    return (results, built)
+}
+
+struct Worker {
+    calx: String
+    jobs: Receiver<(usize, Job)>
+    out: Sender<Done>
+}
+
+impl Task for Worker {
+    fn run(own self) {
+        while let (index, job) = self.jobs.wait() {
+            let began = unsafe { Instant.now() }
+            let (results, built) = work(self.calx, job)
+            let seconds = unsafe { Instant.now() }.secs_since(began)
+            self.out.send(Done { index: index, results: results, built: built, seconds: seconds })
+        }
+    }
+}
+
+fn make_job(label: own String, weight: u64, kind: Kind, rel: own String, release: bool) -> Job {
+    return Job { label: label, weight: weight, kind: kind, rel: rel, release: release, target: String(), source: String(), want: [], name: String() }
+}
+
+fn mode_name(release: bool) -> String {
+    return if release { String("release") } else { String("debug") }
+}
+
+/// Every job, in the order Python's runner made them: the tests, the docs' examples, then the
+/// programs only built. `alone` holds whether each is a test that's run alone once it's built.
+fn jobs(tmp: String) -> List<Job> {
+    var weights = Weights.new()
+    var alone_re = regex(#""build/|listen\("127|connect\("127|\.poll\("#)
+    var out: List<Job> = []
+    let tests = match glob(under("src/test/*.calx")) {
+        ok(f) => f,
+        err(e) => die("run: listing the tests: {e}"),
+    }
+    for test in tests {
+        let file = path.file_name(test) ?? String()
+        if file.starts_with("doc_") or file == "run.calx" {
+            continue
+        }
+        let stem = path.file_stem(test) ?? String()
+        let rel = "src/test/{file}"
+        let source = read(rel)
+        let weight = weights.of(source)
+        let alone = alone_re.is_match(source)
+        for release in [false, true] {
+            let label = "{rel} {mode_name(release)}"
+            if alone {
+                var j = make_job(label, weight + run_seconds(stem) * WEIGHT_PER_SECOND, Kind.BuildAlone, rel.copy(), release)
+                j.target = path.join(tmp, "{stem}{if release { "-release" } else { "" }}{exe()}")
+                out.push(j)
+            } else {
+                out.push(make_job(label, weight, Kind.Test, rel.copy(), release))
+            }
+        }
+    }
+
+    var block_re = regex("(?ms)^```calx\\n(.*?)^```")
+    var out_re = regex(#"//\s*out:\s?(.*)$"#)
+    let doc_rel = "src/README.md"
+    var n = 0
+    for c in block_re.captures_all(read(doc_rel)) {
+        n += 1
+        let body = c.get(1) ?? String()
+        var want: List<String> = []
+        for line in body.lines() {
+            if let o = out_re.captures(line) {
+                want.push((o.get(1) ?? String()).trim_end().copy())
+            }
+        }
+        let name = "doc_src_{n}"
+        let source = "module test.{name}\n\n{body}"
+        var j = make_job("{doc_rel} block {n}", 2 * weights.of(source), Kind.Example, String(), false)
+        j.source = source
+        j.want = want
+        j.name = name
+        out.push(j)
+    }
+
+    let server = weights.of(read("src/calcite.calx"))
+    let adapter = weights.of(read("src/rig/adapter.calx"))
+    for (label, weight, rel, release, name) in [("src/calcite.calx builds (debug)", server, "src/calcite.calx", false, "calcite"), ("src/calcite.calx builds (release)", server, "src/calcite.calx", true, "calcite-release"), ("src/rig/adapter.calx builds", adapter, "src/rig/adapter.calx", true, "calcite-adapter")] {
+        var j = make_job(String(label), weight, Kind.OnlyBuild, String(rel), release)
+        j.target = path.join(tmp, "{name}{exe()}")
+        out.push(j)
+    }
+    return out
+}
+
+/// The jobs' indexes dealt into `parts` parts, heaviest first, each to the part with the least
+/// weight so far, ties to the first.
+fn deal(all: List<Job>, parts: usize) -> List<List<usize>> {
+    var order: List<usize> = []
+    for i in 0..all.len() {
+        order.push(i)
+    }
+    order.sort_by(|a, b| if all[a].weight != all[b].weight { all[b].weight.cmp(all[a].weight) } else { all[a].label.cmp(all[b].label) })
+    var shares: List<List<usize>> = []
+    var loads: List<u64> = []
+    for _ in 0..parts {
+        shares.push([])
+        loads.push(0)
+    }
+    for i in order {
+        var k = 0usize
+        for p in 1..parts {
+            if loads[p] < loads[k] {
+                k = p
+            }
+        }
+        shares[k].push(i)
+        loads[k] += all[i].weight
+    }
+    return shares
+}
+
+struct Tally {
+    passes: u32
+    fails: u32
+}
+
+impl Tally {
+    fn report(mut self, name: String, release: bool, good: bool, r: Output, seconds: f64) {
+        let label = "{name} ({mode_name(release)})"
+        if good {
+            self.passes += 1
+            println("ok   {label} [{seconds:.0}s]")
+            flush()
+        } else {
+            self.fails += 1
+            let code = if let c = r.status.code { "{c}" } else { "{r.status}" }
+            println("FAIL {label}: status {code}\n{r.text()}{r.error_text()}")
+            flush()
+        }
+    }
+}
+
+/// Runs Calcite's Calx tests.
+@cli(name: "run")
+struct Args {
+    /// Builds at once (default: the cores, at most 8).
+    jobs: usize?
+    /// Run the K-th of N parts, as K/N.
+    shard: String = "1/1"
+    /// Run only the tests named, such as play or mob.
+    @positional
+    only: List<String>
+}
+
+pub fn main() {
+    let args = Args.parse()
+    let parts = args.shard.split("/")
+    let k = if parts.len() == 2 { usize.parse(parts[0]) ?? 0 } else { 0 }
+    let n = if parts.len() == 2 { usize.parse(parts[1]) ?? 0 } else { 0 }
+    if k < 1 or k > n {
+        die("run: --shard is K/N with 1 <= K <= N")
+    }
+    let at_once = (args.jobs ?? usize(unsafe { processors() }).min(8)).max(1)
+
+    let calx = find_calx()
+    var tally = Tally { passes: 0, fails: 0 }
+    let start = unsafe { Instant.now() }
+    let tmp = match temp_dir() {
+        ok(d) => d,
+        err(e) => die("run: making a temp folder: {e}"),
+    }
+    var all = jobs(tmp)
+    if not args.only.is_empty() {
+        var names = Set<String>()
+        for name in args.only {
+            names.insert("src/test/{name}.calx")
+        }
+        var kept: List<Job> = []
+        for j in all {
+            let first = j.label.split(" ")
+            if names.contains(first[0]) {
+                kept.push(j.copy())
+            }
+        }
+        all = kept
+    }
+    let shares = deal(all, n)
+    let mine = shares[k - 1].copy()
+    var later: List<usize> = []
+    for i in mine {
+        if all[i].kind == Kind.BuildAlone {
+            later.push(i)
+        }
+    }
+    println("part {k} of {n}: {mine.len()} builds, {at_once} at once, then {later.len()} tests alone")
+    flush()
+
+    let queue = Receiver<(usize, Job)>()
+    var done = Receiver<Done>()
+    var to_workers = queue.sender()
+    var threads: List<Thread> = []
+    for _ in 0..at_once.min(mine.len().max(1)) {
+        threads.push(unsafe { Thread.spawn(Worker { calx: calx.copy(), jobs: queue.share(), out: done.sender() }) })
+    }
+    queue.close()
+    for i in mine {
+        to_workers.send((i, all[i].copy()))
+    }
+    to_workers.close()
+    var built = Set<usize>()
+    var left = mine.len()
+    while left > 0 {
+        let d = done.wait() ?? die("run: the workers stopped early")
+        left -= 1
+        if d.built {
+            built.insert(d.index)
+        }
+        for r in d.results {
+            tally.report(r.name, r.release, r.ok, r.out, d.seconds)
+        }
+    }
+    while let t = threads.pop() {
+        t.join()
+    }
+
+    later.sort_by(|a, b| all[a].label.cmp(all[b].label))
+    for i in later {
+        if not built.contains(i) {
+            continue
+        }
+        let began = unsafe { Instant.now() }
+        let r = run(calx, all[i].rel, all[i].release)
+        let seconds = unsafe { Instant.now() }.secs_since(began)
+        tally.report(all[i].rel, all[i].release, passed(r), r, seconds)
+    }
+    if let err(e) = remove_dir_all(tmp) {
+        eprintln("run: removing {tmp}: {e}")
+    }
+
+    let check = output_of(Command.new(calx.copy()).arg(under("oracle/check_packets.calx")).dir(root()), "the packet check")
+    if check.status.code == some(2) {
+        println("skip vanilla reads the tests' packets: {check.text().trim()}")
+    } else {
+        let lines = check.text().lines()
+        let last = if lines.is_empty() { String("no output") } else { lines[lines.len() - 1].copy() }
+        tally.report("vanilla reads the tests' packets: {last}", true, check.status.success(), check, 0.0)
+    }
+
+    let seconds = unsafe { Instant.now() }.secs_since(start)
+    println("{tally.passes} passed, {tally.fails} failed, in {seconds:.0}s")
+    if tally.fails > 0 {
+        exit(1)
+    }
+}

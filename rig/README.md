@@ -635,7 +635,7 @@ The data converter and the jar fetch step have their own tests, which don't need
 py -I -m unittest discover -s oracle/datagen/tests -v
 ```
 
-CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Windows and Linux, with the oldest supported Python (3.10) and the newest. A second job checks out calx beside Calcite, builds it, runs Calcite's Calx tests (`py -I src/test/run.py`), fetches the pinned server jar, which the `registries` probe reads and which it caches, and scores Calcite against the committed hashes with `--strict` (`P1.9`). Then it runs the lockstep check, `py -I rig/lockstep.py`: Calcite's release build records a session with 8 chunk workers and 4 bots walking into new terrain, in a new world of a fixed seed, and `--replay` plays the input log back on one thread, which fails if any packet or line differs (`G5.3`).
+CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs both on Windows and Linux, with the oldest supported Python (3.10) and the newest. A second job checks out calx beside Calcite, builds it, runs Calcite's Calx tests (`calx src/test/run.calx`), fetches the pinned server jar, which the `registries` probe reads and which it caches, and scores Calcite against the committed hashes with `--strict` (`P1.9`). Then it runs the lockstep check, `py -I rig/lockstep.py`: Calcite's release build records a session with 8 chunk workers and 4 bots walking into new terrain, in a new world of a fixed seed, and `--replay` plays the input log back on one thread, which fails if any packet or line differs (`G5.3`).
 
 ## Found so far
 
