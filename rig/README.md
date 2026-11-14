@@ -148,10 +148,10 @@ py -I cases/biomes/gen.py        # cases/biomes/generated.json
 calx cases/terrain/gen.calx      # cases/terrain/generated.json
 py -I cases/surface/gen.py       # cases/surface/generated.json
 py -I cases/carvers/gen.py       # cases/carvers/generated.json
-py -I cases/features/gen.py      # cases/features/generated.json
-py -I cases/features/structured.py  # cases/features/structured.json
-py -I cases/features/grid.py     # cases/features/grid.json
-py -I cases/features/orders.py   # cases/features/orders.json
+calx cases/features/gen.calx      # cases/features/generated.json
+calx cases/features/structured.calx # cases/features/structured.json
+calx cases/features/grid.calx     # cases/features/grid.json
+calx cases/features/orders.calx   # cases/features/orders.json
 calx cases/structures/gen.calx   # cases/structures/generated.json
 calx cases/datafix/gen.calx      # cases/datafix/generated.json
 calx cases/block_entity/gen.calx # cases/block_entity/generated.json
