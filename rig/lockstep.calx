@@ -1,0 +1,290 @@
+module rig.lockstep
+
+// The determinism check, G5.3 (D21, D283): a session the server records on many threads replays on
+// one to the same packets and lines.
+//
+//     calx rig/lockstep.calx [--bots 4] [--seconds 20] [--workers 8] [--server EXE] [--swarm EXE]
+//
+// The server is Calcite's release build, recording its inputs, in a new world of a fixed seed in
+// build/lockstep/<platform>/, with `chunk-workers` threads generating, reading and lighting chunks
+// and bots from src/rig/swarm.calx walking out from spawn from the start, so new chunks are made
+// the whole time. Then `--replay` plays the input log back, which runs the generator and light on
+// its own thread, and checks each packet sent and line logged against the recording. Any
+// difference fails, with where it first was.
+
+import std.cli.{cli}
+import std.fs.{absolute, exists, glob, make_dir_all, metadata, remove_dir_all, write_text}
+import std.path
+import std.process.{Child, Command, Stdio}
+import std.regex.{Regex}
+import std.time.{Instant}
+import tools.repo.{die, exe, find_calx, platform, root, under}
+
+const PORT: i64 = 25643
+const VIEW: i64 = 8
+const SEED: str = "20261103"
+
+// How long the server has to say it's ready, and to stop once told to.
+const WAIT_MS: u64 = 300000
+
+fn build_dir() -> String {
+    return under("build/lockstep/{platform()}")
+}
+
+/// Builds the server and the bots in release, and gives their programs.
+fn build(calx: String) -> (String, String) {
+    let dir = build_dir()
+    if let err(e) = make_dir_all(dir) {
+        die("lockstep: making {dir}: {e}")
+    }
+    let server = path.join(dir, "calcite{exe()}")
+    let swarm = path.join(dir, "swarm{exe()}")
+    for (source, program) in [("src/calcite.calx", server.copy()), ("src/rig/swarm.calx", swarm.copy())] {
+        match Command.new(calx.copy()).args(["build", "--release", String(source), "-o", program.copy()]).dir(root()).run() {
+            ok => {},
+            err(e) => die("lockstep: building {source}: {e}"),
+        }
+    }
+    return (server, swarm)
+}
+
+fn put(file: String, text: String) {
+    if let err(e) = write_text(file, text) {
+        die("lockstep: writing {file}: {e}")
+    }
+}
+
+/// Makes a new world folder holding the server's settings.
+fn prepare(world: String, workers: i64) {
+    if exists(world) {
+        if let err(e) = remove_dir_all(world) {
+            die("lockstep: removing {world}: {e}")
+        }
+    }
+    if let err(e) = make_dir_all(world) {
+        die("lockstep: making {world}: {e}")
+    }
+    put(path.join(world, "server.properties"), "online-mode=false\nwhite-list=false\nserver-ip=127.0.0.1\nserver-port={PORT}\nmax-players=100\nview-distance={VIEW}\nsimulation-distance={VIEW}\nlevel-seed={SEED}\nmotd=Calcite lockstep check\n")
+    put(path.join(world, "calcite.properties"), "console-dashboard=off\nrecord-inputs=true\nchunk-workers={workers}\n")
+}
+
+/// The lines of a program's output, without the blank ones at its ends, as Python's
+/// `text.strip().splitlines()` gives them.
+fn lines_of(text: String) -> List<String> {
+    return text.trim().lines()
+}
+
+/// The last `n` of `lines`, joined with line breaks.
+fn last(lines: List<String>, n: usize) -> String {
+    let from = if lines.len() > n { lines.len() - n } else { 0 }
+    return lines[from..].join("\n")
+}
+
+/// Keeps a line of the server's, so a failure can show the last of them.
+fn keep(lines: mut List<String>, line: own String) {
+    lines.push(line)
+    if lines.len() > 200 {
+        _ = lines.remove(0)
+    }
+}
+
+/// Reads the server's lines until one holds `text`, waiting at most WAIT_MS in all, and gives
+/// whether one came.
+fn read_until(server: Child, lines: mut List<String>, text: str) -> bool {
+    let start = unsafe { Instant.now() }
+    loop {
+        let spent = unsafe { Instant.now() }.nanos_since(start) / 1000000
+        if spent >= WAIT_MS {
+            return false
+        }
+        let line = server.read_line(WAIT_MS - spent) else {
+            return false
+        }
+        let found = line.contains(text)
+        keep(mut lines, line)
+        if found {
+            return true
+        }
+    }
+}
+
+/// Reads the server's lines until its output ends, waiting at most WAIT_MS in all, and gives
+/// whether it ended.
+fn read_to_end(server: Child, lines: mut List<String>) -> bool {
+    let start = unsafe { Instant.now() }
+    loop {
+        let spent = unsafe { Instant.now() }.nanos_since(start) / 1000000
+        if server.ended() {
+            return true
+        }
+        if spent >= WAIT_MS {
+            return false
+        }
+        if let line = server.read_line(WAIT_MS - spent) {
+            keep(mut lines, line)
+        }
+    }
+}
+
+/// Runs the server with the bots on it, and gives the input log it recorded and the bots' report.
+fn record(server: String, swarm: String, world: String, bots: i64, seconds: i64) -> (String, String) {
+    var lines: List<String> = []
+    var p = match Command.new(server).dir(world.copy()).stdin(Stdio.Pipe).stdout(Stdio.Pipe).stderr(Stdio.Stdout).spawn() {
+        ok(c) => c,
+        err(e) => die("lockstep: starting the server: {e}"),
+    }
+    if not read_until(p, mut lines, "Done (") {
+        p.kill()
+        die("lockstep: the server didn't say it was ready:\n{last(lines, 20)}")
+    }
+    // The bots run while the server's lines are read, so it never waits on a full pipe.
+    let flock = Command.new(swarm).args(["{PORT}", "{bots}", "{bots}", "{seconds}", "{VIEW}", "--walk-at-once", "--speed=4"]).dir(root()).stdout(Stdio.Pipe).stderr(Stdio.Pipe)
+    var b = match flock.spawn() {
+        ok(c) => c,
+        err(e) => {
+            p.kill()
+            die("lockstep: starting the bots: {e}")
+        }
+    }
+    loop {
+        if let _ = b.try_wait() {
+            break
+        }
+        if let line = p.read_line(100) {
+            keep(mut lines, line)
+        }
+    }
+    let got = b.wait()
+    if let err(e) = p.write_text("stop\n") {
+        p.kill()
+        die("lockstep: telling the server to stop: {e}")
+    }
+    if not read_to_end(p, mut lines) {
+        p.kill()
+        die("lockstep: the server didn't stop:\n{last(lines, 20)}")
+    }
+    let ended = p.wait()
+    for line in lines_of(ended.text()) {
+        keep(mut lines, line.copy())
+    }
+    if not got.status.success() {
+        die("lockstep: the bots failed with status {got.status.code ?? -1}:\n{got.text()}{got.error_text()}")
+    }
+    if not ended.status.success() {
+        die("lockstep: the server ended with status {ended.status.code ?? -1}:\n{last(lines, 20)}")
+    }
+    let logs = match glob(path.join(world, "recordings/*")) {
+        ok(found) => found,
+        err(e) => die("lockstep: reading the recordings: {e}"),
+    }
+    if logs.is_empty() {
+        die("lockstep: the server recorded no input log")
+    }
+    let report = lines_of(got.text())
+    if report.is_empty() {
+        die("lockstep: the bots said nothing")
+    }
+    return (logs[logs.len() - 1].copy(), report[report.len() - 1].copy())
+}
+
+/// Plays the input log back, and gives whether it went as recorded, and its last lines.
+fn replay(server: String, world: String, log: String) -> (bool, List<String>) {
+    let name = path.file_name(log) ?? log.copy()
+    let got = match Command.new(server).args(["--replay", "recordings/{name}"]).dir(world).output() {
+        ok(o) => o,
+        err(e) => die("lockstep: starting the replay: {e}"),
+    }
+    let all = lines_of("{got.text()}{got.error_text()}")
+    let from = if all.len() > 6 { all.len() - 6 } else { 0 }
+    var tail: List<String> = []
+    for line in all[from..] {
+        tail.push(line.copy())
+    }
+    return (got.status.success(), tail)
+}
+
+/// A program given on the command line, made absolute, since the server runs in the world folder.
+fn given(p: String) -> String {
+    return match absolute(p) {
+        ok(a) => a,
+        err(e) => die("lockstep: {e}"),
+    }
+}
+
+/// Checks that one thread and many give the same packets and lines.
+@cli(name: "lockstep")
+struct Args {
+    /// How many bots walk out from spawn.
+    bots: i64 = 4
+    /// How long the bots play, in seconds.
+    seconds: i64 = 20
+    /// The chunk workers the recording runs with.
+    workers: i64 = 8
+    /// A server already built, instead of building one.
+    server: String?
+    /// Bots already built, instead of building them.
+    swarm: String?
+}
+
+pub fn main() {
+    let args = Args.parse()
+    if args.workers < 2 {
+        die("lockstep: the recording needs at least 2 chunk workers, or there's nothing to compare")
+    }
+    var server = String("")
+    var swarm = String("")
+    if let s = args.server {
+        if let w = args.swarm {
+            server = given(s.copy())
+            swarm = given(w.copy())
+        }
+    }
+    if server.is_empty() {
+        let (built_server, built_swarm) = build(find_calx())
+        server = built_server
+        swarm = built_swarm
+    }
+    let world = path.join(build_dir(), "world")
+    prepare(world.copy(), args.workers)
+    var began = unsafe { Instant.now() }
+    let (log, bots) = record(server.copy(), swarm, world.copy(), args.bots, args.seconds)
+    let recorded = unsafe { Instant.now() }.secs_since(began)
+    began = unsafe { Instant.now() }
+    let (same, tail) = replay(server, world, log.copy())
+    let replayed = unsafe { Instant.now() }.secs_since(began)
+    let size = match metadata(log.copy()) {
+        ok(m) => f64.nearest(m.size) / 1048576.0,
+        err(e) => die("lockstep: {e}"),
+    }
+    println("recorded {path.file_name(log) ?? ""}, {size:.1} MiB, with {args.workers} chunk workers and {args.bots} bots in {recorded:.0} s")
+    println("bots: {bots}")
+    println("replayed on one thread in {replayed:.0} s:")
+    for line in tail {
+        println("  {line}")
+    }
+    var report: String? = none
+    for line in tail {
+        if line.contains("Replayed ") or line.contains("went another way") {
+            report = some(line.copy())
+        }
+    }
+    let text = report else {
+        die("lockstep: the replay went another way than the recording")
+    }
+    if not same {
+        die("lockstep: the replay went another way than the recording")
+    }
+    var pattern = match Regex.new(#"(\d+) ticks, (\d+) packets and lines compared, (\d+) different"#) {
+        ok(r) => r,
+        err(e) => die("lockstep: {e}"),
+    }
+    let found = pattern.captures(text) else {
+        die("lockstep: the replay's report isn't a match")
+    }
+    let compared = i64.parse(found.get(2) ?? "0") ?? 0
+    let different = i64.parse(found.get(3) ?? "1") ?? 1
+    if different != 0 or compared == 0 {
+        die("lockstep: the replay's report isn't a match")
+    }
+    println("same: one thread and many gave the same packets and lines")
+}
