@@ -19,7 +19,7 @@ The rig runs the same inputs through vanilla and through Calcite and compares th
 | Differences | [`differences/`](differences/) | The registry of places Calcite deliberately differs |
 | Math comparison | [`runner/mathcmp.calx`](runner/mathcmp.calx) | `Math` against `StrictMath` on large sweeps (`P1.5`) |
 | Protocol suites | [`runner/sessions.py`](runner/sessions.py) | The protocol bot against vanilla and Calcite, packet by packet (`P4.8`) |
-| Light timing | [`runner/light_timing.py`](runner/light_timing.py) | Calcite's light engines timed against vanilla's through the `light` probe ([D182](../docs/decisions.md)) |
+| Light timing | [`runner/light_timing.calx`](runner/light_timing.calx) | Calcite's light engines timed against vanilla's through the `light` probe ([D182](../docs/decisions.md)) |
 | The round trip | [`runner/roundtrip.py`](runner/roundtrip.py) | A world vanilla made, loaded and saved by Calcite, then read by vanilla (`G5.2`) |
 | Worldgen with packs | [`runner/terragen.py`](runner/terragen.py) | Chunks Calcite generates with Terralith and Terratonic against vanilla's, block by block (CAL-92) |
 | A chunk as it starts to tick | [`runner/ticking.py`](runner/ticking.py) | The chunks a saved world left to post-process, and the rings it left part-way, as each server sends them once they tick, with the blocks set after, block by block ([D329](../docs/decisions.md), [D333](../docs/decisions.md), [D334](../docs/decisions.md), [D337](../docs/decisions.md)) |
@@ -116,7 +116,7 @@ Runs one case on an adapter and compares it with vanilla's golden: the output fi
 
 ## Case files
 
-Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.md#case-files). Hand-written files cover edge cases. Generated ones (`generated.json`, `limits.json`) come from the `gen.py` beside them, which is deterministic: run it again, on any machine and any Python the runner supports, and the file comes out the same. The runner's tests rerun every generator and compare (D249). So nothing a generator writes may depend on the machine: zip files have fixed times and are laid out by the generator, not `zipfile`, which marks each entry with the system it ran on, and every deflate, zlib or gzip stream comes from [`deflate.py`](runner/deflate.py), not Python's `zlib`, which compresses with whichever zlib Python was built with (zlib-ng on Windows from 3.14, classic zlib elsewhere, with different bytes). The generators that name vanilla's data read its ids from the pinned jar, so they need `oracle/fetch.calx` run first; the tests skip them without it.
+Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.md#case-files). Hand-written files cover edge cases. Generated ones (`generated.json`, `limits.json`) come from the `gen.calx` or, for those not yet ported (CAL-253), `gen.py` beside them, which is deterministic: run it again, on any machine, and the file comes out the same. The tests rerun every generator and compare (D249). So nothing a generator writes may depend on the machine: zip files have fixed times and are laid out by the generator, not `zipfile`, which marks each entry with the system it ran on, and every deflate, zlib or gzip stream comes from [`deflate.py`](runner/deflate.py), not Python's `zlib`, which compresses with whichever zlib Python was built with (zlib-ng on Windows from 3.14, classic zlib elsewhere, with different bytes). The generators that name vanilla's data read its ids from the pinned jar, so they need `oracle/fetch.calx` run first; the tests skip them without it.
 
 A case whose blobs vanilla doesn't write in the same order every run says `"unordered": true`, and the runner ([`unordered.calx`](runner/unordered.calx)) sorts each compound in them by key before hashing (D192).
 
@@ -138,7 +138,7 @@ py -I cases/tickets/gen.py       # cases/tickets/generated.json
 py -I cases/ticks/gen.py         # cases/ticks/generated.json
 py -I cases/levels/gen.py        # cases/levels/generated.json
 py -I cases/distance/gen.py      # cases/distance/generated.json
-py -I cases/light/gen.py         # cases/light/generated.json
+calx cases/light/gen.calx       # cases/light/generated.json
 py -I cases/spawn/gen.py         # cases/spawn/generated.json
 py -I cases/packs/gen.py         # cases/packs/generated.json
 py -I cases/noise/gen.py         # cases/noise/generated.json
@@ -616,18 +616,20 @@ Without `--online`, the server is offline and the client is `RealClient`, with n
 ## Tests and CI
 
 ```sh
-py -I -m unittest discover -s rig/runner/tests -v
+calx test rig/runner/tests/test_runner.calx       # the runner
+calx test rig/runner/tests/test_generators.calx   # the case generators written in Calx
+py -I -m unittest discover -s rig/runner/tests -v  # the tools that are Python still
 ```
 
-The runner's tests use only the standard library and never need the vanilla jar. They cover:
+The runner's tests never need the vanilla jar. They cover:
 
 - frames and the result hash
 - blob parts and generators, including SplitMix64's published outputs
-- that every `gen.py` reproduces its committed case file exactly
 - that every case has an expected hash
 - the differences registry and the store
 - a ping-only test adapter, end to end through `score`
-- the protocol suites' comparison, on sessions made up for it
+
+The generators' tests check that every `gen.calx`, and every `gen.py` not yet ported, writes its committed case file exactly, skipping those that read the jar where it isn't fetched. The Python ones also check the protocol suites' comparison, on sessions made up for it, the deflater and the save comparison.
 
 The data converter and the jar fetch step have their own tests, which don't need the jar either ([`oracle/datagen/`](../oracle/datagen/README.md#tests)):
 

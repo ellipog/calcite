@@ -203,10 +203,10 @@ The peak is the generator's, while it's making a thousand chunks a second, and i
 ## Light
 
 ```sh
-py -I rig/runner/light_timing.py      # Calcite's light engine against vanilla's, 15 runs of each workload
+calx rig/runner/light_timing.calx    # Calcite's light engine against vanilla's, 15 runs of each workload
 ```
 
-[`light_timing.py`](../rig/runner/light_timing.py) runs the rig's `light` probe on vanilla's server and on Calcite, each a few times to warm up and then 15 times, with three workloads: a flat 9×9 chunks, 7×7 chunks of random terrain, and the same with 5,000 random edits relit. Each is run twice, once whole and once with only its chunks and blocks, so the difference is the light. It says whether both engines' light came out the same, which the probe also checks nibble for nibble.
+[`light_timing.calx`](../rig/runner/light_timing.calx) runs the rig's `light` probe on vanilla's server and on Calcite, each a few times to warm up and then 15 times, with three workloads: a flat 9×9 chunks, 7×7 chunks of random terrain, and the same with 5,000 random edits relit. Each is run twice, once whole and once with only its chunks and blocks, so the difference is the light. It says whether both engines' light came out the same, which the probe also checks nibble for nibble.
 
 ### Results
 

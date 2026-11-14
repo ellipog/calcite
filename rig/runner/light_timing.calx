@@ -1,0 +1,153 @@
+module rig.runner.light_timing
+
+// Times the light engines, Calcite's against vanilla's, through the `light` probe.
+//
+//     calx rig/runner/light_timing.calx [runs]
+//
+// Each workload is a case run twice: once whole, and once with only its chunks and blocks, so the
+// difference is the light. Each adapter runs both a few times to warm up, then `runs` times each,
+// alternating, and the median of each is taken.
+
+import std.cli.{cli}
+import std.json.{Json}
+import std.process.{exit}
+import std.time.{Instant}
+import cases.light.gen.{OVERWORLD, STONE, case, flat_fill, gen, generate, made, op, pool, random, square}
+import rig.runner.cases.{Case}
+import rig.runner.rig.{Session, finish, load_cases, run_case, session}
+
+struct Workload {
+    name: String
+    whole: Json
+    plain: Json
+}
+
+/// A case's input: the ops of one workload, as `gen.case` makes them.
+fn input_of(name: own String, ops: own List<Json>) -> Json {
+    return case(name, OVERWORLD, 1, ops).get("input") ?? Json.Null
+}
+
+fn workload(name: str, radius: i64, count: i64, edits: i64, seed: u64) -> Workload {
+    var g = gen(seed)
+    let chunks = square(radius)
+    var ops = made(chunks)
+    for (cx, cz) in chunks {
+        ops.extend(flat_fill(cx, cz, -64))
+    }
+    let lo = -radius * 16
+    let hi = radius * 16 + 15
+    ops.push(op("fill", [lo, -60, lo, hi, -20, hi, STONE]))
+    let first = g.seed()
+    ops.push(random(0, first, count, pool(), [lo, -60, lo, hi, 40, hi]))
+    ops.extend(generate(chunks))
+    if edits > 0 {
+        let second = g.seed()
+        ops.push(random(1, second, edits, pool(), [lo, -60, lo, hi, 40, hi]))
+        ops.push(op("run", []))
+    }
+    ops.push(op("light", [0, 0]))
+    // Without light: the same chunks and blocks, every `random` quiet so it sets the same blocks.
+    var plain: List<Json> = []
+    for o in ops {
+        let Json.Array(parts) = o else {
+            continue
+        }
+        let kind = parts[0].as_str() ?? String("")
+        if kind == "random" {
+            var quiet: List<Json> = [Json.Str("random"), Json.Int(0)]
+            quiet.extend(parts[2..])
+            plain.push(Json.Array(quiet))
+        } else if kind == "chunk" or kind == "fill" {
+            plain.push(o.copy())
+        }
+    }
+    return Workload { name: String(name), whole: input_of(String(name), ops), plain: input_of(String(name), plain) }
+}
+
+/// Seconds the case took, and its first blob.
+fn timed(s: mut Session, template: Case, input: Json) -> (f64, List<u8>) {
+    var c = template.copy()
+    c.input = input.copy()
+    let t = unsafe { Instant.now() }
+    let r = run_case(mut s, c)
+    let dt = unsafe { Instant.now() }.secs_since(t)
+    if r.status != "ok" {
+        eprintln("{r.status}: {r.message ?? String("None")}")
+        exit(1)
+    }
+    let blob = if r.blobs.is_empty() { List<u8>() } else { r.blobs[0].copy() }
+    return (dt, blob)
+}
+
+/// The median, as Python's `statistics.median` takes it: the middle one, or the mean of the
+/// middle two.
+fn median(values: List<f64>) -> f64 {
+    var xs = values.copy()
+    xs.sort_by(|a, b| a.total_cmp(b))
+    let n = xs.len()
+    if n % 2 == 1 {
+        return xs[n / 2]
+    }
+    return (xs[n / 2 - 1] + xs[n / 2]) / 2.0
+}
+
+/// Times Calcite's light engines against vanilla's.
+@cli(name: "light_timing")
+struct Args {
+    /// The timed runs of each workload on each server.
+    @positional
+    runs: i64 = 15
+}
+
+struct Timing {
+    whole: f64
+    plain: f64
+    blob: List<u8>
+}
+
+pub fn main() {
+    let args = Args.parse()
+    let workloads = [
+        workload("flat 9x9", 4, 0, 0, 1),
+        workload("terrain 7x7", 3, 40000, 0, 2),
+        workload("terrain 7x7, 5000 edits", 3, 40000, 5000, 3),
+    ]
+    let by_probe = load_cases([String("light")])
+    let cases = by_probe.find("light") else {
+        eprintln("light_timing: no light cases")
+        exit(1)
+    }
+    let template = cases[0].copy()
+    var results = LinkedMap<String, Timing>()
+    for adapter in ["vanilla", "calcite"] {
+        let config: String? = if adapter == "vanilla" { some(String("strict-math")) } else { none }
+        var s = session(String(adapter), [], none, config)
+        for w in workloads {
+            for _ in 0..5 {
+                _ = timed(mut s, template, w.whole)
+                _ = timed(mut s, template, w.plain)
+            }
+            var a: List<f64> = []
+            var b: List<f64> = []
+            for _ in 0..args.runs {
+                let (whole, _) = timed(mut s, template, w.whole)
+                a.push(whole)
+                let (plain, _) = timed(mut s, template, w.plain)
+                b.push(plain)
+            }
+            let (_, blob) = timed(mut s, template, w.whole)
+            results.insert("{adapter}/{w.name}", Timing { whole: median(a), plain: median(b), blob: blob })
+        }
+        finish(mut s)
+    }
+    println("{"workload":<28} {"vanilla light":>14} {"calcite light":>14} {"ratio":>7}   (whole / blocks only, ms)")
+    for w in workloads {
+        let v = results["vanilla/{w.name}"].copy()
+        let c = results["calcite/{w.name}"].copy()
+        let same = if v.blob == c.blob { "same" } else { "DIFFERENT" }
+        let vl = (v.whole - v.plain) * 1000.0
+        let cl = (c.whole - c.plain) * 1000.0
+        let ratio = if cl > 0.0 { vl / cl } else { 0.0 }
+        println("{w.name:<28} {vl:14.2} {cl:14.2} {ratio:6.2}x   ({v.whole * 1000.0:.1}/{v.plain * 1000.0:.1}, {c.whole * 1000.0:.1}/{c.plain * 1000.0:.1}; results {same})")
+    }
+}
