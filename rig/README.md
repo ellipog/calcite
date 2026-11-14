@@ -116,7 +116,7 @@ Runs one case on an adapter and compares it with vanilla's golden: the output fi
 
 ## Case files
 
-Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.md#case-files). Hand-written files cover edge cases. Generated ones (`generated.json`, `limits.json`) come from the `gen.calx` or, for those not yet ported (CAL-253), `gen.py` beside them, which is deterministic: run it again, on any machine, and the file comes out the same. The tests rerun every generator and compare (D249). So nothing a generator writes may depend on the machine: zip files have fixed times and are laid out by the generator, not `zipfile`, which marks each entry with the system it ran on, and every deflate, zlib or gzip stream comes from [`deflate.calx`](runner/deflate.calx), or [`deflate.py`](runner/deflate.py) for `packs/gen.py` until it's ported, which write the same bytes: one block of fixed Huffman codes, or stored blocks, not `std.zlib`'s matches, which tuning it may change, or Python's `zlib`, which compresses with whichever zlib Python was built with. The generators that name vanilla's data read its ids from the pinned jar, so they need `oracle/fetch.calx` run first; the tests skip them without it.
+Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.md#case-files). Hand-written files cover edge cases. Generated ones (`generated.json`, `limits.json`) come from the `gen.calx` beside them, which is deterministic: run it again, on any machine, and the file comes out the same. The tests rerun every generator and compare (D249). So nothing a generator writes may depend on the machine: zip files have fixed times and are laid out by the generator, not `zipfile`, which marks each entry with the system it ran on, and every deflate, zlib or gzip stream comes from [`deflate.calx`](runner/deflate.calx), which writes the same bytes everywhere: one block of fixed Huffman codes, or stored blocks, not `std.zlib`'s matches, which tuning it may change. The generators that name vanilla's data read its ids from the pinned jar, so they need `oracle/fetch.calx` run first; the tests skip them without it.
 
 A case whose blobs vanilla doesn't write in the same order every run says `"unordered": true`, and the runner ([`unordered.calx`](runner/unordered.calx)) sorts each compound in them by key before hashing (D192).
 
@@ -141,7 +141,7 @@ calx cases/levels/gen.calx       # cases/levels/generated.json
 calx cases/distance/gen.calx     # cases/distance/generated.json
 calx cases/light/gen.calx        # cases/light/generated.json
 calx cases/spawn/gen.calx        # cases/spawn/generated.json
-py -I cases/packs/gen.py         # cases/packs/generated.json
+calx cases/packs/gen.calx        # cases/packs/generated.json
 calx cases/noise/gen.calx        # cases/noise/generated.json
 calx cases/density/gen.calx      # cases/density/generated.json
 calx cases/biomes/gen.calx       # cases/biomes/generated.json
@@ -620,7 +620,8 @@ Without `--online`, the server is offline and the client is `RealClient`, with n
 
 ```sh
 calx test rig/runner/tests/test_runner.calx       # the runner
-calx test rig/runner/tests/test_generators.calx   # the case generators written in Calx
+calx test rig/runner/tests/test_deflate.calx      # the deflater the generators compress with
+calx test rig/runner/tests/test_generators.calx   # the case generators
 py -I -m unittest discover -s rig/runner/tests -v  # the tools that are Python still
 ```
 
@@ -632,7 +633,7 @@ The runner's tests never need the vanilla jar. They cover:
 - the differences registry and the store
 - a ping-only test adapter, end to end through `score`
 
-The generators' tests check that every `gen.calx`, and every `gen.py` not yet ported, writes its committed case file exactly, skipping those that read the jar where it isn't fetched. The Python ones also check the protocol suites' comparison, on sessions made up for it, `deflate.py` and the save comparison, and `test_deflate.calx` checks `deflate.calx`, the same streams and the same pinned bytes.
+The generators' tests check that every `gen.calx` writes its committed case file exactly, skipping those that read the jar where it isn't fetched. The deflater's check that its streams inflate back with `std.zlib` at every level, and that the bytes the case files hold haven't changed. The Python ones check the protocol suites' comparison, on sessions made up for it, and the save comparison.
 
 The data converter and the jar fetch step have their own tests, which don't need the jar either ([`oracle/datagen/`](../oracle/datagen/README.md#tests)):
 
@@ -641,7 +642,7 @@ calx test oracle/datagen/tests/test_convert.calx
 calx test oracle/datagen/tests/test_calx_tables.calx
 ```
 
-CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs the tests of the rig's tools that are Python still, the protocol suites' comparison, the deflater, the save comparison and the case generators, on Windows and Linux, with the oldest supported Python (3.10) and the newest. A second job checks out calx beside Calcite, builds it, runs Calcite's Calx tests (`calx src/test/run.calx`), the converter's and the runner's (`calx test rig/runner/tests/test_runner.calx`), fetches the pinned server jar, which the `registries` probe reads and which it caches, lists the cases and hashes, and scores Calcite against the committed hashes with `calx rig/runner/rig.calx score --strict` (`P1.9`). Then it runs the lockstep check, `calx rig/lockstep.calx`: Calcite's release build records a session with 8 chunk workers and 4 bots walking into new terrain, in a new world of a fixed seed, and `--replay` plays the input log back on one thread, which fails if any packet or line differs (`G5.3`).
+CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs the tests of the rig's tools that are Python still, the protocol suites' comparison and the save comparison, on Windows and Linux, with the oldest supported Python (3.10) and the newest. A second job checks out calx beside Calcite, builds it, runs Calcite's Calx tests (`calx src/test/run.calx`), the converter's, the runner's (`calx test rig/runner/tests/test_runner.calx`), the deflater's and the case generators', fetches the pinned server jar, which the `registries` probe reads and which it caches, lists the cases and hashes, and scores Calcite against the committed hashes with `calx rig/runner/rig.calx score --strict` (`P1.9`). Then it runs the lockstep check, `calx rig/lockstep.calx`: Calcite's release build records a session with 8 chunk workers and 4 bots walking into new terrain, in a new world of a fixed seed, and `--replay` plays the input log back on one thread, which fails if any packet or line differs (`G5.3`).
 
 ## Found so far
 

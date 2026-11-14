@@ -1,0 +1,857 @@
+module cases.packs.gen
+
+// Writes cases/packs/generated.json: a world's data packs found and picked as a server starting
+// finds and picks them, by vanilla's ServerPacksSource and MinecraftServer.configurePackRepository,
+// then their files listed by a MultiPackResourceManager over the picked packs, or the registries
+// loaded from them by RegistryDataLoader.
+//
+//     calx cases/packs/gen.calx
+//
+// Each case makes the world's `datapacks` folder, with folder packs, zips and entries that aren't
+// packs, then picks: as a new world does, from server.properties' `initial-enabled-packs` and
+// `initial-disabled-packs`, or as an old world does, from what its level.dat has on and off and its
+// feature flags, with or without `--safeMode`. Then it lists a folder of the picked packs' files,
+// which shows which pack's file wins, what filters hide and which overlays apply. Or it loads the
+// world's registries from them, which shows what's logged, whether they load and what each
+// synchronized entry sends a client.
+//
+// An entry a case loads is read by vanilla with its registry's codec for the server and by Calcite
+// with its codec for the network, which leaves out what only the server uses. So the entries are
+// in registries whose two codecs read the same fields, or keep to those they share, and a broken
+// one is broken in a field both read.
+//
+// Making a link takes a privilege Windows doesn't give everyone, so the cases with links are
+// Linux's. And vanilla finds what's in a folder in the order the file system lists it, so a folder
+// with more than one entry that logs something logs it in that order. NTFS lists a folder in the
+// same order on every machine, by its names; a Linux file system needn't (ext4 lists by a hash of
+// each name with a seed of each file system's own). So such cases are Windows', named `windows-`,
+// and the others keep to one entry that logs in each folder.
+//
+// The pack files' JSON is written as Python's `json.dumps` wrote it with no arguments, which
+// `pyjson.spaced_ascii` does, from JSON text here in the order the Python wrote its dicts.
+
+import std.bytes
+import std.bytes.{base64}
+import std.json
+import std.json.{Json}
+import std.zlib.{crc32}
+import cases.components.{bad_components, item_components}
+import cases.kit.{arr, b, file, n, obj, s, strs}
+import rig.runner.cases.{write_file}
+import rig.runner.deflate.{deflate}
+import tools.pyjson.{spaced_ascii}
+import tools.repo.{die}
+
+const VANILLA: str = "minecraft:vanilla"
+const REBALANCE: str = "minecraft:trade_rebalance"
+const REDSTONE: str = "minecraft:redstone_experiments"
+const MINECART: str = "minecraft:minecart_improvements"
+// A positional environment attribute, which needs `origin`.
+const POSITIONAL: str = ##"{"type": "minecraft:environment_attribute", "attribute": "minecraft:gameplay/turtle_egg_hatch_chance"}"##
+
+/// JSON written out, with `@P` standing for `POSITIONAL`.
+fn j(text: String) -> Json {
+    let filled = text.replace("@P", POSITIONAL)
+    return match json.parse(filled.copy()) {
+        ok(v) => v,
+        err(e) => die("{filled}: {e}"),
+    }
+}
+
+/// JSON text as `json.dumps` writes it.
+fn d(text: String) -> String {
+    return spaced_ascii(j(text))
+}
+
+fn m(key: str, v: own Json) -> (String, Json) {
+    return (String(key), v)
+}
+
+/// An object's members, in order.
+fn fields(text: String) -> List<(String, Json)> {
+    var out: List<(String, Json)> = []
+    if let Json.Object(members) = j(text) {
+        for (k, v) in members {
+            out.push((k.copy(), v.copy()))
+        }
+    }
+    return out
+}
+
+/// A list's items.
+fn items(text: String) -> List<Json> {
+    if let Json.Array(xs) = j(text) {
+        return xs.copy()
+    }
+    return die("not a list: {text}")
+}
+
+/// `v` with `more` set, as a dict's `update` sets them: in place, or after the rest.
+fn updated(v: own Json, more: List<(String, Json)>) -> Json {
+    if let Json.Object(members) = v {
+        var out = members
+        for (k, x) in more {
+            out.insert(k.copy(), x.copy())
+        }
+        return Json.Object(out)
+    }
+    return v
+}
+
+fn meta_of(description: own Json, lo: own Json, hi: own Json, more: List<(String, Json)>) -> String {
+    let pack = obj([m("description", description), m("min_format", lo), m("max_format", hi)])
+    return spaced_ascii(updated(obj([m("pack", pack)]), more))
+}
+
+fn meta() -> String {
+    return meta_of(s("a pack"), n(121), n(121), [])
+}
+
+fn meta_and(more: List<(String, Json)>) -> String {
+    return meta_of(s("a pack"), n(121), n(121), more)
+}
+
+fn formats(lo: Json, hi: Json) -> String {
+    return meta_of(s("a pack"), lo.copy(), hi.copy(), [])
+}
+
+fn rebalance_meta() -> String {
+    return meta_and(fields(#"{"features": {"enabled": ["minecraft:trade_rebalance"]}}"#))
+}
+
+/// A file of a pack: its path and its text.
+fn at(path: own String, text: own String) -> (String, String) {
+    return (path, text)
+}
+
+fn plus(head: own List<(String, String)>, tail: List<(String, String)>) -> List<(String, String)> {
+    var out = head
+    for (path, text) in tail {
+        out.push((path.copy(), text.copy()))
+    }
+    return out
+}
+
+/// A DOS time and date, as a zip's entries keep them.
+fn dos_time(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> (u16, u16) {
+    return (u16.wrap((hour << 11) | (minute << 5) | (second / 2)), u16.wrap(((year - 1980) << 9) | (month << 5) | day))
+}
+
+/// A zip of the files, each a name and its text, as Java's zip tools would read it, laid out as
+/// Python's zipfile laid one out on Windows, with fixed times: the time the committed ones were
+/// first written, and 1980's start for folders, as `writestr(ZipInfo(name), b"")` makes them,
+/// stored.
+fn zipped(files: List<(String, String)>, compress: bool) -> List<u8> {
+    var out: List<u8> = []
+    var central: List<u8> = []
+    for (name, text) in files {
+        let data = text.to_bytes()
+        let folder = name.ends_with("/")
+        let method: u16 = if compress and not folder { 8 } else { 0 }
+        let (time, date) = if folder { dos_time(1980, 1, 1, 0, 0, 0) } else { dos_time(2026, 11, 1, 3, 19, 0) }
+        let stored = if method == 8 { deflate(data) } else { data.copy() }
+        let encoded = name.to_bytes()
+        var ascii = true
+        for byte in encoded {
+            if byte >= 0x80 {
+                ascii = false
+            }
+        }
+        var common: List<u8> = []
+        bytes.put_u16_le(mut common, 20)
+        bytes.put_u16_le(mut common, if ascii { 0 } else { 0x800 })
+        bytes.put_u16_le(mut common, method)
+        bytes.put_u16_le(mut common, time)
+        bytes.put_u16_le(mut common, date)
+        bytes.put_u32_le(mut common, crc32(data.copy()))
+        bytes.put_u32_le(mut common, u32.wrap(stored.len()))
+        bytes.put_u32_le(mut common, u32.wrap(data.len()))
+        bytes.put_u16_le(mut common, u16.wrap(encoded.len()))
+        bytes.put_u16_le(mut common, 0)
+        let offset = u32.wrap(out.len())
+        bytes.put_u32_le(mut out, 0x04034B50)
+        out.extend(common.copy())
+        out.extend(encoded.copy())
+        out.extend(stored)
+        bytes.put_u32_le(mut central, 0x02014B50)
+        bytes.put_u16_le(mut central, 20)
+        central.extend(common)
+        bytes.put_u16_le(mut central, 0)
+        bytes.put_u16_le(mut central, 0)
+        bytes.put_u16_le(mut central, 0)
+        bytes.put_u32_le(mut central, 0o600 << 16)
+        bytes.put_u32_le(mut central, offset)
+        central.extend(encoded)
+    }
+    let start = u32.wrap(out.len())
+    let size = u32.wrap(central.len())
+    out.extend(central)
+    bytes.put_u32_le(mut out, 0x06054B50)
+    bytes.put_u16_le(mut out, 0)
+    bytes.put_u16_le(mut out, 0)
+    bytes.put_u16_le(mut out, u16.wrap(files.len()))
+    bytes.put_u16_le(mut out, u16.wrap(files.len()))
+    bytes.put_u32_le(mut out, size)
+    bytes.put_u32_le(mut out, start)
+    bytes.put_u16_le(mut out, 0)
+    return out
+}
+
+/// A case being built: its operations and blobs, and the system it's for.
+struct Case {
+    name: String
+    ops: List<Json>
+    blobs: List<Json>
+    system: String
+}
+
+fn named(name: own String) -> Case {
+    return Case { name: name, ops: List<Json>(), blobs: List<Json>(), system: String("") }
+}
+
+impl Case {
+    fn blob(mut self, data: List<u8>) -> i64 {
+        self.blobs.push(s(base64(data.copy())))
+        return i64.wrap(self.blobs.len()) - 1
+    }
+
+    fn put(own self, path: own String, data: List<u8>) -> Case {
+        var c = self
+        let index = c.blob(data)
+        c.ops.push(arr([s("put"), s(path), n(index)]))
+        return c
+    }
+
+    fn put_text(own self, path: own String, text: String) -> Case {
+        return self.put(path, text.to_bytes())
+    }
+
+    fn dir(own self, path: own String) -> Case {
+        var c = self
+        c.ops.push(arr([s("dir"), s(path)]))
+        return c
+    }
+
+    fn link(own self, path: own String, target: own String) -> Case {
+        var c = self
+        c.ops.push(arr([s("link"), s(path), s(target)]))
+        c.system = String("linux")
+        return c
+    }
+
+    /// Only on Windows, for a folder whose entries log in the order NTFS lists them.
+    fn windows(own self) -> Case {
+        var c = self
+        c.system = String("windows")
+        return c
+    }
+
+    fn allow(own self, text: String) -> Case {
+        var c = self
+        let index = c.blob(text.to_bytes())
+        c.ops.push(arr([s("allow"), n(index)]))
+        return c
+    }
+
+    fn folder_pack(own self, name: String, mcmeta: String, files: List<(String, String)>) -> Case {
+        var c = self.put_text("datapacks/{name}/pack.mcmeta", mcmeta)
+        for (path, text) in files {
+            c = c.put_text("datapacks/{name}/{path}", text)
+        }
+        return c
+    }
+
+    fn zip_pack(own self, name: String, files: List<(String, String)>, compress: bool) -> Case {
+        return self.put("datapacks/{name}", zipped(files, compress))
+    }
+
+    fn pick(own self, enabled: List<String>, disabled: List<String>, features: List<String>, init: bool, safe: bool) -> Case {
+        var c = self
+        let how = obj([m("enabled", strs(enabled)), m("disabled", strs(disabled)), m("features", strs(features)), m("init", b(init)), m("safe", b(safe))])
+        c.ops.push(arr([s("pick"), how]))
+        return c
+    }
+
+    fn list(own self) -> Case {
+        return self.list_in("dimension_type", ".json")
+    }
+
+    fn list_in(own self, folder: own String, suffix: own String) -> Case {
+        var c = self
+        c.ops.push(arr([s("list"), s(folder), s(suffix)]))
+        return c
+    }
+
+    fn load(own self) -> Case {
+        var c = self
+        c.ops.push(arr([s("load")]))
+        return c
+    }
+
+    fn done(own self) -> Json {
+        var members: List<(String, Json)> = [m("id", s(self.name.copy())), m("input", obj([m("ops", arr(self.ops.copy()))]))]
+        if not self.blobs.is_empty() {
+            members.push(m("blobs", arr(self.blobs.copy())))
+        }
+        if not self.system.is_empty() {
+            members.push(m("system", s(self.system.copy())))
+        }
+        return obj(members)
+    }
+}
+
+/// As a new world picks, with server.properties' defaults.
+fn new_world(c: own Case) -> Case {
+    return c.pick(["vanilla"], [""], [String(VANILLA)], true, false)
+}
+
+/// A folder pack, a zip, a pack that needs trade_rebalance, and an empty zip, which isn't one.
+///
+/// Only the empty zip logs as the packs are found, so what it logs is in the same order on any
+/// file system.
+fn world_of_packs(name: own String) -> Case {
+    var c = named(name).folder_pack("a_folder", meta(), [at("data/minecraft/dimension_type/a.json", "a")])
+    c = c.zip_pack("b.zip", [at("pack.mcmeta", meta()), at("data/minecraft/dimension_type/b.json", "b")], true)
+    c = c.put("datapacks/d.zip", [])
+    return c.folder_pack("f", rebalance_meta(), [at("data/minecraft/dimension_type/f.json", "f")])
+}
+
+fn picking(out: mut List<Json>) {
+    let v = String(VANILLA)
+    let rebalance = String(REBALANCE)
+    // Nothing in the folder, which is made.
+    out.push(new_world(named("new-world-no-folder")).list().done())
+    out.push(named("new-world-empty-folder").dir("datapacks").pick(["vanilla"], [""], [v.copy()], true, false).list().done())
+    out.push(new_world(world_of_packs("new-world-packs")).list().done())
+    out.push(world_of_packs("new-world-none-on").pick([""], [""], [v.copy()], true, false).list().done())
+    out.push(world_of_packs("new-world-all-off").pick(["vanilla"], ["vanilla", "file/a_folder", "file/b.zip", "file/f"], [v.copy()], true, false).list().done())
+    out.push(world_of_packs("new-world-feature-pack-on").pick(["vanilla", "trade_rebalance"], [""], [v.copy()], true, false).list().done())
+    out.push(world_of_packs("new-world-safe").pick(["vanilla", "file/a_folder"], [""], [v.copy()], true, true).list().done())
+    // An old world, from what its level.dat says.
+    out.push(world_of_packs("old-world-forced-feature").pick(["vanilla", "file/gone"], ["file/b.zip", "file/f"], [v.copy(), rebalance.copy()], false, false).list().done())
+    out.push(world_of_packs("old-world-without-feature").pick(["vanilla", "file/f", "file/a_folder"], ["file/b.zip"], [v.copy()], false, false).list().done())
+    out.push(world_of_packs("old-world-new-pack-needs-feature").pick(["vanilla"], ["file/a_folder", "file/b.zip"], [v.copy()], false, false).list().done())
+    out.push(world_of_packs("old-world-no-features").pick(["vanilla"], ["file/a_folder", "file/b.zip"], [], false, false).list().done())
+    out.push(world_of_packs("old-world-no-features-other-packs").pick(["vanilla", "file/a_folder"], [], [], false, false).list().done())
+    out.push(world_of_packs("old-world-vanilla-off").pick(["file/a_folder"], ["vanilla"], [v.copy()], false, false).list().done())
+    out.push(world_of_packs("old-world-vanilla-on-top").pick(["file/a_folder", "file/b.zip", "vanilla"], [], [v.copy()], false, false).list().done())
+    out.push(world_of_packs("old-world-twice").pick(["vanilla", "file/a_folder", "file/a_folder", "vanilla", "file/b.zip"], ["file/a_folder"], [v.copy()], false, false).list().done())
+    out.push(world_of_packs("old-world-all-features").pick(["vanilla"], [], [v.copy(), rebalance.copy(), String(REDSTONE), String(MINECART)], false, false).list().done())
+    out.push(world_of_packs("old-world-feature-and-pack").pick(["vanilla", "file/f"], [], [v.copy(), rebalance.copy()], false, false).list().done())
+    out.push(world_of_packs("old-world-only-redstone").pick(["vanilla"], [], [String(REDSTONE)], false, false).list().done())
+    out.push(world_of_packs("old-world-safe").pick(["vanilla", "file/a_folder"], [], [v.copy(), rebalance.copy()], false, true).list().done())
+    out.push(world_of_packs("old-world-safe-no-features").pick(["file/a_folder"], ["vanilla"], [], false, true).list().done())
+    out.push(world_of_packs("old-world-nothing-there").pick(["file/x", "file/y"], [], [v.copy()], false, false).list().done())
+}
+
+fn find(texts: List<(String, String)>, name: str) -> String {
+    for (k, text) in texts {
+        if k == name {
+            return text.copy()
+        }
+    }
+    return die("no {name}")
+}
+
+/// Each pack.mcmeta in a folder pack of its own in a new world.
+fn metadata(out: mut List<Json>) {
+    let metas: List<(String, String)> = [
+        at("plain", meta()),
+        at("translated", meta_of(j(#"{"translate": "dataPack.vanilla.description"}"#), n(121), n(121), [])),
+        at("styled", meta_of(j(#"{"text": "red", "color": "red", "bold": true}"#), n(121), n(121), [])),
+        at("list-description", meta_of(j(#"["a", {"text": "b", "italic": true}]"#), n(121), n(121), [])),
+        at("empty-description", meta_of(s(""), n(121), n(121), [])),
+        at("format-lists", formats(j("[121, 0]"), j("[121, 5]"))),
+        at("format-wide", formats(n(82), n(1000))),
+        at("too-old", formats(n(82), n(100))),
+        at("too-new", formats(n(122), n(130))),
+        at("minor-too-new", formats(j("[121, 1]"), j("[121, 9]"))),
+        at("old-style", d(#"{"pack": {"description": "old", "pack_format": 15}}"#)),
+        at("old-style-supported", d(#"{"pack": {"description": "old", "pack_format": 15, "supported_formats": [15, 81]}}"#)),
+        at("old-style-new-format", d(#"{"pack": {"description": "old", "pack_format": 121}}"#)),
+        at("both-styles", d(#"{"pack": {"description": "both", "pack_format": 81, "supported_formats": [15, 81], "min_format": 15, "max_format": 121}}"#)),
+        at("only-min", d(#"{"pack": {"description": "min", "min_format": 121}}"#)),
+        at("only-max", d(#"{"pack": {"description": "max", "max_format": 121}}"#)),
+        at("min-above-max", formats(n(121), n(100))),
+        at("no-description", d(#"{"pack": {"min_format": 121, "max_format": 121}}"#)),
+        at("no-pack", d(#"{"features": {"enabled": ["minecraft:vanilla"]}}"#)),
+        at("empty-object", "\{\}"),
+        at("features-vanilla", meta_and(fields(#"{"features": {"enabled": ["minecraft:vanilla"]}}"#))),
+        at("features-several", meta_and(fields(#"{"features": {"enabled": ["minecraft:redstone_experiments", "minecraft:trade_rebalance", "minecraft:minecart_improvements"]}}"#))),
+        at("features-none", meta_and(fields(#"{"features": {"enabled": []}}"#))),
+        at("features-unknown", meta_and(fields(#"{"features": {"enabled": ["minecraft:nope"]}}"#))),
+        at("features-unknown-and-known", meta_and(fields(#"{"features": {"enabled": ["minecraft:trade_rebalance", "calcite:nope", "minecraft:minecart_improvements"]}}"#))),
+        at("extra-sections", meta_and(fields(#"{"language": {}, "calcite": {"x": 1}}"#))),
+    ]
+    for (name, text) in metas {
+        out.push(new_world(named("meta-{name}").folder_pack("p", text.copy(), [at("data/minecraft/dimension_type/p.json", name.copy())])).list().done())
+    }
+    // Several at once, each one's lines in the order the packs are found, which is the file
+    // system's.
+    var several = named("windows-meta-several").windows()
+    for name in ["too-old", "no-pack", "features-unknown", "plain", "too-new"] {
+        several = several.folder_pack(String(name), find(metas, name), [])
+    }
+    out.push(new_world(several).done())
+    var zips = named("windows-meta-in-zips").windows()
+    for name in ["too-old", "no-pack", "features-unknown", "plain", "old-style"] {
+        zips = zips.zip_pack("{name}.zip", [at("pack.mcmeta", find(metas, name))], true)
+    }
+    out.push(new_world(zips).done())
+}
+
+fn filter_meta(text: String) -> String {
+    return meta_and([m("filter", j(text))])
+}
+
+fn overlay_meta(text: String) -> String {
+    return meta_and([m("overlays", j(text))])
+}
+
+/// What the picked packs' files are, listed: which pack's wins, filters and overlays.
+fn file_cases(out: mut List<Json>) {
+    let v = String(VANILLA)
+    let over: List<(String, String)> = [at("data/minecraft/dimension_type/overworld.json", "mine"), at("data/minecraft/dimension_type/extra.json", "extra")]
+    out.push(new_world(named("files-override-vanilla").folder_pack("p", meta(), over.copy())).list().done())
+    out.push(new_world(named("files-override-in-zip").zip_pack("p.zip", plus([at("pack.mcmeta", meta())], over), true)).list().done())
+    out.push(new_world(named("files-stored-zip").zip_pack("p.zip", plus([at("pack.mcmeta", meta())], over), false)).list().done())
+    out.push(new_world(named("files-zip-with-folders").zip_pack("p.zip", plus([at("pack.mcmeta", meta()), at("data/", ""), at("data/minecraft/", ""), at("data/minecraft/dimension_type/", "")], over), true)).list().done())
+    // Two packs with the same file: the later, `file/b`, wins.
+    let from_a: List<(String, String)> = [at("data/minecraft/dimension_type/x.json", "from a")]
+    let from_b: List<(String, String)> = [at("data/minecraft/dimension_type/x.json", "from b")]
+    out.push(new_world(named("files-later-wins").folder_pack("a", meta(), from_a.copy()).folder_pack("b", meta(), from_b.copy())).list().done())
+    out.push(named("files-order-picked").folder_pack("a", meta(), from_a.copy()).folder_pack("b", meta(), from_b.copy()).pick(["vanilla", "file/b", "file/a"], [], [v.copy()], false, false).list().done())
+    // Namespaces, folders in the folder listed, and files that aren't JSON.
+    let many: List<(String, String)> = [
+        at("data/calcite/dimension_type/z.json", "z"),
+        at("data/a/dimension_type/deep/er/y.json", "y"),
+        at("data/minecraft/dimension_type/n.txt", "not json"),
+        at("data/minecraft/dimension_type.json", "not in it"),
+        at("data/minecraft/dimension_type_x/q.json", "not in it either"),
+        at("data/minecraft/dimension_type/m.json.mcmeta", "metadata"),
+        at("data/minecraft/dimension_type/m.json", "m"),
+    ]
+    out.push(new_world(named("files-namespaces").folder_pack("p", meta(), many.copy())).list().list_in("dimension_type", ".txt").list_in("dimension_type", "").done())
+    out.push(new_world(named("files-namespaces-zip").zip_pack("p.zip", plus([at("pack.mcmeta", meta())], many), true)).list().list_in("dimension_type", ".txt").done())
+    // Paths and namespaces that can't be identifiers: one of each in a folder pack, all of them in
+    // one, whose lines are in the order NTFS lists them, and all of them in a zip, whose lines are
+    // in the zip's order.
+    let bad: List<(String, String)> = [
+        at("data/minecraft/dimension_type/Upper.json", "u"),
+        at("data/minecraft/dimension_type/sp ace.json", "s"),
+        at("data/minecraft/dimension_type/ok.json", "ok"),
+        at("data/Bad/dimension_type/x.json", "bad namespace"),
+        at("data/sp ace/dimension_type/x.json", "bad namespace"),
+    ]
+    let singles: List<(String, String)> = [
+        at("path-upper", "data/minecraft/dimension_type/Upper.json"),
+        at("path-space", "data/minecraft/dimension_type/sp ace.json"),
+        at("namespace-upper", "data/Bad/dimension_type/x.json"),
+        at("namespace-space", "data/sp ace/dimension_type/x.json"),
+    ]
+    for (name, path) in singles {
+        out.push(new_world(named("files-bad-{name}").folder_pack("p", meta(), [at(path.copy(), "bad"), at("data/minecraft/dimension_type/ok.json", "ok")])).list().list_in("worldgen", ".json").done())
+    }
+    out.push(new_world(named("windows-files-bad-names").windows().folder_pack("p", meta(), bad.copy())).list().list_in("worldgen", ".json").done())
+    out.push(new_world(named("files-bad-names-zip").zip_pack("p.zip", plus([at("pack.mcmeta", meta())], bad), true)).list().list_in("worldgen", ".json").done())
+    // A filter hides what's below it.
+    let flt = String(#"{"block": [{"namespace": "minecraft", "path": "dimension_type/overworld.*"}]}"#)
+    out.push(new_world(named("filter-hides-vanilla").folder_pack("p", filter_meta(flt.copy()), [at("data/minecraft/dimension_type/mine.json", "mine")])).list().done())
+    out.push(new_world(named("filter-hides-own-not").folder_pack("p", filter_meta(flt.copy()), [at("data/minecraft/dimension_type/overworld_caves.json", "own")])).list().done())
+    out.push(new_world(named("filter-namespace-only").folder_pack("p", filter_meta(#"{"block": [{"namespace": "minecraft"}]}"#), [at("data/calcite/dimension_type/c.json", "c")])).list().done())
+    out.push(new_world(named("filter-path-only").folder_pack("p", filter_meta(#"{"block": [{"path": "dimension_type/the_.*"}]}"#), [])).list().done())
+    out.push(new_world(named("filter-empty").folder_pack("p", filter_meta(#"{"block": []}"#), [])).list().done())
+    out.push(new_world(named("filter-bad").folder_pack("p", filter_meta(#"{"block": "no"}"#), [])).list().done())
+    out.push(new_world(named("filter-in-zip").zip_pack("p.zip", [at("pack.mcmeta", filter_meta(flt.copy()))], true)).list().done())
+    out.push(named("filter-below-not").folder_pack("a", meta(), [at("data/minecraft/dimension_type/overworld.json", "a")]).folder_pack("b", filter_meta(flt.copy()), []).pick(["vanilla", "file/b", "file/a"], [], [v.copy()], false, false).list().done())
+    // Overlays, which apply if their formats take 26.3's, the last listed on top.
+    let ov = String(#"{"entries": [{"directory": "one", "min_format": 121, "max_format": 121}, {"directory": "old", "min_format": 82, "max_format": 100}, {"directory": "two", "min_format": [121, 0], "max_format": 200}]}"#)
+    let ofiles: List<(String, String)> = [
+        at("data/minecraft/dimension_type/base.json", "base"),
+        at("data/minecraft/dimension_type/x.json", "base x"),
+        at("one/data/minecraft/dimension_type/x.json", "one x"),
+        at("one/data/minecraft/dimension_type/y.json", "one y"),
+        at("two/data/minecraft/dimension_type/y.json", "two y"),
+        at("old/data/minecraft/dimension_type/x.json", "old x"),
+        at("old/data/minecraft/dimension_type/old.json", "old"),
+    ]
+    out.push(new_world(named("overlays").folder_pack("p", overlay_meta(ov.copy()), ofiles.copy())).list().done())
+    out.push(new_world(named("overlays-zip").zip_pack("p.zip", plus([at("pack.mcmeta", overlay_meta(ov.copy()))], ofiles), true)).list().done())
+    out.push(new_world(named("overlays-bad-name").folder_pack("p", overlay_meta(#"{"entries": [{"directory": "Bad Name", "min_format": 121, "max_format": 121}]}"#), [])).list().done())
+    out.push(new_world(named("overlays-missing-folder").folder_pack("p", overlay_meta(#"{"entries": [{"directory": "gone", "min_format": 121, "max_format": 121}]}"#), [at("data/minecraft/dimension_type/p.json", "p")])).list().done())
+}
+
+const ENTRIES: [str; 9] = ["upper-case", "folder-named-zip", "upper-zip-suffix", "meta-inside-zip", "text-zip", "nested", "loose-meta", "empty-folder", "text-file"]
+
+/// The entry `name` put in the world's datapacks folder.
+fn entry(c: own Case, name: str) -> Case {
+    if name == "upper-case" {
+        return c.folder_pack("Upper Case", meta(), [])
+    } else if name == "folder-named-zip" {
+        return c.folder_pack("dotted.zip", meta(), [])
+    } else if name == "upper-zip-suffix" {
+        return c.put("datapacks/notzip.ZIP", zipped([at("pack.mcmeta", meta())], true))
+    } else if name == "meta-inside-zip" {
+        return c.put("datapacks/inner.zip", zipped([at("inner/pack.mcmeta", meta())], true))
+    } else if name == "text-zip" {
+        return c.put_text("datapacks/text.zip", "not a zip")
+    } else if name == "nested" {
+        return c.put_text("datapacks/nested/deeper/pack.mcmeta", meta())
+    } else if name == "loose-meta" {
+        return c.put_text("datapacks/pack.mcmeta", meta())
+    } else if name == "empty-folder" {
+        return c.dir("datapacks/empty")
+    }
+    return c.put_text("datapacks/c.txt", "c")
+}
+
+/// What in the folder is a pack: each entry with a pack beside it, then all of them at once, in
+/// the order NTFS lists them.
+fn entry_cases(out: mut List<Json>) {
+    for name in ENTRIES {
+        let c = named("entries-{name}").folder_pack("p", meta(), [at("data/minecraft/dimension_type/p.json", "p")])
+        out.push(new_world(entry(c, name)).list().done())
+    }
+    var mixed = named("windows-entries-mixed").windows()
+    for name in ENTRIES {
+        mixed = entry(mixed, name)
+    }
+    out.push(new_world(mixed).list().done())
+    out.push(new_world(named("entries-folder-meta-is-folder").dir("datapacks/p/pack.mcmeta")).done())
+    out.push(new_world(named("entries-datapacks-is-file").put_text("datapacks", "a file")).done())
+}
+
+fn outside_pack() -> List<(String, String)> {
+    return [at("pack.mcmeta", meta()), at("data/minecraft/dimension_type/o.json", "outside")]
+}
+
+/// A pack outside the world, in the universe's `outside`, made through the world: `put` writes
+/// only in the world, so it goes in `world/outside` and the link leads there.
+fn outside(c: own Case) -> Case {
+    var out = c
+    for (path, text) in outside_pack() {
+        out = out.put_text("outside/{path}", text)
+    }
+    return out
+}
+
+/// Links in the world's packs, checked against allowed_symlinks.txt as the packs are found.
+fn link_cases(out: mut List<Json>) {
+    let pack: List<(String, String)> = [at("data/minecraft/dimension_type/p.json", "p")]
+    out.push(new_world(outside(named("link-pack-forbidden")).link("datapacks/linked", "<folder>world/outside")).list().done())
+    out.push(new_world(outside(named("link-pack-allowed")).link("datapacks/linked", "<folder>world/outside").allow("[prefix]<folder>")).list().done())
+    out.push(new_world(named("link-in-pack-forbidden").folder_pack("p", meta(), pack.copy()).put_text("elsewhere/x.json", "x").link("datapacks/p/data/minecraft/dimension_type/x.json", "<folder>world/elsewhere/x.json")).list().done())
+    out.push(new_world(named("link-in-pack-allowed").folder_pack("p", meta(), pack.copy()).put_text("elsewhere/x.json", "x").link("datapacks/p/data/minecraft/dimension_type/x.json", "<folder>world/elsewhere/x.json").allow("[prefix]<folder>")).list().done())
+    out.push(new_world(named("link-zip-allowed").put("elsewhere/p.zip", zipped(outside_pack(), true)).link("datapacks/p.zip", "<folder>world/elsewhere/p.zip").allow("[prefix]<folder>")).list().done())
+    out.push(new_world(named("link-zip-forbidden").put("elsewhere/p.zip", zipped(outside_pack(), true)).link("datapacks/p.zip", "<folder>world/elsewhere/p.zip")).list().done())
+    out.push(new_world(named("link-dangling").link("datapacks/gone", "<folder>nowhere").allow("[prefix]<folder>")).done())
+}
+
+/// A notice whose body shows each item, as `ItemStackTemplate.CODEC` reads it (CAL-77).
+fn item_dialog(components: Json) -> String {
+    let item = obj([m("id", s("minecraft:stone")), m("components", components.copy())])
+    let body = obj([m("type", s("minecraft:item")), m("item", item)])
+    return spaced_ascii(obj([m("type", s("minecraft:notice")), m("title", s("T")), m("body", arr([body]))]))
+}
+
+fn painting(width: own Json, height: own Json, asset: str, more: List<(String, Json)>) -> String {
+    return spaced_ascii(updated(obj([m("width", width), m("height", height), m("asset_id", s(String(asset)))]), more))
+}
+
+fn damage(message: own Json, scaling: str, exhaustion: own Json, more: List<(String, Json)>) -> String {
+    return spaced_ascii(updated(obj([m("message_id", message), m("scaling", s(String(scaling))), m("exhaustion", exhaustion)]), more))
+}
+
+/// A dimension type with what it must have and no environment attributes, which only the server's
+/// codec reads all of.
+fn dimension(more: List<(String, Json)>) -> String {
+    let base = j(##"{"has_skylight": true, "has_ceiling": false, "has_ender_dragon_fight": false, "coordinate_scale": 1.0, "min_y": 0, "height": 256, "logical_height": 256, "infiniburn": "#minecraft:infiniburn_overworld", "ambient_light": 0.0, "monster_spawn_light_level": 0, "monster_spawn_block_light_limit": 0}"##)
+    return spaced_ascii(updated(base, more))
+}
+
+fn enchantment_with(effects: own Json) -> String {
+    let fixed = fields(##"{"anvil_cost": 1, "description": "e"}"##)
+    let rest = fields(##"{"max_cost": {"base": 1, "per_level_above_first": 0}, "max_level": 1, "min_cost": {"base": 1, "per_level_above_first": 0}, "slots": ["any"], "supported_items": "#minecraft:enchantable/weapon", "weight": 1}"##)
+    var members = fixed
+    members.push(m("effects", effects))
+    for (k, v) in rest {
+        members.push((k.copy(), v.copy()))
+    }
+    return spaced_ascii(obj(members))
+}
+
+/// An enchantment with an effect for each of `paths`, whose chance is a number from command
+/// storage at that path, as `NbtPathArgument` reads it (CAL-78).
+fn enchantment(paths: List<String>) -> String {
+    var effects: List<Json> = []
+    for p in paths {
+        let chance = obj([m("type", s("minecraft:storage")), m("storage", s("w:s")), m("path", s(p.copy()))])
+        let requirements = obj([m("type", s("minecraft:random_chance")), m("chance", chance)])
+        effects.push(obj([m("affected", s("attacker")), m("enchanted", s("victim")), m("effect", j(#"{"type": "minecraft:change_item_damage", "amount": 1.0}"#)), m("requirements", requirements)]))
+    }
+    return enchantment_with(obj([m("minecraft:post_attack", arr(effects))]))
+}
+
+/// `component`'s list of effects, one for each of `requirements`, with an effect of the kind the
+/// component holds.
+fn conditional(component: str, requirements: List<Json>) -> Json {
+    let damages = component == "tick" or component == "hit_block" or component == "location_changed" or component == "post_piercing_attack" or component == "post_attack"
+    let effect = if damages { j(#"{"type": "minecraft:change_item_damage", "amount": 1.0}"#) } else { j(#"{"type": "minecraft:add", "value": 1.0}"#) }
+    var out: List<Json> = []
+    for r in requirements {
+        if component == "post_attack" {
+            out.push(obj([m("enchanted", s("attacker")), m("affected", s("victim")), m("effect", effect.copy()), m("requirements", r.copy())]))
+        } else {
+            out.push(obj([m("effect", effect.copy()), m("requirements", r.copy())]))
+        }
+    }
+    return arr(out)
+}
+
+/// An effects component of one kind, `minecraft:<component>`, with its requirements written out.
+fn one(component: str, requirements: String) -> Json {
+    return obj([("minecraft:{component}", conditional(component, items(requirements)))])
+}
+
+/// Conditions an effect's context doesn't have the parameters for, by component, each failing to
+/// load as vanilla's `validatedListCodec` fails it.
+fn bad_requirements() -> List<(String, Json)> {
+    let both = obj([m("minecraft:damage", conditional("damage", items(#"[{"type": "minecraft:match_tool"}]"#))), m("minecraft:ammo_use", conditional("ammo_use", items(#"[{"type": "minecraft:killed_by_player"}]"#)))])
+    return [
+        m("tool-in-damage", one("damage", #"[{"type": "minecraft:match_tool"}]"#)),
+        m("origin-in-item", one("item_damage", #"[{"type": "minecraft:location_check"}]"#)),
+        m("killer-in-tick", one("tick", #"[{"type": "minecraft:killed_by_player"}]"#)),
+        m("explosion-in-post-attack", one("post_attack", #"[{"type": "minecraft:survives_explosion"}]"#)),
+        m("active-in-tick", one("tick", #"[{"type": "minecraft:enchantment_active_check", "active": true}]"#)),
+        m("attacker-in-tick", one("tick", #"[{"type": "minecraft:entity_properties", "entity": "attacker"}]"#)),
+        m("block-entity-in-hit-block", one("hit_block", #"[{"type": "minecraft:match_block", "nbt": "{a:1b}"}]"#)),
+        m("bonus-in-item", one("block_experience", #"[{"type": "minecraft:random_chance_with_enchanted_bonus", "unenchanted_chance": 0.5, "enchanted_chance": 0.5, "enchantment": "minecraft:sharpness"}]"#)),
+        m("inverted", one("item_damage", #"[{"type": "minecraft:inverted", "term": {"type": "minecraft:survives_explosion"}}]"#)),
+        m("all-of", one("tick", #"[{"type": "minecraft:all_of", "terms": [{"type": "minecraft:location_check"}, {"type": "minecraft:killed_by_player"}]}]"#)),
+        m("one-term", one("tick", #"[{"type": "minecraft:any_of", "terms": {"type": "minecraft:match_tool"}}]"#)),
+        m("three-terms", one("tick", #"[{"type": "minecraft:all_of", "terms": [{"type": "minecraft:match_tool"}, {"type": "minecraft:killed_by_player"}, {"type": "minecraft:survives_explosion"}]}]"#)),
+        m("two-effects", one("fishing_luck_bonus", #"[{"type": "minecraft:match_tool"}, {"type": "minecraft:weather_check"}, {"type": "minecraft:survives_explosion"}]"#)),
+        m("two-components", both),
+        m("attribute-value", one("item_damage", #"[{"type": "minecraft:float_value_check", "value": @P, "test": {"min": 0.0}}]"#)),
+        m("attribute-range", one("item_damage", #"[{"type": "minecraft:float_value_check", "value": 1.0, "test": {"min": @P, "max": {"type": "minecraft:add", "inputs": [1.0, @P]}}}]"#)),
+        m("empty-inputs", one("tick", #"[{"type": "minecraft:float_value_check", "value": {"type": "minecraft:max", "inputs": []}, "test": 1.0}]"#)),
+        m("score-target", one("tick", #"[{"type": "minecraft:int_value_check", "value": {"type": "minecraft:score", "target": "attacker", "score": "s"}, "test": 1}]"#)),
+        m("time-range", one("item_damage", #"[{"type": "minecraft:time_check", "clock": "minecraft:overworld", "value": {"min": @P}}]"#)),
+        m("time-line", one("item_damage", #"[{"type": "minecraft:time_check", "clock": "minecraft:overworld", "value": {"min": 1, "max": {"type": "minecraft:score", "target": "attacker", "score": "s"}}}]"#)),
+        m("conditional-number", one("tick", #"[{"type": "minecraft:int_value_check", "value": {"type": "minecraft:conditional", "condition": {"type": "minecraft:match_tool"}, "on_true": 1}, "test": 1}]"#)),
+        m("dispatcher", one("item_damage", #"[{"type": "minecraft:float_value_check", "value": {"type": "minecraft:number_dispatcher", "cases": [{"condition": {"type": "minecraft:weather_check"}, "value": 1.0}, {"condition": {"type": "minecraft:killed_by_player"}, "value": 2.0}], "default": {"type": "minecraft:abs", "input": @P}}, "test": 1.0}]"#)),
+        m("scores", one("item_damage", #"[{"type": "minecraft:entity_scores", "entity": "this", "scores": {"a": {"min": {"type": "minecraft:score", "target": "this", "score": "a"}}}}]"#)),
+    ]
+}
+
+/// Conditions their contexts have the parameters for, or that vanilla doesn't check, which load.
+/// `random_chance` checks nothing of its chance, so a chance that needs `origin` loads anywhere.
+fn allowed_requirements() -> Json {
+    return obj([
+        m("minecraft:damage", conditional("damage", items(#"[{"type": "minecraft:damage_source_properties"}, {"type": "minecraft:entity_properties", "entity": "attacker"}, {"type": "minecraft:location_check"}]"#))),
+        m("minecraft:item_damage", conditional("item_damage", items(#"[{"type": "minecraft:match_tool"}, {"type": "minecraft:weather_check"}, {"type": "minecraft:float_value_check", "value": {"type": "minecraft:enchantment_level", "amount": 1.0}, "test": {"min": 1.0}}]"#))),
+        m("minecraft:hit_block", conditional("hit_block", items(#"[{"type": "minecraft:match_block"}, {"type": "minecraft:location_check"}]"#))),
+        m("minecraft:location_changed", conditional("location_changed", items(#"[{"type": "minecraft:enchantment_active_check", "active": true}]"#))),
+        m("minecraft:block_experience", conditional("block_experience", items(#"[{"type": "minecraft:random_chance", "chance": @P}]"#))),
+        m("minecraft:tick", conditional("tick", items(#"[{"type": "minecraft:float_value_check", "value": {"type": "minecraft:environment_attribute", "attribute": "minecraft:gameplay/sky_light_level"}, "test": 1.0}]"#))),
+    ])
+}
+
+/// NBT paths that don't read, by what's wrong with them.
+fn bad_paths() -> List<(String, String)> {
+    return [
+        at("double-dot", "a..b"),
+        at("no-dot", "a]"),
+        at("after-index", "[0]x"),
+        at("not-an-index", "[x]"),
+        at("fraction-index", "[1.5]"),
+        at("unclosed-index", "[1"),
+        at("unclosed-pattern-index", "[\{a:1\}"),
+        at("empty-name", #""""#),
+        at("unclosed-quote", #""abc"#),
+        at("bad-escape", #""a\x""#),
+        at("bad-pattern", "abc\{a:1"),
+        at("pattern-not-first", "a.\{b:1\}"),
+        at("two-roots", "\{a:1\}\{b:2\}"),
+        at("ends-in-bracket", "["),
+        at("ends-in-bracket-after", "a["),
+    ]
+}
+
+/// A tag of these values.
+fn tag(values: String) -> String {
+    return spaced_ascii(obj([m("values", j(values))]))
+}
+
+/// A cat variant, with these spawn conditions.
+fn cat(conditions: String) -> String {
+    return spaced_ascii(obj([m("asset_id", s("w:entity/cat/c")), m("baby_asset_id", s("w:entity/cat/c_baby")), m("spawn_conditions", j(conditions))]))
+}
+
+/// Vanilla's `the_void`, with `features` in its last step and `carvers`.
+fn void_biome(features: String, carvers: String) -> String {
+    var steps: List<Json> = []
+    for _ in 0..10 {
+        steps.push(arr([]))
+    }
+    steps.push(j(features))
+    let colour = obj([m("minecraft:visual/sky_color", s("#7ba4ff"))])
+    let water = obj([m("water_color", s("#3f76e4"))])
+    return spaced_ascii(obj([m("attributes", colour), m("carvers", j(carvers)), m("downfall", Json.Float(0.5)), m("effects", water), m("features", arr(steps)), m("has_precipitation", b(false)), m("temperature", Json.Float(0.5))]))
+}
+
+const VOID_START: str = #"["minecraft:void_start_platform"]"#
+
+fn world(name: own String, files: List<(String, String)>, mcmeta: String) -> Json {
+    return new_world(named(name).folder_pack("p", mcmeta, files)).load().done()
+}
+
+/// The registries loaded from the picked packs, in a new world with one folder pack, `p`.
+fn loading(out: mut List<Json>) {
+    out.push(new_world(named("load-vanilla")).load().done())
+    out.push(named("load-feature-pack").pick(["vanilla", "trade_rebalance"], [""], [String(VANILLA)], true, false).load().done())
+
+    // New entries in several registries and namespaces, in vanilla's order of identifiers, by path
+    // and then namespace, among vanilla's.
+    out.push(world("load-new-entries", [
+        at("data/w/painting_variant/a.json", painting(n(2), n(1), "w:a", fields(#"{"title": {"text": "A", "color": "gold"}, "author": "me"}"#))),
+        at("data/w/painting_variant/b.json", painting(n(16), n(16), "b", [])),
+        at("data/a/painting_variant/z.json", painting(n(1), n(2), "a:z", fields(#"{"title": ["x", {"text": "y", "italic": true}]}"#))),
+        at("data/w/banner_pattern/x.json", d(#"{"asset_id": "w:x", "translation_key": "block.w.x"}"#)),
+        at("data/w/damage_type/d.json", damage(s("d"), "never", Json.Float(0.5), [])),
+        at("data/w/damage_type/e.json", damage(s("e"), "always", n(0), fields(#"{"effects": "burning", "death_message_type": "fall_variants"}"#))),
+        at("data/w/jukebox_song/s.json", d(#"{"sound_event": "minecraft:music_disc.cat", "description": {"translate": "jukebox_song.w.s"}, "length_in_seconds": 12.5, "comparator_output": 3}"#)),
+        at("data/w/jukebox_song/t.json", d(#"{"sound_event": {"sound_id": "w:t", "range": 16.0}, "description": "T", "length_in_seconds": 1, "comparator_output": 15}"#)),
+        at("data/w/world_clock/c.json", "\{\}"),
+        at("data/w/timeline/t.json", d(#"{"clock": "w:c", "period_ticks": 100, "time_markers": {"w:m": 5, "w:n": {"ticks": 7, "show_in_commands": true}}}"#)),
+        at("data/w/timeline/u.json", d(#"{"clock": "minecraft:overworld"}"#)),
+        at("data/w/tags/timeline/all.json", tag(#"["w:t", {"id": "w:gone", "required": false}]"#)),
+        at("data/w/dimension_type/d.json", dimension(fields(##"{"timelines": "#w:all", "default_clock": "w:c"}"##))),
+        at("data/w/dimension_type/e.json", dimension(fields(#"{"timelines": ["w:t", "w:u"], "min_y": -64, "height": 384, "logical_height": 384, "coordinate_scale": 8, "has_ceiling": true}"#))),
+    ], meta()))
+    // Vanilla's own entries, from the world's pack instead, which a client is sent.
+    out.push(world("load-override", [
+        at("data/minecraft/painting_variant/kebab.json", painting(n(3), n(3), "minecraft:kebab", [])),
+        at("data/minecraft/damage_type/generic.json", damage(s("generic"), "never", Json.Float(0.0), [])),
+        at("data/minecraft/dimension_type/overworld.json", dimension([])),
+    ], meta()))
+    // What a codec has a default for, given, which isn't written; and numbers in other shapes.
+    out.push(world("load-defaults-given", [
+        at("data/w/damage_type/d.json", damage(s("d"), "when_caused_by_living_non_player", n(1), fields(#"{"effects": "hurt", "death_message_type": "default"}"#))),
+        at("data/w/dimension_type/d.json", dimension(fields(#"{"has_fixed_time": false, "skybox": "overworld", "cardinal_light": "default", "timelines": [], "attributes": {}}"#))),
+        at("data/w/timeline/t.json", d(#"{"clock": "minecraft:overworld", "tracks": {}, "time_markers": {}}"#)),
+        at("data/w/painting_variant/p.json", painting(Json.Float(2.0), Json.Float(1.5), "w:p", [])),
+        at("data/w/jukebox_song/s.json", d(#"{"sound_event": "minecraft:music_disc.cat", "description": "s", "length_in_seconds": 300.0, "comparator_output": 1.9}"#)),
+    ], meta()))
+    // Tags of the world's: a synchronized registry's, which may name what's optional and missing,
+    // and a built-in one's that names a block there isn't, which is logged, and isn't built.
+    out.push(world("load-world-tags", [
+        at("data/w/painting_variant/a.json", painting(n(1), n(1), "w:a", [])),
+        at("data/w/tags/painting_variant/t.json", tag(##"["w:a", "#minecraft:placeable", {"id": "w:gone", "required": false}, {"id": "#w:nope", "required": false}]"##)),
+        at("data/minecraft/tags/painting_variant/placeable.json", tag(#"["w:a"]"#)),
+        at("data/w/tags/block/bad.json", tag(#"["minecraft:stone", "minecraft:nope"]"#)),
+        at("data/w/tags/block/good.json", tag(#"["minecraft:stone", {"id": "minecraft:nope", "required": false}]"#)),
+    ], meta()))
+
+    // What stops the registries loading.
+    let bad = String("data/w/painting_variant/bad.json")
+    let damage_bad = String("data/w/damage_type/bad.json")
+    let dimension_bad = String("data/w/dimension_type/bad.json")
+    let variant = String("data/w/cat_variant/bad.json")
+    let biome = String("data/w/worldgen/biome/v.json")
+    var broken: List<(String, List<(String, String)>)> = [
+        (String("bad-json"), [at(bad.copy(), "\{")]),
+        (String("not-json"), [at(bad.copy(), "not json")]),
+        (String("trailing"), [at(bad.copy(), "\{\} \{\}")]),
+        (String("empty-file"), [at(bad.copy(), "")]),
+        (String("null"), [at(bad.copy(), "null")]),
+        (String("array"), [at(bad.copy(), "[]")]),
+        (String("missing-field"), [at(bad.copy(), d(#"{"asset_id": "w:a", "width": 1}"#))]),
+        (String("missing-fields"), [at(bad.copy(), d(#"{"asset_id": "w:a"}"#))]),
+        (String("out-of-range"), [at(bad.copy(), painting(n(17), n(0), "w:a", []))]),
+        (String("bad-identifier"), [at(bad.copy(), painting(n(1), n(1), "W:A", []))]),
+        (String("wrong-types"), [at(damage_bad.copy(), damage(n(5), "never", s("x"), []))]),
+        (String("bad-enum"), [at(damage_bad.copy(), damage(s("m"), "sometimes", Json.Float(0.0), []))]),
+        (String("bad-height"), [at(dimension_bad.copy(), dimension(fields(#"{"height": 20, "logical_height": 20}"#)))]),
+        (String("missing-clock"), [at("data/w/timeline/bad.json", d(#"{"clock": "w:nowhere"}"#))]),
+        (String("missing-default-clock"), [at(dimension_bad.copy(), dimension(fields(#"{"default_clock": "w:nowhere"}"#)))]),
+        (String("missing-block-tag"), [at(dimension_bad.copy(), dimension(fields(##"{"infiniburn": "#w:absent"}"##)))]),
+        (String("missing-timeline-tag"), [at(dimension_bad.copy(), dimension(fields(##"{"timelines": "#w:missing"}"##)))]),
+        (String("missing-timeline"), [at(dimension_bad.copy(), dimension(fields(#"{"timelines": ["w:gone", "w:gone_too"]}"#)))]),
+        (String("duplicate-marker"), [
+            at("data/w/world_clock/c.json", "\{\}"),
+            at("data/w/timeline/a.json", d(#"{"clock": "w:c", "time_markers": {"w:m": 1}}"#)),
+            at("data/w/timeline/b.json", d(#"{"clock": "w:c", "time_markers": {"w:m": 2, "w:n": 3}}"#)),
+            at("data/w/timeline/c.json", d(#"{"clock": "w:c", "time_markers": {"w:n": 4}}"#)),
+        ]),
+        (String("tag-of-broken"), [at(bad.copy(), "\{"), at("data/w/tags/painting_variant/t.json", tag(#"["w:bad"]"#))]),
+        (String("tag-missing-entry"), [at("data/w/tags/painting_variant/t.json", tag(#"["w:gone", "w:gone_too"]"#))]),
+        (String("several"), [
+            at(bad.copy(), "\{"),
+            at("data/w/painting_variant/worse.json", d(#"{"width": 1}"#)),
+            at(damage_bad.copy(), damage(s("m"), "sometimes", Json.Float(0.0), [])),
+            at("data/w/banner_pattern/bad.json", d(#"{"asset_id": "w:x"}"#)),
+            at("data/w/timeline/bad.json", d(#"{"clock": "w:nowhere"}"#)),
+            at(dimension_bad.copy(), dimension(fields(##"{"timelines": "#w:missing"}"##))),
+        ]),
+        (String("variant-no-spawn-conditions"), [at(variant.copy(), d(#"{"asset_id": "w:entity/cat/c", "baby_asset_id": "w:entity/cat/c_baby"}"#))]),
+        (String("variant-no-priority"), [at(variant.copy(), cat(#"[{"condition": {"type": "minecraft:moon_brightness", "range": 1}}]"#))]),
+        (String("variant-bad-condition-type"), [at(variant.copy(), cat(#"[{"priority": 0, "condition": {"type": "minecraft:weather"}}]"#))]),
+        (String("variant-bad-moon"), [at(variant.copy(), cat(#"[{"priority": 0, "condition": {"type": "minecraft:moon_brightness", "range": "bright"}}]"#))]),
+        (String("variant-missing-structure"), [at(variant.copy(), cat(#"[{"priority": 0, "condition": {"type": "minecraft:structure", "structures": ["w:gone", "minecraft:swamp_hut", "a:gone"]}}]"#))]),
+        (String("variant-missing-structure-tag"), [at(variant.copy(), cat(##"[{"priority": 0, "condition": {"type": "minecraft:structure", "structures": "#w:gone"}}]"##))]),
+        (String("variant-missing-biome"), [at(variant.copy(), cat(#"[{"priority": 0, "condition": {"type": "minecraft:biome", "biomes": "w:gone"}}]"#))]),
+        (String("biome-missing-feature"), [at(biome.copy(), void_biome(#"["w:gone", "minecraft:oak_checked"]"#, "[]"))]),
+        (String("biome-missing-carver"), [at(biome.copy(), void_biome(String(VOID_START), #"["w:gone"]"#))]),
+        (String("world-tag-missing-entry"), [at("data/w/tags/worldgen/structure/t.json", tag(#"["w:gone", "minecraft:igloo"]"#))]),
+        (String("world-and-synced-unbound"), [
+            at(biome.copy(), void_biome(#"["w:gone"]"#, "[]")),
+            at(dimension_bad.copy(), dimension(fields(#"{"timelines": ["w:gone"]}"#))),
+            at(variant.copy(), cat(##"[{"priority": 0, "condition": {"type": "minecraft:structure", "structures": "#w:gone"}}]"##)),
+        ]),
+    ]
+    for (name, path) in bad_paths() {
+        broken.push(("nbt-path-{name}", [at("data/w/enchantment/bad.json", enchantment([path.copy()]))]))
+    }
+    for (name, effects) in bad_requirements() {
+        broken.push(("requirements-{name}", [at("data/w/enchantment/bad.json", enchantment_with(effects.copy()))]))
+    }
+    for (name, components) in bad_components() {
+        broken.push(("components-{name}", [at("data/w/dialog/bad.json", item_dialog(components))]))
+    }
+    for (name, files) in broken {
+        out.push(world("load-{name}", files, meta()))
+    }
+    // Items with components of each type Calcite reads, which a client is sent as the patch
+    // vanilla writes back (CAL-77).
+    var dialogs: List<(String, String)> = []
+    for (i, components) in item_components().enumerate() {
+        dialogs.push(at("data/w/dialog/d{i}.json", item_dialog(components)))
+    }
+    out.push(world("load-item-components", dialogs, meta()))
+    // NBT paths that read, each written back as the text it was read from, which stops at a space.
+    let paths: List<String> = ["a", "a.b[0]", "a[-1][]", "\{x:1b\}.y", "a\{x:1b\}", "a[\{x:1b\}]", #""q r".'s\'t'"#, "x-y_z:w+", "a b", "a.", "", " a"]
+    out.push(world("load-nbt-paths", [at("data/w/enchantment/paths.json", enchantment(paths))], meta()))
+    out.push(world("load-requirements-allowed", [at("data/w/enchantment/allowed.json", enchantment_with(allowed_requirements()))], meta()))
+    // Spawn conditions of each kind, naming the world registries' entries and tags, vanilla's and
+    // the pack's own, which a client isn't sent; and a biome naming placed features and carvers.
+    out.push(world("load-world-references", [
+        at("data/w/cat_variant/c.json", cat(##"[{"priority": 0}, {"priority": 3, "condition": {"type": "minecraft:structure", "structures": "#w:huts"}}, {"priority": 2, "condition": {"type": "minecraft:structure", "structures": ["minecraft:swamp_hut", "minecraft:igloo"]}}, {"priority": 1, "condition": {"type": "minecraft:moon_brightness", "range": {"min": 0.25}}}, {"priority": 4, "condition": {"type": "minecraft:moon_brightness", "range": 0.5}}, {"priority": 5, "condition": {"type": "minecraft:biome", "biomes": ["minecraft:plains", "w:v"]}}, {"priority": 6, "condition": {"type": "biome", "biomes": "#minecraft:is_ocean"}}]"##)),
+        at("data/w/tags/worldgen/structure/huts.json", tag(##"["minecraft:swamp_hut", "#minecraft:cats_spawn_in"]"##)),
+        at("data/w/worldgen/placed_feature/p.json", d(#"{"feature": "minecraft:oak", "placement": []}"#)),
+        at(biome.copy(), void_biome(#"["w:p", "minecraft:oak_checked"]"#, #"["minecraft:cave", "minecraft:canyon"]"#)),
+    ], meta()))
+    // A registry of variants left empty, by a filter that hides vanilla's paintings and their tags.
+    out.push(world("load-no-paintings", [], filter_meta(#"{"block": [{"namespace": "minecraft", "path": "(tags/)?painting_variant/.*"}]}"#)))
+}
+
+pub fn main() {
+    var made: List<Json> = []
+    picking(mut made)
+    metadata(mut made)
+    file_cases(mut made)
+    entry_cases(mut made)
+    link_cases(mut made)
+    loading(mut made)
+    write_file(file("packs", "generated.json"), String("packs"), String("cases/packs/gen.calx"), made, 2)
+}
