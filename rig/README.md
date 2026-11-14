@@ -10,23 +10,23 @@ The rig runs the same inputs through vanilla and through Calcite and compares th
 | Part | Where | What it does |
 | --- | --- | --- |
 | Protocol | [`PROTOCOL.md`](PROTOCOL.md) | The wire format between the runner and an adapter, and every probe's signature |
-| Runner | [`runner/`](runner/) | Python: loads cases, runs adapters, records, self-checks, scores |
+| Runner | [`runner/rig.calx`](runner/rig.calx) | Calx: loads cases, runs adapters, records, self-checks, scores. The protocol suites and the other tools in `runner/` are Python still, ported in turn (CAL-253) |
 | Vanilla adapter | [`../oracle/vanilla-adapter/`](../oracle/vanilla-adapter/) | Java 25: runs probes against Mojang's server code |
 | Calcite adapter | [`calcite-adapter/`](calcite-adapter/) | Runs probes against Calcite's own code, built from [`../src/rig/`](../src/rig/) with calx |
 | Cases | [`../cases/`](../cases/) | Committed inputs, one folder per probe |
 | Expected hashes | `../expected/26.3/` | Committed: the hash of vanilla's result for every case, and the quarantine list |
 | Goldens | `../golden/26.3/` | Gitignored: vanilla's full results, for `diff` |
 | Differences | [`differences/`](differences/) | The registry of places Calcite deliberately differs |
-| Math comparison | [`runner/mathcmp.py`](runner/mathcmp.py) | `Math` against `StrictMath` on large sweeps (`P1.5`) |
+| Math comparison | [`runner/mathcmp.calx`](runner/mathcmp.calx) | `Math` against `StrictMath` on large sweeps (`P1.5`) |
 | Protocol suites | [`runner/sessions.py`](runner/sessions.py) | The protocol bot against vanilla and Calcite, packet by packet (`P4.8`) |
 | Light timing | [`runner/light_timing.py`](runner/light_timing.py) | Calcite's light engines timed against vanilla's through the `light` probe ([D182](../docs/decisions.md)) |
 | The round trip | [`runner/roundtrip.py`](runner/roundtrip.py) | A world vanilla made, loaded and saved by Calcite, then read by vanilla (`G5.2`) |
 | Worldgen with packs | [`runner/terragen.py`](runner/terragen.py) | Chunks Calcite generates with Terralith and Terratonic against vanilla's, block by block (CAL-92) |
 | A chunk as it starts to tick | [`runner/ticking.py`](runner/ticking.py) | The chunks a saved world left to post-process, and the rings it left part-way, as each server sends them once they tick, with the blocks set after, block by block ([D329](../docs/decisions.md), [D333](../docs/decisions.md), [D334](../docs/decisions.md), [D337](../docs/decisions.md)) |
 | A real client | [`runner/realclient.py`](runner/realclient.py) | Mojang's 26.3 client joins Calcite, walks and chats (`G4.1`), goes to another dimension, and times the chunks it's sent through [`runner/chunkwatch.py`](runner/chunkwatch.py) |
-| The lockstep check | [`lockstep.py`](lockstep.py) | A session Calcite records on many threads, replayed on one to the same packets and lines (`G5.3`, [D283](../docs/decisions.md)) |
+| The lockstep check | [`lockstep.calx`](lockstep.calx) | A session Calcite records on many threads, replayed on one to the same packets and lines (`G5.3`, [D283](../docs/decisions.md)) |
 
-The runner needs only Python 3.10 or newer, with no packages. Run it from anywhere. Paths are relative to the repo.
+The runner needs only calx, which builds it as it runs it. Run it from anywhere. Paths are relative to the repo. The Python tools still in `runner/` need Python 3.10 or newer, with no packages.
 
 ## Vanilla's two configurations
 
@@ -44,16 +44,16 @@ Both configurations repeat bit for bit under every self-check variant, on Window
 ## Commands
 
 ```sh
-py -I rig/runner/rig.py list                     # cases per probe, recorded, quarantined
-py -I rig/runner/rig.py record --config all      # run vanilla; write goldens and expected hashes
-py -I rig/runner/rig.py check --variants all     # the self-check
-py -I rig/runner/rig.py score                    # score Calcite
-py -I rig/runner/rig.py diff rng legacy-seed-0   # one case, Calcite's result against vanilla's golden
-py -I rig/runner/rig.py orders                   # whether vanilla's decorations depend on their order
-py -I rig/runner/mathcmp.py                      # Math against StrictMath, 500,000 arguments per range
+calx rig/runner/rig.calx list                    # cases per probe, recorded, quarantined
+calx rig/runner/rig.calx record --config all     # run vanilla; write goldens and expected hashes
+calx rig/runner/rig.calx check --variants all    # the self-check
+calx rig/runner/rig.calx score                   # score Calcite
+calx rig/runner/rig.calx diff rng legacy-seed-0  # one case, Calcite's result against vanilla's golden
+calx rig/runner/rig.calx orders                  # whether vanilla's decorations depend on their order
+calx rig/runner/mathcmp.calx                     # Math against StrictMath, 500,000 arguments per range
 ```
 
-Every command takes `--probe NAME` (repeatable) to limit it to some probes. `record` and `check` take `--config strict-math` (the default), `intrinsics` or `all`. On Linux, use `python3` for `py`.
+Every command takes `--probe NAME` (repeatable) to limit it to some probes. `record` and `check` take `--config strict-math` (the default), `intrinsics` or `all`. `--version` picks the game version, before or after the command. mathcmp takes `--function NAME` (repeatable) and `--count N`.
 
 The vanilla adapter builds into `oracle/vanilla-adapter/build/<platform>/`, and the runner's logs and reports go to `build/rig/<platform>/`. So one checkout can be run from Windows and from WSL.
 
@@ -118,7 +118,7 @@ Runs one case on an adapter and compares it with vanilla's golden: the output fi
 
 Cases live in `cases/<probe>/*.json`. The format is in [`PROTOCOL.md`](PROTOCOL.md#case-files). Hand-written files cover edge cases. Generated ones (`generated.json`, `limits.json`) come from the `gen.py` beside them, which is deterministic: run it again, on any machine and any Python the runner supports, and the file comes out the same. The runner's tests rerun every generator and compare (D249). So nothing a generator writes may depend on the machine: zip files have fixed times and are laid out by the generator, not `zipfile`, which marks each entry with the system it ran on, and every deflate, zlib or gzip stream comes from [`deflate.py`](runner/deflate.py), not Python's `zlib`, which compresses with whichever zlib Python was built with (zlib-ng on Windows from 3.14, classic zlib elsewhere, with different bytes). The generators that name vanilla's data read its ids from the pinned jar, so they need `oracle/fetch.calx` run first; the tests skip them without it.
 
-A case whose blobs vanilla doesn't write in the same order every run says `"unordered": true`, and the runner ([`unordered.py`](runner/unordered.py)) sorts each compound in them by key before hashing (D192).
+A case whose blobs vanilla doesn't write in the same order every run says `"unordered": true`, and the runner ([`unordered.calx`](runner/unordered.calx)) sorts each compound in them by key before hashing (D192).
 
 ```sh
 py -I cases/rng/gen.py      # cases/rng/generated.json
@@ -184,7 +184,7 @@ The generators use SplitMix64 from the given seed. A range value is `min + (max 
 
 ## The Calcite adapter
 
-`calcite-adapter/adapter.json` starts [`launch.py`](calcite-adapter/launch.py), which builds [`src/rig/adapter.calx`](../src/rig/adapter.calx) with `calx build --release` and runs it (D87). The build takes under half a second, and about 50 ms when nothing changed, so it happens on every start. The binary goes to `build/rig/<platform>/`.
+`calcite-adapter/adapter.json` starts [`launch.calx`](calcite-adapter/launch.calx) with calx, `{calx}` in its `argv` being the calx the runner found, and it builds [`src/rig/adapter.calx`](../src/rig/adapter.calx) with `calx build --release` and runs it (D87). The build takes under half a second, and about 50 ms when nothing changed, so it happens on every start. The binary goes to `build/rig/<platform>/`.
 
 - calx is found from the `CALX` environment variable, then `PATH`, then `../calx/build/compiler/<platform>/` beside this repository. calx finds clang itself.
 - `CALCITE_DEBUG=1` builds the adapter in debug mode, where it checks that it frees everything it allocates and exits with status 102 if not.
@@ -636,7 +636,7 @@ calx test oracle/datagen/tests/test_convert.calx
 calx test oracle/datagen/tests/test_calx_tables.calx
 ```
 
-CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs the rig's tests on Windows and Linux, with the oldest supported Python (3.10) and the newest. A second job checks out calx beside Calcite, builds it, runs Calcite's Calx tests (`calx src/test/run.calx`) and the converter's, fetches the pinned server jar, which the `registries` probe reads and which it caches, and scores Calcite against the committed hashes with `--strict` (`P1.9`). Then it runs the lockstep check, `calx rig/lockstep.calx`: Calcite's release build records a session with 8 chunk workers and 4 bots walking into new terrain, in a new world of a fixed seed, and `--replay` plays the input log back on one thread, which fails if any packet or line differs (`G5.3`).
+CI ([`.github/workflows/rig.yml`](../.github/workflows/rig.yml)) runs the tests of the rig's tools that are Python still, the protocol suites' comparison, the deflater, the save comparison and the case generators, on Windows and Linux, with the oldest supported Python (3.10) and the newest. A second job checks out calx beside Calcite, builds it, runs Calcite's Calx tests (`calx src/test/run.calx`), the converter's and the runner's (`calx test rig/runner/tests/test_runner.calx`), fetches the pinned server jar, which the `registries` probe reads and which it caches, lists the cases and hashes, and scores Calcite against the committed hashes with `calx rig/runner/rig.calx score --strict` (`P1.9`). Then it runs the lockstep check, `calx rig/lockstep.calx`: Calcite's release build records a session with 8 chunk workers and 4 bots walking into new terrain, in a new world of a fixed seed, and `--replay` plays the input log back on one thread, which fails if any packet or line differs (`G5.3`).
 
 ## Found so far
 

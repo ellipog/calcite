@@ -1,0 +1,299 @@
+module rig.runner.protocol
+
+// The rig protocol (rig/PROTOCOL.md): frames, the adapter process, and result hashes.
+
+import std.bytes
+import std.bytes.{hex}
+import std.fs.{make_dir_all, write}
+import std.hash.{sha256}
+import std.json
+import std.json.{Json}
+import std.path
+import std.process.{Child, Command, Stdio}
+import std.time.{Instant}
+import tools.pyjson.{canonical, spaced}
+
+pub const PROTOCOL: i64 = 1
+const MAX_HEADER: u32 = 64 << 20
+
+/// What an adapter gave for a case: `ok`, `unimplemented` or `error`, its output and blobs, and
+/// what it said.
+pub struct Result {
+    pub status: String
+    pub output: Json
+    pub blobs: List<List<u8>>
+    pub message: String?
+}
+
+/// A result that isn't the adapter's, such as one the runner gives when a case can't run.
+pub fn failed(status: str, message: own String) -> Result {
+    return Result { status: String(status), output: Json.Object(LinkedMap<String, Json>()), blobs: [], message: some(message) }
+}
+
+impl Result {
+    /// The result's hash, `result_hash` of its output and blobs.
+    pub fn digest(self) -> String {
+        return result_hash(self.output, self.blobs)
+    }
+}
+
+/// The canonical JSON of an output, which nothing parsed can make fail.
+pub fn canonical_json(value: Json) -> String {
+    return match canonical(value) {
+        ok(text) => text,
+        err(e) => panic("canonical JSON of a result: {e}"),
+    }
+}
+
+/// SHA-256 over the canonical JSON of `output`, then each blob's length as a big-endian u64 and
+/// its bytes (PROTOCOL.md, "Results and hashes").
+pub fn result_hash(output: Json, blobs: List<List<u8>>) -> String {
+    var data = canonical_json(output).to_bytes()
+    for blob in blobs {
+        bytes.put_u64_be(mut data, u64(blob.len()))
+        data.extend(blob)
+    }
+    return hex(sha256(data))
+}
+
+/// A frame: the header's length as a big-endian u32, the header as JSON with the blobs' lengths
+/// in it, then the blobs.
+pub fn frame(header: Json, blobs: List<List<u8>>) -> List<u8> {
+    var members = match header {
+        Json.Object(m) => m.copy(),
+        _ => LinkedMap<String, Json>(),
+    }
+    var lengths: List<Json> = []
+    for b in blobs {
+        lengths.push(Json.Int(i64.wrap(b.len())))
+    }
+    members.insert("blobs", Json.Array(lengths))
+    let text = spaced(Json.Object(members)).to_bytes()
+    var out = List<u8>()
+    bytes.put_u32_be(mut out, u32.wrap(text.len()))
+    out.extend(text)
+    for b in blobs {
+        out.extend(b)
+    }
+    return out
+}
+
+/// Where a frame is read from: bytes already here, and more from a program's output.
+pub struct Reader {
+    data: List<u8>
+    at: usize
+}
+
+pub fn reader(data: own List<u8>) -> Reader {
+    return Reader { data: data, at: 0 }
+}
+
+/// The next `n` bytes, reading more from `child` while there aren't enough, if there's a child.
+fn take(r: mut Reader, child: Child?, n: usize) -> List<u8> ! String {
+    while r.data.len() - r.at < n {
+        let c = child else {
+            fail "adapter closed its output after {r.data.len() - r.at} of {n} bytes"
+        }
+        let more = c.read(60000)
+        if more.is_empty() {
+            if c.ended() {
+                fail "adapter closed its output after {r.data.len() - r.at} of {n} bytes"
+            }
+            continue
+        }
+        if r.at > 0 {
+            r.data = r.data[r.at..]
+            r.at = 0
+        }
+        r.data.extend(more)
+    }
+    let out = r.data[r.at..r.at + n]
+    r.at += n
+    return out
+}
+
+/// Reads a frame: its header, which must be an object, and its blobs.
+pub fn read_frame(r: mut Reader, child: Child?) -> (Json, List<List<u8>>) ! String {
+    let head = try take(mut r, child, 4)
+    let length = bytes.u32_be(head, 0)
+    if length > MAX_HEADER {
+        fail "header length {length} is out of range"
+    }
+    let raw = try take(mut r, child, usize(length))
+    let text = String.from_utf8(raw) else {
+        fail "the header isn't UTF-8"
+    }
+    let header = match json.parse(text) {
+        ok(h) => h,
+        err(e) => fail "the header isn't JSON: {e}",
+    }
+    var blobs: List<List<u8>> = []
+    match header {
+        Json.Object(m) => {
+            if let given = m.find("blobs") {
+                if let Json.Array(lengths) = given {
+                    for n in lengths {
+                        let size = n.as_u64() else {
+                            fail "a blob's length is {n}"
+                        }
+                        blobs.push(try take(mut r, child, usize.wrap(size)))
+                    }
+                }
+            }
+        }
+        _ => fail "header isn't a JSON object",
+    }
+    return (header, blobs)
+}
+
+/// A member of an object as text, or `fallback`.
+pub fn text_member(v: Json, key: str, fallback: str) -> String {
+    if let Json.Str(s) = v.get(String(key)) ?? Json.Null {
+        return s
+    }
+    return String(fallback)
+}
+
+/// How Python's `str()` shows a member that may be missing: its JSON, or `None`.
+fn shown(v: Json, key: str) -> String {
+    return match v.get(String(key)) {
+        some(Json.Str(s)) => s,
+        some(x) => "{x}",
+        none => String("None"),
+    }
+}
+
+/// A running adapter process. `close` it when done.
+pub struct Adapter {
+    child: Child
+    input: Reader
+    log_path: String?
+    next_id: i64
+    closed: bool
+    pub name: String
+    pub game_version: String
+    pub probes: LinkedMap<String, i64>
+    pub about: LinkedMap<String, Json>
+}
+
+/// Starts an adapter and says hello. Its standard error goes to `log_path` once it ends.
+pub fn start(argv: List<String>, cwd: String?, log_path: String?) -> Adapter ! String {
+    if argv.is_empty() {
+        fail "an adapter needs a program to run"
+    }
+    var command = Command.new(argv[0].copy()).args(argv[1..]).stdin(Stdio.Pipe).stdout(Stdio.Pipe)
+    command = command.stderr(if log_path == none { Stdio.Null } else { Stdio.Pipe })
+    if let dir = cwd {
+        command = command.dir(dir.copy())
+    }
+    let child = match command.spawn() {
+        ok(c) => c,
+        err(e) => fail "the adapter didn't start: {e}",
+    }
+    var a = Adapter { child: child, input: reader([]), log_path: log_path.copy(), next_id: 0, closed: false, name: String("?"), game_version: String("?"), probes: LinkedMap<String, i64>(), about: LinkedMap<String, Json>() }
+    var hello = LinkedMap<String, Json>()
+    hello.insert("type", Json.Str("hello"))
+    hello.insert("protocol", Json.Int(PROTOCOL))
+    let (reply, _) = match request(mut a, Json.Object(hello), [], "hello") {
+        ok(got) => got,
+        err(e) => {
+            close(mut a)
+            fail e
+        }
+    }
+    if reply.get("protocol") != some(Json.Int(PROTOCOL)) {
+        close(mut a)
+        fail "adapter speaks protocol {shown(reply, "protocol")}, not {PROTOCOL}"
+    }
+    a.name = text_member(reply, "adapter", "?")
+    a.game_version = text_member(reply, "game_version", "?")
+    if let Json.Object(probes) = reply.get("probes") ?? Json.Null {
+        for (k, v) in probes {
+            a.probes.insert(k.copy(), v.as_i64() ?? 0)
+        }
+    }
+    if let Json.Object(about) = reply.get("about") ?? Json.Null {
+        a.about = about
+    }
+    return a
+}
+
+fn request(a: mut Adapter, header: Json, blobs: List<List<u8>>, expect: str) -> (Json, List<List<u8>>) ! String {
+    if let err(e) = a.child.write(frame(header, blobs)) {
+        fail "adapter exited ({exit_of(a.child)}): {e}"
+    }
+    let (reply, reply_blobs) = match read_frame(mut a.input, some(a.child)) {
+        ok(got) => got,
+        err(e) => fail e,
+    }
+    if text_member(reply, "type", "") != expect {
+        fail "expected `{expect}`, got `{shown(reply, "type")}`: {text_member(reply, "message", "")}"
+    }
+    return (reply, reply_blobs)
+}
+
+/// How the adapter ended, as Python's `poll()` shows it: its status, or `None` if it's running.
+fn exit_of(c: Child) -> String {
+    if let s = c.try_wait() {
+        if let code = s.code {
+            return "{code}"
+        }
+        return "{s}"
+    }
+    return String("None")
+}
+
+/// Runs one case: `unimplemented` if the adapter has no such probe, without asking it.
+pub fn run(a: mut Adapter, probe: String, case_id: String, input: Json, blobs: List<List<u8>>) -> Result ! String {
+    if not a.probes.contains(probe) {
+        return failed("unimplemented", "adapter has no probe `{probe}`")
+    }
+    a.next_id += 1
+    let rid = a.next_id
+    var header = LinkedMap<String, Json>()
+    header.insert("type", Json.Str("run"))
+    header.insert("id", Json.Int(rid))
+    header.insert("probe", Json.Str(probe.copy()))
+    header.insert("case", Json.Str(case_id.copy()))
+    header.insert("input", input.copy())
+    let (reply, reply_blobs) = try request(mut a, Json.Object(header), blobs, "result")
+    if reply.get("id") != some(Json.Int(rid)) {
+        fail "result for id {shown(reply, "id")}, expected {rid}"
+    }
+    let message = match reply.get("message") {
+        some(Json.Str(s)) => some(s),
+        _ => none,
+    }
+    let output = reply.get("output") ?? Json.Object(LinkedMap<String, Json>())
+    return Result { status: text_member(reply, "status", "error"), output: output, blobs: reply_blobs, message: message }
+}
+
+/// Says goodbye, waits up to 30 seconds for the adapter to end, killing it after, and writes
+/// its standard error to its log.
+pub fn close(a: mut Adapter) {
+    if a.closed {
+        return
+    }
+    a.closed = true
+    if a.child.try_wait() == none {
+        var bye = LinkedMap<String, Json>()
+        bye.insert("type", Json.Str("bye"))
+        if let err(_) = request(mut a, Json.Object(bye), [], "bye") {}
+        a.child.close_input()
+        let began = unsafe { Instant.now() }
+        while a.child.try_wait() == none {
+            if unsafe { Instant.now() }.secs_since(began) > 30.0 {
+                a.child.kill()
+                break
+            }
+            _ = a.child.read(100)
+        }
+    }
+    let ended = a.child.wait()
+    if let log = a.log_path {
+        if let dir = path.parent_dir(log) {
+            if let err(_) = make_dir_all(dir) {}
+        }
+        if let err(_) = write(log, ended.stderr) {}
+    }
+}

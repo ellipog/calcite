@@ -1,0 +1,434 @@
+module rig.runner.tests.test_runner
+
+// Tests for the rig's runner: frames, hashes, blobs, case files, the unordered sort, the
+// differences registry, the store and the ping adapter. No vanilla jar needed:
+//
+//     calx test rig/runner/tests/test_runner.calx
+
+import std.bytes
+import std.bytes.{hex}
+import std.fs.{is_file, read, remove_dir_all, temp_dir, write_text}
+import std.hash.{sha256}
+import std.json
+import std.json.{Json}
+import std.path
+import std.process.{Command}
+import rig.runner.cases.{expand_blob, load_all, load_file, splitmix64}
+import rig.runner.differences
+import rig.runner.protocol.{Result, canonical_json, close, frame, read_frame, reader, result_hash, run, start}
+import rig.runner.store.{expected, golden, quarantine, save_expected, save_golden, store}
+import rig.runner.unordered.{sorted_contents}
+import tools.pyjson.{canonical}
+import tools.repo.{find_calx, root, under}
+
+fn js(t: String) -> Json {
+    return match json.parse(t.copy()) {
+        ok(v) => v,
+        err(e) => panic("{t}: {e}"),
+    }
+}
+
+fn blob(b: Json) -> List<u8> {
+    return match expand_blob(b) {
+        ok(x) => x,
+        err(e) => panic(e),
+    }
+}
+
+fn be32(v: i32) -> List<u8> {
+    var out = List<u8>()
+    bytes.put_i32_be(mut out, v)
+    return out
+}
+
+fn be16(v: u16) -> List<u8> {
+    var out = List<u8>()
+    bytes.put_u16_be(mut out, v)
+    return out
+}
+
+fn join(parts: List<List<u8>>) -> List<u8> {
+    var out = List<u8>()
+    for p in parts {
+        out.extend(p)
+    }
+    return out
+}
+
+// --- frames ------------------------------------------------------------------------------------
+
+@test
+fn frames_round_trip() {
+    let data = frame(js(#"{"type": "run", "id": 1, "input": {"s": "é😀", "n": null}}"#), [[0u8, 1], []])
+    var r = reader(data)
+    let (header, blobs) = match read_frame(mut r, none) {
+        ok(got) => got,
+        err(e) => panic(e),
+    }
+    assert(header.get("input") == some(js(#"{"s": "é😀", "n": null}"#)))
+    assert(header.get("blobs") == some(js("[2, 0]")))
+    assert(blobs == [[0u8, 1], []])
+}
+
+@test
+fn a_frame_is_laid_out_as_the_protocol_says() {
+    let data = frame(js(#"{"type": "bye"}"#), [[97u8, 98]])
+    let length = usize(bytes.u32_be(data, 0))
+    let text = String.from_utf8(data[4..4 + length]) ?? String("")
+    assert(js(text.copy()) == js(#"{"type": "bye", "blobs": [2]}"#), text)
+    assert(data[4 + length..] == [97u8, 98])
+}
+
+@test
+fn a_short_frame_is_refused() {
+    var r = reader([0u8, 0, 0, 9, 123])
+    match read_frame(mut r, none) {
+        ok(_) => panic("a frame with its header cut short wasn't refused"),
+        err(e) => assert(e.contains("after 1 of 9 bytes"), e),
+    }
+}
+
+// --- hashes ------------------------------------------------------------------------------------
+
+@test
+fn canonical_json_sorts_keys_and_keeps_text() {
+    assert(canonical_json(js(#"{"b": 1, "a": [null, "é"]}"#)) == #"{"a":[null,"é"],"b":1}"#)
+    // Floats are written as Python's repr writes them, which the committed hashes are over.
+    assert(canonical_json(js("[1e-7, 1E2, 0.1, 1e16, -0.0, 12345678901234567890]")) == "[1e-07,100.0,0.1,1e+16,-0.0,12345678901234567890]")
+}
+
+@test
+fn floats_that_arent_json_are_refused() {
+    match canonical(Json.Float(f64.NAN)) {
+        ok(t) => panic("NaN was written as {t}"),
+        err(_) => {},
+    }
+}
+
+@test
+fn the_hash_follows_the_protocol() {
+    // PROTOCOL.md: SHA-256 over canonical JSON, then each blob's u64 length and bytes. Changing
+    // this changes every committed expected hash.
+    var data = String(#"{"echo":"x"}"#).to_bytes()
+    bytes.put_u64_be(mut data, 2)
+    data.extend([1u8, 2])
+    assert(result_hash(js(#"{"echo": "x"}"#), [[1u8, 2]]) == hex(sha256(data)))
+}
+
+@test
+fn blob_boundaries_matter() {
+    assert(result_hash(js("\{\}"), [[97u8, 98], [99u8]]) != result_hash(js("\{\}"), [[97u8], [98u8, 99]]))
+}
+
+// --- blobs -------------------------------------------------------------------------------------
+
+@test
+fn splitmix64_gives_the_published_outputs() {
+    var g = splitmix64(0)
+    assert([g.next(), g.next(), g.next()] == [0xE220A8397B1DCDAFu64, 0x6E789E6AA1B965F4, 0x06C45D188009454F])
+}
+
+@test
+fn literal_parts() {
+    assert(blob(js(#"{"hex": ["00ff", "10 20"]}"#)) == [0u8, 0xff, 0x10, 0x20])
+    assert(blob(js(#"{"i32": [1, -1]}"#)) == [0u8, 0, 0, 1, 0xff, 0xff, 0xff, 0xff])
+    var minus_zero = List<u8>()
+    bytes.put_f64_be(mut minus_zero, -0.0)
+    assert(blob(js(#"{"f64": ["-0"]}"#)) == minus_zero)
+    assert(blob(js(#"{"f64": ["0x1p-1074"]}"#)) == [0u8, 0, 0, 0, 0, 0, 0, 1])
+    assert(blob(js(#"{"f64_bits": ["7ff8000000000001"]}"#)) == [0x7fu8, 0xf8, 0, 0, 0, 0, 0, 1])
+    assert(blob(js(#""aGk=""#)) == [104u8, 105])
+    assert(blob(js(#"[{"hex": ["01"]}, {"hex": ["02"]}]"#)) == [1u8, 2])
+    // Python's float("nan") and float("inf"), which the math cases use.
+    assert(blob(js(#"{"f64": ["nan", "-inf"]}"#)) == [0x7fu8, 0xf8, 0, 0, 0, 0, 0, 0, 0xff, 0xf0, 0, 0, 0, 0, 0, 0])
+}
+
+@test
+fn generators_are_deterministic() {
+    let spec = js(#"{"gen": "f64_range", "seed": "7", "count": 100, "min": "-1", "max": "1"}"#)
+    let a = blob(spec)
+    assert(a == blob(spec))
+    assert(a.len() == 800)
+    for i in 0..100usize {
+        let v = bytes.f64_be(a, i * 8)
+        assert(v >= -1.0 and v < 1.0, "{v}")
+    }
+}
+
+@test
+fn ranges_make_tuples() {
+    let b = blob(js(#"{"gen": "f64_range", "seed": "1", "count": 50, "ranges": [["0", "1"], ["10", "11"]]}"#))
+    for i in 0..50usize {
+        let first = bytes.f64_be(b, i * 16)
+        let second = bytes.f64_be(b, i * 16 + 8)
+        assert(first >= 0.0 and first < 1.0, "{first}")
+        assert(second >= 10.0 and second < 11.0, "{second}")
+    }
+}
+
+@test
+fn i32_range_covers_its_values() {
+    let b = blob(js(#"{"gen": "i32_range", "seed": "3", "count": 300, "min": "-2", "max": "2"}"#))
+    var seen: Set<i32> = Set()
+    for i in 0..300usize {
+        seen.insert(bytes.i32_be(b, i * 4))
+    }
+    var values: List<i32> = []
+    for v in seen {
+        values.push(v)
+    }
+    values.sort()
+    assert(values == [-2i32, -1, 0, 1, 2])
+}
+
+@test
+fn a_bad_part_is_refused() {
+    match expand_blob(js(#"{"nope": []}"#)) {
+        ok(_) => panic("an unknown part wasn't refused"),
+        err(e) => assert(e.contains("unknown blob part `nope`"), e),
+    }
+}
+
+// --- case files --------------------------------------------------------------------------------
+
+@test
+fn the_repository_cases_load() {
+    let by_probe = match load_all(under("cases"), []) {
+        ok(c) => c,
+        err(e) => panic(e),
+    }
+    var total = 0usize
+    for (probe, items) in by_probe {
+        var ids: Set<String> = Set()
+        for c in items {
+            assert(not ids.contains(c.id), "{probe}: {c.id} twice")
+            ids.insert(c.id.copy())
+        }
+        total += items.len()
+    }
+    assert(total > 0)
+}
+
+@test
+fn the_unordered_flag_is_read_and_checked() {
+    let dir = temp_dir()!
+    let file = path.join(dir, "c.json")
+    write_text(file.copy(), #"{"probe": "p", "probe_version": 1, "cases": [{"id": "a", "unordered": true}, {"id": "b"}]}"#)!
+    let (_, items) = match load_file(file.copy()) {
+        ok(got) => got,
+        err(e) => panic(e),
+    }
+    assert(items.len() == 2 and items[0].unordered and not items[1].unordered)
+    write_text(file.copy(), #"{"probe": "p", "probe_version": 1, "cases": [{"id": "a", "unordered": 1}]}"#)!
+    let refused = match load_file(file.copy()) {
+        ok(_) => false,
+        err(e) => e.contains("`unordered` is 1, not true or false"),
+    }
+    remove_dir_all(dir)!
+    assert(refused)
+}
+
+@test
+fn every_case_has_an_expected_hash() {
+    let s = store(root(), String("26.3"), String("strict-math"))
+    let quarantined = quarantine(s)
+    let by_probe = match load_all(under("cases"), []) {
+        ok(c) => c,
+        err(e) => panic(e),
+    }
+    for (probe, items) in by_probe {
+        let hashes = expected(s, probe.copy())
+        var missing: List<String> = []
+        for c in items {
+            if not hashes.contains(c.id) and not quarantined.contains(c.key()) {
+                missing.push(c.id.copy())
+            }
+        }
+        assert(missing.is_empty(), "{probe}: cases without an expected hash; run `rig.calx record --config all`: {missing}")
+    }
+}
+
+// --- unordered ---------------------------------------------------------------------------------
+
+fn entry(name: str, tag: own List<u8>) -> List<u8> {
+    return join([be32(i32.wrap(name.len())), String(name).to_bytes(), tag])
+}
+
+fn named(kind: u8, name: str, payload: own List<u8>) -> List<u8> {
+    return join([[kind], be16(u16.wrap(name.len())), String(name).to_bytes(), payload])
+}
+
+fn compound(entries: List<List<u8>>) -> List<u8> {
+    var out = join(entries)
+    out.push(0)
+    return out
+}
+
+fn sorted(b: List<u8>) -> List<u8> {
+    return match sorted_contents(b) {
+        ok(x) => x,
+        err(e) => panic(e),
+    }
+}
+
+@test
+fn nested_compounds_are_sorted() {
+    let inner_ba = compound([named(3, "b", be32(2)), named(1, "a", [1u8])])
+    let inner_ab = compound([named(1, "a", [1u8]), named(3, "b", be32(2))])
+    let listed_ba = join([[10u8], be32(2), inner_ba.copy(), inner_ba.copy()])
+    let listed_ab = join([[10u8], be32(2), inner_ab.copy(), inner_ab.copy()])
+    let hi = join([be16(2), String("hi").to_bytes()])
+    let one = compound([named(9, "z", listed_ba), named(8, "y", hi.copy())])
+    let other = compound([named(8, "y", hi.copy()), named(9, "z", listed_ab)])
+    let blob_one = join([be32(2), entry("minecraft:a", join([[10u8], one])), entry("minecraft:b", join([[3u8], be32(7)]))])
+    let blob_other = join([be32(2), entry("minecraft:a", join([[10u8], other])), entry("minecraft:b", join([[3u8], be32(7)]))])
+    assert(blob_one != blob_other)
+    assert(sorted(blob_one.copy()) == sorted(blob_other.copy()))
+    assert(sorted(blob_other.copy()) == blob_other)
+}
+
+@test
+fn arrays_and_numbers_are_kept() {
+    var double = List<u8>()
+    bytes.put_f64_be(mut double, 1.5)
+    var long = List<u8>()
+    bytes.put_i64_be(mut long, 5)
+    let ints = join([be32(2), be32(1), be32(-1)])
+    let longs = join([be32(1), long])
+    let byte_array = join([be32(3), [1u8, 2, 3]])
+    let tag = compound([named(11, "i", ints.copy()), named(12, "l", longs.copy()), named(7, "b", byte_array.copy()), named(6, "d", double.copy())])
+    let given = join([be32(1), entry("x", join([[10u8], tag]))])
+    let want = join([be32(1), entry("x", join([[10u8], compound([named(7, "b", byte_array), named(6, "d", double), named(11, "i", ints), named(12, "l", longs)])]))])
+    assert(sorted(given) == want)
+}
+
+@test
+fn bytes_after_the_last_entry_are_refused() {
+    match sorted_contents(join([be32(0), [0u8]])) {
+        ok(_) => panic("a byte after the entries wasn't refused"),
+        err(e) => assert(e.contains("1 bytes after the last entry"), e),
+    }
+    match sorted_contents(join([be32(1), be32(1), [120u8, 10, 1]])) {
+        ok(_) => panic("a compound cut short wasn't refused"),
+        err(_) => {},
+    }
+}
+
+// --- differences -------------------------------------------------------------------------------
+
+@test
+fn the_repository_registry_loads() {
+    let found = match differences.load(under("rig/differences")) {
+        ok(d) => d,
+        err(e) => panic(e),
+    }
+    assert(not found.is_empty())
+    for d in found {
+        assert(not d.cases.is_empty(), d.id)
+    }
+}
+
+@test
+fn patterns_are_globs() {
+    let dir = temp_dir()!
+    write_text(path.join(dir, "x.md"), "---\ntitle: X\nkind: bug\ncases:\n  - nbt:deep-51?\n---\nbody\n")!
+    let found = match differences.load(dir.copy()) {
+        ok(d) => d,
+        err(e) => panic(e),
+    }
+    remove_dir_all(dir)!
+    assert(found.len() == 1 and found[0].id == "x" and found[0].title == "X")
+    assert(found[0].covers(String("nbt:deep-512")))
+    assert(not found[0].covers(String("nbt:deep-256")))
+    assert(differences.fnmatch(String("session:join/configuration/custom_payload"), String("session:*/configuration/custom_payload")))
+    assert(differences.fnmatch(String("a/b/c"), String("a*c")))
+    assert(differences.fnmatch(String("x5"), String("x[0-9]")) and not differences.fnmatch(String("x5"), String("x[!0-9]")))
+    assert(differences.fnmatch(String("x["), String("x[")))
+}
+
+@test
+fn a_bad_kind_is_refused() {
+    let dir = temp_dir()!
+    write_text(path.join(dir, "x.md"), "---\ntitle: X\nkind: whim\ncases:\n  - a:b\n---\n")!
+    let refused = match differences.load(dir.copy()) {
+        ok(_) => false,
+        err(e) => e.contains("kind must be one of bug, exploit, feature, identity, performance, platform"),
+    }
+    remove_dir_all(dir)!
+    assert(refused)
+}
+
+// --- store -------------------------------------------------------------------------------------
+
+@test
+fn configurations_and_a_round_trip() {
+    let dir = temp_dir()!
+    let reference = store(dir.copy(), String("26.3"), String("strict-math"))
+    let other = store(dir.copy(), String("26.3"), String("intrinsics"))
+    var hashes = LinkedMap<String, String>()
+    hashes.insert("b", "2")
+    hashes.insert("a", "1")
+    save_expected(reference, String("rng"), 1, js("\{\}"), hashes)
+    var theirs = LinkedMap<String, String>()
+    theirs.insert("a", "9")
+    save_expected(other, String("rng"), 1, js("\{\}"), theirs)
+    let got = expected(reference, String("rng"))
+    assert("{got}" == "\{a: 1, b: 2\}", "{got}")
+    assert(expected(other, String("rng"))["a"] == "9")
+    assert(is_file(path.join(dir, "expected/26.3/intrinsics/rng.json")))
+    let text = read(path.join(dir, "expected/26.3/rng.json"))!
+    assert(not text.contains(13u8))
+    // The file is as Python's json.dumps(indent=2) wrote it.
+    assert(String.from_utf8(text) == some(String("\{\n  \"probe\": \"rng\",\n  \"probe_version\": 1,\n  \"game_version\": \"26.3\",\n  \"config\": \"strict-math\",\n  \"recorded_with\": \{\},\n  \"hashes\": \{\n    \"a\": \"1\",\n    \"b\": \"2\"\n  \}\n\}\n")))
+    let result = Result { status: String("ok"), output: js(#"{"x": 1}"#), blobs: [[1u8]], message: none }
+    save_golden(reference, String("rng"), [(String("a"), result)])
+    let g = golden(reference, String("rng"), String("a"))
+    remove_dir_all(dir)!
+    let found = g else {
+        panic("no golden read back")
+    }
+    assert(found.blobs == [[1u8]] and found.status == "ok")
+}
+
+// --- the ping adapter --------------------------------------------------------------------------
+
+@test
+fn the_ping_adapter_speaks_the_protocol() {
+    let dir = under("rig/runner/tests/ping-adapter")
+    var a = match start([find_calx(), String("adapter.calx")], some(dir), none) {
+        ok(x) => x,
+        err(e) => panic(e),
+    }
+    assert(a.name == "ping-only")
+    let r = match run(mut a, String("ping"), String("p"), js(#"{"echo": {"k": [1, null]}}"#), [[9u8]]) {
+        ok(x) => x,
+        err(e) => panic(e),
+    }
+    assert(r.status == "ok" and r.output == js(#"{"echo": {"k": [1, null]}}"#) and r.blobs == [[9u8]])
+    let other = match run(mut a, String("rng"), String("r"), js("\{\}"), []) {
+        ok(x) => x,
+        err(e) => panic(e),
+    }
+    assert(other.status == "unimplemented")
+    close(mut a)
+}
+
+@test
+fn scoring_runs_end_to_end() {
+    let got = Command.new(find_calx()).args(["rig/runner/rig.calx", "score", "--strict", "--adapter", under("rig/runner/tests/ping-adapter/adapter.json")]).dir(root()).output()!
+    let text = got.text()
+    assert(got.status.success(), "{text}{got.error_text()}")
+    assert(text.contains("| ping (rig) | 5 | 5 |"), text)
+    // Every game case is unimplemented here, so none passes.
+    let by_probe = match load_all(under("cases"), []) {
+        ok(c) => c,
+        err(e) => panic(e),
+    }
+    var game = 0usize
+    for (probe, items) in by_probe {
+        if probe != "ping" {
+            game += items.len()
+        }
+    }
+    assert(text.contains("| **All game probes** | {game} | 0 |"), text)
+}

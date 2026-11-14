@@ -1,0 +1,1093 @@
+module rig.runner.rig
+
+// The oracle rig's runner (P1.3).
+//
+//     calx rig/runner/rig.calx list
+//     calx rig/runner/rig.calx record [--probe P ...] [--config strict-math|intrinsics|all]
+//     calx rig/runner/rig.calx check [--probe P ...] [--variants all|name,...] [--config ...]
+//                                    [--quarantine]
+//     calx rig/runner/rig.calx score [--adapter calcite|vanilla|PATH] [--probe P ...] [--strict]
+//     calx rig/runner/rig.calx diff PROBE CASE [--adapter ...]
+//
+// `--version V` before or after the command picks the game version, 26.3 unless given. See
+// rig/README.md.
+
+import std.bytes.{hex}
+import std.cli.{CliError, cli}
+import std.env.{args}
+import std.fs.{is_dir, is_file, list, make_dir_all, read_text, write_text}
+import std.json
+import std.json.{Json}
+import std.path
+import std.process.{exit}
+import std.random.{Random}
+import std.time.{Instant}
+import rig.runner.cases.{Case, load_all}
+import rig.runner.differences.{Difference}
+import rig.runner.differences
+import rig.runner.protocol.{Adapter, Result, canonical_json, close, failed, run, start}
+import rig.runner.store.{Store, expected, golden, quarantine, save_expected, save_golden, save_quarantine, store}
+import rig.runner.unordered.{sorted_contents}
+import tools.pyjson.{indented}
+import tools.repo.{find_calx, platform, root, under}
+
+/// Prints `rig: message` to standard error and ends with status 2, as the Python runner did.
+fn die(message: String) -> never {
+    eprintln("rig: {message}")
+    exit(2)
+}
+
+pub fn out_dir() -> String {
+    return under("build/rig/{platform()}")
+}
+
+/// The adapter.json for a name the runner knows, or the path given.
+fn adapter_spec(name: String) -> String {
+    if name == "vanilla" {
+        return path.join(root(), "oracle/vanilla-adapter/build/{platform()}/adapter.json")
+    }
+    if name == "calcite" {
+        return path.join(root(), "rig/calcite-adapter/adapter.json")
+    }
+    return name.copy()
+}
+
+/// A self-check variant (P1.4): each changes something a result must not depend on.
+struct Variant {
+    name: str
+    jvm: List<String>
+    shuffle: bool
+    twice: bool
+    about: str
+}
+
+fn variants() -> List<Variant> {
+    return [
+        Variant { name: "default", jvm: [], shuffle: false, twice: false, about: "the adapter as built" },
+        Variant { name: "shuffled", jvm: [], shuffle: true, twice: false, about: "cases in a random order, so no case depends on the one before" },
+        Variant { name: "twice", jvm: [], shuffle: false, twice: true, about: "every case run twice in a row, comparing the second run" },
+        Variant { name: "interpreter", jvm: ["-Xint"], shuffle: false, twice: false, about: "no JIT at all" },
+        Variant { name: "c1", jvm: ["-XX:TieredStopAtLevel=1"], shuffle: false, twice: false, about: "only the C1 compiler" },
+        Variant { name: "c2", jvm: ["-XX:-TieredCompilation", "-XX:CompileThreshold=50"], shuffle: false, twice: false, about: "only C2, compiling early" },
+        Variant { name: "serial-1cpu", jvm: ["-XX:+UseSerialGC", "-XX:ActiveProcessorCount=1"], shuffle: false, twice: false, about: "serial GC on one CPU" },
+        Variant { name: "parallel-8cpu", jvm: ["-XX:+UseParallelGC", "-XX:ActiveProcessorCount=8"], shuffle: false, twice: false, about: "parallel GC on eight CPUs" },
+    ]
+}
+
+fn read_json(file: String) -> Json {
+    let text = match read_text(file.copy()) {
+        ok(some(t)) => t,
+        _ => die("can't read {file}"),
+    }
+    return match json.parse(text) {
+        ok(v) => v,
+        err(e) => die("{file}: {e}"),
+    }
+}
+
+/// An adapter that's restarted if it crashes, so one bad case can't end a run.
+pub struct Session {
+    argv: List<String>
+    cwd: String
+    log: String
+    config: String?
+    jvm_flags: List<String>
+    restarts: i64
+    pub adapter: Adapter
+}
+
+const MAX_RESTARTS: i64 = 3
+
+pub fn session(name: String, jvm_args: List<String>, log_name: String?, config: String?) -> Session {
+    let spec_path = adapter_spec(name)
+    if not is_file(spec_path) {
+        let hint = if name == "vanilla" { " Run calx oracle/adapter.calx first." } else { "" }
+        die("no adapter at {spec_path}.{hint}")
+    }
+    let spec = read_json(spec_path.copy())
+    // A configuration is a set of JVM flags the adapter is recorded under (D60).
+    var configs = LinkedMap<String, List<String>>()
+    if let Json.Object(m) = spec.get("configs") ?? Json.Null {
+        for (k, v) in m {
+            var flags: List<String> = []
+            if let Json.Array(xs) = v {
+                for x in xs {
+                    flags.push(x.as_str() ?? String(""))
+                }
+            }
+            configs.insert(k.copy(), flags)
+        }
+    }
+    var chosen = config.copy()
+    if chosen == none {
+        if let Json.Str(d) = spec.get("default_config") ?? Json.Null {
+            chosen = some(d)
+        }
+    }
+    var jvm_flags: List<String> = []
+    if configs.len() > 0 {
+        let c = chosen.copy() ?? String("None")
+        let flags = configs.find(c) else {
+            var names: List<String> = []
+            for (k, _) in configs {
+                names.push(k.copy())
+            }
+            die("adapter {name} has no configuration `{c}`. It has: {names.join(", ")}")
+        }
+        jvm_flags.extend(flags)
+    }
+    jvm_flags.extend(jvm_args)
+    var given: List<String> = []
+    if let Json.Array(xs) = spec.get("argv") ?? Json.Null {
+        for x in xs {
+            let a = x.as_str() ?? String("")
+            given.push(if a == "\{calx\}" { find_calx() } else { a })
+        }
+    }
+    if given.is_empty() {
+        die("{spec_path} has no argv")
+    }
+    var argv: List<String> = [given[0].copy()]
+    argv.extend(jvm_flags)
+    argv.extend(given[1..])
+    let cwd = match spec.get("cwd") {
+        some(Json.Str(c)) => if c.is_empty() { path.parent_dir(spec_path) ?? String(".") } else { c },
+        _ => path.parent_dir(spec_path) ?? String("."),
+    }
+    let stem = log_name.copy() ?? (path.file_stem(name) ?? name.copy())
+    let suffix = if configs.len() > 0 { "-{chosen.copy() ?? String("None")}" } else { String("") }
+    let log = path.join(out_dir(), "logs/{stem}{suffix}.log")
+    let adapter = match start(argv.copy(), some(cwd.copy()), some(log.copy())) {
+        ok(a) => a,
+        err(e) => die("{e} (log: {log})"),
+    }
+    return Session { argv: argv, cwd: cwd, log: log, config: chosen, jvm_flags: jvm_flags, restarts: 0, adapter: adapter }
+}
+
+/// What the adapter said of itself, with the configuration it runs in.
+pub fn about(s: Session) -> Json {
+    var m = LinkedMap<String, Json>()
+    m.insert("adapter", Json.Str(s.adapter.name.copy()))
+    m.insert("game_version", Json.Str(s.adapter.game_version.copy()))
+    for (k, v) in s.adapter.about {
+        m.insert(k.copy(), v.copy())
+    }
+    if let c = s.config {
+        m.insert("config", Json.Str(c.copy()))
+        var flags: List<Json> = []
+        for f in s.jvm_flags {
+            flags.push(Json.Str(f.copy()))
+        }
+        m.insert("jvm_flags", Json.Array(flags))
+    }
+    return Json.Object(m)
+}
+
+pub fn run_case(s: mut Session, case: Case) -> Result {
+    if let version = s.adapter.probes.find(case.probe) {
+        if version != case.probe_version {
+            return failed("error", "adapter has {case.probe} v{version}, case is v{case.probe_version}")
+        }
+    }
+    var result = match run(mut s.adapter, case.probe.copy(), case.id.copy(), case.input.copy(), case.blobs.copy()) {
+        ok(r) => r,
+        err(e) => {
+            close(mut s.adapter)
+            if s.restarts >= MAX_RESTARTS {
+                die("the adapter crashed {MAX_RESTARTS + 1} times; the last: {e} (log: {s.log})")
+            }
+            s.restarts += 1
+            s.adapter = match start(s.argv.copy(), some(s.cwd.copy()), some(s.log.copy())) {
+                ok(a) => a,
+                err(again) => die("{again} (log: {s.log})"),
+            }
+            return failed("error", "adapter crashed: {e} (log: {s.log})")
+        }
+    }
+    if case.unordered and result.status == "ok" {
+        var sorted: List<List<u8>> = []
+        for b in result.blobs {
+            match sorted_contents(b) {
+                ok(x) => sorted.push(x),
+                err(e) => return failed("error", "its blob isn't a contents blob to sort: {e}"),
+            }
+        }
+        result.blobs = sorted
+    }
+    return result
+}
+
+/// Whether the case runs on this system: it's for every system, or for this one.
+fn here(case: Case) -> bool {
+    if let s = case.system {
+        return s == platform()
+    }
+    return true
+}
+
+pub fn load_cases(probes: List<String>) -> LinkedMap<String, List<Case>> {
+    return match load_all(path.join(root(), "cases"), probes) {
+        ok(c) => c,
+        err(e) => die(e),
+    }
+}
+
+fn load_differences() -> List<Difference> {
+    return match differences.load(path.join(root(), "rig/differences")) {
+        ok(d) => d,
+        err(e) => die(e),
+    }
+}
+
+/// The vanilla configurations a command runs under: one by name, or `all`.
+fn vanilla_configs(choice: String) -> List<String> {
+    let spec_path = adapter_spec("vanilla")
+    if not is_file(spec_path) {
+        die("no adapter at {spec_path}. Run calx oracle/adapter.calx first.")
+    }
+    var names: List<String> = []
+    if let Json.Object(m) = read_json(spec_path).get("configs") ?? Json.Null {
+        for (k, _) in m {
+            names.push(k.copy())
+        }
+    }
+    if choice == "all" {
+        return names
+    }
+    if not names.contains(choice) {
+        die("no configuration `{choice}`. Configurations: {names.join(", ")}, all")
+    }
+    return [choice.copy()]
+}
+
+/// Stores for every recorded configuration except the reference.
+fn other_configs(version: String) -> List<Store> {
+    let base = path.join(root(), "expected/{version}")
+    var out: List<Store> = []
+    if not is_dir(base) {
+        return out
+    }
+    let names = match list(base.copy()) {
+        ok(n) => n,
+        err(_) => [],
+    }
+    for name in names {
+        if is_dir(path.join(base, name)) {
+            out.push(store(root(), version.copy(), name.copy()))
+        }
+    }
+    return out
+}
+
+fn reference(version: String) -> Store {
+    return store(root(), version, String("strict-math"))
+}
+
+fn seconds_since(t: Instant) -> f64 {
+    return unsafe { Instant.now() }.secs_since(t)
+}
+
+// --- list ---------------------------------------------------------------------------------------
+
+/// Cases per probe, and how many are recorded.
+@cli(name: "rig list")
+struct ListArgs {
+    /// The game version.
+    version: String = "26.3"
+    /// Only this probe's cases; may be given more than once.
+    probe: List<String>
+}
+
+fn cmd_list(a: ListArgs) -> u8 {
+    let s = reference(a.version.copy())
+    let others = other_configs(a.version.copy())
+    let by_probe = load_cases(a.probe.copy())
+    let quarantined = quarantine(s)
+    var columns = String()
+    for o in others {
+        columns.push_str(" {"differs in {o.config}":>24}")
+    }
+    println("{"probe":<12} {"cases":>6} {"recorded":>9} {"quarantined":>12}{columns}")
+    for (probe, cases) in by_probe {
+        let hashes = expected(s, probe.copy())
+        let recorded = cases.count(|c| hashes.contains(c.id))
+        let q = cases.count(|c| quarantined.contains(c.key()))
+        var differs = String()
+        for o in others {
+            let theirs = expected(o, probe.copy())
+            var n = 0usize
+            for c in cases {
+                if let mine = hashes.find(c.id) {
+                    if let other = theirs.find(c.id) {
+                        if mine != other {
+                            n += 1
+                        }
+                    }
+                }
+            }
+            differs.push_str(" {n:>24}")
+        }
+        println("{probe:<12} {cases.len():>6} {recorded:>9} {q:>12}{differs}")
+    }
+    return 0
+}
+
+// --- record -------------------------------------------------------------------------------------
+
+/// Runs vanilla, and writes goldens and expected hashes.
+@cli(name: "rig record")
+struct RecordArgs {
+    /// The game version.
+    version: String = "26.3"
+    /// Only this probe's cases; may be given more than once.
+    probe: List<String>
+    /// The vanilla configuration: strict-math (the reference), intrinsics, or all.
+    config: String = "strict-math"
+}
+
+fn cmd_record(a: RecordArgs) -> u8 {
+    var failed_any = false
+    for config in vanilla_configs(a.config.copy()) {
+        println("== {config}")
+        if not record_config(a, config.copy()) {
+            failed_any = true
+        }
+    }
+    return if failed_any { 1 } else { 0 }
+}
+
+fn record_config(a: RecordArgs, config: String) -> bool {
+    let s = store(root(), a.version.copy(), config.copy())
+    let by_probe = load_cases(a.probe.copy())
+    let quarantined = quarantine(s)
+    var sess = session(String("vanilla"), [], none, some(config.copy()))
+    if sess.adapter.game_version != a.version {
+        close(mut sess.adapter)
+        die("the vanilla adapter is {sess.adapter.game_version}, not {a.version}")
+    }
+    var failed_any = false
+    for (probe, cases) in by_probe {
+        let started = unsafe { Instant.now() }
+        var records: List<(String, Result)> = []
+        var problems: List<String> = []
+        var elsewhere: Set<String> = Set()
+        for c in cases {
+            if not here(c) {
+                elsewhere.insert(c.id.copy())
+            }
+        }
+        for c in cases {
+            if elsewhere.contains(c.id) {
+                continue
+            }
+            let result = run_case(mut sess, c)
+            if result.status != "ok" {
+                let lines = (result.message.copy() ?? String("")).trim().lines()
+                let first = if lines.is_empty() { String("") } else { lines[0].copy() }
+                problems.push("  {c.key()}: {result.status}: {first}")
+            }
+            records.push((c.id.copy(), result))
+        }
+        if not problems.is_empty() {
+            failed_any = true
+            println("{probe}: not recorded, {problems.len()} cases didn't run:")
+            println(problems[..problems.len().min(20)].join("\n"))
+            continue
+        }
+        let old = expected(s, probe.copy())
+        // Quarantined cases aren't repeatable, so their hashes would change on every record.
+        // Their goldens are still saved, for `diff`.
+        var hashes = LinkedMap<String, String>()
+        for (cid, r) in records {
+            if not quarantined.contains("{probe}:{cid}") {
+                hashes.insert(cid.copy(), r.digest())
+            }
+        }
+        var changed: List<String> = []
+        var added = 0usize
+        for (cid, h) in hashes {
+            if let was = old.find(cid) {
+                if was != h {
+                    changed.push(cid.copy())
+                }
+            } else {
+                added += 1
+            }
+        }
+        var removed = 0usize
+        for (cid, _) in old {
+            if not hashes.contains(cid) and not elsewhere.contains(cid) {
+                removed += 1
+            }
+        }
+        let recorded = hashes.len()
+        // Another system's cases keep the hashes it recorded.
+        for (cid, h) in old {
+            if elsewhere.contains(cid) {
+                hashes.insert(cid.copy(), h.copy())
+            }
+        }
+        let had_records = not records.is_empty()
+        let skipped = records.len() - recorded
+        save_golden(s, probe.copy(), records)
+        if had_records or hashes.len() > 0 {
+            save_expected(s, probe.copy(), cases[0].probe_version, about(sess), hashes)
+        }
+        let quarantine_note = if skipped > 0 { ", {skipped} quarantined" } else { String("") }
+        let elsewhere_note = if elsewhere.len() > 0 { ", {elsewhere.len()} for another system" } else { String("") }
+        println("{probe}: recorded {recorded} cases in {seconds_since(started):.1}s ({added} new, {changed.len()} changed, {removed} removed{quarantine_note}{elsewhere_note})")
+        for cid in changed[..changed.len().min(20)] {
+            println("  changed: {probe}:{cid}")
+        }
+    }
+    close(mut sess.adapter)
+    return not failed_any
+}
+
+// --- check --------------------------------------------------------------------------------------
+
+/// The self-check: vanilla against its own recorded hashes, under each variant.
+@cli(name: "rig check")
+struct CheckArgs {
+    /// The game version.
+    version: String = "26.3"
+    /// Only this probe's cases; may be given more than once.
+    probe: List<String>
+    /// `all`, or some of default, shuffled, twice, interpreter, c1, c2, serial-1cpu and
+    /// parallel-8cpu, with commas between.
+    variants: String = "default"
+    /// Quarantine the cases that aren't repeatable.
+    quarantine: bool
+    /// The vanilla configuration: strict-math (the reference), intrinsics, or all.
+    config: String = "strict-math"
+}
+
+/// Runs every case under one variant, giving {case key: why it differs from expected}.
+fn run_variant(v: Variant, config: String, by_probe: LinkedMap<String, List<Case>>, expected_by_probe: LinkedMap<String, LinkedMap<String, String>>, quarantined: LinkedMap<String, String>) -> LinkedMap<String, String> {
+    var sess = session(String("vanilla"), v.jvm.copy(), some("vanilla-{v.name}"), some(config.copy()))
+    var mismatches = LinkedMap<String, String>()
+    var work: List<Case> = []
+    for (_, cases) in by_probe {
+        for c in cases {
+            work.push(c.copy())
+        }
+    }
+    if v.shuffle {
+        var r = Random.new(20261027)
+        r.shuffle(mut work)
+    }
+    for c in work {
+        let hashes = expected_by_probe.find(c.probe) else {
+            continue
+        }
+        let wanted = hashes.find(c.id) else {
+            continue
+        }
+        let want = wanted.copy()
+        if quarantined.contains(c.key()) or not here(c) {
+            continue
+        }
+        var result = run_case(mut sess, c)
+        if v.twice and result.status == "ok" {
+            let first = result.digest()
+            result = run_case(mut sess, c)
+            if result.status == "ok" and result.digest() != first {
+                mismatches.insert(c.key(), String("differs when run again in the same process"))
+                continue
+            }
+        }
+        if result.status != "ok" {
+            let message = (result.message.copy() ?? String("")).trim()
+            let cut = if message.len() > 200 { message[..200] } else { message.copy() }
+            mismatches.insert(c.key(), "{result.status}: {cut}")
+        } else if result.digest() != want {
+            mismatches.insert(c.key(), String("hash differs from expected"))
+        }
+    }
+    close(mut sess.adapter)
+    return mismatches
+}
+
+fn cmd_check(a: CheckArgs) -> u8 {
+    let all = variants()
+    var chosen: List<Variant> = []
+    if a.variants == "all" {
+        chosen = all.copy()
+    } else {
+        for name in a.variants.split(",") {
+            let v = all.find(|x| x.name == name) else {
+                var names: List<String> = []
+                for x in all {
+                    names.push(String(x.name))
+                }
+                die("unknown variant `{name}`. Variants: {names.join(", ")}")
+            }
+            chosen.push(v.copy())
+        }
+    }
+    let by_probe = load_cases(a.probe.copy())
+    var found = LinkedMap<String, List<String>>()
+    var last: Store? = none
+    for config in vanilla_configs(a.config.copy()) {
+        let s = store(root(), a.version.copy(), config.copy())
+        let quarantined = quarantine(s)
+        var hashes_by_probe = LinkedMap<String, LinkedMap<String, String>>()
+        for (probe, _) in by_probe {
+            hashes_by_probe.insert(probe.copy(), expected(s, probe.copy()))
+        }
+        var unrecorded: List<String> = []
+        for (probe, cases) in by_probe {
+            for c in cases {
+                if not hashes_by_probe[probe].contains(c.id) and here(c) {
+                    unrecorded.push(c.key())
+                }
+            }
+        }
+        println("== {config}")
+        if not unrecorded.is_empty() {
+            println("check: {unrecorded.len()} cases have no expected hash yet; run `record` first. First: {unrecorded[0]}")
+        }
+        for v in chosen {
+            let started = unsafe { Instant.now() }
+            let mismatches = run_variant(v, config.copy(), by_probe, hashes_by_probe, quarantined)
+            println("{v.name:<14} {mismatches.len():>5} mismatches  {seconds_since(started):6.1}s  ({v.about})")
+            for (key, why) in mismatches {
+                if not found.contains(key) {
+                    found.insert(key.copy(), [])
+                }
+                found[key].push("{config}/{v.name}: {why}")
+            }
+        }
+        last = some(s)
+    }
+    if found.len() == 0 {
+        println("check: vanilla is repeatable on every recorded case")
+        return 0
+    }
+    println("check: {found.len()} cases aren't repeatable:")
+    var keys: List<String> = []
+    for (k, _) in found {
+        keys.push(k.copy())
+    }
+    keys.sort()
+    for key in keys[..keys.len().min(40)] {
+        println("  {key}: {found[key].join("; ")}")
+    }
+    if a.quarantine {
+        if let s = last {
+            var q = quarantine(s)
+            for (k, whys) in found {
+                q.insert(k.copy(), whys.join("; "))
+            }
+            save_quarantine(s, q)
+            println("check: quarantined them in {s.quarantine_path}")
+        }
+    }
+    return 1
+}
+
+// --- score --------------------------------------------------------------------------------------
+
+const OUTCOMES: [str; 8] = ["pass", "fail", "difference", "unimplemented", "error", "quarantined", "unrecorded", "elsewhere"]
+// Outcomes that don't count toward a score.
+const UNSCORED: [str; 4] = ["difference", "quarantined", "unrecorded", "elsewhere"]
+// Probes that test the rig itself, shown but not counted toward the game's score.
+const RIG_PROBES: [str; 1] = ["ping"]
+
+/// Runs an adapter against the expected hashes.
+@cli(name: "rig score")
+struct ScoreArgs {
+    /// The game version.
+    version: String = "26.3"
+    /// calcite, vanilla, or a path to an adapter.json.
+    adapter: String = "calcite"
+    /// Only this probe's cases; may be given more than once.
+    probe: List<String>
+    /// When scoring vanilla itself, the configuration to run it in.
+    config: String?
+    /// Exit with status 1 if any case fails or errors.
+    strict: bool
+}
+
+/// A count for each outcome, in OUTCOMES' order.
+fn zero_counts() -> LinkedMap<String, i64> {
+    var m = LinkedMap<String, i64>()
+    for o in OUTCOMES {
+        m.insert(String(o), 0)
+    }
+    return m
+}
+
+/// Python's `str.capitalize`, for the outcomes' names.
+fn capitalize(s: str) -> String {
+    return "{s[..1].to_upper_root()}{s[1..]}"
+}
+
+fn counts_json(m: LinkedMap<String, i64>) -> Json {
+    var out = LinkedMap<String, Json>()
+    for (k, v) in m {
+        out.insert(k.copy(), Json.Int(v))
+    }
+    return Json.Object(out)
+}
+
+fn cmd_score(a: ScoreArgs) -> u8 {
+    let s = reference(a.version.copy())
+    let others = other_configs(a.version.copy())
+    let by_probe = load_cases(a.probe.copy())
+    let quarantined = quarantine(s)
+    let registry = load_differences()
+    var sess = session(a.adapter.copy(), [], none, a.config.copy())
+    var outcomes = LinkedMap<String, String>()
+    var notes = LinkedMap<String, String>()
+    var stale: List<String> = []
+    // For each other configuration: cases it recorded differently, and how many of those pass it.
+    var other_counts = LinkedMap<String, LinkedMap<String, i64>>()
+    for o in others {
+        var m = LinkedMap<String, i64>()
+        m.insert("differ", 0)
+        m.insert("pass", 0)
+        m.insert("scored", 0)
+        other_counts.insert(o.config.copy(), m)
+    }
+    for (probe, cases) in by_probe {
+        let hashes = expected(s, probe.copy())
+        var theirs = LinkedMap<String, LinkedMap<String, String>>()
+        for o in others {
+            theirs.insert(o.config.copy(), expected(o, probe.copy()))
+        }
+        for c in cases {
+            let key = c.key()
+            if not here(c) {
+                outcomes.insert(key, String("elsewhere"))
+                continue
+            }
+            if quarantined.contains(key) {
+                outcomes.insert(key, String("quarantined"))
+                continue
+            }
+            let want = hashes.find(c.id) else {
+                outcomes.insert(key, String("unrecorded"))
+                continue
+            }
+            let result = run_case(mut sess, c)
+            let digest = if result.status == "ok" { result.digest() } else { String("") }
+            for (config, theirs_hashes) in theirs {
+                if result.status != "ok" {
+                    continue
+                }
+                let their = theirs_hashes.find(c.id) else {
+                    continue
+                }
+                other_counts[config]["scored"] += 1
+                if digest == their {
+                    other_counts[config]["pass"] += 1
+                }
+                if their != want {
+                    other_counts[config]["differ"] += 1
+                }
+            }
+            var covering: List<String> = []
+            for d in registry {
+                if d.covers(key) {
+                    covering.push(d.id.copy())
+                }
+            }
+            if result.status == "unimplemented" or result.status == "error" {
+                outcomes.insert(key.copy(), result.status.copy())
+                if result.status == "error" {
+                    let message = (result.message.copy() ?? String("")).trim()
+                    notes.insert(key.copy(), if message.len() > 300 { message[..300] } else { message.copy() })
+                }
+            } else if digest == want {
+                outcomes.insert(key.copy(), String("pass"))
+                for id in covering {
+                    stale.push("{id} covers {key}, which passes")
+                }
+            } else if not covering.is_empty() {
+                outcomes.insert(key.copy(), String("difference"))
+                notes.insert(key.copy(), covering.join(", "))
+            } else {
+                outcomes.insert(key.copy(), String("fail"))
+            }
+        }
+    }
+    close(mut sess.adapter)
+
+    var rows: List<(String, usize, LinkedMap<String, i64>)> = []
+    for (probe, cases) in by_probe {
+        var counts = zero_counts()
+        for c in cases {
+            counts[outcomes[c.key()]] += 1
+        }
+        rows.push((probe.copy(), cases.len(), counts))
+    }
+    // Probes that test the rig itself are shown but don't count toward the game's score.
+    var total = zero_counts()
+    var game_cases = 0usize
+    for (probe, n, counts) in rows {
+        if RIG_PROBES.any(|p| p == probe) {
+            continue
+        }
+        game_cases += n
+        for o in OUTCOMES {
+            total[String(o)] += counts[String(o)]
+        }
+    }
+
+    var names: List<String> = []
+    for o in OUTCOMES {
+        names.push(capitalize(o))
+    }
+    println("Scoreboard: {sess.adapter.name} against vanilla {a.version} ({s.config}, the reference)\n")
+    println("| Probe | Cases | {names.join(" | ")} | Score |")
+    var rule = String("|")
+    for _ in 0..OUTCOMES.len() + 3 {
+        rule.push_str("---|")
+    }
+    println(rule)
+    var shown = rows.copy()
+    shown.push((String("**All game probes**"), game_cases, total.copy()))
+    for (probe, n, counts) in shown {
+        let label = if RIG_PROBES.any(|p| p == probe) { "{probe} (rig)" } else { probe.copy() }
+        var unscored = 0i64
+        for o in UNSCORED {
+            unscored += counts[String(o)]
+        }
+        let scored = i64.wrap(n) - unscored
+        let score = if scored > 0 { "{100.0 * f64.nearest(counts["pass"]) / f64.nearest(scored):.1}%" } else { String("-") }
+        var cells: List<String> = []
+        for o in OUTCOMES {
+            cells.push("{counts[String(o)]}")
+        }
+        println("| {label} | {n} | {cells.join(" | ")} | {score} |")
+    }
+
+    var fails: List<String> = []
+    for (k, o) in outcomes {
+        if o == "fail" or o == "error" {
+            fails.push(k.copy())
+        }
+    }
+    if not fails.is_empty() {
+        println("\nFirst failures ({fails.len()} in all):")
+        for key in fails[..fails.len().min(20)] {
+            var note = String("")
+            if let n = notes.find(key) {
+                let lines = n.lines()
+                if not lines.is_empty() {
+                    note = ": {lines[0]}"
+                }
+            }
+            println("  {key}: {outcomes[key]}{note}")
+        }
+    }
+    for line in stale {
+        println("note: {line}")
+    }
+    for (config, counts) in other_counts {
+        if counts["scored"] > 0 {
+            println("\nAgainst vanilla's `{config}` configuration: {counts["pass"]} of {counts["scored"]} pass. {counts["differ"]} of those cases come out differently there than in {s.config}.")
+        }
+    }
+
+    let dir = out_dir()
+    if let err(e) = make_dir_all(dir.copy()) {
+        die("making {dir}: {e}")
+    }
+    let report = path.join(dir, "scoreboard-{path.file_stem(a.adapter) ?? a.adapter.copy()}.json")
+    var probes_json = LinkedMap<String, Json>()
+    for (probe, _, counts) in rows {
+        probes_json.insert(probe.copy(), counts_json(counts))
+    }
+    var others_json = LinkedMap<String, Json>()
+    for (config, counts) in other_counts {
+        others_json.insert(config.copy(), counts_json(counts))
+    }
+    var cases_json = LinkedMap<String, Json>()
+    for (k, o) in outcomes {
+        cases_json.insert(k.copy(), Json.Str(o.copy()))
+    }
+    var notes_json = LinkedMap<String, Json>()
+    for (k, n) in notes {
+        notes_json.insert(k.copy(), Json.Str(n.copy()))
+    }
+    var data = LinkedMap<String, Json>()
+    data.insert("adapter", about(sess))
+    data.insert("game_version", Json.Str(a.version.copy()))
+    data.insert("reference", Json.Str(s.config.copy()))
+    data.insert("totals", counts_json(total))
+    data.insert("probes", Json.Object(probes_json))
+    data.insert("other_configs", Json.Object(others_json))
+    data.insert("cases", Json.Object(cases_json))
+    data.insert("notes", Json.Object(notes_json))
+    if let err(e) = write_text(report.copy(), "{indented(Json.Object(data), false)}\n") {
+        die("writing {report}: {e}")
+    }
+    println("\nFull report: {report}")
+    return if a.strict and not fails.is_empty() { 1 } else { 0 }
+}
+
+// --- orders -------------------------------------------------------------------------------------
+
+/// Whether vanilla's decorations came out the same in each order (CAL-33).
+@cli(name: "rig orders")
+struct OrdersArgs {
+    /// The game version.
+    version: String = "26.3"
+}
+
+// The orders `cases/features/orders.py` decorates each area's chunks in.
+const ORDERS: [str; 4] = ["colored", "rows", "reverse", "center-out"]
+
+/// For each area of cases/features/orders.json, whether vanilla's recorded world is the same in
+/// every order its chunks were decorated in, and which orders agree where it isn't (CAL-33).
+fn cmd_orders(a: OrdersArgs) -> u8 {
+    let s = reference(a.version.copy())
+    let hashes = expected(s, String("features"))
+    var groups = LinkedMap<String, LinkedMap<String, String>>()
+    let by_probe = load_cases([String("features")])
+    if let cases = by_probe.find("features") {
+        for c in cases {
+            if not c.id.starts_with("orders-") {
+                continue
+            }
+            let order = ORDERS.find(|o| c.id.ends_with("-{o}")) else {
+                continue
+            }
+            let area = c.id[7..c.id.len() - order.len() - 1]
+            if not groups.contains(area) {
+                groups.insert(area.copy(), LinkedMap<String, String>())
+            }
+            if let h = hashes.find(c.id) {
+                groups[area].insert(String(order), h.copy())
+            }
+        }
+    }
+    if groups.len() == 0 {
+        die("no order cases: run cases/features/orders.py, then record them")
+    }
+    var areas: List<String> = []
+    for (area, _) in groups {
+        areas.push(area.copy())
+    }
+    areas.sort()
+    var same = 0usize
+    for area in areas {
+        let by_order = groups[area].copy()
+        var missing: List<String> = []
+        for o in ORDERS {
+            if not by_order.contains(String(o)) {
+                missing.push(String(o))
+            }
+        }
+        if not missing.is_empty() {
+            println("{area}: not recorded in {missing.join(", ")}")
+            continue
+        }
+        var alike = LinkedMap<String, List<String>>()
+        for o in ORDERS {
+            let h = by_order[String(o)].copy()
+            if not alike.contains(h) {
+                alike.insert(h.copy(), [])
+            }
+            alike[h].push(String(o))
+        }
+        if alike.len() == 1 {
+            same += 1
+            println("{area}: the same in every order")
+        } else {
+            var parts: List<String> = []
+            for (_, os) in alike {
+                parts.push(os.join(" = "))
+            }
+            println("{area}: differs: {parts.join(" | ")}")
+        }
+    }
+    println("{same} of {groups.len()} areas the same in every order")
+    return 0
+}
+
+// --- diff ---------------------------------------------------------------------------------------
+
+/// Compares one case's result with vanilla's golden.
+@cli(name: "rig diff")
+struct DiffArgs {
+    /// The game version.
+    version: String = "26.3"
+    /// The probe.
+    @positional
+    probe: String
+    /// The case's ID.
+    @positional
+    case: String
+    /// calcite, vanilla, or a path to an adapter.json.
+    adapter: String = "calcite"
+    /// When diffing vanilla itself, the configuration to run it in.
+    config: String?
+}
+
+/// 16 bytes from `start`, as `f"{start:08x}  {chunk.hex(' ')}"` shows them.
+fn hexdump(data: List<u8>, from: usize) -> String {
+    let end = (from + 16).min(data.len())
+    var parts: List<String> = []
+    for i in from..end {
+        parts.push(hex([data[i]]))
+    }
+    return "{from:08x}  {parts.join(" ")}"
+}
+
+fn cmd_diff(a: DiffArgs) -> u8 {
+    let s = reference(a.version.copy())
+    let by_probe = load_cases([a.probe.copy()])
+    let cases = by_probe.find(a.probe) else {
+        die("no case `{a.case}` in cases/{a.probe}/")
+    }
+    let found = cases.find(|c| c.id == a.case) else {
+        die("no case `{a.case}` in cases/{a.probe}/")
+    }
+    let c = found.copy()
+    let g = golden(s, a.probe.copy(), a.case.copy()) else {
+        die("no golden for {c.key()}; run `record` first")
+    }
+    var sess = session(a.adapter.copy(), [], none, a.config.copy())
+    let result = run_case(mut sess, c)
+    close(mut sess.adapter)
+    let base = root()
+    let source = if c.source.starts_with(base) { c.source[base.len() + 1..] } else { c.source.copy() }
+    let name = sess.adapter.name.copy()
+    println("case:     {c.key()} ({source})")
+    println("vanilla:  {g.status} {g.hash}")
+    println("{"{name}:":<9} {result.status} {if result.status == "ok" { result.digest() } else { String("") }}")
+    if let m = result.message {
+        if not m.is_empty() {
+            println(m.trim_end())
+        }
+    }
+    if result.status != "ok" {
+        return 0
+    }
+    if canonical_json(result.output) != canonical_json(g.output) {
+        println("\noutput differs:")
+        println("  vanilla: {canonical_json(g.output)}")
+        println("  {name}: {canonical_json(result.output)}")
+    }
+    if result.blobs.len() != g.blobs.len() {
+        println("\nblob count differs: vanilla {g.blobs.len()}, {name} {result.blobs.len()}")
+    }
+    for i in 0..g.blobs.len().min(result.blobs.len()) {
+        let want = g.blobs[i].copy()
+        let got = result.blobs[i].copy()
+        if want == got {
+            continue
+        }
+        let shortest = want.len().min(got.len())
+        var at = shortest
+        for j in 0..shortest {
+            if want[j] != got[j] {
+                at = j
+                break
+            }
+        }
+        println("\nblob {i} differs at byte {at} (vanilla {want.len()} bytes, {name} {got.len()}):")
+        let row = at - at % 16
+        println("  vanilla: {hexdump(want, row)}")
+        println("  {name}: {hexdump(got, row)}")
+    }
+    return 0
+}
+
+// --- main ---------------------------------------------------------------------------------------
+
+fn usage() -> String {
+    return "usage: rig [--version V] \{list,record,check,score,orders,diff\} ...\n\nThe oracle rig's runner.\n\ncommands:\n  list     cases per probe, and how many are recorded\n  record   run vanilla, write goldens and expected hashes\n  check    self-check: vanilla against its own expected hashes\n  score    run an adapter against the expected hashes\n  orders   whether vanilla's decorations came out the same in each order (CAL-33)\n  diff     compare one case's result with vanilla's golden\n\n`calx rig/runner/rig.calx COMMAND --help` says what each takes."
+}
+
+/// Prints the help a command was asked for, or the mistake in its options, and ends.
+fn cli_error(e: CliError) -> never {
+    if e.help {
+        println(e.message)
+        exit(0)
+    }
+    eprintln("{e.usage}\n{e.message}")
+    exit(2)
+}
+
+pub fn main() {
+    let given = args()
+    // `--version` may come before the command, as the Python runner took it.
+    var rest: List<String> = []
+    var version: String? = none
+    var command: String? = none
+    var i = 0usize
+    while i < given.len() {
+        let a = given[i].copy()
+        if command == none and a == "--version" and i + 1 < given.len() {
+            version = some(given[i + 1].copy())
+            i += 2
+            continue
+        }
+        if command == none and a.starts_with("--version=") {
+            version = some(a[10..])
+            i += 1
+            continue
+        }
+        if command == none and not a.starts_with("-") {
+            command = some(a)
+        } else if command == none {
+            if a == "-h" or a == "--help" {
+                println(usage())
+                exit(0)
+            }
+            eprintln("{usage()}\nrig: {a} isn't an option before the command")
+            exit(2)
+        } else {
+            rest.push(a)
+        }
+        i += 1
+    }
+    if let v = version {
+        rest.push("--version")
+        rest.push(v)
+    }
+    let name = command else {
+        eprintln("{usage()}\nrig: say which command")
+        exit(2)
+    }
+    let status = match name {
+        "list" => match ListArgs.parse_from(rest) {
+            ok(a) => cmd_list(a),
+            err(e) => cli_error(e),
+        },
+        "record" => match RecordArgs.parse_from(rest) {
+            ok(a) => cmd_record(a),
+            err(e) => cli_error(e),
+        },
+        "check" => match CheckArgs.parse_from(rest) {
+            ok(a) => cmd_check(a),
+            err(e) => cli_error(e),
+        },
+        "score" => match ScoreArgs.parse_from(rest) {
+            ok(a) => cmd_score(a),
+            err(e) => cli_error(e),
+        },
+        "orders" => match OrdersArgs.parse_from(rest) {
+            ok(a) => cmd_orders(a),
+            err(e) => cli_error(e),
+        },
+        "diff" => match DiffArgs.parse_from(rest) {
+            ok(a) => cmd_diff(a),
+            err(e) => cli_error(e),
+        },
+        _ => {
+            eprintln("{usage()}\nrig: no command `{name}`")
+            exit(2)
+        }
+    }
+    exit(status)
+}
+
+/// Says goodbye to the session's adapter and waits for it to end.
+pub fn finish(s: mut Session) {
+    close(mut s.adapter)
+}

@@ -27,7 +27,7 @@ class Case:
     source: Path
     # The one system the case runs on, or None for every system.
     system: str = None
-    # Whether its blobs are compared with each compound sorted by key (`unordered.py`).
+    # Whether its blobs are compared with each compound sorted by key (`unordered.calx`).
     unordered: bool = False
 
     @property

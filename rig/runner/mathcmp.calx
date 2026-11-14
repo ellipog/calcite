@@ -1,0 +1,344 @@
+module rig.runner.mathcmp
+
+// Compares java.lang.Math with StrictMath on the inputs vanilla uses (P1.5, D58).
+//
+//     calx rig/runner/mathcmp.calx [--count 500000] [--function sin ...]
+//
+// Calx's std.java.math ports fdlibm, so it matches StrictMath. Vanilla calls Math, which HotSpot
+// replaces with CPU-specific intrinsics. Wherever the two differ, Calcite would differ from
+// vanilla. This runs both through the vanilla adapter on large sweeps and reports every
+// function's mismatch rate, worst ULP distance and examples, plus an exhaustive check of Mth's
+// sine table. Nothing is recorded: the report goes to stdout and build/rig/<platform>/.
+
+import std.bytes
+import std.cli.{cli}
+import std.fs.{make_dir_all, write_text}
+import std.io.{flush}
+import std.json.{Json}
+import std.math.{PI}
+import std.path
+import std.process.{exit}
+import std.time.{Instant}
+import rig.runner.cases.{Case, SplitMix64, splitmix64}
+import rig.runner.rig.{Session, about, finish, out_dir, run_case, session}
+import tools.pyfmt.{float_hex, g}
+import tools.pyjson.{indented}
+import tools.repo.{platform}
+
+const SIN_SCALE: f64 = 10430.378350470453
+// Values per request, to keep frames a few MB.
+const CHUNK: i64 = 250000
+
+/// A domain: ranges, one per argument, or `bits` for random bit patterns, or `int-exponents`.
+/// Ranges follow how vanilla calls each function.
+struct Domain {
+    kind: str
+    ranges: List<(f64, f64)>
+}
+
+fn ranges(rs: own List<(f64, f64)>) -> Domain {
+    return Domain { kind: "ranges", ranges: rs }
+}
+
+fn special(kind: str) -> Domain {
+    return Domain { kind: kind, ranges: [] }
+}
+
+struct Function {
+    name: str
+    arity: i64
+    called: bool
+    domains: List<Domain>
+}
+
+fn functions() -> List<Function> {
+    let tau = 2.0 * PI
+    return [
+        Function { name: "sin", arity: 1, called: true, domains: [ranges([(-tau, tau)]), ranges([(-1e4, 1e4)]), special("bits")] },
+        Function { name: "cos", arity: 1, called: true, domains: [ranges([(-tau, tau)]), ranges([(-1e4, 1e4)]), special("bits")] },
+        Function { name: "pow", arity: 2, called: true, domains: [ranges([(0.0, 2.0), (0.0, 4.0)]), ranges([(0.0, 1e3), (-8.0, 8.0)]), special("int-exponents"), special("bits")] },
+        Function { name: "log", arity: 1, called: true, domains: [ranges([(0.0, 1.0)]), ranges([(1.0, 1e6)]), special("bits")] },
+        Function { name: "atan2", arity: 2, called: true, domains: [ranges([(-10.0, 10.0), (-10.0, 10.0)]), ranges([(-1e4, 1e4), (-1e4, 1e4)]), special("bits")] },
+        Function { name: "acos", arity: 1, called: true, domains: [ranges([(-1.0, 1.0)]), special("bits")] },
+        Function { name: "asin", arity: 1, called: true, domains: [ranges([(-1.0, 1.0)]), special("bits")] },
+        Function { name: "log1p", arity: 1, called: true, domains: [ranges([(0.0, 10.0)]), special("bits")] },
+        Function { name: "hypot", arity: 2, called: true, domains: [ranges([(-1e3, 1e3), (-1e3, 1e3)]), special("bits")] },
+        Function { name: "sqrt", arity: 1, called: true, domains: [ranges([(0.0, 1e6)]), special("bits")] },
+        Function { name: "tan", arity: 1, called: false, domains: [ranges([(-tau, tau)]), special("bits")] },
+        Function { name: "exp", arity: 1, called: false, domains: [ranges([(-745.0, 710.0)]), special("bits")] },
+        Function { name: "log10", arity: 1, called: false, domains: [ranges([(0.0, 1e6)]), special("bits")] },
+        Function { name: "atan", arity: 1, called: false, domains: [ranges([(-100.0, 100.0)]), special("bits")] },
+        Function { name: "cbrt", arity: 1, called: false, domains: [ranges([(-1e6, 1e6)]), special("bits")] },
+        Function { name: "sinh", arity: 1, called: false, domains: [ranges([(-20.0, 20.0)]), special("bits")] },
+        Function { name: "cosh", arity: 1, called: false, domains: [ranges([(-20.0, 20.0)]), special("bits")] },
+        Function { name: "tanh", arity: 1, called: false, domains: [ranges([(-20.0, 20.0)]), special("bits")] },
+        Function { name: "expm1", arity: 1, called: false, domains: [ranges([(-40.0, 40.0)]), special("bits")] },
+    ]
+}
+
+fn domain_name(d: Domain) -> String {
+    if d.kind != "ranges" {
+        return String(d.kind)
+    }
+    var parts: List<String> = []
+    for (lo, hi) in d.ranges {
+        parts.push("[{g(lo)}, {g(hi)})")
+    }
+    return parts.join(" x ")
+}
+
+/// A uniform value in [0, 1) from the high 53 bits.
+fn unit(r: mut SplitMix64) -> f64 {
+    return f64.nearest(r.next() >> 11) * (1.0 / 9007199254740992.0)
+}
+
+fn make_args(d: Domain, arity: i64, count: i64, seed: u64) -> List<u8> {
+    var rand = splitmix64(seed)
+    var out = List<u8>()
+    for _ in 0..count {
+        if d.kind == "bits" {
+            for _ in 0..arity {
+                bytes.put_u64_be(mut out, rand.next())
+            }
+        } else if d.kind == "int-exponents" {
+            // pow(x, n) with a small integer n, as in pow(d, 2) and pow(2, octave).
+            let u = unit(mut rand)
+            bytes.put_f64_be(mut out, -100.0 + 200.0 * u)
+            bytes.put_f64_be(mut out, f64.nearest(i64.wrap(rand.next() % 41) - 20))
+        } else {
+            for (lo, hi) in d.ranges {
+                let u = unit(mut rand)
+                bytes.put_f64_be(mut out, lo + (hi - lo) * u)
+            }
+        }
+    }
+    return out
+}
+
+/// f64 bits as integers that order like the floats, so ULP distance is a subtraction.
+fn ordered(bits: u64) -> i64 {
+    if bits >> 63 == 1 {
+        return -i64.wrap(bits & 0x7FFFFFFFFFFFFFFF)
+    }
+    return i64.wrap(bits)
+}
+
+fn is_nan(bits: u64) -> bool {
+    return (bits & 0x7FF0000000000000) == 0x7FF0000000000000 and bits & 0x000FFFFFFFFFFFFF != 0
+}
+
+fn probe_case(s: Session, probe: str, fn_name: str, args: own List<u8>) -> Case {
+    var input = LinkedMap<String, Json>()
+    input.insert("fn", Json.Str(String(fn_name)))
+    return Case { probe: String(probe), probe_version: version_of(s, probe), id: "mathcmp-{fn_name}", input: Json.Object(input), blobs: [args], source: String("mathcmp"), system: none, unordered: false }
+}
+
+fn run_probe(s: mut Session, probe: str, fn_name: str, args: own List<u8>) -> List<u8> {
+    let c = probe_case(s, probe, fn_name, args)
+    let result = run_case(mut s, c)
+    if result.status != "ok" or result.blobs.is_empty() {
+        eprintln("mathcmp: {probe} {fn_name}: {result.status}: {result.message ?? String("None")}")
+        exit(1)
+    }
+    return result.blobs[0].copy()
+}
+
+struct Stats {
+    count: i64
+    mismatches: i64
+    nan_payload_only: i64
+    max_ulps: i64
+    examples: List<Json>
+}
+
+fn compare(s: mut Session, f: Function, d: Domain, count: i64, seed: u64) -> Stats {
+    var stats = Stats { count: 0, mismatches: 0, nan_payload_only: 0, max_ulps: 0, examples: [] }
+    var done = 0i64
+    while done < count {
+        let n = CHUNK.min(count - done)
+        let args = make_args(d, f.arity, n, seed + u64.wrap(done))
+        let got_math = run_probe(mut s, "math", f.name, args.copy())
+        let got_strict = run_probe(mut s, "strictmath", f.name, args.copy())
+        for i in 0..usize.wrap(n) {
+            let a = bytes.u64_be(got_math, i * 8)
+            let b = bytes.u64_be(got_strict, i * 8)
+            if a == b {
+                continue
+            }
+            if is_nan(a) and is_nan(b) {
+                stats.nan_payload_only += 1
+                continue
+            }
+            stats.mismatches += 1
+            let ulps = (ordered(a) - ordered(b)).abs()
+            stats.max_ulps = stats.max_ulps.max(ulps)
+            if stats.examples.len() < 5 {
+                var shown: List<Json> = []
+                let arity = usize.wrap(f.arity)
+                for k in 0..arity {
+                    shown.push(Json.Str(float_hex(bytes.f64_be(args, (i * arity + k) * 8))))
+                }
+                var example = LinkedMap<String, Json>()
+                example.insert("args", Json.Array(shown))
+                example.insert("math", Json.Str(float_hex(f64.from_bits(a))))
+                example.insert("strictmath", Json.Str(float_hex(f64.from_bits(b))))
+                example.insert("ulps", Json.Int(ulps))
+                stats.examples.push(Json.Object(example))
+            }
+        }
+        done += n
+    }
+    stats.count = done
+    return stats
+}
+
+/// Mth's 65,536-entry table against (float) StrictMath.sin and (float) Math.sin of each index.
+fn sin_table(s: mut Session) -> Json {
+    var input = LinkedMap<String, Json>()
+    input.insert("fn", Json.Str("sin_table"))
+    let c = Case { probe: String("mth"), probe_version: version_of(s, "mth"), id: String("mathcmp-sin-table"), input: Json.Object(input), blobs: [], source: String("mathcmp"), system: none, unordered: false }
+    let got = run_case(mut s, c)
+    if got.status != "ok" or got.blobs.is_empty() {
+        eprintln("mathcmp: mth sin_table: {got.status}: {got.message ?? String("None")}")
+        exit(1)
+    }
+    let table = got.blobs[0].copy()
+    var args = List<u8>()
+    for i in 0..65536i64 {
+        bytes.put_f64_be(mut args, f64.nearest(i) / SIN_SCALE)
+    }
+    var out = LinkedMap<String, Json>()
+    for probe in ["strictmath", "math"] {
+        let doubles = run_probe(mut s, probe, "sin", args.copy())
+        var bad: List<Json> = []
+        var mismatches = 0i64
+        for i in 0..65536usize {
+            let float = f32.nearest(bytes.f64_be(doubles, i * 8)).to_bits()
+            if float != bytes.u32_be(table, i * 4) {
+                mismatches += 1
+                if bad.len() < 10 {
+                    bad.push(Json.Int(i64.wrap(i)))
+                }
+            }
+        }
+        var m = LinkedMap<String, Json>()
+        m.insert("mismatches", Json.Int(mismatches))
+        m.insert("first", Json.Array(bad))
+        out.insert(String(probe), Json.Object(m))
+    }
+    return Json.Object(out)
+}
+
+/// Compare Math with StrictMath on vanilla's inputs.
+@cli(name: "mathcmp")
+struct Args {
+    /// Arguments per domain.
+    count: i64 = 500000
+    /// Only these functions; may be given more than once.
+    function: List<String>
+    /// The vanilla configuration: intrinsics, HotSpot's defaults, is the case in question.
+    config: String = "intrinsics"
+    /// An extra JVM flag, such as -Xint; may be given more than once.
+    jvm_arg: List<String>
+}
+
+fn about_text(a: Json, key: str) -> String {
+    return match a.get(String(key)) {
+        some(Json.Str(s)) => s,
+        some(v) => "{v}",
+        none => String("None"),
+    }
+}
+
+pub fn main() {
+    let args = Args.parse()
+    var s = session(String("vanilla"), args.jvm_arg.copy(), some(String("vanilla-mathcmp")), some(args.config.copy()))
+    let started = unsafe { Instant.now() }
+    let info = about(s)
+    var jvm_args: List<Json> = []
+    for a in args.jvm_arg {
+        jvm_args.push(Json.Str(a.copy()))
+    }
+    var report = LinkedMap<String, Json>()
+    report.insert("platform", Json.Str(platform()))
+    report.insert("about", info.copy())
+    report.insert("config", Json.Str(args.config.copy()))
+    report.insert("jvm_args", Json.Array(jvm_args))
+    report.insert("count_per_domain", Json.Int(args.count))
+    println("Math against StrictMath, {args.count:,} arguments per domain, on {platform()} ({about_text(info, "java.vm.version")}, {about_text(info, "os.arch")}, {args.config})\n")
+    println("| Function | Vanilla calls it | Domain | Mismatches | Worst ULPs |")
+    println("|---|---|---|---|---|")
+    var seed: u64 = 20261027
+    var by_function = LinkedMap<String, Json>()
+    for f in functions() {
+        if not args.function.is_empty() and not args.function.any(|x| x == f.name) {
+            continue
+        }
+        var rows: List<Json> = []
+        for d in f.domains {
+            seed += 1000003
+            let stats = compare(mut s, f, d, args.count, seed)
+            var row = LinkedMap<String, Json>()
+            row.insert("domain", Json.Str(domain_name(d)))
+            row.insert("count", Json.Int(stats.count))
+            row.insert("mismatches", Json.Int(stats.mismatches))
+            row.insert("nan_payload_only", Json.Int(stats.nan_payload_only))
+            row.insert("max_ulps", Json.Int(stats.max_ulps))
+            row.insert("examples", Json.Array(stats.examples.copy()))
+            rows.push(Json.Object(row))
+            let rate = "{stats.mismatches:,} ({100.0 * f64.nearest(stats.mismatches) / f64.nearest(stats.count):.3}%)"
+            println("| `{f.name}` | {if f.called { "yes" } else { "no" }} | {domain_name(d)} | {rate} | {stats.max_ulps} |")
+            flush()
+        }
+        var entry = LinkedMap<String, Json>()
+        entry.insert("called_by_vanilla", Json.Bool(f.called))
+        entry.insert("domains", Json.Array(rows))
+        by_function.insert(String(f.name), Json.Object(entry))
+    }
+    report.insert("functions", Json.Object(by_function))
+    let table = sin_table(mut s)
+    report.insert("mth_sin_table", table.copy())
+    let strict_bad = table.pointer("/strictmath/mismatches") ?? Json.Null
+    let math_bad = table.pointer("/math/mismatches") ?? Json.Null
+    println("\nMth sine table, 65,536 entries: {strict_bad} differ from (float) StrictMath.sin, {math_bad} from (float) Math.sin")
+    finish(mut s)
+
+    let dir = out_dir()
+    if let err(e) = make_dir_all(dir.copy()) {
+        eprintln("mathcmp: making {dir}: {e}")
+        exit(1)
+    }
+    var suffix = String("")
+    for a in args.jvm_arg {
+        suffix.push_str(strip_dashes(a).replace(":", "").replace("=", ""))
+    }
+    let name = if suffix.is_empty() { "mathcmp-{args.config}.json" } else { "mathcmp-{args.config}-{suffix}.json" }
+    let file = path.join(dir, name)
+    if let err(e) = write_text(file.copy(), "{indented(Json.Object(report), false)}\n") {
+        eprintln("mathcmp: writing {file}: {e}")
+        exit(1)
+    }
+    println("\n{unsafe { Instant.now() }.secs_since(started):.0}s. Full report, with examples: {file}")
+}
+
+/// Python's `s.strip("-")`.
+fn strip_dashes(s: String) -> String {
+    var a = 0usize
+    var b = s.len()
+    while a < b and s.byte_at(a) == 45 {
+        a += 1
+    }
+    while b > a and s.byte_at(b - 1) == 45 {
+        b -= 1
+    }
+    return s[a..b]
+}
+
+/// The version of `probe` the adapter has, which the made-up cases claim, so they run whatever
+/// version the probes are at.
+fn version_of(s: Session, probe: str) -> i64 {
+    if let v = s.adapter.probes.find(String(probe)) {
+        return v
+    }
+    return 1
+}

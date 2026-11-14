@@ -14,7 +14,7 @@ about a chunk out at 100, -60 are decorated with `structured` in one shared worl
 orders: by color, as Calcite does; row by row, `z` then `x`; the reverse of that; and from the
 center out, the corners last. Each case is `final`, so it's the world the decorations left,
 whatever their order, and two orders give the same blob exactly when the order made no
-difference. `rig.py orders` says which.
+difference. `rig.calx orders` says which.
 """
 
 import sys

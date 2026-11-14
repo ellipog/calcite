@@ -1,0 +1,485 @@
+module rig.runner.cases
+
+// Case files (rig/PROTOCOL.md, "Case files"): loading them and expanding their blobs, and writing
+// the ones the case generators make.
+
+import std.bytes
+import std.fs.{glob, is_dir, list, make_dir_all, read_text, write_text}
+import std.json
+import std.json.{Json}
+import std.path
+import tools.pyjson.{compact, py_repr}
+
+// The systems a case can be for, when vanilla gives each its own result, as the rig names them.
+const SYSTEMS: [str; 2] = ["windows", "linux"]
+
+pub struct Case {
+    pub probe: String
+    pub probe_version: i64
+    pub id: String
+    pub input: Json
+    pub blobs: List<List<u8>>
+    pub source: String
+    /// The one system the case runs on, or none for every system.
+    pub system: String?
+    /// Whether its blobs are compared with each compound sorted by key (`unordered.calx`).
+    pub unordered: bool
+}
+
+impl Case {
+    pub fn key(self) -> String {
+        return "{self.probe}:{self.id}"
+    }
+}
+
+/// Steele, Lea and Flood's SplitMix64. The case generators' only source of randomness.
+pub struct SplitMix64 {
+    state: u64
+}
+
+pub fn splitmix64(seed: u64) -> SplitMix64 {
+    return SplitMix64 { state: seed }
+}
+
+impl SplitMix64 {
+    pub fn next(mut self) -> u64 {
+        self.state = self.state + 0x9E3779B97F4A7C15
+        var z = self.state
+        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+        return z ^ (z >> 31)
+    }
+}
+
+/// Whether a case ID is `^[a-z0-9][a-z0-9._-]*$`.
+fn good_id(id: String) -> bool {
+    if id.is_empty() {
+        return false
+    }
+    for i in 0..id.len() {
+        let b = id.byte_at(i)
+        let plain = (b >= 97 and b <= 122) or (b >= 48 and b <= 57)
+        if not plain and (i == 0 or not (b == 46 or b == 95 or b == 45)) {
+            return false
+        }
+    }
+    return true
+}
+
+// Python's `float("nan")`, whose bits CPython fixes, and its negation.
+const NAN_BITS: u64 = 0x7FF8000000000000
+const MINUS_NAN_BITS: u64 = 0xFFF8000000000000
+
+/// A float literal as Python reads it: `float.fromhex` for one starting `0x`, `float` for the
+/// rest: "1.5", "-0", "inf", "nan", "0x1p-1074".
+fn float_of(v: Json) -> f64 ! String {
+    let Json.Str(text) = v else {
+        fail "float literal {py_repr(v)} must be a string"
+    }
+    let t = text.trim().to_lower_root()
+    let negative = t.starts_with("-")
+    let unsigned = if t.starts_with("-") or t.starts_with("+") { t[1..] } else { t.copy() }
+    if unsigned == "inf" or unsigned == "infinity" {
+        return if negative { -f64.INFINITY } else { f64.INFINITY }
+    }
+    if unsigned == "nan" {
+        return f64.from_bits(if negative { MINUS_NAN_BITS } else { NAN_BITS })
+    }
+    var literal = t.replace("_", "")
+    if unsigned.starts_with("0x") and not unsigned.contains("p") {
+        literal = "{literal}p0"
+    }
+    // Java's grammar, which f64.parse reads, takes a type letter at the end, which Python's
+    // doesn't.
+    if literal.ends_with("d") or literal.ends_with("f") {
+        fail "could not convert string to float: {py_repr(Json.Str(text.copy()))}"
+    }
+    let value = f64.parse(literal) else {
+        fail "could not convert string to float: {py_repr(Json.Str(text.copy()))}"
+    }
+    return value
+}
+
+/// An integer as Python's `int(x)` takes one: a number, which a float is cut to, or decimal text.
+fn int_of(v: Json) -> i64 ! String {
+    return match v {
+        Json.Int(i) => i,
+        Json.Float(f) => i64.saturate(f),
+        Json.Bool(b) => if b { 1 } else { 0 },
+        Json.Str(s) => {
+            let t = s.trim().replace("_", "")
+            let n = i64.parse(t) else {
+                fail "invalid literal for int() with base 10: {py_repr(Json.Str(s.copy()))}"
+            }
+            n
+        }
+        _ => fail "int() can't take {py_repr(v)}",
+    }
+}
+
+/// A seed, as `int(spec["seed"]) & MASK64` gives it.
+fn seed_of(v: Json) -> u64 ! String {
+    return match v {
+        Json.UInt(u) => u,
+        Json.Str(s) => {
+            let t = s.trim().replace("_", "")
+            if let u = u64.parse(t) {
+                u
+            } else {
+                let n = i64.parse(t) else {
+                    fail "bad seed"
+                }
+                u64.wrap(n)
+            }
+        }
+        _ => u64.wrap(try int_of(v)),
+    }
+}
+
+fn spec_error(spec: Json) -> String {
+    return "generator {py_repr(spec)} needs a decimal `seed` and a `count`"
+}
+
+/// The ranges a range generator takes: its `ranges`, or its `min` and `max`.
+fn ranges_of(spec: Json) -> List<(Json, Json)> ! String {
+    var out: List<(Json, Json)> = []
+    if let Json.Array(given) = spec.get("ranges") ?? Json.Null {
+        for r in given {
+            let Json.Array(pair) = r else {
+                fail "a range {py_repr(r)} must be [min, max]"
+            }
+            if pair.len() != 2 {
+                fail "a range {py_repr(r)} must be [min, max]"
+            }
+            out.push((pair[0].copy(), pair[1].copy()))
+        }
+    }
+    if out.is_empty() {
+        let lo = spec.get("min") else {
+            fail "'min'"
+        }
+        let hi = spec.get("max") else {
+            fail "'max'"
+        }
+        out.push((lo, hi))
+    }
+    return out
+}
+
+fn generate(spec: Json) -> List<u8> ! String {
+    let gen = match spec.get("gen") {
+        some(Json.Str(g)) => g,
+        _ => String("None"),
+    }
+    let seed_json = spec.get("seed") else {
+        fail spec_error(spec)
+    }
+    let count_json = spec.get("count") else {
+        fail spec_error(spec)
+    }
+    let seed = match seed_of(seed_json) {
+        ok(s) => s,
+        err(_) => fail spec_error(spec),
+    }
+    let count = match int_of(count_json) {
+        ok(c) => c,
+        err(_) => fail spec_error(spec),
+    }
+    var rand = splitmix64(seed)
+    var out = List<u8>()
+    if gen == "f64_bits" {
+        for _ in 0..count {
+            bytes.put_u64_be(mut out, rand.next())
+        }
+    } else if gen == "f32_bits" {
+        for _ in 0..count {
+            bytes.put_u32_be(mut out, u32.wrap(rand.next() >> 32))
+        }
+    } else if gen == "f64_range" or gen == "f32_range" {
+        // `ranges` makes tuples: each of the `count` records has one value from each range in turn.
+        var bounds: List<(f64, f64)> = []
+        for (lo, hi) in try ranges_of(spec) {
+            bounds.push((try float_of(lo), try float_of(hi)))
+        }
+        for _ in 0..count {
+            for (lo, hi) in bounds {
+                // 53 random bits scaled into [0, 1), exactly, then into [min, max) in f64.
+                let u = f64.nearest(rand.next() >> 11) * (1.0 / 9007199254740992.0)
+                let v = lo + (hi - lo) * u
+                if gen == "f64_range" {
+                    bytes.put_f64_be(mut out, v)
+                } else {
+                    bytes.put_f32_be(mut out, try to_f32(v))
+                }
+            }
+        }
+    } else if gen == "i32_range" {
+        // As with the float ranges, `ranges` makes tuples, one value from each range in turn.
+        var bounds: List<(i64, i64)> = []
+        for (lo, hi) in try ranges_of(spec) {
+            let a = try int_of(lo)
+            let b = try int_of(hi)
+            if not (-(1i64 << 31) <= a and a <= b and b < (1i64 << 31)) {
+                fail "generator {py_repr(spec)}: bad i32 range"
+            }
+            bounds.push((a, b))
+        }
+        for _ in 0..count {
+            for (lo, hi) in bounds {
+                let span = u64.wrap(hi - lo + 1)
+                bytes.put_i32_be(mut out, i32.wrap(lo + i64.wrap(rand.next() % span)))
+            }
+        }
+    } else {
+        fail "unknown generator `{gen}`"
+    }
+    return out
+}
+
+/// A double packed as a float, as `struct.pack(">f", v)` packs it: refused if it's too big.
+fn to_f32(v: f64) -> f32 ! String {
+    let f = f32.nearest(v)
+    if f.is_infinite() and not v.is_infinite() {
+        fail "float too large to pack with f format"
+    }
+    return f
+}
+
+/// Python's `int(v, 16)`.
+fn hex_int(v: Json) -> u64 ! String {
+    let Json.Str(s) = v else {
+        fail "int() can't convert non-string with explicit base"
+    }
+    var t = s.trim().replace("_", "").to_lower_root()
+    if t.starts_with("0x") {
+        t = t[2..]
+    }
+    let value = u64.parse_radix(t, 16) else {
+        fail "invalid literal for int() with base 16: {py_repr(Json.Str(s.copy()))}"
+    }
+    return value
+}
+
+/// Python's `bytes.fromhex`: two hex digits a byte, with spaces between bytes.
+fn from_hex(v: Json) -> List<u8> ! String {
+    let Json.Str(s) = v else {
+        fail "fromhex() argument must be str, not {v.kind()}"
+    }
+    var out = List<u8>()
+    var i = 0usize
+    while i < s.len() {
+        let b = s.byte_at(i)
+        if b == 32 or b == 9 or b == 10 or b == 13 or b == 11 or b == 12 {
+            i += 1
+            continue
+        }
+        if i + 1 >= s.len() {
+            fail "non-hexadecimal number found in fromhex() arg at position {i}"
+        }
+        let byte = u8.parse_radix(s[i..i + 2], 16) else {
+            fail "non-hexadecimal number found in fromhex() arg at position {i}"
+        }
+        out.push(byte)
+        i += 2
+    }
+    return out
+}
+
+fn part(p: Json) -> List<u8> ! String {
+    if let Json.Str(s) = p {
+        let value = bytes.from_base64(s) else {
+            fail "Incorrect padding or characters in {py_repr(p)}"
+        }
+        return value
+    }
+    let Json.Object(m) = p else {
+        fail "blob part {py_repr(p)} must be base64 or an object"
+    }
+    if m.contains("gen") {
+        return try generate(p)
+    }
+    if m.len() != 1 {
+        fail "blob part {py_repr(p)} must have exactly one key"
+    }
+    let kind = p.keys()[0].copy()
+    let Json.Array(values) = m[kind] else {
+        fail "blob part `{kind}` must be a list"
+    }
+    var out = List<u8>()
+    for v in values {
+        if kind == "f64" {
+            bytes.put_f64_be(mut out, try float_of(v))
+        } else if kind == "f32" {
+            bytes.put_f32_be(mut out, try to_f32(try float_of(v)))
+        } else if kind == "f64_bits" {
+            bytes.put_u64_be(mut out, try hex_int(v))
+        } else if kind == "f32_bits" {
+            let n = try hex_int(v)
+            if n > 0xFFFFFFFF {
+                fail "argument out of range"
+            }
+            bytes.put_u32_be(mut out, u32.wrap(n))
+        } else if kind == "i32" {
+            let n = try int_of(v)
+            if n < -(1i64 << 31) or n >= (1i64 << 31) {
+                fail "'i' format requires -2147483648 <= number <= 2147483647"
+            }
+            bytes.put_i32_be(mut out, i32.wrap(n))
+        } else if kind == "i64" {
+            bytes.put_i64_be(mut out, try int_of(v))
+        } else if kind == "hex" {
+            out.extend(try from_hex(v))
+        } else {
+            fail "unknown blob part `{kind}`"
+        }
+    }
+    if values.is_empty() and not ["f64", "f32", "f64_bits", "f32_bits", "i32", "i64", "hex"].any(|k| k == kind) {
+        fail "unknown blob part `{kind}`"
+    }
+    return out
+}
+
+/// A blob is one part or a list of parts, put together.
+pub fn expand_blob(blob: Json) -> List<u8> ! String {
+    if let Json.Array(parts) = blob {
+        var out = List<u8>()
+        for p in parts {
+            out.extend(try part(p))
+        }
+        return out
+    }
+    return try part(blob)
+}
+
+/// Writes a generated case file, one case per line so its diffs stay readable.
+pub fn write_file(file: String, probe: String, generated_by: String, cases: List<Json>, probe_version: i64) {
+    var lines: List<String> = []
+    for c in cases {
+        lines.push(compact(c))
+    }
+    let text = "\{\n  \"probe\": {compact(Json.Str(probe.copy()))},\n  \"probe_version\": {probe_version},\n  \"generated_by\": {compact(Json.Str(generated_by.copy()))},\n  \"cases\": [\n    {lines.join(",\n    ")}\n  ]\n\}\n"
+    if let dir = path.parent_dir(file) {
+        if let err(e) = make_dir_all(dir) {
+            panic("making {dir}: {e}")
+        }
+    }
+    if let err(e) = write_text(file.copy(), text) {
+        panic("writing {file}: {e}")
+    }
+    println("wrote {cases.len()} cases to {file}")
+}
+
+/// A case file's probe and its cases.
+pub fn load_file(file: String) -> (String, List<Case>) ! String {
+    let text = match read_text(file.copy()) {
+        ok(some(t)) => t,
+        ok(none) => fail "{file}: isn't UTF-8",
+        err(e) => fail "{file}: {e}",
+    }
+    let data = match json.parse(text) {
+        ok(d) => d,
+        err(e) => fail "{file}: {e}",
+    }
+    let probe = match data.get("probe") {
+        some(Json.Str(p)) => p,
+        _ => fail "{file}: needs `probe` and an integer `probe_version`",
+    }
+    let version = match data.get("probe_version") {
+        some(Json.Int(v)) => v,
+        _ => fail "{file}: needs `probe` and an integer `probe_version`",
+    }
+    var cases: List<Case> = []
+    if let Json.Array(raws) = data.get("cases") ?? Json.Null {
+        for (i, raw) in raws.enumerate() {
+            let cid = match raw.get("id") {
+                some(Json.Str(c)) => c,
+                some(other) => fail "{file}: case {i} has a bad id {py_repr(other)}",
+                none => fail "{file}: case {i} has a bad id None",
+            }
+            if not good_id(cid) {
+                fail "{file}: case {i} has a bad id {py_repr(Json.Str(cid))}"
+            }
+            var blobs: List<List<u8>> = []
+            if let Json.Array(given) = raw.get("blobs") ?? Json.Null {
+                for b in given {
+                    match expand_blob(b) {
+                        ok(bytes_of) => blobs.push(bytes_of),
+                        err(e) => fail "{file}: case `{cid}`: {e}",
+                    }
+                }
+            }
+            let system: String? = match raw.get("system") {
+                none => none,
+                some(Json.Null) => none,
+                some(Json.Str(s)) => {
+                    if not SYSTEMS.any(|x| x == s) {
+                        fail "{file}: case `{cid}`: `system` is {py_repr(Json.Str(s.copy()))}, not one of {SYSTEMS.join(", ")}"
+                    }
+                    some(s)
+                }
+                some(other) => fail "{file}: case `{cid}`: `system` is {py_repr(other)}, not one of {SYSTEMS.join(", ")}",
+            }
+            let unordered = match raw.get("unordered") {
+                none => false,
+                some(Json.Bool(b)) => b,
+                some(other) => fail "{file}: case `{cid}`: `unordered` is {py_repr(other)}, not true or false",
+            }
+            let input = raw.get("input") ?? Json.Object(LinkedMap<String, Json>())
+            cases.push(Case { probe: probe.copy(), probe_version: version, id: cid, input: input, blobs: blobs, source: file.copy(), system: system, unordered: unordered })
+        }
+    }
+    return (probe, cases)
+}
+
+/// Every case under cases/, by probe, in file then case order: only `probes`' if any are given.
+pub fn load_all(cases_dir: String, probes: List<String>) -> LinkedMap<String, List<Case>> ! String {
+    var result = LinkedMap<String, List<Case>>()
+    let names = match list(cases_dir.copy()) {
+        ok(n) => n,
+        err(e) => fail "{cases_dir}: {e}",
+    }
+    for name in names {
+        let dir = path.join(cases_dir, name)
+        if not is_dir(dir) {
+            continue
+        }
+        if not probes.is_empty() and not probes.contains(name) {
+            continue
+        }
+        var seen = LinkedMap<String, String>()
+        let files = match glob(path.join(dir, "*.json")) {
+            ok(f) => f,
+            err(e) => fail "{dir}: {e}",
+        }
+        for file in files {
+            let (probe, cases) = try load_file(file.copy())
+            if probe != name {
+                fail "{file}: says probe `{probe}` but is in cases/{name}/"
+            }
+            let file_name = path.file_name(file) ?? file.copy()
+            for case in cases {
+                if let other = seen.find(case.id) {
+                    fail "{file}: case `{case.id}` is also in {other}"
+                }
+                seen.insert(case.id.copy(), file_name.copy())
+                if not result.contains(probe) {
+                    result.insert(probe.copy(), [])
+                }
+                result[probe].push(case.copy())
+            }
+        }
+    }
+    if not probes.is_empty() {
+        var missing: List<String> = []
+        for p in probes {
+            if not result.contains(p) and not missing.contains(p) {
+                missing.push(p.copy())
+            }
+        }
+        if not missing.is_empty() {
+            missing.sort()
+            fail "no cases for {missing.join(", ")}"
+        }
+    }
+    return result
+}
