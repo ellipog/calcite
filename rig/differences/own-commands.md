@@ -17,6 +17,7 @@ cases:
   - session:dragon/*/commands
   - session:dragon-parts/*/commands
   - session:dragon-strikes/*/commands
+  - session:mob-targets/*/commands
   - session:dragon-flight/*/commands
   - session:dragon-charge/*/commands
   - session:dragon-breath/*/commands
