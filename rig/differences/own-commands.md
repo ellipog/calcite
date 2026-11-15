@@ -18,6 +18,8 @@ cases:
   - session:dragon-parts/*/commands
   - session:dragon-strikes/*/commands
   - session:mob-targets/*/commands
+  - session:zombie-convert/*/commands
+  - session:zombie-convert-hard/*/commands
   - session:dragon-flight/*/commands
   - session:dragon-charge/*/commands
   - session:dragon-breath/*/commands
