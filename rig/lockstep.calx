@@ -3,17 +3,26 @@ module rig.lockstep
 // The determinism check, G5.3 (D21, D283): a session the server records on many threads replays on
 // one to the same packets and lines.
 //
-//     calx rig/lockstep.calx [--bots 4] [--seconds 20] [--workers 8] [--server EXE] [--swarm EXE]
+//     calx rig/lockstep.calx [--bots 4] [--seconds 20] [--workers 8] [--sessions 2]
+//                            [--world DIR] [--server EXE] [--swarm EXE]
 //
 // The server is Calcite's release build, recording its inputs, in a new world of a fixed seed in
 // build/lockstep/<platform>/, with `chunk-workers` threads generating, reading and lighting chunks
 // and bots from src/rig/swarm.calx walking out from spawn from the start, so new chunks are made
 // the whole time. Then `--replay` plays the input log back, which runs the generator and light on
 // its own thread, and checks each packet sent and line logged against the recording. Any
-// difference fails, with where it first was.
+// difference fails, with where it first was. Each session after the first carries on in the
+// world the one before left, the bots seeing 2 chunks further and starting from where they were,
+// so the chunks it parked part-way are made full (D683), and is replayed in turn (CAL-114).
+//
+// --world starts from a copy of a saved world instead of a new one. A replay's generator makes
+// again the chunks Calcite saved part-way just as it carried on from them, so only a world
+// another server left chunks part-way in, such as the one rig/runner/roundtrip.calx has vanilla
+// make, build/rig/roundtrip/vanilla/world, checks that the replay's finds what the recording's
+// did (CAL-114).
 
 import std.cli.{cli}
-import std.fs.{absolute, exists, glob, make_dir_all, metadata, remove_dir_all, write_text}
+import std.fs.{absolute, copy_dir_all, exists, glob, make_dir_all, metadata, remove_dir_all, write_text}
 import std.path
 import std.process.{Child, Command, Stdio}
 import std.regex.{Regex}
@@ -54,8 +63,8 @@ fn put(file: String, text: String) {
     }
 }
 
-/// Makes a new world folder holding the server's settings.
-fn prepare(world: String, workers: i64) {
+/// Makes a new world folder.
+fn prepare(world: String) {
     if exists(world) {
         if let err(e) = remove_dir_all(world) {
             die("lockstep: removing {world}: {e}")
@@ -64,7 +73,12 @@ fn prepare(world: String, workers: i64) {
     if let err(e) = make_dir_all(world) {
         die("lockstep: making {world}: {e}")
     }
-    put(path.join(world, "server.properties"), "online-mode=false\nwhite-list=false\nserver-ip=127.0.0.1\nserver-port={PORT}\nmax-players=100\nview-distance={VIEW}\nsimulation-distance={VIEW}\nlevel-seed={SEED}\nmotd=Calcite lockstep check\n")
+}
+
+/// Writes the server's settings in the world folder, for a session whose players see `view`
+/// chunks.
+fn settings(world: String, workers: i64, view: i64) {
+    put(path.join(world, "server.properties"), "online-mode=false\nwhite-list=false\nserver-ip=127.0.0.1\nserver-port={PORT}\nmax-players=100\nview-distance={view}\nsimulation-distance={view}\nlevel-seed={SEED}\nmotd=Calcite lockstep check\n")
     put(path.join(world, "calcite.properties"), "console-dashboard=off\nrecord-inputs=true\nchunk-workers={workers}\n")
 }
 
@@ -126,8 +140,9 @@ fn read_to_end(server: Child, lines: mut List<String>) -> bool {
     }
 }
 
-/// Runs the server with the bots on it, and gives the input log it recorded and the bots' report.
-fn record(server: String, swarm: String, world: String, bots: i64, seconds: i64) -> (String, String) {
+/// Runs the server with the bots on it, seeing `view` chunks, and gives the input log it
+/// recorded and the bots' report.
+fn record(server: String, swarm: String, world: String, bots: i64, seconds: i64, view: i64) -> (String, String) {
     var lines: List<String> = []
     var p = match Command.new(server).dir(world.copy()).stdin(Stdio.Pipe).stdout(Stdio.Pipe).stderr(Stdio.Stdout).spawn() {
         ok(c) => c,
@@ -138,7 +153,7 @@ fn record(server: String, swarm: String, world: String, bots: i64, seconds: i64)
         die("lockstep: the server didn't say it was ready:\n{last(lines, 20)}")
     }
     // The bots run while the server's lines are read, so it never waits on a full pipe.
-    let flock = Command.new(swarm).args(["{PORT}", "{bots}", "{bots}", "{seconds}", "{VIEW}", "--walk-at-once", "--speed=4"]).dir(root()).stdout(Stdio.Pipe).stderr(Stdio.Pipe)
+    let flock = Command.new(swarm).args(["{PORT}", "{bots}", "{bots}", "{seconds}", "{view}", "--walk-at-once", "--speed=4"]).dir(root()).stdout(Stdio.Pipe).stderr(Stdio.Pipe)
     var b = match flock.spawn() {
         ok(c) => c,
         err(e) => {
@@ -220,10 +235,14 @@ struct Args {
     seconds: i64 = 20
     /// The chunk workers the recording runs with.
     workers: i64 = 8
+    /// How many sessions are recorded and replayed, each carrying on in the world the last left.
+    sessions: i64 = 2
     /// A server already built, instead of building one.
     server: String?
     /// Bots already built, instead of building them.
     swarm: String?
+    /// A saved world to start from, copied, instead of a new one.
+    world: String?
 }
 
 pub fn main() {
@@ -244,10 +263,32 @@ pub fn main() {
         server = built_server
         swarm = built_swarm
     }
+    if args.sessions < 1 {
+        die("lockstep: there must be at least one session")
+    }
     let world = path.join(build_dir(), "world")
-    prepare(world.copy(), args.workers)
+    prepare(world.copy())
+    if let from = args.world {
+        let saved = given(from.copy())
+        if let err(e) = copy_dir_all(saved.copy(), path.join(world, "world")) {
+            die("lockstep: copying {saved}: {e}")
+        }
+    }
+    for session in 1..args.sessions + 1 {
+        check(server.copy(), swarm.copy(), world.copy(), args, session)
+    }
+    println("same: one thread and many gave the same packets and lines")
+}
+
+/// Records session number `session` in the world, carrying on from those before, and replays it,
+/// failing unless it goes as recorded. Each sees 2 chunks further than the one before, so it
+/// finishes the chunks that one left part-way at the edge of what it saw, as the bots seldom
+/// walk far before they're moved back for moving too quickly.
+fn check(server: String, swarm: String, world: String, args: Args, session: i64) {
+    let view = VIEW + 2 * (session - 1)
+    settings(world.copy(), args.workers, view)
     var began = unsafe { Instant.now() }
-    let (log, bots) = record(server.copy(), swarm, world.copy(), args.bots, args.seconds)
+    let (log, bots) = record(server.copy(), swarm, world.copy(), args.bots, args.seconds, view)
     let recorded = unsafe { Instant.now() }.secs_since(began)
     began = unsafe { Instant.now() }
     let (same, tail) = replay(server, world, log.copy())
@@ -256,7 +297,7 @@ pub fn main() {
         ok(m) => f64.nearest(m.size) / 1048576.0,
         err(e) => die("lockstep: {e}"),
     }
-    println("recorded {path.file_name(log) ?? ""}, {size:.1} MiB, with {args.workers} chunk workers and {args.bots} bots in {recorded:.0} s")
+    println("session {session}: recorded {path.file_name(log) ?? ""}, {size:.1} MiB, with {args.workers} chunk workers and {args.bots} bots seeing {view} chunks in {recorded:.0} s")
     println("bots: {bots}")
     println("replayed on one thread in {replayed:.0} s:")
     for line in tail {
@@ -269,22 +310,21 @@ pub fn main() {
         }
     }
     let text = report else {
-        die("lockstep: the replay went another way than the recording")
+        die("lockstep: session {session}'s replay went another way than the recording")
     }
     if not same {
-        die("lockstep: the replay went another way than the recording")
+        die("lockstep: session {session}'s replay went another way than the recording")
     }
     var pattern = match Regex.new(#"(\d+) ticks, (\d+) packets and lines compared, (\d+) different"#) {
         ok(r) => r,
         err(e) => die("lockstep: {e}"),
     }
     let found = pattern.captures(text) else {
-        die("lockstep: the replay's report isn't a match")
+        die("lockstep: session {session}'s replay's report isn't a match")
     }
     let compared = i64.parse(found.get(2) ?? "0") ?? 0
     let different = i64.parse(found.get(3) ?? "1") ?? 1
     if different != 0 or compared == 0 {
-        die("lockstep: the replay's report isn't a match")
+        die("lockstep: session {session}'s replay's report isn't a match")
     }
-    println("same: one thread and many gave the same packets and lines")
 }

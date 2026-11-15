@@ -21,10 +21,11 @@
 /// it, lit once it's lit, as it lets go of it, and the generator saves one nothing wants, keeping
 /// it until it's written (D258). A chunk is a pure function of
 /// where it is, and of what's saved of the chunks around it, which the generator's thread looks
-/// at through the IO thread, to carry on from a chunk saved part-way (D334). So in a world with
-/// none, what comes back depends on nothing but the read, and a replay generates it again; a
-/// replay of one with chunks saved part-way, whose looks the input log doesn't hold, makes them
-/// from the start. So when the terrain kept for chunks far from any wanted lately is too much, the
+/// at through the IO thread, to carry on from a chunk saved part-way (D334). So what comes back
+/// depends on nothing but the read and those looks, and a replay generates it again, its
+/// generator finding what the recording's found the first time it looked at each chunk, which
+/// the server records as it's handed `Done.Look` (CAL-114). So when the terrain kept for chunks
+/// far from any wanted lately is too much, the
 /// scheduler is let go and a new one starts, and memory doesn't grow with the chunks made (D220).
 /// Before it's let go, once no chunk's job is out, each chunk it keeps part-way is saved, as
 /// vanilla saves the `ProtoChunk`s it lets go of (D683): at `minecraft:features` where it's
@@ -229,6 +230,10 @@ pub enum Done {
     /// The IO thread has written every chunk it was handed and closed the region files, as the
     /// server stops, and what it logged doing it.
     Closed(List<Entry>)
+    /// What the generator found saved of the chunk the first time it looked, as the server
+    /// records it for a replay's generator to find (CAL-114): what it read, or `none` where it
+    /// found it full, not yet written. A first look that found nothing isn't handed back.
+    Look(ChunkPos, Stored?)
 }
 
 /// A chunk the generator finished, with the rest of what it saves, as the server takes it: its
@@ -723,13 +728,13 @@ impl IoState {
                 self.write_out()
             }
         } else if self.pending.contains(key) or self.encoding.contains(key) {
-            self.gen.send(GenIn.Peeked(pos.x, pos.z, Saved.Full))
+            self.gen.send(GenIn.Peeked(pos.x, pos.z, Saved.Full, none))
             return
         }
         var logged = List<Entry>()
         match self.storage.read_chunk(pos, mut logged) {
             ChunkRead.Stored(stored) => self.work.send(Work.Peek(pos, stored)),
-            _ => self.gen.send(GenIn.Peeked(pos.x, pos.z, Saved.Nothing)),
+            _ => self.gen.send(GenIn.Peeked(pos.x, pos.z, Saved.Nothing, none)),
         }
     }
 
@@ -840,7 +845,8 @@ impl Task for ChunkWorker {
                 Work.Peek(pos, stored) => {
                     if let held = generate.take() {
                         var g = held
-                        g.send(GenIn.Peeked(pos.x, pos.z, saved_of(self.context, pos, stored)))
+                        let saved = saved_of(self.context, pos, stored)
+                        g.send(GenIn.Peeked(pos.x, pos.z, saved, some(stored)))
                         generate = some(g)
                     }
                 },
@@ -883,14 +889,15 @@ impl Task for ChunkWorker {
     }
 }
 
-// What's saved of the chunk at `pos`, read from its region file, for the generator's thread to
-// carry on from (D334): nothing where it can't be read, isn't this version's, or was saved before
-// its terrain; full, at `minecraft:light` or after, as a chunk lit has what the features of the
-// eight around it put in it, as vanilla lights one only once those have their light initialized,
-// so after their features, and as a chunk Calcite finished is saved at `minecraft:light` while
-// its mobs are still to spawn (D584); and the chunk as it was saved where it's part-way, unless
-// it was saved at another position. What reading it logs isn't logged.
-fn saved_of(context: ChunkContext, pos: ChunkPos, stored: Stored) -> Saved {
+/// What's saved of the chunk at `pos`, read from its region file, for the generator's thread to
+/// carry on from (D334), or a replay's generator, as the input log has it (CAL-114): nothing
+/// where it can't be read, isn't this version's, or was saved before its terrain; full, at
+/// `minecraft:light` or after, as a chunk lit has what the features of the eight around it put in
+/// it, as vanilla lights one only once those have their light initialized, so after their
+/// features, and as a chunk Calcite finished is saved at `minecraft:light` while its mobs are
+/// still to spawn (D584); and the chunk as it was saved where it's part-way, unless it was saved
+/// at another position. What reading it logs isn't logged.
+pub fn saved_of(context: ChunkContext, pos: ChunkPos, stored: Stored) -> Saved {
     var io = List<Entry>()
     let unpacked: List<u8>? = match unpack(pos, stored, mut io) {
         ok(b) => b,
@@ -991,9 +998,10 @@ enum GenIn {
     Spawn
     // A worker's done the jobs of a task, having handed back what each made.
     Free
-    // What's saved of a chunk the scheduler asked to look at, and which chunks a region's file
-    // has, by `chunk_key` of the region, for those looks (D334).
-    Peeked(i32, i32, Saved)
+    // What's saved of a chunk the scheduler asked to look at, with what was read of it, or none
+    // where it's full and not yet written, for the server to record (CAL-114), and which chunks
+    // a region's file has, by `chunk_key` of the region, for those looks (D334).
+    Peeked(i32, i32, Saved, Stored?)
     Presence(i64, List<u64>)
     // The server stops: once no chunk's out, what the scheduler keeps part-way is saved, and the
     // IO thread closes the region files after it (CAL-114).
@@ -1164,6 +1172,7 @@ struct GenThread {
     waker: Waker
     workers: usize
     stage_file: String?
+    record_looks: bool
 }
 
 // Where the generator's thread hands back what it made: the queue back, and what wakes the poll.
@@ -1245,6 +1254,10 @@ struct GenState {
     parking: Map<i64, bool> = Map<i64, bool>()
     full_unwritten: Map<i64, bool> = Map<i64, bool>()
     own_terrain: Map<i64, bool> = Map<i64, bool>()
+    // Whether the server records its input, so each chunk's first look is handed back for it,
+    // and the chunks looked at (CAL-114).
+    record_looks: bool = false
+    looked: Map<i64, bool> = Map<i64, bool>()
 }
 
 // How often the stage times are written while the workers are busy: every second.
@@ -1301,10 +1314,10 @@ impl GenState {
 
 impl Task for GenThread {
     fn run(own self) {
-        let GenThread { setup: setup, context: context, inbox: taken, to_inbox: to_inbox, to_io: to_io, done: done, waker: waker, workers: count, stage_file: stage_file } = self
+        let GenThread { setup: setup, context: context, inbox: taken, to_inbox: to_inbox, to_io: to_io, done: done, waker: waker, workers: count, stage_file: stage_file, record_looks: record_looks } = self
         var inbox = taken
         var out = GenOut { done: done, waker: waker }
-        var s = GenState { sched: none, to_tasks: none, to_io: to_io, workers: count.max(1), began: unsafe { Instant.now() }, stage_file: stage_file, stage_nanos: [0, 0, 0, 0, 0, 0] }
+        var s = GenState { sched: none, to_tasks: none, to_io: to_io, workers: count.max(1), began: unsafe { Instant.now() }, stage_file: stage_file, stage_nanos: [0, 0, 0, 0, 0, 0], record_looks: record_looks }
         match setup_data(setup, mut s.lines) {
             ok(zip) => {
                 // One worker is made, and each thread gets a copy: reading vanilla's data on
@@ -1495,7 +1508,18 @@ impl GenOut {
                 s.spawn = some(SpawnFind { x: x, z: z, offsets: spiral(), at: 0, asked: false })
             },
             GenIn.Free => s.tasks_out -= 1,
-            GenIn.Peeked(x, z, saved) => {
+            GenIn.Peeked(x, z, saved, read) => {
+                // A replay's generator finds what the first look did (CAL-114).
+                if s.record_looks and not s.looked.contains(chunk_key(x, z)) {
+                    s.looked.insert(chunk_key(x, z), true)
+                    match saved {
+                        Saved.Nothing => {},
+                        _ => {
+                            self.done.send(Done.Look(ChunkPos { x: x, z: z }, read))
+                            self.waker.wake()
+                        },
+                    }
+                }
                 if let g = s.sched.take() {
                     var sched = g
                     sched.peeked(x, z, saved)
@@ -1936,6 +1960,9 @@ fn look(s: mut GenState, sched: mut Scheduler, x: i32, z: i32) {
     if s.presence.contains(region) {
         let i = (x & 31) + (z & 31) * 32
         if (s.presence[region][usize.wrap(i >> 6)] & (1u64 << u64.wrap(i & 63))) == 0 {
+            if s.record_looks {
+                s.looked.insert(chunk_key(x, z), true)
+            }
             sched.peeked(x, z, Saved.Nothing)
         } else {
             s.to_io.send(Ask.Peek(ChunkPos { x: x, z: z }))
@@ -2041,6 +2068,8 @@ pub struct ChunkJobs {
     gen_workers: usize
     // Where the generator writes its stage times, for `--stage-times` (D287).
     stage_file: String? = none
+    // Whether the generator hands back each chunk's first look, for the input log (CAL-114).
+    record_looks: bool = false
     // How many chunks are asked for and not back, how many regions, and whether the spawn is.
     chunks_away: usize
     regions_away: usize
@@ -2165,6 +2194,13 @@ impl ChunkJobs {
         self.started += 1
     }
 
+    /// Has the generator hand back what it finds saved of each chunk the first time it looks, as
+    /// `Done.Look`, for the server to record for a replay's generator (CAL-114). It takes effect
+    /// when the generator starts.
+    pub fn hand_back_looks(mut self) {
+        self.record_looks = true
+    }
+
     /// Has the generator write how long its workers spend in each stage to `path`, as they go, for
     /// `--stage-times` (D287). It takes effect when the generator starts.
     pub fn set_stage_times(mut self, path: own String) {
@@ -2191,6 +2227,7 @@ impl ChunkJobs {
                 Done.Withdrawn(_, _, _) => self.chunks_away -= 1,
                 Done.Spawn(_, _) => self.spawn_away -= 1,
                 Done.Closed(_) => self.closing_away -= 1,
+                Done.Look(_, _) => {},
             }
             back.push_last(d)
         }
@@ -2256,6 +2293,6 @@ impl ChunkJobs {
         }
         let setup = self.gen.take() else return
         let to_gen = self.to_gen else return
-        _ = unsafe { Thread.spawn(GenThread { setup: setup, context: self.context.copy(), inbox: self.gen_inbox.share(), to_inbox: to_gen.share(), to_io: self.to_asks.share(), done: self.to_done.share(), waker: self.waker, workers: self.gen_workers, stage_file: self.stage_file.copy() }) }
+        _ = unsafe { Thread.spawn(GenThread { setup: setup, context: self.context.copy(), inbox: self.gen_inbox.share(), to_inbox: to_gen.share(), to_io: self.to_asks.share(), done: self.to_done.share(), waker: self.waker, workers: self.gen_workers, stage_file: self.stage_file.copy(), record_looks: self.record_looks }) }
     }
 }
