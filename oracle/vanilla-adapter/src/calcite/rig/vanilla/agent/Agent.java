@@ -24,13 +24,15 @@ import java.security.ProtectionDomain;
  * run, and from what Calcite draws with the same seed, and can write every draw a level's random
  * makes to a tape.
  *
- * <p>Started as {@code -javaagent:agent.jar=seed=N[,tape=PATH][,reseed=T][,trace=PATH]}. Each
- * {@code ServerLevel}'s constructor, once {@code Level}'s returns, calls {@link Levels#made},
+ * <p>Started as
+ * {@code -javaagent:agent.jar=seed=N[,tape=PATH][,reseed=T][,reseed:LEVEL=T]...[,trace=PATH]}.
+ * Each {@code ServerLevel}'s constructor, once {@code Level}'s returns, calls {@link Levels#made},
  * which seeds the level's random with {@code mixStafford13(N ^ name.hashCode())}, with the name
  * the dimension's, such as {@code minecraft:overworld}, and sets the entity counter back to 0 as
  * the Overworld's is made, before anything else draws from it (D623). With {@code reseed=T},
  * {@code ServerLevel.tick} calls {@link Levels#ticking} as it starts, which seeds the level's
- * random so again the first time its tick starts at game time T or later (D316).
+ * random so again the first time its tick starts at game time T or later (D316), or, for the
+ * level of a dimension named with {@code reseed:LEVEL=T}, at that T (D671).
  * {@code LegacyRandomSource.next}, which every draw of a level's random comes down to, hands
  * {@link Tape#drew} each value it returns, which writes those of a level's random to the tape.
  * {@code Entity}'s constructor, once it's given the entity its ID and before it calls
@@ -73,6 +75,10 @@ public final class Agent {
             int eq = part.indexOf('=');
             String key = eq < 0 ? part : part.substring(0, eq);
             String value = eq < 0 ? "" : part.substring(eq + 1);
+            if (key.startsWith("reseed:")) {
+                Levels.reseedAt(key.substring("reseed:".length()), Long.parseLong(value));
+                continue;
+            }
             switch (key) {
                 case "seed" -> seed = Long.parseLong(value);
                 case "tape" -> tape = Path.of(value);

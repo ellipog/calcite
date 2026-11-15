@@ -1,7 +1,9 @@
 package calcite.rig.vanilla.agent;
 
 import java.lang.reflect.Field;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.server.level.ServerLevel;
@@ -13,9 +15,11 @@ import net.minecraft.world.level.levelgen.RandomSupport;
  * level's constructor calls it, so the game classes it names are loaded by then.
  */
 public final class Levels {
-    // The game time from which each level's random is seeded again, or -1 for never, and the
+    // The game time from which each level's random is seeded again, or -1 for never, those of the
+    // levels seeded again from times of their own, by their dimensions' names (CAL-167), and the
     // levels whose have been.
     private static long reseedAt = -1;
+    private static final Map<String, Long> reseedIn = new HashMap<>();
     private static final Set<String> reseeded = new HashSet<>();
 
     private Levels() {
@@ -23,6 +27,10 @@ public final class Levels {
 
     static void reseedAt(long time) {
         reseedAt = time;
+    }
+
+    static void reseedAt(String name, long time) {
+        reseedIn.put(name, time);
     }
 
     /**
@@ -63,10 +71,13 @@ public final class Levels {
      * draws line up again from there, whatever each drew before (D316, D318).
      */
     public static void ticking(ServerLevel level) {
-        if (reseedAt < 0 || level.getGameTime() < reseedAt) {
+        if (reseedAt < 0) {
             return;
         }
         String name = level.dimension().identifier().toString();
+        if (level.getGameTime() < reseedIn.getOrDefault(name, reseedAt)) {
+            return;
+        }
         if (reseeded.add(name)) {
             seed(level, name);
         }
