@@ -25,8 +25,15 @@
 /// none, what comes back depends on nothing but the read, and a replay generates it again; a
 /// replay of one with chunks saved part-way, whose looks the input log doesn't hold, makes them
 /// from the start. So when the terrain kept for chunks far from any wanted lately is too much, the
-/// scheduler is let go and a new one starts, which makes again from nothing what it needs, and
-/// memory doesn't grow with the chunks made (D220). The generator's thread also finds a new world's spawn, as
+/// scheduler is let go and a new one starts, and memory doesn't grow with the chunks made (D220).
+/// Before it's let go, once no chunk's job is out, each chunk it keeps part-way is saved, as
+/// vanilla saves the `ProtoChunk`s it lets go of (D683): at `minecraft:features` where it's
+/// decorated, else at `minecraft:terrain`. The new one knows each chunk finished and not yet
+/// written as full, reads the rest back as it looks at them, a look at one not yet written
+/// waiting for it, and decorates the terrain the old one parked in the order the old one would
+/// have, so what it makes is what the old one, or a replay's generator, which is never let go,
+/// would have made. The server's stop parks them too, then closes the IO thread. The
+/// generator's thread also finds a new world's spawn, as
 /// `setInitialSpawn` does: from the chunk `getOrigin` picks, which a worker finds, the first
 /// column a player can stand on in the first chunk of the 11×11 around it that has one.
 module server.chunk_jobs
@@ -48,7 +55,7 @@ import world.collision.{CollisionStates}
 import world.light.{LightStates, SkySources}
 import world.pos.{BlockPos, ChunkPos}
 import world.spawn.{respawn_pos}
-import worldgen.generator.{GenSetup, Job, Made, Worker, setup_data}
+import worldgen.generator.{GenSetup, Job, Made, Parked, Worker, parked_data, setup_data}
 import worldgen.locate.{Nearest, Reach, Wanted}
 import worldgen.references.{chunk_key}
 import worldgen.scheduler.{Saved, Scheduler}
@@ -509,8 +516,8 @@ fn on(from: List<Entry>, thread: String, to: mut List<Entry>) {
 // What the IO thread is asked: which chunks a region's file has, a chunk read, a chunk, encoded,
 // written, a chunk the server holds whole saved, with its light once it's lit, and its bytes back
 // from the saver that encoded them, none if they couldn't be (D258), or everything written and the
-// files closed; and, for the generator's thread, which chunks a region's file has, and what's
-// saved of a chunk (D334).
+// files closed; and, for the generator's thread, which chunks a region's file has, what's saved
+// of a chunk (D334), and a chunk it lets go of part-way saved (CAL-114).
 enum Ask {
     Region(ChunkPos)
     Chunk(ChunkPos)
@@ -518,17 +525,20 @@ enum Ask {
     Peek(ChunkPos)
     Write(ChunkPos, List<u8>)
     Save(ChunkPos, Whole, LightData?)
+    Park(ChunkPos, Parked)
     Saved(ChunkPos, List<u8>?)
     Close
 }
 
 // What a chunk worker is handed: a chunk the IO thread read, with what it logged, or a chunk to
 // encode with its light, to go back to the IO thread to write (D258), or a chunk the IO thread
-// read for the generator's thread to look at (D334).
+// read for the generator's thread to look at (D334), or a chunk the generator let go of part-way
+// to encode (CAL-114).
 enum Work {
     Read(ChunkPos, List<Entry>, ChunkRead)
     Save(ChunkPos, Whole, LightData?)
     Peek(ChunkPos, Stored)
+    Park(ChunkPos, Parked)
 }
 
 // The IO thread: it owns the region files, and reads and writes what it's asked, in the order
@@ -563,6 +573,11 @@ struct IoState {
     // for them, in the order they were asked.
     encoding: Map<i64, u32> = Map<i64, u32>()
     held: List<ChunkPos> = List<ChunkPos>()
+    // The chunks whose last save is of one the generator let go of part-way, until it's written,
+    // and the generator's looks that wait for such a one's bytes, in the order they were asked
+    // (CAL-114).
+    parking: Set<i64> = Set<i64>()
+    held_peeks: List<ChunkPos> = List<ChunkPos>()
     close_asked: bool = false
     closed: bool = false
 }
@@ -587,7 +602,16 @@ impl Task for IoThread {
                     if not s.closed {
                         let key = chunk_key(pos.x, pos.z)
                         s.encoding.insert(key, (s.encoding.get(key) ?? 0) + 1)
+                        s.parking.remove(key)
                         s.saves.send(Work.Save(pos, whole, light))
+                    }
+                },
+                Ask.Park(pos, parked) => {
+                    if not s.closed {
+                        let key = chunk_key(pos.x, pos.z)
+                        s.encoding.insert(key, (s.encoding.get(key) ?? 0) + 1)
+                        s.parking.insert(key)
+                        s.saves.send(Work.Park(pos, parked))
                     }
                 },
                 Ask.Saved(pos, bytes) => {
@@ -659,6 +683,13 @@ impl IoState {
     }
 
     fn write_out(mut self) {
+        // What's parked and not being saved again is on the disk after this (CAL-114).
+        for (pos, _) in self.writes {
+            let key = chunk_key(pos.x, pos.z)
+            if not self.encoding.contains(key) {
+                self.parking.remove(key)
+            }
+        }
         write_out(mut self.storage, mut self.writes, mut self.gen)
         self.pending.clear()
     }
@@ -677,12 +708,21 @@ impl IoState {
     }
 
     // Looks at what's saved of the chunk at `pos` for the generator's thread (D334): one about to
-    // be written is full, as only a full chunk is saved; one not saved, or whose file can't be
-    // read, has nothing to carry on from; and one saved goes to a worker to read. What reading it
-    // logs isn't logged, as the read the chunk's asked for logs it.
+    // be written is full, as the server saves only a full chunk, but one the generator let go of
+    // part-way, which is looked at once it's written (CAL-114); one not saved, or whose file can't
+    // be read, has nothing to carry on from; and one saved goes to a worker to read. What reading
+    // it logs isn't logged, as the read the chunk's asked for logs it.
     fn peek(mut self, pos: ChunkPos) {
         let key = chunk_key(pos.x, pos.z)
-        if self.pending.contains(key) or self.encoding.contains(key) {
+        if self.parking.contains(key) {
+            if self.encoding.contains(key) {
+                self.held_peeks.push(pos)
+                return
+            }
+            if self.pending.contains(key) {
+                self.write_out()
+            }
+        } else if self.pending.contains(key) or self.encoding.contains(key) {
             self.gen.send(GenIn.Peeked(pos.x, pos.z, Saved.Full))
             return
         }
@@ -693,8 +733,24 @@ impl IoState {
         }
     }
 
-    // Reads each read held for the chunk at `key`, which is saved now.
+    // Reads each read held for the chunk at `key`, which is saved now, and makes each look held
+    // for it (CAL-114).
     fn read_held(mut self, key: i64) {
+        if not self.held_peeks.is_empty() {
+            var waiting = List<ChunkPos>()
+            var now = List<ChunkPos>()
+            for pos in self.held_peeks {
+                if chunk_key(pos.x, pos.z) == key {
+                    now.push(pos)
+                } else {
+                    waiting.push(pos)
+                }
+            }
+            self.held_peeks = waiting
+            for pos in now {
+                self.peek(pos)
+            }
+        }
         if self.held.is_empty() {
             return
         }
@@ -780,6 +836,7 @@ impl Task for ChunkWorker {
         while let w = work.wait() {
             match w {
                 Work.Save(pos, whole, light) => to_io.send(Ask.Saved(pos, saved_bytes(self.context, pos, whole.chunk.value, whole.rest.unpack(), light, whole.last_update, whole.inhabited, whole.spawn_due))),
+                Work.Park(pos, parked) => to_io.send(Ask.Saved(pos, encoded(self.context, parked_data(self.context.format, self.context.table, parked)))),
                 Work.Peek(pos, stored) => {
                     if let held = generate.take() {
                         var g = held
@@ -938,6 +995,9 @@ enum GenIn {
     // has, by `chunk_key` of the region, for those looks (D334).
     Peeked(i32, i32, Saved)
     Presence(i64, List<u64>)
+    // The server stops: once no chunk's out, what the scheduler keeps part-way is saved, and the
+    // IO thread closes the region files after it (CAL-114).
+    Close
 }
 
 // A chunk to generate, with what the IO thread logged and read, and what the worker logged.
@@ -1173,6 +1233,18 @@ struct GenState {
     stage_nanos: List<u64> = List<u64>()
     stages_written_at: u64 = 0
     stages_changed: bool = false
+    // What lets the scheduler go saves what it keeps part-way (CAL-114): whether it's to start
+    // again once no chunk's out, and whether the server's stopping, so it's saved once none is
+    // and the IO thread then closes; the chunks saved so and not yet written, which a look asks
+    // the IO thread for whatever its region's file had; the chunks finished and not yet written,
+    // which a new scheduler knows as full; and the chunks saved with their terrain alone, which
+    // it decorates by rank, as if they'd been kept.
+    renew_due: bool = false
+    closing: bool = false
+    close_sent: bool = false
+    parking: Map<i64, bool> = Map<i64, bool>()
+    full_unwritten: Map<i64, bool> = Map<i64, bool>()
+    own_terrain: Map<i64, bool> = Map<i64, bool>()
 }
 
 // How often the stage times are written while the workers are busy: every second.
@@ -1350,11 +1422,10 @@ impl GenOut {
                 } else {
                     s.asked.insert(key, [w])
                     if s.reread.contains(key) {
-                        // Not there when it was read again: it's made again from nothing.
+                        // Not there when it was read again: it's made again from nothing, by a
+                        // scheduler started again once no chunk's out (CAL-114).
                         _ = s.reread.remove(key)
-                        if let g = s.sched.take() {
-                            s.sched = some(renewed(mut s, g))
-                        }
+                        s.renew_due = true
                     } else if let g = s.sched.take() {
                         var sched = g
                         sched.want(x, z)
@@ -1388,13 +1459,18 @@ impl GenOut {
             GenIn.Finished(epoch, x, z, saved, nanos) => {
                 s.stage_nanos[5] += nanos
                 s.stages_changed = true
+                // Full, wherever it goes, till it's written (CAL-114).
+                s.full_unwritten.insert(chunk_key(x, z), true)
                 self.finished(mut s, epoch, x, z, saved)
             },
+            GenIn.Close => s.closing = true,
             GenIn.Written(keys, lines) => {
                 for e in lines {
                     s.lines.push(e.copy())
                 }
                 for k in keys {
+                    _ = s.parking.remove(k)
+                    _ = s.full_unwritten.remove(k)
                     // On the disk now, for the scheduler's looks (D334).
                     let x = i32.wrap(k)
                     let z = i32.wrap(k >> 32)
@@ -1454,6 +1530,11 @@ impl GenOut {
     fn step(mut self, s: mut GenState) -> bool {
         var sched = s.sched.take() else {
             var any = false
+            if s.closing and not s.close_sent {
+                s.to_io.send(Ask.Close)
+                s.close_sent = true
+                any = true
+            }
             var keys = List<i64>()
             for (k, _) in s.asked {
                 keys.push(k)
@@ -1482,7 +1563,23 @@ impl GenOut {
         if s.wants >= CHECK_EVERY {
             s.wants = 0
             if sched.kept_outside(s.hot, CELL_SHIFT) > MOST_FAR {
+                s.renew_due = true
+            }
+        }
+        // The scheduler starts again, or the server stops, once no chunk's out, so what it keeps
+        // part-way is all there to save; till then no more goes out (CAL-114).
+        let holding = s.renew_due or s.closing
+        if holding and sched.chunk_jobs_out() == 0 {
+            if s.closing {
+                if not s.close_sent {
+                    park(mut s, mut sched)
+                    s.to_io.send(Ask.Close)
+                    s.close_sent = true
+                    progressed = true
+                }
+            } else {
                 sched = renewed(mut s, sched)
+                s.renew_due = false
                 progressed = true
             }
         }
@@ -1518,7 +1615,7 @@ impl GenOut {
             // own (D298). Otherwise jobs go out one a task, so a few urgent ones spread over the
             // workers.
             let batch = if sched.ready() > s.workers * 2 { TERRAIN_BATCH } else { 1 }
-            while s.tasks_out < s.workers * 2 {
+            while s.tasks_out < s.workers * 2 and not s.renew_due and not s.closing {
                 let job = sched.next() else break
                 var spots = List<(i32, i32)>()
                 if let spot = job.terrain_at() {
@@ -1723,13 +1820,22 @@ impl GenOut {
 // A scheduler started again from `old`, with nothing made but the strongholds' rings it
 // found, of the next epoch, wanting each chunk asked for and not handed back, nearest the
 // chunk wanted last first, and the chunk the spawn's search is trying. What the old one has
-// out is let go as it comes back.
+// out is let go as it comes back: its ring searches, as no chunk's out. What it kept part-way
+// is saved, to carry on from (CAL-114), and the new one knows each chunk finished and not yet
+// written as full, and decorates the terrain this run saved by rank, as the old one would have,
+// so what it makes is what the old one would have.
 fn renewed(s: mut GenState, old: own Scheduler) -> Scheduler {
-    for p in old.problems {
+    var parting = old
+    park(mut s, mut parting)
+    for p in parting.problems {
         s.lines.push(Entry.warn(p.copy()).on(gen_thread()))
     }
     s.epoch += 1
-    var fresh = old.renewed()
+    var fresh = parting.renewed()
+    fresh.own_terrain = s.own_terrain.copy()
+    for (k, _) in s.full_unwritten {
+        fresh.peeked(i32.wrap(k), i32.wrap(k >> 32), Saved.Full)
+    }
     var keys = List<i64>()
     for (k, _) in s.asked {
         keys.push(k)
@@ -1769,7 +1875,7 @@ fn settle(s: mut GenState) {
         return
     }
     if let g = s.sched.take() {
-        if g.holds_any() {
+        if g.holds_any() and g.chunk_jobs_out() == 0 {
             s.sched = some(renewed(mut s, g))
             forget(mut s)
         } else {
@@ -1777,6 +1883,24 @@ fn settle(s: mut GenState) {
         }
     }
     trim()
+}
+
+// Saves what the scheduler keeps part-way, as vanilla saves the `ProtoChunk`s it lets go of
+// (CAL-114): each chunk with its terrain, but a full one's, goes to the IO thread, which has a
+// saver encode it and writes it; until it's written, a look at it asks the IO thread. Those saved
+// with their terrain alone are this run's, and decorated ones aren't any more.
+fn park(s: mut GenState, sched: mut Scheduler) {
+    var parked = sched.parked()
+    while let p = parked.pop() {
+        let key = chunk_key(p.x, p.z)
+        if p.decorated {
+            _ = s.own_terrain.remove(key)
+        } else {
+            s.own_terrain.insert(key, true)
+        }
+        s.parking.insert(key, true)
+        s.to_io.send(Ask.Park(ChunkPos { x: p.x, z: p.z }, p))
+    }
 }
 
 // Has the templates' service let go of the templates it loaded. The workers have let go of their
@@ -1794,6 +1918,11 @@ fn forget(s: mut GenState) {
 // region's file doesn't have it, as the IO thread found it and has written since, told at once;
 // else the IO thread reads it. A region not yet known is asked for, and the look waits for it.
 fn look(s: mut GenState, sched: mut Scheduler, x: i32, z: i32) {
+    // One saved part-way and not yet written: the IO thread looks once it is (CAL-114).
+    if s.parking.contains(chunk_key(x, z)) {
+        s.to_io.send(Ask.Peek(ChunkPos { x: x, z: z }))
+        return
+    }
     let region = chunk_key(x >> 5, z >> 5)
     if s.presence.contains(region) {
         let i = (x & 31) + (z & 31) * 32
@@ -2076,14 +2205,25 @@ impl ChunkJobs {
     }
 
     /// Has the IO thread, if it's started, write every chunk it's been handed and close the
-    /// region files, as the server stops; `closing` counts it until it has. What the generator
-    /// hands it after isn't written: it's made again when it's next asked for.
+    /// region files, as the server stops; `closing` counts it until it has. Where the world
+    /// generates, the generator's thread is told first: once no chunk of its is out, it saves
+    /// what it keeps part-way, then has the IO thread close (CAL-114). What it finishes after
+    /// isn't written: it's made again when it's next asked for.
     pub fn close(mut self) {
         if self.storage != none {
             return
         }
-        self.to_asks.send(Ask.Close)
         self.closing_away += 1
+        // Its thread started with the IO thread, taking what it's made from.
+        if self.gen == none {
+            if let held = self.to_gen.take() {
+                var g = held
+                g.send(GenIn.Close)
+                self.to_gen = some(g)
+                return
+            }
+        }
+        self.to_asks.send(Ask.Close)
     }
 
     /// Whether the IO thread is still closing the region files.

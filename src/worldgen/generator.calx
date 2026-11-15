@@ -28,18 +28,20 @@ import json.tree.{Json, Member, get}
 import nbt.tag.{Tag}
 import pack.data.{Data}
 import pack.vanilla.{data_path, vanilla_data}
+import random.any.{AnyRandom}
 import registry.components.{ItemCodecs}
 import registry.registries.{Registries}
 import registry.registry.{Registry}
 import server.log.{Entry}
 import std.math.{PI, sin, cos}
 import std.palette.{PalettedContainer}
-import storage.chunk.{ChunkData, ChunkRest, SavedTick}
-import world.chunk.{AIR_STATE, BlockStates, Chunk, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, Section, WORLD_SURFACE}
+import storage.chunk.{ChunkData, ChunkFormat, ChunkRest, SavedTick}
+import world.chunk.{AIR_STATE, BlockStates, Chunk, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, OCEAN_FLOOR_WG, Section, WORLD_SURFACE, WORLD_SURFACE_WG}
 import world.difficulty.{LocalDifficulty}
 import world.modes.{Difficulty}
 import world.living.{LivingFacts}
 import world.mob.{Occasion}
+import world.pos.{ChunkPos}
 import world.structure_mobs.{WorldgenMobs, with_structure_tags}
 import world.variants.{MobFacts}
 import worldgen.beardifier.{Beardifier, beard_kernel}
@@ -58,8 +60,8 @@ import worldgen.pieces.{PieceData, Start, template_id}
 import worldgen.placing.{Placer, decorate_structured}
 import worldgen.pool_pieces.{ElementCache}
 import worldgen.predicates.{Readers}
-import worldgen.references.{Refs, StartMap, registry_order}
-import worldgen.region.{Region, RegionChunk}
+import worldgen.references.{Refs, StartMap, chunk_key, registry_order}
+import worldgen.region.{Region, RegionChunk, packed_heights}
 import worldgen.sampler.{Context, CornerFaces, sample}
 import worldgen.structure_world.{StructureWorld}
 import worldgen.structures.{RingSearch, Rings, StructureState, Structures, create_structures, ring_search}
@@ -692,6 +694,13 @@ impl Worker {
 /// in each section; and its structures, its own starts by structure, and its references, each a
 /// structure's chunks in their set's order, as `packStructureData` writes them.
 pub fn rest_of(facts: Facts, structures: Structures, made: RegionChunk, refs: List<Refs>, starts: List<Start>) -> ChunkRest {
+    return rest_with(made, made.saved_block_entities(facts), structures_tag(structures, refs, starts))
+}
+
+// The rest of `made` with `block_entities` and `structures`: its ticks, each due now, as
+// `ProtoChunkTicks` keeps one, its blocks marked for post-processing in each section, and its
+// entities.
+fn rest_with(made: RegionChunk, block_entities: own List<Tag>, structures: own Tag) -> ChunkRest {
     var block_ticks = List<SavedTick>()
     for t in made.block_ticks {
         block_ticks.push(SavedTick { kind: t.kind, x: t.x, y: t.y, z: t.z, delay: 0, priority: t.priority })
@@ -712,6 +721,12 @@ pub fn rest_of(facts: Facts, structures: Structures, made: RegionChunk, refs: Li
         }
         post.push(packed)
     }
+    return ChunkRest { block_entities: block_entities, block_ticks: block_ticks, fluid_ticks: fluid_ticks, post_processing: post, structures: structures, entities: made.entities.copy() }
+}
+
+/// A chunk's structures as `packStructureData` writes them: its own starts by structure, and its
+/// references, each a structure's chunks in their set's order.
+pub fn structures_tag(structures: Structures, refs: List<Refs>, starts: List<Start>) -> Tag {
     var starts_tag = JavaHashMap<String, Tag>()
     for s in starts {
         starts_tag.insert(s.id.copy(), s.tag())
@@ -729,7 +744,62 @@ pub fn rest_of(facts: Facts, structures: Structures, made: RegionChunk, refs: Li
     var tag = JavaHashMap<String, Tag>()
     tag.insert("starts", Tag.Compound(starts_tag))
     tag.insert("References", Tag.Compound(refs_tag))
-    return ChunkRest { block_entities: made.saved_block_entities(facts), block_ticks: block_ticks, fluid_ticks: fluid_ticks, post_processing: post, structures: Tag.Compound(tag), entities: made.entities.copy() }
+    return Tag.Compound(tag)
+}
+
+/// A chunk the generator lets go of part-way, to save as vanilla saves a `ProtoChunk` and carry
+/// on from (CAL-114): where it is, its blocks and what it holds, its biomes, its structures, as
+/// `structures_tag` writes them, and whether it's decorated, its own features placed.
+pub struct Parked {
+    pub x: i32
+    pub z: i32
+    pub made: RegionChunk
+    pub biomes: List<i32>
+    pub structures: Tag
+    pub decorated: bool
+}
+
+/// The parked chunk `p` as `SerializableChunkData.copyOf` saves a `ProtoChunk` (CAL-114): at
+/// `minecraft:features` where it's decorated, else at `minecraft:terrain`, unlit, its sections
+/// with their blocks and biomes; its heightmaps, the final ones, which vanilla's keeps from its
+/// terrain on, and the `_WG` ones as its terrain left them, which vanilla's keeps too and reads
+/// back as they were; its block entities as `part_way_block_entities` gives them, its ticks, its
+/// blocks to update, its structures and its entities.
+pub fn parked_data(format: ChunkFormat, table: BlockStates, p: own Parked) -> ChunkData {
+    let Parked { x: x, z: z, made: made, biomes: biomes, structures: structures, decorated: decorated } = p
+    let min_y = made.filled.min_y
+    let height = made.filled.height
+    let surface = packed_heights(made.filled.world_surface, min_y, height)
+    let floor = packed_heights(made.filled.ocean_floor, min_y, height)
+    let rest = rest_with(made, made.part_way_block_entities(), structures)
+    var data = ChunkData.generated(format, ChunkPos { x: x, z: z }, to_chunk(table, made, biomes), rest)
+    data.status = format.part_way_status(decorated)
+    data.heightmaps[usize.wrap(WORLD_SURFACE_WG)] = some(surface)
+    data.heightmaps[usize.wrap(OCEAN_FLOOR_WG)] = some(floor)
+    data.entities = with_own_uuids(data.entities, x, z)
+    return data
+}
+
+// The entities of the parked chunk at `x`, `z`, each with a UUID of its own, made as
+// `Mth.createInsecureUUID` makes one, from a random seeded by where the chunk is and the entity's
+// place in it. The mobs a structure made were made alike, so they'd have shared one, and vanilla
+// adds only the first of those that do; Calcite draws each its own as it takes in the chunk
+// once it's full (D588).
+fn with_own_uuids(entities: List<Tag>, x: i32, z: i32) -> List<Tag> {
+    var out = List<Tag>()
+    for i in 0..entities.len() {
+        let Tag.Compound(fields) = entities[i] else {
+            out.push(entities[i].copy())
+            continue
+        }
+        var tag = fields.copy()
+        var random = AnyRandom.of(false, chunk_key(x, z) ^ (i64.wrap(i) * i64.wrap(0x9E3779B97F4A7C15u64)))
+        let most = (random.next_long() & ~0xF000i64) | 0x4000i64
+        let least = (random.next_long() & 0x3FFFFFFFFFFFFFFFi64) | i64.MIN
+        tag.insert("UUID", Tag.IntArray([i32.wrap(most >> 32), i32.wrap(most), i32.wrap(least >> 32), i32.wrap(least)]))
+        out.push(Tag.Compound(tag))
+    }
+    return out
 }
 
 fn to_chunk(table: BlockStates, made: own RegionChunk, biomes: List<i32>) -> Chunk {
