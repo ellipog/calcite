@@ -59,6 +59,7 @@ public final class Agent {
     private static final String PROVIDER = "net/minecraft/world/entity/ai/Brain$Provider";
     private static final String SHUFFLING = "net/minecraft/world/entity/ai/behavior/ShufflingList";
     private static final String INSIDE = "net/minecraft/world/entity/ai/behavior/InsideBrownianWalk";
+    private static final String PILLARS = "net/minecraft/world/level/dimension/end/DragonRespawnStage$3";
 
     private Agent() {
     }
@@ -100,7 +101,7 @@ public final class Agent {
         @Override
         public byte[] transform(ClassLoader loader, String name, Class<?> redefined, ProtectionDomain domain, byte[] bytes) {
             if (!LEVEL.equals(name) && !LEGACY.equals(name) && !ENTITY.equals(name) && !PLAYER.equals(name)
-                    && !PROVIDER.equals(name) && !SHUFFLING.equals(name) && !INSIDE.equals(name)) {
+                    && !PROVIDER.equals(name) && !SHUFFLING.equals(name) && !INSIDE.equals(name) && !PILLARS.equals(name)) {
                 return null;
             }
             try {
@@ -110,7 +111,7 @@ public final class Agent {
                 return LEVEL.equals(name) ? level(cf, bytes) : ENTITY.equals(name) ? entity(cf, bytes)
                         : PLAYER.equals(name) ? player(cf, bytes) : PROVIDER.equals(name) ? provider(cf, bytes)
                         : SHUFFLING.equals(name) ? shuffling(cf, bytes) : INSIDE.equals(name) ? inside(cf, bytes)
-                        : legacy(cf, bytes);
+                        : PILLARS.equals(name) ? pillars(cf, bytes) : legacy(cf, bytes);
             } catch (Throwable t) {
                 // A transformer's exception is swallowed by the JVM, and the class loads unchanged,
                 // so the run would go on unseeded: stop it instead.
@@ -306,6 +307,31 @@ public final class Agent {
         byte[] out = cf.transformClass(cf.parse(bytes), each);
         if (hooked[0] != 1) {
             throw new IllegalStateException("InsideBrownianWalk calls Collections.shuffle " + hooked[0] + " times, not once");
+        }
+        return out;
+    }
+
+    // The respawn's pillars' stage's RandomSource.create(), the random each spike it builds again
+    // turns its crystal by, is Levels.pillars(level) instead, with the level its tick is given, the
+    // first of its parameters (CAL-167).
+    private static byte[] pillars(ClassFile cf, byte[] bytes) {
+        ClassDesc source = ClassDesc.of("net.minecraft.util.RandomSource");
+        MethodTypeDesc withLevel = MethodTypeDesc.of(source, ConstantDescs.CD_Object);
+        int[] hooked = {0};
+        CodeTransform swap = (b, e) -> {
+            if (e instanceof InvokeInstruction i && i.opcode() == Opcode.INVOKESTATIC && i.owner().asSymbol().equals(source)
+                    && i.name().equalsString("create") && i.typeSymbol().parameterCount() == 0) {
+                b.aload(1);
+                b.invokestatic(ClassDesc.of("calcite.rig.vanilla.agent.Levels"), "pillars", withLevel);
+                hooked[0]++;
+                return;
+            }
+            b.with(e);
+        };
+        byte[] out = cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
+                m -> m.methodName().equalsString("tick"), swap));
+        if (hooked[0] != 1) {
+            throw new IllegalStateException("DragonRespawnStage's pillars call RandomSource.create " + hooked[0] + " times, not once");
         }
         return out;
     }

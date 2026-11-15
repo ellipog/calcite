@@ -7,6 +7,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.levelgen.RandomSupport;
 
@@ -81,6 +82,16 @@ public final class Levels {
         if (reseeded.add(name)) {
             seed(level, name);
         }
+    }
+
+    /**
+     * The random a dragon fight's respawn builds a spike again with, which turns its new crystal,
+     * where vanilla makes it unseeded, {@code RandomSource.create()} (CAL-167): seeded with
+     * {@code mixStafford13(seed ^ time)}, {@code time} the level's game time, as Calcite's
+     * {@code level-random-seed} seeds its own.
+     */
+    public static RandomSource pillars(Object level) {
+        return RandomSource.create(RandomSupport.mixStafford13(Tape.seed() ^ ((ServerLevel) level).getGameTime()));
     }
 
     private static AtomicInteger counter() {
