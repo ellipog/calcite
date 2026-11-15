@@ -37,6 +37,7 @@ cases:
   - session:eggs/*/commands
   - session:eggs-kept/*/commands
   - session:cauldrons/*/commands
+  - session:lids/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
