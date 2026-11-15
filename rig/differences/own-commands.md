@@ -32,6 +32,8 @@ cases:
   - session:fight-abort/*/commands
   - session:fight-respawn/*/commands
   - session:fight-crystal/*/commands
+  - session:silverfish/*/commands
+  - session:silverfish-kept/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
