@@ -114,9 +114,9 @@ import net.minecraft.world.ticks.SavedTick;
  * <p>A `structured` op decorates with structures. The chunks out to 9 around get their starts, as
  * the `structures` probe's `bearded` op makes them, and each of the 3×3 its references and its
  * terrain filled with their beardifier. The region's chunks are given those starts, and the 3×3
- * their references, and the structure manager says structures generate. Entities are written
- * only as their type, position and rotation, since the rest of what an entity saves is random
- * or set as it's spawned.
+ * their references, and the structure manager says structures generate. Entities of the types
+ * Calcite makes whole are written whole, their attributes in order of their IDs (CAL-87); the
+ * rest only as their type, position and rotation.
  */
 final class FeaturesProbe implements Probe {
     private static final long MAX_CHUNKS = 64;
@@ -140,7 +140,22 @@ final class FeaturesProbe implements Probe {
 
     @Override
     public int version() {
-        return 4;
+        return 5;
+    }
+
+    /** The types of mob a `structured` op writes whole, as Calcite makes them (CAL-87). */
+    private static final Set<String> WHOLE = Set.of("minecraft:witch");
+
+    /** A saved list of attributes in order of their IDs, as the attribute map keeps no order two runs share. */
+    private static net.minecraft.nbt.ListTag sortedAttributes(net.minecraft.nbt.ListTag list) {
+        List<CompoundTag> entries = new ArrayList<>();
+        for (int i = 0; i < list.size(); i++) {
+            entries.add(list.getCompoundOrEmpty(i));
+        }
+        entries.sort(Comparator.comparing((CompoundTag a) -> a.getStringOr("id", "")));
+        net.minecraft.nbt.ListTag out = new net.minecraft.nbt.ListTag();
+        out.addAll(entries);
+        return out;
     }
 
     /** The level, as far as the region and features ask it. */
@@ -830,7 +845,12 @@ final class FeaturesProbe implements Probe {
             if (masked.contains("UUID")) {
                 masked.putIntArray("UUID", new int[4]);
             }
-            if (structured) {
+            if (structured && WHOLE.contains(entity.getStringOr("id", ""))) {
+                // Whole, its attributes in order of their IDs (CAL-87).
+                if (masked.contains("attributes")) {
+                    masked.put("attributes", sortedAttributes(masked.getListOrEmpty("attributes")));
+                }
+            } else if (structured) {
                 // Only the type, position and rotation.
                 CompoundTag kept = new CompoundTag();
                 for (String key : List.of("id", "Pos", "Rotation")) {
