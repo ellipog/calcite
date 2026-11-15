@@ -140,11 +140,11 @@ final class FeaturesProbe implements Probe {
 
     @Override
     public int version() {
-        return 6;
+        return 7;
     }
 
-    /** The types of mob a `structured` op writes whole, as Calcite makes them (CAL-87). */
-    private static final Set<String> WHOLE = Set.of("minecraft:witch", "minecraft:villager", "minecraft:zombie_villager", "minecraft:cow", "minecraft:pig", "minecraft:sheep", "minecraft:chicken", "minecraft:horse", "minecraft:donkey");
+    /** The types of entity a `structured` op writes whole, as Calcite makes them (CAL-87, CAL-270). */
+    private static final Set<String> WHOLE = Set.of("minecraft:witch", "minecraft:villager", "minecraft:zombie_villager", "minecraft:cow", "minecraft:pig", "minecraft:sheep", "minecraft:chicken", "minecraft:horse", "minecraft:donkey", "minecraft:chest_minecart", "minecraft:item_frame");
 
     /** A saved list of attributes in order of their IDs, as the attribute map keeps no order two runs share. */
     private static net.minecraft.nbt.ListTag sortedAttributes(net.minecraft.nbt.ListTag list) {
@@ -192,6 +192,16 @@ final class FeaturesProbe implements Probe {
         @Override
         public int getNextEntityId() {
             return 1;
+        }
+
+        // A sound, which plays to the players near and to nothing saved, and here to none, as the
+        // level has none: the one an End city's item frame plays as its elytra goes in (CAL-270).
+        @Override
+        public void playSound(net.minecraft.world.entity.Entity except, double x, double y, double z, net.minecraft.sounds.SoundEvent sound, net.minecraft.sounds.SoundSource source, float volume, float pitch) {
+        }
+
+        @Override
+        public void playSound(net.minecraft.world.entity.Entity except, double x, double y, double z, net.minecraft.core.Holder<net.minecraft.sounds.SoundEvent> sound, net.minecraft.sounds.SoundSource source, float volume, float pitch) {
         }
 
         @Override
