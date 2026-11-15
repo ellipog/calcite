@@ -46,6 +46,9 @@ import java.security.ProtectionDomain;
  * its random to {@link Entities#shuffling} as it returns, which seeds it (CAL-160).
  * {@code InsideBrownianWalk}'s {@code Collections.shuffle}, which draws from a random of its own
  * vanilla seeds from the clock, is {@link Entities#shuffle} instead, with the mob it walks.
+ * The dragon fight's respawn builds each spike again with {@link Levels#pillars}' random, seeded
+ * from the game time, where vanilla's is unseeded (D672), and {@code ChunkMap} saves chunks by
+ * {@link Levels#saveMillis}, the game time's clock, where vanilla's is the wall clock's (D673).
  *
  * <p>This class names no game class, so loading it loads none: {@code ServerLevel} and
  * {@code LegacyRandomSource} must load after the transformer is in place to be changed.
@@ -60,6 +63,7 @@ public final class Agent {
     private static final String SHUFFLING = "net/minecraft/world/entity/ai/behavior/ShufflingList";
     private static final String INSIDE = "net/minecraft/world/entity/ai/behavior/InsideBrownianWalk";
     private static final String PILLARS = "net/minecraft/world/level/dimension/end/DragonRespawnStage$3";
+    private static final String CHUNKS = "net/minecraft/server/level/ChunkMap";
 
     private Agent() {
     }
@@ -101,7 +105,8 @@ public final class Agent {
         @Override
         public byte[] transform(ClassLoader loader, String name, Class<?> redefined, ProtectionDomain domain, byte[] bytes) {
             if (!LEVEL.equals(name) && !LEGACY.equals(name) && !ENTITY.equals(name) && !PLAYER.equals(name)
-                    && !PROVIDER.equals(name) && !SHUFFLING.equals(name) && !INSIDE.equals(name) && !PILLARS.equals(name)) {
+                    && !PROVIDER.equals(name) && !SHUFFLING.equals(name) && !INSIDE.equals(name) && !PILLARS.equals(name)
+                    && !CHUNKS.equals(name)) {
                 return null;
             }
             try {
@@ -111,7 +116,8 @@ public final class Agent {
                 return LEVEL.equals(name) ? level(cf, bytes) : ENTITY.equals(name) ? entity(cf, bytes)
                         : PLAYER.equals(name) ? player(cf, bytes) : PROVIDER.equals(name) ? provider(cf, bytes)
                         : SHUFFLING.equals(name) ? shuffling(cf, bytes) : INSIDE.equals(name) ? inside(cf, bytes)
-                        : PILLARS.equals(name) ? pillars(cf, bytes) : legacy(cf, bytes);
+                        : PILLARS.equals(name) ? pillars(cf, bytes) : CHUNKS.equals(name) ? chunks(cf, bytes)
+                        : legacy(cf, bytes);
             } catch (Throwable t) {
                 // A transformer's exception is swallowed by the JVM, and the class loads unchanged,
                 // so the run would go on unseeded: stop it instead.
@@ -332,6 +338,51 @@ public final class Agent {
                 m -> m.methodName().equalsString("tick"), swap));
         if (hooked[0] != 1) {
             throw new IllegalStateException("DragonRespawnStage's pillars call RandomSource.create " + hooked[0] + " times, not once");
+        }
+        return out;
+    }
+
+    // The clock ChunkMap saves chunks by, as it saves those changed in play, saveChunksEagerly,
+    // and at an autosave, saveAllChunks(false), each Util.getMillis(), is Levels.saveMillis(this)
+    // instead, the game time's 50 a tick, and whether the tick has time left to save more,
+    // haveTime, is true, so it saves the same chunks at the same ticks from run to run, as
+    // Calcite does (CAL-261).
+    private static byte[] chunks(ClassFile cf, byte[] bytes) {
+        ClassDesc util = ClassDesc.of("net.minecraft.util.Util");
+        ClassDesc supplier = ClassDesc.of("java.util.function.BooleanSupplier");
+        MethodTypeDesc withMap = MethodTypeDesc.of(ConstantDescs.CD_long, ConstantDescs.CD_Object);
+        int[] clocks = {0};
+        int[] times = {0};
+        ClassTransform each = (cb, ce) -> {
+            if (!(ce instanceof MethodModel m) || !(m.methodName().equalsString("saveChunksEagerly")
+                    || m.methodName().equalsString("saveAllChunks"))) {
+                cb.with(ce);
+                return;
+            }
+            boolean eager = m.methodName().equalsString("saveChunksEagerly");
+            CodeTransform swap = (b, e) -> {
+                if (e instanceof InvokeInstruction i && i.opcode() == Opcode.INVOKESTATIC && i.owner().asSymbol().equals(util)
+                        && i.name().equalsString("getMillis")) {
+                    b.aload(0);
+                    b.invokestatic(ClassDesc.of("calcite.rig.vanilla.agent.Levels"), "saveMillis", withMap);
+                    clocks[0]++;
+                    return;
+                }
+                if (eager && e instanceof InvokeInstruction i && i.owner().asSymbol().equals(supplier)
+                        && i.name().equalsString("getAsBoolean")) {
+                    b.pop();
+                    b.iconst_1();
+                    times[0]++;
+                    return;
+                }
+                b.with(e);
+            };
+            cb.transformMethod(m, MethodTransform.transformingCode(swap));
+        };
+        byte[] out = cf.transformClass(cf.parse(bytes), each);
+        if (clocks[0] != 2 || times[0] != 1) {
+            throw new IllegalStateException("ChunkMap's saves call Util.getMillis " + clocks[0] + " times, not twice, and haveTime "
+                    + times[0] + " times, not once");
         }
         return out;
     }

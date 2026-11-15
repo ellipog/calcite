@@ -22,6 +22,8 @@ public final class Levels {
     private static long reseedAt = -1;
     private static final Map<String, Long> reseedIn = new HashMap<>();
     private static final Set<String> reseeded = new HashSet<>();
+    // ChunkMap's level, which saveMillis reads the game time of.
+    private static Field chunkLevel;
 
     private Levels() {
     }
@@ -92,6 +94,24 @@ public final class Levels {
      */
     public static RandomSource pillars(Object level) {
         return RandomSource.create(RandomSupport.mixStafford13(Tape.seed() ^ ((ServerLevel) level).getGameTime()));
+    }
+
+    /**
+     * The clock {@code ChunkMap} saves chunks by, where vanilla's is the wall clock's,
+     * {@code Util.getMillis()} (CAL-261): the game time of the map's level, 50 a tick, so a
+     * chunk's saved 200 ticks at the soonest after it last was, as Calcite's are in the rig.
+     */
+    public static long saveMillis(Object map) {
+        try {
+            if (chunkLevel == null) {
+                Field f = map.getClass().getDeclaredField("level");
+                f.setAccessible(true);
+                chunkLevel = f;
+            }
+            return ((ServerLevel) chunkLevel.get(map)).getGameTime() * 50;
+        } catch (ReflectiveOperationException e) {
+            throw new IllegalStateException("agent: ChunkMap has no level", e);
+        }
     }
 
     private static AtomicInteger counter() {
