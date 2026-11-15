@@ -120,7 +120,7 @@ import world.clip.{clip_outline}
 import world.difficulty.{LocalDifficulty, moon_brightness}
 import world.mob.{CHICKEN, COW, CREEPER, DONKEY, ENDERMAN, ENDERMITE, ENDER_DRAGON, HORSE, INTERACT_PASS, INTERACT_SERVER, MOOSHROOM, Making, Mob, Occasion, PIG, SHEEP, SKELETON, SLIME, SPIDER, VILLAGER, WITCH, ZOMBIE, ZOMBIE_HORSE, ZOMBIE_VILLAGER, bed_sleep_height, bed_yaw, held_name, species_named, type_name}
 import world.variants.{MobFacts}
-import world.loot.{Attacked, Burst, Located, LocatedEntry, Loot, LootEntity, LootParams, PostAttack, condition_holds, modify_stack, disk_blocks, disk_holds, distance_holds, doubles_match, doubles_match_sqr, enchanted_amount, equipment_drop_chance, float_sample, ints_hold, item_holds, location_entries, location_holds, post_attack_effects, random_sequence, roll_table, spawned_effects, state_holds, tick_entries, tick_holds, trade_offers, trade_sequence, weapon_effects}
+import world.loot.{Attacked, Burst, Located, LocatedEntry, Loot, LootEntity, LootParams, PostAttack, condition_holds, modify_stack, disk_blocks, disk_holds, distance_holds, doubles_match, doubles_match_sqr, enchanted_amount, equipment_drop_chance, float_sample, ints_hold, item_holds, place_holds, location_entries, location_holds, post_attack_effects, random_sequence, roll_table, spawned_effects, state_holds, tick_entries, tick_holds, trade_offers, trade_sequence, weapon_effects}
 import world.item_tracker.{PathStep, Tracker, Sent, delta_bytes, lp_vec3_bytes, path_bytes, section_of}
 import world.movement.{MovementStates, Mover, meets}
 import math.mth.{RAD_TO_DEG, floor as mth_floor, round_double, round_float, table_atan2, table_cos, table_sin}
@@ -647,6 +647,14 @@ struct Player {
     impulse_grace: i32 = 0
     impulse_at: (f64, f64, f64)? = none
     extra_fall_particles: bool = false
+    // Where they started falling, `startingToFallPosition`, till their fall's reset; and where an
+    // explosion last hit them, `currentExplosionImpactPos`, saved as `last_explosion_impact_pos`,
+    // with what it came from, `currentExplosionCause`, by its ID and as a criterion's predicates
+    // read it as it hit them, for where it's gone by when they're read, till they start falling
+    // (D666).
+    fall_start: (f64, f64, f64)? = none
+    blast_at: (f64, f64, f64)? = none
+    blast_cause: (i32, LootEntity)? = none
     // What's hurt them lately, `CombatTracker`, and where they were last on what's climbable since
     // they were on the ground, `lastClimbablePos`; dead, the ticks since, `deathTime`, whether
     // they're out of their level, as they are 20 ticks after, and whether their client's waiting
@@ -1873,6 +1881,10 @@ pub struct Network {
     // The mob lent out of its level's list as it hurts a player, by its ID, as loot and a
     // criterion's predicates read it, so the hurt's and the death's triggers find it (CAL-164).
     lent_mob: (i32, LootEntity)? = none
+    // What an explosion going off came from, by its ID, as a criterion's predicates read it,
+    // where it's no longer among its level's entities, as a wind charge, primed TNT and an end
+    // crystal aren't as they go off, `explode_gone` (D666).
+    blast_source: (i32, LootEntity)? = none
     // The attack a player's packet asked for, by their connection's slot and the entity ID of what
     // they attack, made once their connection's back among the others, `attack_deferred`, so
     // the players it hurts are heard by them as by everyone (CAL-162).
@@ -6642,6 +6654,14 @@ impl Network {
         }
         con.player.portal_cooldown = cooldown
         con.player.entered_nether = entered
+        // `last_explosion_impact_pos`, as `ServerPlayer` reads it, without what it came from
+        // (D666).
+        var blasted: (f64, f64, f64)? = none
+        if let loaded = con.player.data {
+            blasted = vec3_of(loaded, "last_explosion_impact_pos")
+        }
+        con.player.blast_at = blasted
+        con.player.blast_cause = none
         // `seenCredits`, as `ServerPlayer` reads it (D586).
         var credits = false
         if let loaded = con.player.data {
@@ -7281,6 +7301,148 @@ impl Network {
         self.award_all(mut con, matched)
     }
 
+    // A `DistanceTrigger`'s `trigger` for the player, `trigger` its whole ID, of where they were
+    // at `sx`, `sy`, `sz` (D666), as `NETHER_TRAVEL` and `FALL_FROM_HEIGHT` are: each criterion
+    // listening whose `start_position` holds there, in the level they're in now,
+    // `player.level()`, whose `distance` holds from there to where they are, and whose player's
+    // condition holds, awarded.
+    fn distance_trigger(mut self, con: mut Connection, trigger: str, sx: f64, sy: f64, sz: f64) {
+        let listening = con.player.advancements.listening(String(trigger))
+        if listening.is_empty() {
+            return
+        }
+        var matched = List<Listener>()
+        for (key, conditions) in listening {
+            if not self.start_holds(con, field_of(conditions, "start_position"), sx, sy, sz) {
+                continue
+            }
+            let distance = field_of(conditions, "distance")
+            if distance != Tag.End and not distance_holds(distance, sx, sy, sz, con.player.x, con.player.y, con.player.z) {
+                continue
+            }
+            if self.player_holds(con, conditions) {
+                matched.push(key.copy())
+            }
+        }
+        self.award_all(mut con, matched)
+    }
+
+    // Whether a criterion's `start_position`, `start`, holds at x, y, z,
+    // `LocationPredicate.matches` in the level the player's in (D666): there's none, or it does.
+    // What it asks that loot can't tell is said to be missing.
+    fn start_holds(mut self, con: Connection, start: Tag, x: f64, y: f64, z: f64) -> bool {
+        if start == Tag.End {
+            return true
+        }
+        let d = con.player.dim
+        let shared = self.levels[d].world_loot() else return false
+        let env = self.levels[d].shared_env() else return false
+        let Env { facts: f, .. } = env.value
+        var missing = List<String>()
+        let holds = place_holds(shared.value, f, self.levels[d], start, x, y, z, mut missing)
+        for m in missing {
+            self.levels[d].unimplemented(m)
+        }
+        return holds
+    }
+
+    // `trackStartFallingPosition` (D666): where the player's fallen and hasn't started a fall
+    // yet, where they are kept as where it started; then, where an explosion hit them no higher,
+    // `FALL_AFTER_EXPLOSION` of where it hit them, `fell_after_blast`; then where it hit them and
+    // what it came from forgotten.
+    fn track_fall_start(mut self, con: mut Connection) {
+        if not (con.player.fall > 0.0) or con.player.fall_start != none {
+            return
+        }
+        con.player.fall_start = some((con.player.x, con.player.y, con.player.z))
+        if let (bx, by, bz) = con.player.blast_at {
+            if by <= con.player.y {
+                self.fell_after_blast(mut con, bx, by, bz)
+            }
+        }
+        con.player.blast_at = none
+        con.player.blast_cause = none
+    }
+
+    // `CriteriaTriggers.FALL_AFTER_EXPLOSION.trigger` for the player, hit by an explosion at `bx`,
+    // `by`, `bz` (D666): each criterion listening whose `start_position` holds there, whose
+    // `distance` holds from there to where they are, whose `cause` holds of what the explosion
+    // came from, `EntityPredicate.createContext(player, cause)`, as it is where it's still there,
+    // else as it was as it hit them, and not where it came from nothing, and whose player's
+    // condition holds, awarded.
+    fn fell_after_blast(mut self, con: mut Connection, bx: f64, by: f64, bz: f64) {
+        let listening = con.player.advancements.listening(String("minecraft:fall_after_explosion"))
+        if listening.is_empty() {
+            return
+        }
+        var cause: LootEntity? = none
+        if let (id, seen) = con.player.blast_cause.copy() {
+            cause = some(self.entity_looted(con.player.dim, id, con) ?? seen)
+        }
+        var matched = List<Listener>()
+        for (key, conditions) in listening {
+            if not self.start_holds(con, field_of(conditions, "start_position"), bx, by, bz) {
+                continue
+            }
+            let distance = field_of(conditions, "distance")
+            if distance != Tag.End and not distance_holds(distance, bx, by, bz, con.player.x, con.player.y, con.player.z) {
+                continue
+            }
+            let wanted = field_of(conditions, "cause")
+            if wanted != Tag.End {
+                let c = cause.copy() else continue
+                if not self.entity_condition(con, wanted, c) {
+                    continue
+                }
+            }
+            if self.player_holds(con, conditions) {
+                matched.push(key.copy())
+            }
+        }
+        self.award_all(mut con, matched)
+    }
+
+    // `ServerPlayer.resetFallDistance` of the player where they are (D666): `fall_reset_at`, then
+    // their fall forgotten, `Entity.resetFallDistance`.
+    fn reset_fall(mut self, con: mut Connection) {
+        let at = (con.player.x, con.player.y, con.player.z)
+        self.fall_reset_at(mut con, at)
+        con.player.fall = 0.0
+    }
+
+    // `ServerPlayer.resetFallDistance`'s trigger, of the player reset at `at`, which their
+    // server's move of them had them at as it reset it, or where they are (D666): where they're
+    // alive and started falling, `FALL_FROM_HEIGHT` of where they started, as of them there;
+    // then where they started forgotten.
+    fn fall_reset_at(mut self, con: mut Connection, at: (f64, f64, f64)) {
+        if let (sx, sy, sz) = con.player.fall_start {
+            if con.player.entity_data.float(HEALTH) > 0.0f32 {
+                let (nx, ny, nz) = (con.player.x, con.player.y, con.player.z)
+                let (ax, ay, az) = at
+                con.player.x = ax
+                con.player.y = ay
+                con.player.z = az
+                self.distance_trigger(mut con, "minecraft:fall_from_height", sx, sy, sz)
+                con.player.x = nx
+                con.player.y = ny
+                con.player.z = nz
+            }
+        }
+        con.player.fall_start = none
+    }
+
+    // Where the server's last move of the player's body reset their fall, the first time it did
+    // since it took it up, `fall_reset_at` there (D666).
+    fn body_fall_reset(mut self, con: mut Connection) {
+        var l = con.player.body.take() else return
+        let reset = l.body.fall_reset
+        l.body.fall_reset = none
+        con.player.body = some(l)
+        if let at = reset {
+            self.fall_reset_at(mut con, at)
+        }
+    }
+
     // `CriteriaTriggers.BRED_ANIMALS.trigger` for the player of the UUID `who` in the level `d`,
     // who made `parent` and `partner` fall in love and breed `child` (CAL-164), where they're
     // there.
@@ -7531,8 +7693,9 @@ impl Network {
     }
 
     // What a criterion's predicates read of the entity `id` of the level `d` (CAL-164): of `con`'s
-    // player where it's them, of another player, or of a mob or an arrow where the level's
-    // entities are in; else nothing, as of one that isn't there.
+    // player where it's them, of another player, of what an explosion going off came from where
+    // it's gone, `blast_source`, or of a mob, an arrow, a fireball, primed TNT or an end crystal
+    // where the level's entities are in (D666); else nothing, as of one that isn't there.
     fn entity_looted(mut self, d: usize, id: i32, con: Connection) -> LootEntity? {
         if id < 0 {
             return none
@@ -7542,6 +7705,11 @@ impl Network {
         }
         if let (lent, seen) = self.lent_mob {
             if lent == id {
+                return some(seen.copy())
+            }
+        }
+        if let (gone, seen) = self.blast_source {
+            if gone == id {
                 return some(seen.copy())
             }
         }
@@ -7561,6 +7729,8 @@ impl Network {
         } else if es.list.is_arrow(id) {
             let a = es.list.arrow(id)
             out = some(LootEntity { kind: String("minecraft:arrow"), at: some((a.body.x, a.body.y, a.body.z)) })
+        } else if let kind = es.list.blast_kind(id) {
+            out = some(LootEntity { kind: kind, at: es.list.place(id) })
         }
         self.put_entities(d, es)
         return out
@@ -9422,9 +9592,9 @@ impl Network {
     // `triggerDimensionChangeTriggers` of the player, come from the dimension at `from` (D577):
     // each criterion of `CHANGED_DIMENSION` listening whose `from` and `to` are where they came
     // from and are, where they're given, and whose player's condition holds, awarded; then, from
-    // the Nether into the Overworld, where they went into the Nether, each of `NETHER_TRAVEL`'s
-    // whose `distance` holds from there to where they are; then, out of the Nether, where they went
-    // in's forgotten. A criterion with a `start_position` is said to be missing.
+    // the Nether into the Overworld, `NETHER_TRAVEL` of where they went into the Nether,
+    // `distance_trigger`, its `start_position` read in the Overworld, as vanilla's is (D666);
+    // then, out of the Nether, where they went in's forgotten.
     fn dimension_changed(mut self, con: mut Connection, from: usize) {
         let to = con.player.dim
         let came = self.world.dims[from].id.to_string()
@@ -9432,21 +9602,7 @@ impl Network {
         self.dimension_criteria(mut con, came, now)
         if self.dim_is(from, "the_nether") and self.dim_is(to, "overworld") {
             if let (sx, sy, sz) = con.player.entered_nether {
-                var traveled = List<Listener>()
-                for (key, conditions) in con.player.advancements.listening(String("minecraft:nether_travel")) {
-                    if field_of(conditions, "start_position") != Tag.End {
-                        self.levels[to].unimplemented(String("Where a player went into the Nether, as nether_travel's start_position"))
-                        continue
-                    }
-                    let distance = field_of(conditions, "distance")
-                    if distance != Tag.End and not distance_holds(distance, sx, sy, sz, con.player.x, con.player.y, con.player.z) {
-                        continue
-                    }
-                    if self.player_holds(con, conditions) {
-                        traveled.push(key.copy())
-                    }
-                }
-                self.award_all(mut con, traveled)
+                self.distance_trigger(mut con, "minecraft:nether_travel", sx, sy, sz)
             }
         }
         if not self.dim_is(to, "the_nether") {
@@ -9711,6 +9867,8 @@ impl Network {
             if let (sx, sy, sz, ticks) = levitating {
                 self.levitated(mut con, sx, sy, sz, ticks)
             }
+            // Where they start falling, and their fall after an explosion (D666).
+            self.track_fall_start(mut con)
             let crouching = con.player.entity_data.number(POSE_ID) == CROUCHING
             update_player(mut con.player.attributes, con.player.mode == GameType.Creative, crouching)
             // `flushDirty` of their advancements (CAL-164).
@@ -12167,7 +12325,7 @@ impl Network {
         let interaction = self.world.explosions.interaction(Cause.Trigger, self.world.mob_griefing)
         let e = Explosion { x: s.x, y: s.y, z: s.z, radius: 1.2f32, interaction: interaction, calculator: Calculator.Simple(true, false, some(1.22f32), some(immune)), source: some(s.id), wind_charge: true, indirect: indirect, by_player: by_player, mob_griefing: self.world.mob_griefing }
         self.put_entities(d, all)
-        self.explode(d, e, source, wind_look(), s.silent)
+        self.explode_gone(d, e, source, wind_look(), s.silent, LootEntity { kind: String("minecraft:wind_charge"), at: some((s.x, s.y, s.z)) })
         return self.take_entities(d)
     }
 
@@ -12611,6 +12769,14 @@ impl Network {
         return all
     }
 
+    // `explode` of `e` in the level `d` from what's no longer among its entities as it goes off,
+    // as a criterion's predicates read it then, `from`, `blast_source` till it's done (D666).
+    fn explode_gone(mut self, d: usize, e: Explosion, source: Damage, look: BlastLook, silent: bool, from: own LootEntity) {
+        self.blast_source = some((e.source ?? -1, from))
+        self.explode(d, e, source, look, silent)
+        self.blast_source = none
+    }
+
     // `ServerLevel.explode` of `e` in the level `d` (CAL-182), hurting with `source`, showing and
     // sounding as `look` has it, `silent` where what it came from is: the places its rays reach,
     // `blown_places`; the entities it reaches hurt and pushed, `blast_entities`; where it acts on
@@ -12810,10 +12976,10 @@ impl Network {
     // The player in the slot `slot`, of `b`, the explosion `e` reached, as `hurtEntities` has it
     // (CAL-182): hurt where it hurts what it reaches, `hurt_player`; pushed away from its middle,
     // `pushFromExplosion`, their motion more by it where it's finite, their tracker to send it;
-    // and told, `onExplosionHit`: the grace of the impulse given, from where they are, where a
-    // wind charge gave it, else none. Where the explosion was and what it came from, which its
-    // advancement trigger reads as they fall after, `currentExplosionImpactPos`, is said to be
-    // missing. The push, where they're among `hitPlayers`.
+    // and told, `onExplosionHit`: where they are kept as where it hit them, with what it came
+    // from, `currentExplosionImpactPos` and `currentExplosionCause` (D666), and the grace of the
+    // impulse given, from where they are, where a wind charge gave it, else none. The push, where
+    // they're among `hitPlayers`.
     fn blast_player(mut self, slot: usize, e: Explosion, source: Damage, b: Blasted) -> (i32, f64, f64, f64)? {
         var con = self.connections[slot].take() else return none
         if damages(e) {
@@ -12831,6 +12997,14 @@ impl Network {
             con.player.vz = con.player.vz + kz
             con.player.needs_sync = true
         }
+        let d = con.player.dim
+        con.player.blast_at = some((con.player.x, con.player.y, con.player.z))
+        con.player.blast_cause = none
+        if let from = e.source {
+            if let seen = self.entity_looted(d, from, con) {
+                con.player.blast_cause = some((from, seen))
+            }
+        }
         if e.wind_charge {
             con.player.impulse_grace = con.player.impulse_grace.max(40)
             con.player.impulse_at = some((con.player.x, con.player.y, con.player.z))
@@ -12838,9 +13012,7 @@ impl Network {
             con.player.impulse_grace = 0
         }
         let id = con.player.entity_id
-        let d = con.player.dim
         self.connections[slot] = some(con)
-        self.levels[d].unimplemented(String("Where a player was hit by an explosion, for its advancement trigger as they fall after, `currentExplosionImpactPos`"))
         if b.flying {
             return none
         }
@@ -12882,7 +13054,7 @@ impl Network {
         let source = Damage { kind: kind, cause: g.source.cause, direct: g.id, at: some(g.at), player: g.source.player, creative: g.source.creative, living_cause: g.source.living_cause }
         let interaction = self.world.explosions.interaction(Cause.Block, self.world.mob_griefing)
         let e = Explosion { x: x, y: y, z: z, radius: 6.0f32, interaction: interaction, calculator: Calculator.Plain, source: some(g.id), mob_griefing: self.world.mob_griefing }
-        self.explode(d, e, source, plain_look(), g.silent)
+        self.explode_gone(d, e, source, plain_look(), g.silent, LootEntity { kind: String("minecraft:end_crystal"), at: some(g.at) })
     }
 
     // The `explode` effects queued in `bursts`, each gone off in the level `d` in turn, `burst`, as
@@ -13170,7 +13342,7 @@ impl Network {
         }
         let interaction = self.world.explosions.interaction(Cause.Tnt, self.world.mob_griefing)
         let e = Explosion { x: b.x, y: b.y, z: b.z, radius: b.power, interaction: interaction, calculator: calculator, source: some(id), indirect: indirect, by_player: by_player, mob_griefing: self.world.mob_griefing }
-        self.explode(d, e, source, plain_look(), b.silent)
+        self.explode_gone(d, e, source, plain_look(), b.silent, LootEntity { kind: String("minecraft:tnt"), at: some(b.at) })
     }
 
     // The mob `mob`, lent out of the level `d`'s entities, given back, and the entities taken
@@ -16836,7 +17008,7 @@ impl Network {
             // `Player.aiStep`'s: what's in their inventory ticks (D603).
             self.inventory_tick(mut con)
             if con.player.abilities.flying {
-                con.player.fall = 0.0
+                self.reset_fall(mut con)
             }
             // `LivingEntity.aiStep`'s: their equipment ticks (D603).
             self.equipment_tick(mut con)
@@ -16853,7 +17025,7 @@ impl Network {
             }
             // `aiStep`'s: their fall forgotten under slow falling or levitation (D514).
             if con.player.effects.has(SLOW_FALLING) or con.player.effects.has(LEVITATION) {
-                con.player.fall = 0.0
+                self.reset_fall(mut con)
             }
             self.player_travel(mut con)
             self.player_steps(mut con)
@@ -17051,6 +17223,7 @@ impl Network {
         self.living_facts = some(lf)
         self.movement = some(m)
         self.item_facts = some(t)
+        self.body_fall_reset(mut con)
     }
 
     // `applyEffectsFromBlocks` for the player as it begins, after their travel (D431): what the
@@ -22327,7 +22500,7 @@ impl Network {
             // `hurtEnemy`'s `ITEM_USED` of a weapon (CAL-164).
             con.player.stats.award(String("minecraft:used"), stack_item(weapon.copy()), 1)
             if stack_item(weapon) == "minecraft:mace" and can_smash(con) {
-                con.player.fall = 0.0
+                self.reset_fall(mut con)
             }
             if let t = taken {
                 self.wear_taken(mut con, d, t, drop, n)
@@ -30020,7 +30193,7 @@ impl Network {
             self.check_fall(mut con, f, m, t, lf, dy, ground)
         }
         if up {
-            con.player.fall = 0.0
+            self.reset_fall(mut con)
         }
         // `checkMovementStatistics` asks whether they're on what's climbable, `onClimbable`, which
         // keeps where, only where they moved and aren't in water (D427).
@@ -30086,6 +30259,7 @@ impl Network {
         self.living_facts = some(lf)
         self.movement = some(m)
         self.item_facts = some(t)
+        self.body_fall_reset(mut con)
     }
 
     // What the server's move of the player made heard (D421): their steps and swims, which
@@ -30206,7 +30380,7 @@ impl Network {
         let r = fluids_at(f, t.flow, self.levels[d], b, flying)
         let wet = r.water > 0.0
         if wet {
-            con.player.fall = 0.0
+            self.reset_fall(mut con)
             if not con.player.in_water and con.player.based {
                 var random = con.player.random.take() ?? LegacyRandom.new(self.entity_seed(con.player.entity_id))
                 let (volume, pitch) = splash_draws(mut random, 0.6f32, con.player.vx, con.player.vy, con.player.vz)
@@ -30291,7 +30465,7 @@ impl Network {
             if fell > 0.0 {
                 self.land_on(mut con, f, m, lf, state, fell)
             }
-            con.player.fall = 0.0
+            self.reset_fall(mut con)
             // `LivingEntity.checkFallDamage`: on the ground, where they were last on what's
             // climbable forgotten (D427).
             con.player.last_climbable = none
@@ -31519,7 +31693,7 @@ impl Network {
             } else {
                 self.change_dimension_by(mut con, d, ax, ay, az, 0.0f32, 0.0f32, 24)
             }
-            con.player.fall = 0.0
+            self.reset_fall(mut con)
             con.player.impulse_grace = 0
             con.player.impulse_at = none
             if let lf = self.living_facts.take() {
@@ -33443,6 +33617,14 @@ fn player_tag(player: Player, id: Uuid, dimension: own String) -> JavaHashMap<St
     } else {
         _ = data.remove("entered_nether_pos")
     }
+    // `last_explosion_impact_pos`, where an explosion's hit them since they last started falling
+    // (D666).
+    if let at = player.blast_at {
+        let (bx, by, bz) = at
+        data.insert(String("last_explosion_impact_pos"), Tag.List([Tag.double(bx), Tag.double(by), Tag.double(bz)]))
+    } else {
+        _ = data.remove("last_explosion_impact_pos")
+    }
     // `DeathTime`, and `LastDeathLocation`, `GlobalPos.CODEC`'s, where they've died (D427).
     data.insert(String("DeathTime"), Tag.Short(i16.wrap(player.death_time)))
     if let died = player.last_death {
@@ -33588,11 +33770,13 @@ fn tracked_body(con: Connection) -> Body {
 // physics, hold shift, fly, sprint and crouch; their entity's random, which their swims draw
 // from (D421); whether a nether portal resets their fall as they pass through it, `portal`
 // (D422); and their effects, as slow falling, levitation and dolphin's grace move them (D515).
+// Where it last reset their fall's forgotten, as what's taken it up since has (D666).
 fn body_of(con: mut Connection, lf: LivingFacts, portal: bool) -> Living {
     var l = con.player.body.take() ?? Living.player_body(player_kind(), con.player.entity_id, con.player.entity_data.copy())
     let pose = con.player.entity_data.number(POSE_ID)
     l.crouching = pose == CROUCHING
     l.body.portal = portal
+    l.body.fall_reset = none
     l.body.random = con.player.random ?? l.body.random
     let (width, height) = pose_size(pose)
     l.body.x = con.player.x
@@ -34102,10 +34286,11 @@ fn smash_push(living: mut Living, lf: LivingFacts, x: f64, y: f64, z: f64, fell:
 // their attributes' bases, `assignBaseValues`, without their modifiers, full health, their
 // enchantment seed, ender chest, skin's parts and main hand, where they last died, their
 // advancements, which the player list keeps for them, and their recipe book, `copyOverData`
-// (CAL-164); what they carried, the slot they held, and their experience only where `keeps`,
-// with `keep_inventory` or for a spectator, `transferInventoryXpAndScore`; their health, food and
-// experience sent again on their next tick; `random`, their new entity's; everything else a new
-// player's, their client's loading timer at 60 and no longer waiting for them to respawn.
+// (CAL-164), and where an explosion last hit them and what it came from (D666); what they
+// carried, the slot they held, and their experience only where `keeps`, with `keep_inventory` or
+// for a spectator, `transferInventoryXpAndScore`; their health, food and experience sent again on
+// their next tick; `random`, their new entity's; everything else a new player's, their client's
+// loading timer at 60 and no longer waiting for them to respawn.
 fn respawned_player(old: Player, information: ClientInformation, random: own LegacyRandom, dim: usize, keeps: bool, keep_all: bool) -> Player {
     var abilities = Abilities()
     abilities.update(old.mode)
@@ -34147,7 +34332,7 @@ fn respawned_player(old: Player, information: ClientInformation, random: own Leg
     status.sent_xp = -1
     let inventory = if keeps { old.inventory.copy() } else { Inventory.empty() }
     let selected = if keeps { old.selected } else { 0 }
-    return Player { entity_id: old.entity_id, tick_count: old.tick_count, teleport_id: old.teleport_id, awaiting: old.awaiting, awaiting_time: old.awaiting_time, position_this_tick: old.position_this_tick, moved_this_tick: old.moved_this_tick, center_x: old.center_x, center_z: old.center_z, view: old.view, sender: old.sender.copy(), asked: old.asked, last_seen: old.last_seen.copy(), next_chat_index: old.next_chat_index, chat_spam: old.chat_spam, command_spam: old.command_spam, session: old.session.copy(), chain: old.chain, signatures: old.signatures.copy(), data: old.data.copy(), mode: old.mode, previous_mode: old.previous_mode, abilities: abilities, level: old.level, joined: old.joined, dim: dim, selected: selected, inventory: inventory, ender: old.ender.copy(), attributes: attributes, worn: unworn(), ack: old.ack, entity_data: data, status: status, random: some(random), last_death: old.last_death.copy(), advancements: old.advancements.copy(), recipe_book: old.recipe_book.copy(), stats: old.stats.copy(), first_good: old.first_good, last_good: old.last_good, move_packets: old.move_packets, known_packets: old.known_packets, floating: old.floating, floating_ticks: old.floating_ticks, entered_nether: old.entered_nether, portal: if keep_all { old.portal } else { none }, seen_credits: old.seen_credits }
+    return Player { entity_id: old.entity_id, tick_count: old.tick_count, teleport_id: old.teleport_id, awaiting: old.awaiting, awaiting_time: old.awaiting_time, position_this_tick: old.position_this_tick, moved_this_tick: old.moved_this_tick, center_x: old.center_x, center_z: old.center_z, view: old.view, sender: old.sender.copy(), asked: old.asked, last_seen: old.last_seen.copy(), next_chat_index: old.next_chat_index, chat_spam: old.chat_spam, command_spam: old.command_spam, session: old.session.copy(), chain: old.chain, signatures: old.signatures.copy(), data: old.data.copy(), mode: old.mode, previous_mode: old.previous_mode, abilities: abilities, level: old.level, joined: old.joined, dim: dim, selected: selected, inventory: inventory, ender: old.ender.copy(), attributes: attributes, worn: unworn(), ack: old.ack, entity_data: data, status: status, random: some(random), last_death: old.last_death.copy(), advancements: old.advancements.copy(), recipe_book: old.recipe_book.copy(), stats: old.stats.copy(), first_good: old.first_good, last_good: old.last_good, move_packets: old.move_packets, known_packets: old.known_packets, floating: old.floating, floating_ticks: old.floating_ticks, entered_nether: old.entered_nether, blast_at: old.blast_at, blast_cause: old.blast_cause.copy(), portal: if keep_all { old.portal } else { none }, seen_credits: old.seen_credits }
 }
 
 // What a player's saved data `d` says of their death (D427): the ticks they've been dead,
