@@ -27,6 +27,7 @@ cases:
   - session:fight-kill/*/commands
   - session:fight-abort/*/commands
   - session:fight-respawn/*/commands
+  - session:fight-crystal/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
