@@ -140,11 +140,11 @@ final class FeaturesProbe implements Probe {
 
     @Override
     public int version() {
-        return 5;
+        return 6;
     }
 
     /** The types of mob a `structured` op writes whole, as Calcite makes them (CAL-87). */
-    private static final Set<String> WHOLE = Set.of("minecraft:witch");
+    private static final Set<String> WHOLE = Set.of("minecraft:witch", "minecraft:villager", "minecraft:zombie_villager", "minecraft:cow", "minecraft:pig", "minecraft:sheep", "minecraft:chicken", "minecraft:horse", "minecraft:donkey");
 
     /** A saved list of attributes in order of their IDs, as the attribute map keeps no order two runs share. */
     private static net.minecraft.nbt.ListTag sortedAttributes(net.minecraft.nbt.ListTag list) {

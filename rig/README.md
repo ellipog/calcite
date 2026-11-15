@@ -53,7 +53,7 @@ calx rig/runner/rig.calx orders                  # whether vanilla's decorations
 calx rig/runner/mathcmp.calx                     # Math against StrictMath, 500,000 arguments per range
 ```
 
-Every command takes `--probe NAME` (repeatable) to limit it to some probes. `record` and `check` take `--config strict-math` (the default), `intrinsics` or `all`. `--version` picks the game version, before or after the command. mathcmp takes `--function NAME` (repeatable) and `--count N`.
+Every command takes `--probe NAME` (repeatable) to limit it to some probes. `record` and `check` take `--config strict-math` (the default), `intrinsics` or `all`. `--version` picks the game version, before or after the command. `diff` takes `--blobs DIR` to write both sides of each output blob that differs there, as `vanilla-<i>.bin` and `<adapter>-<i>.bin`, for a tool that reads them. mathcmp takes `--function NAME` (repeatable) and `--count N`.
 
 The vanilla adapter builds into `oracle/vanilla-adapter/build/<platform>/`, and the runner's logs and reports go to `build/rig/<platform>/`. So one checkout can be run from Windows and from WSL.
 
