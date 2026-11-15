@@ -34,6 +34,8 @@ cases:
   - session:fight-crystal/*/commands
   - session:silverfish/*/commands
   - session:silverfish-kept/*/commands
+  - session:eggs/*/commands
+  - session:eggs-kept/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
