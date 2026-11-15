@@ -39,6 +39,7 @@ cases:
   - session:cauldrons/*/commands
   - session:lids/*/commands
   - session:webs/*/commands
+  - session:bushes/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
