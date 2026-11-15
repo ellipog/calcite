@@ -15,6 +15,7 @@ cases:
   - session:compass/*/commands
   - session:bossbars/*/commands
   - session:dragon/*/commands
+  - session:dragon-parts/*/commands
   - session:dragon-flight/*/commands
   - session:dragon-charge/*/commands
   - session:dragon-breath/*/commands
