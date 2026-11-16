@@ -52,6 +52,8 @@ cases:
   - session:snowfall/*/commands
   - session:riding/*/commands
   - session:jockeys/*/commands
+  - session:steering/*/commands
+  - session:bucking/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
