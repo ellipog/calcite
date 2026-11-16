@@ -62,6 +62,7 @@ cases:
   - session:snowstep/*/commands
   - session:bees/*/commands
   - session:hives/*/commands
+  - session:beeflight/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
