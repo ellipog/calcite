@@ -58,6 +58,7 @@ cases:
   - session:husks/*/commands
   - session:drowned/*/commands
   - session:cure/*/commands
+  - session:split-rider/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
