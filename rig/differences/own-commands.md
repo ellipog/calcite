@@ -68,6 +68,7 @@ cases:
   - session:beealert/*/commands
   - session:cod/*/commands
   - session:naming/*/commands
+  - session:shearing/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
