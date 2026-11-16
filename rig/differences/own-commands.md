@@ -60,6 +60,8 @@ cases:
   - session:cure/*/commands
   - session:split-rider/*/commands
   - session:snowstep/*/commands
+  - session:bees/*/commands
+  - session:hives/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
