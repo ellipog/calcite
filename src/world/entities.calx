@@ -27,7 +27,7 @@
 /// order they came into each, though nothing finds or ticks them.
 module world.entities
 
-import math.mth.{floor}
+import math.mth.{floor, table_cos, table_sin}
 import nbt.tag.{Tag}
 import random.taped.{TapedRandom}
 import registry.components.{ItemCodecs}
@@ -44,6 +44,8 @@ import world.eye_of_ender.{EYE_GONE, EyeOfEnder}
 import world.fireball.{Fireball, WIND_CHARGE}
 import world.tnt.{PrimedTnt}
 import world.damage.{DamageTypes}
+import world.dismount.{animal_dismount}
+import world.entity_data.{POSE_ID, STANDING, Value}
 import world.effects.{ActiveEffect}
 import world.experience_orb.{ExperienceOrb, Follower, can_merge}
 import world.goals.{Kin}
@@ -52,11 +54,12 @@ import world.item_entity.{ItemEntity}
 import world.living.{ArmorStand, Beat, Blast, LivingFacts, Shown, Spilled, Stab, StabDue}
 import world.menu.{count_of, same_components}
 import world.living.{Living, Warding}
-import world.mob.{ENDER_DRAGON, Mob, MobLight, ZOMBIE, ZOMBIE_VILLAGER}
+import world.mob.{CHICKEN, ENDER_DRAGON, Mob, MobLight, SLIME, ZOMBIE, ZOMBIE_VILLAGER, passenger_point, vehicle_point}
 import world.movement.{MovementStates, Mover}
 import world.navigation.{NavLevel}
-import world.paths.{PathTypeCache}
+import world.paths.{PathTypeCache, state_at}
 import world.poi.{Pois}
+import world.portal.{free_position}
 import world.pos.{BlockPos, ChunkPos}
 import world.lodestone.{TrackerTick, draws_map, lodestone_tick}
 import world.placing.{stack_item}
@@ -111,6 +114,20 @@ pub enum Entity {
     Eye(EyeOfEnder)
     Fireball(Fireball)
     Tnt(PrimedTnt)
+}
+
+// What's alive that got off something, `rider`, as `dismountVehicle` puts it (D708): where what it
+// rode was, the top of its box and its yaw as it got off, whether it was gone, and whether it's
+// an animal, `Animal`.
+struct Unseat {
+    rider: i32
+    x: f64
+    y: f64
+    z: f64
+    top: f64
+    yaw: f32
+    gone: bool
+    animal: bool
 }
 
 /// A player as an ender pearl of theirs asks after them, wherever they are,
@@ -300,6 +317,15 @@ pub struct Entities {
     cursor: usize = 0
     end: usize = 0
     heard: usize = 0
+    // The entity whose tick goes on, by its ID, and what it rides where it ticks as a passenger,
+    // `rideTick`; and the passengers to tick after it, each with what it rode as its vehicle's tick
+    // began, first first, as `tickNonPassenger` and `tickPassenger` go through them, depth first
+    // (D708).
+    ticking: (i32, i32?)? = none
+    riders: List<(i32, i32)> = List<(i32, i32)>()
+    // What got off something, to be put where it gets off where its level's blocks are at hand,
+    // as the next entity's tick begins (D708).
+    unseated: List<Unseat> = List<Unseat>()
     // The level's path types, `PathTypeCache`, and how many of the blocks it sent again it's read
     // (CAL-157).
     path_types: PathTypeCache = PathTypeCache()
@@ -645,8 +671,57 @@ impl Entities {
         return a.copy()
     }
 
-    /// What the entity `id`, which must be here, is saved as, `saveAsPassenger`.
+    /// What the entity `id`, which must be here, is saved as, `saveAsPassenger`, with what rides
+    /// it, here, each so in turn, `Passengers` (D708).
     pub fn saved(self, id: i32) -> Tag {
+        let own_tag = self.saved_alone(id)
+        let riders = self.passengers_of(id)
+        if riders.is_empty() {
+            return own_tag
+        }
+        // Each where it rides across and at its own height, `saveWithoutId`'s `Pos`.
+        let (vx, _, vz) = self.place(id) ?? (0.0, 0.0, 0.0)
+        var list = List<Tag>()
+        for p in riders {
+            if self.at.contains(p) and self.all[self.at[p]] != none {
+                let rider = self.saved(p)
+                let (_, py, _) = self.place(p) ?? (0.0, 0.0, 0.0)
+                if let Tag.Compound(rm) = rider {
+                    var t = rm.copy()
+                    t.insert(String("Pos"), Tag.List([Tag.Double(vx), Tag.Double(py), Tag.Double(vz)]))
+                    list.push(Tag.Compound(t))
+                } else {
+                    list.push(rider)
+                }
+            }
+        }
+        let Tag.Compound(m) = own_tag else return own_tag
+        var t = m.copy()
+        t.insert(String("Passengers"), Tag.List(list))
+        return Tag.Compound(t)
+    }
+
+    /// Whether the entity `id` is saved by itself, `Entity.save`: what rides something is saved
+    /// with it, not by itself (D708).
+    pub fn saved_by_itself(self, id: i32) -> bool {
+        return self.vehicle_of(id) == none
+    }
+
+    /// The entity `id`'s passengers, theirs first, then each, depth first, as
+    /// `getPassengersAndSelf` goes, without `id` (D708).
+    pub fn riders_under(self, id: i32) -> List<i32> {
+        var out = List<i32>()
+        for p in self.passengers_of(id) {
+            for q in self.riders_under(p) {
+                out.push(q)
+            }
+            out.push(p)
+        }
+        return out
+    }
+
+    // What the entity `id` is saved as by itself.
+    fn saved_alone(self, id: i32) -> Tag {
         let slot = self.all[self.at[id]] else panic("no entity {id}")
         return match slot {
             Entity.Item(e) => e.saved(),
@@ -753,12 +828,21 @@ impl Entities {
     /// Takes the entity `id` away, `discard`, if it's here. Where it's a living entity the
     /// scoreboard has under its UUID, `scored`, it's kept in `unscored` with its ID, for the
     /// scoreboard to forget it, `entityRemoved` (CAL-164), but where a nether portal took it,
-    /// `CHANGED_DIMENSION`, which doesn't destroy it, `shouldDestroy` (D578).
+    /// `CHANGED_DIMENSION`, which doesn't destroy it, `shouldDestroy` (D578). It gets off what it
+    /// rides, and what rides it off it, gone, as `setRemoved` has them (D708).
     pub fn remove(mut self, id: i32) {
         if not self.at.contains(id) {
             return
         }
         let i = self.at[id]
+        if let (_, rides, carries, _, _) = self.riding_at(i) {
+            if rides != none {
+                self.leave(id, false)
+            }
+            if carries {
+                self.eject(id, true)
+            }
+        }
         if not self.scored.is_empty() {
             var uuid: (i64, i64)? = none
             match self.all[i] {
@@ -1235,6 +1319,318 @@ impl Entities {
         return some(place_of(e))
     }
 
+    /// What rides the entity `id`, in order, `getPassengers` (D708); none where it isn't here.
+    pub fn passengers_of(self, id: i32) -> List<i32> {
+        let b = self.body_at(id) else return List<i32>()
+        return b.passengers.copy()
+    }
+
+    /// What the entity `id` rides, `getVehicle` (D708), none where it isn't here or rides nothing.
+    pub fn vehicle_of(self, id: i32) -> i32? {
+        if not self.at.contains(id) {
+            return none
+        }
+        let e = self.all[self.at[id]] else return none
+        let (_, vehicle, _) = riding_of(e)
+        return vehicle
+    }
+
+    /// What the entity `id` rides at the bottom, `getRootVehicle` (D708): itself where it rides
+    /// nothing.
+    pub fn root_vehicle(self, id: i32) -> i32 {
+        var at = id
+        var depth = 0
+        while depth < 4096 {
+            let under = self.vehicle_of(at) else break
+            at = under
+            depth += 1
+        }
+        return at
+    }
+
+    // A copy of the body of the entity `id`, where it's here and not lent.
+    fn body_at(self, id: i32) -> Body? {
+        if not self.at.contains(id) {
+            return none
+        }
+        let e = self.all[self.at[id]] else return none
+        return some(body_of(e))
+    }
+
+    // The entity `id`'s body made `b`, where it's here and not lent.
+    fn put_body(mut self, id: i32, b: own Body) {
+        if not self.at.contains(id) {
+            return
+        }
+        let i = self.at[id]
+        let e = self.all[i].take() else return
+        self.all[i] = some(with_body(e, b))
+    }
+
+    // What rides the entity `id` given to each of them as what rides with it, `riding_with`.
+    fn share_riders(mut self, id: i32) {
+        let riders = self.passengers_of(id)
+        for p in riders {
+            var b = self.body_at(p) else continue
+            b.riding_with = riders.copy()
+            self.put_body(p, b)
+        }
+    }
+
+    /// `startRiding` of the entity `rider` onto the entity `vehicle` (D708), both here, `force`
+    /// where it boards however soon after it got off something and whatever already rides
+    /// `vehicle`, as loading and `summon` board, `canRide` and `canAddPassenger`: not where it
+    /// rides it already, would ride itself, or what `vehicle` rides, all the way down, is it;
+    /// else off what it rode, standing, `setPose(STANDING)`, and last of what rides `vehicle`,
+    /// `addPassenger`. Says whether it boarded. Its game event, `ENTITY_MOUNT`, is the caller's.
+    pub fn start_riding(mut self, rider: i32, vehicle: i32, force: bool) -> bool {
+        if rider == vehicle {
+            return false
+        }
+        let r = self.body_at(rider) else return false
+        let v = self.body_at(vehicle) else return false
+        if r.vehicle == some(vehicle) {
+            return false
+        }
+        var below = v.vehicle
+        var depth = 0
+        while depth < 4096 {
+            let under = below else break
+            if under == rider {
+                return false
+            }
+            below = self.vehicle_of(under)
+            depth += 1
+        }
+        if not force and (r.boarding_cooldown > 0 or not v.passengers.is_empty()) {
+            return false
+        }
+        if r.vehicle != none {
+            self.stop_riding(rider)
+        }
+        let i = self.at[rider]
+        if let held = self.all[i].take() {
+            self.all[i] = some(match held {
+                Entity.Mob(m) => {
+                    var t = m
+                    t.living.data.set(POSE_ID, Value.Number(STANDING))
+                    Entity.Mob(t)
+                },
+                Entity.Stand(a) => {
+                    var t = a
+                    t.living.data.set(POSE_ID, Value.Number(STANDING))
+                    Entity.Stand(t)
+                },
+                other => other,
+            })
+        }
+        var rb = self.body_at(rider) else return false
+        rb.vehicle = some(vehicle)
+        self.put_body(rider, rb)
+        var vb = self.body_at(vehicle) else return false
+        vb.passengers.push(rider)
+        self.put_body(vehicle, vb)
+        self.share_riders(vehicle)
+        return true
+    }
+
+    /// `stopRiding` of the entity `rider` (D708), `removeVehicle`: off what it rides, which it may
+    /// board again in 60 ticks, `boardingCooldown`; and what's alive put where it gets off,
+    /// `dismountVehicle`, as the next entity's tick begins, where its level's blocks are at hand,
+    /// or as the server asks, `seat_off`. Its game event, `ENTITY_DISMOUNT`, isn't made.
+    pub fn stop_riding(mut self, rider: i32) {
+        self.leave(rider, false)
+    }
+
+    // `stopRiding` of `rider`, `gone` where what it rides is gone, `isRemoved`.
+    fn leave(mut self, rider: i32, gone: bool) {
+        var rb = self.body_at(rider) else return
+        let vehicle = rb.vehicle else return
+        rb.vehicle = none
+        rb.riding_with = List<i32>()
+        rb.boarding_cooldown = 60
+        let removed = rb.removed
+        self.put_body(rider, rb)
+        var off = Unseat { rider: rider, x: 0.0, y: 0.0, z: 0.0, top: 0.0, yaw: 0.0f32, gone: gone, animal: false }
+        if let got = self.body_at(vehicle) {
+            var vb = got
+            var kept = List<i32>()
+            for p in vb.passengers {
+                if p != rider {
+                    kept.push(p)
+                }
+            }
+            vb.passengers = kept
+            off.x = vb.x
+            off.y = vb.y
+            off.z = vb.z
+            off.top = vb.bounding_box().max_y
+            off.yaw = vb.y_rot
+            off.gone = gone or vb.removed
+            self.put_body(vehicle, vb)
+            self.share_riders(vehicle)
+            if let Entity.Mob(m) = self.all[self.at[vehicle]] {
+                off.animal = m.animal
+            }
+        } else {
+            off.gone = true
+        }
+        // `LivingEntity.stopRiding`: what's alive and not gone itself gets off where its vehicle
+        // puts it.
+        let (_, _, _, _, alive) = self.riding_at(self.at[rider]) else return
+        if alive and not removed {
+            self.unseated.push(off)
+        }
+    }
+
+    // The entity at `i`'s ID, what it rides, whether anything rides it, whether it's gone, and
+    // whether it's alive, where it's there and not lent (D708).
+    fn riding_at(self, i: usize) -> (i32, i32?, bool, bool, bool)? {
+        let e = self.all[i] else return none
+        let (id, rides, carries) = riding_of(e)
+        return some((id, rides, carries, body_of(e).removed, alive_kind(e)))
+    }
+
+    // What rides `id` off it, `ejectPassengers`, last first, `gone` where it's gone.
+    fn eject(mut self, id: i32, gone: bool) {
+        let riders = self.passengers_of(id)
+        var k = riders.len()
+        while k > 0 {
+            k -= 1
+            self.leave(riders[k], gone)
+        }
+    }
+
+    /// `dismountVehicle` of what got off something since (D708): where it's gone, as it is; else
+    /// where what it rode isn't gone and isn't in a portal, `#portals`, where that puts it,
+    /// `getDismountLocationForPassenger`: an animal's beside it, `Animal`'s, else on its box's
+    /// top, `Entity`'s; else where it is, but no lower than what it rode, put out of the blocks
+    /// there, `findFreePosition`, unless it's over 4 wide or tall. It's put there as it looks,
+    /// `dismountTo`, `teleportTo`, `snapTo`, and so what rides it, `teleportPassengers`.
+    pub fn seat_off<B: CollisionBlocks>(mut self, f: Facts, m: MovementStates, blocks: B) {
+        let offs = self.unseated.copy()
+        self.unseated.clear()
+        let border = self.border ?? (-2.9999984e7, -2.9999984e7, 2.9999984e7, 2.9999984e7)
+        for off in offs {
+            let b = self.body_at(off.rider) else continue
+            if b.removed or b.vehicle != none {
+                continue
+            }
+            var at = (off.x, off.top, off.z)
+            let vx = i32.saturate(off.x.floor())
+            let vy = i32.saturate(off.y.floor())
+            let vz = i32.saturate(off.z.floor())
+            let portal = f.in_set(state_at(blocks, vx, vy, vz), f.tag("minecraft:portals"))
+            if not off.gone and not portal {
+                if off.animal {
+                    if let beside = animal_dismount(f, m, blocks, border, off.x, off.y, off.z, off.yaw, b.width, b.height, b.mover()) {
+                        at = beside
+                    }
+                }
+            } else {
+                let bottom = (b.x, if b.y > off.y { b.y } else { off.y }, b.z)
+                at = free_position(f, m, blocks, border, bottom, b.width, b.height, b.mover())
+            }
+            self.snap_to(off.rider, at)
+        }
+    }
+
+    // `snapTo` of the entity `id` to `at` as it looks, there last tick too, and what rides it
+    // with it, `teleportPassengers` (D708).
+    fn snap_to(mut self, id: i32, at: (f64, f64, f64)) {
+        var b = self.body_at(id) else return
+        let (x, y, z) = at
+        b.x = x
+        b.y = y
+        b.z = z
+        b.xo = x
+        b.yo = y
+        b.zo = z
+        self.put_body(id, b)
+        self.move_section(id, section_key(x, y, z))
+        var carrying: List<i32> = [id]
+        var k: usize = 0
+        while k < carrying.len() {
+            let v = carrying[k]
+            for p in self.passengers_of(v) {
+                self.position_rider(v, p, true)
+                carrying.push(p)
+            }
+            k += 1
+        }
+    }
+
+    // `positionRider` of the entity `rider` on `vehicle` (D708): where `vehicle` seats it,
+    // `getPassengerRidingPosition`, its seat turned by its yaw, less where `rider` is held, turned
+    // by its own, `setPos`, or `snapTo` where `snap`; a living rider of a chicken or a horse
+    // turned as it is, `yBodyRot`. Nothing where `rider` doesn't ride it.
+    fn position_rider(mut self, vehicle: i32, rider: i32, snap: bool) {
+        if not self.at.contains(vehicle) or not self.at.contains(rider) {
+            return
+        }
+        let (vb, seat, turn) = self.seat_info(vehicle) else return
+        if not vb.passengers.contains(rider) {
+            return
+        }
+        let ri = self.at[rider]
+        let re = self.all[ri].take() else return
+        let rb = body_of(re)
+        let (sx, sy, sz) = turned(seat, vb.y_rot)
+        let (hx, hy, hz) = turned(held_at(re), rb.y_rot)
+        let (x, y, z) = (vb.x + sx - hx, vb.y + sy - hy, vb.z + sz - hz)
+        var moved = rb
+        moved.x = x
+        moved.y = y
+        moved.z = z
+        if snap {
+            moved.xo = x
+            moved.yo = y
+            moved.zo = z
+        }
+        var back = with_body(re, moved)
+        if let r = turn {
+            back = match back {
+                Entity.Mob(rm) => {
+                    var t = rm
+                    t.living.y_body_rot = r
+                    Entity.Mob(t)
+                },
+                Entity.Stand(ra) => {
+                    var t = ra
+                    t.living.y_body_rot = r
+                    Entity.Stand(t)
+                },
+                other => other,
+            }
+        }
+        self.all[ri] = some(back)
+        self.move_section(rider, section_key(x, y, z))
+    }
+
+    // The body of the entity `vehicle`, a copy, where it seats what rides it before its turn, and
+    // the turn it gives a living rider, a chicken's and a horse's own, `yBodyRot` (D708).
+    fn seat_info(self, vehicle: i32) -> (Body, (f64, f64, f64), f32?)? {
+        let ve = self.all[self.at[vehicle]] else return none
+        var turn: f32? = none
+        if let Entity.Mob(vm) = ve {
+            if vm.species == CHICKEN or vm.equine() {
+                turn = some(vm.living.y_body_rot)
+            }
+        }
+        return some((body_of(ve), seat_of(ve), turn))
+    }
+
+    // Whether the entity `vehicle` is here, isn't gone and has `rider` among what rides it,
+    // `hasPassenger` (D708).
+    fn carries(self, vehicle: i32, rider: i32) -> bool {
+        if not self.at.contains(vehicle) {
+            return false
+        }
+        let e = self.all[self.at[vehicle]] else return true
+        let b = body_of(e)
+        return not b.removed and b.passengers.contains(rider)
+    }
+
     /// `Entity.teleport` of the entity `id`, not a player, to x, y, z by an ender pearl of its own
     /// that landed in its level, `teleportSameDimension` (D585), where it may go,
     /// `isAllowedToTeleportOwner`: a living entity alive and not asleep, anything else not gone.
@@ -1689,6 +2085,9 @@ impl Entities {
     /// sounds it plays go to `sounds`, which starts empty.
     pub fn tick_next<B: CollisionBlocks + EntityTicking + MobLight + NavLevel + Rain + Warding + Gateways, S: StackSizes + Wearing>(mut self, before: u64, f: Facts, m: MovementStates, t: BodyFacts, lf: LivingFacts, codecs: S, blocks: B, min_y: i32, fast_lava: bool, players: List<Follower>, sounds: mut List<EntitySound>) -> bool {
         self.take_sent(lf, f, m, blocks, min_y)
+        if not self.unseated.is_empty() {
+            self.seat_off(f, m, blocks)
+        }
         if let stopped = self.paused.take() {
             let (at, entered, bred) = stopped
             self.heard = 0
@@ -1737,6 +2136,16 @@ impl Entities {
             }
             return true
         }
+        // The tick that went on done, what rides it ticks next, `tickPassenger` (D708).
+        if let done = self.ticking.take() {
+            let (done_id, rode) = done
+            self.ride_done(done_id, rode)
+        }
+        if let next = self.riders.pop() {
+            let (vehicle, rider) = next
+            self.ride_tick(vehicle, rider, f, m, t, lf, codecs, blocks, min_y, fast_lava, players, mut sounds)
+            return true
+        }
         while self.cursor < self.end {
             match self.all[self.cursor] {
                 some(_) => break,
@@ -1761,6 +2170,116 @@ impl Entities {
         let (cx, cz) = (i32.saturate(x.floor()) >> 4, i32.saturate(z.floor()) >> 4)
         let listed = blocks.listed(cx, cz)
         let ticks = listed and blocks.ticks_entities(cx, cz)
+        // What rides something that has it ticks after that, `tickPassenger`, here only looking at
+        // whether it goes, which it never does from afar while it rides; what rides something gone
+        // gets off it and ticks as it is (D708).
+        let (own_id, rides, _) = riding_of(taken)
+        if let vehicle = rides {
+            if ticks and self.carries(vehicle, own_id) {
+                match taken {
+                    Entity.Mob(mob) => {
+                        var a = mob
+                        let nearest = nearest_to(a, players)
+                        if a.check_despawn(self.peaceful, nearest) {
+                            a.living.body.removed = true
+                            self.all[i] = some(Entity.Mob(a))
+                            self.remove(own_id)
+                        } else {
+                            self.all[i] = some(Entity.Mob(a))
+                        }
+                    },
+                    other => self.all[i] = some(other),
+                }
+                return true
+            }
+            if ticks {
+                self.all[i] = some(taken)
+                self.stop_riding(own_id)
+                let again = self.all[i].take() else return true
+                return self.tick_at(i, again, true, true, f, m, t, lf, codecs, blocks, min_y, fast_lava, players, mut sounds)
+            }
+        }
+        return self.tick_at(i, taken, listed, ticks, f, m, t, lf, codecs, blocks, min_y, fast_lava, players, mut sounds)
+    }
+
+    // A passenger's tick, `tickPassenger` (D708): what's gone or rides something else now gets off;
+    // else, still, `rideTick`, it ticks as it does, then its vehicle positions it, as its tick's
+    // done, `ride_done`.
+    fn ride_tick<B: CollisionBlocks + EntityTicking + MobLight + NavLevel + Rain + Warding + Gateways, S: StackSizes + Wearing>(mut self, vehicle: i32, rider: i32, f: Facts, m: MovementStates, t: BodyFacts, lf: LivingFacts, codecs: S, blocks: B, min_y: i32, fast_lava: bool, players: List<Follower>, sounds: mut List<EntitySound>) {
+        if not self.at.contains(rider) {
+            self.drop_rider(vehicle, rider)
+            return
+        }
+        let i = self.at[rider]
+        let (_, rides, _, removed, _) = self.riding_at(i) else return
+        if removed or rides != some(vehicle) {
+            self.stop_riding(rider)
+            return
+        }
+        let held = self.all[i].take() else return
+        self.heard = 0
+        self.ticking = some((rider, some(vehicle)))
+        let ready = opened(stilled(held), self.portal_open, self.end_portal_open)
+        _ = self.tick_at(i, ready, true, true, f, m, t, lf, codecs, blocks, min_y, fast_lava, players, mut sounds)
+    }
+
+    // `rider` dropped from what rides `vehicle`, where it's gone from the level (D708).
+    fn drop_rider(mut self, vehicle: i32, rider: i32) {
+        var vb = self.body_at(vehicle) else return
+        var kept = List<i32>()
+        for p in vb.passengers {
+            if p != rider {
+                kept.push(p)
+            }
+        }
+        vb.passengers = kept
+        self.put_body(vehicle, vb)
+        self.share_riders(vehicle)
+    }
+
+    // The entity `id`'s tick done (D708): where it rode `rode`, its vehicle positions it,
+    // `positionRider`, and what's alive forgets its fall, `LivingEntity.rideTick`; then what rides
+    // it ticks next, in order, `tickPassenger`.
+    fn ride_done(mut self, id: i32, rode: i32?) {
+        if rode != none {
+            if let v = self.vehicle_of(id) {
+                self.position_rider(v, id, false)
+            }
+            if self.at.contains(id) {
+                let i = self.at[id]
+                if let held = self.all[i].take() {
+                    self.all[i] = some(match held {
+                        Entity.Mob(mb) => {
+                            var a = mb
+                            a.living.body.fall = 0.0
+                            Entity.Mob(a)
+                        },
+                        Entity.Stand(st) => {
+                            var a = st
+                            a.living.body.fall = 0.0
+                            Entity.Stand(a)
+                        },
+                        other => other,
+                    })
+                }
+            }
+        }
+        let riders = self.passengers_of(id)
+        var k = riders.len()
+        while k > 0 {
+            k -= 1
+            self.riders.push((id, riders[k]))
+        }
+    }
+
+    // The tick of the entity `taken` at `i`, as the tick list has it: what's in a chunk that ticks
+    // entities ticks, and a mob in one listed looks at whether it goes, `checkDespawn` (D452);
+    // the entity marked as ticking, for what rides it to tick after it (D708).
+    fn tick_at<B: CollisionBlocks + EntityTicking + MobLight + NavLevel + Rain + Warding + Gateways, S: StackSizes + Wearing>(mut self, i: usize, taken: own Entity, listed: bool, ticks: bool, f: Facts, m: MovementStates, t: BodyFacts, lf: LivingFacts, codecs: S, blocks: B, min_y: i32, fast_lava: bool, players: List<Follower>, sounds: mut List<EntitySound>) -> bool {
+        if ticks and self.ticking == none {
+            let (own_id, _, _) = riding_of(taken)
+            self.ticking = some((own_id, none))
+        }
         match taken {
             Entity.Item(e) => {
                 if ticks {
@@ -2559,24 +3078,7 @@ impl Entities {
     fn tick_mob<B: CollisionBlocks + EntityTicking + MobLight + NavLevel + Rain + Warding + Gateways, W: Wearing>(mut self, i: usize, mob: own Mob, ticks: bool, lf: LivingFacts, f: Facts, m: MovementStates, t: BodyFacts, blocks: B, items: W, min_y: i32, fast_lava: bool, players: List<Follower>, sounds: mut List<EntitySound>) {
         var a = mob
         let id = a.living.body.id
-        var nearest: f64? = none
-        for p in players {
-            if p.spectator {
-                continue
-            }
-            let dx = p.x - a.living.body.x
-            let dy = p.y - a.living.body.y
-            let dz = p.z - a.living.body.z
-            let d = dx * dx + dy * dy + dz * dz
-            match nearest {
-                some(b) => {
-                    if d < b {
-                        nearest = some(d)
-                    }
-                },
-                none => nearest = some(d),
-            }
-        }
+        let nearest = nearest_to(a, players)
         if a.check_despawn(self.peaceful, nearest) {
             a.living.body.removed = true
             self.all[i] = some(Entity.Mob(a))
@@ -2586,6 +3088,10 @@ impl Entities {
         if not ticks {
             self.all[i] = some(Entity.Mob(a))
             return
+        }
+        a.carries_mob = false
+        if a.living.body.passengers.len() > 0 {
+            a.carries_mob = self.is_mob(a.living.body.passengers[0])
         }
         if a.wants_kin() {
             a.kin = self.kin_near(a.living.body.bounding_box(), id)
@@ -3169,6 +3675,13 @@ impl Entities {
     // time, its ID, its place and motion, its turns, its body's and its head's, what it's told to
     // walk and its speed, and whether it's on the ground.
     fn trace_mob(mut self, i: usize) {
+        // A passenger's ride isn't traced, as vanilla's trace runs from `tickNonPassenger` (D708).
+        if let ticked = self.ticking {
+            let (_, rode) = ticked
+            if rode != none {
+                return
+            }
+        }
         let taken = self.all[i].take() else return
         let line = traced(self.game_time, taken)
         self.all[i] = some(taken)
@@ -3481,6 +3994,11 @@ impl Entities {
     // `LivingEntity.push` (CAL-160), neither has no physics and they're far enough apart across,
     // each that may be pushed pushed away from the other.
     fn push_pair<B: CollisionBlocks + EntityTicking>(mut self, pusher: i32, other: i32, lf: LivingFacts, f: Facts, blocks: B) {
+        // What rides with it, down to what they all ride, isn't pushed by it,
+        // `isPassengerOfSameVehicle` (D708).
+        if self.root_vehicle(pusher) == self.root_vehicle(other) {
+            return
+        }
         var a = self.lend_mob(pusher) else return
         var o = self.lend_mob(other) else {
             self.give_back_mob(a)
@@ -4414,6 +4932,171 @@ fn place_of(e: Entity) -> (f64, f64, f64) {
         Entity.Eye(eye) => (eye.body.x, eye.body.y, eye.body.z),
         Entity.Fireball(b) => (b.body.x, b.body.y, b.body.z),
         Entity.Tnt(p) => (p.body.x, p.body.y, p.body.z),
+    }
+}
+
+// The nearest player to the mob `a` that isn't a spectator, by the square of how far, as
+// `checkDespawn` looks, `getNearestPlayer(this, -1.0)`.
+fn nearest_to(a: Mob, players: List<Follower>) -> f64? {
+    var nearest: f64? = none
+    for p in players {
+        if p.spectator {
+            continue
+        }
+        let dx = p.x - a.living.body.x
+        let dy = p.y - a.living.body.y
+        let dz = p.z - a.living.body.z
+        let d = dx * dx + dy * dy + dz * dz
+        match nearest {
+            some(b) => {
+                if d < b {
+                    nearest = some(d)
+                }
+            },
+            none => nearest = some(d),
+        }
+    }
+    return nearest
+}
+
+// The entity's body, a copy (D708).
+fn body_of(e: Entity) -> Body {
+    return match e {
+        Entity.Item(i) => i.body.copy(),
+        Entity.Orb(o) => o.body.copy(),
+        Entity.Stand(a) => a.living.body.copy(),
+        Entity.Mob(m) => m.living.body.copy(),
+        Entity.Arrow(a) => a.body.copy(),
+        Entity.Thrown(p) => p.body.copy(),
+        Entity.Cloud(c) => c.body.copy(),
+        Entity.Crystal(c) => c.body.copy(),
+        Entity.Eye(eye) => eye.body.copy(),
+        Entity.Fireball(b) => b.body.copy(),
+        Entity.Tnt(p) => p.body.copy(),
+    }
+}
+
+// The entity with its body `b` (D708).
+fn with_body(e: own Entity, b: own Body) -> Entity {
+    return match e {
+        Entity.Item(i) => {
+            var t = i
+            t.body = b
+            Entity.Item(t)
+        },
+        Entity.Orb(o) => {
+            var t = o
+            t.body = b
+            Entity.Orb(t)
+        },
+        Entity.Stand(a) => {
+            var t = a
+            t.living.body = b
+            Entity.Stand(t)
+        },
+        Entity.Mob(m) => {
+            var t = m
+            t.living.body = b
+            Entity.Mob(t)
+        },
+        Entity.Arrow(a) => {
+            var t = a
+            t.body = b
+            Entity.Arrow(t)
+        },
+        Entity.Thrown(p) => {
+            var t = p
+            t.body = b
+            Entity.Thrown(t)
+        },
+        Entity.Cloud(c) => {
+            var t = c
+            t.body = b
+            Entity.Cloud(t)
+        },
+        Entity.Crystal(c) => {
+            var t = c
+            t.body = b
+            Entity.Crystal(t)
+        },
+        Entity.Eye(eye) => {
+            var t = eye
+            t.body = b
+            Entity.Eye(t)
+        },
+        Entity.Fireball(f) => {
+            var t = f
+            t.body = b
+            Entity.Fireball(t)
+        },
+        Entity.Tnt(p) => {
+            var t = p
+            t.body = b
+            Entity.Tnt(t)
+        },
+    }
+}
+
+// The entity's ID, what it rides, and whether anything rides it, without copying its body (D708).
+fn riding_of(e: Entity) -> (i32, i32?, bool) {
+    return match e {
+        Entity.Item(i) => (i.body.id, i.body.vehicle, not i.body.passengers.is_empty()),
+        Entity.Orb(o) => (o.body.id, o.body.vehicle, not o.body.passengers.is_empty()),
+        Entity.Stand(a) => (a.living.body.id, a.living.body.vehicle, not a.living.body.passengers.is_empty()),
+        Entity.Mob(m) => (m.living.body.id, m.living.body.vehicle, not m.living.body.passengers.is_empty()),
+        Entity.Arrow(a) => (a.body.id, a.body.vehicle, not a.body.passengers.is_empty()),
+        Entity.Thrown(p) => (p.body.id, p.body.vehicle, not p.body.passengers.is_empty()),
+        Entity.Cloud(c) => (c.body.id, c.body.vehicle, not c.body.passengers.is_empty()),
+        Entity.Crystal(c) => (c.body.id, c.body.vehicle, not c.body.passengers.is_empty()),
+        Entity.Eye(eye) => (eye.body.id, eye.body.vehicle, not eye.body.passengers.is_empty()),
+        Entity.Fireball(b) => (b.body.id, b.body.vehicle, not b.body.passengers.is_empty()),
+        Entity.Tnt(p) => (p.body.id, p.body.vehicle, not p.body.passengers.is_empty()),
+    }
+}
+
+// Whether the entity's alive, `LivingEntity`: an armor stand or a mob.
+fn alive_kind(e: Entity) -> bool {
+    return match e {
+        Entity.Stand(_) => true,
+        Entity.Mob(_) => true,
+        _ => false,
+    }
+}
+
+// The entity, still, `setDeltaMovement(Vec3.ZERO)`, as its ride's tick begins (D708).
+fn stilled(e: own Entity) -> Entity {
+    var b = body_of(e)
+    b.vx = 0.0
+    b.vy = 0.0
+    b.vz = 0.0
+    return with_body(e, b)
+}
+
+// `Vec3.yRot(-y_rot * (float) (Math.PI / 180.0))`, as `EntityAttachments.transformPoint` turns a
+// point by its entity's yaw, by the table's sine and cosine (D708).
+fn turned(p: (f64, f64, f64), y_rot: f32) -> (f64, f64, f64) {
+    let (x, y, z) = p
+    let radians = -y_rot * 0.017453292f32
+    let cos = f64(table_cos(f64(radians)))
+    let sin = f64(table_sin(f64(radians)))
+    return (x * cos + z * sin, y, z * cos - x * sin)
+}
+
+// Where what rides the entity `e` sits on it before its turn, `getPassengerAttachmentPoint`
+// (D708): a mob's its kind's, anything else's its height, `AT_HEIGHT`.
+fn seat_of(e: Entity) -> (f64, f64, f64) {
+    return match e {
+        Entity.Mob(m) => passenger_point(m.species, m.baby(), m.living.body.height, if m.species == SLIME { m.slime_size() } else { 0 }),
+        other => (0.0, f64(body_of(other).height), 0.0),
+    }
+}
+
+// Where the entity `e` is held by what it rides before its turn, `getVehicleAttachmentPoint`
+// (D708): a mob's its kind's, anything else's its feet.
+fn held_at(e: Entity) -> (f64, f64, f64) {
+    return match e {
+        Entity.Mob(m) => vehicle_point(m.species, m.baby()),
+        _ => (0.0, 0.0, 0.0),
     }
 }
 

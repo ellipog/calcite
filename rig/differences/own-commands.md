@@ -50,6 +50,7 @@ cases:
   - session:lid-riders/*/commands
   - session:lid-ceiling/*/commands
   - session:snowfall/*/commands
+  - session:riding/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
