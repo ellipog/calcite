@@ -73,6 +73,7 @@ cases:
   - session:saddles/*/commands
   - session:fishing/*/commands
   - session:stand-use/*/commands
+  - session:leads/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
