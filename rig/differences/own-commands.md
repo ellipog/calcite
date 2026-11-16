@@ -49,6 +49,7 @@ cases:
   - session:rails/*/commands
   - session:lid-riders/*/commands
   - session:lid-ceiling/*/commands
+  - session:snowfall/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
