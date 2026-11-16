@@ -48,6 +48,7 @@ cases:
   - session:dripleaves/*/commands
   - session:rails/*/commands
   - session:lid-riders/*/commands
+  - session:lid-ceiling/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
