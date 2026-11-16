@@ -41,6 +41,7 @@ cases:
   - session:webs/*/commands
   - session:bushes/*/commands
   - session:powder/*/commands
+  - session:honey/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
