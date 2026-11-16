@@ -63,6 +63,7 @@ cases:
   - session:bees/*/commands
   - session:hives/*/commands
   - session:beeflight/*/commands
+  - session:beehome/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
