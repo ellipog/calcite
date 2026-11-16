@@ -69,6 +69,8 @@ cases:
   - session:cod/*/commands
   - session:naming/*/commands
   - session:shearing/*/commands
+  - session:agelock/*/commands
+  - session:saddles/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
