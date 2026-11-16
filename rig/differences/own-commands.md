@@ -57,6 +57,7 @@ cases:
   - session:freezing/*/commands
   - session:husks/*/commands
   - session:drowned/*/commands
+  - session:cure/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
