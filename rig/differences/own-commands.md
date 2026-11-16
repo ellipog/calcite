@@ -66,6 +66,7 @@ cases:
   - session:beehome/*/commands
   - session:hivebreak/*/commands
   - session:beealert/*/commands
+  - session:cod/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
