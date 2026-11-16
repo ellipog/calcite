@@ -55,6 +55,7 @@ cases:
   - session:steering/*/commands
   - session:bucking/*/commands
   - session:freezing/*/commands
+  - session:husks/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
