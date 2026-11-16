@@ -44,6 +44,7 @@ cases:
   - session:honey/*/commands
   - session:bubbles/*/commands
   - session:plates/*/commands
+  - session:trips/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
