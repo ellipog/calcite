@@ -71,6 +71,8 @@ cases:
   - session:shearing/*/commands
   - session:agelock/*/commands
   - session:saddles/*/commands
+  - session:fishing/*/commands
+  - session:stand-use/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
