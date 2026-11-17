@@ -83,6 +83,7 @@ cases:
   - session:horseinv/*/commands
   - session:leaps/*/commands
   - session:donkeychest/*/commands
+  - session:flowered/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
