@@ -22,17 +22,30 @@ import java.nio.file.Path;
  * body's turn and what they're told to walk as 0, which Calcite doesn't keep. It's loaded the
  * first time {@code ServerLevel.tickNonPassenger} or {@code doTick} calls it, so the game classes
  * it names are loaded by then.
+ *
+ * <p>With {@code controls} too, each line goes on with a mob's controls (CAL-180):
+ *
+ * <pre>moveX moveY moveZ moveSpeed moveWanted lookX lookY lookZ looking</pre>
+ *
+ * <p>its {@code MoveControl}'s wanted place and speed and whether it has one, {@code hasWanted},
+ * and its {@code LookControl}'s wanted place and whether it's looking there,
+ * {@code isLookingAtTarget}; a living entity that isn't a mob, and a player, writes 0 and false
+ * for each.
  */
 public final class Trace {
+    private static final String NO_CONTROLS = " 0.0 0.0 0.0 0.0 false 0.0 0.0 0.0 false";
+
     private static Writer out;
+    private static boolean controls;
 
     private Trace() {
     }
 
-    static void start(Path trace) {
+    static void start(Path trace, boolean withControls) {
         if (trace == null) {
             return;
         }
+        controls = withControls;
         try {
             out = new BufferedWriter(Files.newBufferedWriter(trace, StandardCharsets.UTF_8));
         } catch (IOException e) {
@@ -59,8 +72,24 @@ public final class Trace {
         var m = e.getDeltaMovement();
         String line = at.getGameTime() + " " + e.getId() + " " + e.getX() + " " + e.getY() + " " + e.getZ()
                 + " " + m.x + " " + m.y + " " + m.z + " " + e.getYRot() + " " + e.getXRot() + " " + e.getYHeadRot()
-                + " " + e.yBodyRot + " " + e.zza + " " + e.xxa + " " + e.getSpeed() + " " + e.onGround() + "\n";
+                + " " + e.yBodyRot + " " + e.zza + " " + e.xxa + " " + e.getSpeed() + " " + e.onGround()
+                + controlsOf(e) + "\n";
         write(line);
+    }
+
+    /** The mob's controls, as the line goes on with them, or nothing without {@code controls}. */
+    private static String controlsOf(net.minecraft.world.entity.LivingEntity e) {
+        if (!controls) {
+            return "";
+        }
+        if (!(e instanceof net.minecraft.world.entity.Mob mob)) {
+            return NO_CONTROLS;
+        }
+        var move = mob.getMoveControl();
+        var look = mob.getLookControl();
+        return " " + move.getWantedX() + " " + move.getWantedY() + " " + move.getWantedZ() + " " + move.getSpeedModifier()
+                + " " + move.hasWanted() + " " + look.getWantedX() + " " + look.getWantedY() + " " + look.getWantedZ()
+                + " " + look.isLookingAtTarget();
     }
 
     /** The player whose own tick, {@code doTick}, is done. */
@@ -72,7 +101,7 @@ public final class Trace {
         var m = p.getDeltaMovement();
         String line = p.level().getGameTime() + " " + p.getId() + " " + p.getX() + " " + p.getY() + " " + p.getZ()
                 + " " + m.x + " " + m.y + " " + m.z + " " + p.getYRot() + " " + p.getXRot() + " " + p.getYHeadRot()
-                + " 0.0 0.0 0.0 " + p.getSpeed() + " " + p.onGround() + "\n";
+                + " 0.0 0.0 0.0 " + p.getSpeed() + " " + p.onGround() + (controls ? NO_CONTROLS : "") + "\n";
         write(line);
     }
 

@@ -25,7 +25,7 @@ import java.security.ProtectionDomain;
  * makes to a tape.
  *
  * <p>Started as
- * {@code -javaagent:agent.jar=seed=N[,tape=PATH][,reseed=T][,reseed:LEVEL=T]...[,trace=PATH]}.
+ * {@code -javaagent:agent.jar=seed=N[,tape=PATH][,reseed=T][,reseed:LEVEL=T]...[,trace=PATH[,controls]]}.
  * Each {@code ServerLevel}'s constructor, once {@code Level}'s returns, calls {@link Levels#made},
  * which seeds the level's random with {@code mixStafford13(N ^ name.hashCode())}, with the name
  * the dimension's, such as {@code minecraft:overworld}, and sets the entity counter back to 0 as
@@ -40,8 +40,9 @@ import java.security.ProtectionDomain;
  * the seed and its ID (CAL-148). With {@code trace=PATH},
  * {@code ServerLevel.tickNonPassenger} hands each entity it's ticked to {@link Trace#ticked} as it
  * returns, which writes a living one's state, and {@code ServerPlayer.doTick} hands the player to
- * {@link Trace#played} as it returns (CAL-159). {@code Brain.Provider.makeBrain} hands the entity
- * it's making a brain for to {@link Entities#braining} as it starts and calls
+ * {@link Trace#played} as it returns (CAL-159); with {@code controls} too, a mob's line has its
+ * controls (CAL-180). {@code Brain.Provider.makeBrain} hands the entity it's making a brain for
+ * to {@link Entities#braining} as it starts and calls
  * {@link Entities#brained} as it returns, and each of {@code ShufflingList}'s constructors hands
  * its random to {@link Entities#shuffling} as it returns, which seeds it (CAL-160).
  * {@code InsideBrownianWalk}'s {@code Collections.shuffle}, which draws from a random of its own
@@ -72,6 +73,7 @@ public final class Agent {
         Long seed = null;
         Path tape = null;
         Path trace = null;
+        boolean controls = false;
         long reseed = -1;
         for (String part : (arguments == null ? "" : arguments).split(",")) {
             if (part.isEmpty()) {
@@ -89,6 +91,7 @@ public final class Agent {
                 case "tape" -> tape = Path.of(value);
                 case "reseed" -> reseed = Long.parseLong(value);
                 case "trace" -> trace = Path.of(value);
+                case "controls" -> controls = true;
                 default -> throw new IllegalArgumentException("agent: unknown argument " + key);
             }
         }
@@ -96,7 +99,7 @@ public final class Agent {
             throw new IllegalArgumentException("agent: no seed=N given");
         }
         Tape.start(seed, tape);
-        Trace.start(trace);
+        Trace.start(trace, controls);
         Levels.reseedAt(reseed);
         inst.addTransformer(new Transformer());
     }

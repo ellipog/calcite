@@ -220,6 +220,8 @@ calx rig/runner/sessions.calx --compare-only --show 0
 
 With `--trace`, the agent writes the state of each of vanilla's living entities to `entities.txt` in its folder as the level's tick is done with it, `trace=entities.txt`, and a player's as their own tick, `doTick`, is done, before they're put back where their client has them; and Calcite, with `--entity-trace`, its own the same way, a line each: the game time, the entity's ID, its place and motion, its turns, what it's told to walk and its speed, and whether it's on the ground. [`traces.calx`](runner/traces.calx) lines the two up entity by entity and shows the first tick where they part, each value that differs marked, read as numbers, so Java's `1.0E-4` and Calcite's `0.0001` are the same. A mob's moves are sent to a 4096th of a block, and its motion as rounded, too coarse to find where two servers' mobs part; the trace finds the tick and the value ([D457](../docs/decisions.md)).
 
+With `--trace-controls`, both trace as `--trace` does, each mob's line going on with its controls: its move control's wanted place and speed and whether it has one, `hasWanted`, and its look control's wanted place and whether it's looking there, `isLookingAtTarget`, a living entity that isn't a mob and a player 0 and false for each. The agent's `controls` writes vanilla's, and Calcite's `--entity-controls` its own, and [`traces.calx`](runner/traces.calx) compares them with the rest, a `true` as 1 and a `false` as 0, so a mob's goals are seen to part where they choose another place to go or look, before its moves show it ([D739](../docs/decisions.md)).
+
 The scenarios:
 
 | Scenario | What the bot does |
