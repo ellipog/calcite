@@ -79,6 +79,7 @@ cases:
   - session:beetied/*/commands
   - session:horsefeed/*/commands
   - session:mounted/*/commands
+  - session:steered/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
