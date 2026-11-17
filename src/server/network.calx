@@ -143,7 +143,7 @@ import world.level_writer.{UPDATE_LIMIT}
 import world.pistons.{check_if_extend}
 import world.placing.{PlaceFacts, Placement, bucket_stack, can_be_replaced, component_of, has_components, placement_state, stack_item}
 import world.attributes.{Attributes, Modifier, Snapshot, attribute_id, broken, equip, operation_names, slot_names, sprint, stack_modifiers, unworn, update_player}
-import world.entity_data.{ABSORPTION, AIR_SUPPLY, CUSTOM_NAME, ARROW_COUNT, STINGER_COUNT, ITEM_STACK, THROWN_ITEM, LIVING_FLAGS, FALL_FLYING_FLAG, ON_FIRE_FLAG, TICKS_FROZEN, CROUCHING, CROUCHING_FLAG, EntityData, HEALTH, INVISIBLE_FLAG, MAIN_HAND, MODE_CUSTOMISATION, POSE_ID, SCORE, SHARED_FLAGS, SILENT, SLEEPING, SLEEPING_POS, SPRINTING_FLAG, STANDING, SWIMMING, SWIMMING_FLAG, Value, player_data}
+import world.entity_data.{ABSORPTION, AIR_SUPPLY, FALL_FLYING, CUSTOM_NAME, ARROW_COUNT, STINGER_COUNT, ITEM_STACK, THROWN_ITEM, LIVING_FLAGS, FALL_FLYING_FLAG, ON_FIRE_FLAG, TICKS_FROZEN, CROUCHING, CROUCHING_FLAG, EntityData, HEALTH, INVISIBLE_FLAG, MAIN_HAND, MODE_CUSTOMISATION, POSE_ID, SCORE, SHARED_FLAGS, SILENT, SLEEPING, SLEEPING_POS, SPRINTING_FLAG, STANDING, SWIMMING, SWIMMING_FLAG, Value, player_data}
 import world.player_status.{Status, heal, read_status, set_health, tick_food, tick_regeneration, write_status}
 import world.digging.{ABORT_DESTROY_BLOCK, ACTIONS, CHANGE_DESTROY_DIRECTION, DESTROY_PROGRESS, DESTROY_PROGRESS_SOUND, DROP_ALL_ITEMS, DROP_ITEM, Digging, RELEASE_USE_ITEM, STAB, START_DESTROY_BLOCK, STOP_DESTROY_BLOCK, SWAP_ITEM_WITH_OFFHAND, attack, break_block, can_destroy, destroy_progress, durability_change, entity_in_reach, eye_in_water, game_master, has_correct_tool, in_reach, java_int, within_range, may_break_in_adventure, may_use_in_adventure, mining_damage, player_destroy, shrunk, emptied, with_damage, enchanted_value, is_damaged, mends_in, value_effect}
 import world.block_level.{BeaconPulse, Breaker, Released, SOUND_BLOCKS, destroy_block as level_destroy_block, remove_block, update_output_signal}
@@ -613,6 +613,8 @@ struct Player {
     swinging: bool = false
     swing_ticks: i32 = 0
     swing_length: i32 = 0
+    // The ticks they've glided, `fallFlyTicks` (CAL-286).
+    fall_fly_ticks: i32 = 0
     // Their item cooldowns, `ItemCooldowns` (D579), which a respawn's new player doesn't keep.
     cooldowns: ItemCooldowns = ItemCooldowns()
     // Which player they are, as vanilla's `ServerPlayer` objects are each their own, the next
@@ -20242,7 +20244,11 @@ impl Network {
             if con.player.vy.abs() < 0.003 {
                 con.player.vy = 0.0
             }
-            // `aiStep`'s: their fall forgotten under slow falling or levitation (D514).
+            // `aiStep`'s travel: gliding, `updateFallFlying` (CAL-286); then their fall forgotten
+            // under slow falling or levitation (D514).
+            if gliding(con) {
+                self.update_gliding(mut con)
+            }
             if con.player.effects.has(SLOW_FALLING) or con.player.effects.has(LEVITATION) {
                 self.reset_fall(mut con)
             }
@@ -20258,9 +20264,11 @@ impl Network {
                 self.pick_up_items(mut con)
             }
         }
-        // `LivingEntity.tick`'s, after `aiStep`: asleep, their pitch level (D574); then its
+        // `LivingEntity.tick`'s, after `aiStep`: their ticks gliding, one more, or 0 where they
+        // don't, `fallFlyTicks` (CAL-286); asleep, their pitch level (D574); then its
         // `refreshDirtyAttributes`, their waypoint ranges (CAL-174); then its last, their
         // impulse's grace counted down (D443).
+        con.player.fall_fly_ticks = if gliding(con) { con.player.fall_fly_ticks + 1 } else { 0 }
         if con.player.sleeping != none {
             con.player.x_rot = 0.0f32
         }
@@ -20439,6 +20447,10 @@ impl Network {
         let lava_fast = self.levels[d].fast_lava
         let was = (con.player.x, con.player.y, con.player.z)
         body.travel(lf, f, m, t, self.levels[d], lava_fast, mut sounds)
+        let stopped = body.glide_stopped
+        let wall = body.wall_hit
+        body.glide_stopped = false
+        body.wall_hit = 0.0f32
         body_back(mut con, body)
         self.moved_from(mut con, was)
         self.play_steps(d, mut con, sounds)
@@ -20446,6 +20458,117 @@ impl Network {
         self.movement = some(m)
         self.item_facts = some(t)
         self.body_fall_reset(mut con)
+        // Gliding onto what's climbable stops it, `stopFallFlying`; into a wall, the fall's sound
+        // for those about them and the hurt, `handleFallFlyingCollisions` (CAL-286).
+        if stopped {
+            stop_gliding(mut con)
+        }
+        if wall > 0.0f32 {
+            self.flew_into_wall(mut con, wall)
+        }
+    }
+
+    // `tryToStartFallFlying` of the player (CAL-286): where they don't glide yet, may,
+    // `can_glide`, and aren't in water or lava, `isInLiquid`, they glide, `startFallFlying`, their
+    // shared flags' eighth. Whether they did.
+    fn try_start_gliding(mut self, con: mut Connection) -> bool {
+        let lava = con.player.based and con.player.lava > 0.0
+        if gliding(con) or not self.can_glide(con) or con.player.in_water or lava {
+            return false
+        }
+        con.player.entity_data.set_flag(SHARED_FLAGS, FALL_FLYING_FLAG, true)
+        return true
+    }
+
+    // `canGlide` of the player (CAL-286): off the ground, not riding, without levitation and not
+    // flying, `Player.canGlide`, with something worn to glide with, `glider_slots`.
+    fn can_glide(mut self, con: Connection) -> bool {
+        if con.player.on_ground or con.player.vehicle != none or con.player.effects.has(LEVITATION) or con.player.abilities.flying {
+            return false
+        }
+        return not self.glider_slots(con).is_empty()
+    }
+
+    // The slots, in `EquipmentSlot`'s order, whose stack the player can glide with,
+    // `canGlideUsing` (CAL-286): one with `glider`, `equippable` in that slot, and not a damage
+    // from breaking, `nextDamageWillBreak`, where it can be damaged, with `max_damage` and
+    // `damage` and not `unbreakable`.
+    fn glider_slots(mut self, con: Connection) -> List<usize> {
+        var out = List<usize>()
+        if not self.items_ready() {
+            return out
+        }
+        let items = self.items.take() else return out
+        let names = slot_names()
+        for slot in 0..names.len() {
+            let stack = worn_in(con, slot) else continue
+            if items.component(stack.copy(), String("minecraft:glider")) == none {
+                continue
+            }
+            let equippable = items.component(stack.copy(), String("minecraft:equippable")) else continue
+            let Tag.Compound(e) = equippable else continue
+            if not e.contains("slot") {
+                continue
+            }
+            let Tag.Str(worn) = e["slot"].copy() else continue
+            if worn != names[slot] {
+                continue
+            }
+            let most = items.component(stack.copy(), String("minecraft:max_damage"))
+            let damage = items.component(stack.copy(), String("minecraft:damage"))
+            let unbreakable = items.component(stack.copy(), String("minecraft:unbreakable")) != none
+            if let m = most {
+                if let n = damage {
+                    let top = m.number_int() ?? 0
+                    let now = (n.number_int() ?? 0).max(0).min(top)
+                    if not unbreakable and now >= top - 1 {
+                        continue
+                    }
+                }
+            }
+            out.push(slot)
+        }
+        self.items = some(items)
+        return out
+    }
+
+    // `updateFallFlying` of the player, gliding (CAL-286): their fall back to 1 where it's past
+    // that and they go down slower than half a block a tick, `checkFallDistanceAccumulation`;
+    // then, where they can't glide, they stop, their flag cleared; else at each tenth of their
+    // ticks gliding, counting this one, and each second of those, one of the slots they glide with
+    // drawn from their random, `Util.getRandom`, worn by 1, `hurtAndBreak`. Its game event,
+    // `ELYTRA_GLIDE`, comes with game events.
+    fn update_gliding(mut self, con: mut Connection) {
+        if con.player.vy > -0.5 and con.player.fall > 1.0 {
+            con.player.fall = 1.0
+        }
+        if not self.can_glide(con) {
+            con.player.entity_data.set_flag(SHARED_FLAGS, FALL_FLYING_FLAG, false)
+            return
+        }
+        let next = con.player.fall_fly_ticks + 1
+        if next % 10 == 0 and (next / 10) % 2 == 0 {
+            let slots = self.glider_slots(con)
+            if slots.is_empty() {
+                return
+            }
+            var random = con.player.random.take() ?? LegacyRandom.new(self.entity_seed(con.player.entity_id))
+            let slot = slots[usize.wrap(random.next_int_below(i32.wrap(slots.len())))]
+            con.player.random = some(random)
+            self.located_wear(mut con, slot, 1)
+        }
+    }
+
+    // `handleFallFlyingCollisions`' hurt of the player, gliding into a wall by `damage` (CAL-286):
+    // their fall's sound, `getFallDamageSound`, big past 4 of it as a whole number, small else,
+    // for those about them but not them, `Player.playSound`; then `fly_into_wall`'s hurt.
+    fn flew_into_wall(mut self, con: mut Connection, damage: f32) {
+        let d = con.player.dim
+        let sound = if i32.saturate(f64(damage)) > 4 { "entity.player.big_fall" } else { "entity.player.small_fall" }
+        let me = con.player.entity_id
+        self.levels[d].play_sound_except(String(sound), con.player.x, con.player.y, con.player.z, 7, 1.0f32, 1.0f32, me)
+        self.send_level_events_with(d, mut con)
+        self.player_hurt_by(mut con, "fly_into_wall", damage)
     }
 
     // `applyEffectsFromBlocks` for the player as it begins, after their travel (D431): what the
@@ -21702,16 +21825,17 @@ impl Network {
     }
 
     // `updatePlayerPose` (CAL-141): where the player fits swimming, the pose they want, sleeping
-    // where they sleep (D574), swimming where they swim (D444), crouching if they hold shift and
-    // aren't flying, else standing, as Calcite has no gliding or spinning yet; if they don't fit
-    // it and aren't a spectator, crouching where they fit that, else swimming.
+    // where they sleep (D574), swimming where they swim (D444), gliding where they glide
+    // (CAL-286), crouching if they hold shift and aren't flying, else standing, as Calcite has no
+    // riptide's spin yet; if they don't fit it and aren't a spectator or riding, crouching where
+    // they fit that, else swimming.
     fn update_pose(mut self, con: mut Connection) {
         if not self.fits(con, SWIMMING) {
             return
         }
-        let desired = if con.player.sleeping != none { SLEEPING } else if swimming(con) { SWIMMING } else if con.player.shift and not con.player.abilities.flying { CROUCHING } else { STANDING }
+        let desired = if con.player.sleeping != none { SLEEPING } else if swimming(con) { SWIMMING } else if gliding(con) { FALL_FLYING } else if con.player.shift and not con.player.abilities.flying { CROUCHING } else { STANDING }
         var pose = desired
-        if con.player.mode != GameType.Spectator and not self.fits(con, desired) {
+        if con.player.mode != GameType.Spectator and con.player.vehicle == none and not self.fits(con, desired) {
             pose = if self.fits(con, CROUCHING) { CROUCHING } else { SWIMMING }
         }
         con.player.entity_data.set(POSE_ID, Value.Number(pose))
@@ -24194,9 +24318,10 @@ impl Network {
             },
             // `handlePlayerCommand`: sprinting started and stopped, as `setSprinting` changes
             // the movement speed's modifiers and the shared flag (D417), and their bed left,
-            // `STOP_SLEEPING`, not forcefully, where they sleep (D574); what else it starts
-            // waits for vehicles and elytra. An action past `Action`'s last stops the
-            // connection, as `readEnum` does; till their client's loaded, nothing (D423).
+            // `STOP_SLEEPING`, not forcefully, where they sleep (D574), a ridden horse's jump
+            // (CAL-179) and gliding, `START_FALL_FLYING` (CAL-286). An action past `Action`'s
+            // last stops the connection, as `readEnum` does; till their client's loaded, nothing
+            // (D423).
             PlayIn.PlayerCommand(c) => {
                 if c.action < 0 or c.action > 6 {
                     self.fault(mut con, decode_exception("Failed to decode packet 'serverbound/minecraft:player_command': Index {c.action} out of bounds for length 7"))
@@ -24208,6 +24333,11 @@ impl Network {
                 if c.action == 1 or c.action == 2 {
                     sprint(mut con.player.attributes, c.action == 1)
                     con.player.entity_data.set_flag(SHARED_FLAGS, SPRINTING_FLAG, c.action == 1)
+                }
+                // `START_FALL_FLYING`: they glide where they may, `tryToStartFallFlying`, else
+                // they're told they don't, `stopFallFlying` (CAL-286).
+                if c.action == 6 and not self.try_start_gliding(mut con) {
+                    stop_gliding(mut con)
                 }
                 if c.action == 0 and con.player.sleeping != none {
                     self.stop_sleep_in_bed(mut con, false, true)
@@ -32949,7 +33079,7 @@ impl Network {
         if let l = look {
             self.look_at(mut con, slot, l)
         }
-        if i32(con.player.entity_data.byte(SHARED_FLAGS)) & FALL_FLYING_FLAG == 0 {
+        if not gliding(con) {
             con.player.vy = con.player.vy * 0.0
             con.player.on_ground = true
         }
@@ -34282,7 +34412,8 @@ impl Network {
     // tick began than their motion goes and 10 blocks more for each move since their last tick
     // ended, five at most, is too quick, `moved too quickly`, and they're sent back where they
     // are; flying faster than vanilla lets with `calcite flyspeed`, the same at their own speed
-    // (CAL-254). Else the server moves them itself from where it last took them, `client_move`;
+    // (CAL-254); gliding, `sqrt(300)` rather than 10, and not checked at all where
+    // `elytra_movement_check` is off (CAL-286), nor are they floating. Else the server moves them itself from where it last took them, `client_move`;
     // where that leaves them more than a quarter of a block across from where the client said,
     // out of creative and spectator, the move's wrong, `moved wrongly`. Then, unless they're a
     // spectator, a wrong move from where nothing was in their way, or one into a block their box
@@ -34324,7 +34455,12 @@ impl Network {
             packets = 1
         }
         let name = con.name.copy() ?? String()
-        if self.world.movement_check and not con.player.changing_dimension and xd * xd + yd * yd + zd * zd - expected > 100.0 * f64(packets) * fly_margin(con.player.abilities) {
+        // Gliding, `isFallFlying` as the move comes: 300 a move rather than 100, and not checked
+        // at all where `elytra_movement_check` is off, `shouldCheckPlayerMovement` (CAL-286).
+        let glides = gliding(con)
+        let checks = self.world.movement_check and (not glides or self.world.game_rules.flag("elytra_movement_check"))
+        let limit = if glides { 300.0 } else { 100.0 }
+        if checks and not con.player.changing_dimension and xd * xd + yd * yd + zd * zd - expected > limit * f64(packets) * fly_margin(con.player.abilities) {
             self.logs.push(Entry.warn("{name} moved too quickly! {xd},{yd},{zd}"))
             let (pyr, pxr) = (con.player.y_rot, con.player.x_rot)
             self.teleport(mut con, sx, sy, sz, pyr, pxr)
@@ -34354,11 +34490,11 @@ impl Network {
             return true
         }
         self.move_player(mut con, tx, ty, tz, y_rot, x_rot)
-        con.player.floating = dy >= -0.03125 and not stands and not spectator and not self.world.allow_flight and not con.player.abilities.may_fly and not con.player.effects.has(LEVITATION) and self.no_blocks_around(con)
+        con.player.floating = dy >= -0.03125 and not stands and not spectator and not self.world.allow_flight and not con.player.abilities.may_fly and not con.player.effects.has(LEVITATION) and not glides and self.no_blocks_around(con)
         con.player.on_ground = ground
         con.player.horizontal_collision = horizontal
         self.player_moved(mut con, sx, sy, sz, ground, true)
-        self.impulse_moved(mut con, ground)
+        self.impulse_moved(mut con, ground, glides)
         con.player.known_x = con.player.x - sx
         con.player.known_y = con.player.y - sy
         con.player.known_z = con.player.z - sz
@@ -34369,9 +34505,10 @@ impl Network {
 
     // `handleMovePlayer`'s `tryResetCurrentImpulseContext` once a move's taken (D443): on the
     // ground, landed in water or lava, going up by less than a float's hundred thousandth, on
-    // what's climbable, which keeps where, `onClimbable`, or a spectator, their impulse forgotten
-    // where its grace is over. Fall flying and riptide's spin come with them.
-    fn impulse_moved(self, con: mut Connection, ground: bool) {
+    // what's climbable, which keeps where, `onClimbable`, a spectator, or gliding as the move came,
+    // `glides` (CAL-286), their impulse forgotten where its grace is over. Riptide's spin comes
+    // with it.
+    fn impulse_moved(self, con: mut Connection, ground: bool, glides: bool) {
         let lava = con.player.based and con.player.lava > 0.0
         var reset = ground or (con.player.vy < f64(1.0e-5f32) and (con.player.in_water or lava))
         if not reset {
@@ -34382,7 +34519,7 @@ impl Network {
                 }
             }
         }
-        if (reset or con.player.mode == GameType.Spectator) and con.player.impulse_grace == 0 {
+        if (reset or con.player.mode == GameType.Spectator or glides) and con.player.impulse_grace == 0 {
             con.player.impulse_at = none
         }
     }
@@ -35423,9 +35560,9 @@ impl Network {
     // an advancement's predicates read them, where they are and what they wear (CAL-164).
     fn player_looted(self, con: Connection, f: Facts, t: BodyFacts) -> LootEntity {
         let d = con.player.dim
-        let gliding = i32(con.player.entity_data.byte(SHARED_FLAGS)) & FALL_FLYING_FLAG != 0
+        let glides = gliding(con)
         let below = on_pos_of(f, t, self.levels[d], con.player.support, con.player.x, con.player.y, con.player.z, 0.500001f32)
-        return LootEntity { kind: String("minecraft:player"), on_fire: con.player.fire > 0, hand: held_in(con, 0), on_ground: con.player.on_ground, flying: gliding or con.player.abilities.flying, moved_x: con.player.known_x, moved_y: con.player.known_y, moved_z: con.player.known_z, fall_distance: con.player.fall, affected_by: some(below), tick_count: con.player.own_ticks, at: some((con.player.x, con.player.y, con.player.z)), worn: worn_by(con) }
+        return LootEntity { kind: String("minecraft:player"), on_fire: con.player.fire > 0, hand: held_in(con, 0), on_ground: con.player.on_ground, flying: glides or con.player.abilities.flying, moved_x: con.player.known_x, moved_y: con.player.known_y, moved_z: con.player.known_z, fall_distance: con.player.fall, affected_by: some(below), tick_count: con.player.own_ticks, at: some((con.player.x, con.player.y, con.player.z)), worn: worn_by(con) }
     }
 
     // `Player.causeFallDamage` of a fall `fell` with the modifier `modifier`, the damage named
@@ -38435,6 +38572,7 @@ fn tracked_body(con: Connection) -> Body {
     b.on_ground = con.player.on_ground
     b.needs_sync = con.player.needs_sync
     b.sync_velocity = con.player.sync_velocity
+    b.fall_flying = gliding(con)
     return b
 }
 
@@ -38493,6 +38631,9 @@ fn body_of(con: mut Connection, lf: LivingFacts, portal: bool) -> Living {
     l.refresh_body(lf)
     l.speed = con.player.speed
     l.flying = con.player.abilities.flying
+    l.gliding = gliding(con)
+    l.glide_stopped = false
+    l.wall_hit = 0.0f32
     l.sprinting = sprints(con)
     l.swimming = swimming(con)
     return l
@@ -38653,7 +38794,7 @@ fn movement_statistics(con: mut Connection, dx: f64, dy: f64, dz: f64, climbing:
                 con.player.stats.award_custom("walk_one_cm", across)
             }
         }
-    } else if i32(con.player.entity_data.byte(SHARED_FLAGS)) & FALL_FLYING_FLAG != 0 {
+    } else if gliding(con) {
         con.player.stats.award_custom("aviate_one_cm", whole)
     } else if across > 25 {
         con.player.stats.award_custom("fly_one_cm", across)
@@ -38940,7 +39081,7 @@ fn target_strength(face: i32, at: (f64, f64, f64)) -> i32 {
 }
 
 fn can_smash(con: Connection) -> bool {
-    return con.player.fall > 1.5 and i32(con.player.entity_data.byte(SHARED_FLAGS)) & FALL_FLYING_FLAG == 0
+    return con.player.fall > 1.5 and not gliding(con)
 }
 
 // `Entity.push` of the living entity `living` by a mace's smash on what's at x, y, z, from `fell`
@@ -39001,6 +39142,18 @@ fn start_swing(p: mut Player, duration: i32) -> bool {
     p.swing_ticks = 0
     p.swinging = true
     return true
+}
+
+// Whether the player glides, `isFallFlying`, their shared flags' eighth (CAL-286).
+fn gliding(con: Connection) -> bool {
+    return i32(con.player.entity_data.byte(SHARED_FLAGS)) & FALL_FLYING_FLAG != 0
+}
+
+// `stopFallFlying` of the player (CAL-286): their flag set, then cleared, so it's sent them again
+// as it is, where it was clear, as their client may glide.
+fn stop_gliding(con: mut Connection) {
+    con.player.entity_data.set_flag(SHARED_FLAGS, FALL_FLYING_FLAG, true)
+    con.player.entity_data.set_flag(SHARED_FLAGS, FALL_FLYING_FLAG, false)
 }
 
 // `SwingState.tick` of the player `p`'s swing (CAL-186): where one's under way, a tick on, and
@@ -39874,8 +40027,8 @@ fn damage_context(con: Connection, living: Living, this: LootEntity) -> LootPara
 // what `player_looted` has of them but the block below them, as wind burst's requirement reads
 // their flags and fall (CAL-182).
 fn body_damage_context(con: Connection, body: Body, this: LootEntity) -> LootParams {
-    let gliding = i32(con.player.entity_data.byte(SHARED_FLAGS)) & FALL_FLYING_FLAG != 0
-    let me = LootEntity { kind: String("minecraft:player"), on_fire: con.player.fire > 0, hand: held_in(con, 0), on_ground: con.player.on_ground, flying: gliding or con.player.abilities.flying, moved_x: con.player.known_x, moved_y: con.player.known_y, moved_z: con.player.known_z, fall_distance: con.player.fall, tick_count: con.player.own_ticks, at: some((con.player.x, con.player.y, con.player.z)), worn: worn_by(con) }
+    let glides = gliding(con)
+    let me = LootEntity { kind: String("minecraft:player"), on_fire: con.player.fire > 0, hand: held_in(con, 0), on_ground: con.player.on_ground, flying: glides or con.player.abilities.flying, moved_x: con.player.known_x, moved_y: con.player.known_y, moved_z: con.player.known_z, fall_distance: con.player.fall, tick_count: con.player.own_ticks, at: some((con.player.x, con.player.y, con.player.z)), worn: worn_by(con) }
     return LootParams { origin: some((body.x, body.y, body.z)), this_entity: true, this: some(this.copy()), damage_source: true, attacker: some(me.copy()), direct_attacker: some(me), direct: true }
 }
 
