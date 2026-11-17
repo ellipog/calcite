@@ -81,6 +81,7 @@ cases:
   - session:mounted/*/commands
   - session:steered/*/commands
   - session:horseinv/*/commands
+  - session:leaps/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
