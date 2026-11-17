@@ -608,6 +608,11 @@ struct Player {
     // `attackStrengthTicker`, and what was there as it last looked, `lastItemInMainHand` (D416).
     attack_ticker: i32 = 0
     last_main_hand: Tag? = none
+    // Their arm's swing, `SwingState` (CAL-186): whether one's under way, `currentSwing`, its ticks
+    // so far and its length.
+    swinging: bool = false
+    swing_ticks: i32 = 0
+    swing_length: i32 = 0
     // Their item cooldowns, `ItemCooldowns` (D579), which a respawn's new player doesn't keep.
     cooldowns: ItemCooldowns = ItemCooldowns()
     // Which player they are, as vanilla's `ServerPlayer` objects are each their own, the next
@@ -16317,8 +16322,7 @@ impl Network {
             }
         }
         if result == INTERACT_SERVER {
-            let me = con.player.entity_id
-            self.send_seen_and_self(mut con, encode_play(ClientboundSwingAnimation { entity_id: me, hand: hand, kind: kind, duration: duration }))
+            self.swing_and_reset(mut con, hand, kind, duration, true)
         }
     }
 
@@ -17477,17 +17481,10 @@ impl Network {
     // `setNoPickUpDelay` and `setTarget`, as what an advancement's loot gave that didn't go in
     // their inventory is (CAL-164).
     fn drop_for(mut self, con: mut Connection, stack: Tag, thrown: bool, alone: bool, theirs: bool) {
-        // A dead player out of their level has no tracker, which `swing` sends through, so
-        // theirs reaches no one, not even them, as what their menus held drops (D576).
-        if not con.player.removed {
-            let swung = encode_play(ClientboundSwingAnimation { entity_id: con.player.entity_id, hand: 0, kind: 1, duration: 6 })
-            if alone {
-                self.send_seen_and_self(mut con, swung)
-            } else {
-                let seen = self.seers_of(con)
-                self.send_to_seen(seen, swung)
-            }
-        }
+        // `LivingEntity.drop`'s swing of their main hand, `SwingAnimation.DEFAULT`, where their swing
+        // state lets one start (CAL-186); a dead player's, out of their level, reaching no one, not
+        // even them, as what their menus held drops (D576).
+        _ = self.swing_hand(mut con, 0, 1, 6, alone)
         self.drop_from(mut con, stack, thrown, if theirs { DROP_THEIRS } else { DROP_ANY })
     }
 
@@ -20321,6 +20318,8 @@ impl Network {
         if con.player.own_ticks % 20 == 0 {
             self.trigger_simple(mut con, "minecraft:location")
         }
+        // `SwingState.tick` (CAL-186): a swing under way a tick on, over once past its length.
+        tick_swing(mut con.player)
         // `Player.tick`'s attack strength (D416): a tick more, from 0 again where the item in their
         // main hand changed, `resetAttackStrengthTicker`, the stack kept where it changed at all.
         con.player.attack_ticker += 1
@@ -22284,8 +22283,9 @@ impl Network {
     // the one beside the face are sent them as they are, and what else was set off. One the
     // server swings, `SUCCESS_SERVER`, swings it for the player and those who see them, twice,
     // as `handleUseItemOn` does,
-    // with what the hand held as it was used (CAL-143). A swing half through another is let be,
-    // `SwingState.startIfAble`, which waits for the client's own swings to be read.
+    // with what the hand held as it was used (CAL-143), `swingAndResetAttackStrength`: where their
+    // swing state lets it start, their attack strength from 0 again (CAL-186). A use the client
+    // predicted, `SUCCESS`, isn't yet swung for those who see them (CAL-285).
     fn use_item_on(mut self, con: mut Connection, u: ServerboundUseItemOn) -> bool {
         if u.sequence < 0 {
             self.suppress("net.minecraft.network.protocol.game.ServerboundUseItemOnPacket", "java.lang.IllegalArgumentException: Expected packet sequence nr >= 0")
@@ -22324,7 +22324,6 @@ impl Network {
             self.send(mut con, ClientboundSystemChat { content: text, overlay: true }, State.Play)
         } else if not con.player.awaiting and self.world.dims[d].border.within(f64(x), f64(z)) {
             let (kind, duration) = self.interact_animation(con, hand)
-            let me = con.player.entity_id
             self.server_swing = false
             let consumed = self.use_on_block(mut con, hand, x, y, z, face, at_x, at_y, at_z, u.inside)
             // What it dropped, a full composter's bone meal, is made as it's dropped, before its
@@ -22344,7 +22343,7 @@ impl Network {
             if face == UP and not consumed and y >= max_y and attempt {
                 self.build_limit(mut con, true, max_y)
             } else if swing {
-                self.send_seen_and_self(mut con, encode_play(ClientboundSwingAnimation { entity_id: me, hand: hand, kind: kind, duration: duration }))
+                self.swing_and_reset(mut con, hand, kind, duration, true)
             }
             if not consumed and attempt {
                 if face == UP and y >= max_y {
@@ -22353,7 +22352,7 @@ impl Network {
                     self.build_limit(mut con, false, min_y)
                 }
             } else if swing {
-                self.send_seen_and_self(mut con, encode_play(ClientboundSwingAnimation { entity_id: me, hand: hand, kind: kind, duration: duration }))
+                self.swing_and_reset(mut con, hand, kind, duration, true)
             }
         } else {
             self.build_limit(mut con, true, max_y)
@@ -22371,12 +22370,59 @@ impl Network {
     // `interact_animation`'s type, by `SwingAnimationType`'s ID, and its ticks, a whack of 6 where
     // it has none (CAL-143).
     fn interact_animation(mut self, con: Connection, hand: i32) -> (i32, i32) {
+        return self.swing_animation(con, hand, "minecraft:interact_animation")
+    }
+
+    // `LivingEntity.swing` of the player's hand `hand` with the animation `kind` of `duration`
+    // ticks (CAL-186): only where their swing state lets one start, `start_swing`; shown to those
+    // who see them, `sendToTrackingPlayers`, and to them too where `to_self`,
+    // `sendToTrackingPlayersAndSelf`; a dead player's to no one, not even them, as they're out of
+    // their level and have no tracker to send it through (D576). Whether it started.
+    fn swing_hand(mut self, con: mut Connection, hand: i32, kind: i32, duration: i32, to_self: bool) -> bool {
+        if not start_swing(mut con.player, duration) {
+            return false
+        }
+        if con.player.removed {
+            return true
+        }
+        let packet = encode_play(ClientboundSwingAnimation { entity_id: con.player.entity_id, hand: hand, kind: kind, duration: duration })
+        if to_self {
+            self.send_seen_and_self(mut con, packet)
+        } else {
+            let seen = self.seers_of(con)
+            self.send_to_seen(seen, packet)
+        }
+        return true
+    }
+
+    // `ServerPlayer.swingAndResetAttackStrength` (CAL-186): `swing_hand`, and where it started,
+    // their attack strength from 0 again, `resetAttackStrengthTicker`.
+    fn swing_and_reset(mut self, con: mut Connection, hand: i32, kind: i32, duration: i32, to_self: bool) {
+        if self.swing_hand(mut con, hand, kind, duration, to_self) {
+            con.player.attack_ticker = 0
+        }
+    }
+
+    // `handlePunch` (CAL-186): their idle time, `resetLastActionTime`, waits for idle kicks; their
+    // main hand swung with what it holds's `attack_animation`, `getAttackAnimation`, for those who
+    // see them, as their client swung it already; and their attack strength from 0 again, whether
+    // or not it swung, `resetAttackStrengthTicker`.
+    fn punch(mut self, con: mut Connection) {
+        let (kind, duration) = self.swing_animation(con, 0, "minecraft:attack_animation")
+        _ = self.swing_hand(mut con, 0, kind, duration, false)
+        con.player.attack_ticker = 0
+    }
+
+    // The swing animation of what the player's hand `hand` holds, by its item's component
+    // `component`, `getAttackAnimation` or `getInteractAnimation`: its type's ID, none 0, whack 1
+    // and stab 2, and its ticks; `SwingAnimation.DEFAULT`, a whack of 6, where it has none.
+    fn swing_animation(mut self, con: Connection, hand: i32, component: str) -> (i32, i32) {
         let held = held_in(con, hand) else return (1, 6)
         if not self.items_ready() {
             return (1, 6)
         }
         let items = self.items.take() else return (1, 6)
-        let found = items.component(held, String("minecraft:interact_animation"))
+        let found = items.component(held, String(component))
         self.items = some(items)
         let given = found else return (1, 6)
         let Tag.Compound(m) = given else return (1, 6)
@@ -24109,6 +24155,10 @@ impl Network {
                 return true
             },
             // `handleAcceptPlayerLoad`: their client's loaded, `markClientLoaded` (D418).
+            PlayIn.Punch(_) => {
+                self.punch(mut con)
+                return true
+            },
             PlayIn.PlayerLoaded(_) => {
                 con.player.load_timer = 0
                 return true
@@ -26961,8 +27011,7 @@ impl Network {
             }
         }
         if done.result == INTERACT_SERVER {
-            let me = con.player.entity_id
-            self.send_seen_and_self(mut con, encode_play(ClientboundSwingAnimation { entity_id: me, hand: hand, kind: kind, duration: duration }))
+            self.swing_and_reset(mut con, hand, kind, duration, true)
         }
         return true
     }
@@ -35833,13 +35882,11 @@ impl Network {
         self.send_level_events_with(d, mut con)
         if self.use_swung_self {
             self.use_swung_self = false
-            let me = con.player.entity_id
-            self.send_seen_and_self(mut con, encode_play(ClientboundSwingAnimation { entity_id: me, hand: hand, kind: kind, duration: duration }))
+            self.swing_and_reset(mut con, hand, kind, duration, true)
         }
         if self.use_swung {
             self.use_swung = false
-            let seen = self.seers_of(con)
-            self.send_to_seen(seen, encode_play(ClientboundSwingAnimation { entity_id: con.player.entity_id, hand: hand, kind: kind, duration: duration }))
+            self.swing_and_reset(mut con, hand, kind, duration, false)
         }
         return true
     }
@@ -38932,6 +38979,43 @@ fn smash_push(living: mut Living, lf: LivingFacts, x: f64, y: f64, z: f64, fell:
 // for a spectator, `transferInventoryXpAndScore`; their health, food and experience sent again on
 // their next tick; `random`, their new entity's; everything else a new player's, their client's
 // loading timer at 60 and no longer waiting for them to respawn.
+// `SwingState.startIfAble` of a swing of `duration` ticks by the player `p` (CAL-186): none
+// where one's under way and not yet past half its length, `ticks <= durationTicks / 2` and past
+// its first tick; else it starts, its ticks from 0, its length theirs, `getModifiedSwingDuration`:
+// less haste's or the conduit's power's amplifier and 1, the greater, else more by mining
+// fatigue's and 1, twice. Whether it started.
+fn start_swing(p: mut Player, duration: i32) -> bool {
+    if p.swinging and p.swing_ticks <= p.swing_length / 2 and p.swing_ticks > 0 {
+        return false
+    }
+    let haste = p.effects.amplifier(HASTE)
+    let conduit = p.effects.amplifier(CONDUIT_POWER)
+    let fatigue = p.effects.amplifier(MINING_FATIGUE)
+    p.swing_length = if haste >= 0 or conduit >= 0 {
+        duration - (1 + haste.max(0).max(conduit.max(0)))
+    } else if fatigue >= 0 {
+        duration + (1 + fatigue) * 2
+    } else {
+        duration
+    }
+    p.swing_ticks = 0
+    p.swinging = true
+    return true
+}
+
+// `SwingState.tick` of the player `p`'s swing (CAL-186): where one's under way, a tick on, and
+// over where its ticks were past its length before.
+fn tick_swing(p: mut Player) {
+    if not p.swinging {
+        return
+    }
+    let was = p.swing_ticks
+    p.swing_ticks += 1
+    if was > p.swing_length {
+        p.swinging = false
+    }
+}
+
 fn respawned_player(old: Player, information: ClientInformation, random: own LegacyRandom, dim: usize, keeps: bool, keep_all: bool) -> Player {
     var abilities = Abilities()
     abilities.update(old.mode)
