@@ -78,6 +78,7 @@ cases:
   - session:knots/*/commands
   - session:beetied/*/commands
   - session:horsefeed/*/commands
+  - session:mounted/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too

@@ -92,7 +92,7 @@ import world.border.{Border, BorderSettings, saved_id as border_id}
 import world.clocks.{saved_id as clocks_id}
 import world.chunk.{MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, WORLD_SURFACE}
 import world.collision.{Aabb, CollisionBlocks, CollisionStates, eye_height, pose_box, pose_height, pose_size}
-import world.entities.{Entities, FreeChicken, PearlOwner, PortalDue, Reached}
+import world.entities.{Entities, FreeChicken, PearlOwner, PortalDue, Reached, Unseat}
 import world.body.{Body, BodyFacts, EntitySound, NEUTRAL_SOURCE, PLAYERS_SOURCE, across_enough, bool_or, insecure_uuid, on_pos_of, push_between, splash_draws, support_of, uuid_of, uuid_tag}
 import world.currents.{fluids_at, push as current_push}
 import world.damage.{BYPASSES_ARMOR, BYPASSES_COOLDOWN, BYPASSES_EFFECTS, BYPASSES_ENCHANTMENTS, BYPASSES_INVULNERABILITY, BYPASSES_RESISTANCE, DAMAGES_HELMET, Damage, DamageTypes, IS_FIRE, NO_ANGER, NO_IMPACT, NO_KNOCKBACK, resists}
@@ -452,6 +452,8 @@ struct OpenContainer {
 
 struct Player {
     entity_id: i32 = 0
+    // What they ride, by its entity ID, `getVehicle` (CAL-179).
+    vehicle: i32? = none
     x: f64 = 0.0
     y: f64 = 0.0
     z: f64 = 0.0
@@ -4258,8 +4260,20 @@ impl Network {
     // A tracker sends what `world.item_tracker` says; a player's sends them too what of their
     // entity data changed (CAL-141), then of their attributes, as `sendDirtyEntityData` sends
     // them, every second time it runs, a player's `updateInterval`, from when they came into the
-    // level, or at once where their data changed (D375).
+    // level, or at once where their data changed (D375). First each player's view moves where
+    // they're in another chunk than its middle, `updateChunkTracking`, as what they ride takes
+    // them (CAL-179).
     fn track_players(mut self, d: usize) {
+        for slot in 0..self.connections.len() {
+            if not self.playing(slot) {
+                continue
+            }
+            var con = self.connections[slot].take() else continue
+            if con.player.dim == d and not con.player.removed and not con.closing {
+                self.track(mut con, false)
+            }
+            self.connections[slot] = some(con)
+        }
         let es = self.take_entities(d)
         var order = List<(i32, bool)>()
         for (id, player) in es.tracked {
@@ -10827,7 +10841,31 @@ impl Network {
         self.begin_items(d)
         for (entered, slot) in order {
             self.tick_items(d, entered)
-            var con = self.connections[slot].take() else continue
+            // A player riding something ticks after it, `tickPassenger`, not here; one whose
+            // vehicle doesn't carry them now gets off it first, `stopRiding` (CAL-179).
+            var pid = -1
+            var rides: i32? = none
+            if let c = self.connections[slot] {
+                pid = c.player.entity_id
+                rides = c.player.vehicle
+            }
+            if let v = rides {
+                if self.level_carries(d, v, pid) {
+                    continue
+                }
+                self.unseat_player(d, pid)
+            }
+            self.player_tick(d, slot)
+        }
+        self.tick_items(d, u64.MAX)
+        self.end_items(d)
+    }
+
+    // A player's tick among their level's entities, `tickNonPassenger`'s or `tickPassenger`'s
+    // (CAL-179): their tick counted and where they were kept, then `ServerPlayer.tick`.
+    fn player_tick(mut self, d: usize, slot: usize) {
+        {
+            var con = self.connections[slot].take() else return
             // `commonTick`'s `tickCount`, as `tickNonPassenger` counts it up before their tick
             // (D433), and where they are, `setOldPosAndRot` (D434).
             con.player.own_ticks += 1
@@ -10868,8 +10906,230 @@ impl Network {
             self.flush_advancements(mut con)
             self.connections[slot] = some(con)
         }
-        self.tick_items(d, u64.MAX)
-        self.end_items(d)
+    }
+
+    // Whether the level `d`'s entity `vehicle` carries the player `pid` (CAL-179).
+    fn level_carries(mut self, d: usize, vehicle: i32, pid: i32) -> bool {
+        if d >= self.entities.len() or self.entities[d] == none {
+            return false
+        }
+        let es = self.take_entities(d)
+        let carried = es.list.carries_player(vehicle, pid)
+        self.put_entities(d, es)
+        return carried
+    }
+
+    // `stopRiding` of the player `pid` in the level `d` (CAL-179): off what they ride there, and
+    // put where they get off, `players_got_off`.
+    fn unseat_player(mut self, d: usize, pid: i32) {
+        if d < self.entities.len() and self.entities[d] != none {
+            var es = self.take_entities(d)
+            es.list.unseat_player(pid)
+            self.put_entities(d, es)
+        }
+        // Where their level hasn't them riding, they're off still.
+        if let slot = self.slot_of_entity(pid) {
+            if let held = self.connections[slot].take() {
+                var con = held
+                con.player.vehicle = none
+                self.connections[slot] = some(con)
+            }
+        }
+        self.players_got_off(d)
+    }
+
+    // `Player.startRiding` of the player `con`, of the UUID `uuid`, onto the level `d`'s entity
+    // `vehicle` (CAL-179), `canRide`: not holding shift, a player's boarding never cooling down,
+    // `removeVehicle`, and not riding it already; off what they ride first, then on it where it
+    // has room, `seat_player`, standing, `setPose(STANDING)`; their `STARTED_RIDING`; where it
+    // seats them, `positionRider`, a horse turning them to where it looked, `view`, sent as a
+    // teleport turning them none, `Relative.ROTATION`;
+    // its effects, `sendActiveEffects`; and what rides it, `ClientboundSetPassengersPacket`.
+    fn board(mut self, d: usize, con: mut Connection, uuid: (i64, i64), vehicle: i32, view: (f32, f32)?) {
+        if con.player.shift or con.player.vehicle == some(vehicle) {
+            return
+        }
+        let pid = con.player.entity_id
+        var es = self.take_entities(d)
+        if es.list.passengers_of(vehicle).len() > 0 or es.list.place(vehicle) == none {
+            self.put_entities(d, es)
+            return
+        }
+        if con.player.vehicle != none {
+            es.list.unseat_player(pid)
+            let offs = es.list.take_players_off()
+            self.put_entities(d, es)
+            for off in offs {
+                self.player_off(d, mut con, off.copy())
+            }
+            es = self.take_entities(d)
+        }
+        if not es.list.seat_player(pid, uuid, vehicle) {
+            self.put_entities(d, es)
+            return
+        }
+        con.player.vehicle = some(vehicle)
+        con.player.entity_data.set(POSE_ID, Value.Number(STANDING))
+        // A horse turns them to where it looked, `absSnapRotationTo`.
+        if let (vy, vx) = view {
+            con.player.y_rot = vy % 360.0f32
+            con.player.x_rot = clamp_f32(vx, -90.0, 90.0) % 360.0f32
+        }
+        let seat = es.list.player_seat(vehicle, pid, con.player.y_rot)
+        let effects = es.list.effects_on(vehicle)
+        let riders = es.list.passengers_of(vehicle)
+        self.put_entities(d, es)
+        self.trigger_simple(mut con, "minecraft:started_riding")
+        var (x, y, z) = (con.player.x, con.player.y, con.player.z)
+        if let ((sx, sy, sz), _) = seat {
+            x = sx
+            y = sy
+            z = sz
+        }
+        self.teleport_by(mut con, x, y, z, 0.0f32, 0.0f32, 8 | 16)
+        for e in effects {
+            self.send(mut con, effect_packet(vehicle, e, false), State.Play)
+        }
+        self.send(mut con, ClientboundSetPassengers { vehicle: vehicle, passengers: riders }, State.Play)
+    }
+
+    // The level `d`'s players who got off something since (CAL-179), each put where they get
+    // off, `player_off`.
+    fn players_got_off(mut self, d: usize) {
+        if d >= self.entities.len() or self.entities[d] == none {
+            return
+        }
+        var es = self.take_entities(d)
+        let offs = es.list.take_players_off()
+        self.put_entities(d, es)
+        for off in offs {
+            let slot = self.slot_of_entity(off.rider) else continue
+            var con = self.connections[slot].take() else continue
+            self.player_off(d, mut con, off.copy())
+            self.connections[slot] = some(con)
+        }
+    }
+
+    // A player off what they rode as `off` has it (CAL-179): `ServerPlayer.removeVehicle`, its
+    // effects gone for them, `ClientboundRemoveMobEffectPacket`, and what rides it now,
+    // `ClientboundSetPassengersPacket`; then, not removed, put where they get off,
+    // `dismountVehicle`, standing, crouching or swimming, the first that fits, `setPose`, sent as
+    // a teleport keeping their motion and turn, `teleportTo`.
+    fn player_off(mut self, d: usize, con: mut Connection, off: own Unseat) {
+        con.player.vehicle = none
+        var es = self.take_entities(d)
+        let effects = es.list.effects_on(off.vehicle)
+        self.put_entities(d, es)
+        for e in effects {
+            self.send(mut con, ClientboundRemoveMobEffect { entity_id: off.vehicle, effect: e.id }, State.Play)
+        }
+        self.send(mut con, ClientboundSetPassengers { vehicle: off.vehicle, passengers: off.left_riding.copy() }, State.Play)
+        if con.player.removed {
+            return
+        }
+        let shared = self.levels[d].shared_env() else return
+        let Env { facts: f, .. } = shared.value
+        if self.movement == none {
+            self.movement = some(MovementStates.new(f))
+        }
+        let m = self.movement.take() else return
+        var from = off
+        from.left = con.information.main_hand == HumanoidArm.Left
+        let mover = Mover { y: con.player.y, fall: con.player.fall, descending: con.player.shift, walks_on_snow: walks_on_snow(con) }
+        let at = (con.player.x, con.player.y, con.player.z)
+        let heights: List<f32> = [1.8f32, 1.5f32, 0.6f32]
+        es = self.take_entities(d)
+        let (spot, pose) = es.list.off_spot(f, m, self.levels[d], from, at, 0.6f32, heights, mover)
+        self.put_entities(d, es)
+        self.movement = some(m)
+        if let k = pose {
+            let poses: List<i32> = [STANDING, CROUCHING, SWIMMING]
+            con.player.entity_data.set(POSE_ID, Value.Number(poses[k]))
+        }
+        let (x, y, z) = spot
+        self.teleport_by(mut con, x, y, z, 0.0f32, 0.0f32, 8 | 16 | 32 | 64 | 128 | 256)
+    }
+
+    // A player's ride, `tickPassenger` (CAL-179), on the level `d`'s entity `vehicle`: holding
+    // shift they get off, `Player.rideTick`'s `stopRiding`, and that's all; else still,
+    // `Entity.rideTick`'s `setDeltaMovement(ZERO)`, their own tick, `player_tick`, then where
+    // their vehicle seats them, `positionRider`, their fall forgotten, `LivingEntity.rideTick`,
+    // and how far it took them counted, as a float rounded, `checkRidingStatistics`.
+    fn player_ride_tick(mut self, d: usize, vehicle: i32, pid: i32) {
+        let slot = self.slot_of_entity(pid) else return
+        var shift = false
+        if let c = self.connections[slot] {
+            shift = c.player.shift
+        }
+        if shift {
+            self.unseat_player(d, pid)
+            return
+        }
+        var still = self.connections[slot].take() else return
+        let was = (still.player.x, still.player.y, still.player.z)
+        still.player.vx = 0.0
+        still.player.vy = 0.0
+        still.player.vz = 0.0
+        self.connections[slot] = some(still)
+        self.player_tick(d, slot)
+        var con = self.connections[slot].take() else return
+        let es = self.take_entities(d)
+        let seat = es.list.player_seat(vehicle, pid, con.player.y_rot)
+        let stat = es.list.riding_stat(vehicle)
+        self.put_entities(d, es)
+        if let ((x, y, z), _) = seat {
+            let before = (con.player.x, con.player.y, con.player.z)
+            con.player.x = x
+            con.player.y = y
+            con.player.z = z
+            self.moved_from(mut con, before)
+        }
+        self.reset_fall(mut con)
+        let (px, py, pz) = was
+        let (dx, dy, dz) = (con.player.x - px, con.player.y - py, con.player.z - pz)
+        if not (dx == 0.0 and dy == 0.0 and dz == 0.0) {
+            if let name = stat {
+                con.player.stats.award_custom(name, round_float(f32.nearest((dx * dx + dy * dy + dz * dz).sqrt()) * 100.0f32))
+            }
+        }
+        self.connections[slot] = some(con)
+    }
+
+    // `CriteriaTriggers.TAME_ANIMAL.trigger` for the player of `con`, who tamed `entity`
+    // (CAL-179): each criterion listening whose `entity` holds of it and whose player's condition
+    // holds, awarded.
+    fn tamed_for(mut self, con: mut Connection, entity: LootEntity) {
+        let listening = con.player.advancements.listening(String("minecraft:tame_animal"))
+        if listening.is_empty() {
+            return
+        }
+        var matched = List<Listener>()
+        for (key, conditions) in listening {
+            if not self.maybe_holds(con, field_of(conditions, "entity"), some(entity.copy())) {
+                continue
+            }
+            if self.player_holds(con, conditions) {
+                matched.push(key.copy())
+            }
+        }
+        self.award_all(mut con, matched)
+    }
+
+    // The slot of the player of the UUID `who` in the level `d`, where they're there and playing
+    // (CAL-179).
+    fn slot_of_uuid(self, d: usize, who: (i64, i64)) -> usize? {
+        let (most, least) = who
+        for slot in 0..self.connections.len() {
+            if not self.playing(slot) {
+                continue
+            }
+            let c = self.connections[slot] else continue
+            let p = c.profile else continue
+            if p.id.most == most and p.id.least == least and c.player.dim == d {
+                return some(slot)
+            }
+        }
+        return none
     }
 
     // Starts the tick of the level `d`'s items (CAL-148).
@@ -11146,6 +11406,8 @@ impl Network {
         es.list.level_random = some(self.levels[d].lend_random())
         es.list.pois = some(self.levels[d].lend_pois())
         let going = es.list.tick_next(before, f, m, t, lf, codecs, self.levels[d], min_y, fast, players, mut sounds)
+        // A player's ride, ticked once the entities are back (CAL-179).
+        let ride = es.list.player_ride.take()
         // The tickets ender pearls put as they flew, `placeEnderPearlTicket` (D579), each with its
         // level's empty time none, `registerAndUpdateEnderPearlTicket` (D621).
         let pearled = es.list.pearl_tickets.copy()
@@ -11191,6 +11453,9 @@ impl Network {
                 Shown.Attack(_) => attacked = true,
                 Shown.Shot(_) => attacked = true,
                 Shown.Stabbed(_) => attacked = true,
+                // A player thrown off where they get off is where its tick goes on to see them
+                // (CAL-179).
+                Shown.ThrewPlayer => attacked = true,
                 _ => {},
             }
         }
@@ -11228,6 +11493,13 @@ impl Network {
             self.unscore(mut es, none)
         }
         self.put_entities(d, es)
+        // The players who got off what they rode as it ticked, put where they get off; then a
+        // player's ride, after which the players are read again (CAL-179).
+        self.players_got_off(d)
+        if let (vehicle, pid) = ride {
+            self.player_ride_tick(d, vehicle, pid)
+            attacked = true
+        }
         return (true, attacked)
     }
 
@@ -11523,6 +11795,26 @@ impl Network {
             Shown.Knotted(at) => {
                 self.send_level_events(d)
                 return self.knot_for(es, d, id, at)
+            },
+            Shown.Tamed(owner) => {
+                self.send_level_events(d)
+                var kept = es
+                let mob = kept.list.lend_mob(id) else return kept
+                let seen = mob.loot_entity()
+                kept.list.give_back_mob(mob)
+                let slot = self.slot_of_uuid(d, owner) else return kept
+                var con = self.connections[slot].take() else return kept
+                self.tamed_for(mut con, seen)
+                self.connections[slot] = some(con)
+                return kept
+            },
+            Shown.ThrewPlayer => {
+                self.send_level_events(d)
+                var kept = es
+                kept.list.throw_player(id)
+                self.put_entities(d, kept)
+                self.players_got_off(d)
+                return self.take_entities(d)
             },
             Shown.Worn(slots) => {
                 self.send_level_events(d)
@@ -19706,9 +19998,9 @@ impl Network {
     // `LivingEntity.tick` passes it over for an entity that's removed (D427).
     fn do_tick(mut self, con: mut Connection) {
         // Where the tick began, `firstGoodX`, `firstGoodY` and `firstGoodZ`; and, as `Player.tick`
-        // begins, a spectator off the ground, `setOnGround(false)` (D419).
+        // begins, a spectator (D419) or a rider (CAL-179) off the ground, `setOnGround(false)`.
         let (gx, gy, gz) = (con.player.x, con.player.y, con.player.z)
-        if con.player.mode == GameType.Spectator {
+        if con.player.mode == GameType.Spectator or con.player.vehicle != none {
             con.player.on_ground = false
             con.player.no_blocks = false
             con.player.support = none
@@ -26262,6 +26554,14 @@ impl Network {
             }
         }
         self.put_entities(d, es)
+        // Its rider, `startRiding`, turned first as a horse looks, `doPlayerRide` (CAL-179).
+        if done.rides {
+            if let (yr, xr) = done.rides_turned {
+                con.player.y_rot = yr
+                con.player.x_rot = xr
+            }
+            self.board(d, mut con, (who.most, who.least), id, done.rides_view)
+        }
         // What the use did to leashes (CAL-179), in order: each lead dropped, `spawnAtLocation`,
         // made and seen by the player too, then the link sent those who see the mob.
         if not leash_steps.is_empty() {
@@ -33670,6 +33970,13 @@ impl Network {
     // from where their tick began sends them back, and none's taken (D574). Riding waits for
     // vehicles, an impulse's grace time for what gives one.
     fn position_change(mut self, con: mut Connection, x: f64, y: f64, z: f64, y_rot: f32, x_rot: f32, ground: bool, horizontal: bool) -> bool {
+        // Riding, a move only turns them where they are, `absSnapTo`, and moves their view with
+        // them, `ChunkMap.move` (CAL-179).
+        if con.player.vehicle != none {
+            let (px, py, pz) = (con.player.x, con.player.y, con.player.z)
+            self.move_player(mut con, px, py, pz, y_rot, x_rot)
+            return true
+        }
         let tx = clamp_f64(x, -30000000.0, 30000000.0)
         let ty = clamp_f64(y, -20000000.0, 20000000.0)
         let tz = clamp_f64(z, -30000000.0, 30000000.0)
@@ -37618,6 +37925,7 @@ fn body_of(con: mut Connection, lf: LivingFacts, portal: bool) -> Living {
     l.data.set(TICKS_FROZEN, Value.Number(con.player.entity_data.number(TICKS_FROZEN)))
     l.body.no_physics = con.player.mode == GameType.Spectator
     l.body.shift = con.player.shift
+    l.body.vehicle = con.player.vehicle
     l.body.walks_on_snow = walks_on_snow(con)
     l.attributes = con.player.attributes.copy()
     l.effects = con.player.effects.list.copy()
@@ -37738,7 +38046,7 @@ fn dealt_counted(con: mut Connection, h: Hurt) {
 }
 
 // `ServerPlayer.checkMovementStatistics` of a move of dx, dy, dz, the player on what's climbable or
-// not (D418), unless they didn't move; no player rides anything yet, `isPassenger`. The
+// not (D418), unless they didn't move or ride something, `isPassenger` (CAL-179). The
 // centimetres they moved, as a float rounded, `Math.round`, each to its stat (CAL-164), with its
 // exhaustion (D418): swimming (D444), `SWIM_ONE_CM`, or with their eyes under water,
 // `WALK_UNDER_WATER_ONE_CM`, a hundredth for each metre; in water, those across,
@@ -37748,7 +38056,7 @@ fn dealt_counted(con: mut Connection, h: Hurt) {
 // the air, those across past 25, `FLY_ONE_CM`. No exhaustion where they're invulnerable,
 // `causeFoodExhaustion`.
 fn movement_statistics(con: mut Connection, dx: f64, dy: f64, dz: f64, climbing: bool) {
-    if dx == 0.0 and dy == 0.0 and dz == 0.0 {
+    if con.player.vehicle != none or (dx == 0.0 and dy == 0.0 and dz == 0.0) {
         return
     }
     let whole = round_float(f32.nearest((dx * dx + dy * dy + dz * dz).sqrt()) * 100.0f32)
