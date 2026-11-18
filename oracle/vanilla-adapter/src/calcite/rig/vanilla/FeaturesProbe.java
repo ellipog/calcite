@@ -140,11 +140,11 @@ final class FeaturesProbe implements Probe {
 
     @Override
     public int version() {
-        return 7;
+        return 8;
     }
 
-    /** The types of entity a `structured` op writes whole, as Calcite makes them (CAL-87, CAL-270). */
-    private static final Set<String> WHOLE = Set.of("minecraft:witch", "minecraft:villager", "minecraft:zombie_villager", "minecraft:cow", "minecraft:pig", "minecraft:sheep", "minecraft:chicken", "minecraft:horse", "minecraft:donkey", "minecraft:chest_minecart", "minecraft:item_frame");
+    /** The types of entity a `structured` op writes whole, as Calcite makes them (CAL-87, CAL-270, CAL-200), not a drowned, whose attribute bonuses `Zombie.handleAttributes` draws from its own random. */
+    private static final Set<String> WHOLE = Set.of("minecraft:witch", "minecraft:villager", "minecraft:zombie_villager", "minecraft:cow", "minecraft:pig", "minecraft:sheep", "minecraft:chicken", "minecraft:horse", "minecraft:donkey", "minecraft:chest_minecart", "minecraft:item_frame", "minecraft:elder_guardian", "minecraft:evoker", "minecraft:vindicator", "minecraft:shulker");
 
     /** A saved list of attributes in order of their IDs, as the attribute map keeps no order two runs share. */
     private static net.minecraft.nbt.ListTag sortedAttributes(net.minecraft.nbt.ListTag list) {
@@ -868,15 +868,16 @@ final class FeaturesProbe implements Probe {
                         kept.put(key, entity.get(key).copy());
                     }
                 }
-                // A shulker keeps the yaw it was made with, drawn from its own random, which is
-                // seeded from the clock, since nothing that places one turns it: zeros instead.
-                if ("minecraft:shulker".equals(entity.getStringOr("id", "")) && kept.contains("Rotation")) {
-                    net.minecraft.nbt.ListTag zero = new net.minecraft.nbt.ListTag();
-                    zero.add(net.minecraft.nbt.FloatTag.valueOf(0.0F));
-                    zero.add(net.minecraft.nbt.FloatTag.valueOf(0.0F));
-                    kept.put("Rotation", zero);
-                }
                 masked = kept;
+            }
+            // A shulker keeps the yaw it was made with, drawn from its own random, which is seeded
+            // from the clock, since nothing that places one turns it: zeros instead, whole or not
+            // (CAL-200).
+            if (structured && "minecraft:shulker".equals(entity.getStringOr("id", "")) && masked.contains("Rotation")) {
+                net.minecraft.nbt.ListTag zero = new net.minecraft.nbt.ListTag();
+                zero.add(net.minecraft.nbt.FloatTag.valueOf(0.0F));
+                zero.add(net.minecraft.nbt.FloatTag.valueOf(0.0F));
+                masked.put("Rotation", zero);
             }
             NbtIo.writeAnyTag(masked, out);
         }
