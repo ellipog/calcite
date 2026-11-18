@@ -84,11 +84,13 @@ import world.post_process.{post_process}
 import world.precipitation.{Precipitation}
 import world.random_ticks.{RandomTicks, TickPlace}
 import world.sources.{arrow_press, arrows_press, plate_entered, rail_entered, tripwire_entered}
-import world.block_entity_updates.{block_entity_ids, block_entity_infos, block_entity_map, holds_anything, kind_of, made_block_entity, place_of, saved_block_entities, sends_update_packet, slots_dropped, update_tag}
-import world.block_entity_ticks.{GATEWAY_COOLDOWN, NO_TICKER, PISTON_TICKER, add_occupant, tick_block_entity, ticker_of}
+import world.block_entity_updates.{block_entity_ids, block_entity_infos, block_entity_map, kind_of, made_block_entity, place_of, saved_block_entities, sends_update_packet, slots_dropped, update_tag}
+import world.block_entity_ticks.{GATEWAY_COOLDOWN, NO_TICKER, PISTON_TICKER, add_occupant, playing_song, song_changed, stop_song, tick_block_entity, ticker_of}
 import world.block_level.{BLOCK_BROKEN, BeaconPulse, BeaconState, BlockLevel, MovingPiston, Openers, Released, SHULKER_CLOSED, destroy_block, remove_block, update_or_destroy, update_output_signal}
 import world.digging.{decrease_eggs, interact_ore}
-import world.drops.{DropLevel, drop_block_resources, get_drops_at}
+import world.drops.{DropLevel, award_experience, drop_block_resources, get_drops_at, spill_stack}
+import world.menu.{count_of}
+import world.recipes.{Recipes}
 import world.end_portal.{PortalMatch, exit_portal_match}
 import world.living.{Warding}
 import world.loot.{Drawless, Loot, LootParams, worn_amount, worn_immune}
@@ -493,6 +495,9 @@ struct Toggle {
 /// where (CAL-172).
 pub enum Dropped {
     Item(f64, f64, f64, Tag)
+    /// An item a removed container spilled, `Containers.dropItemStack`'s: where, its stack and
+    /// how it's thrown, with no pickup delay (CAL-197).
+    Spilled(f64, f64, f64, Tag, f64, f64, f64)
     Orb(f64, f64, f64, i32, i32)
     Tnt(Primed)
     Silverfish(f64, f64, f64)
@@ -744,6 +749,9 @@ pub struct Level {
     /// running, and the world's seed they're made from; the game rule `block_drops`; and the
     /// items and orbs dropped, for the network to make in order.
     pub loot: Shared<Loot>? = none
+    /// The world's recipes, which a removed furnace's experience reads, as the network has them
+    /// (CAL-197).
+    pub recipes: Shared<Recipes>? = none
     pub sequences: RandomSequences? = none
     pub world_seed: i64 = 0
     pub block_drops: bool = true
@@ -4001,9 +4009,10 @@ impl Level {
     }
 
     // `removeBlockEntity`: the block entity at `pos` in the chunk at `k` taken away, if it has one;
-    // with `effects`, what it holds dropped first, `preRemoveSideEffects`, which isn't yet, though
-    // where each of its empty slots' items would go is drawn, as vanilla's are (CAL-159).
-    fn remove_block_entity(mut self, k: i64, pos: BlockPos, effects: bool) {
+    // with `effects`, what it holds dropped first, `preRemoveSideEffects`, of the block `old` it
+    // was (CAL-197). Then `setRemoved`: a beacon's deactivation heard (D520), and a jukebox's song
+    // stopped for everyone, its level event 1011, as it's removed, whatever it held (CAL-197).
+    fn remove_block_entity(mut self, k: i64, pos: BlockPos, effects: bool, old: u32) {
         // A moving piston's goes with what it moves and its ticker (CAL-125), and a container's
         // with who had it open (CAL-144).
         _ = self.motions.remove(pos.pack())
@@ -4016,19 +4025,176 @@ impl Level {
         if not self.columns.block_entities[k].contains(pos) {
             return
         }
-        if effects and holds_anything(self.columns.block_entities[k][pos]) {
-            self.report(String("What a block entity holds dropped as it's removed, `preRemoveSideEffects`"))
-        } else if effects {
-            // `dropItemStack`'s place in the block for an empty stack, which it then doesn't drop.
-            for _ in 0..slots_dropped(self.columns.block_entities[k][pos]) * 3 {
-                _ = self.next_double()
+        if effects {
+            let saved = self.columns.block_entities[k][pos].copy()
+            self.pre_remove_side_effects(saved, pos, old)
+            self.columns.own_block_entities(k)
+            if not self.columns.block_entities[k].contains(pos) {
+                return
             }
         }
+        let removed = kind_of(self.columns.block_entities[k][pos]) ?? String()
         // `BeaconBlockEntity.setRemoved`: its deactivation heard, on or not (D520).
-        if (kind_of(self.columns.block_entities[k][pos]) ?? String()) == "minecraft:beacon" {
+        if removed == "minecraft:beacon" {
             self.play_sound_at(f64(pos.x) + 0.5, f64(pos.y) + 0.5, f64(pos.z) + 0.5, String("block.beacon.deactivate"), 1.0f32, 1.0f32)
         }
+        // `JukeboxBlockEntity.setRemoved`: its song stopped for everyone, with its game event,
+        // which waits for game events (CAL-197).
+        if removed == "minecraft:jukebox" {
+            self.level_event(1011, pos.x, pos.y, pos.z, 0)
+        }
         _ = self.columns.block_entities[k].remove(pos)
+    }
+
+    // `preRemoveSideEffects` of the block entity `saved` at `pos`, of the block `old` (CAL-197): a
+    // container's slots dropped in turn, `Containers.dropContents`, each drawing where its stack
+    // goes, empty or not, and its stack thrown out in parts, `dropItemStack`; a furnace's recipes'
+    // experience after, `getRecipesToAwardAndPopExperience`; a jukebox's disc popped out, its song
+    // stopped; a lectern's book dropped. A shulker box keeps its items. What isn't yet: a
+    // container's loot to come, which `getItem` makes first, `unpackLootTable`; a shrieking sculk
+    // shrieker's answer, `tryRespond`; and a creaking heart's creaking torn down.
+    fn pre_remove_side_effects(mut self, saved: Tag, pos: BlockPos, old: u32) {
+        let kind = kind_of(saved) ?? String()
+        let Tag.Compound(tags) = saved else return
+        if tags.contains("LootTable") {
+            self.report(String("The loot a removed container makes before it drops it, `unpackLootTable`"))
+            return
+        }
+        if kind == "minecraft:jukebox" {
+            self.pop_record(tags, pos, old)
+            return
+        }
+        if kind == "minecraft:lectern" {
+            self.drop_book(tags, pos, old)
+            return
+        }
+        if kind == "minecraft:sculk_shrieker" {
+            if let shared = self.env.copy() {
+                if shared.value.facts.get_bool(old, String("shrieking")) {
+                    self.report(String("A removed sculk shrieker's answer to its shriek, `tryRespond`"))
+                }
+            }
+            return
+        }
+        if kind == "minecraft:creaking_heart" {
+            if tags.contains("creaking") {
+                self.report(String("A removed creaking heart's creaking torn down, `removeProtector`"))
+            }
+            return
+        }
+        let n = slots_dropped(saved)
+        if n == 0 {
+            return
+        }
+        var by_slot = OpenHashMap<i32, Tag>()
+        if kind == "minecraft:decorated_pot" {
+            if tags.contains("item") {
+                by_slot.insert(0, tags["item"].copy())
+            }
+        } else if tags.contains("Items") {
+            if let Tag.List(items) = tags["Items"] {
+                for t in items {
+                    let Tag.Compound(m) = t else continue
+                    if not m.contains("Slot") {
+                        continue
+                    }
+                    let slot = (m["Slot"].number_int() ?? -1) & 255
+                    var stack = m.copy()
+                    _ = stack.remove("Slot")
+                    by_slot.insert(slot, Tag.Compound(stack))
+                }
+            }
+        }
+        for i in 0..n {
+            let stack: Tag? = if by_slot.contains(i) { some(by_slot[i].copy()) } else { none }
+            spill_stack(mut self, pos.x, pos.y, pos.z, stack)
+        }
+        if kind == "minecraft:furnace" or kind == "minecraft:blast_furnace" or kind == "minecraft:smoker" {
+            self.furnace_experience(tags, pos)
+        }
+    }
+
+    // `getRecipesToAwardAndPopExperience` of the furnace whose data is `tags` at `pos` (CAL-197): of
+    // each recipe it's used, `RecipesUsed`, that the world has, `createExperience`: its times
+    // used by its experience, the fraction one more where the level's random draws under it,
+    // awarded at the block's middle. Vanilla's map of them goes by its keys' identity hashes,
+    // so where it's used two or more, their order here is the one they were saved in.
+    fn furnace_experience(mut self, tags: JavaHashMap<String, Tag>, pos: BlockPos) {
+        if not tags.contains("RecipesUsed") {
+            return
+        }
+        let Tag.Compound(used) = tags["RecipesUsed"] else return
+        let book = self.recipes.copy() else return
+        for (id, times) in used {
+            let value = book.value.cooking_experience(id.copy()) else continue
+            let amount = f32.nearest(f64(times.number_int() ?? 0)) * value
+            let floored = f64(amount).floor()
+            var xp = i32.saturate(floored)
+            let fraction = amount - f32.nearest(floored)
+            if fraction != 0.0f32 and self.next_float() < fraction {
+                xp += 1
+            }
+            award_experience(mut self, f64(pos.x) + 0.5, f64(pos.y) + 0.5, f64(pos.z) + 0.5, xp)
+        }
+    }
+
+    // `JukeboxBlockEntity.popOutTheItem` of the jukebox whose data is `tags` at `pos`, the block
+    // `old` (CAL-197): its disc taken out, `setTheItem` of nothing, which stops its song if it
+    // plays; then the disc dropped half a block over its top's middle, a little off, the level's
+    // random drawing how far each way, with its default pickup delay; then `onSongChanged`.
+    fn pop_record(mut self, tags: JavaHashMap<String, Tag>, pos: BlockPos, old: u32) {
+        if not tags.contains("RecordItem") {
+            return
+        }
+        let record = tags["RecordItem"].copy()
+        if count_of(some(record.copy())) <= 0 {
+            return
+        }
+        let shared = self.env.copy() else return
+        let f = shared.value.facts.copy()
+        if let _ = playing_song(self, tags) {
+            match stop_song(f, mut self, old, pos.x, pos.y, pos.z) {
+                ok => {},
+                err(thrown) => self.report(thrown.message),
+            }
+        }
+        let dx = (self.next_float() - 0.5f32) * 0.7f32
+        let dz = (self.next_float() - 0.5f32) * 0.7f32
+        let x = f64(pos.x) + 0.5 + f64(dx)
+        let y = f64(pos.y) + 1.01
+        let z = f64(pos.z) + 0.5 + f64(dz)
+        self.add_dropped(x, y, z, record)
+        match song_changed(f, mut self, f.block(old), pos.x, pos.y, pos.z) {
+            ok => {},
+            err(thrown) => self.report(thrown.message),
+        }
+    }
+
+    // `LecternBlockEntity.preRemoveSideEffects` of the lectern whose data is `tags` at `pos`, the
+    // block `old` (CAL-197): where it has a book, the book dropped a block over it, a quarter
+    // toward its front, with its default pickup delay.
+    fn drop_book(mut self, tags: JavaHashMap<String, Tag>, pos: BlockPos, old: u32) {
+        let shared = self.env.copy() else return
+        let f = shared.value.facts.copy()
+        if not f.get_bool(old, String("has_book")) or not tags.contains("Book") {
+            return
+        }
+        var sx = 0
+        var sz = 0
+        if let n = f.get_name(old, String("facing")) {
+            if n == "north" {
+                sz = -1
+            } else if n == "south" {
+                sz = 1
+            } else if n == "west" {
+                sx = -1
+            } else if n == "east" {
+                sx = 1
+            }
+        }
+        let xo = 0.25f32 * f32.nearest(f64(sx))
+        let zo = 0.25f32 * f32.nearest(f64(sz))
+        self.add_dropped(f64(pos.x) + 0.5 + f64(xo), f64(pos.y + 1), f64(pos.z) + 0.5 + f64(zo), tags["Book"].copy())
     }
 
     // The block entity of `state`, set at `pos` in the chunk at `k`, as `setBlockState` gives it
@@ -6026,6 +6192,11 @@ impl DropLevel for Level {
         self.dropped_heard.push(self.events.len())
     }
 
+    fn add_spilled(mut self, x: f64, y: f64, z: f64, stack: own Tag, vx: f64, vy: f64, vz: f64) {
+        self.dropped.push(Dropped.Spilled(x, y, z, stack, vx, vy, vz))
+        self.dropped_heard.push(self.events.len())
+    }
+
     fn add_orb(mut self, x: f64, y: f64, z: f64, value: i32, pick: i32) {
         self.dropped.push(Dropped.Orb(x, y, z, value, pick))
         self.dropped_heard.push(self.events.len())
@@ -6110,7 +6281,7 @@ impl BlockLevel for Level {
         // The block entity of the block replaced goes, unless the block set keeps it, what it holds
         // dropping first unless `UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS` (CAL-115).
         if f.block(old) != block and f.has_block_entity(old) and not keeps_block_entity(f, old, state) {
-            self.remove_block_entity(k, BlockPos { x: x, y: y, z: z }, flags & UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS == 0)
+            self.remove_block_entity(k, BlockPos { x: x, y: y, z: z }, flags & UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS == 0, old)
         }
         if (f.block(old) != block or f.is_a(block, "BaseRailBlock")) and (flags & UPDATE_NEIGHBORS != 0 or moved) {
             match after_removal(shared.value, mut self, old, x, y, z, moved) {
@@ -6594,7 +6765,7 @@ impl BlockLevel for Level {
 
     fn remove_block_entity_at(mut self, x: i32, y: i32, z: i32) {
         let pos = BlockPos { x: x, y: y, z: z }
-        self.remove_block_entity(pos.chunk().pack(), pos, false)
+        self.remove_block_entity(pos.chunk().pack(), pos, false, 0)
     }
 
     fn in_border(self, x: i32, z: i32) -> bool {
