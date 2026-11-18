@@ -92,6 +92,8 @@ cases:
   - session:phantoms/*/commands
   - session:nightmares/*/commands
   - session:gamerules/*/commands
+  - session:guardians/*/commands
+  - session:elders/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
