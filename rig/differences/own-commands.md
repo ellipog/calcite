@@ -111,6 +111,7 @@ cases:
   - session:magmacubes/*/commands
   - session:blazes/*/commands
   - session:ghasts/*/commands
+  - session:zpiglins/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
