@@ -85,6 +85,8 @@ cases:
   - session:donkeychest/*/commands
   - session:flowered/*/commands
   - session:requeue/*/commands
+  - session:bogged/*/commands
+  - session:bogshear/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
