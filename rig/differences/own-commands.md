@@ -97,6 +97,8 @@ cases:
   - session:vindicators/*/commands
   - session:vindicated/*/commands
   - session:leaders/*/commands
+  - session:pillagers/*/commands
+  - session:pillaged/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
