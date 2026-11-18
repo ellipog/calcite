@@ -90,6 +90,8 @@ cases:
   - session:withered/*/commands
   - session:caves/*/commands
   - session:phantoms/*/commands
+  - session:nightmares/*/commands
+  - session:gamerules/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
