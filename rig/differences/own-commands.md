@@ -87,6 +87,7 @@ cases:
   - session:requeue/*/commands
   - session:bogged/*/commands
   - session:bogshear/*/commands
+  - session:withered/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
