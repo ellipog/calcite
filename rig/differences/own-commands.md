@@ -94,6 +94,9 @@ cases:
   - session:gamerules/*/commands
   - session:guardians/*/commands
   - session:elders/*/commands
+  - session:vindicators/*/commands
+  - session:vindicated/*/commands
+  - session:leaders/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
