@@ -110,6 +110,7 @@ cases:
   - session:multishot/*/commands
   - session:magmacubes/*/commands
   - session:blazes/*/commands
+  - session:ghasts/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
