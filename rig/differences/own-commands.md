@@ -101,6 +101,8 @@ cases:
   - session:pillaged/*/commands
   - session:ravagers/*/commands
   - session:ravaged/*/commands
+  - session:vexes/*/commands
+  - session:vexbound/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
