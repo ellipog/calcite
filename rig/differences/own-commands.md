@@ -105,6 +105,7 @@ cases:
   - session:vexbound/*/commands
   - session:evokers/*/commands
   - session:evoked/*/commands
+  - session:tridents/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
