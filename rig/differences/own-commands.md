@@ -89,6 +89,7 @@ cases:
   - session:bogshear/*/commands
   - session:withered/*/commands
   - session:caves/*/commands
+  - session:phantoms/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
