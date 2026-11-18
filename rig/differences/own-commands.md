@@ -107,6 +107,7 @@ cases:
   - session:evoked/*/commands
   - session:tridents/*/commands
   - session:piercing/*/commands
+  - session:multishot/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
