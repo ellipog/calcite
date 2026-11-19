@@ -116,6 +116,7 @@ cases:
   - session:shulkerbullets/*/commands
   - session:hoglins/*/commands
   - session:zoglins/*/commands
+  - session:brutes/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
