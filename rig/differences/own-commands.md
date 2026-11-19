@@ -129,6 +129,10 @@ cases:
   - session:snowballs/*/commands
   - session:snow-golems/*/commands
   - session:snow-golem-shear/*/commands
+  - session:wolves/*/commands
+  - session:wolf-beg/*/commands
+  - session:wolf-anger/*/commands
+  - session:wolf-shake/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
