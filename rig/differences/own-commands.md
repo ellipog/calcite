@@ -133,6 +133,7 @@ cases:
   - session:wolf-beg/*/commands
   - session:wolf-anger/*/commands
   - session:wolf-shake/*/commands
+  - session:wolf-tame/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
