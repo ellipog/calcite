@@ -122,6 +122,7 @@ cases:
   - session:piglin-crossbows/*/commands
   - session:piglin-spears/*/commands
   - session:piglin-hunt/*/commands
+  - session:piglin-ride/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
