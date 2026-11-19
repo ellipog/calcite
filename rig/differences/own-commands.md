@@ -126,6 +126,7 @@ cases:
   - session:golems/*/commands
   - session:golem-repair/*/commands
   - session:golem-call/*/commands
+  - session:snowballs/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
