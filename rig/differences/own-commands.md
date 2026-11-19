@@ -125,6 +125,7 @@ cases:
   - session:piglin-ride/*/commands
   - session:golems/*/commands
   - session:golem-repair/*/commands
+  - session:golem-call/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
