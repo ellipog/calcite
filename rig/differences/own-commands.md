@@ -123,6 +123,8 @@ cases:
   - session:piglin-spears/*/commands
   - session:piglin-hunt/*/commands
   - session:piglin-ride/*/commands
+  - session:golems/*/commands
+  - session:golem-repair/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
