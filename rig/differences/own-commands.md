@@ -121,6 +121,7 @@ cases:
   - session:barter/*/commands
   - session:piglin-crossbows/*/commands
   - session:piglin-spears/*/commands
+  - session:piglin-hunt/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
