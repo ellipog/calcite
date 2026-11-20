@@ -139,6 +139,9 @@ cases:
   - session:wolf-armor/*/commands
   - session:cats/*/commands
   - session:cat-tame/*/commands
+  - session:cat-blocks/*/commands
+  - session:cat-lie/*/commands
+  - session:cat-breed/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
