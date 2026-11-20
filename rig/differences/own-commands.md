@@ -137,6 +137,8 @@ cases:
   - session:wolf-defend/*/commands
   - session:wolf-breed/*/commands
   - session:wolf-armor/*/commands
+  - session:cats/*/commands
+  - session:cat-tame/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
