@@ -9,6 +9,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.util.RandomSource;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.gamerules.GameRules;
 import net.minecraft.world.level.levelgen.RandomSupport;
 
 /**
@@ -22,6 +23,8 @@ public final class Levels {
     private static long reseedAt = -1;
     private static final Map<String, Long> reseedIn = new HashMap<>();
     private static final Set<String> reseeded = new HashSet<>();
+    // The random tick speed set as the first level's seeded again, or -1 for none (CAL-301).
+    private static int ticksAfter = -1;
     // ChunkMap's level, which saveMillis reads the game time of.
     private static Field chunkLevel;
 
@@ -34,6 +37,10 @@ public final class Levels {
 
     static void reseedAt(String name, long time) {
         reseedIn.put(name, time);
+    }
+
+    static void ticksAfter(int speed) {
+        ticksAfter = speed;
     }
 
     /**
@@ -83,6 +90,12 @@ public final class Levels {
         }
         if (reseeded.add(name)) {
             seed(level, name);
+            // Random ticks on from here, at the speed the rig wants, where they were off till
+            // the randoms line up, as they'd change blocks at times that differ from run to run
+            // (CAL-301); set once, by the first level seeded again, as the rule's the server's.
+            if (ticksAfter >= 0 && level.getGameRules().get(GameRules.RANDOM_TICK_SPEED) != ticksAfter) {
+                level.getGameRules().set(GameRules.RANDOM_TICK_SPEED, ticksAfter, level.getServer());
+            }
         }
     }
 
