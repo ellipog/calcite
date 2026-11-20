@@ -160,6 +160,13 @@ cases:
   - session:polar-cub/*/commands
   - session:polar-anger/*/commands
   - session:polar-hit/*/commands
+  - session:foxes/*/commands
+  - session:fox-sleep/*/commands
+  - session:fox-hunt/*/commands
+  - session:fox-berries/*/commands
+  - session:fox-items/*/commands
+  - session:fox-flee/*/commands
+  - session:fox-breed/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
