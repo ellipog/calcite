@@ -146,6 +146,9 @@ cases:
   - session:village-cats/*/commands
   - session:ocelots/*/commands
   - session:ocelot-trust/*/commands
+  - session:creeper-cats/*/commands
+  - session:phantom-cats/*/commands
+  - session:spider-armadillo/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
