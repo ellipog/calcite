@@ -142,6 +142,7 @@ cases:
   - session:cat-blocks/*/commands
   - session:cat-lie/*/commands
   - session:cat-breed/*/commands
+  - session:cat-relax/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
