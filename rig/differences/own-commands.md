@@ -177,6 +177,9 @@ cases:
   - session:panda-babies/*/commands
   - session:panda-breed/*/commands
   - session:panda-hurt/*/commands
+  - session:parrots/*/commands
+  - session:parrot-tame/*/commands
+  - session:parrot-shoulder/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
