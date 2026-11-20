@@ -150,6 +150,12 @@ cases:
   - session:phantom-cats/*/commands
   - session:spider-armadillo/*/commands
   - session:withered-piglins/*/commands
+  - session:rabbits/*/commands
+  - session:rabbit-breed/*/commands
+  - session:rabbit-garden/*/commands
+  - session:killer-bunny/*/commands
+  - session:rabbit-wolf/*/commands
+  - session:rabbit-husk/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
