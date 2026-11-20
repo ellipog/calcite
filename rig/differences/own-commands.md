@@ -156,6 +156,10 @@ cases:
   - session:killer-bunny/*/commands
   - session:rabbit-wolf/*/commands
   - session:rabbit-husk/*/commands
+  - session:polar-bears/*/commands
+  - session:polar-cub/*/commands
+  - session:polar-anger/*/commands
+  - session:polar-hit/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
