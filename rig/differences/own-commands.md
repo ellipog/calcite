@@ -167,6 +167,11 @@ cases:
   - session:fox-items/*/commands
   - session:fox-flee/*/commands
   - session:fox-breed/*/commands
+  - session:llamas/*/commands
+  - session:llama-spit/*/commands
+  - session:llama-wolf/*/commands
+  - session:llama-caravan/*/commands
+  - session:llama-chest/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
