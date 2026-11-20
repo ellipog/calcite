@@ -172,6 +172,11 @@ cases:
   - session:llama-wolf/*/commands
   - session:llama-caravan/*/commands
   - session:llama-chest/*/commands
+  - session:pandas/*/commands
+  - session:panda-eat/*/commands
+  - session:panda-babies/*/commands
+  - session:panda-breed/*/commands
+  - session:panda-hurt/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
