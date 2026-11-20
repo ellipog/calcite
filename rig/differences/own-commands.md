@@ -143,6 +143,7 @@ cases:
   - session:cat-lie/*/commands
   - session:cat-breed/*/commands
   - session:cat-relax/*/commands
+  - session:village-cats/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
