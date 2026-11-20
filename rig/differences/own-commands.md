@@ -149,6 +149,7 @@ cases:
   - session:creeper-cats/*/commands
   - session:phantom-cats/*/commands
   - session:spider-armadillo/*/commands
+  - session:withered-piglins/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
