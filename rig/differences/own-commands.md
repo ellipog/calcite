@@ -144,6 +144,8 @@ cases:
   - session:cat-breed/*/commands
   - session:cat-relax/*/commands
   - session:village-cats/*/commands
+  - session:ocelots/*/commands
+  - session:ocelot-trust/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
