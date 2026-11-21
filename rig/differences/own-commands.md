@@ -180,6 +180,10 @@ cases:
   - session:parrots/*/commands
   - session:parrot-tame/*/commands
   - session:parrot-shoulder/*/commands
+  - session:turtles/*/commands
+  - session:turtle-eggs/*/commands
+  - session:turtle-breed/*/commands
+  - session:zombie-eggs/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
