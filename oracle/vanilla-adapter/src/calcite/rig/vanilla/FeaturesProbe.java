@@ -140,11 +140,11 @@ final class FeaturesProbe implements Probe {
 
     @Override
     public int version() {
-        return 8;
+        return 9;
     }
 
-    /** The types of entity a `structured` op writes whole, as Calcite makes them (CAL-87, CAL-270, CAL-200), not a drowned, whose attribute bonuses `Zombie.handleAttributes` draws from its own random. */
-    private static final Set<String> WHOLE = Set.of("minecraft:witch", "minecraft:villager", "minecraft:zombie_villager", "minecraft:cow", "minecraft:pig", "minecraft:sheep", "minecraft:chicken", "minecraft:horse", "minecraft:donkey", "minecraft:chest_minecart", "minecraft:item_frame", "minecraft:elder_guardian", "minecraft:evoker", "minecraft:vindicator", "minecraft:shulker");
+    /** The types of entity a `structured` op writes whole, as Calcite makes them (CAL-87, CAL-270, CAL-200, CAL-201), not a drowned, whose attribute bonuses `Zombie.handleAttributes` draws from its own random. */
+    private static final Set<String> WHOLE = Set.of("minecraft:witch", "minecraft:villager", "minecraft:zombie_villager", "minecraft:cow", "minecraft:pig", "minecraft:sheep", "minecraft:chicken", "minecraft:horse", "minecraft:donkey", "minecraft:chest_minecart", "minecraft:item_frame", "minecraft:elder_guardian", "minecraft:evoker", "minecraft:vindicator", "minecraft:shulker", "minecraft:iron_golem", "minecraft:cat");
 
     /** A saved list of attributes in order of their IDs, as the attribute map keeps no order two runs share. */
     private static net.minecraft.nbt.ListTag sortedAttributes(net.minecraft.nbt.ListTag list) {
