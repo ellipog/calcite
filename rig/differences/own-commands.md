@@ -184,6 +184,7 @@ cases:
   - session:turtle-eggs/*/commands
   - session:turtle-breed/*/commands
   - session:zombie-eggs/*/commands
+  - session:bats/*/commands
 ---
 
 # Game masters and owners get Calcite's own commands too
