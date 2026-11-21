@@ -184,6 +184,7 @@ cases:
   - session:turtle-eggs/*/commands
   - session:turtle-breed/*/commands
   - session:zombie-eggs/*/commands
+  - session:entity-nbt/*/commands
   - session:entity-items/*/commands
   - session:entity-damage/*/commands
   - session:entity-tags/*/commands
