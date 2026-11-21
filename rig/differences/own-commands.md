@@ -184,6 +184,7 @@ cases:
   - session:turtle-eggs/*/commands
   - session:turtle-breed/*/commands
   - session:zombie-eggs/*/commands
+  - session:tropical-fish/*/commands
   - session:salmon/*/commands
   - session:bats/*/commands
 ---
