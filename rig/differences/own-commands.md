@@ -184,6 +184,7 @@ cases:
   - session:turtle-eggs/*/commands
   - session:turtle-breed/*/commands
   - session:zombie-eggs/*/commands
+  - session:golem-build/*/commands
   - session:dolphin/*/commands
   - session:squid/*/commands
   - session:pufferfish/*/commands
