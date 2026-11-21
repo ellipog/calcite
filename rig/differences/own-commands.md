@@ -184,6 +184,7 @@ cases:
   - session:turtle-eggs/*/commands
   - session:turtle-breed/*/commands
   - session:zombie-eggs/*/commands
+  - session:entity-tp/*/commands
   - session:entity-commands/*/commands
   - session:selectors/*/commands
   - session:golem-build/*/commands
