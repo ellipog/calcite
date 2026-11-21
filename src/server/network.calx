@@ -58,7 +58,7 @@ import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done, Loaded}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
-import server.commands.{BossBarAction, Condition, DataAction, ForceLoadAction, DataPackAction, PackPlace, ItemAction, ItemFrom, ItemTarget, SlotsGiven, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, FunctionArgs, ScheduleAction, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
+import server.commands.{BossBarAction, Condition, DamageFrom, DataAction, ForceLoadAction, DataPackAction, PackPlace, ItemAction, ItemFrom, ItemTarget, SlotsGiven, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, FunctionArgs, ScheduleAction, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree, help_node, parse_in, signable_in, tree, usage}
 import server.configuration.{Configuration, update_tags}
 import server.layout.{Layout, Placed}
 import server.level.{ChunkPacket, Dropped, EMPTY_TICKS, Heard, Level, LevelEvent, LevelParticles, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
@@ -93,7 +93,7 @@ import world.clocks.{saved_id as clocks_id}
 import world.chunk.{MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES, OCEAN_FLOOR, WORLD_SURFACE}
 import world.brain.{Near, PLAYER}
 import world.collision.{Aabb, CollisionBlocks, CollisionStates, eye_height, pose_box, pose_height, pose_size}
-import world.entities.{Entities, FreeChicken, Picking, NO_CONTROLS, PearlOwner, PortalDue, Reached, Steered, Unseat}
+import world.entities.{Entities, FreeChicken, Picking, NO_CONTROLS, PearlOwner, PortalDue, Reached, Steered, Unseat, tag_change}
 import world.body.{Body, BodyFacts, EntitySound, HOSTILE_SOURCE, NEUTRAL_SOURCE, PLAYERS_SOURCE, across_enough, bool_or, insecure_uuid, on_pos_of, push_between, splash_draws, support_of, uuid_of, uuid_tag}
 import world.currents.{fluids_at, push as current_push}
 import world.damage.{BYPASSES_ARMOR, BYPASSES_COOLDOWN, BYPASSES_EFFECTS, BYPASSES_ENCHANTMENTS, BYPASSES_INVULNERABILITY, BYPASSES_RESISTANCE, DAMAGES_HELMET, Damage, DamageTypes, IS_FIRE, NO_ANGER, NO_WOLF_RETALIATION, NO_IMPACT, NO_KNOCKBACK, resists}
@@ -15692,7 +15692,8 @@ impl Network {
             }
             if h.full and all.trackers.contains(target) {
                 let seen = all.trackers[target].seen_by.copy()
-                let at: Point? = none
+                // `sourcePositionRaw`: the place the damage was made with, where it was (CAL-165).
+                let at: Point? = if source.raw { match source.at { some((x, y, z)) => some(Point { x: x, y: y, z: z }), none => none } } else { none }
                 let packet = ClientboundDamageEvent { entity_id: target, source_type: source.kind, source_cause: source.cause + 1, source_direct: source.direct + 1, source_position: at }
                 self.send_to_seen(seen, encode_play(packet))
             }
@@ -30787,6 +30788,18 @@ impl Network {
                     err(f) => done = some(f),
                 }
             },
+            Parsed.Tag(targets, name, add) => {
+                match self.tag_command(source, targets, name, add) {
+                    ok(r) => result = r,
+                    err(f) => done = some(f),
+                }
+            },
+            Parsed.Damage(target, amount, kind, from) => {
+                match self.damage_command(source, target, amount, kind, from) {
+                    ok(r) => result = r,
+                    err(f) => done = some(f),
+                }
+            },
             Parsed.SetBlock(at, block, mode) => {
                 match self.setblock_command(source, at, block, mode) {
                     ok(r) => result = r,
@@ -31644,6 +31657,10 @@ impl Network {
                     tags.push(t.name.copy())
                 }
                 out.push(ResourceNames { registry: String("minecraft:worldgen/biome"), names: r.value.synced[at].entries.copy(), tags: tags })
+            }
+            // The damage types, for `damage` (CAL-165).
+            if let at = r.value.find(String("damage_type")) {
+                out.push(ResourceNames { registry: String("minecraft:damage_type"), names: r.value.synced[at].entries.copy() })
             }
         }
         return out
@@ -35486,6 +35503,281 @@ impl Network {
         }
         let all = self.gone_now(es, d, id)
         self.put_entities(d, all)
+    }
+
+    // `damage`, `DamageCommand` (CAL-165): the one entity named hurt, `hurtServer`, by `amount` of
+    // a damage of the type named, `generic` where none is, `getResource`, from the place given,
+    // `DamageSource(type, position)`, which it's sent as coming from, or dealt by the entity given
+    // and caused by the cause given, or by that entity where none is, `DamageSource(type, direct,
+    // causing)`, where the dealer is, each as an arrow's owner is, `damage_party`. Then the source
+    // told, and the operators, `commands.damage.success`, of the amount and its display name; or,
+    // where it wasn't hurt, `commands.damage.invulnerable`. It gives 1. Calcite says it can't yet
+    // hurt so an ender dragon, an armor stand or an entity that isn't living.
+    fn damage_command(mut self, source: Source, target: own Selector, amount: f32, kind: own Identifier?, from: own DamageFrom) -> i32 ! Failure {
+        let found = try self.entities_picked(source, target)
+        if found.is_empty() {
+            fail Failure.alone(Component.translatable("argument.entity.notfound.entity", []))
+        }
+        let victim = found[0]
+        let lf = self.living_facts.take() else fail Failure.alone(Component.translatable("commands.damage.invulnerable", []))
+        let type_id = match kind {
+            some(named) => lf.damage.id_named(named.to_string()),
+            none => lf.damage.id("generic"),
+        }
+        self.living_facts = some(lf)
+        if type_id < 0 {
+            let named = match kind {
+                some(n) => n.to_string(),
+                none => String("minecraft:generic"),
+            }
+            fail Failure.alone(Component.translatable("argument.resource.not_found", [Component.literal(named), Component.literal("minecraft:damage_type")]))
+        }
+        var dealer: Picked? = none
+        var causer: Picked? = none
+        var at: (f64, f64, f64)? = none
+        match from {
+            DamageFrom.Nowhere => {},
+            DamageFrom.At(c) => at = some(self.point_of(source, c)),
+            DamageFrom.By(s, cause) => {
+                let ds = try self.entities_picked(source, s)
+                if ds.is_empty() {
+                    fail Failure.alone(Component.translatable("argument.entity.notfound.entity", []))
+                }
+                dealer = some(ds[0])
+                causer = some(ds[0])
+                if let cs = cause {
+                    let cf = try self.entities_picked(source, cs)
+                    if cf.is_empty() {
+                        fail Failure.alone(Component.translatable("argument.entity.notfound.entity", []))
+                    }
+                    causer = some(cf[0])
+                }
+            },
+        }
+        let td = match victim {
+            Picked.Player(slot) => match self.connections[slot] {
+                some(c) => c.player.dim,
+                none => source.dim,
+            },
+            Picked.Entity(d, _) => d,
+        }
+        var dmg = Damage { kind: type_id }
+        var blame = Blame()
+        var attacker: LootEntity? = none
+        var projectile: LootEntity? = none
+        if let p = at {
+            dmg.at = some(p)
+            dmg.raw = true
+        }
+        if let dp = dealer {
+            let ds = self.damage_party(td, dp)
+            dmg.direct = ds.id
+            if let pose = self.picked_pose(dp) {
+                dmg.at = some((pose.x, pose.y, pose.z))
+            }
+            blame.direct = ds.name.copy()
+            let cp = causer ?? dp
+            let one_party = cp == dp
+            if not one_party {
+                projectile = ds.loot.copy()
+            }
+            let cs = if one_party { ds } else { self.damage_party(td, cp) }
+            dmg.cause = cs.id
+            dmg.player = cs.player
+            dmg.creative = cs.creative
+            dmg.living_cause = cs.mob
+            dmg.mob = cs.living
+            blame.cause = cs.name.copy()
+            blame.weapon = cs.weapon.copy()
+            attacker = cs.loot.copy()
+        }
+        var hurt = false
+        match victim {
+            Picked.Player(slot) => {
+                var taken: Connection? = none
+                if slot < self.connections.len() {
+                    taken = self.connections[slot].take()
+                }
+                if let c = taken {
+                    var con = c
+                    if let facts = self.living_facts.take() {
+                        hurt = self.hurt_player_by(mut con, facts, dmg, amount, blame)
+                        self.living_facts = some(facts)
+                    }
+                    self.connections[slot] = some(con)
+                }
+            },
+            Picked.Entity(d, id) => {
+                let es = self.take_entities(d)
+                if not es.list.is_mob(id) or es.list.mob(id).species == ENDER_DRAGON {
+                    self.put_entities(d, es)
+                    fail Failure.alone(Component.literal("Calcite can't damage an ender dragon, an armor stand or an entity that isn't living by a command yet"))
+                }
+                let (back, h, _) = self.shoot_mob(es, d, id, dmg, amount, attacker, projectile, false, false, none)
+                self.put_entities(d, back)
+                hurt = h
+            },
+        }
+        if not hurt {
+            fail Failure.alone(Component.translatable("commands.damage.invulnerable", []))
+        }
+        let name = self.picked_name(victim)
+        self.success(source, Component.translatable_args("commands.damage.success", [Argument.Number(Tag.Float(amount)), Argument.Text(name)]), true)
+        return 1
+    }
+
+    // What `damage` names as dealing or causing its damage, `p`, as the level `d` of the one it
+    // hurts finds it (CAL-165): a player there, or a mob or armor stand, as an arrow's owner is,
+    // `shooter_of`; else what was named, by its ID and display name.
+    fn damage_party(mut self, d: usize, p: Picked) -> Shooter {
+        var uuid: (i64, i64)? = none
+        var id = -1
+        var name: Component? = none
+        match p {
+            Picked.Player(slot) => {
+                if slot < self.connections.len() {
+                    if let c = self.connections[slot] {
+                        id = c.player.entity_id
+                        if let pr = c.profile {
+                            uuid = some((pr.id.most, pr.id.least))
+                        }
+                    }
+                }
+                name = some(self.name_of(slot))
+            },
+            Picked.Entity(ed, eid) => {
+                let es = self.take_entities(ed)
+                if let k = es.list.picking(eid) {
+                    uuid = some(k.uuid)
+                }
+                self.put_entities(ed, es)
+                id = eid
+                name = some(self.picked_display_name(ed, eid))
+            },
+        }
+        let es = self.take_entities(d)
+        let found = self.shooter_of(d, es.list, uuid)
+        self.put_entities(d, es)
+        return found ?? Shooter { id: id, name: name }
+    }
+
+    // `tag`, `TagCommand` (CAL-165): each entity named, a player or another, given the tag `name`,
+    // `addTag`, where `add`, or it taken off, `removeTag`, `tag_change`; then the source told, and
+    // the operators, `CommandResponseTracker.sendFeedback` of those it changed, of the one where
+    // there's one, else of how many, which fails where it changed none; it gives how many it
+    // changed. With no tag, their tags listed, those of all of them together, sorted, green,
+    // `formatList`: the source alone told of the one with any where there's one, else of how many
+    // have any, none where none do, as `NON_ZERO` counts them; it gives how many tags.
+    fn tag_command(mut self, source: Source, targets: own Selector, name: own String?, add: bool) -> i32 ! Failure {
+        let who = try self.entities_picked(source, targets)
+        if who.is_empty() {
+            fail Failure.alone(Component.translatable("argument.entity.notfound.entity", []))
+        }
+        if let n = name {
+            var changed = 0
+            var only: Picked? = none
+            for p in who {
+                var did = false
+                match p {
+                    Picked.Player(slot) => did = self.change_player_tag(slot, n.copy(), add),
+                    Picked.Entity(d, id) => {
+                        var es = self.take_entities(d)
+                        did = es.list.change_tag(id, n.copy(), add)
+                        self.put_entities(d, es)
+                    },
+                }
+                if did {
+                    changed += 1
+                    only = if changed == 1 { some(p) } else { none }
+                }
+            }
+            let (verb, failed) = if add { ("add", "commands.tag.add.failed") } else { ("remove", "commands.tag.remove.failed") }
+            if changed == 0 {
+                fail Failure.alone(Component.translatable(failed, []))
+            }
+            let message = match only {
+                some(p) => Component.translatable("commands.tag.{verb}.success.single", [Component.literal(n.copy()), self.picked_name(p)]),
+                none => Component.translatable_args("commands.tag.{verb}.success.multiple", [named_text(n.copy()), Argument.Number(Tag.Int(changed))]),
+            }
+            self.success(source, message, true)
+            return changed
+        }
+        var names = List<String>()
+        var with_any = 0
+        var only: Picked? = none
+        for p in who {
+            let tags = match p {
+                Picked.Player(slot) => match self.connections[slot] {
+                    some(c) => tags_of(c),
+                    none => List<String>(),
+                },
+                Picked.Entity(d, id) => {
+                    let es = self.take_entities(d)
+                    let seen = es.list.picking(id)
+                    self.put_entities(d, es)
+                    match seen {
+                        some(k) => k.tags.copy(),
+                        none => List<String>(),
+                    }
+                },
+            }
+            for t in tags {
+                if not names.contains(t) {
+                    names.push(t.copy())
+                }
+            }
+            if not tags.is_empty() {
+                with_any += 1
+                only = if with_any == 1 { some(p) } else { none }
+            }
+        }
+        names.sort()
+        var shown = List<Component>()
+        for t in names {
+            shown.push(Component.literal(t.copy()).colored("green"))
+        }
+        let count = i32.wrap(names.len())
+        let message = if names.is_empty() {
+            match only {
+                some(p) => Component.translatable("commands.tag.list.single.empty", [self.picked_name(p)]),
+                none => Component.translatable_args("commands.tag.list.multiple.empty", [Argument.Number(Tag.Int(with_any))]),
+            }
+        } else {
+            match only {
+                some(p) => Component.translatable_args("commands.tag.list.single.success", [Argument.Text(self.picked_name(p)), Argument.Number(Tag.Int(count)), Argument.Text(format_list(shown))]),
+                none => Component.translatable_args("commands.tag.list.multiple.success", [Argument.Number(Tag.Int(with_any)), Argument.Number(Tag.Int(count)), Argument.Text(format_list(shown))]),
+            }
+        }
+        self.success(source, message, false)
+        return count
+    }
+
+    // `addTag` or `removeTag` of the player in `slot` (CAL-165), by `tag_change`, on their data as
+    // it was read as they joined, which their saves keep, or, for a player new to the world, made
+    // as their saves make it then; whether it changed.
+    fn change_player_tag(mut self, slot: usize, name: String, add: bool) -> bool {
+        if slot >= self.connections.len() {
+            return false
+        }
+        var con = self.connections[slot].take() else return false
+        var data = JavaHashMap<String, Tag>()
+        if let kept = con.player.data {
+            data = kept.copy()
+        } else if let p = con.profile {
+            data.insert(String("DataVersion"), Tag.Int(DATA_VERSION))
+            data.insert(String("UUID"), Tag.IntArray(p.id.ints()))
+        }
+        let saved: Tag? = if data.contains("Tags") { some(data["Tags"].copy()) } else { none }
+        let (did, changed) = tag_change(saved, name, add)
+        if did {
+            match changed {
+                some(t) => data.insert(String("Tags"), t),
+                none => _ = data.remove("Tags"),
+            }
+            con.player.data = some(data)
+        }
+        self.connections[slot] = some(con)
+        return did
     }
 
     // `effect give`, `EffectCommands.giveEffect` (D675): to each named that's living, a player,
