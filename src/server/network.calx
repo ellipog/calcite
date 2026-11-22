@@ -147,7 +147,7 @@ import world.level_writer.{UPDATE_LIMIT}
 import world.pistons.{check_if_extend}
 import world.placing.{PlaceFacts, Placement, bucket_stack, can_be_replaced, component_of, has_components, placement_state, stack_item}
 import world.attributes.{Attributes, Modifier, Snapshot, attribute_id, broken, equip, operation_names, slot_names, sprint, stack_modifiers, unworn, update_player}
-import world.entity_data.{ABSORPTION, PARROT_LEFT, PARROT_RIGHT, AIR_SUPPLY, FALL_FLYING, CUSTOM_NAME, ARROW_COUNT, STINGER_COUNT, ITEM_STACK, THROWN_ITEM, LIVING_FLAGS, FALL_FLYING_FLAG, ON_FIRE_FLAG, TICKS_FROZEN, CROUCHING, CROUCHING_FLAG, EntityData, HEALTH, INVISIBLE_FLAG, MAIN_HAND, MODE_CUSTOMISATION, POSE_ID, SCORE, SHARED_FLAGS, SILENT, SLEEPING, SLEEPING_POS, SPRINTING_FLAG, STANDING, SWIMMING, SWIMMING_FLAG, Value, player_data}
+import world.entity_data.{ABSORPTION, PARROT_LEFT, PARROT_RIGHT, AIR_SUPPLY, FALL_FLYING, CUSTOM_NAME, ARROW_COUNT, STINGER_COUNT, ITEM_STACK, THROWN_ITEM, LIVING_FLAGS, FALL_FLYING_FLAG, ON_FIRE_FLAG, TICKS_FROZEN, CROUCHING, CROUCHING_FLAG, EntityData, HEALTH, INVISIBLE_FLAG, MAIN_HAND, MODE_CUSTOMISATION, POSE_ID, SCORE, SHARED_FLAGS, SILENT, SLEEPING, SLEEPING_POS, SPIN_ATTACK, SPRINTING_FLAG, STANDING, SWIMMING, SWIMMING_FLAG, Value, player_data}
 import world.player_status.{Status, heal, read_status, set_health, tick_food, tick_regeneration, write_status}
 import world.digging.{ABORT_DESTROY_BLOCK, ACTIONS, CHANGE_DESTROY_DIRECTION, DESTROY_PROGRESS, DESTROY_PROGRESS_SOUND, DROP_ALL_ITEMS, DROP_ITEM, Digging, RELEASE_USE_ITEM, STAB, START_DESTROY_BLOCK, STOP_DESTROY_BLOCK, SWAP_ITEM_WITH_OFFHAND, attack, break_block, can_destroy, destroy_progress, durability_change, entity_in_reach, eye_in_water, game_master, has_correct_tool, in_reach, java_int, within_range, may_break_in_adventure, may_use_in_adventure, mining_damage, player_destroy, shrunk, emptied, with_damage, enchanted_value, is_damaged, mends_in, value_effect}
 import world.block_level.{BeaconPulse, Breaker, Released, SOUND_BLOCKS, destroy_block as level_destroy_block, remove_block, update_output_signal}
@@ -656,6 +656,12 @@ struct Player {
     sync_velocity: bool = false
     horizontal_collision: bool = false
     vertical_collision: bool = false
+    // Their riptide's spin, `autoSpinAttackTicks`, `autoSpinAttackDmg` and
+    // `autoSpinAttackItemStack` (CAL-214): the ticks left of it, what it'd hurt by, and the
+    // trident it's of; never saved.
+    spin_ticks: i32 = 0
+    spin_damage: f32 = 0.0f32
+    spin_item: Tag? = none
     vertical_below: bool = false
     body: Living? = none
     damage_cooldown: i32 = 0
@@ -21124,9 +21130,10 @@ impl Network {
 
     // What the effects `name` of the enchantments on `weapon` make of `start` (CAL-200), as
     // `EnchantmentHelper`'s item-filtered and entity-filtered values run them, `getPiercingCount`
-    // and `processProjectileSpread`: each in its enchantment's order at its level. One that asks
-    // of the ammo or the shooter, `requirements`, which none of vanilla's do, is said missing and
-    // left out.
+    // and `processProjectileSpread`: each in its enchantment's order at its level, a list of
+    // conditional effects or one effect alone, as `getTridentSpinAttackStrength` reads riptide's
+    // (CAL-214). One that asks of the ammo or the shooter, `requirements`, which none of vanilla's
+    // do, is said missing and left out.
     fn weapon_value(mut self, d: usize, weapon: Tag, name: str, start: f32) -> f32 {
         let enchanted = match self.items {
             some(codecs) => codecs.enchantments(weapon),
@@ -21140,6 +21147,12 @@ impl Network {
                 continue
             }
             let Tag.Compound(effects) = e["effects"] else continue
+            // A value effect of its own, as `trident_spin_attack_strength` is, without
+            // conditions (CAL-214).
+            if let Tag.Compound(one) = effects[name] {
+                count = value_effect(Tag.Compound(one.copy()), level, count, mut unasked)
+                continue
+            }
             let Tag.List(entries) = effects[name] else continue
             for piercing in entries {
                 let Tag.Compound(c) = piercing else continue
@@ -23350,10 +23363,12 @@ impl Network {
             if con.player.effects.has(SLOW_FALLING) or con.player.effects.has(LEVITATION) {
                 self.reset_fall(mut con)
             }
+            let travel_box = pose_box(con.player.entity_data.number(POSE_ID), con.player.x, con.player.y, con.player.z)
             self.player_travel(mut con)
             self.player_steps(mut con)
             self.player_freezing(mut con)
             _ = con.player.attributes.instance(attribute_id(String("movement_speed")) ?? 0)
+            self.spin_tick(mut con, travel_box)
             self.push_entities(mut con)
             // `Player.aiStep`'s head: their yaw (CAL-174).
             con.player.y_head_rot = con.player.y_rot
@@ -24926,14 +24941,15 @@ impl Network {
 
     // `updatePlayerPose` (CAL-141): where the player fits swimming, the pose they want, sleeping
     // where they sleep (D574), swimming where they swim (D444), gliding where they glide
-    // (CAL-286), crouching if they hold shift and aren't flying, else standing, as Calcite has no
-    // riptide's spin yet; if they don't fit it and aren't a spectator or riding, crouching where
-    // they fit that, else swimming.
+    // (CAL-286), spinning where their riptide spins them, `isAutoSpinAttack` (CAL-214), crouching
+    // if they hold shift and aren't flying, else standing; if they don't fit it and aren't a
+    // spectator or riding, crouching where they fit that, else swimming.
     fn update_pose(mut self, con: mut Connection) {
         if not self.fits(con, SWIMMING) {
             return
         }
-        let desired = if con.player.sleeping != none { SLEEPING } else if swimming(con) { SWIMMING } else if gliding(con) { FALL_FLYING } else if con.player.shift and not con.player.abilities.flying { CROUCHING } else { STANDING }
+        let spinning = i32(con.player.entity_data.byte(LIVING_FLAGS)) & 4 != 0
+        let desired = if con.player.sleeping != none { SLEEPING } else if swimming(con) { SWIMMING } else if gliding(con) { FALL_FLYING } else if spinning { SPIN_ATTACK } else if con.player.shift and not con.player.abilities.flying { CROUCHING } else { STANDING }
         var pose = desired
         if con.player.mode != GameType.Spectator and con.player.vehicle == none and not self.fits(con, desired) {
             pose = if self.fits(con, CROUCHING) { CROUCHING } else { SWIMMING }
@@ -41225,18 +41241,182 @@ impl Network {
     }
 
     // `TridentItem.use` of the trident `held` in the player's hand `hand` (CAL-214): nothing where
-    // its next damage would break it, `nextDamageWillBreak`; one with riptide,
-    // `trident_spin_attack_strength`, said missing; else they ready it for 72000 ticks.
+    // its next damage would break it, `nextDamageWillBreak`, or where it has riptide,
+    // `trident_spin_attack_strength`, and they're in neither water nor rain,
+    // `isInWaterOrRain`; else they ready it for 72000 ticks.
     fn use_trident(mut self, con: mut Connection, hand: i32, held: Tag) {
         if self.next_damage_breaks(held.copy()) {
             return
         }
         let d = con.player.dim
-        if self.weapon_value(d, held, "minecraft:trident_spin_attack_strength", 0.0f32) > 0.0f32 {
-            self.levels[d].unimplemented(String("A trident's riptide"))
+        if self.weapon_value(d, held, "minecraft:trident_spin_attack_strength", 0.0f32) > 0.0f32 and not self.in_water_or_rain(con) {
             return
         }
         self.start_using(mut con, hand, 72000)
+    }
+
+    // `Entity.isInWaterOrRain` of the player (CAL-214): in water, or rained on at their block or
+    // at their box's top above it, `isInRain`.
+    fn in_water_or_rain(self, con: Connection) -> bool {
+        if con.player.in_water {
+            return true
+        }
+        let d = con.player.dim
+        let (x, y, z) = (i32.saturate(con.player.x.floor()), i32.saturate(con.player.y.floor()), i32.saturate(con.player.z.floor()))
+        let top = i32.saturate(pose_box(con.player.entity_data.number(POSE_ID), con.player.x, con.player.y, con.player.z).max_y.floor())
+        return self.levels[d].rains_on(x, y, z) or self.levels[d].rains_on(x, top, z)
+    }
+
+    // The sound of the trident `stack` as it's thrown or spun with, `TRIDENT_SOUND`: of its
+    // enchantments that have one, the highest level's, `pickHighestLevel`, its list's entry for
+    // that level, the last where the list's shorter; else `item.trident.throw` (CAL-214).
+    fn trident_sound(self, stack: Tag) -> String {
+        let items = self.items else return String("item.trident.throw")
+        var best: (i32, String)? = none
+        for (level, e) in items.enchantments(stack) {
+            if not e.contains("effects") {
+                continue
+            }
+            let Tag.Compound(effects) = e["effects"] else continue
+            if not effects.contains("minecraft:trident_sound") {
+                continue
+            }
+            let Tag.List(sounds) = effects["minecraft:trident_sound"] else continue
+            if sounds.is_empty() {
+                continue
+            }
+            let higher = match best {
+                some((l, _)) => l < level,
+                none => true,
+            }
+            if higher {
+                let k = if level < 1 { 0usize } else { usize.wrap(level).min(sounds.len()) - 1 }
+                let name = match sounds[k] {
+                    Tag.Str(s) => s.copy(),
+                    Tag.Compound(m) => if m.contains("sound_id") { match m["sound_id"] { Tag.Str(s) => s.copy(), _ => String() } } else { String() },
+                    _ => String(),
+                }
+                best = some((level, plain_sound(name)))
+            }
+        }
+        let (_, sound) = best else return String("item.trident.throw")
+        return sound
+    }
+
+    // `releaseUsing`'s riptide (CAL-214), of `strength`, `trident_spin_attack_strength`, with the
+    // trident `stack` as it is now, heard as `sound`: the player pushed along where they face by
+    // the strength, `push`, their spin begun, `startAutoSpinAttack(20, 8, stack)`, what sits on
+    // their shoulders let go, `removeEntitiesOnShoulder`, and their living flag 4 set; where
+    // they're on the ground, moved 1.2 up, `move(SELF)`, `lift`; then the sound heard from them by
+    // all, among the players' sounds.
+    fn riptide(mut self, con: mut Connection, strength: f32, stack: own Tag, sound: own String) {
+        let d = con.player.dim
+        let (y_rot, x_rot) = (con.player.y_rot, con.player.x_rot)
+        let (sy, cy) = (table_sin(f64(y_rot * 0.017453292f32)), table_cos(f64(y_rot * 0.017453292f32)))
+        let (sx, cx) = (table_sin(f64(x_rot * 0.017453292f32)), table_cos(f64(x_rot * 0.017453292f32)))
+        var xd = -sy * cx
+        var yd = -sx
+        var zd = cy * cx
+        let dist = f32.nearest(f64(xd * xd + yd * yd + zd * zd).sqrt())
+        xd = xd * (strength / dist)
+        yd = yd * (strength / dist)
+        zd = zd * (strength / dist)
+        player_push(mut con, f64(xd), f64(yd), f64(zd))
+        con.player.spin_ticks = 20
+        con.player.spin_damage = 8.0f32
+        con.player.spin_item = some(stack)
+        self.shoulders_off(mut con)
+        con.player.entity_data.set_flag(LIVING_FLAGS, 4, true)
+        if con.player.on_ground {
+            self.lift(mut con, f64(1.1999999f32))
+        }
+        let (x, y, z) = (con.player.x, con.player.y, con.player.z)
+        self.levels[d].play_from_entity(sound, con.player.entity_id, x, y, z, PLAYERS_SOURCE, 1.0f32, 1.0f32, -1)
+        self.send_level_events_with(d, mut con)
+    }
+
+    // The server's own move of the player `dy` up, `move(MoverType.SELF)` (CAL-214), as
+    // `client_move` moves them for their client: stopped by what's in the way, their steps heard
+    // by those near; all the way where the level hasn't its facts or the living's aren't ready.
+    fn lift(mut self, con: mut Connection, dy: f64) {
+        let d = con.player.dim
+        let was = (con.player.x, con.player.y, con.player.z)
+        if not self.living_ready(d) {
+            uncollided(mut con, 0.0, dy, 0.0)
+            self.moved_from(mut con, was)
+            return
+        }
+        let shared = self.levels[d].shared_env() else return
+        let Env { facts: f, .. } = shared.value
+        let lent = self.lend_moving(f) else return
+        let (lf, m, t) = lent
+        var body = body_of(mut con, lf, self.world.portal_delay == 0)
+        var sounds = List<EntitySound>()
+        let lava_fast = self.levels[d].fast_lava
+        body.move_self(lf, f, m, t, self.levels[d], 0.0, dy, 0.0, lava_fast, mut sounds)
+        body_back(mut con, body)
+        self.moved_from(mut con, was)
+        self.play_steps(d, mut con, sounds)
+        self.living_facts = some(lf)
+        self.movement = some(m)
+        self.item_facts = some(t)
+    }
+
+    // `LivingEntity.aiStep`'s spin (CAL-214): where the player's spinning, a tick less of it, then
+    // `checkAutoSpinAttack` over their box before they travelled, `before`, and now: of what's in
+    // it but them, not spectating, `getEntities`, the first that's living ends the spin, their
+    // motion turned back to a fifth of itself, and its hit by them, `doAutoAttackOnTouch`, is
+    // said missing; with nothing in it, the spin ends where they hit something across,
+    // `horizontalCollision`. Its end, their living flag 4 off and its damage and trident gone.
+    fn spin_tick(mut self, con: mut Connection, before: Aabb) {
+        if con.player.spin_ticks <= 0 {
+            return
+        }
+        con.player.spin_ticks -= 1
+        let d = con.player.dim
+        let now = pose_box(con.player.entity_data.number(POSE_ID), con.player.x, con.player.y, con.player.z)
+        let b = Aabb { min_x: before.min_x.min(now.min_x), min_y: before.min_y.min(now.min_y), min_z: before.min_z.min(now.min_z), max_x: before.max_x.max(now.max_x), max_y: before.max_y.max(now.max_y), max_z: before.max_z.max(now.max_z) }
+        let me = con.player.entity_id
+        var met = false
+        var living = false
+        if d < self.entities.len() and self.entities[d] != none {
+            let es = self.take_entities(d)
+            for id in es.list.in_box_order(b) {
+                if id == me {
+                    continue
+                }
+                if let slot = self.slot_of_entity(id) {
+                    let (pb, _, _) = self.player_box(slot) else continue
+                    let c = self.connections[slot] else continue
+                    if c.player.mode == GameType.Spectator or not pb.intersects(b.min_x, b.min_y, b.min_z, b.max_x, b.max_y, b.max_z) {
+                        continue
+                    }
+                    met = true
+                    living = true
+                    break
+                }
+                met = true
+                if es.list.is_living(id) {
+                    living = true
+                    break
+                }
+            }
+            self.put_entities(d, es)
+        }
+        if living {
+            self.levels[d].unimplemented(String("A riptide spin's hit on what it meets, doAutoAttackOnTouch"))
+            con.player.spin_ticks = 0
+            con.player.vx = con.player.vx * -0.2
+            con.player.vy = con.player.vy * -0.2
+            con.player.vz = con.player.vz * -0.2
+        } else if not met and con.player.horizontal_collision {
+            con.player.spin_ticks = 0
+        }
+        if con.player.spin_ticks <= 0 {
+            con.player.entity_data.set_flag(LIVING_FLAGS, 4, false)
+            con.player.spin_damage = 0.0f32
+            con.player.spin_item = none
+        }
     }
 
     // `TridentItem.releaseUsing` as the player lets go of the trident they ready (CAL-214): held
@@ -41248,8 +41428,9 @@ impl Network {
     // `spawnProjectileFromRotation` along their facing at 2.5 blocks a tick, 1 off, their known
     // movement added, added, `addFreshEntity`, and seen by them, then what the enchantments on it
     // do as it's spawned; and `item.trident.throw` heard from it by all, among the players'
-    // sounds. Then the trident's `use_cooldown`, `applyAfterUseComponentSideEffects`. Riptide's
-    // spin, a `trident_sound` of an enchantment's own and a `use_remainder` are said missing.
+    // sounds, or its enchantments' own, `trident_sound`. Then the trident's `use_cooldown`,
+    // `applyAfterUseComponentSideEffects`. With riptide, where they're in water or rain and ride
+    // nothing, it's worn and spun with instead, `riptide`. A `use_remainder` is said missing.
     fn trident_released(mut self, con: mut Connection) {
         let hand = used_hand(con)
         let held = held_in(con, hand) else return
@@ -41257,25 +41438,22 @@ impl Network {
             return
         }
         let d = con.player.dim
-        if self.weapon_value(d, held.copy(), "minecraft:trident_spin_attack_strength", 0.0f32) > 0.0f32 {
-            self.levels[d].unimplemented(String("A trident's riptide"))
+        let riptide = self.weapon_value(d, held.copy(), "minecraft:trident_spin_attack_strength", 0.0f32)
+        if riptide > 0.0f32 and not (self.in_water_or_rain(con) and con.player.vehicle == none) {
             return
         }
         if self.next_damage_breaks(held.copy()) {
             return
         }
-        var sounding = false
-        if let items = self.items {
-            for (_, e) in items.enchantments(held.copy()) {
-                sounding = sounding or enchantment_has(e, "minecraft:trident_sound")
-            }
-        }
-        if sounding {
-            self.levels[d].unimplemented(String("An enchantment's own trident_sound as a trident's thrown"))
-        }
+        let sound = self.trident_sound(held.copy())
         con.player.stats.award(String("minecraft:used"), String("minecraft:trident"), 1)
         self.wear_worn(mut con, if hand == 1 { 1usize } else { 0usize }, 1)
         let worn = held_in(con, hand) else return
+        if riptide > 0.0f32 {
+            self.riptide(mut con, riptide, worn.copy(), sound)
+            self.use_cooldown(mut con, worn)
+            return
+        }
         let thrown = with_count(worn.copy(), 1) ?? worn.copy()
         let creative = con.player.abilities.instabuild
         if not creative {
@@ -41297,7 +41475,7 @@ impl Network {
         if not con.player.removed {
             self.item_sees(d, id, mut con)
         }
-        self.levels[d].play_from_entity(String("item.trident.throw"), id, tx, ty, tz, PLAYERS_SOURCE, 1.0f32, 1.0f32, -1)
+        self.levels[d].play_from_entity(sound, id, tx, ty, tz, PLAYERS_SOURCE, 1.0f32, 1.0f32, -1)
         self.send_level_events_with(d, mut con)
         if self.stack_component(worn.copy(), String("minecraft:use_remainder")) != none {
             self.levels[d].unimplemented(String("A trident's use_remainder as it's thrown"))
@@ -45090,6 +45268,14 @@ fn player_push(con: mut Connection, xa: f64, ya: f64, za: f64) {
         con.player.vz = con.player.vz + za
         con.player.needs_sync = true
     }
+}
+
+// The sound `name` as Calcite plays it, without `minecraft:` (CAL-214).
+fn plain_sound(name: String) -> String {
+    if name.starts_with("minecraft:") {
+        return name[10..].copy()
+    }
+    return name.copy()
 }
 
 // Whether the enchantment `e` has effects of the component `name`.
