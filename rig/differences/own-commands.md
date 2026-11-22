@@ -184,6 +184,7 @@ cases:
   - session:turtle-eggs/*/commands
   - session:turtle-breed/*/commands
   - session:zombie-eggs/*/commands
+  - session:armor-swap/*/commands
   - session:fish-buckets/*/commands
   - session:bucket-use/*/commands
   - session:bottle-fill/*/commands
