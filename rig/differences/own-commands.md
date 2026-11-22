@@ -184,6 +184,7 @@ cases:
   - session:turtle-eggs/*/commands
   - session:turtle-breed/*/commands
   - session:zombie-eggs/*/commands
+  - session:trident-throws/*/commands
   - session:crossbow-shots/*/commands
   - session:bow-shots/*/commands
   - session:horn-spyglass/*/commands
