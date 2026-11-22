@@ -184,6 +184,7 @@ cases:
   - session:turtle-eggs/*/commands
   - session:turtle-breed/*/commands
   - session:zombie-eggs/*/commands
+  - session:bottle-fill/*/commands
   - session:xp-bottles/*/commands
   - session:egg-throws/*/commands
   - session:entity-data/*/commands
