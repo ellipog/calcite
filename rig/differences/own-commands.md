@@ -184,6 +184,7 @@ cases:
   - session:turtle-eggs/*/commands
   - session:turtle-breed/*/commands
   - session:zombie-eggs/*/commands
+  - session:rocket-bursts/*/commands
   - session:rocket-launches/*/commands
   - session:bundle-uses/*/commands
   - session:spawn-eggs/*/commands
