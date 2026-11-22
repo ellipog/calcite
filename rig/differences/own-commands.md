@@ -184,6 +184,7 @@ cases:
   - session:turtle-eggs/*/commands
   - session:turtle-breed/*/commands
   - session:zombie-eggs/*/commands
+  - session:spawn-eggs/*/commands
   - session:water-placing/*/commands
   - session:book-uses/*/commands
   - session:trident-throws/*/commands
