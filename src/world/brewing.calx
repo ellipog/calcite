@@ -1,0 +1,331 @@
+/// A brewing stand's brewing, `BrewingStandBlockEntity.serverTick` (CAL-337): what its fuel slot
+/// holds burnt as its fuel's run out, for as many brews as its `brewing_fuel` gives, at the speed
+/// it gives, each worked out in the stand's loot context; then, with a reagent the world's brewing
+/// recipes take and a bottle one of them brews with it, a brew of 400 ticks over its speed,
+/// which, done, brews each bottle by the first recipe of the world's that matches it with the
+/// reagent, `doBrew`, and uses one of the reagent up; one whose reagent is taken away or changed,
+/// or that can no longer brew, stops. The stand shows a bottle in each place that holds one. What
+/// it holds is kept as it saves, `Items` and its fields; what it keeps unsaved, the reagent its
+/// brew began with and the bottles it last showed, is `BrewingState`.
+module world.brewing
+
+import nbt.tag.{Tag}
+import random.source.{RandomSource}
+import registry.components.{ItemCodecs}
+import world.block_level.{BlockLevel, update_output_signal}
+import world.container_loot.{items_of}
+import world.crafting.{crafting_remainder}
+import world.drops.{DropLevel, spill_stack}
+import world.level_writer.{UPDATE_LIMIT}
+import world.loot.{Loot, LootParams, context_float, context_int}
+import world.menu.{count_of, with_count}
+import world.recipes.{Ingredient}
+import worldgen.access.{BlockAccess}
+import worldgen.facts.{Facts}
+import worldgen.interval.{Thrown}
+
+/// What a brewing stand keeps unsaved (CAL-337): the item its brew began with, `ingredient`, none
+/// where it's brewed nothing since it was loaded but for a brew it saved partway; and the bottles
+/// it last showed, `lastPotionCount`, none before its first tick.
+pub struct BrewingState {
+    pub ingredient: String? = none
+    pub last: List<bool>? = none
+}
+
+/// `BrewingStandBlockEntity.serverTick` of the brewing stand `state` at x, y, z, with what it
+/// keeps unsaved, `kept`, given back as it is after the tick, `first` where its ticker's new, as
+/// it is once loaded (CAL-337): its fuel's run out and its fuel slot holds fuel, a new one burnt,
+/// `getUses` and `getSpeedMultiplier`, what its item leaves taking its place, else dropped; then,
+/// brewing, its brew goes on a tick, and, done and still able to, brews, else, unable or with
+/// another reagent, stops; not brewing, able to and with fuel, a brew begins, using one of its
+/// fuel. Each `setChanged`, its chunk to save and the comparators by it told. Then, where the
+/// bottles it holds aren't those it last showed, it shows them, its `has_bottle` set with flags 2.
+pub fn brewing_tick<L: BlockAccess + BlockLevel + DropLevel + RandomSource>(f: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32, kept: own BrewingState, first: bool) -> BrewingState ! Thrown {
+    // A new ticker's block entity was just made or loaded, with nothing kept.
+    var keep = if first { BrewingState() } else { kept }
+    let saved = level.block_entity_tag(x, y, z) else return keep
+    let Tag.Compound(tags) = saved else return keep
+    var brew_time = int_or(tags, "BrewTime", 0)
+    var total_brew = int_or(tags, "total_brew_time", 400)
+    var fuel = int_or(tags, "Fuel", 0)
+    var total_fuel = int_or(tags, "total_fuel", 20)
+    var speed = if tags.contains("speed_multiplier") { tags["speed_multiplier"].number_float() ?? 1.0f32 } else { 1.0f32 }
+    var slots = brewing_slots(tags)
+    // `loadAdditional`: a brew saved partway is of what its reagent slot holds.
+    if first and brew_time > 0 {
+        keep.ingredient = some(item_of(slots[3].copy()))
+    }
+    let shared = level.world_loot() else {
+        if brew_time > 0 or count_of(slots[3].copy()) > 0 or count_of(slots[4].copy()) > 0 {
+            level.unimplemented(String("A brewing stand's brewing where the world has no recipes"))
+        }
+        return try shown_bottles(f, mut level, state, x, y, z, slots, keep)
+    }
+    let block = f.block(state)
+    let old = (brew_time, total_brew, fuel, total_fuel, speed.to_bits())
+    var stacks_changed = false
+    var changed = false
+    let fuel_stack = slots[4].copy()
+    if fuel <= 0 {
+        if let s = fuel_stack {
+            if let Tag.Compound(c) = shared.value.items.component(s.copy(), String("minecraft:brewing_fuel")) {
+                let params = LootParams { origin: some((f64(x) + 0.5, f64(y) + 0.5, f64(z) + 0.5)), state: some(state) }
+                fuel = if c.contains("uses") { context_number(f, mut level, shared.value, params, c["uses"]) } else { 0 }
+                total_fuel = fuel
+                speed = if c.contains("speed_multiplier") { context_speed(f, mut level, shared.value, params, c["speed_multiplier"]) } else { 1.0f32 }
+                let left = with_count(s.copy(), count_of(some(s.copy())) - 1)
+                if let r = crafting_remainder(some(s.copy())) {
+                    if left == none {
+                        slots[4] = some(r)
+                    } else {
+                        spill_stack(mut level, x, y, z, some(r))
+                        slots[4] = left
+                    }
+                } else {
+                    slots[4] = left
+                }
+                stacks_changed = true
+                changed = true
+            }
+        }
+    }
+    let brewable = is_brewable(shared.value, slots)
+    if brew_time > 0 {
+        brew_time -= 1
+        if brew_time == 0 and brewable {
+            brew(mut level, shared.value, mut slots, x, y, z)
+            stacks_changed = true
+        } else if not brewable or keep.ingredient != some(item_of(slots[3].copy())) {
+            brew_time = 0
+        }
+        changed = true
+    } else if brewable and fuel > 0 {
+        let s = if speed > 0.0f32 { speed } else { 1.0f32 }
+        fuel -= 1
+        brew_time = i32.saturate(f64(400.0f32 / s).ceil())
+        total_brew = brew_time
+        keep.ingredient = some(item_of(slots[3].copy()))
+        changed = true
+    }
+    let now = (brew_time, total_brew, fuel, total_fuel, speed.to_bits())
+    if now != old {
+        level.keep_block_entity_value(x, y, z, "BrewTime", Tag.Int(brew_time))
+        level.keep_block_entity_value(x, y, z, "total_brew_time", Tag.Int(total_brew))
+        level.keep_block_entity_value(x, y, z, "Fuel", Tag.Int(fuel))
+        level.keep_block_entity_value(x, y, z, "total_fuel", Tag.Int(total_fuel))
+        level.keep_block_entity_value(x, y, z, "speed_multiplier", Tag.Float(speed))
+    }
+    if stacks_changed {
+        level.keep_block_entity_value(x, y, z, "Items", items_of(slots))
+    }
+    if changed {
+        // `BlockEntity.setChanged(level, pos, state)`.
+        level.touch_block_entity(x, y, z)
+        try update_output_signal(f, mut level, block, x, y, z)
+    }
+    return try shown_bottles(f, mut level, state, x, y, z, slots, keep)
+}
+
+// The bottles the brewing stand at x, y, z shows, `has_bottle_0` to `_2`, set with flags 2 where
+// which of `slots` hold one isn't what it last was, `keep.last`, as it first ticks too.
+fn shown_bottles<L: BlockAccess + BlockLevel>(f: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32, slots: List<Tag?>, kept: own BrewingState) -> BrewingState ! Thrown {
+    var keep = kept
+    let block = f.block(state)
+    var bits = List<bool>()
+    for i in 0usize..3 {
+        bits.push(count_of(slots[i].copy()) > 0)
+    }
+    if keep.last != some(bits.copy()) {
+        keep.last = some(bits.copy())
+        if f.class_name(block) == "BrewingStandBlock" {
+            var shown = state
+            for i in 0usize..3 {
+                shown = try f.with_bool(shown, "has_bottle_{i}", bits[i])
+            }
+            _ = level.set_block_limited(x, y, z, shown, 2, UPDATE_LIMIT)
+        }
+    }
+    return keep
+}
+
+/// Whether `stack`'s item is a brewing reagent, as the property set `BREWING_REAGENTS` holds it:
+/// a reagent of one of the world's brewing recipes.
+pub fn is_reagent(loot: Loot, stack: Tag?) -> bool {
+    let item = item_of(stack.copy())
+    for r in loot.brewing {
+        if r.reagent.items.contains(item) {
+            return true
+        }
+    }
+    return false
+}
+
+/// The first of the world's brewing recipes, by its place, that brews `bottle` with `reagent`,
+/// `getRecipeFor`: whose input holds of the bottle and whose reagent holds of the reagent,
+/// `PotionIngredient.test`, each its item's and, where it says them, its potion's.
+pub fn brewing_for(loot: Loot, bottle: Tag?, reagent: Tag?) -> usize? {
+    if count_of(bottle.copy()) <= 0 or count_of(reagent.copy()) <= 0 {
+        return none
+    }
+    for i in 0..loot.brewing.len() {
+        if potion_ingredient(loot.items, loot.brewing[i].input, loot.brewing[i].input_potions, bottle.copy()) and potion_ingredient(loot.items, loot.brewing[i].reagent, loot.brewing[i].reagent_potions, reagent.copy()) {
+            return some(i)
+        }
+    }
+    return none
+}
+
+/// `PotionsPredicate.matches` of the predicate `p` against `contents`, a stack's
+/// `potion_contents`: its `potions`, where it says them, holding the potion the contents are of,
+/// which they must be of one; its `effects` are said to be missing, and hold.
+pub fn potions_match(items: ItemCodecs, p: Tag, contents: Tag?, missing: mut List<String>) -> bool {
+    let Tag.Compound(m) = p else return true
+    if m.contains("potions") {
+        let Tag.Compound(c) = contents.copy() ?? Tag.End else return false
+        if not c.contains("potion") {
+            return false
+        }
+        let Tag.Str(name) = c["potion"] else return false
+        let id = items.builtin_id("potion", name.copy()) else return false
+        if not items.holder_set_has("potion", m["potions"], id) {
+            return false
+        }
+    }
+    if m.contains("effects") {
+        missing.push(String("A potions predicate's effects"))
+    }
+    return true
+}
+
+// `PotionIngredient.test`: `stack` of one of the ingredient's items and, where it says potions,
+// with `potion_contents` they hold of, `SingleComponentItemPredicate.matches`.
+fn potion_ingredient(items: ItemCodecs, ingredient: Ingredient, potions: Tag?, stack: Tag?) -> bool {
+    if not ingredient.test(stack.copy()) {
+        return false
+    }
+    let p = potions else return true
+    let s = stack else return false
+    let contents = items.component(s, String("minecraft:potion_contents")) else return false
+    var missing = List<String>()
+    return potions_match(items, p, some(contents), mut missing)
+}
+
+// `isBrewable`: a reagent the world's brewing recipes take, `BREWING_REAGENTS`, and a bottle a
+// recipe brews with it.
+fn is_brewable(loot: Loot, slots: List<Tag?>) -> bool {
+    if count_of(slots[3].copy()) <= 0 or not is_reagent(loot, slots[3].copy()) {
+        return false
+    }
+    for dest in 0usize..3 {
+        if count_of(slots[dest].copy()) > 0 and brewing_for(loot, slots[dest].copy(), slots[3].copy()) != none {
+            return true
+        }
+    }
+    return false
+}
+
+// `doBrew`: each bottle brewed by the recipe it matches with the reagent, `assemble`, its output
+// made a stack, else left; one of the reagent used up, what its item leaves taking its place,
+// else dropped; then the level event 1035 for everyone.
+fn brew<L: BlockAccess + BlockLevel + DropLevel + RandomSource>(level: mut L, loot: Loot, slots: mut List<Tag?>, x: i32, y: i32, z: i32) {
+    let reagent = slots[3].copy()
+    for dest in 0usize..3 {
+        if let r = brewing_for(loot, slots[dest].copy(), reagent.copy()) {
+            let output = loot.brewing[r].output.copy()
+            slots[dest] = with_count(output.copy(), count_of(some(output)))
+        }
+    }
+    if let s = reagent {
+        let left = with_count(s.copy(), count_of(some(s.copy())) - 1)
+        if let r = crafting_remainder(some(s.copy())) {
+            if left == none {
+                slots[3] = some(r)
+            } else {
+                spill_stack(mut level, x, y, z, some(r))
+                slots[3] = left
+            }
+        } else {
+            slots[3] = left
+        }
+    }
+    level.level_event(1035, x, y, z, 0)
+}
+
+// `getUses`: the brews the fuel's `uses` gives in `params`.
+fn context_number<L: BlockAccess + BlockLevel + DropLevel>(f: Facts, level: mut L, loot: Loot, params: LootParams, t: Tag) -> i32 {
+    var random = level.lend_level_random()
+    var missing = List<String>()
+    let v = context_int(loot, f, level, mut random, params, t, mut missing)
+    level.give_back_level_random(random)
+    for m in missing {
+        level.unimplemented(m.copy())
+    }
+    return v
+}
+
+// `getSpeedMultiplier`: the speed the fuel's `speed_multiplier` gives in `params`.
+fn context_speed<L: BlockAccess + BlockLevel + DropLevel>(f: Facts, level: mut L, loot: Loot, params: LootParams, t: Tag) -> f32 {
+    var random = level.lend_level_random()
+    var missing = List<String>()
+    let v = context_float(loot, f, level, mut random, params, t, mut missing)
+    level.give_back_level_random(random)
+    for m in missing {
+        level.unimplemented(m.copy())
+    }
+    return v
+}
+
+/// A brewing stand's menu's data, `dataAccess`, from what it saved as, `saved` (CAL-337): its
+/// brew's time left, its fuel, its brew's time in all, then its fuel in all.
+pub fn brewing_data(saved: Tag?) -> List<i32> {
+    let Tag.Compound(tags) = saved.copy() ?? Tag.End else return [0, 0, 400, 20]
+    return [int_or(tags, "BrewTime", 0), int_or(tags, "Fuel", 0), int_or(tags, "total_brew_time", 400), int_or(tags, "total_fuel", 20)]
+}
+
+/// A brewing stand's five slots as `Items` holds them, by their `Slot`: its three bottles, its
+/// reagent and its fuel, nothing in those it hasn't.
+pub fn brewing_slots(tags: JavaHashMap<String, Tag>) -> List<Tag?> {
+    var slots: List<Tag?> = [none, none, none, none, none]
+    if not tags.contains("Items") {
+        return slots
+    }
+    let Tag.List(items) = tags["Items"] else return slots
+    for item in items {
+        let Tag.Compound(m) = item else continue
+        if not m.contains("Slot") {
+            continue
+        }
+        let at = match m["Slot"] {
+            Tag.Byte(b) => i32(b) & 255,
+            _ => continue,
+        }
+        if at >= 5 {
+            continue
+        }
+        var stack = m.copy()
+        _ = stack.remove("Slot")
+        slots[usize.wrap(at)] = some(Tag.Compound(stack))
+    }
+    return slots
+}
+
+// The int field `key`, `fallback` where it has none, as `getIntOr` reads it.
+fn int_or(tags: JavaHashMap<String, Tag>, key: str, fallback: i32) -> i32 {
+    if not tags.contains(key) {
+        return fallback
+    }
+    return tags[key].number_int() ?? fallback
+}
+
+// A stack's item, by its whole ID, air for nothing.
+fn item_of(stack: Tag?) -> String {
+    let s = stack else return String("minecraft:air")
+    let Tag.Compound(m) = s else return String("minecraft:air")
+    if not m.contains("id") {
+        return String("minecraft:air")
+    }
+    return match m["id"] {
+        Tag.Str(i) => i.copy(),
+        _ => String("minecraft:air"),
+    }
+}
