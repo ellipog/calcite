@@ -23,6 +23,7 @@
 /// (D524).
 module world.loot
 
+import java.number.{parse_int}
 import nbt.tag.{Accounter, Tag, read_any}
 import random.source.{RandomSource}
 import registry.components.{ItemCodecs}
@@ -37,9 +38,11 @@ import world.damage.{damage_tag_names}
 import world.digging.{value_effect}
 import world.effects.{effect_facts, effect_id}
 import world.enchanting.{Enchanting, enchanting_of, upgrade}
+import world.flowing.{liquid_of}
+import world.movement.{MovementStates, lit_campfire}
 import world.recipes.{Smelting, smelting_of}
 import worldgen.access.{BlockAccess}
-import worldgen.facts.{Facts}
+import worldgen.facts.{EMPTY_FLUID, FLOWING_LAVA, FLOWING_WATER, Facts}
 import worldgen.providers.{read_int}
 
 // The registries loot reads, by their places in `Loot.places`.
@@ -345,12 +348,14 @@ impl Stack {
 // Where a roll is: what it met that Calcite hasn't, and the tables and modifiers it's going
 // through by name, as `LootContext.visitedElements` keeps them, so one that names itself stops;
 // and the level of the enchantment whose effect it tests, `ENCHANTMENT_LEVEL`, where there's one
-// (D442); and how many times it met what Calcite hasn't, each time counted (CAL-160).
+// (D442); how many times it met what Calcite hasn't, each time counted (CAL-160); and the blocks'
+// collision shapes, made the first time a location predicate asks whether it's `smokey` (CAL-221).
 struct Roll {
     missing: List<String>
     visited: List<String>
     enchanted_at: i32? = none
     misses: i32 = 0
+    movement: MovementStates? = none
 }
 
 impl Roll {
@@ -2991,8 +2996,12 @@ fn equipment_slot(name: String) -> usize? {
 // `LocationPredicate.matches` at x, y, z, in its order (CAL-164): `position`, each way's bounds;
 // `dimension`, the level's; then, at the block there, `biomes`, holding the biome there, loaded;
 // `light`, the light there, `getMaxLocalRawBrightness`, loaded; `block`, the block there, loaded,
-// as `BlockPredicate.matches` reads it; and `can_see_sky`, the sky's light there 15. Its
-// `structures`, `smokey` and `fluid` are said to be missing where they're asked.
+// as `BlockPredicate.matches` reads it; `fluid`, the fluid state there, as `FluidPredicate.matches`
+// reads it; `can_see_sky`, the sky's light there 15; and `smokey`, whether a lit campfire's smoke
+// rises there, loaded, `CampfireBlock.isSmokeyPos` (CAL-221). Vanilla asks `smokey` after
+// `structures` and before `light`; it's asked last here, as it's the dearest and nothing else
+// reads what it reads or changes it, so the answer's the same. Its `structures` are said to be
+// missing where they're asked.
 fn location_matches<B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, roll: mut Roll, given: Tag, x: f64, y: f64, z: f64) -> bool {
     let Tag.Compound(m) = given else return false
     for (k, _) in m {
@@ -3021,14 +3030,12 @@ fn location_matches<B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B,
             return false
         }
     }
-    for k in ["structures", "smokey"] {
-        if m.contains(k) {
-            if not loaded {
-                return false
-            }
-            roll.miss("The location predicate's {k}")
+    if m.contains("structures") {
+        if not loaded {
             return false
         }
+        roll.miss(String("The location predicate's structures"))
+        return false
     }
     if m.contains("light") {
         let Tag.Compound(l) = m["light"] else return false
@@ -3045,8 +3052,9 @@ fn location_matches<B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B,
         }
     }
     if m.contains("fluid") {
-        roll.miss(String("The location predicate's fluid"))
-        return false
+        if not loaded or not fluid_holds(loot, f, level, mut roll, m["fluid"], bx, by, bz) {
+            return false
+        }
     }
     if m.contains("can_see_sky") {
         let wanted = m["can_see_sky"].number_bool() ?? false
@@ -3054,7 +3062,125 @@ fn location_matches<B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B,
             return false
         }
     }
+    if m.contains("smokey") {
+        let wanted = m["smokey"].number_bool() ?? false
+        if not loaded or wanted != smokey_at(f, level, mut roll, bx, by, bz) {
+            return false
+        }
+    }
     return true
+}
+
+// `CampfireBlock.isSmokeyPos` at x, y, z (CAL-221), as a hive's being smoked reads it: a lit
+// campfire in the 5 blocks under it, or, under the first of them whose collision shape stops the
+// smoke, just under that one.
+fn smokey_at<B: BlockAccess + BlockLevel>(f: Facts, level: B, roll: mut Roll, x: i32, y: i32, z: i32) -> bool {
+    let m = roll.movement.take() ?? MovementStates.new(f)
+    var smoky = false
+    var failed: String? = none
+    for i in 1..6 {
+        let s = match level.state(f, x, y - i, z) {
+            ok(s) => s,
+            err(e) => {
+                failed = some(e.message.copy())
+                break
+            },
+        }
+        if lit_campfire(f, s) {
+            smoky = true
+            break
+        }
+        if m.stops_smoke(f, s, x, y - i, z) {
+            smoky = match level.state(f, x, y - i - 1, z) {
+                ok(under) => lit_campfire(f, under),
+                err(e) => {
+                    failed = some(e.message.copy())
+                    false
+                },
+            }
+            break
+        }
+    }
+    roll.movement = some(m)
+    if let message = failed {
+        roll.miss(message)
+        return false
+    }
+    return smoky
+}
+
+// `FluidPredicate.matches` of the fluid state at x, y, z, loaded (CAL-221): its fluid in `fluids`,
+// a holder set of the fluid registry, where that's given; and its properties as `state` has them,
+// `StatePropertiesPredicate`, where that's given: `falling`, which each fluid but the empty one
+// has, and `level`, 1 to 8, which a flowing one has.
+fn fluid_holds<B: BlockAccess + BlockLevel>(loot: Loot, f: Facts, level: B, roll: mut Roll, given: Tag, bx: i32, by: i32, bz: i32) -> bool {
+    let state = match level.state(f, bx, by, bz) {
+        ok(s) => s,
+        err(e) => {
+            roll.miss(e.message.copy())
+            return false
+        },
+    }
+    let Tag.Compound(p) = given else return false
+    let liquid = liquid_of(f, state)
+    if p.contains("fluids") and not loot.items.holder_set_has("fluid", p["fluids"], i32.wrap(liquid.fluid)) {
+        return false
+    }
+    if not p.contains("state") {
+        return true
+    }
+    let Tag.Compound(wanted) = p["state"] else return true
+    let flowing = liquid.fluid == FLOWING_WATER or liquid.fluid == FLOWING_LAVA
+    for (name, want) in wanted {
+        let is_level = name == "level"
+        if is_level and not flowing {
+            return false
+        }
+        if not is_level and (name != "falling" or liquid.fluid == EMPTY_FLUID) {
+            return false
+        }
+        let have = if is_level { liquid.amount } else if liquid.falling { 1 } else { 0 }
+        match want {
+            Tag.Str(v) => {
+                if fluid_value(is_level, v) != some(have) {
+                    return false
+                }
+            },
+            Tag.Compound(range) => {
+                for (bound, low) in [("min", true), ("max", false)] {
+                    if range.contains(bound) {
+                        let Tag.Str(v) = range[bound] else return false
+                        let at = fluid_value(is_level, v) else return false
+                        if (low and have < at) or (not low and have > at) {
+                            return false
+                        }
+                    }
+                }
+            },
+            _ => return false,
+        }
+    }
+    return true
+}
+
+// The value `text` names of a fluid state's property, as the property's `getValue` reads it, as
+// an int that compares as its values do: `level`'s, 1 to 8, by `Integer.parseInt`; `falling`'s,
+// `false` 0 and `true` 1.
+fn fluid_value(is_level: bool, text: String) -> i32? {
+    if is_level {
+        let v = match parse_int(text, 10) {
+            ok(v) => v,
+            err(_) => return none,
+        }
+        return if v >= 1 and v <= 8 { some(v) } else { none }
+    }
+    if text == "true" {
+        return some(1)
+    }
+    if text == "false" {
+        return some(0)
+    }
+    return none
 }
 
 // `BlockPredicate.matches` of the block at x, y, z, loaded, as it reads it.
