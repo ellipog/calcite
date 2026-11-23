@@ -1,0 +1,329 @@
+/// A furnace's cooking, `AbstractFurnaceBlockEntity.serverTick`, for a furnace, a blast furnace
+/// and a smoker, each cooking by its own recipe type (CAL-336): what's in its input slot cooked
+/// by the first recipe of the type it matches, while its fuel burns, a new one burnt from its
+/// fuel slot as the last goes out, for as long as its fuel's `cooking_fuel` gives, at the speed
+/// it gives, each worked out in the furnace's loot context, so a blast furnace and a smoker burn
+/// their fuel twice as fast; and the furnace lit and put out with it. Each recipe it uses is
+/// counted, `RecipesUsed`, for the experience taking the result gives. What it holds is kept as
+/// it saves, `Items` and its fields.
+module world.furnace
+
+import nbt.tag.{Tag}
+import random.source.{RandomSource}
+import world.block_level.{BlockLevel, update_output_signal}
+import world.container_loot.{items_of}
+import world.crafting.{crafting_remainder}
+import world.drops.{DropLevel, spill_stack}
+import world.level_writer.{UPDATE_LIMIT}
+import world.loot.{Loot, LootParams, context_float, context_int}
+import world.menu.{count_of, same_components, with_count}
+import world.recipes.{Cooking}
+import worldgen.access.{BlockAccess}
+import worldgen.facts.{Facts}
+import worldgen.interval.{Thrown}
+
+/// `Container.getMaxStackSize`, the most a furnace's slots hold of a stack.
+const MOST: i32 = 99
+
+/// The recipe type a furnace of the block entity type `kind` cooks by: a furnace's
+/// `minecraft:smelting`, a blast furnace's `minecraft:blasting` and a smoker's `minecraft:smoking`.
+pub fn cooking_type(kind: String) -> String {
+    if kind == "minecraft:blast_furnace" {
+        return String("minecraft:blasting")
+    }
+    if kind == "minecraft:smoker" {
+        return String("minecraft:smoking")
+    }
+    return String("minecraft:smelting")
+}
+
+/// The place in `loot.cooking` of the first recipe of the type `kind` whose ingredient `stack`
+/// is, `RecipeManager.getRecipeFor`; none where there's none, or nothing's there.
+pub fn cooking_for(loot: Loot, kind: String, stack: Tag?) -> usize? {
+    if count_of(stack.copy()) <= 0 {
+        return none
+    }
+    for i in 0..loot.cooking.len() {
+        if loot.cooking[i].kind == kind and loot.cooking[i].input.test(stack.copy()) {
+            return some(i)
+        }
+    }
+    return none
+}
+
+/// `getTotalCookTime` of the recipe `r` at the speed `speed`: its cooking time over the speed,
+/// rounded up, where the speed's over 0, else as it is.
+pub fn total_cook_time(r: Cooking, speed: f32) -> i32 {
+    if speed > 0.0f32 {
+        return i32.saturate(f64(f32.nearest(f64(r.time)) / speed).ceil())
+    }
+    return r.time
+}
+
+/// `AbstractFurnaceBlockEntity.serverTick` of the furnace `state` at x, y, z (CAL-336): its fuel
+/// burns down a tick; then, lit, or with fuel and something to cook, what it holds cooks, by the
+/// recipe it matches, where what that makes fits its result slot, `canBurn`: where it isn't lit,
+/// a new fuel's burnt, its time and speed worked out, `getBurnDuration` and
+/// `getSpeedMultiplier`, what it had cooked kept in proportion to the new speed, and, where it
+/// burns at all, one of the fuel used up, `consumeFuel`; then, lit, its cooking goes on a tick,
+/// and, done, the result's made, `burn`, and the recipe counted. Neither lit nor with both,
+/// what it had cooked goes back two ticks. Lit or put out, its `lit` is set with flags 3; and
+/// where any of that changed what it holds, `setChanged`, its chunk to save and the comparators
+/// by it told. What only counts down is kept unsaved, as vanilla's fields are.
+pub fn furnace_tick<L: BlockAccess + BlockLevel + DropLevel + RandomSource>(f: Facts, level: mut L, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+    let saved = level.block_entity_tag(x, y, z) else return
+    let Tag.Compound(tags) = saved else return
+    var lit = int_of(tags, "lit_time_remaining")
+    var lit_total = int_of(tags, "lit_total_time")
+    var timer = int_of(tags, "cooking_time_spent")
+    var total = int_of(tags, "cooking_total_time")
+    var speed = if tags.contains("speed_multiplier") { tags["speed_multiplier"].number_float() ?? 1.0f32 } else { 1.0f32 }
+    let old = (lit, lit_total, timer, total, speed.to_bits())
+    var slots = slots_of(tags)
+    var stacks_changed = false
+    var used_changed = false
+    var used = if tags.contains("RecipesUsed") {
+        match tags["RecipesUsed"] {
+            Tag.Compound(m) => m.copy(),
+            _ => JavaHashMap<String, Tag>(),
+        }
+    } else {
+        JavaHashMap<String, Tag>()
+    }
+    var changed = false
+    var was_lit = false
+    var is_lit = false
+    if lit > 0 {
+        was_lit = true
+        lit -= 1
+        is_lit = lit > 0
+    }
+    let has_ingredient = count_of(slots[0].copy()) > 0
+    let has_fuel = count_of(slots[1].copy()) > 0
+    if is_lit or (has_fuel and has_ingredient) {
+        if has_ingredient {
+            let shared = level.world_loot() else {
+                level.unimplemented(String("A furnace's cooking where the world has no recipes"))
+                return
+            }
+            let block = f.block(state)
+            let kind = cooking_type(f.block_entity_kind(block) ?? String())
+            if let r = cooking_for(shared.value, kind, slots[0].copy()) {
+                let recipe = shared.value.cooking[r].copy()
+                // `assemble`, the result's template made a stack, its count 1 where it gives none.
+                let assembled = with_count(recipe.result.copy(), count_of(some(recipe.result.copy())))
+                let made = assembled.copy() ?? Tag.End
+                if assembled != none and can_burn(shared.value, slots, made) {
+                    if not is_lit {
+                        let params = LootParams { origin: some((f64(x) + 0.5, f64(y) + 0.5, f64(z) + 0.5)), state: some(state) }
+                        let fuel = slots[1].copy()
+                        let new_lit = burn_duration(f, mut level, shared.value, params, fuel)
+                        let new_speed = speed_multiplier(f, mut level, shared.value, params, fuel)
+                        lit = new_lit
+                        lit_total = new_lit
+                        speed = new_speed
+                        if total > 0 and timer < total {
+                            let ratio = f32.nearest(f64(timer)) / f32.nearest(f64(total))
+                            total = total_cook_time(recipe, speed)
+                            timer = i32.saturate(f64(ratio * f32.nearest(f64(total))).ceil())
+                        }
+                        if new_lit > 0 {
+                            consume_fuel(mut level, x, y, z, mut slots)
+                            stacks_changed = true
+                            is_lit = true
+                            changed = true
+                        }
+                    }
+                    if is_lit {
+                        timer += 1
+                        if timer >= total {
+                            timer = 0
+                            total = total_cook_time(recipe, speed)
+                            burn(mut slots, made)
+                            stacks_changed = true
+                            let times = if used.contains(recipe.id) { used[recipe.id].number_int() ?? 0 } else { 0 }
+                            used.insert(recipe.id.copy(), Tag.Int(times + 1))
+                            used_changed = true
+                            changed = true
+                        }
+                    } else {
+                        timer = 0
+                    }
+                } else {
+                    timer = 0
+                }
+            }
+        } else {
+            timer = 0
+        }
+    } else if timer > 0 {
+        // `Mth.clamp`.
+        let back = timer - 2
+        timer = if back < 0 { 0 } else { back.min(total) }
+    }
+    let now = (lit, lit_total, timer, total, speed.to_bits())
+    if now != old {
+        level.keep_block_entity_value(x, y, z, "cooking_time_spent", Tag.Int(timer))
+        level.keep_block_entity_value(x, y, z, "cooking_total_time", Tag.Int(total))
+        level.keep_block_entity_value(x, y, z, "lit_time_remaining", Tag.Int(lit))
+        level.keep_block_entity_value(x, y, z, "lit_total_time", Tag.Int(lit_total))
+        level.keep_block_entity_value(x, y, z, "speed_multiplier", Tag.Float(speed))
+    }
+    if stacks_changed {
+        level.keep_block_entity_value(x, y, z, "Items", items_of(slots))
+    }
+    if used_changed {
+        level.keep_block_entity_value(x, y, z, "RecipesUsed", Tag.Compound(used))
+    }
+    var shown = state
+    if was_lit != is_lit {
+        changed = true
+        shown = try f.with_bool(state, "lit", is_lit)
+        _ = level.set_block_limited(x, y, z, shown, 3, UPDATE_LIMIT)
+    }
+    if changed {
+        // `BlockEntity.setChanged(level, pos, state)`.
+        level.touch_block_entity(x, y, z)
+        if not f.is_air(shown) {
+            try update_output_signal(f, mut level, f.block(shown), x, y, z)
+        }
+    }
+}
+
+// `canBurn`: whether `made` goes in the result slot, empty, or of the same item and components
+// with room for it, as many as the slot holds and the item stacks to.
+fn can_burn(loot: Loot, slots: List<Tag?>, made: Tag) -> bool {
+    let result = slots[2].copy()
+    if count_of(result.copy()) <= 0 {
+        return true
+    }
+    if not same_components(result.copy(), some(made.copy())) {
+        return false
+    }
+    let n = count_of(result) + count_of(some(made.copy()))
+    return n <= MOST.min(loot.items.max_stack_size(made))
+}
+
+// `burn`: `made` put in the result slot, or added to what's there; a wet sponge's cooking fills a
+// bucket in the fuel slot with water; and one of what was cooked used up.
+fn burn(slots: mut List<Tag?>, made: Tag) {
+    let result = slots[2].copy()
+    if count_of(result.copy()) <= 0 {
+        slots[2] = some(made.copy())
+    } else if let r = result {
+        slots[2] = with_count(r, count_of(some(r.copy())) + count_of(some(made.copy())))
+    }
+    if item_of(slots[0].copy()) == "minecraft:wet_sponge" and count_of(slots[1].copy()) > 0 and item_of(slots[1].copy()) == "minecraft:bucket" {
+        slots[1] = some(water_bucket())
+    }
+    if let input = slots[0].copy() {
+        slots[0] = with_count(input, count_of(some(input.copy())) - 1)
+    }
+}
+
+// `consumeFuel`: one of the fuel used up; what its item leaves, `getCraftingRemainder`, takes its
+// place where none's left, else is dropped at the furnace's corner, `Containers.dropItemStack`.
+fn consume_fuel<L: DropLevel + RandomSource>(level: mut L, x: i32, y: i32, z: i32, slots: mut List<Tag?>) {
+    let fuel = slots[1].copy() else return
+    let left = with_count(fuel.copy(), count_of(some(fuel.copy())) - 1)
+    let remainder = crafting_remainder(some(fuel))
+    if let r = remainder {
+        if left == none {
+            slots[1] = some(r)
+            return
+        }
+        spill_stack(mut level, x, y, z, some(r))
+    }
+    slots[1] = left
+}
+
+// `getBurnDuration`: the burn time the fuel's `cooking_fuel` gives in `params`, 0 for a stack
+// with none, nothing being one.
+fn burn_duration<L: BlockAccess + BlockLevel + DropLevel>(f: Facts, level: mut L, loot: Loot, params: LootParams, fuel: Tag?) -> i32 {
+    let s = fuel else return 0
+    let Tag.Compound(c) = loot.items.component(s, String("minecraft:cooking_fuel")) ?? Tag.End else return 0
+    if not c.contains("burn_time") {
+        return 0
+    }
+    var random = level.lend_level_random()
+    var missing = List<String>()
+    let v = context_int(loot, f, level, mut random, params, c["burn_time"], mut missing)
+    level.give_back_level_random(random)
+    for m in missing {
+        level.unimplemented(m.copy())
+    }
+    return v
+}
+
+// `getSpeedMultiplier`: the speed the fuel's `cooking_fuel` gives in `params`, 1 for a stack
+// with none.
+fn speed_multiplier<L: BlockAccess + BlockLevel + DropLevel>(f: Facts, level: mut L, loot: Loot, params: LootParams, fuel: Tag?) -> f32 {
+    let s = fuel else return 1.0f32
+    let Tag.Compound(c) = loot.items.component(s, String("minecraft:cooking_fuel")) ?? Tag.End else return 1.0f32
+    if not c.contains("speed_multiplier") {
+        return 1.0f32
+    }
+    var random = level.lend_level_random()
+    var missing = List<String>()
+    let v = context_float(loot, f, level, mut random, params, c["speed_multiplier"], mut missing)
+    level.give_back_level_random(random)
+    for m in missing {
+        level.unimplemented(m.copy())
+    }
+    return v
+}
+
+// The furnace's three slots as `Items` holds them, by their `Slot`, nothing in those it hasn't.
+fn slots_of(tags: JavaHashMap<String, Tag>) -> List<Tag?> {
+    var slots: List<Tag?> = [none, none, none]
+    if not tags.contains("Items") {
+        return slots
+    }
+    let Tag.List(items) = tags["Items"] else return slots
+    for item in items {
+        let Tag.Compound(m) = item else continue
+        if not m.contains("Slot") {
+            continue
+        }
+        let at = match m["Slot"] {
+            Tag.Byte(b) => i32(b) & 255,
+            _ => continue,
+        }
+        if at >= 3 {
+            continue
+        }
+        var stack = m.copy()
+        _ = stack.remove("Slot")
+        slots[usize.wrap(at)] = some(Tag.Compound(stack))
+    }
+    return slots
+}
+
+// The int field `key`, 0 where it has none, as `getIntOr` reads it.
+fn int_of(tags: JavaHashMap<String, Tag>, key: str) -> i32 {
+    if not tags.contains(key) {
+        return 0
+    }
+    return tags[key].number_int() ?? 0
+}
+
+// A stack's item, by its whole ID, air for nothing.
+fn item_of(stack: Tag?) -> String {
+    let s = stack else return String("minecraft:air")
+    let Tag.Compound(m) = s else return String("minecraft:air")
+    if not m.contains("id") {
+        return String("minecraft:air")
+    }
+    return match m["id"] {
+        Tag.Str(i) => i.copy(),
+        _ => String("minecraft:air"),
+    }
+}
+
+// `new ItemStack(Items.WATER_BUCKET)`.
+fn water_bucket() -> Tag {
+    var m = JavaHashMap<String, Tag>()
+    m.insert(String("id"), Tag.Str(String("minecraft:water_bucket")))
+    m.insert(String("count"), Tag.Int(1))
+    return Tag.Compound(m)
+}
