@@ -10,6 +10,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -41,6 +42,12 @@ import net.minecraft.server.permissions.PermissionLevel;
  * argument type's ID in {@code command_argument_type} and name, its properties as the packet
  * writes them, {@code serializeToNetwork}, in hex, and its custom suggestions' name, where it has
  * them.
+ *
+ * <p>Each argument's type and each node's command are also numbered by vanilla's own {@code equals},
+ * each the place of the first equal to it, {@code same_type} and {@code same_command}: the
+ * commands packet numbers its nodes in a map that goes by {@code CommandNode.equals}, which
+ * compares a node's name, its type, its command and its children, so nodes alike in those are
+ * written once (CAL-345).
  */
 final class CommandTree {
     private CommandTree() {}
@@ -61,6 +68,8 @@ final class CommandTree {
         for (int level = 0; level <= 4; level++) {
             sources.add(Commands.createCompilationContext(LevelBasedPermissionSet.forLevel(PermissionLevel.byId(level))));
         }
+        Map<Object, Integer> types = new HashMap<>();
+        Map<Object, Integer> commandsSeen = new HashMap<>();
         StringBuilder json = new StringBuilder();
         json.append("{\n  \"game_version\": \"").append(SharedConstants.getCurrentVersion().name()).append("\",\n");
         json.append("  \"nodes\": [\n");
@@ -84,6 +93,9 @@ final class CommandTree {
                 json.append(ids.get(child));
             }
             json.append("], \"executable\": ").append(node.getCommand() != null);
+            if (node.getCommand() != null) {
+                json.append(", \"same_command\": ").append(numbered(commandsSeen, node.getCommand()));
+            }
             json.append(", \"redirect\": ").append(node.getRedirect() == null ? -1 : ids.get(node.getRedirect()));
             int level = 5;
             for (int l = 0; l <= 4; l++) {
@@ -97,6 +109,7 @@ final class CommandTree {
                 ArgumentTypeInfo.Template<?> template = ArgumentTypeInfos.unpack(argument.getType());
                 ArgumentTypeInfo<?, ?> info = template.type();
                 json.append(", \"parser\": ").append(BuiltInRegistries.COMMAND_ARGUMENT_TYPE.getId(info));
+                json.append(", \"same_type\": ").append(numbered(types, argument.getType()));
                 json.append(", \"parser_name\": ").append(quote(BuiltInRegistries.COMMAND_ARGUMENT_TYPE.getKey(info).toString()));
                 json.append(", \"properties\": ").append(quote(properties(template)));
                 if (argument.getCustomSuggestions() != null) {
@@ -107,6 +120,16 @@ final class CommandTree {
         }
         json.append("  ]\n}\n");
         Files.writeString(Path.of(args[0]), json, StandardCharsets.UTF_8);
+    }
+
+    // The number of the first key seen equal to `key`, by its `equals`, or the next number.
+    private static int numbered(Map<Object, Integer> seen, Object key) {
+        Integer n = seen.get(key);
+        if (n == null) {
+            n = seen.size();
+            seen.put(key, n);
+        }
+        return n;
     }
 
     // Each node from `node` down, in the order brigadier keeps its children, numbered as it's
