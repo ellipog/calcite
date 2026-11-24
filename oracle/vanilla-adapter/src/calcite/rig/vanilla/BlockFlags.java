@@ -640,6 +640,23 @@ final class BlockFlags {
         boxes(json, outlines);
         json.append(",\n  \"movement_factors\": [").append(movementFactors()).append("],\n");
         json.append("  \"movement_cases\": [").append(movementCases(movements)).append("]");
+        // Each movement shape's grid, the lines its cells lie between on x, y and z, `getCoords`,
+        // which a box that starts inside it is stopped at (CAL-338).
+        json.append(",\n  \"movement_grids\": [");
+        for (int s = 0; s < movements.shapes.size(); s++) {
+            VoxelShape gridded = movements.shapes.get(s);
+            json.append(s == 0 ? "[" : ", [");
+            for (Direction.Axis axis : Direction.Axis.values()) {
+                json.append(axis == Direction.Axis.X ? "[" : ", [");
+                it.unimi.dsi.fastutil.doubles.DoubleList lines = gridCoords(gridded, axis);
+                for (int i = 0; i < lines.size(); i++) {
+                    json.append(i == 0 ? "" : ", ").append(lines.getDouble(i));
+                }
+                json.append("]");
+            }
+            json.append("]");
+        }
+        json.append("]");
         json.append(",\n  \"face_occludes\": [");
         for (int i = 0; i < faces.shapes.size(); i++) {
             json.append(i == 0 ? "[" : ", [");
@@ -772,12 +789,17 @@ final class BlockFlags {
 
     /** Where {@code shape}'s grid starts on {@code axis}, or ends if {@code last}. */
     private static double gridEnd(VoxelShape shape, Direction.Axis axis, boolean last) throws ReflectiveOperationException {
+        it.unimi.dsi.fastutil.doubles.DoubleList list = gridCoords(shape, axis);
+        return last ? list.getDouble(list.size() - 1) : list.getDouble(0);
+    }
+
+    /** The lines of {@code shape}'s grid on {@code axis}, {@code getCoords}. */
+    private static it.unimi.dsi.fastutil.doubles.DoubleList gridCoords(VoxelShape shape, Direction.Axis axis) throws ReflectiveOperationException {
         if (coords == null) {
             coords = VoxelShape.class.getDeclaredMethod("getCoords", Direction.Axis.class);
             coords.setAccessible(true);
         }
-        it.unimi.dsi.fastutil.doubles.DoubleList list = (it.unimi.dsi.fastutil.doubles.DoubleList) coords.invoke(shape, axis);
-        return last ? list.getDouble(list.size() - 1) : list.getDouble(0);
+        return (it.unimi.dsi.fastutil.doubles.DoubleList) coords.invoke(shape, axis);
     }
 
     /**
@@ -1031,6 +1053,43 @@ final class BlockFlags {
                 }
                 out.append("]");
                 written++;
+                total++;
+                moved += given != distance ? 1 : 0;
+            }
+        }
+        // Boxes that start inside one of a shape's boxes, as an orb a grindstone gives does
+        // (CAL-338): up to 4 a shape, half with their corners on sixteenths of a block, so their
+        // edges fall on the lines of its grid, from a random of their own so the cases above stay
+        // as they were.
+        java.util.Random inside = new java.util.Random(338L);
+        for (int s = 0; s < shapes.shapes.size(); s++) {
+            VoxelShape shape = shapes.shapes.get(s);
+            List<AABB> parts = shape.toAabbs();
+            if (parts.isEmpty()) {
+                continue;
+            }
+            for (int c = 0; c < 4; c++) {
+                AABB part = parts.get(inside.nextInt(parts.size()));
+                int size = inside.nextInt(3);
+                double w = widths[size];
+                double h = heights[size];
+                double x = part.minX + inside.nextDouble() * part.getXsize() - w / 2;
+                double y = part.minY + inside.nextDouble() * part.getYsize() - h / 2;
+                double z = part.minZ + inside.nextDouble() * part.getZsize() - w / 2;
+                if (c % 2 == 0) {
+                    x = Math.round(x * 16.0) / 16.0;
+                    y = Math.round(y * 16.0) / 16.0;
+                    z = Math.round(z * 16.0) / 16.0;
+                }
+                Direction.Axis axis = Direction.Axis.values()[inside.nextInt(3)];
+                AABB box = new AABB(x, y, z, x + w, y + h, z + w);
+                double distance = inside.nextDouble() * 3.0 - 1.5;
+                double given = shape.collide(axis, box, distance);
+                out.append(out.isEmpty() ? "[" : ", [").append(s).append(", ").append(axis.ordinal());
+                for (double v : new double[] {box.minX, box.minY, box.minZ, box.maxX, box.maxY, box.maxZ, distance, given}) {
+                    out.append(", ").append(Double.doubleToLongBits(v));
+                }
+                out.append("]");
                 total++;
                 moved += given != distance ? 1 : 0;
             }
