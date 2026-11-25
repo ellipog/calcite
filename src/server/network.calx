@@ -2022,13 +2022,15 @@ enum StoreTo {
 // A result callback, vanilla's `CommandResultCallback` (D566, D567), told whether a command ran
 // and what it gave: an `execute store`'s, storing the result, or the success, where its step
 // found; two in turn, by place plus one, as `chain` makes them; a function's result said to a
-// source, `commands.function.result`, then another told, `decorateOutputIfNeeded`; or a sum of
-// functions' results, by place, added to.
+// source, `commands.function.result`, then another told, `decorateOutputIfNeeded`; a sum of
+// functions' results, by place, added to; or a source kept in a list, by place, where a
+// function's result is not 0 or, for the last false, is, `execute if function` (CAL-165).
 enum Callback {
     Store(bool, StoreTo)
     Chain(usize, usize)
     Signal(Source, Identifier, usize)
     Add(usize)
+    Filter(usize, Source, bool)
 }
 
 // A frame of the command queue, vanilla's `Frame` (D567): how deep it is; what's told what it
@@ -2055,8 +2057,9 @@ struct Plan {
 // one that ran it and its modifiers, `Continuation`; the end of a command run by a source,
 // `ExecuteCommand`, or by the sources from one on; a function called for a source, with what's
 // told what it returns and whether returning from it returns from the frame it's called in,
-// `CallFunction`; a failure returned from the frame, `FallthroughTask`; and functions' results'
-// sum told a callback, where there's one.
+// `CallFunction`; a failure returned from the frame, `FallthroughTask`; functions' results' sum
+// told a callback, where there's one; and functions called alone for a source, what they return
+// told a callback, `IsolatedCall` (CAL-165).
 enum Action {
     Command(Source, usize)
     Line(usize, usize, Source)
@@ -2067,6 +2070,7 @@ enum Action {
     Call(usize, Source, usize, bool)
     Fallthrough
     Sum(usize, usize)
+    Isolated(List<usize>, Source, usize)
 }
 
 // An entry of the command queue, `CommandQueueEntry`: its frame, by place, and what it runs.
@@ -36345,6 +36349,19 @@ impl Network {
                     try self.callback(back, true, total)
                 }
             },
+            Action.Isolated(called, s, back) => {
+                // `IsolatedCall`: a frame a step deeper, which tells `back` what it returns and,
+                // returning, throws away what's queued at its depth; each function called in it
+                // for `s`, returning from it, then a failure returned, which the first return
+                // stops.
+                let depth = self.frames[frame].depth + 1
+                self.frames.push(QueueFrame { depth: depth, back: back, discard_from: depth })
+                let inner = self.frames.len() - 1
+                for f in called {
+                    self.queue_next(inner, Action.Call(f, s, back, true))
+                }
+                self.queue_next(inner, Action.Fallthrough)
+            },
         }
     }
 
@@ -36375,6 +36392,11 @@ impl Network {
                 self.discard(frame)
                 let list = self.add_sources(sources)
                 self.queue_next(frame, Action.Steps(original, list, plan, i + 1, modifiers | RETURNING))
+                return
+            }
+            if let ExecuteStep.Test(expected, Condition.Function(id, tag)) = steps[i] {
+                // `ExecuteIfFunctionCustomModifier`, which forks and isn't counted.
+                self.function_condition(original, sources, expected, id.copy(), tag, plan, i + 1, frame, modifiers | FORKED)
                 return
             }
             if forks(steps[i]) {
@@ -36434,6 +36456,47 @@ impl Network {
             let list = self.add_sources(runs)
             self.queue_next(frame, Action.Runs(list, 0, plan, modifiers))
         }
+    }
+
+    // `scheduleFunctionConditionsAndTest` (CAL-165): the functions `id` names, or its tag's, as
+    // `FunctionArgument.getFunctions` finds them, none for one not found, which is told no one,
+    // as the step forks; of those, the ones before the first macro function, which can't be made
+    // without arguments, `instantiate`, told no one too; then, where any were found, for each
+    // source in turn, those called alone, `IsolatedCall`, for it kept to itself at most at
+    // `GAMEMASTERS` with no callback, `modifySenderForExecution`, the source kept where what
+    // they return is not 0, for `if`, or is, for `unless`; then the rest of the steps from
+    // `next` for the sources kept, in order, `BuildContexts.Continuation`.
+    fn function_condition(mut self, original: Source, sources: List<Source>, expected: bool, id: Identifier, tag: bool, plan: usize, next: usize, frame: usize, modifiers: u8) {
+        var called = List<usize>()
+        if let names = self.function_names {
+            if tag {
+                for v in names.tag_ids(id) {
+                    called.push(usize.wrap(v))
+                }
+            } else if let f = names.id(id) {
+                called.push(usize.wrap(f))
+            }
+        }
+        if called.is_empty() {
+            return
+        }
+        var made = List<usize>()
+        for f in called {
+            if self.functions[f].is_macro() {
+                break
+            }
+            made.push(f)
+        }
+        let kept = self.add_sources(List<Source>())
+        for s in sources {
+            var alone = s
+            alone.silent = true
+            alone.level = alone.level.min(GAMEMASTERS)
+            alone.callback = 0
+            let back = self.add_callback(Callback.Filter(kept, s, expected))
+            self.queue_next(frame, Action.Isolated(made.copy(), alone, back))
+        }
+        self.queue_next(frame, Action.Steps(original, kept, plan, next, modifiers))
     }
 
     // Whether the plan's end is a custom command executor, `function` or `return` (D567).
@@ -36663,6 +36726,11 @@ impl Network {
             Callback.Add(sum) => {
                 let (_, total) = self.sums[sum]
                 self.sums[sum] = (true, i32.wrap(i64(total) + i64(result)))
+            },
+            Callback.Filter(list, s, expected) => {
+                if (result != 0) == expected {
+                    self.source_lists[list].push(s)
+                }
             },
             Callback.Store(stores_result, to) => {
                 let value = if stores_result { result } else if success { 1 } else { 0 }
@@ -37014,6 +37082,8 @@ impl Network {
                 }
                 return count
             },
+            // Run by the command queue, `build`, never counted.
+            Condition.Function(_, _) => return 0,
             Condition.Stopwatch(named, range) => {
                 // `checkStopwatch`: the one named, which must be there, its elapsed seconds now in
                 // the range.
