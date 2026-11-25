@@ -59,7 +59,7 @@ import server.access.{Access, ban_ip}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done, Loaded}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
-import server.commands.{SOUND_SOURCES, ADVANCEMENT_EVERYTHING, ADVANCEMENT_FROM, ADVANCEMENT_THROUGH, ADVANCEMENT_UNTIL, BossBarAction, Condition, DamageFrom, DataAction, ForceLoadAction, DataPackAction, PackPlace, ItemAction, ItemFrom, ItemTarget, SlotsGiven, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, FunctionArgs, ScheduleAction, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree_for, help_node, parse_in, signable_in, tree, usage}
+import server.commands.{SOUND_SOURCES, CLONE_MOVE, CLONE_NORMAL, CloneFilter, ADVANCEMENT_EVERYTHING, ADVANCEMENT_FROM, ADVANCEMENT_THROUGH, ADVANCEMENT_UNTIL, BossBarAction, Condition, DamageFrom, DataAction, ForceLoadAction, DataPackAction, PackPlace, ItemAction, ItemFrom, ItemTarget, SlotsGiven, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, FunctionArgs, ScheduleAction, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TitleAction, TriggerChange, WeatherKind, failure_context, full_tree_for, help_node, parse_in, signable_in, tree, usage}
 import server.configuration.{Configuration, update_tags}
 import server.layout.{Layout, Placed}
 import server.level.{ChunkPacket, Dropped, EMPTY_TICKS, Heard, Level, LevelEvent, LevelParticles, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, section_key}
@@ -33824,6 +33824,12 @@ impl Network {
                     err(f) => done = some(f),
                 }
             },
+            Parsed.Clone(from_dim, begin, end, to_dim, destination, strict, taking, how) => {
+                match self.clone_command(source, from_dim, begin, end, to_dim, destination, strict, taking, how) {
+                    ok(r) => result = r,
+                    err(f) => done = some(f),
+                }
+            },
             Parsed.FillBiome(from, to, biome, filter) => {
                 match self.fillbiome_command(source, from, to, biome, filter) {
                     ok(r) => result = r,
@@ -38097,6 +38103,181 @@ impl Network {
         }
         self.success(source, said, true)
         return i32.wrap(heard.len())
+    }
+
+    // `clone` as `CloneCommands` runs it (CAL-165): the dimensions named, else the source's,
+    // `argument.dimension.invalid` where there's none; the corners in the first and the
+    // destination in the second, each loaded, `getLoadedBlockPos`; the box between the corners
+    // and the one as big at the destination, which mustn't overlap in one dimension unless it's
+    // `force` or `move`, `commands.clone.overlap`; no more blocks than the game rule
+    // `max_block_modifications`, `commands.clone.toobig`; every chunk of both loaded,
+    // `hasChunksAt`. Then each block the filter takes, z, then y, then x fastest, kept: with its
+    // block entity, saved, in the middle, or where it isn't a whole cube, `isSolidRender` nor
+    // `isCollisionShapeFullBlock`, last, else first, with what was at its destination. With
+    // `move`, each taken made barrier, then air, those that aren't whole first. Then the
+    // destinations made barrier, last first; each block set, those that changed counted; each
+    // block entity loaded with what it saved and its block set again; unless `strict`, the
+    // neighbours of each told, last first, `updateNeighboursOnBlockSet`; and the box's block
+    // ticks copied, `copyAreaFrom`. The source's told how many, and the operators,
+    // `commands.clone.success`, or `commands.clone.failed` where none changed.
+    fn clone_command(mut self, source: Source, from_dim: own Identifier?, begin: own Coordinates, end: own Coordinates, to_dim: own Identifier?, destination: own Coordinates, strict: bool, taking: own CloneFilter, how: i32) -> i32 ! Failure {
+        let fd = try self.dimension_given(from_dim, source.dim)
+        let (x0, y0, z0) = try self.loaded_pos_in(source, begin, fd)
+        let (x1, y1, z1) = try self.loaded_pos_in(source, end, fd)
+        let td = try self.dimension_given(to_dim, source.dim)
+        let (dx, dy, dz) = try self.loaded_pos_in(source, destination, td)
+        let (min_x, min_y, min_z) = (min(x0, x1), min(y0, y1), min(z0, z1))
+        let (max_x, max_y, max_z) = (max(x0, x1), max(y0, y1), max(z0, z1))
+        let (ox, oy, oz) = (dx - min_x, dy - min_y, dz - min_z)
+        let (to_x, to_y, to_z) = (dx + max_x - min_x, dy + max_y - min_y, dz + max_z - min_z)
+        if how == CLONE_NORMAL and fd == td and to_x >= min_x and dx <= max_x and to_y >= min_y and dy <= max_y and to_z >= min_z and dz <= max_z {
+            fail Failure.alone(Component.translatable("commands.clone.overlap", []))
+        }
+        let area = i64(max_x - min_x + 1) * i64(max_y - min_y + 1) * i64(max_z - min_z + 1)
+        let limit = self.world.max_block_modifications
+        if area > i64(limit) {
+            fail Failure.alone(Component.translatable_args("commands.clone.toobig", [Argument.Number(Tag.Int(limit)), Argument.Number(Tag.Long(area))]))
+        }
+        if not self.chunks_loaded(fd, min_x, min_z, max_x, max_z) or not self.chunks_loaded(td, dx, dz, to_x, to_z) {
+            fail Failure.alone(Component.translatable("argument.pos.unloaded", []))
+        }
+        let shared = self.levels[td].shared_env() else fail Failure.alone(Component.literal("Calcite can't set blocks in a level without its blocks"))
+        let Env { facts: f, .. } = shared.value
+        let air = f.ids.air_state
+        let barrier = match f.block_named(String("minecraft:barrier")) {
+            some(b) => f.default_state(b),
+            none => air,
+        }
+        // Each block kept: where it goes, its state, its block entity's data, and what was there.
+        var solid = List<(i32, i32, i32, u32, Tag?, u32)>()
+        var with_entities = List<(i32, i32, i32, u32, Tag?, u32)>()
+        var others = List<(i32, i32, i32, u32, Tag?, u32)>()
+        var clear = Deque<(i32, i32, i32)>()
+        for z in min_z..max_z + 1 {
+            for y in min_y..max_y + 1 {
+                for x in min_x..max_x + 1 {
+                    let state = self.block_at(fd, f, x, y, z) ?? air
+                    let takes = match taking {
+                        CloneFilter.Replace => true,
+                        CloneFilter.Masked => not f.is_air(state),
+                        CloneFilter.Filtered(test) => try self.block_matches(fd, test, x, y, z),
+                    }
+                    if not takes {
+                        continue
+                    }
+                    let there = self.block_at(td, f, x + ox, y + oy, z + oz) ?? air
+                    if let Tag.Compound(saved) = self.levels[fd].saved_block_entity(x, y, z) ?? Tag.End {
+                        var custom = saved.copy()
+                        for key in ["id", "x", "y", "z"] {
+                            _ = custom.remove(key)
+                        }
+                        with_entities.push((x + ox, y + oy, z + oz, state, some(Tag.Compound(custom)), there))
+                        clear.push_last((x, y, z))
+                    } else if not f.solid_render(state) and not f.collision_full_block(state) {
+                        others.push((x + ox, y + oy, z + oz, state, none, there))
+                        clear.push_first((x, y, z))
+                    } else {
+                        solid.push((x + ox, y + oy, z + oz, state, none, there))
+                        clear.push_last((x, y, z))
+                    }
+                }
+            }
+        }
+        let flags = if strict { 2 | 816 } else { 2 }
+        if how == CLONE_MOVE {
+            for (x, y, z) in clear {
+                _ = self.levels[fd].set_block_limited(x, y, z, barrier, flags | 816, UPDATE_LIMIT)
+            }
+            let standard = if strict { flags } else { 3 }
+            for (x, y, z) in clear {
+                _ = self.levels[fd].set_block_limited(x, y, z, air, standard, UPDATE_LIMIT)
+            }
+        }
+        var all = solid
+        for b in with_entities {
+            all.push(b.copy())
+        }
+        for b in others {
+            all.push(b.copy())
+        }
+        var i = all.len()
+        while i > 0 {
+            i -= 1
+            let (x, y, z, _, _, _) = all[i].copy()
+            _ = self.levels[td].set_block_limited(x, y, z, barrier, flags | 816, UPDATE_LIMIT)
+        }
+        var count = 0
+        for (x, y, z, state, _, _) in all.copy() {
+            if self.levels[td].set_block_limited(x, y, z, state, flags, UPDATE_LIMIT) {
+                count += 1
+            }
+        }
+        var items: Shared<ItemCodecs>? = none
+        if let set = self.commands {
+            items = set.tree.items.copy()
+        }
+        for (x, y, z, state, data, _) in with_entities {
+            if let Tag.Compound(tag) = data.copy() ?? Tag.End {
+                if self.levels[td].saved_block_entity(x, y, z) != none {
+                    match self.levels[td].load_block_entity_input(x, y, z, tag, items.copy()) {
+                        ok(_) => {},
+                        err(what) => self.levels[td].unimplemented("A block entity clone copied: {what}"),
+                    }
+                }
+            }
+            _ = self.levels[td].set_block_limited(x, y, z, state, flags, UPDATE_LIMIT)
+        }
+        if not strict {
+            var j = all.len()
+            while j > 0 {
+                j -= 1
+                let (x, y, z, _, _, there) = all[j].copy()
+                self.block_set(td, x, y, z, there)
+            }
+        }
+        let ticks = self.levels[fd].block_ticks_in((min_x, min_y, min_z), (max_x, max_y, max_z))
+        self.levels[td].copy_block_ticks(ticks, ox, oy, oz)
+        if count == 0 {
+            fail Failure.alone(Component.translatable("commands.clone.failed", []))
+        }
+        self.success(source, Component.translatable_args("commands.clone.success", [Argument.Number(Tag.Int(count))]), true)
+        return count
+    }
+
+    // The level of the dimension `id` names, `DimensionArgument.getDimension`, or `fallback`
+    // where none's named; `argument.dimension.invalid` where it names none there is.
+    fn dimension_given(self, id: Identifier?, fallback: usize) -> usize ! Failure {
+        let named = id else return fallback
+        let d = self.world.dimension_of(named.copy()) else fail Failure.alone(Component.translatable("argument.dimension.invalid", [Component.literal(named.to_string())]))
+        return d
+    }
+
+    // `loaded_pos` in the level `d`, `getLoadedBlockPos(context, level, name)` (CAL-165).
+    fn loaded_pos_in(self, source: Source, at: Coordinates, d: usize) -> (i32, i32, i32) ! Failure {
+        let (px, py, pz) = self.point_of(source, at)
+        let x = mth_floor(px)
+        let y = mth_floor(py)
+        let z = mth_floor(pz)
+        if not self.levels[d].full(ChunkPos { x: x >> 4, z: z >> 4 }) {
+            fail Failure.alone(Component.translatable("argument.pos.unloaded", []))
+        }
+        if not self.levels[d].in_height(y) or x < -30000000 or z < -30000000 or x >= 30000000 or z >= 30000000 {
+            fail Failure.alone(Component.translatable("argument.pos.outofworld", []))
+        }
+        return (x, y, z)
+    }
+
+    // `hasChunksAt` of the columns from `x0`, `z0` to `x1`, `z1` in the level `d`: each chunk
+    // full.
+    fn chunks_loaded(self, d: usize, x0: i32, z0: i32, x1: i32, z1: i32) -> bool {
+        for cx in (x0 >> 4)..(x1 >> 4) + 1 {
+            for cz in (z0 >> 4)..(z1 >> 4) + 1 {
+                if not self.levels[d].full(ChunkPos { x: cx, z: cz }) {
+                    return false
+                }
+            }
+        }
+        return true
     }
 
     // `fillbiome` as `FillBiomeCommand` runs it (CAL-165): the corners, each loaded,
