@@ -557,6 +557,13 @@ final class BlockFlags {
             }
             stateSounds.append(id == 0 ? "" : ", ").append(at);
         }
+        // Each state's map color, `MapColor.id`, as `getMapColor` gives it, which a map drawing the
+        // level reads (CAL-167). Vanilla works it out once for each state, from the state alone.
+        StringBuilder mapColors = new StringBuilder();
+        for (int id = 0; id < count; id++) {
+            BlockState state = Block.BLOCK_STATE_REGISTRY.byId(id);
+            mapColors.append(id == 0 ? "" : ", ").append(state.getMapColor(EmptyBlockGetter.INSTANCE, BlockPos.ZERO).id);
+        }
         // Each block with a block entity and its type, as `BlockEntityType.isValid` names it.
         StringBuilder blockEntities = new StringBuilder();
         for (int id = 0; id < BuiltInRegistries.BLOCK.size(); id++) {
@@ -602,6 +609,7 @@ final class BlockFlags {
         json.append("  \"items_of_blocks\": [").append(itemsOfBlocks).append("],\n");
         json.append("  \"place_sounds\": [").append(soundTypes).append("],\n");
         json.append("  \"state_place_sounds\": [").append(stateSounds).append("],\n");
+        json.append("  \"state_map_colors\": [").append(mapColors).append("],\n");
         json.append("  \"item_stack_sizes\": [").append(stacks).append("],\n");
         json.append("  \"push_reactions\": [").append(pushReactions).append("],\n");
         json.append("  \"unbreakable_blocks\": [").append(unbreakable).append("],\n");
