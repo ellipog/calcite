@@ -109,6 +109,18 @@ public final class Levels {
         return RandomSource.create(RandomSupport.mixStafford13(Tape.seed() ^ ((ServerLevel) level).getGameTime()));
     }
 
+    private static long raids;
+
+    /**
+     * The random a raid draws from, where vanilla makes it unseeded, {@code RandomSource.create()}
+     * (CAL-167): the {@code n}th made since the server started seeded with
+     * {@code mixStafford13(seed ^ n)}, as Calcite seeds its raids' with {@code level-random-seed}.
+     */
+    public static synchronized RandomSource raid() {
+        raids++;
+        return RandomSource.create(RandomSupport.mixStafford13(Tape.seed() ^ raids));
+    }
+
     /**
      * The clock {@code ChunkMap} saves chunks by, where vanilla's is the wall clock's,
      * {@code Util.getMillis()} (CAL-261): the game time of the map's level, 50 a tick, so a

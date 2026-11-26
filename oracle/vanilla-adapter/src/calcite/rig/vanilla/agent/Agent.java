@@ -9,6 +9,7 @@ import java.lang.classfile.CodeTransform;
 import java.lang.classfile.MethodModel;
 import java.lang.classfile.MethodTransform;
 import java.lang.classfile.Opcode;
+import java.lang.classfile.instruction.FieldInstruction;
 import java.lang.classfile.instruction.InvokeInstruction;
 import java.lang.classfile.instruction.ReturnInstruction;
 import java.lang.constant.ClassDesc;
@@ -50,7 +51,11 @@ import java.security.ProtectionDomain;
  * {@code InsideBrownianWalk}'s {@code Collections.shuffle}, which draws from a random of its own
  * vanilla seeds from the clock, is {@link Entities#shuffle} instead, with the mob it walks.
  * The dragon fight's respawn builds each spike again with {@link Levels#pillars}' random, seeded
- * from the game time, where vanilla's is unseeded (D672), and {@code ChunkMap} saves chunks by
+ * from the game time, where vanilla's is unseeded (D672), each {@code Raid}'s random is
+ * {@link Levels#raid}'s, seeded by how many raids came before it, where vanilla's is unseeded
+ * (CAL-167), a living entity's effects are kept in the order they came, {@link #linked},
+ * where vanilla's {@code HashMap} orders them by their holders' identity hashes (CAL-167), and
+ * {@code ChunkMap} saves chunks by
  * {@link Levels#saveMillis}, the game time's clock, where vanilla's is the wall clock's (D673).
  *
  * <p>This class names no game class, so loading it loads none: {@code ServerLevel} and
@@ -67,8 +72,19 @@ public final class Agent {
     private static final String INSIDE = "net/minecraft/world/entity/ai/behavior/InsideBrownianWalk";
     private static final String PILLARS = "net/minecraft/world/level/dimension/end/DragonRespawnStage$3";
     private static final String CHUNKS = "net/minecraft/server/level/ChunkMap";
+    private static final String RAID = "net/minecraft/world/entity/raid/Raid";
+    private static final String LIVING = "net/minecraft/world/entity/LivingEntity";
 
     private Agent() {
+    }
+
+    /**
+     * The map a living entity keeps its effects in, where vanilla's is the {@code HashMap}
+     * {@code from} (CAL-167): a {@code LinkedHashMap} of what it holds, so they go in the order
+     * they came.
+     */
+    public static <K, V> java.util.Map<K, V> linked(java.util.Map<K, V> from) {
+        return new java.util.LinkedHashMap<>(from);
     }
 
     public static void premain(String arguments, Instrumentation inst) {
@@ -112,7 +128,7 @@ public final class Agent {
         public byte[] transform(ClassLoader loader, String name, Class<?> redefined, ProtectionDomain domain, byte[] bytes) {
             if (!LEVEL.equals(name) && !LEGACY.equals(name) && !ENTITY.equals(name) && !PLAYER.equals(name)
                     && !PROVIDER.equals(name) && !SHUFFLING.equals(name) && !INSIDE.equals(name) && !PILLARS.equals(name)
-                    && !CHUNKS.equals(name)) {
+                    && !CHUNKS.equals(name) && !RAID.equals(name) && !LIVING.equals(name)) {
                 return null;
             }
             try {
@@ -123,6 +139,7 @@ public final class Agent {
                         : PLAYER.equals(name) ? player(cf, bytes) : PROVIDER.equals(name) ? provider(cf, bytes)
                         : SHUFFLING.equals(name) ? shuffling(cf, bytes) : INSIDE.equals(name) ? inside(cf, bytes)
                         : PILLARS.equals(name) ? pillars(cf, bytes) : CHUNKS.equals(name) ? chunks(cf, bytes)
+                        : RAID.equals(name) ? raid(cf, bytes) : LIVING.equals(name) ? living(cf, bytes)
                         : legacy(cf, bytes);
             } catch (Throwable t) {
                 // A transformer's exception is swallowed by the JVM, and the class loads unchanged,
@@ -344,6 +361,52 @@ public final class Agent {
                 m -> m.methodName().equalsString("tick"), swap));
         if (hooked[0] != 1) {
             throw new IllegalStateException("DragonRespawnStage's pillars call RandomSource.create " + hooked[0] + " times, not once");
+        }
+        return out;
+    }
+
+    // The map LivingEntity's constructor keeps its effects in, activeEffects, Maps.newHashMap()'s,
+    // is Agent.linked(map) instead, a LinkedHashMap, so they're ticked, shown and saved in the
+    // order they came, as Calcite keeps them, where a HashMap's order is its holders' identity
+    // hashes', which differ from run to run (CAL-167).
+    private static byte[] living(ClassFile cf, byte[] bytes) {
+        ClassDesc map = ClassDesc.of("java.util.Map");
+        MethodTypeDesc linked = MethodTypeDesc.of(map, map);
+        int[] hooked = {0};
+        CodeTransform swap = (b, e) -> {
+            if (e instanceof FieldInstruction i && i.opcode() == Opcode.PUTFIELD && i.name().equalsString("activeEffects")) {
+                b.invokestatic(ClassDesc.of("calcite.rig.vanilla.agent.Agent"), "linked", linked);
+                hooked[0]++;
+            }
+            b.with(e);
+        };
+        byte[] out = cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
+                m -> m.methodName().equalsString("<init>"), swap));
+        if (hooked[0] != 1) {
+            throw new IllegalStateException("LivingEntity's constructors set activeEffects " + hooked[0] + " times, not once");
+        }
+        return out;
+    }
+
+    // Each of Raid's constructors' RandomSource.create(), its random field's, is Levels.raid()
+    // instead, so its bar's UUID and its wave spots are drawn as Calcite draws them (CAL-167).
+    private static byte[] raid(ClassFile cf, byte[] bytes) {
+        ClassDesc source = ClassDesc.of("net.minecraft.util.RandomSource");
+        MethodTypeDesc none = MethodTypeDesc.of(source);
+        int[] hooked = {0};
+        CodeTransform swap = (b, e) -> {
+            if (e instanceof InvokeInstruction i && i.opcode() == Opcode.INVOKESTATIC && i.owner().asSymbol().equals(source)
+                    && i.name().equalsString("create") && i.typeSymbol().parameterCount() == 0) {
+                b.invokestatic(ClassDesc.of("calcite.rig.vanilla.agent.Levels"), "raid", none);
+                hooked[0]++;
+                return;
+            }
+            b.with(e);
+        };
+        byte[] out = cf.transformClass(cf.parse(bytes), ClassTransform.transformingMethodBodies(
+                m -> m.methodName().equalsString("<init>"), swap));
+        if (hooked[0] != 2) {
+            throw new IllegalStateException("Raid's constructors call RandomSource.create " + hooked[0] + " times, not twice");
         }
         return out;
     }

@@ -1,24 +1,388 @@
-/// A level's raids, vanilla's `Raids`, in its dimension's `data/minecraft/raids.dat` (CAL-170).
-/// Each level has them from its start, as `ServerLevel`'s constructor asks `computeIfAbsent` for
-/// them, so a new world saves them at its first save. Calcite runs no raid yet: those a world
-/// saved are kept as they were, and only the tick vanilla counts goes on, as `Raids.tick` counts
-/// it each tick the level runs, marking them to be saved every 200.
+/// A level's raids, vanilla's `Raids` and `Raid`, in its dimension's `data/minecraft/raids.dat`
+/// (CAL-170, CAL-167). Each level has them from its start, as `ServerLevel`'s constructor asks
+/// `computeIfAbsent` for them, so a new world saves them at its first save. What a raid is and
+/// keeps lives here, with the rules of its waves that need nothing of the level; its server runs
+/// each raid's tick, `Raid.tick`, as that reads the level, its players and its entities.
 module world.raids
 
+import chat.component.{Argument, Component}
+import java.uuid.{Uuid}
 import nbt.tag.{Tag}
+import random.legacy.{LegacyRandom}
 import resources.identifier.{Identifier}
 import server.log.{Entry}
 import storage.saved.{parse_failed}
+import world.body.{insecure_uuid, uuid_tag}
+import world.boss_bars.{BossBar, BossSent, Viewer}
 
 /// The saved data type they're saved as, `Raids.TYPE`.
 pub fn raids_id() -> Identifier {
     return Identifier { namespace: "minecraft", path: "raids" }
 }
 
-/// A level's raids: those saved, as their list, the next raid's ID and the ticks counted,
-/// its `tick`.
+/// A raid's status, `Raid.RaidStatus`, by its ordinal.
+pub const ONGOING: i32 = 0
+pub const VICTORY: i32 = 1
+pub const LOSS: i32 = 2
+pub const STOPPED: i32 = 3
+
+/// The bar's color, red, `BossBarColor.RED`, and its notches, ten, `NOTCHED_10`.
+const RED: i32 = 2
+const NOTCHED_10: i32 = 2
+
+/// The raid omen level a raid holds at most, `getMaxRaidOmenLevel`.
+pub const MAX_OMEN: i32 = 5
+
+/// The ticks between waves, and before the first, `DEFAULT_PRE_RAID_TICKS`.
+pub const PRE_RAID_TICKS: i32 = 300
+
+/// The kinds of raider a wave has, `Raid.RaiderType.VALUES` in order, by their entity types.
+pub fn raider_types() -> List<str> {
+    return ["minecraft:vindicator", "minecraft:evoker", "minecraft:pillager", "minecraft:witch", "minecraft:ravager"]
+}
+
+// How many of each kind a wave has before its bonus, `spawnsPerWaveBeforeBonus`, by wave.
+fn spawns_before_bonus(kind: usize) -> List<i32> {
+    return match kind {
+        0 => [0, 0, 2, 0, 1, 4, 2, 5],
+        1 => [0, 0, 0, 0, 0, 1, 1, 2],
+        2 => [0, 4, 3, 3, 4, 4, 4, 2],
+        3 => [0, 0, 0, 0, 3, 0, 0, 1],
+        _ => [0, 0, 0, 1, 0, 1, 0, 2],
+    }
+}
+
+/// A raid, `Raid`: what `MAP_CODEC` keeps of it, by its `id` among its level's raids, then what
+/// it holds only while it's loaded: its random, `RandomSource.create()`, seeded where the rig
+/// seeds vanilla's; its bar, `raidEvent`, whose UUID that random drew first; its raiders by wave,
+/// `groupRaiderMap`, each by its entity's ID in the order it joined; each wave's leader,
+/// `groupToLeaderMap`; its celebration's ticks; and where its next wave's to come,
+/// `waveSpawnPos`.
+pub struct Raid {
+    pub id: i32
+    pub started: bool = false
+    pub active: bool = true
+    pub ticks_active: i64 = 0
+    pub omen: i32 = 0
+    pub groups_spawned: i32 = 0
+    pub cooldown: i32 = PRE_RAID_TICKS
+    pub post_ticks: i32 = 0
+    pub total_health: f32 = 0.0f32
+    pub groups: i32 = 0
+    pub status: i32 = ONGOING
+    pub center: (i32, i32, i32) = (0, 0, 0)
+    pub heroes: List<(i64, i64)> = List<(i64, i64)>()
+    pub random: LegacyRandom
+    pub bar: BossBar
+    pub celebration: i32 = 0
+    pub wave_spawn: (i32, i32, i32)? = none
+    pub raiders: List<(i32, i32)> = List<(i32, i32)>()
+    pub leaders: List<(i32, i32)> = List<(i32, i32)>()
+}
+
+/// What a raider sees of its raid as it ticks (CAL-167): its ID, whether it's active, over or
+/// lost, its center, the waves come, whether it's between waves, and each wave's leader.
+pub struct RaidView {
+    pub id: i32
+    pub active: bool
+    pub over: bool
+    pub loss: bool
+    pub center: (i32, i32, i32)
+    pub groups_spawned: i32
+    pub between: bool = false
+    pub leaders: List<(i32, i32)> = List<(i32, i32)>()
+}
+
+/// `getRaidAt` among `views` of the block `pos`, `getNearbyRaid` within 96: of the active raids,
+/// in their order, the one whose center's nearest, a later one only where it's nearer.
+pub fn raid_at(views: List<RaidView>, pos: (i32, i32, i32)) -> RaidView? {
+    var best = 9216.0
+    var found: RaidView? = none
+    for v in views {
+        let d = dist_sqr(v.center, pos)
+        if v.active and d < best {
+            found = some(v.copy())
+            best = d
+        }
+    }
+    return found
+}
+
+/// `getNumGroups` of the difficulty by its ID: none in peaceful, 3 on easy, 5 on normal and 7
+/// on hard.
+pub fn num_groups(difficulty: i32) -> i32 {
+    return match difficulty {
+        1 => 3,
+        2 => 5,
+        3 => 7,
+        _ => 0,
+    }
+}
+
+impl Raid {
+    /// `new Raid(center, difficulty)`, its random seeded with `seed`: active, 300 ticks before
+    /// its first wave, its bar's progress 0, as many waves as the difficulty gives, ongoing. Its
+    /// bar is named `event.minecraft.raid`, red with ten notches, its UUID drawn from its random,
+    /// `createInsecureUUID`.
+    pub fn new(id: i32, center: (i32, i32, i32), difficulty: i32, seed: i64) -> Raid {
+        var random = LegacyRandom.new(seed)
+        let bar = raid_bar(mut random)
+        return Raid { id: id, center: center, groups: num_groups(difficulty), random: random, bar: bar }
+    }
+
+    /// What its raiders see of it.
+    pub fn view(self) -> RaidView {
+        return RaidView { id: self.id, active: self.active, over: self.over(), loss: self.status == LOSS, center: self.center, groups_spawned: self.groups_spawned, between: self.between_waves(), leaders: self.leaders.copy() }
+    }
+
+    /// `isOver`: won or lost.
+    pub fn over(self) -> bool {
+        return self.status == VICTORY or self.status == LOSS
+    }
+
+    /// `getTotalRaidersAlive`: how many are in it.
+    pub fn alive(self) -> i32 {
+        return i32.wrap(self.raiders.len())
+    }
+
+    /// `hasBonusWave`: a raid omen over 1.
+    pub fn bonus_wave(self) -> bool {
+        return self.omen > 1
+    }
+
+    /// `isFinalWave`: as many waves come as it has.
+    pub fn final_wave(self) -> bool {
+        return self.groups_spawned == self.groups
+    }
+
+    /// `hasMoreWaves`: its bonus wave not come where it has one, else its last not come.
+    pub fn more_waves(self) -> bool {
+        return if self.bonus_wave() { self.groups_spawned <= self.groups } else { not self.final_wave() }
+    }
+
+    /// `shouldSpawnBonusGroup`: its last wave come, none of its raiders left and a bonus wave.
+    pub fn bonus_group_due(self) -> bool {
+        return self.final_wave() and self.alive() == 0 and self.bonus_wave()
+    }
+
+    /// `shouldSpawnGroup`: no cooldown left, a wave or the bonus one still to come, and none of
+    /// its raiders left.
+    pub fn group_due(self) -> bool {
+        return self.cooldown == 0 and (self.groups_spawned < self.groups or self.bonus_group_due()) and self.alive() == 0
+    }
+
+    /// `getDefaultNumSpawns` of the raider kind `kind` in the wave `wave`, the bonus wave's the
+    /// one after its last.
+    pub fn default_spawns(self, kind: usize, wave: i32, bonus: bool) -> i32 {
+        let counts = spawns_before_bonus(kind)
+        let at = usize.wrap(if bonus { self.groups } else { wave })
+        return if at < counts.len() { counts[at] } else { 0 }
+    }
+
+    /// `getPotentialBonusSpawns` of the raider kind `kind` in the wave `wave` on the difficulty
+    /// `difficulty`, drawn from its random: vindicators and pillagers up to one on easy, drawn
+    /// whether there's one, one on normal and two on hard; a witch one past easy in waves 3, 5
+    /// and on; a ravager one in a bonus wave past easy; evokers none.
+    pub fn bonus_spawns(mut self, kind: usize, wave: i32, difficulty: i32, bonus: bool) -> i32 {
+        let easy = difficulty == 1
+        let normal = difficulty == 2
+        var most = 0
+        if kind == 0 or kind == 2 {
+            if easy {
+                most = self.random.next_int_below(2)
+            } else if normal {
+                most = 1
+            } else {
+                most = 2
+            }
+        } else if kind == 3 {
+            if easy or wave <= 2 or wave == 4 {
+                return 0
+            }
+            most = 1
+        } else if kind == 4 {
+            most = if not easy and bonus { 1 } else { 0 }
+        } else {
+            return 0
+        }
+        return if most > 0 { self.random.next_int_below(most + 1) } else { 0 }
+    }
+
+    /// `getEnchantOdds`: by its raid omen level, 0.1 at 2, 0.25 at 3, 0.5 at 4, 0.75 at 5.
+    pub fn enchant_odds(self) -> f32 {
+        return match self.omen {
+            2 => 0.1f32,
+            3 => 0.25f32,
+            4 => 0.5f32,
+            5 => 0.75f32,
+            _ => 0.0f32,
+        }
+    }
+
+    /// `absorbRaidOmen` of a player's raid omen of the amplifier `amplifier`: its level that and
+    /// one more, kept to 5. Whether its first wave's still to come, when the player's
+    /// `RAID_TRIGGER` and `RAID_OMEN` count.
+    pub fn absorb(mut self, amplifier: i32) -> bool {
+        self.omen = (self.omen + amplifier + 1).max(0).min(MAX_OMEN)
+        return self.groups_spawned == 0
+    }
+
+    /// `stop`: no longer active, its bar taken from each it's shown to, stopped.
+    pub fn stop(mut self, sent: mut List<BossSent>) {
+        self.active = false
+        self.bar.remove_all(mut sent)
+        self.status = STOPPED
+    }
+
+    /// `isBetweenWaves`: a wave come, none of its raiders left and its cooldown running.
+    pub fn between_waves(self) -> bool {
+        return self.groups_spawned > 0 and self.alive() == 0 and self.cooldown > 0
+    }
+
+    /// `updatePlayers` of those `found`, `validPlayer`'s: each not shown its bar shown it, then
+    /// each it's shown to not among them no longer shown it.
+    pub fn update_players(mut self, found: List<Viewer>, sent: mut List<BossSent>) {
+        for v in found {
+            _ = self.bar.show_to(v, mut sent)
+        }
+        for v in self.bar.viewers.copy() {
+            var still = false
+            for f in found {
+                if f.entity == v.entity and f.serial == v.serial {
+                    still = true
+                }
+            }
+            if not still {
+                _ = self.bar.stop_showing(v, mut sent)
+            }
+        }
+    }
+
+    /// The wave of the raider `id`, where it's in it.
+    pub fn wave_of(self, id: i32) -> i32? {
+        for (wave, r) in self.raiders {
+            if r == id {
+                return some(wave)
+            }
+        }
+        return none
+    }
+
+    /// The leader of the wave `wave`, `getLeader`.
+    pub fn leader(self, wave: i32) -> i32? {
+        for (w, r) in self.leaders {
+            if w == wave {
+                return some(r)
+            }
+        }
+        return none
+    }
+
+    /// `removeFromRaid` of the raider `id`: taken out of its wave, where it's in it; whether it
+    /// was.
+    pub fn take_raider(mut self, id: i32) -> bool {
+        for k in 0..self.raiders.len() {
+            let (_, r) = self.raiders[k]
+            if r == id {
+                _ = self.raiders.remove(k)
+                return true
+            }
+        }
+        return false
+    }
+
+    /// `addHeroOfTheVillage` of the player `uuid`, where they aren't one.
+    pub fn add_hero(mut self, uuid: (i64, i64)) {
+        if not self.heroes.contains(uuid) {
+            self.heroes.push(uuid)
+        }
+    }
+
+    /// `removeLeader` of the wave `wave`.
+    pub fn drop_leader(mut self, wave: i32) {
+        var kept = List<(i32, i32)>()
+        for (w, r) in self.leaders {
+            if w != wave {
+                kept.push((w, r))
+            }
+        }
+        self.leaders = kept
+    }
+
+    /// Its `MAP_CODEC` fields, with its `id`, as `Raids.RaidWithId` writes them.
+    pub fn pack(self) -> Tag {
+        var m = JavaHashMap<String, Tag>()
+        m.insert(String("id"), Tag.Int(self.id))
+        m.insert(String("started"), Tag.Byte(if self.started { 1i8 } else { 0i8 }))
+        m.insert(String("active"), Tag.Byte(if self.active { 1i8 } else { 0i8 }))
+        m.insert(String("ticks_active"), Tag.Long(self.ticks_active))
+        m.insert(String("raid_omen_level"), Tag.Int(self.omen))
+        m.insert(String("groups_spawned"), Tag.Int(self.groups_spawned))
+        m.insert(String("cooldown_ticks"), Tag.Int(self.cooldown))
+        m.insert(String("post_raid_ticks"), Tag.Int(self.post_ticks))
+        m.insert(String("total_health"), Tag.Float(self.total_health))
+        m.insert(String("group_count"), Tag.Int(self.groups))
+        m.insert(String("status"), Tag.Str(String(status_name(self.status))))
+        let (x, y, z) = self.center
+        m.insert(String("center"), Tag.IntArray([x, y, z]))
+        var heroes = List<Tag>()
+        for h in self.heroes {
+            heroes.push(uuid_tag(h))
+        }
+        m.insert(String("heroes_of_the_village"), Tag.List(heroes))
+        return Tag.Compound(m)
+    }
+}
+
+// A raid's bar, `new ServerBossEvent(createInsecureUUID(random), RAID_NAME_COMPONENT, RED,
+// NOTCHED_10)`, its progress 0.
+fn raid_bar(random: mut LegacyRandom) -> BossBar {
+    let (most, least) = insecure_uuid(mut random)
+    return BossBar { id: raids_id(), uuid: Uuid { most: most, least: least }, name: Component.translatable(String("event.minecraft.raid"), []), color: RED, overlay: NOTCHED_10 }
+}
+
+/// The bar's name, `RAID_NAME_COMPONENT`.
+pub fn raid_name() -> Component {
+    return Component.translatable(String("event.minecraft.raid"), [])
+}
+
+/// The bar's name with `n` raiders left, `event.minecraft.raid.raiders_remaining` after a dash.
+pub fn raid_name_remaining(n: i32) -> Component {
+    var c = raid_name()
+    c.extra.push(Component.literal(String(" - ")))
+    c.extra.push(Component.translatable_args(String("event.minecraft.raid.raiders_remaining"), [Argument.Number(Tag.Int(n))]))
+    return c
+}
+
+/// The bar's name once it's won, `RAID_BAR_VICTORY_COMPONENT`, or lost.
+pub fn raid_over_name(won: bool) -> Component {
+    return Component.translatable(String(if won { "event.minecraft.raid.victory.full" } else { "event.minecraft.raid.defeat.full" }), [])
+}
+
+/// A status's name, `getSerializedName`.
+pub fn status_name(status: i32) -> str {
+    return match status {
+        1 => "victory",
+        2 => "loss",
+        3 => "stopped",
+        _ => "ongoing",
+    }
+}
+
+// The status named `name`, if there's one.
+fn status_named(name: String) -> i32? {
+    for s in 0..4 {
+        if name == status_name(s) {
+            return some(s)
+        }
+    }
+    return none
+}
+
+/// A level's raids: each raid, in the order its `Int2ObjectOpenHashMap` gives them, the next
+/// raid's ID and the ticks counted, its `tick`.
 pub struct Raids {
-    raids: Tag? = none
+    pub raids: List<Raid> = List<Raid>()
     pub next_id: i32 = 1
     pub ticks: i32 = 0
     /// Whether they've changed since they were saved, as `setDirty` marks them.
@@ -32,10 +396,11 @@ impl Raids {
         return Raids { dirty: true }
     }
 
-    /// The raids of a saved file's root, as the codec reads them: the list kept as it is, and
-    /// `next_id` and `tick`, which it needs. Where it can't read them, what it says is logged and
-    /// they start `fresh`.
-    pub fn load(root: JavaHashMap<String, Tag>, lines: mut List<Entry>) -> Raids {
+    /// The raids of a saved file's root, as the codec reads them, each raid's random seeded by
+    /// `seed_of` its place among those made since the server started: `next_id` and `tick`,
+    /// which it needs, and the list, a raid it can't read left out, as `resultOrPartial` leaves
+    /// it. Where it can't read them, what it says is logged and they start `fresh`.
+    pub fn load(root: JavaHashMap<String, Tag>, lines: mut List<Entry>, seeds: mut RaidSeeds) -> Raids {
         if not root.contains("data") {
             lines.push(parse_failed(raids_id(), String("Not a map: null")))
             return Raids.fresh()
@@ -64,20 +429,57 @@ impl Raids {
             }
         }
         if data.contains("raids") {
-            match data["raids"] {
-                Tag.List(l) => {
-                    if not l.is_empty() {
-                        out.raids = some(Tag.List(l.copy()))
+            if let Tag.List(l) = data["raids"] {
+                for t in l {
+                    if let Tag.Compound(m) = t {
+                        if let r = read_raid(m, mut seeds) {
+                            out.put(r)
+                        }
                     }
-                },
-                _ => {},
+                }
             }
         }
         return out
     }
 
-    /// `Raids.tick` of what Calcite has: the count goes on, an `int`'s, and every 200 they're
-    /// marked to be saved.
+    /// The raid with the ID `id`, `get`.
+    pub fn index_of(self, id: i32) -> usize? {
+        for (k, r) in self.raids.enumerate() {
+            if r.id == id {
+                return some(k)
+            }
+        }
+        return none
+    }
+
+    /// `raidMap.put` of `raid`, where its `Int2ObjectOpenHashMap` keeps it: by its ID's hash,
+    /// `HashCommon.mix`, in a table of the size its count needs.
+    pub fn put(mut self, raid: own Raid) {
+        self.raids.push(raid)
+        self.order()
+    }
+
+    // The raids in the order their map iterates them.
+    fn order(mut self) {
+        var n = 1usize
+        while n * 3 < self.raids.len() * 4 + 4 {
+            n *= 2
+        }
+        n = n.max(2)
+        let mask = i32.wrap(n - 1)
+        var i = 1usize
+        while i < self.raids.len() {
+            var j = i
+            while j > 0 and slot_of(self.raids[j].id, mask) < slot_of(self.raids[j - 1].id, mask) {
+                let t = self.raids.remove(j)
+                self.raids.insert(j - 1, t)
+                j -= 1
+            }
+            i += 1
+        }
+    }
+
+    /// `Raids.tick`'s count, the raids' own ticks left to their server: saved every 200.
     pub fn tick(mut self) {
         self.ticks = self.ticks.wrapping_add(1)
         if self.ticks % 200 == 0 {
@@ -85,15 +487,161 @@ impl Raids {
         }
     }
 
+    /// `getNearbyRaid` of the block `pos` within `most` squared: of the active raids, in their
+    /// order, the one whose center's nearest, a later one only where it's nearer.
+    pub fn nearby(self, pos: (i32, i32, i32), most: f64) -> usize? {
+        var best = most
+        var found: usize? = none
+        let (x, y, z) = pos
+        for (k, r) in self.raids.enumerate() {
+            let d = dist_sqr(r.center, (x, y, z))
+            if r.active and d < best {
+                found = some(k)
+                best = d
+            }
+        }
+        return found
+    }
+
+    /// Whether `nearby` of `pos` within `most` finds `raid`, taken out of them from `k`, as it
+    /// would among them there.
+    pub fn nearby_is(self, pos: (i32, i32, i32), most: f64, raid: Raid, k: usize) -> bool {
+        var best = most
+        var found = false
+        for i in 0..self.raids.len() + 1 {
+            let (active, center, me) = if i == k { (raid.active, raid.center, true) } else if i < k { (self.raids[i].active, self.raids[i].center, false) } else { (self.raids[i - 1].active, self.raids[i - 1].center, false) }
+            let d = dist_sqr(center, pos)
+            if active and d < best {
+                found = me
+                best = d
+            }
+        }
+        return found
+    }
+
+    /// `getUniqueId`: the next ID, counted on first.
+    pub fn unique_id(mut self) -> i32 {
+        self.next_id += 1
+        return self.next_id
+    }
+
     /// Their `data`, as the codec writes it: the list only where there are raids, as
     /// `optionalFieldOf` leaves out its default, then `next_id` and `tick`.
     pub fn pack(self) -> Tag {
         var fields = JavaHashMap<String, Tag>()
-        if let r = self.raids {
-            fields.insert(String("raids"), r.copy())
+        if not self.raids.is_empty() {
+            var list = List<Tag>()
+            for r in self.raids {
+                list.push(r.pack())
+            }
+            fields.insert(String("raids"), Tag.List(list))
         }
         fields.insert(String("next_id"), Tag.Int(self.next_id))
         fields.insert(String("tick"), Tag.Int(self.ticks))
         return Tag.Compound(fields)
     }
+}
+
+/// `Vec3i.distSqr` of two blocks.
+pub fn dist_sqr(a: (i32, i32, i32), b: (i32, i32, i32)) -> f64 {
+    let (ax, ay, az) = a
+    let (bx, by, bz) = b
+    let dx = f64(ax) - f64(bx)
+    let dy = f64(ay) - f64(by)
+    let dz = f64(az) - f64(bz)
+    return dx * dx + dy * dy + dz * dz
+}
+
+// The slot of the key `id` in an open hash table of `mask + 1` slots, `HashCommon.mix(id) & mask`;
+// collisions, which take the next free slot, are left to the order they came in.
+fn slot_of(id: i32, mask: i32) -> i32 {
+    let h = id * -1640531527
+    return (h ^ (h >>> 16)) & mask
+}
+
+/// The seeds of the raids made since the server started, as the rig's agent seeds vanilla's
+/// `RandomSource.create()` in each raid it makes: `mixStafford13(seed ^ n)` of the `n`th.
+pub struct RaidSeeds {
+    pub seed: i64 = 0
+    pub made: i64 = 0
+}
+
+impl RaidSeeds {
+    /// The next raid's seed.
+    pub fn next(mut self) -> i64 {
+        self.made += 1
+        return mix_stafford13(self.seed ^ self.made)
+    }
+}
+
+// `RandomSupport.mixStafford13`.
+fn mix_stafford13(z0: i64) -> i64 {
+    var z = (z0 ^ (z0 >>> 30)) * -4658895280553007687
+    z = (z ^ (z >>> 27)) * -7723592293110705685
+    return z ^ (z >>> 31)
+}
+
+// A raid as `MAP_CODEC` reads it, with its `id`, none where a field it needs is missing or isn't
+// what it should be.
+fn read_raid(m: JavaHashMap<String, Tag>, seeds: mut RaidSeeds) -> Raid? {
+    let id = int_field(m, "id") else return none
+    let started = bool_field(m, "started") else return none
+    let active = bool_field(m, "active") else return none
+    if not m.contains("ticks_active") {
+        return none
+    }
+    let ticks = m["ticks_active"].number_long() else return none
+    let omen = int_field(m, "raid_omen_level") else return none
+    let groups_spawned = int_field(m, "groups_spawned") else return none
+    let cooldown = int_field(m, "cooldown_ticks") else return none
+    let post = int_field(m, "post_raid_ticks") else return none
+    if not m.contains("total_health") {
+        return none
+    }
+    let health = m["total_health"].number_float() else return none
+    let groups = int_field(m, "group_count") else return none
+    if not m.contains("status") {
+        return none
+    }
+    let Tag.Str(named) = m["status"] else return none
+    let status = status_named(named.copy()) else return none
+    if not m.contains("center") {
+        return none
+    }
+    let Tag.IntArray(c) = m["center"] else return none
+    if c.len() != 3 {
+        return none
+    }
+    var heroes = List<(i64, i64)>()
+    if not m.contains("heroes_of_the_village") {
+        return none
+    }
+    if let Tag.List(l) = m["heroes_of_the_village"] {
+        for t in l {
+            if let Tag.IntArray(a) = t {
+                if a.len() == 4 {
+                    heroes.push(((i64(a[0]) << 32) | (i64(a[1]) & 4294967295), (i64(a[2]) << 32) | (i64(a[3]) & 4294967295)))
+                }
+            }
+        }
+    }
+    var random = LegacyRandom.new(seeds.next())
+    let bar = raid_bar(mut random)
+    return some(Raid { id: id, started: started, active: active, ticks_active: ticks, omen: omen, groups_spawned: groups_spawned, cooldown: cooldown, post_ticks: post, total_health: health, groups: groups, status: status, center: (c[0], c[1], c[2]), heroes: heroes, random: random, bar: bar })
+}
+
+// The int at `key`, none where it's missing or isn't a number.
+fn int_field(m: JavaHashMap<String, Tag>, key: str) -> i32? {
+    if not m.contains(key) {
+        return none
+    }
+    return m[key].number_int()
+}
+
+// The boolean at `key`, a byte, none where it's missing or isn't a number.
+fn bool_field(m: JavaHashMap<String, Tag>, key: str) -> bool? {
+    if not m.contains(key) {
+        return none
+    }
+    return m[key].number_bool()
 }
