@@ -73,7 +73,8 @@ public final class Main {
                 new BlockEntityProbe(),
                 new EnvironmentProbe(),
                 new ItemsProbe(),
-                new StatsProbe())) {
+                new StatsProbe(),
+                new CommandParseProbe())) {
             probes.put(probe.name(), probe);
         }
 
