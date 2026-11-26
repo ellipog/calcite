@@ -22,13 +22,14 @@ module world.boat
 
 import nbt.tag.{Tag}
 import server.log.{Entry}
-import world.body.{Body, BodyFacts, EntitySound, PORTAL_DELAY, bool_or, int_or}
+import world.body.{Body, BodyFacts, EntitySound, NEUTRAL_SOURCE, PORTAL_DELAY, bool_or, int_or, uuid_tag}
 import world.collision.{Aabb, CollisionBlocks}
 import world.currents.{height}
 import world.damage.{BYPASSES_INVULNERABILITY, DamageTypes}
 import world.entity_data.{AIR_SUPPLY, BOAT_BUBBLE_TIME, BOAT_PADDLE_LEFT, BOAT_PADDLE_RIGHT, CUSTOM_NAME, CUSTOM_NAME_VISIBLE, EntityData, GLOWING_FLAG, NO_GRAVITY, ON_FIRE_FLAG, SHARED_FLAGS, SILENT, TICKS_FROZEN, VEHICLE_DAMAGE, VEHICLE_HURT, VEHICLE_HURT_DIR, Value, boat_data}
 import world.flowing.{is_source, liquid_of}
 import world.living.{view_vector}
+import world.leash.{ELASTIC_DISTANCE, Held, Holding, Leash, SNAP_DISTANCE, box_distance, lead_stack, leash_pull}
 import world.inside.{Acted, BlockEffect, CLEAR_FREEZE, Collector, EXTINGUISH, FIRE_IGNITE, FREEZE, Gateways, LAVA_IGNITE, Movement, Rain, Touched, bubble_open_above, fluid_effects, inside_blocks, touch_block}
 import world.movement.{MovementStates, Mover, meets}
 import worldgen.facts.{Facts}
@@ -80,8 +81,14 @@ pub struct Boat {
     /// Whether a bubble column's under it this tick, and whether that drags it down.
     above_bubble: bool = false
     bubble_down: bool = false
-    /// Its leash as it was read, `writeLeashData`, saved back as it was (CAL-315).
-    pub leash: Tag? = none
+    /// Its leash, `Leashable`'s, as a mob's is, `world.leash`'s; what holds it as its level found
+    /// it for its tick; how it moves as its level knows it, `getKnownMovement`, its steering
+    /// player's last move where one steers it, else none for its motion; and whether a knot it was
+    /// saved tied to was missed, said once (CAL-315).
+    pub tether: Leash? = none
+    pub holding: Holding? = none
+    pub known: (f64, f64, f64)? = none
+    knot_missed: bool = false
     /// What its tick had its level do, each after so many of the tick's sounds, which its level
     /// takes as it's ticked: its way through a portal, what's missing, and its drop as it breaks.
     pub acted: List<Acted> = List<Acted>()
@@ -189,7 +196,7 @@ impl Boat {
         if damage > 0.0f32 {
             self.data.set(VEHICLE_DAMAGE, Value.Float(damage - 1.0f32))
         }
-        self.base_tick(f, t, types, blocks, min_y, fast_lava, drops, mut sounds)
+        self.base_tick(f, m, t, types, blocks, min_y, fast_lava, drops, mut sounds)
         if self.body.removed {
             return eject
         }
@@ -305,7 +312,7 @@ impl Boat {
     // then 300, what it saves then its level's to take on (D578); the fluids it's in, which push it
     // and splash where it falls in; its fire burning it, 1 of `on_fire` every 20 ticks out of lava;
     // its fall halved in lava; gone 64 below the world; and its flag of being on fire.
-    fn base_tick<B: CollisionBlocks + Gateways>(mut self, f: Facts, t: BodyFacts, types: DamageTypes, blocks: B, min_y: i32, fast_lava: bool, drops: bool, sounds: mut List<EntitySound>) {
+    fn base_tick<B: CollisionBlocks + Gateways>(mut self, f: Facts, m: MovementStates, t: BodyFacts, types: DamageTypes, blocks: B, min_y: i32, fast_lava: bool, drops: bool, sounds: mut List<EntitySound>) {
         if self.body.portal_cooldown > 0 {
             self.body.portal_cooldown -= 1
         }
@@ -332,10 +339,207 @@ impl Boat {
         }
         if self.body.y < f64(min_y - 64) {
             self.body.removed = true
+            self.unleash(true, sounds.len())
         }
         let shown = self.body.fire_shown()
         self.data.set_flag(SHARED_FLAGS, ON_FIRE_FLAG, shown)
         self.body.first_tick = false
+        self.leash_tick(f, m, t, blocks, drops, mut sounds)
+    }
+
+    /// Whether it's leashed, `isLeashed`: its holder found, not only saved (CAL-315).
+    pub fn leashed(self) -> bool {
+        if let l = self.tether {
+            return l.holder != none
+        }
+        return false
+    }
+
+    /// What holds its leash, `getLeashHolder`, where it's found (CAL-315).
+    pub fn leash_holder(self) -> Held? {
+        if let l = self.tether {
+            return l.holder
+        }
+        return none
+    }
+
+    /// The knot its leash ties it to, 0 for none (CAL-315).
+    pub fn knot_holder(self) -> i32 {
+        let h = self.leash_holder() else return 0
+        return if h.knot != none { h.id } else { 0 }
+    }
+
+    /// Whether a leash may tie it to what's at `other`'s box, `canHaveALeashAttachedTo` (CAL-315):
+    /// it's another, within its leash's snap, from the middle of one box to the other's.
+    pub fn may_tie_to(self, other: Aabb, other_id: i32) -> bool {
+        if other_id == self.body.id {
+            return false
+        }
+        return box_distance(other, self.body.bounding_box()) <= SNAP_DISTANCE
+    }
+
+    /// Its leash tied to `h`, `setLeashedTo` but for what's sent (CAL-315): its leash's turn kept
+    /// where it had one. Whether it rides something it would leave, `stopRiding`.
+    pub fn tie(mut self, h: Held) -> bool {
+        var momentum = 0.0
+        if let l = self.tether {
+            momentum = l.momentum
+        }
+        let id = h.id
+        self.tether = some(Leash { holder: some(h), momentum: momentum })
+        self.body.leashed_to = some(id)
+        return self.body.vehicle != none
+    }
+
+    /// Its leash let go, but for what's dropped and sent (CAL-315): whether it was leashed.
+    pub fn untie(mut self) -> bool {
+        if not self.leashed() {
+            return false
+        }
+        self.tether = none
+        self.body.leashed_to = none
+        return true
+    }
+
+    /// `dropLeash` where `drops`, else `removeLeash` (CAL-315): where it's leashed, its leash gone,
+    /// its lead dropped where it is, `spawnAtLocation`, its link's end for its level to send, and
+    /// the knot it was tied to left, after `heard` of its tick's sounds.
+    pub fn unleash(mut self, drops: bool, heard: usize) {
+        let knot = self.knot_holder()
+        if not self.untie() {
+            return
+        }
+        if drops {
+            let at = (self.body.x, self.body.y, self.body.z)
+            self.act(Acted.Dropped((at, lead_stack())), heard)
+        }
+        self.act(Acted.Leashed(0), heard)
+        if knot != 0 {
+            self.act(Acted.KnotLeft(knot), heard)
+        }
+    }
+
+    /// Its leash's link let go and the knot it left, where it did, taken out of what it did, for
+    /// a level that's hurt it outside its tick to send before its removal (CAL-315).
+    pub fn take_unleashed(mut self) -> (bool, i32) {
+        var unleashed = false
+        var knot = 0
+        var kept = List<Acted>()
+        var kept_after = List<usize>()
+        for k in 0..self.acted.len() {
+            match self.acted[k] {
+                Acted.Leashed(0) => unleashed = true,
+                Acted.KnotLeft(n) => knot = n,
+                other => {
+                    kept.push(other.copy())
+                    kept_after.push(self.acted_after[k])
+                },
+            }
+        }
+        self.acted = kept
+        self.acted_after = kept_after
+        return (unleashed, knot)
+    }
+
+    // `Leashable.tickLeash`, at the end of `Entity.baseTick` (CAL-315): a leash saved found, its
+    // holder as its level found it by UUID among its entities, `restoreLeashFromSave`, or its lead
+    // dropped where it isn't after 100 ticks; a knot's place, the knot there, which its level
+    // makes where there's none, said to be missing. Then, leashed, let go where it or its holder
+    // can't interact with its level, `dropLeash` where `drops`, its level's `entity_drops`, else
+    // `removeLeash`; where its holder's in its level, past its snap, 12, the leash breaks, heard at
+    // its holder, its lead dropped, `leashTooFarBehaviour`; past its slack, 6 less both widths, its
+    // holder's pull, which settles its fall to 1, `onElasticLeashPull`. Its leash's turn then
+    // turns it, and slows by what's under it, `angularFriction`.
+    fn leash_tick<B: CollisionBlocks>(mut self, f: Facts, m: MovementStates, t: BodyFacts, blocks: B, drops: bool, sounds: mut List<EntitySound>) {
+        let l = self.tether.copy() else return
+        let seen = self.holding.take()
+        if l.holder == none {
+            let knot = match l.saved {
+                some(Tag.IntArray(_)) => true,
+                _ => false,
+            }
+            if let found = seen {
+                let id = found.held.id
+                if self.tie(found.held) {
+                    self.act(Acted.Missing(String("A boat leashed leaving what it rides")), sounds.len())
+                }
+                self.act(Acted.Leashed(id), sounds.len())
+            } else if knot {
+                if not self.knot_missed {
+                    self.knot_missed = true
+                    self.act(Acted.Missing(String("A knot made for a boat's leash as it's loaded")), sounds.len())
+                }
+                return
+            } else if self.body.tick_count > 100 {
+                let at = (self.body.x, self.body.y, self.body.z)
+                self.act(Acted.Dropped((at, lead_stack())), sounds.len())
+                self.tether = none
+                return
+            }
+        }
+        if not self.leashed() {
+            return
+        }
+        let h = seen else return
+        if self.body.removed or not h.interacts {
+            self.unleash(drops, sounds.len())
+            return
+        }
+        if not h.here {
+            return
+        }
+        let momentum = l.momentum
+        let distance = box_distance(self.body.bounding_box(), h.bounds)
+        if distance > SNAP_DISTANCE {
+            sounds.push(EntitySound { sound: String("item.lead.break"), x: h.x, y: h.y, z: h.z, volume: 1.0f32, pitch: 1.0f32, source: NEUTRAL_SOURCE })
+            self.unleash(true, sounds.len())
+        } else if distance > ELASTIC_DISTANCE - f64(h.width) - f64(self.body.width) and self.elastic_pull(h) {
+            // `Entity.checkFallDistanceAccumulation`.
+            if self.body.vy > -0.5 and self.body.fall > 1.0 {
+                self.body.fall = 1.0
+            }
+        }
+        // The leash it had turns it, though it may have broken.
+        var turn = momentum
+        if let now = self.tether {
+            turn = now.momentum
+        }
+        self.body.y_rot = f32.nearest(f64(self.body.y_rot) - turn)
+        let friction = if self.body.on_ground {
+            let (px, py, pz) = self.body.on_pos(f, t, blocks, 0.500001f32)
+            m.friction(f.block(blocks.collision_state(px, py, pz) ?? 0)) * 0.91f32
+        } else if self.body.in_water or self.body.in_lava() {
+            0.8f32
+        } else {
+            0.91f32
+        }
+        if let was = self.tether.take() {
+            var now = was
+            now.momentum = now.momentum * f64(friction)
+            self.tether = some(now)
+        }
+    }
+
+    // `checkElasticInteractions` with one point on each, as a boat's holder isn't a quad leash's,
+    // `supportQuadLeashAsHolder` (CAL-315): its holder's pull, where it's past its slack,
+    // `leash_pull`, turning it by ten times its torque, and moving it by the pull, 0.8 across and
+    // 0.2 up, and 0.11 of how much faster its holder moves than it, its known movement. Whether it
+    // pulled.
+    fn elastic_pull(mut self, h: Holding) -> bool {
+        let (vx, vy, vz) = (self.body.vx, self.body.vy, self.body.vz)
+        let moving = self.known ?? (vx, vy, vz)
+        let p = leash_pull(self.body.x, self.body.y, self.body.z, self.body.width, self.body.height, self.body.y_rot, moving, h, ELASTIC_DISTANCE) else return false
+        if let was = self.tether.take() {
+            var l = was
+            l.momentum = l.momentum + 10.0 * p.torque
+            self.tether = some(l)
+        }
+        let (hx, hy, hz) = h.moving
+        let (kx, ky, kz) = moving
+        self.body.vx = vx + (p.x * 0.8 + (hx - kx) * 0.11)
+        self.body.vy = vy + (p.y * 0.2 + (hy - ky) * 0.11)
+        self.body.vz = vz + (p.z * 0.8 + (hz - kz) * 0.11)
+        return true
     }
 
     // `getStatus`: under water, `isUnderwater`, its top at the water level; else in water,
@@ -743,8 +947,10 @@ impl Boat {
         self.data.set(VEHICLE_DAMAGE, Value.Float(damage))
         if creative {
             self.body.removed = true
+            self.unleash(true, heard)
         } else if damage > 40.0f32 {
             self.body.removed = true
+            self.unleash(true, heard)
             if drops {
                 var stack = JavaHashMap<String, Tag>()
                 stack.insert(String("id"), Tag.Str(self.kind.copy()))
@@ -787,8 +993,20 @@ impl Boat {
     pub fn saved(self) -> Tag {
         var t = JavaHashMap<String, Tag>()
         self.body.save_into(mut t, self.type_name())
-        if let leash = self.leash {
-            t.insert(String("leash"), leash.copy())
+        // `writeLeashData`: its holder's UUID, a knot's place, or what it was saved with till
+        // that's found.
+        if let l = self.tether {
+            if let h = l.holder {
+                if let (kx, ky, kz) = h.knot {
+                    t.insert(String("leash"), Tag.IntArray([kx, ky, kz]))
+                } else {
+                    var u = JavaHashMap<String, Tag>()
+                    u.insert(String("UUID"), uuid_tag(h.uuid))
+                    t.insert(String("leash"), Tag.Compound(u))
+                }
+            } else if let saved = l.saved {
+                t.insert(String("leash"), saved.copy())
+            }
         }
         if self.has_chest() {
             // `addChestVehicleSaveData`: its loot table and seed where it has one, else its items,
@@ -832,7 +1050,21 @@ impl Boat {
         self.data.set(NO_GRAVITY, Value.Bool(self.body.no_gravity))
         self.data.set_flag(SHARED_FLAGS, GLOWING_FLAG, bool_or(tag, "Glowing"))
         self.data.set(TICKS_FROZEN, Value.Number(int_or(tag, "TicksFrozen", 0)))
-        self.leash = if tag.contains("leash") { some(tag["leash"].copy()) } else { none }
+        // `readLeashData`: a leash it had and the tag hasn't let go, `removeLeash`; one the tag has
+        // found as it ticks.
+        if not tag.contains("leash") {
+            let knot = self.knot_holder()
+            if self.untie() {
+                self.act(Acted.Leashed(0), 0)
+                if knot != 0 {
+                    self.act(Acted.KnotLeft(knot), 0)
+                }
+            }
+            self.tether = none
+        } else {
+            self.tether = some(Leash { saved: some(tag["leash"].copy()) })
+            self.body.leashed_to = none
+        }
         if self.has_chest() {
             self.read_chest(tag)
         }
