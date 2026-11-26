@@ -8,7 +8,7 @@ Goals:
 - **Performance.** Folia-style regions on every core, ticking in lockstep so results never depend on the thread count.
 - **Vanilla parity.** Worldgen matches block for block and behavior matches vanilla, checked bit for bit by an oracle rig. Bugs and exploits are fixed and listed.
 
-Status: Phases 0 to 5 have passed their gates, and Phase 6, simulation, is next. Before Phase 5 came the design, the oracle rig, the data tables generated from the vanilla jar, the Calx compiler core, and the protocol: Mojang's own 26.3 client joins in online mode, walks and chats with signed chat, the login and configuration suites match vanilla packet for packet, and a recorded session replays exactly. Calx runs the Phase 3 tick-loop benchmark in about 0.7× the time of its Rust reference ([results](https://github.com/ellipog/calx#performance)).
+Status: Phases 0 to 5 have passed their gates, and Phase 6, simulation, is under way: mobs and their brains, redstone, fluids, combat, items' uses, the world-wide systems and vanilla's commands, each compared with vanilla's in the rig's sessions. Before Phase 5 came the design, the oracle rig, the data tables generated from the vanilla jar, the Calx compiler core, and the protocol: Mojang's own 26.3 client joins in online mode, walks and chats with signed chat, the login and configuration suites match vanilla packet for packet, and a recorded session replays exactly. Calx runs the Phase 3 tick-loop benchmark in about 0.7× the time of its Rust reference ([results](https://github.com/ellipog/calx#performance)).
 
 Phase 5 made the world: chunks, storage, regions and worldgen. On the [benchmarks](bench/README.md)' reference machine, an i9-13900K:
 
