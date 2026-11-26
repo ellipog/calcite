@@ -7,10 +7,10 @@
 module server.network
 
 import auth.profile.{GameProfile, is_valid_name}
-import auth.services.{JoinCheck, KeySet, Services}
+import auth.services.{Asked, JoinCheck, KeySet, Services, named_answer, profile_answer}
 import auth.session.{Joined, server_hash}
 import auth.velocity.{channel, request, read}
-import chat.component.{Argument, ClickEvent, Component, Contents, DataSource as TextSource, HoverEvent, NbtText, Score as ScoreText, Style, TextColor, Translation}
+import chat.component.{Argument, ClickEvent, Component, Contents, DataSource as TextSource, HoverEvent, NbtText, ObjectInfo, ObjectText, Score as ScoreText, Style, TextColor, Translation}
 import command.coordinates.{Coordinates, block_pos}
 import command.dispatcher.{BlockInput, BlockNames, BlockTag, BlockTest, Builder, Holder, ItemInput, Known, Message, ResourceNames, Suggestion, Suggestions, Tree, Value as ArgValue, Context as ParseContext, create, entity_type_names, entity_types, parse_from, suggest_entities, suggest_node, suggestion_context}
 import command.item_test.{ItemTest}
@@ -63,7 +63,7 @@ import server.users.{UserCache}
 import server.chat.{Chain, ChatMessage, LastSeenValidator, MOST_PENDING, MessageBody, SignatureCache, Throttler, is_illegal, signed_by_services}
 import server.chunk_jobs.{ChunkContext, ChunkJobs, Done, Loaded}
 import server.chunks.{ChunkSender, Spiral, chunks_held, column}
-import server.commands.{TickAction, WhitelistAction, SOUND_SOURCES, PostEffectAction, CLONE_MOVE, CLONE_NORMAL, CloneFilter, ADVANCEMENT_EVERYTHING, ADVANCEMENT_FROM, ADVANCEMENT_THROUGH, ADVANCEMENT_UNTIL, BossBarAction, Condition, DamageFrom, DataAction, ForceLoadAction, DataPackAction, PackPlace, ItemAction, ItemFrom, ItemTarget, SlotsGiven, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, FunctionArgs, ScheduleAction, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TeamAction, TeamChange, TitleAction, WaypointAction, BorderAction, LootSource, LootTarget, LootTool, DialogAction, ParticleGiven, StopwatchAction, SAVE_ALL, SAVE_FLUSH, SAVE_OFF, TriggerChange, WeatherKind, failure_context, full_tree_for, help_node, parse_in, signable_in, tree, usage}
+import server.commands.{DebugAction, ProfileAsk, TickAction, WhitelistAction, SOUND_SOURCES, PostEffectAction, CLONE_MOVE, CLONE_NORMAL, CloneFilter, ADVANCEMENT_EVERYTHING, ADVANCEMENT_FROM, ADVANCEMENT_THROUGH, ADVANCEMENT_UNTIL, BossBarAction, Condition, DamageFrom, DataAction, ForceLoadAction, DataPackAction, PackPlace, ItemAction, ItemFrom, ItemTarget, SlotsGiven, DataHow, DataSource, DataTarget, Destination, ExecuteEnd, ExecuteStep, Facing, Failure, FunctionArgs, ScheduleAction, TimeAction, GAMEMASTERS, NumberFormatGiven, OWNERS, Parsed, PregenCommand, ScoreboardAction, StoreTarget, TeamAction, TeamChange, TitleAction, WaypointAction, BorderAction, LootSource, LootTarget, LootTool, DialogAction, ParticleGiven, StopwatchAction, SAVE_ALL, SAVE_FLUSH, SAVE_OFF, TriggerChange, WeatherKind, failure_context, full_tree_for, help_node, parse_in, signable_in, tree, usage}
 import server.configuration.{Configuration, update_tags}
 import server.layout.{Layout, Placed}
 import server.level.{ChunkPacket, Dropped, EMPTY_TICKS, Heard, Level, LevelEvent, LevelParticles, PORTAL_RADIUS, SPAWN_RADIUS, SectionChanges, VERSION_SHIFT, region_about, section_key}
@@ -88,7 +88,8 @@ import storage.players.{PlayerFiles, SavedPosition, saved_position}
 import storage.progress.{ProgressFiles}
 import storage.poi.{PoiFormat}
 import storage.saved.{SavedFiles}
-import std.fs.{is_dir, is_file, make_dir, write as write_bytes}
+import std.fs.{is_dir, is_file, make_dir, make_dir_all, write as write_bytes}
+import std.zip.{Writer as ZipWriter}
 import storage.world.{join as join_path}
 import storage.world_gen.{world_gen_id}
 import world.dragon.{HEAD as DRAGON_HEAD, HOLDING_PATTERN, part_size}
@@ -1938,10 +1939,13 @@ impl Outgoing {
     }
 }
 
-// Who hears what a command says, vanilla's `CommandSource`: the console, or the player in a slot.
+// Who hears what a command says, vanilla's `CommandSource`: the console, the player in a slot, or
+// the trace `debug function` writes (CAL-363), which hears all of it, `alwaysAccepts`, so is never
+// kept quiet, and tells no operator.
 enum Output {
     Console
     Player(usize)
+    Trace
 }
 
 // A command's source, vanilla's `CommandSourceStack` (CAL-165): who hears what it says; the
@@ -2059,6 +2063,8 @@ struct Plan {
     steps: List<ExecuteStep>
     end: ExecuteEnd
     signed: List<(String, ChatMessage)>
+    // The command as written, which a trace writes (CAL-363).
+    input: String = String()
 }
 
 // What the command queue runs (D567), vanilla's entry actions, each naming a plan, a list of
@@ -2069,8 +2075,9 @@ struct Plan {
 // `ExecuteCommand`, or by the sources from one on; a function called for a source, with what's
 // told what it returns and whether returning from it returns from the frame it's called in,
 // `CallFunction`; a failure returned from the frame, `FallthroughTask`; functions' results' sum
-// told a callback, where there's one; and functions called alone for a source, what they return
-// told a callback, `IsolatedCall` (CAL-165).
+// told a callback, where there's one; functions called alone for a source, what they return
+// told a callback, `IsolatedCall` (CAL-165); a function `debug function` calls for a source, its ID
+// written to the trace first; and a success it tells a source once they're queued (CAL-363).
 enum Action {
     Command(Source, usize)
     Line(usize, usize, Source)
@@ -2082,12 +2089,121 @@ enum Action {
     Fallthrough
     Sum(usize, usize)
     Isolated(List<usize>, Source, usize)
+    Traced(usize, Source)
+    Said(Source, Component)
 }
 
 // An entry of the command queue, `CommandQueueEntry`: its frame, by place, and what it runs.
 struct QueueEntry {
     frame: usize
     action: Action
+}
+
+// The trace `debug function` writes (CAL-363), vanilla's `DebugCommand.Tracer` and its
+// `PrintWriter`: its file's name in the server's `debug` folder; what's written so far, each line
+// ending with `\n`; the depth of the last line written at one; and whether a command's line
+// waits for what it gives.
+struct Trace {
+    name: String
+    text: String = String()
+    last_indent: i32 = 0
+    waiting: bool = false
+}
+
+impl Trace {
+    // `printIndent`: four spaces for each step deep, and four more.
+    fn indent(mut self, depth: i32) {
+        for _ in 0..depth + 1 {
+            self.text.push_str("    ")
+        }
+    }
+
+    // `indentAndSave`.
+    fn indent_and_save(mut self, depth: i32) {
+        self.indent(depth)
+        self.last_indent = depth
+    }
+
+    // `newLine`: the line of a command waiting on what it gives ended.
+    fn new_line(mut self) {
+        if self.waiting {
+            self.text.push_str("\n")
+            self.waiting = false
+        }
+    }
+
+    // `onCommand`: `[C]` and the command, waiting on what it gives.
+    fn command(mut self, depth: i32, command: String) {
+        self.new_line()
+        self.indent_and_save(depth)
+        self.text.push_str("[C] {command}")
+        self.waiting = true
+    }
+
+    // `onReturn`: ` -> ` and what it gave on the command's line, where it waits, else
+    // `[R = result]` and the command on a line of its own.
+    fn returned(mut self, depth: i32, command: String, result: i32) {
+        if self.waiting {
+            self.text.push_str(" -> {result}\n")
+            self.waiting = false
+            return
+        }
+        self.indent_and_save(depth)
+        self.text.push_str("[R = {result}] {command}\n")
+    }
+
+    // `onCall`: `[F]`, the function and how many commands it has.
+    fn call(mut self, depth: i32, id: String, size: usize) {
+        self.new_line()
+        self.indent_and_save(depth)
+        self.text.push_str("[F] {id} size={size}\n")
+    }
+
+    // `onError`: `[E]` and the message a step deeper than the last line, which, as vanilla's,
+    // ends no line.
+    fn error(mut self, message: String) {
+        self.new_line()
+        let depth = self.last_indent + 1
+        self.indent_and_save(depth)
+        self.text.push_str("[E] {message}")
+    }
+
+    // `sendSystemMessage`: `[M]` and the message a step deeper than the last line.
+    fn message(mut self, text: String) {
+        self.new_line()
+        let depth = self.last_indent + 1
+        self.indent(depth)
+        self.text.push_str("[M] {text}\n")
+    }
+}
+
+// The `perf` recording (CAL-363), `ActiveMetricsRecorder`: whose it is, who's told how it went;
+// when it started, on the caller's clock, `none` while it's only due; the ticks it's counted; whether
+// it's been stopped, `killSwitch`; and each tick's nanoseconds as it ran, for Calcite's own report.
+struct PerfRun {
+    source: Source
+    started: u64? = none
+    ticks: i32 = 0
+    ending: bool = false
+    times: List<u64> = List<u64>()
+}
+
+// How long a `perf` recording runs at most, `PROFILING_MAX_DURATION_SECONDS` (CAL-363).
+const PERF_LIMIT_NS: u64 = 10000000000
+
+// A `fetchprofile` lookup (CAL-363), as vanilla's task on its `nonCriticalIoPool` runs it: its
+// source; what its message shows of what was asked; whether it's by name, and the name; the UUID,
+// once it's known; the request in flight, where there's one; whether it's done; and the profile it
+// found.
+struct ProfileFetch {
+    source: Source
+    shown: Component
+    by_name: bool
+    name: String
+    id: Uuid? = none
+    asked: List<Asked> = List<Asked>()
+    done: bool = false
+    found: GameProfile? = none
 }
 
 // `ChainModifiers`: forked, and returning (D567).
@@ -2282,6 +2398,17 @@ pub struct Network {
     tick_times: List<u64> = List<u64>()
     tick_sum: u64 = 0
     tallied: bool = false
+    // The `debug` profiler (CAL-363): whether it starts at the next tick,
+    // `debugCommandProfilerDelayStart`, and, once it has, the nanoseconds and the tick count it
+    // started at, `TimeProfiler`.
+    profile_due: bool = false
+    profiling: (u64, i32)? = none
+    // The `perf` recording, `metricsRecorder` while it's one that records (CAL-363).
+    perf: PerfRun? = none
+    // The trace `debug function` writes as the queue runs, `ExecutionContext.tracer` (CAL-363).
+    tracer: Trace? = none
+    // The `fetchprofile` lookups waiting on Mojang's services (CAL-363).
+    fetches: List<ProfileFetch> = List<ProfileFetch>()
     // Pregenerating (CAL-71, D275): the tasks running, a dimension's at most, in the order they
     // started; what each source has chosen for the next it starts, by `source_key`; how often the
     // console's told how they go, in nanoseconds, and whether it's told at all; when they were
@@ -3685,6 +3812,9 @@ impl Network {
             self.flush()
             return
         }
+        // The `debug` profiler and the `perf` recording start where they're due, as the main
+        // loop starts them before the tick (CAL-363).
+        self.profilers_start()
         // The tick starts, where vanilla's main-thread executor doesn't run: a chunk that comes
         // to a ticking level ticks from the pass after it (D447). What light's told waits for
         // the main thread's next wake, as vanilla's light work waits for a `pollTask` (CAL-183).
@@ -3707,7 +3837,9 @@ impl Network {
         if self.paused() {
             self.tick_connections(now)
             self.set_in_tick(false)
+            self.profilers_end()
             self.held_reads_in()
+            self.fetches_in()
             self.settle_between()
             self.stop_if_due()
             self.dispatch_all()
@@ -3738,7 +3870,9 @@ impl Network {
         // Before it, the server's own tasks, as its `pollTask` runs them first: the entity
         // chunks read while the tick held for a portal's way made into their entities (D579).
         self.set_in_tick(false)
+        self.profilers_end()
         self.held_reads_in()
+        self.fetches_in()
         self.settle_between()
         self.stop_if_due()
         self.dispatch_all()
@@ -3774,6 +3908,7 @@ impl Network {
     /// The tick that ran took `took` nanoseconds, kept where it ran on past its autosave, as
     /// `tickServer` tallies it, by its count among the last 100 (CAL-360).
     pub fn tick_took(mut self, took: u64) {
+        self.perf_took(took)
         if not self.tallied {
             return
         }
@@ -3784,6 +3919,15 @@ impl Network {
         let i = usize.wrap(self.ticks % 100)
         self.tick_sum = self.tick_sum.wrapping_sub(self.tick_times[i]).wrapping_add(took)
         self.tick_times[i] = took
+    }
+
+    // The tick's `took` nanoseconds kept for the `perf` recording, where one's recording (CAL-363).
+    fn perf_took(mut self, took: u64) {
+        var run = self.perf.take() else return
+        if run.started != none {
+            run.times.push(took)
+        }
+        self.perf = some(run)
     }
 
     // `getAverageTickTimeNanos` (CAL-360): the last ticks' times' sum over as many as there are, up
@@ -34666,7 +34810,7 @@ impl Network {
         match parse_in(set.tree, input.copy(), level, set.types) {
             ok(p) => {
                 self.commands = some(set)
-                self.run_parsed(source, p, signed)
+                self.run_parsed(source, p, signed, input)
             },
             err(f) => {
                 self.commands = some(set)
@@ -34677,17 +34821,17 @@ impl Network {
 
     // A command read, run from `source` as `Commands.performCommand` runs it, the top of a command
     // queue, `queueInitialCommandExecution`, whose return nothing's told (D567).
-    fn run_parsed(mut self, source: Source, p: own Parsed, signed: List<(String, ChatMessage)>) {
-        let plan = self.plan_of(p, signed)
+    fn run_parsed(mut self, source: Source, p: own Parsed, signed: List<(String, ChatMessage)>, input: String) {
+        let plan = self.plan_of(p, signed, input)
         self.in_context(source, Action.Command(source, plan), 0, none)
     }
 
     // A command as the queue runs it, among its plans, by place (D567): an `execute`'s steps and
     // end, or a command alone, which has no steps.
-    fn plan_of(mut self, p: own Parsed, signed: List<(String, ChatMessage)>) -> usize {
+    fn plan_of(mut self, p: own Parsed, signed: List<(String, ChatMessage)>, input: String) -> usize {
         let plan = match p {
-            Parsed.Execute(steps, end) => Plan { steps: steps.copy(), end: end.copy(), signed: signed.copy() },
-            _ => Plan { steps: List<ExecuteStep>(), end: ExecuteEnd.Run(Box(p)), signed: signed.copy() },
+            Parsed.Execute(steps, end) => Plan { steps: steps.copy(), end: end.copy(), signed: signed.copy(), input: input.copy() },
+            _ => Plan { steps: List<ExecuteStep>(), end: ExecuteEnd.Run(Box(p)), signed: signed.copy(), input: input.copy() },
         }
         self.plans.push(plan)
         return self.plans.len() - 1
@@ -34799,6 +34943,30 @@ impl Network {
             Parsed.DefaultMode(mode) => result = self.default_mode_command(source, mode),
             Parsed.Tick(action) => {
                 match self.tick_command(source, action) {
+                    ok(r) => result = r,
+                    err(f) => done = some(f),
+                }
+            },
+            Parsed.Debug(action) => {
+                match self.debug_command(source, action) {
+                    ok(r) => result = r,
+                    err(f) => done = some(f),
+                }
+            },
+            Parsed.Perf(start) => {
+                match self.perf_command(source, start) {
+                    ok(r) => result = r,
+                    err(f) => done = some(f),
+                }
+            },
+            Parsed.Jfr(start) => {
+                match self.jfr_command(start) {
+                    ok(r) => result = r,
+                    err(f) => done = some(f),
+                }
+            },
+            Parsed.FetchProfile(ask) => {
+                match self.fetch_profile_command(source, ask) {
                     ok(r) => result = r,
                     err(f) => done = some(f),
                 }
@@ -36063,6 +36231,7 @@ impl Network {
         match source.output {
             Output.Console => self.tell_server(message, true),
             Output.Player(slot) => self.tell_slot(slot, message),
+            Output.Trace => self.trace_message(message),
         }
     }
 
@@ -36600,6 +36769,7 @@ impl Network {
                 }
             },
         }
+        self.close_trace()
         self.queue_overflow = false
         self.queue.clear()
         self.queue_new.clear()
@@ -36616,6 +36786,458 @@ impl Network {
         if self.library_due and self.function_loops == 0 {
             self.replace_library()
         }
+    }
+
+    // `onCommand` of the trace `debug function` writes, where there's one (CAL-363).
+    fn trace_command(mut self, depth: i32, command: String) {
+        var t = self.tracer.take() else return
+        t.command(depth, command)
+        self.tracer = some(t)
+    }
+
+    // `onReturn` of the trace, where there's one (CAL-363).
+    fn trace_return(mut self, depth: i32, command: String, result: i32) {
+        var t = self.tracer.take() else return
+        t.returned(depth, command, result)
+        self.tracer = some(t)
+    }
+
+    // `onCall` of the trace, where there's one (CAL-363): the function `f` called, with its
+    // commands.
+    fn trace_call(mut self, depth: i32, f: usize) {
+        var t = self.tracer.take() else return
+        t.call(depth, self.functions[f].id.to_string(), self.functions[f].lines.len())
+        self.tracer = some(t)
+    }
+
+    // `onError` of the trace, where there's one, as `handleError` tells it (CAL-363): the
+    // failure's message as text.
+    fn trace_error(mut self, f: Failure) {
+        var t = self.tracer.take() else return
+        t.error(f.message.get_string(self.lang))
+        self.tracer = some(t)
+    }
+
+    // `sendSystemMessage` to the trace, where there's one (CAL-363): the message as text.
+    fn trace_message(mut self, message: Component) {
+        var t = self.tracer.take() else return
+        t.message(message.get_string(self.lang))
+        self.tracer = some(t)
+    }
+
+    // `ExecutionContext.close` (CAL-363): the trace written to the server's `debug` folder,
+    // where there's one, the folder made where it isn't there; one that can't be written is lost,
+    // `Tracing failed` logged.
+    fn close_trace(mut self) {
+        let t = self.tracer.take() else return
+        let folder = "{self.access.server_folder()}/debug"
+        let written = match make_dir_all(folder) {
+            ok => match write_bytes("{folder}/{t.name}", t.text.to_bytes()) {
+                ok => true,
+                err(_) => false,
+            },
+            err(_) => false,
+        }
+        if not written {
+            self.logs.push(Entry.warn("Tracing failed"))
+        }
+    }
+
+    // `DebugCommand.TraceCustomExecutor` (CAL-363): `commands.debug.function.noReturnRun` for
+    // `return run`; `commands.debug.function.noRecursion` where the queue's traced already; then
+    // the functions named, as `FunctionArgument.getFunctions` finds them, and the trace begun,
+    // `debug-trace-` and the date and time, `yyyy-MM-dd_HH.mm.ss`; each queued called for the
+    // source, which says what it's told to the trace, at `GAMEMASTERS` at least, its ID written
+    // first; a macro function, made with no arguments, its failure told the source and not
+    // called. Then the source and the operators told how many commands there are in all, and of
+    // the one function, or how many there are, and the trace's name.
+    fn trace_functions(mut self, s: Source, id: Identifier, tag: bool, modifiers: u8, frame: usize) ! Failure {
+        if modifiers & RETURNING != 0 {
+            fail Failure.alone(Component.translatable("commands.debug.function.noReturnRun", []))
+        }
+        if self.tracer != none {
+            fail Failure.alone(Component.translatable("commands.debug.function.noRecursion", []))
+        }
+        var called = List<usize>()
+        if let names = self.function_names {
+            if tag {
+                for v in names.tag_ids(id) {
+                    called.push(usize.wrap(v))
+                }
+            } else if let f = names.id(id) {
+                called.push(usize.wrap(f))
+            }
+        }
+        if called.is_empty() {
+            let key = if tag { "arguments.function.tag.unknown" } else { "arguments.function.unknown" }
+            fail Failure.alone(Component.translatable(key, [Component.literal(id.to_string())]))
+        }
+        let name = "debug-trace-{file_stamp(self.clock)}.txt"
+        self.tracer = some(Trace { name: name.copy() })
+        var traced = s
+        traced.output = Output.Trace
+        traced.level = traced.level.max(GAMEMASTERS)
+        var total: usize = 0
+        var counted: usize = 0
+        var only: usize? = none
+        for f in called {
+            if self.functions[f].is_macro() {
+                let shown = Component.literal(self.functions[f].id.to_string())
+                self.source_failure(s, Component.translatable("commands.function.error.missing_arguments", [shown]))
+                continue
+            }
+            self.queue_next(frame, Action.Traced(f, traced))
+            total += self.functions[f].lines.len()
+            counted += 1
+            only = if counted == 1 { some(f) } else { none }
+        }
+        let message = match only {
+            some(f) => Component.translatable_args(String("commands.debug.function.success.single"), [Argument.Number(Tag.Int(i32.wrap(total))), Argument.Text(Component.literal(self.functions[f].id.to_string())), Argument.Text(Component.literal(name.copy()))]),
+            none => Component.translatable_args(String("commands.debug.function.success.multiple"), [Argument.Number(Tag.Int(i32.wrap(total))), Argument.Number(Tag.Int(i32.wrap(counted))), Argument.Text(Component.literal(name))]),
+        }
+        self.queue_next(frame, Action.Said(s, message))
+    }
+
+    // `debug start` and `debug stop`, `DebugCommand` (CAL-363). `start`: the profiler due at the
+    // next tick, `commands.debug.alreadyRunning` where it's due or running; the source and the
+    // operators told; it gives 0. `stop`: `commands.debug.notRunning` where it's neither; else
+    // it's stopped and the source and the operators told its seconds and ticks, and the ticks a
+    // second, `%.2f`, which it gives as an int. One stopped while it's only due has run no time
+    // and no ticks, NaN a second, and starts at the next tick all the same, as vanilla's does.
+    fn debug_command(mut self, source: Source, action: DebugAction) -> i32 ! Failure {
+        match action {
+            DebugAction.Start => {
+                if self.profile_due or self.profiling != none {
+                    fail Failure.alone(Component.translatable("commands.debug.alreadyRunning", []))
+                }
+                self.profile_due = true
+                self.success(source, Component.translatable("commands.debug.started", []), true)
+                return 0
+            },
+            DebugAction.Stop => {
+                if not self.profile_due and self.profiling == none {
+                    fail Failure.alone(Component.translatable("commands.debug.notRunning", []))
+                }
+                var nanos: u64 = 0
+                var ticks = 0
+                if let (start, tick) = self.profiling.take() {
+                    nanos = self.now - start
+                    ticks = self.ticks - tick
+                }
+                let seconds = f64.nearest(nanos) / 1000000000.0
+                let rate = f64(ticks) / seconds
+                let shown: List<Argument> = [Argument.Text(Component.literal(format_fixed(seconds, 2))), Argument.Number(Tag.Int(ticks)), Argument.Text(Component.literal(format_fixed(rate, 2)))]
+                self.success(source, Component.translatable_args(String("commands.debug.stopped"), shown), true)
+                return int_of_double(rate)
+            },
+            DebugAction.Function(_, _) => return 0,
+        }
+    }
+
+    // `perf start` and `perf stop`, `PerfCommand` (CAL-363). `start`: a recording due at the
+    // next tick, `commands.perf.alreadyRunning` where one's recording, which one only due isn't
+    // yet, as `isRecordingMetrics` has it; the source told; it gives 0. `stop`: the recording
+    // ends at the end of the tick, `commands.perf.notRunning` where none is; it gives 0.
+    fn perf_command(mut self, source: Source, start: bool) -> i32 ! Failure {
+        let recording = match self.perf {
+            some(p) => p.started != none,
+            none => false,
+        }
+        if start {
+            if recording {
+                fail Failure.alone(Component.translatable("commands.perf.alreadyRunning", []))
+            }
+            self.perf = some(PerfRun { source: source })
+            self.success(source, Component.translatable("commands.perf.started", []), false)
+            return 0
+        }
+        if not recording {
+            fail Failure.alone(Component.translatable("commands.perf.notRunning", []))
+        }
+        var run = self.perf.take() else return 0
+        run.ending = true
+        self.perf = some(run)
+        return 0
+    }
+
+    // `jfr start` and `jfr stop`, `JfrCommand` (CAL-363), as a JVM without the Flight Recorder
+    // runs them, `JvmProfiler.NoOpProfiler`, which Calcite is: `commands.jfr.start.failed`, with
+    // its warning logged, and `commands.jfr.dump.failed` with its exception's message.
+    fn jfr_command(mut self, start: bool) -> i32 ! Failure {
+        if start {
+            self.logs.push(Entry.warn("Attempted to start Flight Recorder, but it's not supported on this JVM"))
+            fail Failure.alone(Component.translatable("commands.jfr.start.failed", []))
+        }
+        fail Failure.alone(Component.translatable("commands.jfr.dump.failed", [Component.literal("Attempted to stop Flight Recorder, but it's not supported on this JVM")]))
+    }
+
+    // At the top of the tick, before what it runs, as the main loop starts them (CAL-363): the
+    // `debug` profiler, where it's due, from now and the tick count; and the `perf` recording,
+    // where there's one, from now where it's due, `createProfiler`, then the tick counted,
+    // `startTick`.
+    fn profilers_start(mut self) {
+        if self.profile_due {
+            self.profile_due = false
+            self.profiling = some((self.now, self.ticks))
+        }
+        var run = self.perf.take() else return
+        if run.started == none {
+            run.started = some(self.now)
+        }
+        run.ticks += 1
+        self.perf = some(run)
+    }
+
+    // At the end of the tick, `endMetricsRecordingTick` (CAL-363): the `perf` recording ended,
+    // where it's been stopped or has run past its 10 seconds, its source told its seconds and
+    // ticks, and the ticks a second, `%.2f`, `whenStopped`; then its report saved,
+    // `saveResults`, and the source told where, `commands.perf.reportSaved`, or
+    // `commands.perf.reportFailed`.
+    fn profilers_end(mut self) {
+        let run = self.perf.take() else return
+        let start = run.started else {
+            self.perf = some(run)
+            return
+        }
+        if not run.ending and self.now <= start + PERF_LIMIT_NS {
+            self.perf = some(run)
+            return
+        }
+        let seconds = f64.nearest(self.now - start) / 1000000000.0
+        let shown: List<Argument> = [Argument.Text(Component.literal(format_fixed(seconds, 2))), Argument.Number(Tag.Int(run.ticks)), Argument.Text(Component.literal(format_fixed(f64(run.ticks) / seconds, 2)))]
+        self.success(run.source, Component.translatable_args(String("commands.perf.stopped"), shown), false)
+        match self.perf_report(run, seconds) {
+            some(name) => self.success(run.source, Component.translatable("commands.perf.reportSaved", [Component.literal(name)]), false),
+            none => {
+                self.source_failure(run.source, Component.translatable("commands.perf.reportFailed", []))
+                self.logs.push(Entry.error("Failed to create report name"))
+            },
+        }
+    }
+
+    // The report of the recording `run` (CAL-363), as `saveResults` zips it in
+    // `debug/profiling`: named for the date and time, `yyyy-MM-dd_HH.mm.ss`, the world and the
+    // game's version, with ` (1)` and on where that's taken, `findAvailableName`; `system.txt`,
+    // and Calcite's own, each tick's nanoseconds, in `server/ticks.csv`. Its name, or `none`
+    // where it can't be written.
+    fn perf_report(self, run: PerfRun, seconds: f64) -> String? {
+        let folder = "{self.access.server_folder()}/debug/profiling"
+        let stem = "{file_stamp(self.clock)}-{self.level_name}-{game_version()}"
+        var name = "{stem}.zip"
+        var n = 0
+        while is_file("{folder}/{name}") or is_dir("{folder}/{name}") {
+            n += 1
+            name = "{stem} ({n}).zip"
+        }
+        let system = "-- System Details --\nDetails:\n\tMinecraft Version: {game_version()}\n\tMinecraft Version ID: {game_version()}\n\tServer Brand: calcite\n\tTicks: {run.ticks}\n\tSeconds: {format_fixed(seconds, 2)}\n"
+        var ticks = String("tick,nanoseconds\n")
+        for i in 0..run.times.len() {
+            ticks.push_str("{i + 1},{run.times[i]}\n")
+        }
+        var w = ZipWriter.new()
+        w.add(String("system.txt"), system.to_bytes())
+        w.add(String("server/ticks.csv"), ticks.to_bytes())
+        match make_dir_all(folder) {
+            ok => {},
+            err(_) => return none,
+        }
+        match write_bytes("{folder}/{name}", w.finish()) {
+            ok => return some(name),
+            err(_) => return none,
+        }
+    }
+
+    // `fetchprofile`, `FetchProfileCommand` (CAL-363). By `name` or `id`, the profile's looked
+    // up off the tick, as `ProfileResolver.Cached` looks it up on the `nonCriticalIoPool`, and
+    // what's found told between ticks, `fetches_in`; it gives 1 at once. Of an `entity`: a
+    // player's profile, or a mannequin's, as its data holds it, `commands.fetchprofile.no_profile`
+    // with its name for any other; it gives 1.
+    fn fetch_profile_command(mut self, source: Source, ask: ProfileAsk) -> i32 ! Failure {
+        match ask {
+            ProfileAsk.Name(name) => {
+                var f = ProfileFetch { source: source, shown: Component.literal(name.copy()), by_name: true, name: name.copy() }
+                self.start_fetch(mut f)
+                self.fetches.push(f)
+                return 1
+            },
+            ProfileAsk.Id(id) => {
+                var f = ProfileFetch { source: source, shown: Component.literal(id.to_string()), by_name: false, name: String(), id: some(id) }
+                self.start_fetch(mut f)
+                self.fetches.push(f)
+                return 1
+            },
+            ProfileAsk.Entity(s) => {
+                let picked = try self.entities_picked(source, s)
+                if picked.is_empty() {
+                    fail Failure.alone(Component.translatable("argument.entity.notfound.entity", []))
+                }
+                match picked[0] {
+                    Picked.Player(slot) => {
+                        var profile: Tag? = none
+                        if let c = self.connections[slot] {
+                            if let p = c.profile {
+                                profile = some(profile_tag(p))
+                            }
+                        }
+                        let shown = self.name_of(slot)
+                        self.report_profile(source, String("commands.fetchprofile.entity.success"), shown, profile ?? Tag.Compound(JavaHashMap<String, Tag>()))
+                    },
+                    Picked.Entity(d, id) => {
+                        let es = self.take_entities(d)
+                        let saved = if es.list.picking(id) != none { es.list.saved(id) } else { Tag.Compound(JavaHashMap<String, Tag>()) }
+                        self.put_entities(d, es)
+                        let shown = self.picked_display_name(d, id)
+                        let Tag.Compound(m) = saved else fail Failure.alone(Component.translatable("commands.fetchprofile.no_profile", [shown]))
+                        var kind = String()
+                        if let k = m.find("id") {
+                            if let Tag.Str(v) = k {
+                                kind = v.copy()
+                            }
+                        }
+                        if kind != "minecraft:mannequin" {
+                            fail Failure.alone(Component.translatable("commands.fetchprofile.no_profile", [shown]))
+                        }
+                        var profile = Tag.Compound(JavaHashMap<String, Tag>())
+                        if let t = m.find("profile") {
+                            profile = t.copy()
+                        }
+                        self.report_profile(source, String("commands.fetchprofile.entity.success"), shown, profile)
+                    },
+                }
+                return 1
+            },
+        }
+    }
+
+    // The first request of the lookup `f` (CAL-363): by name, none where it isn't a valid one,
+    // `StringUtil.isValidPlayerName`; the UUID the cache of names knows, or else the profiles
+    // service's for it, or, where that can't be asked, the cache's answer for no one, an offline
+    // UUID where the server doesn't authenticate; then, or by UUID at once, the session server's
+    // profile. What can't be asked has it done, having found none.
+    fn start_fetch(mut self, f: mut ProfileFetch) {
+        var lines = List<Entry>()
+        if f.id == none {
+            if not is_valid_name(f.name) {
+                f.done = true
+                return
+            }
+            let now = self.clock.unix_ms
+            if let known = self.users.cached(f.name, now) {
+                f.id = some(known.id)
+            } else if let a = self.services.ask_named(f.name, mut lines, self.link) {
+                f.asked.push(a)
+            } else if let r = self.users.resolved(f.name, none, now) {
+                f.id = some(r.id)
+            } else {
+                f.done = true
+            }
+        }
+        if f.asked.is_empty() and not f.done {
+            if let id = f.id {
+                match self.services.ask_profile(id, mut lines, self.link) {
+                    some(a) => f.asked.push(a),
+                    none => f.done = true,
+                }
+            }
+        }
+        for e in lines {
+            self.logs.push(e.copy())
+        }
+    }
+
+    // The lookup `f` moved on, where its request's answered (CAL-363): a name's UUID, from the
+    // profiles service's answer, as the cache of names keeps it, the profile then asked for, or
+    // none found; or the profile, from the session server's. Whether it's done.
+    fn fetch_moved(mut self, f: mut ProfileFetch) -> bool {
+        if f.done or f.asked.is_empty() {
+            return true
+        }
+        if not self.link.done(f.asked[0].call) {
+            return false
+        }
+        var asked = f.asked.pop()!
+        var lines = List<Entry>()
+        match f.id {
+            none => {
+                var found: Named? = none
+                if let (id, named) = named_answer(f.name, mut asked, mut lines, mut self.link) {
+                    found = some(Named { id: id, name: named })
+                }
+                match self.users.resolved(f.name, found, self.clock.unix_ms) {
+                    some(r) => {
+                        f.id = some(r.id)
+                        match self.services.ask_profile(r.id, mut lines, self.link) {
+                            some(a) => f.asked.push(a),
+                            none => f.done = true,
+                        }
+                    },
+                    none => f.done = true,
+                }
+            },
+            some(id) => {
+                f.found = profile_answer(id, mut asked, mut lines, mut self.link)
+                f.done = true
+            },
+        }
+        for e in lines {
+            self.logs.push(e.copy())
+        }
+        return f.done
+    }
+
+    // Between ticks, as `server.execute` runs what the lookups hand back (CAL-363): each lookup
+    // moved on, and each that's done told its source, `commands.fetchprofile.name.success` or
+    // `id.success` with the profile, else their `failure`.
+    fn fetches_in(mut self) {
+        if self.fetches.is_empty() {
+            return
+        }
+        let n = self.fetches.len()
+        var kept = List<ProfileFetch>()
+        for _ in 0..n {
+            var f = self.fetches.remove(0)
+            if not self.fetch_moved(mut f) {
+                kept.push(f)
+                continue
+            }
+            let what = if f.by_name { "name" } else { "id" }
+            match f.found {
+                some(p) => self.report_profile(f.source, "commands.fetchprofile.{what}.success", f.shown, profile_tag(p)),
+                none => self.source_failure(f.source, Component.translatable("commands.fetchprofile.{what}.failure", [f.shown.copy()])),
+            }
+        }
+        self.fetches = kept
+    }
+
+    // `reportResolvedProfile` (CAL-363): the source told `key` with `argument` and, each green in
+    // brackets and a space apart, what copies the profile, written as `ResolvableProfile.CODEC`
+    // writes it, gives its head and summons a mannequin of it, each by its SNBT, and what copies
+    // its head as a component, white, by the component's SNBT.
+    fn report_profile(mut self, source: Source, key: String, argument: Component, profile: Tag) {
+        let written = profile.to_snbt()
+        let head = Component { contents: Contents.Object(ObjectText { info: ObjectInfo.Player(profile.copy(), true), fallback: none }), extra: List<Component>() }
+        let head_written = head.to_nbt().to_snbt()
+        let choices: List<(String, ClickEvent, Component?)> = [
+            (String("commands.fetchprofile.copy_component"), ClickEvent.CopyToClipboard(written.copy()), none),
+            (String("commands.fetchprofile.give_item"), ClickEvent.RunCommand("give @s minecraft:player_head[profile={written}]"), none),
+            (String("commands.fetchprofile.summon_mannequin"), ClickEvent.RunCommand("summon minecraft:mannequin ~ ~ ~ \{profile:{written}\}"), none),
+            (String("commands.fetchprofile.copy_text"), ClickEvent.CopyToClipboard(head_written), some(head.colored("white"))),
+        ]
+        var clickable = Component.empty()
+        for i in 0..choices.len() {
+            let (choice, click, shown) = choices[i].copy()
+            let args: List<Component> = match shown {
+                some(c) => [c],
+                none => [],
+            }
+            var c = Component.translatable(choice, args)
+            c.style.click_event = some(click)
+            if i > 0 {
+                clickable.extra.push(Component.literal(" "))
+            }
+            clickable.extra.push(Component.translatable("chat.square_brackets", [c.colored("green")]))
+        }
+        self.success(source, Component.translatable(key, [argument.copy(), clickable]), false)
     }
 
     // `ExecutionContext.queueNext` (D567): `action` in `frame`, to go in front of what's queued
@@ -36704,10 +37326,20 @@ impl Network {
     fn run_entry(mut self, e: own QueueEntry) ! Failure {
         let frame = e.frame
         match e.action {
-            Action.Command(s, plan) => try self.build(s, [s], plan, 0, frame, 0),
+            Action.Command(s, plan) => {
+                // `BuildContexts.TopLevel`, traced (CAL-363).
+                let at_depth = self.frames[frame].depth
+                let input = self.plans[plan].input.copy()
+                self.trace_command(at_depth, input)
+                try self.build(s, [s], plan, 0, frame, 0)
+            },
             Action.Line(f, i, s) => {
                 let line = self.functions[f].lines[i].copy()
-                let plan = self.plan_of(line, [])
+                let text = if i < self.functions[f].texts.len() { self.functions[f].texts[i].copy() } else { String() }
+                let plan = self.plan_of(line, [], text.copy())
+                // `BuildContexts.Unbound`, traced (CAL-363).
+                let at_depth = self.frames[frame].depth
+                self.trace_command(at_depth, text)
                 try self.build(s, [s], plan, 0, frame, 0)
             },
             Action.Lines(f, i, s) => {
@@ -36732,6 +37364,8 @@ impl Network {
                 // `CallFunction`: a frame a step deeper, which, returning, throws away what's
                 // queued at its depth, or what its caller's would where it returns from that.
                 self.quota -= 1
+                let at_depth = self.frames[frame].depth
+                self.trace_call(at_depth, f)
                 let depth = self.frames[frame].depth + 1
                 let from = if return_parent { self.frames[frame].discard_from } else { depth }
                 self.frames.push(QueueFrame { depth: depth, back: back, discard_from: from })
@@ -36770,6 +37404,14 @@ impl Network {
                 }
                 self.queue_next(inner, Action.Fallthrough)
             },
+            Action.Traced(f, s) => {
+                // `DebugCommand`'s `CallFunction`, which writes the function's ID first.
+                var t = self.tracer.take() else return
+                t.text.push_str("{self.functions[f].id.to_string()}\n")
+                self.tracer = some(t)
+                try self.run_entry(QueueEntry { frame: frame, action: Action.Call(f, s, 0, false) })
+            },
+            Action.Said(s, message) => self.success(s, message.copy(), true),
         }
     }
 
@@ -36817,8 +37459,10 @@ impl Network {
                 match self.execute_step(s, steps[i]) {
                     ok(made) => {
                         if next.len() + made.len() >= FORK_LIMIT {
+                            let limit = Failure.alone(Component.translatable_args(String("command.forkLimit"), [Argument.Number(Tag.Int(i32.wrap(FORK_LIMIT)))]))
+                            self.trace_error(limit)
                             if not forked {
-                                self.command_failed(original, Failure.alone(Component.translatable_args(String("command.forkLimit"), [Argument.Number(Tag.Int(i32.wrap(FORK_LIMIT)))])))
+                                self.command_failed(original, limit)
                             }
                             return
                         }
@@ -36827,6 +37471,7 @@ impl Network {
                         }
                     },
                     err(f) => {
+                        self.trace_error(f)
                         if not forked {
                             self.command_failed(s, f)
                             return
@@ -36898,7 +37543,9 @@ impl Network {
         let kept = self.add_sources(List<Source>())
         for s in sources {
             var alone = s
-            alone.silent = true
+            if not hears_all(s.output) {
+                alone.silent = true
+            }
             alone.level = alone.level.min(GAMEMASTERS)
             alone.callback = 0
             let back = self.add_callback(Callback.Filter(kept, s, expected))
@@ -36914,6 +37561,7 @@ impl Network {
                 return match run.value {
                     Parsed.Function(_, _, _) => true,
                     Parsed.Return(_) => true,
+                    Parsed.Debug(DebugAction.Function(_, _)) => true,
                     _ => false,
                 }
             },
@@ -36946,9 +37594,14 @@ impl Network {
         }
         try self.callback(s.callback, failure == none, result)
         if let f = failure {
+            self.trace_error(f)
             if modifiers & FORKED == 0 {
                 self.command_failed(s, f)
             }
+        } else {
+            let at_depth = self.queue_depth
+            let input = self.plans[plan].input.copy()
+            self.trace_return(at_depth, input, result)
         }
     }
 
@@ -36964,6 +37617,19 @@ impl Network {
                 match self.queue_functions(s, id, tag, args, modifiers, frame) {
                     ok => {},
                     err(f) => {
+                        self.trace_error(f)
+                        if modifiers & FORKED == 0 {
+                            self.command_failed(s, f)
+                        }
+                        try self.callback(s.callback, false, 0)
+                    },
+                }
+            },
+            Parsed.Debug(DebugAction.Function(id, tag)) => {
+                match self.trace_functions(s, id, tag, modifiers, frame) {
+                    ok => {},
+                    err(f) => {
+                        self.trace_error(f)
                         if modifiers & FORKED == 0 {
                             self.command_failed(s, f)
                         }
@@ -37010,7 +37676,9 @@ impl Network {
         }
         let given = try self.function_args(s, args)
         var function_source = s
-        function_source.silent = true
+        if not hears_all(s.output) {
+            function_source.silent = true
+        }
         function_source.level = function_source.level.min(GAMEMASTERS)
         function_source.callback = 0
         if called.len() == 1 {
@@ -44143,7 +44811,7 @@ impl Network {
     fn locate_structure(mut self, source: Source, key: Identifier, tag: bool) -> i32 ! Failure {
         let by = match source.output {
             Output.Player(slot) => self.playing_in(slot),
-            Output.Console => none,
+            _ => none,
         }
         let ask = Locating {
             source: source, by: by, key: key.copy(), tag: tag, tried: [source.dim], dim: source.dim,
@@ -44159,7 +44827,7 @@ impl Network {
     fn locate_biome(mut self, source: Source, key: Identifier, tag: bool) -> i32 ! Failure {
         let by = match source.output {
             Output.Player(slot) => self.playing_in(slot),
-            Output.Console => none,
+            _ => none,
         }
         let ask = Locating {
             source: source, by: by, key: key.copy(), tag: tag, tried: [source.dim], dim: source.dim,
@@ -44177,7 +44845,7 @@ impl Network {
     fn locate_poi(mut self, source: Source, key: Identifier, tag: bool) -> i32 ! Failure {
         let by = match source.output {
             Output.Player(slot) => self.playing_in(slot),
-            Output.Console => none,
+            _ => none,
         }
         let ask = Locating {
             source: source, by: by, key: key.copy(), tag: tag, tried: [source.dim], dim: source.dim,
@@ -44375,7 +45043,7 @@ impl Network {
             if let id = a.by {
                 let slot = match a.source.output {
                     Output.Player(s) => s,
-                    Output.Console => 0,
+                    _ => 0,
                 }
                 if self.playing_in(slot) != some(id) {
                     continue
@@ -46536,6 +47204,7 @@ impl Network {
     fn source_key(self, source: Source) -> String {
         match source.output {
             Output.Console => return String("console"),
+            Output.Trace => return String("trace"),
             Output.Player(slot) => {
                 if let c = self.connections[slot] {
                     if let p = c.profile {
@@ -46852,6 +47521,7 @@ impl Network {
         match source.output {
             Output.Console => self.tell_server(message.copy(), true),
             Output.Player(slot) => self.tell_slot(slot, message.copy()),
+            Output.Trace => self.trace_message(message.copy()),
         }
         if broadcast {
             self.inform_admins(source, message)
@@ -46872,6 +47542,7 @@ impl Network {
                     return
                 }
             },
+            Output.Trace => return,
         }
         var line = Component.translatable("chat.type.admin", [by, message]).colored("gray")
         line.style.italic = some(true)
@@ -46925,6 +47596,12 @@ impl Network {
                 }
                 self.connections[slot] = some(con)
             },
+            Output.Trace => {
+                self.trace_message(f.message.copy())
+                if let c = where_ {
+                    self.trace_message(c)
+                }
+            },
         }
     }
 
@@ -46936,6 +47613,7 @@ impl Network {
         }
         match source.output {
             Output.Console => self.tell_server(message, true),
+            Output.Trace => self.trace_message(message),
             Output.Player(slot) => {
                 var con = self.connections[slot].take() else return
                 self.failure(mut con, message)
@@ -58213,4 +58891,34 @@ fn millis_text(nanos: u64) -> String {
 // where it's them.
 fn camera_id(con: Connection) -> i32 {
     return if con.player.camera == none { con.player.entity_id } else { con.player.camera_id }
+}
+
+// Whether `o` hears all a source says, a trace, so is never kept quiet, as `withSuppressedOutput`
+// leaves a source whose output `alwaysAccepts` (CAL-363).
+fn hears_all(o: Output) -> bool {
+    return match o {
+        Output.Trace => true,
+        _ => false,
+    }
+}
+
+// Java's `(int)` of `v` (CAL-363): 0 for NaN, else rounded toward zero, the ends where it's past
+// them.
+fn int_of_double(v: f64) -> i32 {
+    if v != v {
+        return 0
+    }
+    return i32.saturate(v)
+}
+
+// The date and time `at` is here, as `Util.getFilenameFormattedDateTime` writes it,
+// `yyyy-MM-dd_HH.mm.ss` in the system's time zone (CAL-363).
+fn file_stamp(at: Timestamp) -> String {
+    let d = at.date_time(unsafe { at.local_offset() })
+    return "{d.year}-{two_digits(d.month)}-{two_digits(d.day)}_{two_digits(d.hour)}.{two_digits(d.minute)}.{two_digits(d.second)}"
+}
+
+// `n` with a 0 before it where it's one digit (CAL-363).
+fn two_digits(n: i32) -> String {
+    return if n < 10 { "0{n}" } else { "{n}" }
 }
