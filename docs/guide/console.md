@@ -37,17 +37,22 @@ The bar is drawn only on a terminal that gives its size and takes raw input, nev
 
 ## Commands
 
-The console takes what a vanilla console does, between ticks, so a hosting panel's `stop` works. So far:
+The console takes what a vanilla console does, between ticks, so a hosting panel's `stop` works. Every command a vanilla dedicated server has runs, read from vanilla's own command tree, with vanilla's arguments, errors, feedback and results, for the console and for players by their permission level. What it doesn't know gets vanilla's answer.
+
+Where Calcite differs:
+
+- **`locate`** finds the nearest structure, biome or point of interest anywhere, and in the dimension that has it, where vanilla's stops at the first it comes to ([locate structure](../../rig/differences/locate-nearest.md), [locate biome](../../rig/differences/locate-biome-nearest.md), [locate poi](../../rig/differences/locate-poi-anywhere.md)). A long search answers when it's done without holding the tick up.
+- **`jfr`** fails as it does on a JVM without the Flight Recorder, since Calcite isn't a JVM ([jfr](../../rig/differences/no-flight-recorder.md)). `perf` and `debug` record what Calcite can.
+- **`test`** runs function tests. Block-based tests fail as tests Calcite doesn't run yet ([CAL-376](https://acta.aaenz.no/aaen-studios/calcite#CAL-376)).
+
+Calcite's own commands come after vanilla's:
 
 | Command | What it does |
 | --- | --- |
-| `stop` | Tells each player the server closed, saves, and stops |
-| `gamemode <mode> [<player>]` | As vanilla's; `gmc`, `gms`, `gma` and `gmsp` are short for it |
+| `gmc`, `gms`, `gma`, `gmsp` `[<player>]` | Short for `gamemode creative`, `survival`, `adventure` and `spectator` |
 | `pregen ...` | Generates an area ahead of time ([Pregenerating chunks](../pregen.md)) |
 | `calcite flyspeed [<speed>]` | A player's flying speed as a multiple of vanilla's, up to 1,000, for testing. While they fly, how far a move may go before it's too quick grows with it, so a fast flight isn't sent back |
 | `calcite dimension <dimension> [<player>]` | Takes a player to another dimension, for testing |
-
-The rest of vanilla's come in Phase 6. Anything else gets vanilla's answer to a command it doesn't know.
 
 ## Logs
 
