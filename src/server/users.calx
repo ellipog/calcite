@@ -1,0 +1,224 @@
+/// The players the server knows by name, as vanilla's `CachedUserNameToIdResolver` keeps them in
+/// usercache.json (CAL-361): read as the server starts, each player who joins added, and a name a
+/// command gives found there, else looked up, `findProfileByName`, else, where the server doesn't
+/// authenticate, given its offline UUID. Each is kept for a month from when it was added, and the
+/// 1000 used most recently are written back, compact, each time one is added.
+module server.users
+
+import auth.profile.{GameProfile}
+import java.uuid.{Uuid}
+import json.gson.{compact}
+import json.tree.{Json, Member, parse}
+import server.access.{Named, list_date, parse_date, string_of, user}
+import server.log.{Entry}
+import std.fs.{is_file, read, write}
+import std.time.{DateTime, Timestamp, days_in_month}
+
+// How many players are written back, `GAMEPROFILES_MRU_LIMIT`.
+const KEPT: usize = 1000
+
+// A player known: who they are, when they're forgotten, in milliseconds since 1970, and when
+// they were last used, by the count of uses, `lastAccess`.
+struct Known {
+    named: Named
+    expires: i64
+    last: i64
+}
+
+/// The players known, by name and by UUID, and whether a name no one has is given an offline
+/// profile, `resolveOfflineUsers`.
+pub struct UserCache {
+    known: List<Known>
+    by_name: Map<String, usize>
+    by_id: Map<String, usize>
+    operations: i64
+    /// Whether a name the lookup doesn't find is given an offline profile, as it is where the
+    /// server doesn't authenticate, `online-mode=false`.
+    pub offline: bool
+    // The file, and whether it's written.
+    file: String
+    saves: bool
+    // Whether a player was forgotten as their month was over, for `resolved` to write the file.
+    stale: bool
+}
+
+impl UserCache {
+    /// No one known, written nowhere.
+    pub fn empty() -> UserCache {
+        return UserCache { known: List<Known>(), by_name: Map<String, usize>(), by_id: Map<String, usize>(), operations: 0, offline: true, file: String(), saves: false, stale: false }
+    }
+
+    /// The players in the file `file`, with a warning in `lines` where it can't be read, as
+    /// vanilla's `load` reads them: each object with a UUID, a name and `expiresOn`, a date that
+    /// parses, else passed over, with a warning for the date. They're added from the last to
+    /// the first, so the first is the one used most recently.
+    pub fn load(file: String, lines: mut List<Entry>) -> UserCache {
+        var cache = UserCache.empty()
+        cache.file = file.copy()
+        if not is_file(file) {
+            return cache
+        }
+        let bytes = match read(file) {
+            ok(b) => b,
+            err(_) => {
+                lines.push(Entry.warn("Failed to load profile cache {file}"))
+                return cache
+            },
+        }
+        let text = String.from_utf8(bytes) else {
+            lines.push(Entry.warn("Failed to load profile cache {file}"))
+            return cache
+        }
+        var read_in = List<(Named, i64)>()
+        match parse(text) {
+            some(Json.Array(values)) => {
+                for v in values {
+                    match v {
+                        Json.Object(o) => {
+                            let named = user(o) else continue
+                            let date = string_of(o, "expiresOn") else continue
+                            if let at = parse_date(date) {
+                                read_in.push((named, at))
+                            } else {
+                                lines.push(Entry.warn("Failed to parse date {date}"))
+                            }
+                        },
+                        _ => {},
+                    }
+                }
+            },
+            some(Json.Null) => {},
+            _ => {
+                // Gson reads an empty file as no list at all.
+                if not text.trim().is_empty() {
+                    lines.push(Entry.warn("Failed to load profile cache {file}"))
+                }
+            },
+        }
+        var i = read_in.len()
+        while i > 0 {
+            i -= 1
+            let (named, at) = read_in[i].copy()
+            cache.keep(named, at)
+        }
+        return cache
+    }
+
+    /// From now on, the file's written each time a player's added.
+    pub fn writes_back(mut self) {
+        self.saves = true
+    }
+
+    /// `add`: the player, kept for a month from `now`, `Calendar.add(MONTH, 1)` in the system's
+    /// time zone, and the file written.
+    pub fn add(mut self, named: Named, now: i64) {
+        self.keep(named.copy(), month_later(now))
+        self.save()
+    }
+
+    /// `get(UUID)`: the player with the UUID `id`, where they're known, used now.
+    pub fn of_id(mut self, id: Uuid) -> Named? {
+        let i = self.by_id.get(id.to_string()) else return none
+        self.operations += 1
+        self.known[i].last = self.operations
+        return some(Named { id: self.known[i].named.id, name: self.known[i].named.name.copy() })
+    }
+
+    /// `get(String)`'s first part: the player named `name`, in any case, where they're known and
+    /// their month isn't over at `now`, used now. One whose month is over is forgotten. Where
+    /// it's `none`, the name's to be looked up, where it's a valid name, and given to `resolved`.
+    pub fn cached(mut self, name: String, now: i64) -> Named? {
+        let lower = name.to_lower_root()
+        let i = self.by_name.get(lower) else return none
+        if now >= self.known[i].expires {
+            _ = self.by_id.remove(self.known[i].named.id.to_string())
+            _ = self.by_name.remove(self.known[i].named.name.to_lower_root())
+            self.stale = true
+            return none
+        }
+        self.operations += 1
+        self.known[i].last = self.operations
+        return some(Named { id: self.known[i].named.id, name: self.known[i].named.name.copy() })
+    }
+
+    /// `get(String)`'s end, for a name `cached` didn't know: the player the lookup `found`, else,
+    /// where the server doesn't authenticate, the name in lower case with its offline UUID,
+    /// `createOffline`, either added at `now` and written; else `none`, with the file written
+    /// where a player was forgotten.
+    pub fn resolved(mut self, name: String, found: Named?, now: i64) -> Named? {
+        var profile: Named? = none
+        if let f = found {
+            profile = some(Named { id: f.id, name: f.name.copy() })
+        } else if self.offline {
+            let lower = name.to_lower_root()
+            profile = some(Named { id: GameProfile.offline(lower).id, name: lower })
+        }
+        if let p = profile {
+            self.stale = false
+            self.add(Named { id: p.id, name: p.name.copy() }, now)
+            return some(p)
+        }
+        if self.stale {
+            self.stale = false
+            self.save()
+        }
+        return none
+    }
+
+    // `safeAdd`: the player kept till `expires`, used now, by their name in lower case and by
+    // their UUID.
+    fn keep(mut self, named: own Named, expires: i64) {
+        self.operations += 1
+        let i = self.known.len()
+        self.by_name.insert(named.name.to_lower_root(), i)
+        self.by_id.insert(named.id.to_string(), i)
+        self.known.push(Known { named: named, expires: expires, last: self.operations })
+    }
+
+    /// `save`: the 1000 players known by UUID used most recently, the most recent first, each
+    /// with their UUID, name and `expiresOn`, compact, where the file's written. A file that
+    /// can't be written is let be, as vanilla lets it.
+    pub fn save(self) {
+        if not self.saves {
+            return
+        }
+        var uses = List<i64>()
+        var of_use = Map<i64, usize>()
+        for (_, i) in self.by_id {
+            uses.push(-self.known[i].last)
+            of_use.insert(-self.known[i].last, i)
+        }
+        uses.sort()
+        var items = List<Json>()
+        for u in uses {
+            if items.len() >= KEPT {
+                break
+            }
+            let k = self.known[of_use[u]].copy()
+            items.push(Json.Object([
+                Member { key: String("uuid"), value: Json.Str(k.named.id.to_string()) },
+                Member { key: String("name"), value: Json.Str(k.named.name.copy()) },
+                Member { key: String("expiresOn"), value: Json.Str(list_date(k.expires)) },
+            ]))
+        }
+        match write(self.file, compact(Json.Array(items)).to_bytes()) {
+            ok => {},
+            err(_) => {},
+        }
+    }
+}
+
+// A month from `now`, as `Calendar.add(MONTH, 1)` gives it in the system's time zone: the same
+// day of the next month, or its last where it's shorter, at the same time of day.
+fn month_later(now: i64) -> i64 {
+    let t = Timestamp { unix_ms: now }
+    let offset = unsafe { t.local_offset() }
+    let d = t.date_time(offset)
+    let year = if d.month == 12 { d.year + 1 } else { d.year }
+    let month = if d.month == 12 { 1 } else { d.month + 1 }
+    let day = d.day.min(days_in_month(year, month))
+    let later = DateTime { year: year, month: month, day: day, hour: d.hour, minute: d.minute, second: d.second, milli: d.milli }
+    // The offset then, which summer time may change.
+    let guess = later.timestamp(offset)
+    return later.timestamp(unsafe { guess.local_offset() }).unix_ms
+}

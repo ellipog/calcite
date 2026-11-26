@@ -2,30 +2,59 @@
 /// lists vanilla's `DedicatedPlayerList` reads from the server's folder as it starts:
 /// banned-players.json, banned-ips.json, ops.json and whitelist.json, each a JSON array of
 /// objects. A player is found by their UUID as Java writes it, and an address by the IP that
-/// `IpBanList` cuts from the connection's, as vanilla's `StoredUserList` keys them.
+/// `IpBanList` cuts from the connection's, as vanilla's `StoredUserList` keys them, each list a
+/// Java `HashMap` by those keys, which the commands go over in its order (CAL-361).
 ///
-/// The lists are read once, at start. Vanilla writes the first three back as it starts, and the
-/// whitelist if it isn't there. Calcite writes each one that isn't there, as `[]`, and leaves the
-/// rest as they are, since writing them back only formats them again, until commands change
-/// them (P8.5). Vanilla also writes a list it couldn't read back as `[]`, losing it, which
-/// Calcite doesn't.
+/// The lists are read at start, and the whitelist again by `whitelist reload`. Vanilla writes the
+/// first three back as it starts, and the whitelist if it isn't there. Calcite writes each one
+/// that isn't there, as `[]`, and leaves the rest as they are, since writing them back only
+/// formats them again. A command that changes a list writes it back, as `StoredUserList.save`
+/// writes it, where `writes_back` says so (CAL-361). Vanilla also writes a list it couldn't read
+/// back as `[]`, losing it, which Calcite doesn't.
 module server.access
 
 import chat.component.{Component}
 import java.date.{zone_name}
 import java.uuid.{Uuid}
+import json.gson.{pretty}
 import json.tree.{Json, Member, get, parse}
 import server.log.{Entry}
 import std.fs.{is_file, read, write}
 import std.time.{Timestamp}
 
-/// A ban from banned-players.json or banned-ips.json, as vanilla's `BanListEntry` reads one.
+/// A player's name and UUID, vanilla's `NameAndId`.
+pub struct Named {
+    pub id: Uuid
+    pub name: String
+}
+
+/// A ban, as vanilla's `BanListEntry` holds one: the player's name, or the IP, it bans; when it
+/// was made, in milliseconds since 1970; who made it, `getSource`; when it ends, `none` for
+/// never, or a date that doesn't parse; and why, `none` for the default reason.
 pub struct Ban {
-    /// `reason`, or `none` for the default reason.
-    pub reason: String?
-    /// `expires`, in milliseconds since 1970, or `none` where it's `forever` or a date that
-    /// doesn't parse, which never ends.
+    pub name: String
+    pub created: i64
+    pub source: String
     pub expires: i64?
+    pub reason: String?
+}
+
+impl Ban {
+    /// `getReasonMessage`: the reason, else `multiplayer.disconnect.banned.reason.default`.
+    pub fn reason_message(self) -> Component {
+        if let r = self.reason {
+            return Component.literal(r)
+        }
+        return Component.translatable("multiplayer.disconnect.banned.reason.default", [])
+    }
+}
+
+/// An op, as `ServerOpListEntry` holds one: their name, their permission level, and whether they
+/// may join a full server, `bypassesPlayerLimit`.
+pub struct Op {
+    pub name: String
+    pub level: i32
+    pub bypass: bool
 }
 
 /// Who may join: the four lists and `white-list`.
@@ -33,60 +62,99 @@ pub struct Access {
     /// `white-list` from server.properties, default `true`: whether only ops and the players on
     /// the whitelist may join.
     pub whitelist_on: bool
-    whitelist: Set<String>
-    /// Each op's `bypassesPlayerLimit`, and permission level.
-    ops: Map<String, bool>
-    levels: Map<String, i32>
-    bans: Map<String, Ban>
-    ip_bans: Map<String, Ban>
+    /// `enforce-whitelist`, default `false`: whether the whitelist turned on, or a player taken
+    /// off it or made no op, kicks those it doesn't list, `kickUnlistedPlayers`.
+    pub enforce_whitelist: bool
+    /// `op-permission-level`, default 4: the level `op` makes a player an op at,
+    /// `operatorUserPermissions`.
+    pub op_level: i32
+    whitelist: JavaHashMap<String, String>
+    ops: JavaHashMap<String, Op>
+    bans: JavaHashMap<String, Ban>
+    ip_bans: JavaHashMap<String, Ban>
+    // The folder the lists are in, and whether one a command changes is written back there.
+    folder: String
+    saves: bool
+    // The warnings of lists that couldn't be written, till they're taken.
+    failed: List<Entry>
 }
 
 impl Access {
     /// No one on any list.
     pub fn empty(whitelist_on: bool) -> Access {
-        return Access { whitelist_on: whitelist_on, whitelist: Set<String>(), ops: Map<String, bool>(), levels: Map<String, i32>(), bans: Map<String, Ban>(), ip_bans: Map<String, Ban>() }
+        return Access { whitelist_on: whitelist_on, enforce_whitelist: false, op_level: 4, whitelist: JavaHashMap<String, String>(), ops: JavaHashMap<String, Op>(), bans: JavaHashMap<String, Ban>(), ip_bans: JavaHashMap<String, Ban>(), folder: String("."), saves: false, failed: List<Entry>() }
     }
 
     /// The lists in `folder`, the server's, with a warning in `lines` for each that can't be
     /// read, as vanilla's are. The entries before one that isn't an object are kept, as vanilla
-    /// keeps them, and one without a player or an address is passed over.
+    /// keeps them, and one without a player or an address is passed over. A ban made at a date
+    /// that's missing or doesn't parse was made now, as `new Date()` makes it.
     pub fn load(folder: String, whitelist_on: bool, lines: mut List<Entry>) -> Access {
         var access = Access.empty(whitelist_on)
+        access.folder = folder.copy()
+        let now = unsafe { Timestamp.now() }.unix_ms
         for o in entries(folder, "banned-players.json", "user banlist", mut lines) {
-            if let id = user(o) {
-                access.bans.insert(id, ban(o))
+            if let u = user(o) {
+                access.bans.insert(u.id.to_string(), ban(o, u.name, now))
             }
         }
         for o in entries(folder, "banned-ips.json", "ip banlist", mut lines) {
             if let ip = string_of(o, "ip") {
-                access.ip_bans.insert(ip, ban(o))
+                access.ip_bans.insert(ip.copy(), ban(o, ip, now))
             }
         }
         for o in entries(folder, "ops.json", "operators list", mut lines) {
-            if let id = user(o) {
-                access.ops.insert(id.copy(), flag(o, "bypassesPlayerLimit"))
-                access.levels.insert(id, op_level_of(o))
+            if let u = user(o) {
+                access.ops.insert(u.id.to_string(), Op { name: u.name.copy(), level: op_level_of(o), bypass: flag(o, "bypassesPlayerLimit") })
             }
         }
-        for o in entries(folder, "whitelist.json", "white-list", mut lines) {
-            if let id = user(o) {
-                access.whitelist.insert(id)
-            }
-        }
+        access.read_whitelist(mut lines)
         return access
+    }
+
+    /// From now on, a list a command changes is written back to the folder (CAL-361).
+    pub fn writes_back(mut self) {
+        self.saves = true
+    }
+
+    /// The warnings of the lists that couldn't be written since they were last taken.
+    pub fn take_warnings(mut self) -> List<Entry> {
+        let out = self.failed.copy()
+        self.failed = List<Entry>()
+        return out
+    }
+
+    /// `whitelist reload`: whitelist.json read again, `reloadWhiteList`, where it's there, with a
+    /// warning in `lines` where it can't be (CAL-361).
+    pub fn reload_whitelist(mut self, lines: mut List<Entry>) {
+        self.read_whitelist(mut lines)
+    }
+
+    // `UserWhiteList.load`: where the file's there, the list emptied, then each player in it.
+    fn read_whitelist(mut self, lines: mut List<Entry>) {
+        if not is_file("{self.folder}/whitelist.json") {
+            return
+        }
+        self.whitelist.clear()
+        let found = entries(self.folder, "whitelist.json", "white-list", mut lines)
+        for o in found {
+            if let u = user(o) {
+                self.whitelist.insert(u.id.to_string(), u.name.copy())
+            }
+        }
     }
 
     /// The permission level of the player `id`, as `getProfilePermissions` gives it: an op's
     /// from ops.json, and 0 for anyone else.
     pub fn level(self, id: Uuid) -> i32 {
-        return self.levels.get(id.to_string()) ?? 0
+        let key = id.to_string()
+        return if self.ops.contains(key) { self.ops[key].level } else { 0 }
     }
 
     /// Makes the player `id` an op at `level`, who doesn't bypass the player limit, as a test's
     /// server has them.
     pub fn op(mut self, id: Uuid, level: i32) {
-        self.ops.insert(id.to_string(), false)
-        self.levels.insert(id.to_string(), level)
+        self.ops.insert(id.to_string(), Op { name: String(), level: level, bypass: false })
     }
 
     /// Whether there's any op, as `getOps().isEmpty()` asks (D376).
@@ -97,6 +165,149 @@ impl Access {
     /// Whether the player `id` is an op, whatever their level.
     pub fn is_op(self, id: Uuid) -> bool {
         return self.ops.contains(id.to_string())
+    }
+
+    /// `PlayerList.op`: the player made an op at `op-permission-level`, who may bypass the player
+    /// limit where they could before, and ops.json written (CAL-361).
+    pub fn make_op(mut self, n: Named) {
+        let key = n.id.to_string()
+        let bypass = self.ops.contains(key) and self.ops[key].bypass
+        self.ops.insert(key, Op { name: n.name.copy(), level: self.op_level, bypass: bypass })
+        self.save_ops(true)
+    }
+
+    /// `PlayerList.deop`: whether the player `id` was an op, who isn't now, with ops.json
+    /// written (CAL-361).
+    pub fn deop(mut self, id: Uuid) -> bool {
+        match self.ops.remove(id.to_string()) {
+            some(_) => {},
+            none => return false,
+        }
+        self.save_ops(false)
+        return true
+    }
+
+    /// Whether the player `id` is banned, `isBanned`, though their ban may have expired.
+    pub fn is_banned(self, id: Uuid) -> bool {
+        return self.bans.contains(id.to_string())
+    }
+
+    /// `UserBanList.add`: the player banned by `b`, and banned-players.json written (CAL-361).
+    pub fn ban(mut self, id: Uuid, b: own Ban) {
+        self.bans.insert(id.to_string(), b)
+        self.save_bans(true)
+    }
+
+    /// `UserBanList.remove`: whether the player `id` was banned, who isn't now, with
+    /// banned-players.json written (CAL-361).
+    pub fn pardon(mut self, id: Uuid) -> bool {
+        match self.bans.remove(id.to_string()) {
+            some(_) => {},
+            none => return false,
+        }
+        self.save_bans(false)
+        return true
+    }
+
+    /// Whether the address `ip` is banned, `IpBanList.isBanned`.
+    pub fn is_ip_banned(self, ip: String) -> bool {
+        return self.ip_bans.contains(ip)
+    }
+
+    /// `IpBanList.add`: the address the ban names banned, and banned-ips.json written (CAL-361).
+    pub fn ban_address(mut self, b: own Ban) {
+        let key = b.name.copy()
+        self.ip_bans.insert(key, b)
+        self.save_ip_bans(true)
+    }
+
+    /// `IpBanList.remove`: whether the address `ip` was banned, which it isn't now, with
+    /// banned-ips.json written (CAL-361).
+    pub fn pardon_address(mut self, ip: String) -> bool {
+        match self.ip_bans.remove(ip) {
+            some(_) => {},
+            none => return false,
+        }
+        self.save_ip_bans(false)
+        return true
+    }
+
+    /// Whether the player `id` is on the whitelist, `UserWhiteList.isWhiteListed`, whether or
+    /// not it's on.
+    pub fn whitelisted(self, id: Uuid) -> bool {
+        return self.whitelist.contains(id.to_string())
+    }
+
+    /// `UserWhiteList.add`: the player put on the whitelist, and whitelist.json written
+    /// (CAL-361).
+    pub fn add_to_whitelist(mut self, n: Named) {
+        self.whitelist.insert(n.id.to_string(), n.name.copy())
+        self.save_whitelist(true)
+    }
+
+    /// `UserWhiteList.remove`: whether the player `id` was on the whitelist, who isn't now, with
+    /// whitelist.json written (CAL-361).
+    pub fn remove_from_whitelist(mut self, id: Uuid) -> bool {
+        match self.whitelist.remove(id.to_string()) {
+            some(_) => {},
+            none => return false,
+        }
+        self.save_whitelist(false)
+        return true
+    }
+
+    /// The ops' names, `getOpNames`, in the list's order.
+    pub fn op_names(self) -> List<String> {
+        var out = List<String>()
+        for (_, o) in self.ops {
+            out.push(o.name.copy())
+        }
+        return out
+    }
+
+    /// The names on the whitelist, `getWhiteListNames`, in its order.
+    pub fn whitelist_names(self) -> List<String> {
+        var out = List<String>()
+        for (_, name) in self.whitelist {
+            out.push(name.copy())
+        }
+        return out
+    }
+
+    /// The banned players' names, `UserBanList.getUserList`, in the list's order.
+    pub fn banned_names(self) -> List<String> {
+        var out = List<String>()
+        for (_, b) in self.bans {
+            out.push(b.name.copy())
+        }
+        return out
+    }
+
+    /// The banned addresses, `IpBanList.getUserList`, in the list's order.
+    pub fn banned_addresses(self) -> List<String> {
+        var out = List<String>()
+        for (ip, _) in self.ip_bans {
+            out.push(ip.copy())
+        }
+        return out
+    }
+
+    /// The players' bans, `getEntries`, in the list's order, those expired too.
+    pub fn bans_listed(self) -> List<Ban> {
+        var out = List<Ban>()
+        for (_, b) in self.bans {
+            out.push(b.copy())
+        }
+        return out
+    }
+
+    /// The addresses' bans, `getEntries`, in the list's order, those expired too.
+    pub fn address_bans_listed(self) -> List<Ban> {
+        var out = List<Ban>()
+        for (_, b) in self.ip_bans {
+            out.push(b.copy())
+        }
+        return out
     }
 
     /// How many players the whitelist lets in: those on it, and the ops, who needn't be.
@@ -150,11 +361,91 @@ impl Access {
             }
         }
         let full = max <= 0 or online >= usize.wrap(max)
-        if full and not (self.ops.get(key) ?? false) {
+        let bypass = self.ops.contains(key) and self.ops[key].bypass
+        if full and not bypass {
             return some(Component.translatable("multiplayer.disconnect.server_full", []))
         }
         return none
     }
+
+    // ops.json as `ServerOpList.save` writes it: each op's UUID, name, level and
+    // `bypassesPlayerLimit`.
+    fn save_ops(mut self, added: bool) {
+        var items = List<Json>()
+        for (key, o) in self.ops {
+            var m = named_members(key, o.name)
+            m.push(Member { key: String("level"), value: Json.Number("{o.level}") })
+            m.push(Member { key: String("bypassesPlayerLimit"), value: Json.Bool(o.bypass) })
+            items.push(Json.Object(m))
+        }
+        self.save("ops.json", items, added)
+    }
+
+    // whitelist.json as `UserWhiteList.save` writes it: each player's UUID and name.
+    fn save_whitelist(mut self, added: bool) {
+        var items = List<Json>()
+        for (key, name) in self.whitelist {
+            items.push(Json.Object(named_members(key, name)))
+        }
+        self.save("whitelist.json", items, added)
+    }
+
+    // banned-players.json as `UserBanList.save` writes it: each player's UUID and name, then
+    // their ban.
+    fn save_bans(mut self, added: bool) {
+        var items = List<Json>()
+        for (key, b) in self.bans {
+            var m = named_members(key, b.name)
+            ban_members(mut m, b)
+            items.push(Json.Object(m))
+        }
+        self.save("banned-players.json", items, added)
+    }
+
+    // banned-ips.json as `IpBanList.save` writes it: each address, then its ban.
+    fn save_ip_bans(mut self, added: bool) {
+        var items = List<Json>()
+        for (ip, b) in self.ip_bans {
+            var m: List<Member> = [Member { key: String("ip"), value: Json.Str(ip.copy()) }]
+            ban_members(mut m, b)
+            items.push(Json.Object(m))
+        }
+        self.save("banned-ips.json", items, added)
+    }
+
+    // `StoredUserList.save`: the list as Gson pretty-prints it, where lists are written back,
+    // with vanilla's warning where it can't be.
+    fn save(mut self, name: str, items: own List<Json>, added: bool) {
+        if not self.saves {
+            return
+        }
+        match write("{self.folder}/{name}", pretty(Json.Array(items)).to_bytes()) {
+            ok => {},
+            err(_) => self.failed.push(Entry.warn(if added { "Could not save the list after adding a user." } else { "Could not save the list after removing a user." })),
+        }
+    }
+}
+
+// `NameAndId.appendTo`: the UUID, then the name.
+fn named_members(id: String, name: String) -> List<Member> {
+    return [Member { key: String("uuid"), value: Json.Str(id.copy()) }, Member { key: String("name"), value: Json.Str(name.copy()) }]
+}
+
+// `BanListEntry.serialize`: when it was made, by whom, when it ends, `forever` where it doesn't,
+// and why, which Gson leaves out where there's no reason.
+fn ban_members(m: mut List<Member>, b: Ban) {
+    m.push(Member { key: String("created"), value: Json.Str(list_date(b.created)) })
+    m.push(Member { key: String("source"), value: Json.Str(b.source.copy()) })
+    let expires = match b.expires {
+        some(at) => list_date(at),
+        none => String("forever"),
+    }
+    m.push(Member { key: String("expires"), value: Json.Str(expires) })
+    let reason = match b.reason {
+        some(r) => Json.Str(r.copy()),
+        none => Json.Null,
+    }
+    m.push(Member { key: String("reason"), value: reason })
 }
 
 // An op's `level`, as `ServerOpListEntry` reads it: 0 where it's missing, and kept from 0 to 4,
@@ -191,14 +482,171 @@ pub fn ban_ip(address: String) -> String {
     return ip
 }
 
+/// Whether the text is an IP address, as Guava's `InetAddresses.isInetAddress` reads one, which
+/// `ban-ip` and `pardon-ip` ask (CAL-361): hex digits, dots and colons only, up to a `%`, after
+/// which an IPv6 address's scope is anything; IPv4 as 4 decimal parts of up to 3 digits, none
+/// past 255 and none with a leading zero; IPv6 as 8 groups of up to 4 hex digits, `::` once for
+/// one or more groups of zeros, the last two groups perhaps a dotted IPv4 address.
+pub fn is_inet_address(text: String) -> bool {
+    var colon = false
+    var dot = false
+    var percent: usize? = none
+    for i in 0..text.len() {
+        let c = text.byte_at(i)
+        if c == 46 {
+            dot = true
+        } else if c == 58 {
+            if dot {
+                return false
+            }
+            colon = true
+        } else if c == 37 {
+            percent = some(i)
+            break
+        } else if not is_hex(c) {
+            return false
+        }
+    }
+    if colon {
+        var ip = text.copy()
+        if dot {
+            let last = ip.find_last(":") ?? 0
+            let quad = v4_parts(ip[last + 1..]) else return false
+            ip = "{ip[..last + 1]}{hex_of(quad[0] * 256 + quad[1])}:{hex_of(quad[2] * 256 + quad[3])}"
+        }
+        if let p = percent {
+            if p <= ip.len() {
+                ip = ip[..p]
+            }
+        }
+        return is_v6(ip)
+    }
+    if dot {
+        if percent != none {
+            return false
+        }
+        return v4_parts(text) != none
+    }
+    return false
+}
+
+// `textToNumericFormatV4`'s four parts, or `none`.
+fn v4_parts(text: String) -> List<i32>? {
+    var parts = List<i32>()
+    var start: usize = 0
+    for i in 0..text.len() + 1 {
+        if i < text.len() and text.byte_at(i) != 46 {
+            continue
+        }
+        let length = i - start
+        if length == 0 or length > 3 or (length > 1 and text.byte_at(start) == 48) {
+            return none
+        }
+        var n = 0
+        for j in start..i {
+            let c = text.byte_at(j)
+            if c < 48 or c > 57 {
+                return none
+            }
+            n = n * 10 + i32(c - 48)
+        }
+        if n > 255 {
+            return none
+        }
+        parts.push(n)
+        start = i + 1
+    }
+    return if parts.len() == 4 { some(parts) } else { none }
+}
+
+// `textToNumericFormatV6`: whether the text, with no scope, is an IPv6 address's groups.
+fn is_v6(text: String) -> bool {
+    let n = text.len()
+    var delimiters = 0
+    for i in 0..n {
+        if text.byte_at(i) == 58 {
+            delimiters += 1
+        }
+    }
+    if delimiters < 2 or delimiters > 8 {
+        return false
+    }
+    var skipped = 8 - (delimiters + 1)
+    var skip = false
+    for i in 0..n - 1 {
+        if text.byte_at(i) == 58 and text.byte_at(i + 1) == 58 {
+            if skip {
+                return false
+            }
+            skip = true
+            skipped += 1
+            if i == 0 {
+                skipped += 1
+            }
+            if i == n - 2 {
+                skipped += 1
+            }
+        }
+    }
+    if text.byte_at(0) == 58 and text.byte_at(1) != 58 {
+        return false
+    }
+    if text.byte_at(n - 1) == 58 and text.byte_at(n - 2) != 58 {
+        return false
+    }
+    if skip and skipped <= 0 {
+        return false
+    }
+    if not skip and delimiters + 1 != 8 {
+        return false
+    }
+    // Each group between the colons, of 1 to 4 hex digits.
+    var start: usize = if text.byte_at(0) == 58 { 1 } else { 0 }
+    while start < n {
+        var end = start
+        while end < n and text.byte_at(end) != 58 {
+            end += 1
+        }
+        if text.byte_at(start) != 58 {
+            let length = end - start
+            if length == 0 or length > 4 {
+                return false
+            }
+            for j in start..end {
+                if not is_hex(text.byte_at(j)) {
+                    return false
+                }
+            }
+        }
+        start = end + 1
+    }
+    return true
+}
+
+fn is_hex(c: u8) -> bool {
+    return (c >= 48 and c <= 57) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102)
+}
+
+// `Integer.toHexString`.
+fn hex_of(v: i32) -> String {
+    let digits = "0123456789abcdef"
+    if v == 0 {
+        return String("0")
+    }
+    var out = String()
+    var n = v
+    while n > 0 {
+        let d = usize.wrap(n % 16)
+        out = "{digits[d..d + 1]}{out}"
+        n /= 16
+    }
+    return out
+}
+
 // The reason a ban gives, `key` with its reason and, if it expires, `key.expiration` with the
 // date, or `none` if it has expired.
 fn banned(b: Ban, key: str, now: Timestamp) -> Component? {
-    var reason_message = Component.translatable("multiplayer.disconnect.banned.reason.default", [])
-    if let r = b.reason {
-        reason_message = Component.literal(r)
-    }
-    var reason = Component.translatable("{key}.reason", [reason_message])
+    var reason = Component.translatable("{key}.reason", [b.reason_message()])
     if let at = b.expires {
         if at < now.unix_ms {
             return none
@@ -215,6 +663,18 @@ fn ban_date(at: Timestamp) -> String {
     let zone = zone_name(unsafe { at.zone_abbreviation() }, offset)
     let d = at.date_time(offset)
     return "{d.year}-{two(d.month)}-{two(d.day)} at {two(d.hour)}:{two(d.minute)}:{two(d.second)} {zone}"
+}
+
+/// A date, in milliseconds since 1970, as `yyyy-MM-dd HH:mm:ss Z` writes it, in the system's time
+/// zone, as vanilla's JVM has it: `2026-10-29 12:00:00 +0100`. The lists and usercache.json write
+/// their dates so (CAL-361).
+pub fn list_date(at: i64) -> String {
+    let t = Timestamp { unix_ms: at }
+    let offset = unsafe { t.local_offset() }
+    let d = t.date_time(offset)
+    let sign = if offset < 0 { "-" } else { "+" }
+    let minutes = offset.abs() / 60
+    return "{d.year}-{two(d.month)}-{two(d.day)} {two(d.hour)}:{two(d.minute)}:{two(d.second)} {sign}{two(minutes / 60)}{two(minutes % 60)}"
 }
 
 // The objects in the list `path` in `folder`: none if it isn't there or is empty, none with a
@@ -263,29 +723,32 @@ fn entries(folder: String, path: str, what: str, lines: mut List<Entry>) -> List
     return objects
 }
 
-// The player an entry names, as `NameAndId.fromJson` reads them, by their UUID: `none` if it
-// hasn't both `uuid` and `name`, or the UUID doesn't parse.
-fn user(o: List<Member>) -> String? {
+/// The player an entry names, as `NameAndId.fromJson` reads them: `none` if it hasn't both
+/// `uuid` and `name`, or the UUID doesn't parse.
+pub fn user(o: List<Member>) -> Named? {
     let id = string_of(o, "uuid") else return none
-    if string_of(o, "name") == none {
-        return none
-    }
+    let name = string_of(o, "name") else return none
     let uuid = Uuid.parse(id) else return none
-    return some(uuid.to_string())
+    return some(Named { id: uuid, name: name })
 }
 
-// A ban's reason and when it ends, as `BanListEntry` reads them.
-fn ban(o: List<Member>) -> Ban {
+// A ban as `BanListEntry` reads it, of `name`: made at `created`, else `now`; by `source`, else
+// `(Unknown)`; ending at `expires`, else never; for `reason`, else none.
+fn ban(o: List<Member>, name: String, now: i64) -> Ban {
+    var created = now
+    if let date = string_of(o, "created") {
+        created = parse_date(date) ?? now
+    }
     var expires: i64? = none
     if let date = string_of(o, "expires") {
         expires = parse_date(date)
     }
-    return Ban { reason: string_of(o, "reason"), expires: expires }
+    return Ban { name: name.copy(), created: created, source: string_of(o, "source") ?? String("(Unknown)"), expires: expires, reason: string_of(o, "reason") }
 }
 
-// A member as `getAsString` gives it: a string's text, or a number's or a boolean's as Java
-// writes it.
-fn string_of(o: List<Member>, key: str) -> String? {
+/// A member as `getAsString` gives it: a string's text, or a number's or a boolean's as Java
+/// writes it.
+pub fn string_of(o: List<Member>, key: str) -> String? {
     let v = get(o, String(key)) else return none
     return match v {
         Json.Str(s) => some(s.copy()),
