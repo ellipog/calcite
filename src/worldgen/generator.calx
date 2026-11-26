@@ -29,6 +29,9 @@ import nbt.tag.{Tag}
 import pack.data.{Data}
 import pack.vanilla.{data_path, vanilla_data}
 import random.any.{AnyRandom}
+import random.legacy.{LegacyRandom}
+import random.taped.{TapedRandom}
+import random.worldgen.{WorldgenRandom}
 import registry.components.{ItemCodecs}
 import registry.registries.{Registries}
 import registry.registry.{Registry}
@@ -51,22 +54,23 @@ import worldgen.carver.{Carvers, Corners, carve_chunk}
 import worldgen.climate.{Parameter, quantize}
 import worldgen.density.{Functions, data_json}
 import worldgen.facts.{Facts}
-import worldgen.features.{Catalog, Decoration, Gen}
+import worldgen.features.{Catalog, Decoration, Gen, place_feature}
 import worldgen.interval.{Thrown}
-import worldgen.jigsaw.{Pools}
+import worldgen.jigsaw.{Alias, JigsawConfig, Pools, jigsaw_from}
 import worldgen.locate.{Nearest, Reach, Wanted, nearest_biome, nearest_map_structure, nearest_structure, wanted_structures}
 import worldgen.material.{Materials, Rules, build_surface, materials, read_rules}
-import worldgen.pieces.{PieceData, Start, template_id}
-import worldgen.placing.{Placer, decorate_structured}
-import worldgen.pool_pieces.{ElementCache}
+import worldgen.pieces.{Piece, PieceData, Start, template_id}
+import worldgen.providers.{Anchor, HeightProvider}
+import worldgen.placing.{Placer, decorate_structured, place_in_area}
+import worldgen.pool_pieces.{ElementCache, place_jigsaw}
 import worldgen.predicates.{Readers}
 import worldgen.references.{Refs, StartMap, chunk_key, registry_order}
-import worldgen.region.{Region, RegionChunk, packed_heights}
+import worldgen.region.{Placing, Region, RegionChunk, packed_heights}
 import worldgen.sampler.{Context, CornerFaces, sample}
 import worldgen.structure_world.{StructureWorld}
-import worldgen.structures.{RingSearch, Rings, StructureState, Structures, create_structures, ring_search}
+import worldgen.structures.{RingSearch, Rings, StructureState, Structures, create_structures, generate, ring_search}
 import worldgen.survive.{Env}
-import worldgen.template.{TemplateAsk, TemplateService, Templates}
+import worldgen.template.{Bounds, Processor, Settings, TemplateAsk, TemplateService, Templates, place_in_world}
 import worldgen.terrain.{Filled, Shape, SurfaceLevels, air_filled, clamped, fill_noise, read_shape}
 
 /// The Overworld's bottom and height, which a `GenSetup` has unless it's given another's.
@@ -177,6 +181,83 @@ pub struct DecorateJob {
     pub biomes: List<List<i32>>
     pub refs: List<Refs>
     pub starts: StartMap
+}
+
+/// What's to be placed into the running level (CAL-362): a feature, as `place feature` places
+/// one, by its ID or written out as its codec reads it; a template, as `place template` places
+/// one; or nothing, only the box a template would cover, for the level to know what to give.
+pub enum Placement {
+    Feature(Json)
+    Template(TemplatePlacement)
+    Bounds(TemplatePlacement)
+    /// A pool's pieces from a jigsaw in it, as `place jigsaw` has `generateJigsaw` make them:
+    /// made, where there's no start yet, else placed.
+    Jigsaw(JigsawPlacement)
+    /// A structure, as `place structure` has `Structure.generate` make it: made, where there's no
+    /// start yet, else placed in the job's middle chunk, `placeInChunk`.
+    Structure(StructurePlacement)
+}
+
+/// A jigsaw as `place jigsaw` places it: the pool's ID, the jigsaw's name, the depth, and the
+/// start its pieces made, once they're made.
+pub struct JigsawPlacement {
+    pub pool: String
+    pub target: String
+    pub max_depth: i32
+    pub start: Start? = none
+}
+
+/// A structure as `place structure` places it: its ID, and its start, once it's made, as the
+/// chunks placed so far left it.
+pub struct StructurePlacement {
+    pub id: String
+    pub start: Start? = none
+}
+
+/// A template as `place template` places it: its ID; its mirror and rotation, by
+/// `worldgen.template`'s numbers; the chance each block's kept, `BlockRotProcessor`, where it's
+/// under 1; the seed of its randoms, `StructureBlockEntity.createRandom`, the milliseconds of the
+/// clock, `Util.getMillis`, where it's 0; and whether it's strict.
+pub struct TemplatePlacement {
+    pub id: String
+    pub mirror: i32
+    pub rotation: i32
+    pub integrity: f32
+    pub seed: i32
+    pub millis: i64
+    pub strict: bool
+}
+
+/// What to place into the running level and where (CAL-362): the region of chunks it's placed in,
+/// about the chunk `cx`, `cz`, `reach` each way, from the lower corner, `x` fastest, as the level
+/// has them, none for `Bounds`; the biomes of the nine about the middle; and the level's random,
+/// `getRandom`, which a feature draws from.
+pub struct PlaceJob {
+    pub what: Placement
+    pub x: i32
+    pub y: i32
+    pub z: i32
+    pub cx: i32
+    pub cz: i32
+    pub reach: i32
+    pub chunks: List<RegionChunk>
+    pub biomes: List<List<i32>>
+    pub random: TapedRandom
+}
+
+/// What placing came to: whether it placed, what it did, in order, for the level to do, the
+/// level's random back, and why what was named couldn't be read or found, where it couldn't, or
+/// what went wrong placing it; for a template, its size and the box it covers.
+pub struct PlaceBack {
+    pub placed: bool
+    pub done: List<Placing>
+    pub random: TapedRandom
+    pub unread: String? = none
+    pub problems: List<String> = List<String>()
+    pub size: (i32, i32, i32) = (0, 0, 0)
+    pub bounds: Bounds? = none
+    /// A jigsaw's or a structure's start, as it was made or the placing left it.
+    pub start: Start? = none
 }
 
 /// A chunk decorated around, to make the server's chunk of, with its biomes, its references to
@@ -640,6 +721,242 @@ impl Worker {
         return Made.Decorated(DecorateJob { x: x, z: z, chunks: back, biomes: zoom_back.chunks, refs: refs, starts: starts }, problems)
     }
 
+    /// Places what the job says into the running level (CAL-362), in a region of the job's
+    /// chunks, what it did kept for the level to do again. A feature's read as `Feature.CODEC`
+    /// reads it and placed as `PlaceCommand.placeFeature` places it, from the level's random. A
+    /// template's found as `StructureTemplateManager.get` finds one, among vanilla's, and placed as
+    /// `placeTemplate` places it: mirrored and rotated, strict as `setKnownShape`, its blocks kept
+    /// by its integrity where that's under 1, and placed with flags 2, and 816 more where strict.
+    /// Vanilla gives that a random of its own, seeded as the placing's is, which Calcite's
+    /// template has the placing's take the place of. The region's own random, which what a
+    /// block's shape draws takes, is the one decoration gives its middle chunk.
+    pub fn place(mut self, job: own PlaceJob) -> PlaceBack {
+        let PlaceJob { what: what, x: x, y: y, z: z, cx: cx, cz: cz, reach: reach, chunks: chunks, biomes: biomes, random: given } = job
+        var random = given
+        // What's only made first, to know where it goes, not placed.
+        match what {
+            Placement.Bounds(tp) => {
+                let i = self.known_template(tp.id) else return PlaceBack { placed: false, done: List<Placing>(), random: random, unread: some(tp.id.copy()) }
+                let shared = self.w.templates.list[i].copy()
+                let b = shared.value.bounding_box(template_settings(tp), x, y, z)
+                return PlaceBack { placed: true, done: List<Placing>(), random: random, size: (shared.value.size_x, shared.value.size_y, shared.value.size_z), bounds: some(b) }
+            },
+            Placement.Jigsaw(jp) => {
+                if jp.start == none {
+                    return self.jigsaw_start(jp, x, y, z, random)
+                }
+            },
+            Placement.Structure(sp) => {
+                if sp.start == none {
+                    return self.structure_start(sp, x, z, random)
+                }
+            },
+            _ => {},
+        }
+        var fi: usize = 0
+        var ti: usize = 0
+        var st: usize = 0
+        var settings = Settings {}
+        var flags = 2
+        var template_seed: i64 = 0
+        var start = Start { id: String(), chunk_x: 0, chunk_z: 0, references: 0, pieces: List<Piece>() }
+        var problems = List<String>()
+        match what {
+            Placement.Feature(feature) => {
+                match self.g.catalog.read_feature(self.zip.value, self.g.env.facts, self.rd, feature) {
+                    ok(i) => fi = i,
+                    err(why) => return PlaceBack { placed: false, done: List<Placing>(), random: random, unread: some(why) },
+                }
+            },
+            Placement.Template(tp) => {
+                let i = self.known_template(tp.id) else return PlaceBack { placed: false, done: List<Placing>(), random: random, unread: some(tp.id.copy()) }
+                ti = i
+                settings = template_settings(tp)
+                flags = if tp.strict { 2 | 816 } else { 2 }
+                template_seed = if tp.seed == 0 { tp.millis } else { i64(tp.seed) }
+            },
+            Placement.Jigsaw(jp) => {
+                start = jp.start.copy() ?? start
+            },
+            Placement.Structure(sp) => {
+                let i = self.structure_index(sp.id) else return PlaceBack { placed: false, done: List<Placing>(), random: random, unread: some(sp.id.copy()) }
+                st = i
+                start = sp.start.copy() ?? start
+            },
+            Placement.Bounds(_) => {},
+        }
+        // A start made on another worker names its pools and templates by ID.
+        match what {
+            Placement.Jigsaw(_) | Placement.Structure(_) => {
+                match self.localize_start(mut start) {
+                    ok => {},
+                    err(t) => problems.push("Couldn't load what a structure's pieces place: {t.exception}: {t.message}"),
+                }
+            },
+            _ => {},
+        }
+        let zoom = Zoom { chunk_x: cx, chunk_z: cz, min_y: self.w.level_min, height: self.w.level_height, seed: self.w.biomes.seed, chunks: biomes }
+        var region_hash = self.w.functions.positional().from_hash_of(String("minecraft:worldgen_region_random"))
+        let region_random = region_hash.fork_positional().at(cx * 16, 0, cz * 16)
+        var r = Region.around(cx, cz, chunks, zoom, self.seed, self.w.shape.sea_level, region_random)
+        r.chunk_reach = reach
+        r.journal = some(List<Placing>())
+        var placed = false
+        var start_back: Start? = none
+        match what {
+            Placement.Feature(_) => {
+                match place_feature(self.g, mut r, mut random, fi, x, y, z) {
+                    ok(p) => placed = p,
+                    err(t) => problems.push("Couldn't place a feature at {x}, {y}, {z}: {t.exception}: {t.message}"),
+                }
+            },
+            Placement.Template(_) => {
+                var placing = LegacyRandom.new(template_seed)
+                let shared = self.w.templates.list[ti].copy()
+                match place_in_world(self.g.env, mut r, shared.value, x, y, z, x, y, z, settings, mut placing, flags) {
+                    ok(p) => placed = p,
+                    err(thrown) => problems.push("Couldn't place a template at {x}, {y}, {z}: {thrown.exception}: {thrown.message}"),
+                }
+            },
+            Placement.Jigsaw(_) => {
+                // Each pool element's piece, in a box without end, from the block given,
+                // `PoolElementStructurePiece.place`, its jigsaws replaced.
+                let infinite = Bounds { min_x: -2147483648, min_y: -2147483648, min_z: -2147483648, max_x: 2147483647, max_y: 2147483647, max_z: 2147483647 }
+                for i in 0..start.pieces.len() {
+                    if let PieceData.Jigsaw(j) = start.pieces[i].data {
+                        match place_jigsaw(self.g, self.w, self.placer.elements, self.placer.pools, mut r, mut random, j, infinite, x, y, z) {
+                            ok => {},
+                            err(t) => problems.push("Couldn't place a jigsaw's piece at {x}, {y}, {z}: {t.exception}: {t.message}"),
+                        }
+                    }
+                }
+                placed = true
+                start_back = some(start.copy())
+            },
+            Placement.Structure(_) => {
+                // The chunk's column, from the world's bottom to one past its top.
+                let area = Bounds { min_x: cx << 4, min_y: self.w.level_min, min_z: cz << 4, max_x: (cx << 4) + 15, max_y: self.w.level_min + self.w.level_height, max_z: (cz << 4) + 15 }
+                match place_in_area(self.g, self.w, self.placer, st, mut r, mut random, mut start, area) {
+                    ok => {},
+                    err(t) => problems.push("Couldn't place a structure in chunk [{cx}, {cz}]: {t.exception}: {t.message}"),
+                }
+                placed = true
+                start_back = some(start.copy())
+            },
+            Placement.Bounds(_) => {},
+        }
+        var done = List<Placing>()
+        for p in r.journal.take() ?? List<Placing>() {
+            match p {
+                Placing.Data(bx, by, bz) => {
+                    if let tag = r.block_entity_tag(bx, by, bz) {
+                        done.push(Placing.Loaded(bx, by, bz, tag))
+                    }
+                },
+                _ => done.push(p.copy()),
+            }
+        }
+        return PlaceBack { placed: placed, done: done, random: random, problems: problems, start: start_back }
+    }
+
+    // `JigsawPlacement.generateJigsaw`'s pieces, before they're placed (CAL-362): `addPieces` from
+    // the job's block, of its pool, from its jigsaw named, to its depth, no more than 128 from the
+    // middle of its first piece, in any biome, with no heightmap, aliases or padding, from a
+    // random seeded by the world's seed and the block's chunk, `setLargeFeatureSeed`. The start
+    // they make, and the box they cover; the pool back as `unread` where there's none.
+    fn jigsaw_start(mut self, jp: JigsawPlacement, x: i32, y: i32, z: i32, random: own TapedRandom) -> PlaceBack {
+        let known = match self.placer.pools.get(self.zip.value, jp.pool) {
+            ok(p) => p != none,
+            err(_) => false,
+        }
+        if not known {
+            return PlaceBack { placed: false, done: List<Placing>(), random: random, unread: some(jp.pool.copy()) }
+        }
+        let c = JigsawConfig {
+            start_pool: jp.pool.copy(), start_jigsaw: some(jp.target.copy()), max_depth: jp.max_depth, start_height: HeightProvider.Constant(Anchor.Absolute(y)),
+            expansion_hack: false, project: none, horizontal: 128, vertical: 128, aliases: List<Alias>(), padding_given: false, padding_bottom: 0, padding_top: 0, ignore_waterlogging: false,
+        }
+        var seeded = WorldgenRandom.new(LegacyRandom.new(0))
+        seeded.set_large_feature_seed(self.seed, x >> 4, z >> 4)
+        self.w.any_biome = true
+        var pieces = List<Piece>()
+        var problem: String? = none
+        match jigsaw_from(mut self.w, mut self.placer.pools, self.zip.value, x, y, z, List<i32>(), mut seeded, c) {
+            ok(p) => pieces = p,
+            err(t) => problem = some("Couldn't make a jigsaw's pieces at {x}, {y}, {z}: {t.exception}: {t.message}"),
+        }
+        self.w.any_biome = false
+        if let why = problem {
+            return PlaceBack { placed: false, done: List<Placing>(), random: random, problems: [why.copy()] }
+        }
+        return started(pieces, x >> 4, z >> 4, random)
+    }
+
+    // `Structure.generate` of the structure `sp` names in the chunk of the block x, z, before it's
+    // placed (CAL-362), in any biome: its start, and the box it covers; the ID back as `unread`
+    // where there's no such structure.
+    fn structure_start(mut self, sp: StructurePlacement, x: i32, z: i32, random: own TapedRandom) -> PlaceBack {
+        let st = self.structure_index(sp.id) else return PlaceBack { placed: false, done: List<Placing>(), random: random, unread: some(sp.id.copy()) }
+        self.w.any_biome = true
+        var pieces = List<Piece>()
+        var problem: String? = none
+        match generate(mut self.w, mut self.placer.pools, self.zip.value, self.placer.structures, st, x >> 4, z >> 4) {
+            ok(made) => {
+                if let start = made {
+                    pieces = start.pieces.copy()
+                }
+            },
+            err(t) => problem = some("Couldn't make the structure {sp.id} in chunk [{x >> 4}, {z >> 4}]: {t.exception}: {t.message}"),
+        }
+        self.w.any_biome = false
+        if let why = problem {
+            return PlaceBack { placed: false, done: List<Placing>(), random: random, problems: [why.copy()] }
+        }
+        var back = started(pieces, x >> 4, z >> 4, random)
+        if let start = back.start.take() {
+            var named = start
+            named.id = sp.id.copy()
+            back.start = some(named)
+        }
+        return back
+    }
+
+    // The structure `id` names, by its place among the world's.
+    fn structure_index(self, id: String) -> usize? {
+        for i in 0..self.placer.structures.structures.len() {
+            if self.placer.structures.structures[i].id == id {
+                return some(i)
+            }
+        }
+        return none
+    }
+
+    // The template `id` names, where vanilla's data has one, loaded once, `StructureTemplateManager.get`
+    // (CAL-362); none where there's none, or `id` isn't an identifier.
+    fn known_template(mut self, id: String) -> usize? {
+        let colon = id.find(":") else return none
+        if self.zip.value.find("data/{id[..colon]}/structure/{id[colon + 1..]}.nbt") == none {
+            return none
+        }
+        return match self.w.template(self.zip.value, id) {
+            ok(i) => some(i),
+            err(_) => none,
+        }
+    }
+
+    // Points a start's pieces at this worker's pools and templates, and loads what their elements
+    // need, as `localize` does each start's (CAL-362).
+    fn localize_start(mut self, start: mut Start) ! Thrown {
+        var starts = StartMap.new()
+        starts.chunks.insert(0, [start.copy()])
+        try self.localize(mut starts)
+        if let list = starts.chunks.remove(0) {
+            if not list.is_empty() {
+                start = list[0].copy()
+            }
+        }
+    }
+
     // Points the starts' pieces at this worker's pools and templates, which a start made on
     // another names by ID, and loads what their elements need.
     fn localize(mut self, starts: mut StartMap) ! Thrown {
@@ -837,4 +1154,36 @@ fn to_chunk(table: BlockStates, made: own RegionChunk, biomes: List<i32>) -> Chu
     var chunk = Chunk.of(f.min_y, sections)
     chunk.prime_heightmaps(table, [WORLD_SURFACE, OCEAN_FLOOR, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES])
     return chunk
+}
+
+// The settings `place template` places a template with (CAL-362): its mirror and rotation,
+// strict as `setKnownShape`, and, where its integrity's under 1, its blocks kept by that from the
+// random it's given, `BlockRotProcessor`.
+fn template_settings(tp: TemplatePlacement) -> Settings {
+    var s = Settings { mirror: tp.mirror, rotation: tp.rotation, known_shape: tp.strict }
+    if tp.integrity < 1.0f32 {
+        s.processors = [Processor.Rot { blocks: none, integrity: tp.integrity }]
+        s.has_random = true
+    }
+    return s
+}
+
+// A start of `pieces` in the chunk cx, cz, and the box they cover; nothing placed where there are
+// none (CAL-362).
+fn started(pieces: own List<Piece>, cx: i32, cz: i32, random: own TapedRandom) -> PlaceBack {
+    if pieces.is_empty() {
+        return PlaceBack { placed: false, done: List<Placing>(), random: random }
+    }
+    let start = Start { id: String(), chunk_x: cx, chunk_z: cz, references: 0, pieces: pieces }
+    let b = start_bounds(start)
+    return PlaceBack { placed: true, done: List<Placing>(), random: random, start: some(start), bounds: some(b) }
+}
+
+// `StructureStart.getBoundingBox`: the box about all its pieces', `encapsulatingBoxes` (CAL-362).
+fn start_bounds(start: Start) -> Bounds {
+    var b = start.pieces[0].bb
+    for p in start.pieces {
+        b = Bounds { min_x: b.min_x.min(p.bb.min_x), min_y: b.min_y.min(p.bb.min_y), min_z: b.min_z.min(p.bb.min_z), max_x: b.max_x.max(p.bb.max_x), max_y: b.max_y.max(p.bb.max_y), max_z: b.max_z.max(p.bb.max_z) }
+    }
+    return b
 }
