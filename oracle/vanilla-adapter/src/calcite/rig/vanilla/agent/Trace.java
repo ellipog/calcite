@@ -31,12 +31,24 @@ import java.nio.file.Path;
  * and its {@code LookControl}'s wanted place and whether it's looking there,
  * {@code isLookingAtTarget}, and its own random's seed as it is now, so where a mob's draws part
  * shows (CAL-303); a living entity that isn't a mob, and a player, writes 0 and false for each.
+ *
+ * <p>With {@code controls}, {@code paths.txt} beside the trace gets a line each time a mob's
+ * navigation's path is another than as its last tick was done, or it's moved on to another node of
+ * it (CAL-403):
+ *
+ * <pre>T ID next tx,ty,tz x,y,z...</pre>
+ *
+ * <p>the game time, the mob's ID, the index of the node it's going to, the path's target and its
+ * nodes in order, or {@code T ID none} where it has none.
  */
 public final class Trace {
     private static final String NO_CONTROLS = " 0.0 0.0 0.0 0.0 false 0.0 0.0 0.0 false 0";
 
     private static Writer out;
+    private static Writer paths;
     private static boolean controls;
+    /** Each mob's path as it was last written, by ID: its identity and its next node's index. */
+    private static final java.util.Map<Integer, String> lastPaths = new java.util.HashMap<>();
 
     private Trace() {
     }
@@ -48,6 +60,9 @@ public final class Trace {
         controls = withControls;
         try {
             out = new BufferedWriter(Files.newBufferedWriter(trace, StandardCharsets.UTF_8));
+            if (withControls) {
+                paths = new BufferedWriter(Files.newBufferedWriter(trace.resolveSibling("paths.txt"), StandardCharsets.UTF_8));
+            }
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -55,6 +70,9 @@ public final class Trace {
             synchronized (Trace.class) {
                 try {
                     out.close();
+                    if (paths != null) {
+                        paths.close();
+                    }
                 } catch (IOException ignored) {
                     // The JVM is going; there's nowhere left to say so.
                 }
@@ -75,6 +93,39 @@ public final class Trace {
                 + " " + e.yBodyRot + " " + e.zza + " " + e.xxa + " " + e.getSpeed() + " " + e.onGround()
                 + controlsOf(e) + "\n";
         write(line);
+        if (controls && e instanceof net.minecraft.world.entity.Mob mob) {
+            pathOf(at.getGameTime(), mob);
+        }
+    }
+
+    /** The mob's path, written to {@code paths.txt} where it isn't as it was last written. */
+    private static void pathOf(long time, net.minecraft.world.entity.Mob mob) {
+        var path = mob.getNavigation().getPath();
+        String key = path == null ? "none" : System.identityHashCode(path) + ":" + path.getNextNodeIndex();
+        if (key.equals(lastPaths.get(mob.getId()))) {
+            return;
+        }
+        lastPaths.put(mob.getId(), key);
+        StringBuilder b = new StringBuilder();
+        b.append(time).append(' ').append(mob.getId()).append(' ');
+        if (path == null) {
+            b.append("none");
+        } else {
+            var target = path.getTarget();
+            b.append(path.getNextNodeIndex()).append(' ').append(target.getX()).append(',').append(target.getY()).append(',').append(target.getZ());
+            for (int i = 0; i < path.getNodeCount(); i++) {
+                var node = path.getNode(i);
+                b.append(' ').append(node.x).append(',').append(node.y).append(',').append(node.z);
+            }
+        }
+        b.append('\n');
+        synchronized (Trace.class) {
+            try {
+                paths.write(b.toString());
+            } catch (IOException ex) {
+                throw new UncheckedIOException(ex);
+            }
+        }
     }
 
     /** The mob's controls, as the line goes on with them, or nothing without {@code controls}. */
