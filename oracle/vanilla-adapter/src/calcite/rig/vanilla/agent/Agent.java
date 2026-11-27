@@ -49,7 +49,8 @@ import java.security.ProtectionDomain;
  * {@link Entities#brained} as it returns, and each of {@code ShufflingList}'s constructors hands
  * its random to {@link Entities#shuffling} as it returns, which seeds it (CAL-160).
  * {@code InsideBrownianWalk}'s {@code Collections.shuffle}, which draws from a random of its own
- * vanilla seeds from the clock, is {@link Entities#shuffle} instead, with the mob it walks.
+ * vanilla seeds from the clock, is {@link Entities#shuffle} instead, with the mob it walks, and so
+ * is {@code LongJumpToRandomPos}'s shuffle of its jump's angles, with the mob that jumps (CAL-207).
  * The dragon fight's respawn builds each spike again with {@link Levels#pillars}' random, seeded
  * from the game time, where vanilla's is unseeded (D672), each {@code Raid}'s random is
  * {@link Levels#raid}'s, seeded by how many raids came before it, where vanilla's is unseeded
@@ -70,6 +71,7 @@ public final class Agent {
     private static final String PROVIDER = "net/minecraft/world/entity/ai/Brain$Provider";
     private static final String SHUFFLING = "net/minecraft/world/entity/ai/behavior/ShufflingList";
     private static final String INSIDE = "net/minecraft/world/entity/ai/behavior/InsideBrownianWalk";
+    private static final String LONG_JUMP = "net/minecraft/world/entity/ai/behavior/LongJumpToRandomPos";
     private static final String PILLARS = "net/minecraft/world/level/dimension/end/DragonRespawnStage$3";
     private static final String CHUNKS = "net/minecraft/server/level/ChunkMap";
     private static final String RAID = "net/minecraft/world/entity/raid/Raid";
@@ -127,7 +129,7 @@ public final class Agent {
         @Override
         public byte[] transform(ClassLoader loader, String name, Class<?> redefined, ProtectionDomain domain, byte[] bytes) {
             if (!LEVEL.equals(name) && !LEGACY.equals(name) && !ENTITY.equals(name) && !PLAYER.equals(name)
-                    && !PROVIDER.equals(name) && !SHUFFLING.equals(name) && !INSIDE.equals(name) && !PILLARS.equals(name)
+                    && !PROVIDER.equals(name) && !SHUFFLING.equals(name) && !INSIDE.equals(name) && !LONG_JUMP.equals(name) && !PILLARS.equals(name)
                     && !CHUNKS.equals(name) && !RAID.equals(name) && !LIVING.equals(name)) {
                 return null;
             }
@@ -137,7 +139,8 @@ public final class Agent {
                         ClassHierarchyResolver.defaultResolver().orElse(ClassHierarchyResolver.ofResourceParsing(from))));
                 return LEVEL.equals(name) ? level(cf, bytes) : ENTITY.equals(name) ? entity(cf, bytes)
                         : PLAYER.equals(name) ? player(cf, bytes) : PROVIDER.equals(name) ? provider(cf, bytes)
-                        : SHUFFLING.equals(name) ? shuffling(cf, bytes) : INSIDE.equals(name) ? inside(cf, bytes)
+                        : SHUFFLING.equals(name) ? shuffling(cf, bytes) : INSIDE.equals(name) ? inside(cf, bytes, "net.minecraft.world.entity.PathfinderMob", "InsideBrownianWalk")
+                        : LONG_JUMP.equals(name) ? inside(cf, bytes, "net.minecraft.world.entity.Mob", "LongJumpToRandomPos")
                         : PILLARS.equals(name) ? pillars(cf, bytes) : CHUNKS.equals(name) ? chunks(cf, bytes)
                         : RAID.equals(name) ? raid(cf, bytes) : LIVING.equals(name) ? living(cf, bytes)
                         : legacy(cf, bytes);
@@ -299,10 +302,11 @@ public final class Agent {
 
     // InsideBrownianWalk's Collections.shuffle(List) is Entities.shuffle(List, Object) instead,
     // with the mob the lambda that calls it is given, the first of its parameters that's a
-    // PathfinderMob, loaded from its slot (CAL-160).
-    private static byte[] inside(ClassFile cf, byte[] bytes) {
+    // PathfinderMob, loaded from its slot (CAL-160); LongJumpToRandomPos's alike, with the Mob
+    // calculateOptimalJumpVector is given (CAL-207). `owner` names the class for its check.
+    private static byte[] inside(ClassFile cf, byte[] bytes, String mobClass, String owner) {
         ClassDesc collections = ClassDesc.of("java.util.Collections");
-        ClassDesc mob = ClassDesc.of("net.minecraft.world.entity.PathfinderMob");
+        ClassDesc mob = ClassDesc.of(mobClass);
         MethodTypeDesc withTwo = MethodTypeDesc.of(ConstantDescs.CD_void, ClassDesc.of("java.util.List"), ConstantDescs.CD_Object);
         int[] hooked = {0};
         ClassTransform each = (cb, ce) -> {
@@ -335,7 +339,7 @@ public final class Agent {
         };
         byte[] out = cf.transformClass(cf.parse(bytes), each);
         if (hooked[0] != 1) {
-            throw new IllegalStateException("InsideBrownianWalk calls Collections.shuffle " + hooked[0] + " times, not once");
+            throw new IllegalStateException(owner + " calls Collections.shuffle " + hooked[0] + " times, not once");
         }
         return out;
     }
