@@ -25,15 +25,15 @@ import java.nio.file.Path;
  *
  * <p>With {@code controls} too, each line goes on with a mob's controls (CAL-180):
  *
- * <pre>moveX moveY moveZ moveSpeed moveWanted lookX lookY lookZ looking</pre>
+ * <pre>moveX moveY moveZ moveSpeed moveWanted lookX lookY lookZ looking seed</pre>
  *
  * <p>its {@code MoveControl}'s wanted place and speed and whether it has one, {@code hasWanted},
  * and its {@code LookControl}'s wanted place and whether it's looking there,
- * {@code isLookingAtTarget}; a living entity that isn't a mob, and a player, writes 0 and false
- * for each.
+ * {@code isLookingAtTarget}, and its own random's seed as it is now, so where a mob's draws part
+ * shows (CAL-303); a living entity that isn't a mob, and a player, writes 0 and false for each.
  */
 public final class Trace {
-    private static final String NO_CONTROLS = " 0.0 0.0 0.0 0.0 false 0.0 0.0 0.0 false";
+    private static final String NO_CONTROLS = " 0.0 0.0 0.0 0.0 false 0.0 0.0 0.0 false 0";
 
     private static Writer out;
     private static boolean controls;
@@ -89,7 +89,23 @@ public final class Trace {
         var look = mob.getLookControl();
         return " " + move.getWantedX() + " " + move.getWantedY() + " " + move.getWantedZ() + " " + move.getSpeedModifier()
                 + " " + move.hasWanted() + " " + look.getWantedX() + " " + look.getWantedY() + " " + look.getWantedZ()
-                + " " + look.isLookingAtTarget();
+                + " " + look.isLookingAtTarget() + " " + seedOf(mob);
+    }
+
+    /** The seed of the mob's random as it is now, its {@code LegacyRandomSource}'s, or -1. */
+    private static long seedOf(net.minecraft.world.entity.Mob mob) {
+        Object random = mob.getRandom();
+        try {
+            var field = random.getClass().getDeclaredField("seed");
+            field.setAccessible(true);
+            Object value = field.get(random);
+            if (value instanceof java.util.concurrent.atomic.AtomicLong seed) {
+                return seed.get();
+            }
+            return value instanceof Long seed ? seed : -1L;
+        } catch (ReflectiveOperationException e) {
+            return -1L;
+        }
     }
 
     /** The player whose own tick, {@code doTick}, is done. */
