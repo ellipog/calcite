@@ -175,7 +175,7 @@ import world.beds.{BedRule}
 import world.dismount.{anchor_stand_up_position, stand_up_position}
 import world.end_portal.{fill_frame}
 import world.golem_building.{IRON_GOLEM_BUILT, check_wither_spawn}
-import world.block_updates.{after_removal, falling_free, fire_state, tilt_leaf}
+import world.block_updates.{after_removal, chain_next, command_block_begins, command_block_ends, falling_free, fire_state, tilt_leaf}
 import world.states.{Prop, StateCodec}
 import worldgen.shapes.{concrete_of, touches_liquid, update_from_neighbours}
 import worldgen.generator.{JigsawPlacement, Placement as GenPlacement, StructurePlacement, TemplatePlacement}
@@ -2004,11 +2004,13 @@ impl Outgoing {
 
 // Who hears what a command says, vanilla's `CommandSource`: the console, the player in a slot, or
 // the trace `debug function` writes (CAL-363), which hears all of it, `alwaysAccepts`, so is never
-// kept quiet, and tells no operator.
+// kept quiet, and tells no operator; or a command block, by its level and place, which keeps the
+// last it heard where it tracks its output (CAL-410).
 enum Output {
     Console
     Player(usize)
     Trace
+    Block(usize, i32, i32, i32)
 }
 
 // A command's source, vanilla's `CommandSourceStack` (CAL-165): who hears what it says; the
@@ -2102,13 +2104,15 @@ enum StoreTo {
 // found; two in turn, by place plus one, as `chain` makes them; a function's result said to a
 // source, `commands.function.result`, then another told, `decorateOutputIfNeeded`; a sum of
 // functions' results, by place, added to; or a source kept in a list, by place, where a
-// function's result is not 0 or, for the last false, is, `execute if function` (CAL-165).
+// function's result is not 0 or, for the last false, is, `execute if function` (CAL-165); or a
+// command block's, counting its command's successes (CAL-410).
 enum Callback {
     Store(bool, StoreTo)
     Chain(usize, usize)
     Signal(Source, Identifier, usize)
     Add(usize)
     Filter(usize, Source, bool)
+    Count
 }
 
 // A frame of the command queue, vanilla's `Frame` (D567): how deep it is; what's told what it
@@ -2417,6 +2421,8 @@ pub struct Network {
     queue_depth: i32 = 0
     quota: i32 = 0
     callbacks: List<Callback> = List<Callback>()
+    // The successes a command block's command has had, as its callback counts them (CAL-410).
+    command_successes: i32 = 0
     plans: List<Plan> = List<Plan>()
     source_lists: List<List<Source>> = List<List<Source>>()
     sums: List<(bool, i32)> = List<(bool, i32)>()
@@ -4351,7 +4357,17 @@ impl Network {
             self.levels[d].items = self.items.take()
             let shared = if let set = self.commands { set.tree.items.copy() } else { none }
             self.levels[d].shared_items = shared
-            self.levels[d].run_block_ticks()
+            // Each command block's tick as the block ticks come to it, which the network runs, the
+            // item codecs back for its commands meanwhile (CAL-410).
+            self.levels[d].runs_commands = true
+            self.levels[d].start_block_ticks()
+            loop {
+                let due = self.levels[d].resume_block_ticks() else break
+                self.items = self.levels[d].items.take()
+                let (cx, cy, cz) = due
+                self.command_block_tick(d, cx, cy, cz)
+                self.levels[d].items = self.items.take()
+            }
             self.items = self.levels[d].items.take()
             self.levels[d].run_fluid_ticks()
             // Then its raids (CAL-170, CAL-167).
@@ -18729,6 +18745,164 @@ impl Network {
         if spawned {
             self.spawner_delay(d, x, y, z)
         }
+    }
+
+    // `CommandBlock.tick` of the command block at x, y, z of the level `d`, as the block ticks stop
+    // for it (CAL-410): as its mode has it, `command_block_begins`, it runs, `execute`, then
+    // `command_block_ends`. What isn't in Calcite yet is reported.
+    fn command_block_tick(mut self, d: usize, x: i32, y: i32, z: i32) {
+        let shared = self.levels[d].shared_env() else return
+        let Env { facts: f, .. } = shared.value
+        match self.command_block_ticked(d, f, x, y, z) {
+            ok => {},
+            err(thrown) => self.levels[d].unimplemented(thrown.message),
+        }
+    }
+
+    fn command_block_ticked(mut self, d: usize, f: Facts, x: i32, y: i32, z: i32) ! Thrown {
+        let state = try self.levels[d].state(f, x, y, z)
+        if try command_block_begins(f, mut self.levels[d], state, x, y, z) {
+            try self.command_block_execute(d, f, state, x, y, z)
+        }
+        try command_block_ends(f, mut self.levels[d], state, x, y, z)
+    }
+
+    // `CommandBlock.execute` (CAL-410): its command run, `performCommand`, or without one a
+    // success at nothing; then the chain in front, `executeChain`, as far as
+    // `max_command_sequence_length` lets it, each that runs running its command and, unless that
+    // didn't run, telling a comparator reading it; with a warning where it went that far.
+    fn command_block_execute(mut self, d: usize, f: Facts, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+        if self.command_of(d, x, y, z).is_empty() {
+            self.levels[d].set_block_entity_value(x, y, z, "SuccessCount", Tag.Int(0))
+        } else {
+            _ = self.perform_command_block(d, f, state, x, y, z)
+        }
+        let limit = self.world.game_rules.value_of(String("max_command_sequence_length")) ?? 65536
+        var left = limit
+        var (cx, cy, cz) = (x, y, z)
+        var facing = try facing_of(f, state)
+        while left > 0 {
+            left -= 1
+            let next = try chain_next(f, mut self.levels[d], cx, cy, cz, facing)
+            let link = next else break
+            if link.runs {
+                if not self.perform_command_block(d, f, link.state, link.x, link.y, link.z) {
+                    break
+                }
+                try update_output_signal(f, mut self.levels[d], f.block(link.state), link.x, link.y, link.z)
+            }
+            cx = link.x
+            cy = link.y
+            cz = link.z
+            facing = link.facing
+        }
+        if left <= 0 {
+            self.logs.push(Entry.warn("Command Block chain tried to execute more than {limit.max(0)} steps!"))
+        }
+    }
+
+    // The command the command block at x, y, z of the level `d` keeps, `Command` (CAL-410).
+    fn command_of(self, d: usize, x: i32, y: i32, z: i32) -> String {
+        let tags = self.levels[d].block_entity_tag(x, y, z) else return String()
+        if let Tag.Compound(m) = tags {
+            if m.contains("Command") {
+                if let Tag.Str(c) = m["Command"] {
+                    return c.copy()
+                }
+            }
+        }
+        return String()
+    }
+
+    // Whether the command block at x, y, z of the level `d` tracks its output, `TrackOutput`, true
+    // where it says nothing (CAL-410).
+    fn command_block_tracks(self, d: usize, x: i32, y: i32, z: i32) -> bool {
+        let tags = self.levels[d].block_entity_tag(x, y, z) else return false
+        if let Tag.Compound(m) = tags {
+            if m.contains("TrackOutput") {
+                if let Tag.Byte(b) = m["TrackOutput"] {
+                    return b != 0i8
+                }
+            }
+        }
+        return true
+    }
+
+    // `BaseCommandBlock.performCommand` of the command block `state` at x, y, z of the level `d`
+    // (CAL-410): not again in the game tick it last ran in, `LastExecution`, kept where it
+    // updates it, `UpdateLastExecution`; `Searge` a success of its own; else, where
+    // `command_blocks_work`, its command, a leading slash dropped, `performPrefixedCommand`, run
+    // from its block's middle, facing its way across, at the game masters' level, by its name,
+    // its output kept as it tracks it, its successes counted, `SuccessCount`. Whether it ran.
+    fn perform_command_block(mut self, d: usize, f: Facts, state: u32, x: i32, y: i32, z: i32) -> bool {
+        let tags = self.levels[d].block_entity_tag(x, y, z) else return false
+        let m = match tags {
+            Tag.Compound(t) => t.copy(),
+            _ => return false,
+        }
+        let now = self.levels[d].game_time
+        var updates = true
+        if m.contains("UpdateLastExecution") {
+            if let Tag.Byte(b) = m["UpdateLastExecution"] {
+                updates = b != 0i8
+            }
+        }
+        var last = -1i64
+        if updates and m.contains("LastExecution") {
+            if let Tag.Long(l) = m["LastExecution"] {
+                last = l
+            }
+        }
+        if now == last {
+            return false
+        }
+        let command = self.command_of(d, x, y, z)
+        let tracks = self.command_block_tracks(d, x, y, z)
+        if command.to_lower_root() == "searge" {
+            if tracks {
+                self.levels[d].keep_block_entity_value(x, y, z, "LastOutput", Component.literal("#itzlipofutzli").to_nbt())
+            }
+            self.levels[d].keep_block_entity_value(x, y, z, "SuccessCount", Tag.Int(1))
+            return true
+        }
+        var count = 0
+        if self.world.game_rules.flag("command_blocks_work") and not command.is_empty() {
+            self.levels[d].remove_block_entity_value(x, y, z, "LastOutput")
+            let facing = match facing_of(f, state) {
+                ok(v) => v,
+                err(_) => 0,
+            }
+            let y_rot = if facing == 2 { 180.0f32 } else if facing == 3 { 0.0f32 } else if facing == 4 { 90.0f32 } else { 270.0f32 }
+            var source = Source { output: Output.Block(d, x, y, z), entity: none, x: f64(x) + 0.5, y: f64(y) + 0.5, z: f64(z) + 0.5, x_rot: 0.0f32, y_rot: y_rot, dim: d, level: GAMEMASTERS }
+            self.command_successes = 0
+            source.callback = self.add_callback(Callback.Count)
+            let input = if command.starts_with("/") { command[1..command.len()] } else { command.copy() }
+            self.run_command(source, input, List<(String, ChatMessage)>())
+            count = self.command_successes
+            self.command_successes = 0
+        }
+        self.levels[d].keep_block_entity_value(x, y, z, "SuccessCount", Tag.Int(count))
+        if updates {
+            self.levels[d].keep_block_entity_value(x, y, z, "LastExecution", Tag.Long(now))
+        } else {
+            self.levels[d].remove_block_entity_value(x, y, z, "LastExecution")
+        }
+        return true
+    }
+
+    // `CloseableCommandBlockSource.sendSystemMessage` (CAL-410): where the command block at x, y,
+    // z of the level `d` tracks its output, `message` kept as its last, after the wall clock's
+    // time, `[HH:mm:ss] `, and its block sent again, `onUpdated`.
+    fn block_output(mut self, d: usize, x: i32, y: i32, z: i32, message: own Component) {
+        if not self.command_block_tracks(d, x, y, z) {
+            return
+        }
+        let now = unsafe { Timestamp.now() }
+        let t = now.date_time(unsafe { now.local_offset() })
+        var line = Component.literal("[{two_digits(t.hour)}:{two_digits(t.minute)}:{two_digits(t.second)}] ")
+        line.extra.push(message)
+        self.levels[d].keep_block_entity_value(x, y, z, "LastOutput", line.to_nbt())
+        self.levels[d].send_block_updated(x, y, z)
     }
 
     // `getOrCreateNextSpawnData` of the spawner at x, y, z of the level `d` (CAL-408): its
@@ -42955,6 +43129,20 @@ impl Network {
         if let (d, id) = source.other {
             return self.picked_display_name(d, id)
         }
+        // A command block's, its custom name or `@` (CAL-410).
+        if let Output.Block(d, x, y, z) = source.output {
+            if let tags = self.levels[d].block_entity_tag(x, y, z) {
+                if let Tag.Compound(m) = tags {
+                    if m.contains("CustomName") {
+                        match Component.from_nbt(m["CustomName"].copy()) {
+                            ok(c) => return c,
+                            err(_) => {},
+                        }
+                    }
+                }
+            }
+            return Component.literal("@")
+        }
         return Component.literal("Server")
     }
 
@@ -42992,6 +43180,7 @@ impl Network {
             Output.Console => self.tell_server(message, true),
             Output.Player(slot) => self.tell_slot(slot, message),
             Output.Trace => self.trace_message(message),
+            Output.Block(d, x, y, z) => self.block_output(d, x, y, z, message),
         }
     }
 
@@ -44586,6 +44775,11 @@ impl Network {
             Callback.Signal(s, id, back) => {
                 self.success(s, Component.translatable_args(String("commands.function.result"), [Argument.Text(Component.literal(id.to_string())), Argument.Number(Tag.Int(result))]), true)
                 try self.callback(back, success, result)
+            },
+            Callback.Count => {
+                if success {
+                    self.command_successes += 1
+                }
             },
             Callback.Add(sum) => {
                 let (_, total) = self.sums[sum]
@@ -54109,6 +54303,7 @@ impl Network {
         match source.output {
             Output.Console => return String("console"),
             Output.Trace => return String("trace"),
+            Output.Block(d, x, y, z) => return "block {d} {x} {y} {z}",
             Output.Player(slot) => {
                 if let c = self.connections[slot] {
                     if let p = c.profile {
@@ -54415,17 +54610,27 @@ impl Network {
         return (x, y.max(f64(min_y)).min(f64(top)), z)
     }
 
-    // `sendSuccess`: the message to its source, a player only as `sendCommandFeedback`, true
-    // until Calcite reads the game rules, lets them have it, and the console logging it; then,
-    // where `broadcast`, to the operators.
+    // `sendSuccess`: the message to its source, a player or a command block only as
+    // `send_command_feedback` lets them have it, `acceptsSuccess`, and the console logging it;
+    // then, where `broadcast`, to the operators.
     fn success(mut self, source: Source, message: own Component, broadcast: bool) {
         if source.silent {
             return
         }
+        let feedback = self.world.game_rules.flag("send_command_feedback")
         match source.output {
             Output.Console => self.tell_server(message.copy(), true),
-            Output.Player(slot) => self.tell_slot(slot, message.copy()),
+            Output.Player(slot) => {
+                if feedback {
+                    self.tell_slot(slot, message.copy())
+                }
+            },
             Output.Trace => self.trace_message(message.copy()),
+            Output.Block(d, x, y, z) => {
+                if feedback {
+                    self.block_output(d, x, y, z, message.copy())
+                }
+            },
         }
         if broadcast {
             self.inform_admins(source, message)
@@ -54433,24 +54638,37 @@ impl Network {
     }
 
     // `broadcastToAdmins`, as `shouldInformAdmins` lets it: in gray italics, `[Source: message]`,
-    // the source by the name it goes by, to each operator but the one who hears it, and logged
-    // where that's a player. The console's go to the operators where `broadcast-console-to-ops`
-    // says so.
+    // the source by the name it goes by, to each operator but the one who hears it where
+    // `send_command_feedback` says so, and logged where it isn't the console's and
+    // `log_admin_commands` says so. The console's go to the operators where
+    // `broadcast-console-to-ops` says so, and a command block's where it tracks its output and
+    // `command_block_output` says so (CAL-410).
     fn inform_admins(mut self, source: Source, message: own Component) {
         let by = self.source_name(source)
         var from: usize? = none
+        var console = false
         match source.output {
             Output.Player(slot) => from = some(slot),
             Output.Console => {
                 if not self.world.settings.broadcast_console_to_ops {
                     return
                 }
+                console = true
             },
             Output.Trace => return,
+            Output.Block(d, x, y, z) => {
+                if not self.command_block_tracks(d, x, y, z) or not self.world.game_rules.flag("command_block_output") {
+                    return
+                }
+            },
         }
         var line = Component.translatable("chat.type.admin", [by, message]).colored("gray")
         line.style.italic = some(true)
+        let feedback = self.world.game_rules.flag("send_command_feedback")
         for slot in self.by_joining() {
+            if not feedback {
+                break
+            }
             if from == some(slot) {
                 continue
             }
@@ -54464,7 +54682,7 @@ impl Network {
                 self.tell_slot(slot, line.copy())
             }
         }
-        if from != none {
+        if not console and self.world.game_rules.flag("log_admin_commands") {
             self.tell_server(line, true)
         }
     }
@@ -54506,6 +54724,12 @@ impl Network {
                     self.trace_message(c)
                 }
             },
+            Output.Block(d, x, y, z) => {
+                self.block_output(d, x, y, z, red(f.message.copy()))
+                if let c = where_ {
+                    self.block_output(d, x, y, z, red(c))
+                }
+            },
         }
     }
 
@@ -54518,6 +54742,7 @@ impl Network {
         match source.output {
             Output.Console => self.tell_server(message, true),
             Output.Trace => self.trace_message(message),
+            Output.Block(d, x, y, z) => self.block_output(d, x, y, z, red(message)),
             Output.Player(slot) => {
                 var con = self.connections[slot].take() else return
                 self.failure(mut con, message)
@@ -66203,6 +66428,13 @@ fn camera_id(con: Connection) -> i32 {
 }
 
 // Whether `o` hears all a source says, a trace, so is never kept quiet, as `withSuppressedOutput`
+// `message` in red, as `sendFailure` makes it (CAL-410).
+fn red(message: own Component) -> Component {
+    var c = Component.empty().colored("red")
+    c.extra.push(message)
+    return c
+}
+
 // leaves a source whose output `alwaysAccepts` (CAL-363).
 fn hears_all(o: Output) -> bool {
     return match o {
