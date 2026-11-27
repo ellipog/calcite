@@ -196,7 +196,7 @@ import world.portal.{Heights, PortalSite, Rect, exit_target, free_position, larg
 import world.pos.{BlockPos, ChunkPos}
 import world.entity_facts.{CREATURE, MONSTER, PEACEFUL, SUMMON, types as type_facts}
 import world.environment.{Value as AttributeValue, can_pillager_patrol_spawn, can_start_raid, eyeblossom_open, snow_golem_melts, baby_villager_activity, bed_rule, bees_stay_in_hive, fast_lava, increased_fire_burnout, monsters_burn, moon_phase, nether_portal_spawns_piglin, piglins_zombify, respawn_anchor_works, sun_angle, straw_bed_rule, surface_slime_spawn_chance, turtle_egg_hatch_chance, cat_waking_up_gift_chance, villager_activity, water_evaporates}
-import world.natural.{MobMaker, SpawnPlace, SpawnState, reinforce, summon_golem, spawn_for_chunk, spawn_patrol, spawn_phantoms, monster_spawn_rules, spawn_position_ok, spawn_for_generation, spawning_categories, spawns_in}
+import world.natural.{MobMaker, SpawnPlace, SpawnState, spawn_box, spawn_box_free, spawner_mob_ok, spawner_rules, reinforce, summon_golem, spawn_for_chunk, spawn_patrol, spawn_phantoms, monster_spawn_rules, spawn_position_ok, spawn_for_generation, spawning_categories, spawns_in}
 import world.random_sequences.{RandomSequences, saved_id as sequences_id}
 import world.command_storage.{storage_id}
 import world.lodestone.{TrackerTick, lodestone_tick, with_component}
@@ -1662,6 +1662,13 @@ fn named_text(text: own String) -> Argument {
 }
 
 // How `drop_from` leaves an item a player drops: as it's made, for them alone at once, or fake.
+// What a spawner's try came to (CAL-408): nothing spawned, a mob spawned, the spawn put off,
+// `delay` and return, or what Calcite hasn't, said to be missing.
+const SPAWN_SKIPPED: i32 = 0
+const SPAWN_MADE: i32 = 1
+const SPAWN_STOPPED: i32 = 2
+const SPAWN_MISSING: i32 = 3
+
 const DROP_ANY: i32 = 0
 const DROP_THEIRS: i32 = 1
 const DROP_FAKE: i32 = 2
@@ -4412,6 +4419,7 @@ impl Network {
                 self.hopper_world_back(d)
             }
             self.tick_bells(d)
+            self.tick_spawners(d)
             self.push_lids(d)
         }
         self.make_drops(d)
@@ -18581,6 +18589,295 @@ impl Network {
                 },
             }
         }
+    }
+
+    // The spawners of the level `d` whose block entities ticked, in their order (CAL-408), each's
+    // `BaseSpawner.serverTick`, after the level's other block entities, as it reads its entities.
+    fn tick_spawners(mut self, d: usize) {
+        for (x, y, z) in self.levels[d].take_spawners_ticked() {
+            self.spawner_tick(d, x, y, z)
+        }
+    }
+
+    // What the spawner at x, y, z of the level `d` saves, where there's one (CAL-408).
+    fn spawner_data(self, d: usize, x: i32, y: i32, z: i32) -> JavaHashMap<String, Tag>? {
+        let t = self.levels[d].block_entity_tag(x, y, z) else return none
+        let Tag.Compound(m) = t else return none
+        return some(m.copy())
+    }
+
+    // `BaseSpawner.serverTick` of the spawner at x, y, z of the level `d` (CAL-408). It runs where
+    // a player alive and not spectating is within its `RequiredPlayerRange`, `isNearPlayer`, and
+    // the game rule `spawner_blocks_work` is on. A `Delay` of -1 is put off first, `delay`. Then
+    // above 0 it counts down, kept without `setChanged`. At 0 it makes its `SpawnCount` tries of
+    // its next spawn's data, `getOrCreateNextSpawnData`, drawn where it has none, each
+    // `spawner_try`; and where one spawned, it's put off again.
+    fn spawner_tick(mut self, d: usize, x: i32, y: i32, z: i32) {
+        let saved = self.spawner_data(d, x, y, z) else return
+        let range = spawner_number(saved, "RequiredPlayerRange", 16)
+        if not self.levels[d].player_within(f64(x) + 0.5, f64(y) + 0.5, f64(z) + 0.5, f64(range)) or not self.world.game_rules.flag("spawner_blocks_work") {
+            return
+        }
+        if spawner_number(saved, "Delay", 20) == -1 {
+            self.spawner_delay(d, x, y, z)
+        }
+        let data = self.spawner_data(d, x, y, z) else return
+        let delay = spawner_number(data, "Delay", 20)
+        if delay > 0 {
+            self.levels[d].keep_block_entity_value(x, y, z, "Delay", Tag.Short(i16.wrap(delay - 1)))
+            return
+        }
+        let next = self.spawner_next(d, x, y, z)
+        let count = spawner_number(data, "SpawnCount", 4)
+        let spread = spawner_number(data, "SpawnRange", 4)
+        let most = spawner_number(data, "MaxNearbyEntities", 6)
+        var spawned = false
+        for _ in 0..count {
+            let came = self.spawner_try(d, x, y, z, next.copy(), spread, most)
+            if came == SPAWN_MADE {
+                spawned = true
+            } else if came == SPAWN_STOPPED {
+                self.spawner_delay(d, x, y, z)
+                return
+            } else if came == SPAWN_MISSING {
+                return
+            }
+        }
+        if spawned {
+            self.spawner_delay(d, x, y, z)
+        }
+    }
+
+    // `getOrCreateNextSpawnData` of the spawner at x, y, z of the level `d` (CAL-408): its
+    // `SpawnData`, or else one drawn from its `SpawnPotentials` by the level's random,
+    // `WeightedList.getRandom`, kept, `setNextSpawnData`, or an empty one where it has none.
+    fn spawner_next(mut self, d: usize, x: i32, y: i32, z: i32) -> JavaHashMap<String, Tag> {
+        let data = self.spawner_data(d, x, y, z) ?? JavaHashMap<String, Tag>()
+        if data.contains("SpawnData") {
+            if let Tag.Compound(next) = data["SpawnData"] {
+                return next.copy()
+            }
+        }
+        if let picked = self.spawner_pick(d, data) {
+            self.spawner_set_next(d, x, y, z, picked.copy())
+            return picked
+        }
+        return JavaHashMap<String, Tag>()
+    }
+
+    // `WeightedList.getRandom` of a spawner's `SpawnPotentials` in `data` by the level `d`'s random
+    // (CAL-408): none where they weigh nothing, else a draw under their weight, the entry it falls
+    // in, its `data`.
+    fn spawner_pick(mut self, d: usize, data: JavaHashMap<String, Tag>) -> JavaHashMap<String, Tag>? {
+        if not data.contains("SpawnPotentials") {
+            return none
+        }
+        let Tag.List(entries) = data["SpawnPotentials"] else return none
+        var total = 0
+        for e in entries {
+            if let Tag.Compound(m) = e {
+                total += if m.contains("weight") { m["weight"].number_int() ?? 0 } else { 0 }
+            }
+        }
+        if total <= 0 {
+            return none
+        }
+        var selection = self.levels[d].next_int_below(total)
+        for e in entries {
+            let Tag.Compound(m) = e else continue
+            selection -= if m.contains("weight") { m["weight"].number_int() ?? 0 } else { 0 }
+            if selection < 0 {
+                if m.contains("data") {
+                    if let Tag.Compound(next) = m["data"] {
+                        return some(next.copy())
+                    }
+                }
+                return some(JavaHashMap<String, Tag>())
+            }
+        }
+        return none
+    }
+
+    // `SpawnerBlockEntity`'s `setNextSpawnData` (CAL-408): kept as its `SpawnData`, and the block
+    // sent again, `sendBlockUpdated`, its update packet with it.
+    fn spawner_set_next(mut self, d: usize, x: i32, y: i32, z: i32, next: own JavaHashMap<String, Tag>) {
+        self.levels[d].keep_block_entity_value(x, y, z, "SpawnData", Tag.Compound(next))
+        self.levels[d].send_block_updated(x, y, z)
+    }
+
+    // `BaseSpawner.delay` of the spawner at x, y, z of the level `d` (CAL-408): its delay its
+    // least, or that and a draw of the level's random under the gap to its most; its next spawn's
+    // data drawn from its potentials, `setNextSpawnData`, where they weigh anything; then its
+    // block event 1, `broadcastEvent`.
+    fn spawner_delay(mut self, d: usize, x: i32, y: i32, z: i32) {
+        let data = self.spawner_data(d, x, y, z) else return
+        let least = spawner_number(data, "MinSpawnDelay", 200)
+        let most = spawner_number(data, "MaxSpawnDelay", 800)
+        let delay = if most <= least { least } else { least + self.levels[d].next_int_below(most - least) }
+        self.levels[d].keep_block_entity_value(x, y, z, "Delay", Tag.Short(i16.wrap(delay)))
+        if let picked = self.spawner_pick(d, data) {
+            self.spawner_set_next(d, x, y, z, picked)
+        }
+        let shared = self.levels[d].shared_env() else return
+        let Env { facts: f, .. } = shared.value
+        let state = self.block_at(d, f, x, y, z) ?? f.ids.air_state
+        self.levels[d].block_event(x, y, z, f.block(state), 1, 0)
+    }
+
+    // One of a spawner's tries, at x, y, z of the level `d`, of its next spawn's data `next`,
+    // spreading `spread` and with at most `most` of its kind about (CAL-408), as
+    // `BaseSpawner.serverTick` makes it, by the level's random. Its entity's type is read first,
+    // `EntityType.by`, and the spawn is put off where there's none. Its place comes from its `Pos`,
+    // or a draw within `spread` across, 1 up or down. Its spawn box must meet no block,
+    // `noCollision`, and its spawn rules hold, as a spawner's, `SpawnPlacements.checkSpawnRules`.
+    // Then it's made there, `loadEntityRecursive`, with a turn drawn, `snapTo`. Where `most` of its
+    // kind are about the spawner, within `spread` of its block, the spawn's put off. Its own rules
+    // and room come next, `checkSpawnRules` and `checkSpawnObstruction`. Where its data is only its
+    // type it's finalized, `SPAWNER`, at the local difficulty at its block. Then it's added with
+    // what it made, `tryAddFreshEntityWithPassengers`; level event 2004 at the spawner; and its
+    // poof, entity event 20, `spawnAnim`. An entity that isn't a mob, one with passengers,
+    // custom spawn rules, equipment and rules Calcite hasn't for spawners are said to be missing.
+    fn spawner_try(mut self, d: usize, x: i32, y: i32, z: i32, next: JavaHashMap<String, Tag>, spread: i32, most: i32) -> i32 {
+        var entity = JavaHashMap<String, Tag>()
+        if next.contains("entity") {
+            if let Tag.Compound(e) = next["entity"] {
+                entity = e.copy()
+            }
+        }
+        let name = match if entity.contains("id") { entity["id"].copy() } else { Tag.End } {
+            Tag.Str(n) => n.copy(),
+            _ => return SPAWN_STOPPED,
+        }
+        let species = species_named(name.copy()) else {
+            self.levels[d].unimplemented(String("A spawner's entity that isn't a mob"))
+            return SPAWN_MISSING
+        }
+        if entity.contains("Passengers") {
+            self.levels[d].unimplemented(String("A spawner's entity with passengers"))
+            return SPAWN_MISSING
+        }
+        if next.contains("custom_spawn_rules") or next.contains("equipment") {
+            self.levels[d].unimplemented(String("A spawner's custom spawn rules or equipment"))
+            return SPAWN_MISSING
+        }
+        if not self.items_ready() or not self.living_ready(d) or not self.mob_facts_ready() {
+            return SPAWN_MISSING
+        }
+        let type_id = self.entity_type_of(name.copy())
+        let n = self.world.natural.take() else return SPAWN_MISSING
+        var random = self.levels[d].lend_random()
+        let (a, b) = (random.next_double(), random.next_double())
+        let sx = f64(x) + (a - b) * f64(spread) + 0.5
+        let sy = f64(y + random.next_int_below(3) - 1)
+        let (c, e) = (random.next_double(), random.next_double())
+        let sz = f64(z) + (c - e) * f64(spread) + 0.5
+        if not spawn_box_free(n, self.levels[d], spawn_box(n, type_id, sx, sy, sz)) {
+            self.levels[d].give_back_random(random)
+            self.world.natural = some(n)
+            return SPAWN_SKIPPED
+        }
+        let (bx, by, bz) = (mth_floor(sx), mth_floor(sy), mth_floor(sz))
+        let players = self.level_players(d)
+        let place = self.spawn_place(d, players, List<i32>())
+        let ruled = match spawner_rules(n, self.world.mobs[d], place, mut self.levels[d], type_id, bx, by, bz, mut random) {
+            ok(r) => r,
+            err(thrown) => {
+                self.levels[d].unimplemented(thrown.message)
+                none
+            },
+        }
+        let allowed = ruled else {
+            self.levels[d].give_back_random(random)
+            self.world.natural = some(n)
+            self.levels[d].unimplemented(String("A spawner's spawn rules for its mob"))
+            return SPAWN_MISSING
+        }
+        if not allowed {
+            self.levels[d].give_back_random(random)
+            self.world.natural = some(n)
+            return SPAWN_SKIPPED
+        }
+        // Read from its data, `loadEntityRecursive`, as a summoned mob is, so turned as its data
+        // has it, its head and body too.
+        var lines = List<Entry>()
+        let loaded = self.loaded_mob(species, entity.copy(), mut lines)
+        for l in lines {
+            self.logs.push(l.copy())
+        }
+        var maker = self.level_making(d)
+        maker.ids = self.entity_ids
+        maker.seeds = self.entity_seeds
+        maker.lf = self.living_facts.take()
+        maker.facts = self.mob_facts.take()
+        var made = List<Mob>()
+        var outcome = SPAWN_STOPPED
+        if let fresh = loaded {
+            var mob = fresh
+            let (turn, pitch) = (mob.living.body.y_rot, mob.living.body.x_rot)
+            mob.living.snap_to(sx, sy, sz, turn, pitch)
+            let es = self.take_entities(d)
+            let about = Aabb { min_x: f64(x - spread), min_y: f64(y - spread), min_z: f64(z - spread), max_x: f64(x + 1 + spread), max_y: f64(y + 1 + spread), max_z: f64(z + 1 + spread) }
+            let near = es.list.mobs_of_kind_in(about, species)
+            self.put_entities(d, es)
+            if near < usize.wrap(most) {
+                let yaw = random.next_float() * 360.0f32
+                let (px, py, pz) = (mob.living.body.x, mob.living.body.y, mob.living.body.z)
+                mob.living.snap_to(px, py, pz, yaw, 0.0f32)
+                if not spawner_mob_ok(n, place, self.levels[d], maker, mob, true) {
+                    outcome = SPAWN_SKIPPED
+                } else {
+                    let (mx, my, mz) = (mth_floor(mob.living.body.x), mth_floor(mob.living.body.y), mth_floor(mob.living.body.z))
+                    let biome = self.levels[d].biome(mx, my, mz)
+                    let local = self.difficulty_at(d, mx, mz)
+                    let today = self.clock.date_time(unsafe { self.clock.local_offset() })
+                    let o = Occasion { local: local, halloween: today.month == 10 and today.day == 31, natural: false }
+                    let moon = self.moon_at(d)
+                    // Finalized only where its data is just its type.
+                    if entity.len() == 1 {
+                        maker.spawning_at(mut mob, SpawnAt { biome: biome, moon: some(moon) })
+                        _ = mob.finalize_spawn(none, o, mut maker, mut random)
+                    }
+                    for m in maker.made {
+                        made.push(m.copy())
+                    }
+                    made.push(mob.copy())
+                    for m in maker.riders {
+                        made.push(m.copy())
+                    }
+                    outcome = SPAWN_MADE
+                }
+            }
+        }
+        self.levels[d].give_back_random(random)
+        self.world.natural = some(n)
+        self.entity_ids = maker.ids
+        self.entity_seeds = maker.seeds
+        self.living_facts = maker.lf.take()
+        self.mob_facts = maker.facts.take()
+        if outcome != SPAWN_MADE {
+            return outcome
+        }
+        self.seat_boarded(d, mut maker)
+        for m in made {
+            if self.uuid_loaded(d, m.living.body.uuid) {
+                return SPAWN_STOPPED
+            }
+        }
+        var main = -1
+        for m in made {
+            if m.species == species and main < 0 {
+                main = m.living.body.id
+            }
+            self.add_mob(d, m.copy())
+        }
+        self.levels[d].mob_level_event(2004, x, y, z, 0)
+        self.send_level_events(d)
+        let es = self.take_entities(d)
+        if main >= 0 and es.trackers.contains(main) {
+            self.send_to_seen(es.trackers[main].seen_by, encode_play(ClientboundEntityEvent { entity_id: main, event: 20i8 }))
+        }
+        self.put_entities(d, es)
+        return SPAWN_MADE
     }
 
     // The bells of the level `d` whose block entities ticked, in their order (CAL-394): each's
@@ -63307,6 +63604,14 @@ fn in_powder_snow(c: Connection) -> bool {
         some(l) => l.body.in_powder_snow,
         none => false,
     }
+}
+
+// A spawner's saved number `key`, a short as it saves it or any number, else `default` (CAL-408).
+fn spawner_number(data: JavaHashMap<String, Tag>, key: str, default: i32) -> i32 {
+    if not data.contains(key) {
+        return default
+    }
+    return data[key].number_int() ?? default
 }
 
 fn swimming(con: Connection) -> bool {
