@@ -5,16 +5,19 @@
 /// pulling what they stick to along, twelve blocks at most. Each block moved is a moving piston
 /// for two ticks, whose block entity's tick, `PistonMovingBlockEntity.tick`, then sets the block
 /// it moved in its new place, shaped by what's around it; `finalTick` does that at once where a
-/// piston moves again first. Entities aren't moved with them yet, and what a broken block drops
-/// comes with items.
+/// piston moves again first. What a broken block drops comes with items. As it moves, a moving piston pushes the entities in its way along and carries
+/// what stands on a honey block across, `moveCollidedEntities` and `moveStuckEntities`, which
+/// the server does once the level's block entities are done, `PistonPush`; and its shape, which
+/// entities meet as they move, is where it's got to, `moving_pieces` (CAL-445).
 module world.pistons
 
 import random.source.{RandomSource}
-import world.block_level.{BlockLevel, MovingPiston, remove_block, update_or_destroy}
+import world.block_level.{BlockLevel, MovingPiston, PistonPush, remove_block, update_or_destroy}
+import world.collision.{Aabb}
 import world.level_writer.{UPDATE_LIMIT}
 import world.pos.{BlockPos}
 import worldgen.access.{BlockAccess}
-import worldgen.facts.{DOWN, Facts, IMMOVEABLE, POPPED, PUSH_ONLY, PUSH_PULL, UP, direction_name, opposite, step_x, step_y, step_z}
+import worldgen.facts.{DOWN, EAST, Facts, IMMOVEABLE, NORTH, POPPED, PUSH_ONLY, PUSH_PULL, SOUTH, UP, WEST, direction_name, opposite, step_x, step_y, step_z}
 import worldgen.interval.{Thrown}
 import worldgen.shapes.{update_from_neighbours}
 import worldgen.signals.{has_signal}
@@ -181,6 +184,8 @@ pub fn is_pushable<L: BlockAccess + BlockLevel>(f: Facts, level: L, state: u32, 
 /// further along, what it holds after; or, all the way along as the tick starts, gone, `none`,
 /// with the block it moved set in its place with flags 67, shaped by the blocks around and not
 /// waterlogged, and told it's there, or, where it can't be there, set with flags 340 and broken.
+/// Under way, what it pushes is kept for the server first, `moveCollidedEntities` and
+/// `moveStuckEntities`, `pushed` (CAL-445).
 pub fn tick_moving<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mut L, x: i32, y: i32, z: i32, m: MovingPiston) -> MovingPiston? ! Thrown {
     let Env { facts: f, .. } = e
     var now = m
@@ -205,11 +210,210 @@ pub fn tick_moving<L: BlockAccess + BlockLevel + RandomSource>(e: Env, level: mu
         level.neighbour_changed(x, y, z, f.block(placed))
         return none
     }
-    // `moveCollidedEntities` and `moveStuckEntities` come with entities.
-    level.unimplemented(String("Entities moved by a piston"))
+    level.piston_push(try pushed(f, x, y, z, now))
     let next = now.progress + 0.5f32
     now.progress = if next >= 1.0f32 { 1.0f32 } else { next }
     return some(now)
+}
+
+/// `PistonMovingBlockEntity.getCollisionShape` of the moving piston `m` (CAL-445): the states whose
+/// collision shapes make it up, each with how far it's moved in its block, for an entity a piston
+/// pushes `noclip`'s way, `NOCLIP`, or -1. A piston's own base going back in has its extended
+/// base's shape; then, but where it's under way and the entity's pushed its way, so it doesn't
+/// meet what pushes it, the head's for a piston's own, short once it's under a quarter from
+/// where it stops, else the block it moves, moved along by how far it's yet to go.
+pub fn moving_pieces(f: Facts, m: MovingPiston, noclip: i32) -> List<(u32, f64, f64, f64)> ! Thrown {
+    var out = List<(u32, f64, f64, f64)>()
+    if not m.extending and m.source and is_base(f, m.moved) {
+        out.push((try f.with_bool(m.moved, "extended", true), 0.0, 0.0, 0.0))
+    }
+    if m.progress < 1.0f32 and noclip == movement_of(m) {
+        return out
+    }
+    var state = m.moved
+    if m.source {
+        let faced = try f.with_name(f.default_state(f.ids.piston_head), "facing", direction_name(m.facing))
+        state = try f.with_bool(faced, "short", m.extending != (1.0f32 - m.progress < 0.25f32))
+    }
+    let along = extended_progress(m, m.progress)
+    out.push((state, f64(f32.nearest(step_x(m.facing)) * along), f64(f32.nearest(step_y(m.facing)) * along), f64(f32.nearest(step_z(m.facing)) * along)))
+    return out
+}
+
+// What the moving piston at x, y, z, holding `m`, pushes as it ticks half a block further
+// along (CAL-445): what its shape sweeps, `getCollisionRelatedBlockState`, the head of a piston's
+// own base going back in, short past a quarter of the way, of its type and its base's facing,
+// else the block it moves.
+fn pushed(f: Facts, x: i32, y: i32, z: i32, m: MovingPiston) -> PistonPush ! Thrown {
+    var state = m.moved
+    if not m.extending and m.source and is_base(f, m.moved) {
+        let faced = try f.with_name(f.default_state(f.ids.piston_head), "facing", direction_name(try facing_of(f, m.moved)))
+        let typed_head = try f.with_name(faced, "type", if f.block(m.moved) == f.ids.sticky_piston { String("sticky") } else { String("normal") })
+        state = try f.with_bool(typed_head, "short", m.progress > 0.25f32)
+    }
+    let movement = movement_of(m)
+    let next = m.progress + 0.5f32
+    let block = f.block(m.moved)
+    return PistonPush {
+        x: x, y: y, z: z, state: state, moved: m.moved, facing: m.facing, movement: movement,
+        current: f64(extended_progress(m, m.progress)), delta: f64(next - m.progress),
+        bounce: block == f.ids.slime_block, fix_base: not m.extending and m.source,
+        sticky: block == f.ids.honey_block and movement != UP and movement != DOWN,
+    }
+}
+
+/// Where `moveCollidedEntities` looks for what the moving piston `p` pushes (CAL-445): the box
+/// about its shape's boxes `boxes`, from its block's corner, where it is,
+/// `moveByPositionAndProgress`, and what it sweeps as it goes on, `getMovementArea`, put
+/// together, `minmax`; none where it has no shape.
+pub fn push_area(boxes: List<Aabb>, p: PistonPush) -> Aabb? {
+    if boxes.is_empty() {
+        return none
+    }
+    var b = boxes[0]
+    for o in boxes {
+        b = Aabb { min_x: b.min_x.min(o.min_x), min_y: b.min_y.min(o.min_y), min_z: b.min_z.min(o.min_z), max_x: b.max_x.max(o.max_x), max_y: b.max_y.max(o.max_y), max_z: b.max_z.max(o.max_z) }
+    }
+    let here = placed_at(b, p)
+    let swept = movement_area(here, p.movement, p.delta)
+    return some(Aabb {
+        min_x: here.min_x.min(swept.min_x), min_y: here.min_y.min(swept.min_y), min_z: here.min_z.min(swept.min_z),
+        max_x: here.max_x.max(swept.max_x), max_y: here.max_y.max(swept.max_y), max_z: here.max_z.max(swept.max_z),
+    })
+}
+
+/// How far the moving piston `p`, its shape's boxes `boxes`, pushes what has the box `eb`
+/// (CAL-445): of its boxes as they sweep, each where it is and what it sweeps,
+/// `getMovementArea`, that meet it, the most one needs to put it out of it the way it moves,
+/// `getMovement`, till that's as far as the piston goes; then no further than that, and 0.01
+/// more. None where none meets it or it needn't move.
+pub fn push_by(boxes: List<Aabb>, p: PistonPush, eb: Aabb) -> f64? {
+    var delta = 0.0
+    for b in boxes {
+        let moving = movement_area(placed_at(b, p), p.movement, p.delta)
+        if moving.intersects(eb.min_x, eb.min_y, eb.min_z, eb.max_x, eb.max_y, eb.max_z) {
+            delta = delta.max(movement_out(moving, p.movement, eb))
+            if delta >= p.delta {
+                break
+            }
+        }
+    }
+    if delta <= 0.0 {
+        return none
+    }
+    return some(delta.min(p.delta) + 0.01)
+}
+
+/// `fixEntityWithinPistonBase` (CAL-445): how far what has the box `eb`, as a piston's own base
+/// going back in has pushed it, is put back out of the base's block the other way, where it's in
+/// that block and as far out of the block whole as its part in it, no further than the piston
+/// goes and 0.01 more; none where it isn't.
+pub fn base_push(p: PistonPush, eb: Aabb) -> f64? {
+    let (x, y, z) = (f64(p.x), f64(p.y), f64(p.z))
+    let block = Aabb { min_x: x, min_y: y, min_z: z, max_x: x + 1.0, max_y: y + 1.0, max_z: z + 1.0 }
+    if not eb.intersects(block.min_x, block.min_y, block.min_z, block.max_x, block.max_y, block.max_z) {
+        return none
+    }
+    let back = opposite(p.movement)
+    let inside = Aabb {
+        min_x: eb.min_x.max(block.min_x), min_y: eb.min_y.max(block.min_y), min_z: eb.min_z.max(block.min_z),
+        max_x: eb.max_x.min(block.max_x), max_y: eb.max_y.min(block.max_y), max_z: eb.max_z.min(block.max_z),
+    }
+    let delta = movement_out(block, back, eb) + 0.01
+    let within = movement_out(block, back, inside) + 0.01
+    if not ((delta - within).abs() < 0.01) {
+        return none
+    }
+    return some(delta.min(p.delta) + 0.01)
+}
+
+/// Where `moveStuckEntities` looks for what the honey block `p` moves carries along (CAL-445):
+/// from the top of its block's shape, `top`, to 1.5 and a hair up, across its block, where it is.
+pub fn stuck_area(p: PistonPush, top: f64) -> Aabb {
+    return placed_at(Aabb { min_x: 0.0, min_y: top, min_z: 0.0, max_x: 1.0, max_y: 1.5000010000000001, max_z: 1.0 }, p)
+}
+
+/// `matchesStickyCritera` of what's at x, z, on the ground where `on_ground`, standing on
+/// `support`, in the honey block `p`'s `stuck_area` `area` (CAL-445): on the ground, and standing
+/// on the moving block or with its feet over the area.
+pub fn honey_carries(p: PistonPush, area: Aabb, on_ground: bool, support: (i32, i32, i32)?, x: f64, z: f64) -> bool {
+    if not on_ground {
+        return false
+    }
+    return support == some((p.x, p.y, p.z)) or (x >= area.min_x and x <= area.max_x and z >= area.min_z and z <= area.max_z)
+}
+
+/// A push of `delta` the way `d` goes, as `moveEntityByPiston` moves it.
+pub fn push_step(d: i32, delta: f64) -> (f64, f64, f64) {
+    return (delta * f64(step_x(d)), delta * f64(step_y(d)), delta * f64(step_z(d)))
+}
+
+// `moveByPositionAndProgress`: the box `b`, from the moving piston's block's corner, where the
+// piston `p` is, its block moved along its facing by how far it's yet to go.
+fn placed_at(b: Aabb, p: PistonPush) -> Aabb {
+    let dx = f64(p.x) + p.current * f64(step_x(p.facing))
+    let dy = f64(p.y) + p.current * f64(step_y(p.facing))
+    let dz = f64(p.z) + p.current * f64(step_z(p.facing))
+    return Aabb { min_x: b.min_x + dx, min_y: b.min_y + dy, min_z: b.min_z + dz, max_x: b.max_x + dx, max_y: b.max_y + dy, max_z: b.max_z + dz }
+}
+
+// `PistonMath.getMovementArea`: what the box `b`'s face the way `d` goes sweeps going `amount`.
+fn movement_area(b: Aabb, d: i32, amount: f64) -> Aabb {
+    let delta = if d == EAST or d == UP or d == SOUTH { amount } else { -amount }
+    let lo = delta.min(0.0)
+    let hi = delta.max(0.0)
+    if d == WEST {
+        return Aabb { min_x: b.min_x + lo, min_y: b.min_y, min_z: b.min_z, max_x: b.min_x + hi, max_y: b.max_y, max_z: b.max_z }
+    }
+    if d == EAST {
+        return Aabb { min_x: b.max_x + lo, min_y: b.min_y, min_z: b.min_z, max_x: b.max_x + hi, max_y: b.max_y, max_z: b.max_z }
+    }
+    if d == DOWN {
+        return Aabb { min_x: b.min_x, min_y: b.min_y + lo, min_z: b.min_z, max_x: b.max_x, max_y: b.min_y + hi, max_z: b.max_z }
+    }
+    if d == NORTH {
+        return Aabb { min_x: b.min_x, min_y: b.min_y, min_z: b.min_z + lo, max_x: b.max_x, max_y: b.max_y, max_z: b.min_z + hi }
+    }
+    if d == SOUTH {
+        return Aabb { min_x: b.min_x, min_y: b.min_y, min_z: b.max_z + lo, max_x: b.max_x, max_y: b.max_y, max_z: b.max_z + hi }
+    }
+    return Aabb { min_x: b.min_x, min_y: b.max_y + lo, min_z: b.min_z, max_x: b.max_x, max_y: b.max_y + hi, max_z: b.max_z }
+}
+
+// `getMovement`: how far `b` must go the way `d` goes to be out of `outside`.
+fn movement_out(outside: Aabb, d: i32, b: Aabb) -> f64 {
+    if d == EAST {
+        return outside.max_x - b.min_x
+    }
+    if d == WEST {
+        return b.max_x - outside.min_x
+    }
+    if d == DOWN {
+        return b.max_y - outside.min_y
+    }
+    if d == SOUTH {
+        return outside.max_z - b.min_z
+    }
+    if d == NORTH {
+        return b.max_z - outside.min_z
+    }
+    return outside.max_y - b.min_y
+}
+
+// Whether the state is a piston's base, `instanceof PistonBaseBlock`.
+fn is_base(f: Facts, state: u32) -> bool {
+    let block = f.block(state)
+    return block == f.ids.piston or block == f.ids.sticky_piston
+}
+
+// `getMovementDirection`: its facing going out, else the other way.
+fn movement_of(m: MovingPiston) -> i32 {
+    return if m.extending { m.facing } else { opposite(m.facing) }
+}
+
+// `getExtendedProgress`: how far it's yet to go at `progress`, below nought going out.
+fn extended_progress(m: MovingPiston, progress: f32) -> f32 {
+    return if m.extending { progress - 1.0f32 } else { 1.0f32 - progress }
 }
 
 /// `PistonMovingBlockEntity.finalTick`: the moving piston at `x`, `y`, `z`, holding `m`, done
