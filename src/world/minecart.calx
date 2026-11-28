@@ -24,7 +24,8 @@ module world.minecart
 import chat.component.{Component}
 import nbt.tag.{Tag}
 import server.log.{Entry}
-import math.mth.{table_atan2}
+import math.mth.{table_atan2, wrap_degrees as wrap_f32}
+import std.java.math.{atan2 as java_atan2}
 import world.analog_output.{slots_signal}
 import world.boat.{chest_read, slotted}
 import world.body.{BLOCKS_SOURCE, Body, BodyFacts, EntitySound, VEHICLE_PORTAL_DELAY, bool_or, int_or}
@@ -32,6 +33,7 @@ import world.collision.{CollisionBlocks}
 import world.damage.{BYPASSES_INVULNERABILITY, DamageTypes, IS_EXPLOSION, IS_FIRE}
 import world.living.{Blast}
 import world.entity_data.{BOOLEAN, AIR_SUPPLY, CART_COMMAND, CART_FUEL, CART_LAST_OUTPUT, COMPONENT, STRING, CUSTOM_NAME, CUSTOM_NAME_VISIBLE, EntityData, GLOWING_FLAG, NO_GRAVITY, SHARED_FLAGS, SILENT, TICKS_FROZEN, VEHICLE_DAMAGE, VEHICLE_HURT, VEHICLE_HURT_DIR, Value, minecart_data}
+import world.item_tracker.{CartStep}
 import world.inside.{Acted, BlockEffect, CLEAR_FREEZE, Collector, EXTINGUISH, FIRE_IGNITE, FREEZE, Gateways, LAVA_IGNITE, Movement, Rain, Touched, bubble_open_above, fluid_effects, inside_blocks, touch_block}
 import world.event_source.{EventSource}
 import world.movement.{MovementStates}
@@ -94,6 +96,20 @@ pub fn exits(s: i32) -> ((i32, i32, i32), (i32, i32, i32)) {
     return ((0, 0, -1), (1, 0, 0))
 }
 
+/// Where a minecart was as a move of its own collided, as `NewMinecartBehavior.pushAndPickupEntities`
+/// pushes what's about it then (CAL-315): its place, motion and facing after the move, and whether
+/// a step along its track, which sets its motion after, made the move.
+pub struct CartMove {
+    pub x: f64
+    pub y: f64
+    pub z: f64
+    pub vx: f64
+    pub vy: f64
+    pub vz: f64
+    pub y_rot: f32
+    pub on_track: bool
+}
+
 /// What a minecart's tick leaves its level to do with it.
 pub struct CartTicked {
     /// Whether it's to take in or push what's about it, `pushAndPickupEntities`, as it's done
@@ -115,6 +131,16 @@ pub struct Minecart {
     pub flipped: bool = false
     /// Whether it was on a rail as its tick last found, `onRails`.
     pub on_rails: bool = false
+    /// Whether it moves as `NewMinecartBehavior` moves it, the world's features having
+    /// `minecart_improvements`, and the game rule `max_minecart_speed`, as its level last gave
+    /// them (CAL-315).
+    pub experimental: bool = false
+    pub max_cart_speed: i32 = 8
+    /// The steps of its way since its tracker last sent them, `lerpSteps`.
+    pub lerp_steps: List<CartStep> = List<CartStep>()
+    /// Where it was each time a move of its own collided this tick, for its level to push what's
+    /// about it from (CAL-315).
+    pub collided: List<CartMove> = List<CartMove>()
     /// The block it shows, as it was saved, `DisplayState`, and how far up, `DisplayOffset`.
     display: Tag? = none
     display_offset: i32? = none
@@ -393,7 +419,8 @@ impl Minecart {
     // `getMaxSpeed`: 0.2 in water, else 0.4; a furnace minecart's three quarters of that in
     // water, else half.
     fn max_speed(self) -> f64 {
-        let base = if self.body.in_water { 0.2 } else { 0.4 }
+        // `NewMinecartBehavior.getMaxSpeed`: the game rule's blocks a second, half in water.
+        let base = if self.experimental { f64(self.max_cart_speed) * (if self.body.in_water { 0.5 } else { 1.0 }) / 20.0 } else if self.body.in_water { 0.2 } else { 0.4 }
         if self.is_furnace() {
             return if self.body.in_water { base * 0.75 } else { base * 0.5 }
         }
@@ -405,6 +432,15 @@ impl Minecart {
     // table a thousandth more for each step of the 15 its slots are short of full, then by 0.95 in
     // water, in floats.
     fn natural_slowdown(mut self, f: Facts) {
+        let (bx, by, bz) = (self.body.vx, self.body.vy, self.body.vz)
+        let (vx, vy, vz) = self.slowed(f, bx, by, bz)
+        self.body.vx = vx
+        self.body.vy = vy
+        self.body.vz = vz
+    }
+
+    // `applyNaturalSlowdown` of the motion vx, vy, vz, as `natural_slowdown` has it.
+    fn slowed(mut self, f: Facts, vx: f64, vy: f64, vz: f64) -> (f64, f64, f64) {
         if self.has_chest() {
             var keep = 0.98f32
             if self.loot_table == none {
@@ -414,16 +450,13 @@ impl Minecart {
             if self.body.in_water {
                 keep = keep * 0.95f32
             }
-            self.body.vx = self.body.vx * f64(keep)
-            self.body.vy = 0.0
-            self.body.vz = self.body.vz * f64(keep)
-            return
+            return (vx * f64(keep), 0.0, vz * f64(keep))
         }
+        var (ox, oy, oz) = (vx, vy, vz)
         if self.is_furnace() {
             // `MinecartFurnace.applyNaturalSlowdown`: pushed, its push turned along the way it
             // goes, `calculateNewPushAlong`, it slowed to 0.8 across and the push added, a tenth of
             // that in water; else slowed to 0.98 across; then as any minecart.
-            let (vx, vy, vz) = (self.body.vx, self.body.vy, self.body.vz)
             let (px, py, pz) = (self.push_x, self.push_y, self.push_z)
             if px * px + py * py + pz * pz > 1.0e-7 {
                 let moving = vx * vx + vz * vz
@@ -450,29 +483,34 @@ impl Minecart {
                     ny = ny * 0.1
                     nz = nz * 0.1
                 }
-                self.body.vx = nx
-                self.body.vy = ny
-                self.body.vz = nz
+                ox = nx
+                oy = ny
+                oz = nz
             } else {
-                self.body.vx = vx * 0.98
-                self.body.vy = vy * 0.0
-                self.body.vz = vz * 0.98
+                ox = vx * 0.98
+                oy = vy * 0.0
+                oz = vz * 0.98
             }
         }
         let slow = self.slowdown()
-        self.body.vx = self.body.vx * slow
-        self.body.vy = 0.0
-        self.body.vz = self.body.vz * slow
+        ox = ox * slow
+        oy = 0.0
+        oz = oz * slow
         if self.body.in_water {
             let w = f64(0.95f32)
-            self.body.vx = self.body.vx * w
-            self.body.vz = self.body.vz * w
+            ox = ox * w
+            oz = oz * w
         }
+        return (ox, oy, oz)
     }
 
-    // `getSlowdownFactor`: 0.997 with a rider, else 0.96.
+    // `getSlowdownFactor`: 0.997 with a rider, else 0.96; 0.975 without one where it moves as
+    // `NewMinecartBehavior` has it.
     fn slowdown(self) -> f64 {
-        return if self.body.passengers.is_empty() { 0.96 } else { 0.997 }
+        if not self.body.passengers.is_empty() {
+            return 0.997
+        }
+        return if self.experimental { 0.975 } else { 0.96 }
     }
 
     /// Its tick among `blocks`, as `tickNonPassenger` and `AbstractMinecart.tick` run it, in a
@@ -515,6 +553,23 @@ impl Minecart {
                 self.act(Acted.Travel(way), sounds.len())
             }
         }
+        if self.experimental {
+            // `NewMinecartBehavior.tick`: on its first tick set on the rail it's on, then its
+            // fall and its way along the track. Its level takes in or pushes what's about it as
+            // it moves (CAL-315).
+            self.collided.clear()
+            let (rx, ry, rz) = self.rail_pos(f, blocks)
+            let state = blocks.collision_state(rx, ry, rz) ?? 0
+            if self.body.first_tick {
+                self.on_rails = is_rail(f, state)
+                self.adjust_to_rails(f, rx, ry, rz, state, true)
+            }
+            self.body.vy = self.body.vy - self.gravity()
+            self.track_along(f, m, t, blocks, intent, types, drops, mut out, mut sounds)
+            self.tnt_fell(f, m)
+            out.push = true
+            return out
+        }
         // `OldMinecartBehavior.tick`.
         self.body.vy = self.body.vy - self.gravity()
         let (rx, ry, rz) = self.rail_pos(f, blocks)
@@ -523,24 +578,7 @@ impl Minecart {
         if self.on_rails {
             self.move_along_track(f, m, t, blocks, rx, ry, rz, state, intent, types, drops, mut sounds)
             if f.block_named(String("minecraft:activator_rail")) == some(f.block(state)) {
-                // `activateMinecart`: the plain minecart's riders let go and it rocked, a TNT
-                // minecart primed, where the rail's powered; the others do nothing.
-                let powered = f.get_bool(state, "powered")
-                if powered and self.kind == "minecraft:minecart" {
-                    out.eject = true
-                    self.activated()
-                } else if powered and self.is_tnt() and self.fuse < 0 {
-                    self.prime(false, none)
-                    self.show_primed(mut sounds)
-                } else if self.is_hopper() {
-                    // `MinecartHopper.activateMinecart`: taking in items but where it's powered.
-                    self.enabled = not powered
-                } else if powered and self.is_command() and self.body.tick_count - self.last_activated >= 4 {
-                    // `MinecartCommandBlock.activateMinecart`: its command run, at most once in 4
-                    // ticks (CAL-388).
-                    self.act(Acted.CartCommand, sounds.len())
-                    self.last_activated = self.body.tick_count
-                }
+                self.activate(f.get_bool(state, "powered"), mut out, mut sounds)
             }
         } else {
             self.come_off_track(f, m, t, blocks, types, drops, mut sounds)
@@ -783,11 +821,41 @@ impl Minecart {
         self.body.z = z
     }
 
-    // `getCurrentBlockPosOrRailBelow`: the block it's in, or the one under it where that's a rail.
-    fn rail_pos<B: CollisionBlocks>(self, f: Facts, blocks: B) -> (i32, i32, i32) {
+    // `activateMinecart` on an activator rail, `powered` or not: the plain minecart's riders let
+    // go and it rocked, a TNT minecart primed, where the rail's powered; a hopper minecart takes
+    // in items but where it's powered; a command block minecart runs its command; the others do
+    // nothing.
+    fn activate(mut self, powered: bool, out: mut CartTicked, sounds: mut List<EntitySound>) {
+        if powered and self.kind == "minecraft:minecart" {
+            out.eject = true
+            self.activated()
+        } else if powered and self.is_tnt() and self.fuse < 0 {
+            self.prime(false, none)
+            self.show_primed(mut sounds)
+        } else if self.is_hopper() {
+            // `MinecartHopper.activateMinecart`.
+            self.enabled = not powered
+        } else if powered and self.is_command() and self.body.tick_count - self.last_activated >= 4 {
+            // `MinecartCommandBlock.activateMinecart`: at most once in 4 ticks (CAL-388).
+            self.act(Acted.CartCommand, sounds.len())
+            self.last_activated = self.body.tick_count
+        }
+    }
+
+    // `getCurrentBlockPosOrRailBelow`: the block it's in, or the one under it where that's a rail;
+    // where it moves as `NewMinecartBehavior` has it, the one a tenth and a hair under it.
+    pub fn rail_pos<B: CollisionBlocks>(self, f: Facts, blocks: B) -> (i32, i32, i32) {
         let x = i32.saturate(self.body.x.floor())
-        let y = i32.saturate(self.body.y.floor())
         let z = i32.saturate(self.body.z.floor())
+        if self.experimental {
+            let under = self.body.y - 0.1 - f64(1.0e-5f32)
+            let uy = i32.saturate(under.floor())
+            if f.in_set(blocks.collision_state(x, uy, z) ?? 0, f.tag("minecraft:rails")) {
+                return (x, uy, z)
+            }
+            return (x, i32.saturate(self.body.y.floor()), z)
+        }
+        let y = i32.saturate(self.body.y.floor())
         let below = blocks.collision_state(x, y - 1, z) ?? 0
         if f.in_set(below, f.tag("minecraft:rails")) {
             return (x, y - 1, z)
@@ -1288,6 +1356,494 @@ impl Minecart {
             self.spawner = spawner_fields(tag)
         }
         return true
+    }
+}
+
+// `NewMinecartBehavior.TrackIteration`: the way left this tick, whether this is the first go
+// along the track, and whether its slope, a halt and a boost have had their say.
+struct TrackIteration {
+    left: f64 = 0.0
+    first: bool = true
+    sloped: bool = false
+    halted: bool = false
+    boosted: bool = false
+}
+
+// `Mth.SQRT_OF_TWO`, a float.
+const SQRT_OF_TWO: f32 = 1.4142135f32
+
+// `1.0E-5F` as a double, which `NewMinecartBehavior` compares lengths with.
+fn hair() -> f64 {
+    return f64(1.0e-5f32)
+}
+
+// `Vec3.normalize`: none where it's shorter than 1.0E-5F.
+fn unit(x: f64, y: f64, z: f64) -> (f64, f64, f64) {
+    let length = (x * x + y * y + z * z).sqrt()
+    if length < hair() {
+        return (0.0, 0.0, 0.0)
+    }
+    return (x / length, y / length, z / length)
+}
+
+// `180.0F - (float)(Math.atan2(z, x) * 180.0 / Math.PI)`: the turn toward x, z.
+fn turn_to(z: f64, x: f64) -> f32 {
+    return 180.0f32 - f32.nearest(java_atan2(z, x) * 180.0 / 3.141592653589793)
+}
+
+// `NewMinecartBehavior.isDecending`: whether a move of x, z goes down the slope `shape`.
+fn descending(x: f64, z: f64, shape: i32) -> bool {
+    if shape == ASCENDING_EAST {
+        return x < 0.0
+    }
+    if shape == ASCENDING_WEST {
+        return x > 0.0
+    }
+    if shape == ASCENDING_NORTH {
+        return z > 0.0
+    }
+    if shape == ASCENDING_SOUTH {
+        return z < 0.0
+    }
+    return false
+}
+
+// `RailShape.isSlope`.
+fn sloped(shape: i32) -> bool {
+    return shape >= ASCENDING_EAST and shape <= ASCENDING_SOUTH
+}
+
+impl Minecart {
+    /// `NewMinecartBehavior.adjustToRails` on the rail `state` at rx, ry, rz, where it is one: set
+    /// along it a tenth above it, or up its slope, turned along it, flipped where that turns it
+    /// round; a step of the way it was moved, of no weight where `instant`, where it moved at all.
+    pub fn adjust_to_rails(mut self, f: Facts, rx: i32, ry: i32, rz: i32, state: u32, instant: bool) {
+        if not is_rail(f, state) {
+            return
+        }
+        let shape = rail_shape(f, state)
+        let (a, b) = exits(shape)
+        let (a0x, a0y, a0z) = a
+        let (a1x, a1y, a1z) = b
+        let (e0x, e0y, e0z) = (f64(a0x) * 0.5, f64(a0y) * 0.5, f64(a0z) * 0.5)
+        let (e1x, e1y, e1z) = (f64(a1x) * 0.5, f64(a1y) * 0.5, f64(a1z) * 0.5)
+        var (ox, oz) = (e0x, e0z)
+        var (ix, iz) = (e1x, e1z)
+        let (vx, vy, vz) = (self.body.vx, self.body.vy, self.body.vz)
+        let moving = (vx * vx + vy * vy + vz * vz).sqrt() > hair()
+        if (moving and vx * ox + vy * 0.0 + vz * oz < vx * ix + vy * 0.0 + vz * iz) or descending(ix, iz, shape) {
+            let (sx, sz) = (ox, oz)
+            ox = ix
+            oz = iz
+            ix = sx
+            iz = sz
+        }
+        var y_rot = turn_to(oz, ox)
+        if self.flipped {
+            y_rot = y_rot + 180.0f32
+        }
+        let (px, py, pz) = (self.body.x, self.body.y, self.body.z)
+        let (bx, by, bz) = (f64(rx) + 0.5, f64(ry), f64(rz) + 0.5)
+        var (tx, ty, tz) = (px, by, pz)
+        if e0x != e1x and e0z != e1z {
+            // In a corner: along the line between its ways out, from where it is.
+            let (fx, fy, fz) = (e1x - e0x, e1y - e0y, e1z - e0z)
+            let (qx, qy, qz) = (px - bx - e0x, py - by - e0y, pz - bz - e0z)
+            let k = (fx * qx + fy * qy + fz * qz) / (fx * fx + fy * fy + fz * fz)
+            let (gx, gy, gz) = (fx * k, fy * k, fz * k)
+            tx = bx + e0x + gx
+            ty = by + e0y + gy
+            tz = bz + e0z + gz
+            y_rot = turn_to(gz, gx)
+            if self.flipped {
+                y_rot = y_rot + 180.0f32
+            }
+        } else {
+            if e0z - e1z != 0.0 {
+                tx = bx
+            }
+            if e0x - e1x != 0.0 {
+                tz = bz
+            }
+        }
+        self.place(px + (tx - px), py + (ty - py), pz + (tz - pz))
+        var x_rot = 0.0f32
+        if e0y != e1y {
+            // Up its slope: as high above its way in as it is along from it.
+            let (wx, wy, wz) = (bx + ix, by + 0.0, bz + iz)
+            let (dx, dy, dz) = (self.body.x - wx, self.body.y - wy, self.body.z - wz)
+            let along = (dx * dx + dy * dy + dz * dz).sqrt()
+            let (cx, cy, cz) = (self.body.x + 0.0, self.body.y + (along + 0.1), self.body.z + 0.0)
+            self.place(cx, cy, cz)
+            x_rot = if self.flipped { 45.0f32 } else { -45.0f32 }
+        } else {
+            let (cx, cy, cz) = (self.body.x + 0.0, self.body.y + 0.1, self.body.z + 0.0)
+            self.place(cx, cy, cz)
+        }
+        self.set_rotation(y_rot, x_rot)
+        let (mx, my, mz) = (self.body.x - px, self.body.y - py, self.body.z - pz)
+        let moved = (mx * mx + my * my + mz * mz).sqrt()
+        if moved > 0.0 {
+            let weight = if instant { 0.0f32 } else { f32.nearest(moved) }
+            self.add_step(weight)
+        }
+    }
+
+    // A step of its way to where it is now, with its motion and turn, of `weight`.
+    fn add_step(mut self, weight: f32) {
+        self.lerp_steps.push(CartStep { x: self.body.x, y: self.body.y, z: self.body.z, vx: self.body.vx, vy: self.body.vy, vz: self.body.vz, y_rot: self.body.y_rot, x_rot: self.body.x_rot, weight: weight })
+    }
+
+    // `NewMinecartBehavior.setRotation`: flipped where it turns half round, give or take 5
+    // degrees, its pitch then the other way; its pitch within 45 of level.
+    fn set_rotation(mut self, y_rot: f32, x_rot: f32) {
+        var y = y_rot
+        var x = x_rot
+        let diff = f64(y - self.body.y_rot).abs()
+        if diff >= 175.0 and diff <= 185.0 {
+            self.flipped = not self.flipped
+            y = y - 180.0f32
+            x = x * -1.0f32
+        }
+        x = if x < -45.0f32 { -45.0f32 } else if x > 45.0f32 { 45.0f32 } else { x }
+        self.body.x_rot = x % 360.0f32
+        self.body.y_rot = y % 360.0f32
+    }
+
+    // `NewMinecartBehavior.moveAlongTrack`: along the track as far as its speed takes it, over
+    // as many rails as that crosses, a step of its way each, or off it; what the blocks it went
+    // through do to it after each.
+    fn track_along<B: CollisionBlocks + Rain + Gateways>(mut self, f: Facts, m: MovementStates, t: BodyFacts, blocks: B, intent: (f64, f64, f64)?, types: DamageTypes, drops: bool, out: mut CartTicked, sounds: mut List<EntitySound>) {
+        var it = TrackIteration()
+        while (it.first or it.left > hair()) and not self.body.removed {
+            let (ivx, ivz) = (self.body.vx, self.body.vz)
+            let (rx, ry, rz) = self.rail_pos(f, blocks)
+            let state = blocks.collision_state(rx, ry, rz) ?? 0
+            let rails = is_rail(f, state)
+            if self.on_rails != rails {
+                self.on_rails = rails
+                self.adjust_to_rails(f, rx, ry, rz, state, false)
+            }
+            if rails {
+                self.body.reset_fall()
+                self.body.xo = self.body.x
+                self.body.yo = self.body.y
+                self.body.zo = self.body.z
+                if f.block_named(String("minecraft:activator_rail")) == some(f.block(state)) {
+                    self.activate(f.get_bool(state, "powered"), mut out, mut sounds)
+                }
+                let shape = rail_shape(f, state)
+                let (nx, ny, nz) = self.track_speed(f, blocks, ivx, ivz, mut it, rx, ry, rz, state, shape, intent)
+                let across = (nx * nx + nz * nz).sqrt()
+                if it.first {
+                    it.left = across
+                } else {
+                    it.left = it.left + (across - (ivx * ivx + ivz * ivz).sqrt())
+                }
+                self.body.vx = nx
+                self.body.vy = ny
+                self.body.vz = nz
+                it.left = self.step_along(f, m, t, blocks, rx, ry, rz, shape, it.left, mut sounds)
+            } else {
+                self.come_off_new(f, m, t, blocks, mut sounds)
+                it.left = 0.0
+            }
+            let (dx, dy, dz) = (self.body.x - self.body.xo, self.body.y - self.body.yo, self.body.z - self.body.zo)
+            let length = (dx * dx + dy * dy + dz * dz).sqrt()
+            if length > hair() {
+                if not (dx * dx + dz * dz > hair()) {
+                    if not self.on_rails {
+                        self.body.x_rot = if self.body.on_ground { 0.0f32 } else { self.body.x_rot + 0.2f32 * wrap_f32(0.0f32 - self.body.x_rot) }
+                    }
+                } else {
+                    var y_rot = turn_to(dz, dx)
+                    var x_rot = if self.body.on_ground and not self.on_rails { 0.0f32 } else { 90.0f32 - f32.nearest(java_atan2((dx * dx + dz * dz).sqrt(), dy) * 180.0 / 3.141592653589793) }
+                    if self.flipped {
+                        y_rot = y_rot + 180.0f32
+                        x_rot = x_rot * -1.0f32
+                    }
+                    self.set_rotation(y_rot, x_rot)
+                }
+                // The behaviour's own top speed, not a furnace minecart's.
+                let most = f64(self.max_cart_speed) * (if self.body.in_water { 0.5 } else { 1.0 }) / 20.0
+                self.add_step(f32.nearest(if length < most { length } else { most }))
+            } else if ivx * ivx + ivz * ivz > 0.0 {
+                self.add_step(1.0f32)
+            }
+            if length > hair() or it.first {
+                self.entity_effects(f, t, types, blocks, drops, mut sounds)
+                self.entity_effects(f, t, types, blocks, drops, mut sounds)
+            }
+            it.first = false
+        }
+    }
+
+    // `Entity.applyEffectsFromBlocks`, as a minecart that moves as `NewMinecartBehavior` has it
+    // takes it: along the moves it made since it last did, then forgotten.
+    fn entity_effects<B: CollisionBlocks + Rain + Gateways>(mut self, f: Facts, t: BodyFacts, types: DamageTypes, blocks: B, drops: bool, sounds: mut List<EntitySound>) {
+        let moves = self.body.final_moves()
+        self.blocks_act(f, t, types, blocks, moves, drops, mut sounds)
+    }
+
+    // `NewMinecartBehavior.calculateTrackSpeed` of the motion across vx, vz on the rail `state`:
+    // its slope's pull, once a tick; its rider's push, on the first go; a halt, once; its
+    // slowing and top speed, on the first go; a boost, once.
+    fn track_speed<B: CollisionBlocks>(mut self, f: Facts, blocks: B, vx: f64, vz: f64, it: mut TrackIteration, rx: i32, ry: i32, rz: i32, state: u32, shape: i32, intent: (f64, f64, f64)?) -> (f64, f64, f64) {
+        var (nx, ny, nz) = (vx, 0.0, vz)
+        if not it.sloped {
+            var slide = (nx * nx + nz * nz).sqrt() * 0.02
+            if slide < 0.0078125 {
+                slide = 0.0078125
+            }
+            if self.body.in_water {
+                slide = slide * 0.2
+            }
+            var (sx, sz) = (nx, nz)
+            if shape == ASCENDING_EAST {
+                sx = nx + -slide
+            } else if shape == ASCENDING_WEST {
+                sx = nx + slide
+            } else if shape == ASCENDING_NORTH {
+                sz = nz + slide
+            } else if shape == ASCENDING_SOUTH {
+                sz = nz + -slide
+            }
+            if sx * sx + sz * sz != nx * nx + nz * nz {
+                it.sloped = true
+                nx = sx
+                nz = sz
+            }
+        }
+        if it.first {
+            // `calculatePlayerInputSpeed`: a rider's push of a thousandth where it's all but
+            // still.
+            if let (ix, iy, iz) = intent {
+                if ix * ix + iy * iy + iz * iz > 0.0 {
+                    let (ux, uy, uz) = unit(ix, iy, iz)
+                    if ux * ux + uy * uy + uz * uz > 0.0 and nx * nx + nz * nz < 0.01 {
+                        let (hx, _, hz) = unit(ux, 0.0, uz)
+                        let (px, pz) = (nx + hx * 0.001, nz + hz * 0.001)
+                        if px * px + pz * pz != nx * nx + nz * nz {
+                            it.halted = true
+                            nx = px
+                            nz = pz
+                        }
+                    }
+                }
+            }
+        }
+        let powered_rail = f.block_named(String("minecraft:powered_rail")) == some(f.block(state))
+        let powered = powered_rail and f.get_bool(state, "powered")
+        if not it.halted and powered_rail and not powered {
+            // `calculateHaltTrackSpeed`: an unpowered powered rail halves it, or stops it.
+            let speed = (nx * nx + ny * ny + nz * nz).sqrt()
+            let (hx, hy, hz) = if speed < 0.03 { (0.0, 0.0, 0.0) } else { (nx * 0.5, ny * 0.5, nz * 0.5) }
+            if hx * hx + hz * hz != nx * nx + nz * nz {
+                it.halted = true
+                nx = hx
+                ny = hy
+                nz = hz
+            }
+        }
+        if it.first {
+            let (sx, sy, sz) = self.slowed(f, nx, ny, nz)
+            nx = sx
+            ny = sy
+            nz = sz
+            if nx * nx + ny * ny + nz * nz > 0.0 {
+                let length = (nx * nx + ny * ny + nz * nz).sqrt()
+                let most = self.max_speed()
+                let speed = if length < most { length } else { most }
+                let (ux, uy, uz) = unit(nx, ny, nz)
+                nx = ux * speed
+                ny = uy * speed
+                nz = uz * speed
+            }
+        }
+        if not it.boosted and powered {
+            // `calculateBoostTrackSpeed`: a powered rail speeds it up, or starts it away from a
+            // block that conducts beside it.
+            let speed = (nx * nx + ny * ny + nz * nz).sqrt()
+            var (bx, by, bz) = (nx, ny, nz)
+            if speed > 0.01 {
+                let (ux, uy, uz) = unit(nx, ny, nz)
+                let to = speed + 0.06
+                bx = ux * to
+                by = uy * to
+                bz = uz * to
+            } else {
+                var (dx, dz) = (0.0, 0.0)
+                if shape == EAST_WEST {
+                    if conductor(f, blocks, rx - 1, ry, rz) {
+                        dx = 1.0
+                    } else if conductor(f, blocks, rx + 1, ry, rz) {
+                        dx = -1.0
+                    }
+                } else if shape == NORTH_SOUTH {
+                    if conductor(f, blocks, rx, ry, rz - 1) {
+                        dz = 1.0
+                    } else if conductor(f, blocks, rx, ry, rz + 1) {
+                        dz = -1.0
+                    }
+                }
+                if dx * dx + dz * dz > 0.0 {
+                    let to = speed + 0.2
+                    bx = dx * to
+                    by = 0.0 * to
+                    bz = dz * to
+                }
+            }
+            if bx * bx + bz * bz != nx * nx + nz * nz {
+                it.boosted = true
+                nx = bx
+                ny = by
+                nz = bz
+            }
+        }
+        return (nx, ny, nz)
+    }
+
+    // `NewMinecartBehavior.stepAlongTrack` on the rail of `shape` at rx, ry, rz, with `left` of
+    // its way to go: toward the way out it's heading for, as far as that or as `left` takes it,
+    // held to its slope; the way left once it's out, else none.
+    fn step_along<B: CollisionBlocks + Rain + Gateways>(mut self, f: Facts, m: MovementStates, t: BodyFacts, blocks: B, rx: i32, ry: i32, rz: i32, shape: i32, left: f64, sounds: mut List<EntitySound>) -> f64 {
+        if left < hair() {
+            return 0.0
+        }
+        let (px, py, pz) = (self.body.x, self.body.y, self.body.z)
+        let (a, b) = exits(shape)
+        let (a0x, a0y, a0z) = a
+        let (a1x, a1y, a1z) = b
+        let (mx, mz) = (self.body.vx, self.body.vz)
+        if (mx * mx + mz * mz).sqrt() < hair() {
+            self.body.vx = 0.0
+            self.body.vy = 0.0
+            self.body.vz = 0.0
+            return 0.0
+        }
+        let hill = a0y != a1y
+        let (ix, iz) = (f64(a1x) * 0.5, f64(a1z) * 0.5)
+        var (ox, oz) = (f64(a0x) * 0.5, f64(a0z) * 0.5)
+        if mx * ox + mz * oz < mx * ix + mz * iz {
+            ox = ix
+            oz = iz
+        }
+        let (nx, ny, nz) = unit(ox, 0.0, oz)
+        let k = f64(1.0e-5f32)
+        let ex = f64(rx) + 0.5 + ox + 0.0 + nx * k
+        var ey = f64(ry) + 0.0 + 0.0 + 0.1 + ny * k
+        let ez = f64(rz) + 0.5 + oz + 0.0 + nz * k
+        if hill and not descending(mx, mz, shape) {
+            ey = ey + 1.0
+        }
+        let (tx, ty, tz) = unit(ex - px, ey - py, ez - pz)
+        let scale = (mx * mx + mz * mz).sqrt() / (tx * tx + tz * tz).sqrt()
+        let (wx, wy, wz) = (tx * scale, ty * scale, tz * scale)
+        let (ux, uy, uz) = unit(wx, wy, wz)
+        let reach = left * f64(if hill { SQRT_OF_TWO } else { 1.0f32 })
+        var (gx, gy, gz) = (px + ux * reach, py + uy * reach, pz + uz * reach)
+        var rest = 0.0
+        let (ax, ay, az) = (ex - px, ey - py, ez - pz)
+        let (bx, by, bz) = (gx - px, gy - py, gz - pz)
+        if ax * ax + ay * ay + az * az <= bx * bx + by * by + bz * bz {
+            let (hx, hz) = (ex - gx, ez - gz)
+            rest = (hx * hx + hz * hz).sqrt()
+            gx = ex
+            gy = ey
+            gz = ez
+        }
+        self.move_new(f, m, t, blocks, gx - px, gy - py, gz - pz, true, mut sounds)
+        let landed = blocks.collision_state(i32.saturate(gx.floor()), i32.saturate(gy.floor()), i32.saturate(gz.floor())) ?? 0
+        if hill {
+            if is_rail(f, landed) and self.rest_at_v(shape, rail_shape(f, landed)) {
+                return 0.0
+            }
+            let (hx, hz) = (self.body.x - ex, self.body.z - ez)
+            let off = (hx * hx + 0.0 * 0.0 + hz * hz).sqrt()
+            let held = ey + (if descending(wx, wz, shape) { off } else { -off })
+            if self.body.y < held {
+                let (cx, cz) = (self.body.x, self.body.z)
+                self.place(cx, held, cz)
+            }
+        }
+        let (qx, qy, qz) = (self.body.x - px, self.body.y - py, self.body.z - pz)
+        let (rx2, ry2, rz2) = (gx - px, gy - py, gz - pz)
+        if (qx * qx + qy * qy + qz * qz).sqrt() < hair() and (rx2 * rx2 + ry2 * ry2 + rz2 * rz2).sqrt() > hair() {
+            self.body.vx = 0.0
+            self.body.vy = 0.0
+            self.body.vz = 0.0
+            return 0.0
+        }
+        self.body.vx = wx
+        self.body.vy = wy
+        self.body.vz = wz
+        return rest
+    }
+
+    // `NewMinecartBehavior.restAtVShape`: stopped where it's all but still going down one slope
+    // onto another that goes up.
+    fn rest_at_v(mut self, now: i32, next: i32) -> bool {
+        let (vx, vy, vz) = (self.body.vx, self.body.vy, self.body.vz)
+        if vx * vx + vy * vy + vz * vz < 0.005 and sloped(next) and descending(vx, vz, now) and not descending(vx, vz, next) {
+            self.body.vx = 0.0
+            self.body.vy = 0.0
+            self.body.vz = 0.0
+            return true
+        }
+        return false
+    }
+
+    // `AbstractMinecart.move` as it moves as `NewMinecartBehavior` has it: its move, colliding
+    // with no block under the rail it's on, nor the one its slope climbs onto,
+    // `MinecartCollisionContext`; its level takes in or pushes what's about it after its tick.
+    fn move_new<B: CollisionBlocks>(mut self, f: Facts, m: MovementStates, t: BodyFacts, blocks: B, dx: f64, dy: f64, dz: f64, on_track: bool, sounds: mut List<EntitySound>) {
+        let (rx, ry, rz) = self.rail_pos(f, blocks)
+        let state = blocks.collision_state(rx, ry, rz) ?? 0
+        self.body.skip_a = none
+        self.body.skip_b = none
+        if is_rail(f, state) {
+            self.body.skip_a = some((rx, ry - 1, rz))
+            let shape = rail_shape(f, state)
+            if shape == ASCENDING_EAST {
+                self.body.skip_b = some((rx + 1, ry, rz))
+            } else if shape == ASCENDING_WEST {
+                self.body.skip_b = some((rx - 1, ry, rz))
+            } else if shape == ASCENDING_NORTH {
+                self.body.skip_b = some((rx, ry, rz - 1))
+            } else if shape == ASCENDING_SOUTH {
+                self.body.skip_b = some((rx, ry, rz + 1))
+            }
+        }
+        self.body.move_by(f, m, t, blocks, dx, dy, dz)
+        self.body.skip_a = none
+        self.body.skip_b = none
+        // `AbstractMinecart.move`: where it collided, what's about it pushed from where it is now.
+        if self.body.horizontal_collision or self.body.vertical_collision {
+            self.collided.push(CartMove { x: self.body.x, y: self.body.y, z: self.body.z, vx: self.body.vx, vy: self.body.vy, vz: self.body.vz, y_rot: self.body.y_rot, on_track: on_track })
+        }
+        for (a, heard) in self.body.moved_acts(f, t, blocks, true, mut sounds) {
+            self.act(a.copy(), heard)
+        }
+    }
+
+    // `comeOffTrack` as it moves as `NewMinecartBehavior` has it, its move `move_new`'s.
+    fn come_off_new<B: CollisionBlocks>(mut self, f: Facts, m: MovementStates, t: BodyFacts, blocks: B, sounds: mut List<EntitySound>) {
+        let most = self.max_speed()
+        self.body.vx = clamp(self.body.vx, -most, most)
+        self.body.vz = clamp(self.body.vz, -most, most)
+        if self.body.on_ground {
+            self.body.vx = self.body.vx * 0.5
+            self.body.vy = self.body.vy * 0.5
+            self.body.vz = self.body.vz * 0.5
+        }
+        let (vx, vy, vz) = (self.body.vx, self.body.vy, self.body.vz)
+        self.move_new(f, m, t, blocks, vx, vy, vz, false, mut sounds)
+        if not self.body.on_ground {
+            let drag = f64(0.95f32)
+            self.body.vx = self.body.vx * drag
+            self.body.vy = self.body.vy * drag
+            self.body.vz = self.body.vz * drag
+        }
     }
 }
 
