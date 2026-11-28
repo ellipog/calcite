@@ -1,0 +1,670 @@
+/// A sculk catalyst's `SculkSpreader`, the level's, `createLevelSpreader` (CAL-275): the charge
+/// cursors a death near it leaves, kept in its block entity as `cursors`, which creep over sculk
+/// and veins as it ticks, turn what they cross to sculk, spread veins, and raise sensors and
+/// shriekers, as the blocks' `SculkBehaviour`s do it out of world generation; and its bloom as it
+/// takes a death in. World generation's spreader is `worldgen.sculk`'s.
+module world.sculk_spread
+
+import java.object_set.{array_size, max_fill, mix}
+import nbt.tag.{Tag}
+import random.source.{RandomSource}
+import std.java.math.{log1p}
+import world.block_level.{BlockLevel}
+import world.collision.{Aabb}
+import world.level_writer.{UPDATE_LIMIT}
+import world.push_ups.{PushUps}
+import worldgen.access.{BlockAccess, FeatureAccess}
+import worldgen.facts.{DOWN, EAST, EMPTY_FLUID, FULL, Facts, NORTH, SOUTH, UP, WATER_FLUID, WEST, opposite, step_x, step_y, step_z}
+import worldgen.interval.{Thrown}
+import worldgen.multiface.{all_shuffled, shuffle, spread_all}
+import worldgen.survive.{attaches_state, direction_property}
+
+/// `createLevelSpreader`'s numbers: `growthSpawnCost`, `noGrowthRadius`, `chargeDecayRate` and
+/// `additionalDecayRate`.
+const GROWTH_SPAWN_COST: i32 = 10
+const NO_GROWTH_RADIUS: i32 = 4
+const CHARGE_DECAY_RATE: i32 = 10
+const ADDITIONAL_DECAY_RATE: i32 = 5
+/// `SculkSpreader.MAX_CURSORS` and `MAX_CHARGE`.
+const MAX_CURSORS: usize = 32
+const MAX_CHARGE: i32 = 1000
+
+// `SculkSpreader.ChargeCursor`. The facings are a mask of directions, -1 for none known.
+struct Cursor {
+    x: i32
+    y: i32
+    z: i32
+    charge: i32
+    update_delay: i32
+    decay_delay: i32
+    facings: i32
+}
+
+// Which `SculkBehaviour` a block has.
+const DEFAULT: i32 = 0
+const SCULK: i32 = 1
+const VEIN: i32 = 2
+
+fn behaviour(f: Facts, state: u32) -> i32 {
+    if f.is(state, f.ids.sculk) {
+        return SCULK
+    }
+    if f.is(state, f.ids.sculk_vein) {
+        return VEIN
+    }
+    return DEFAULT
+}
+
+/// `CatalystListener.handleGameEvent`'s `addCursors` of `charge` at `at` to the catalyst at `x`,
+/// `y`, `z`: in cursors of at most 1000, while there are fewer than 32, without `setChanged`.
+pub fn add_cursors<L: BlockAccess + BlockLevel>(level: mut L, x: i32, y: i32, z: i32, at: (i32, i32, i32), charge: i32) {
+    var cursors = read_cursors(level, x, y, z)
+    let (cx, cy, cz) = at
+    var left = charge
+    while left > 0 {
+        let current = left.min(MAX_CHARGE)
+        if cursors.len() < MAX_CURSORS {
+            cursors.push(Cursor { x: cx, y: cy, z: cz, charge: current, update_delay: 0, decay_delay: 1, facings: -1 })
+        }
+        left -= current
+    }
+    level.keep_block_entity_value(x, y, z, "cursors", cursors_tag(cursors))
+}
+
+/// `CatalystListener.bloom` of the catalyst at `x`, `y`, `z`: it pulses, `setBlockAndUpdate`, its
+/// tick due in 8 to stop, two souls rise from it, and it blooms aloud, its pitch drawn from the
+/// level's random.
+pub fn bloom<L: BlockAccess + FeatureAccess + BlockLevel + PushUps + RandomSource>(f: Facts, level: mut L, x: i32, y: i32, z: i32) ! Thrown {
+    let state = try level.state(f, x, y, z)
+    let block = f.block(state)
+    if f.has(state, "bloom") {
+        _ = level.set_block_limited(x, y, z, try f.with_bool(state, "bloom", true), 3, UPDATE_LIMIT)
+    }
+    level.schedule_block(block, x, y, z, 8, 0)
+    level.send_particles("sculk_soul", f64(x) + 0.5, f64(y) + 1.15, f64(z) + 0.5, 2, 0.2, 0.0, 0.2, 0.0)
+    let pitch = 0.6f32 + level.next_float() * 0.4f32
+    level.play_sound(x, y, z, String("block.sculk_catalyst.bloom"), 2.0f32, pitch)
+}
+
+/// `SculkCatalystBlockEntity.serverTick`, `updateCursors` with veins spreading, of the catalyst at
+/// `x`, `y`, `z`: each cursor not too far away updated, those left with charge kept, two at the
+/// same place merged where their charge together is 1000 at most; a spent one's place told,
+/// level event 3006 with no data, then each place with charge left told, as many souls as its
+/// charge makes and the faces of the cursor kept there, in the order fastutil's map of them has
+/// them.
+pub fn update_cursors<L: BlockAccess + FeatureAccess + BlockLevel + PushUps + RandomSource>(f: Facts, level: mut L, x: i32, y: i32, z: i32) ! Thrown {
+    let cursors = read_cursors(level, x, y, z)
+    if cursors.len() == 0 {
+        return
+    }
+    var processed = List<Cursor>()
+    // `mergeableCursors`, by place, as the index in `processed` of the one kept there.
+    var places = List<(i32, i32, i32)>()
+    var at = List<usize>()
+    var charges = ChargeMap.new()
+    for c in cursors {
+        var cursor = c
+        let far = (cursor.x - x).abs().max((cursor.y - y).abs()).max((cursor.z - z).abs()) > 1024
+        if far {
+            continue
+        }
+        try update(f, mut level, mut cursor, x, y, z)
+        if cursor.charge <= 0 {
+            level.level_event(3006, cursor.x, cursor.y, cursor.z, 0)
+            continue
+        }
+        let pos = (cursor.x, cursor.y, cursor.z)
+        charges.add(pos, cursor.charge)
+        var found: usize? = none
+        for i in 0..places.len() {
+            if places[i] == pos {
+                found = some(i)
+            }
+        }
+        if let i = found {
+            let k = at[i]
+            if cursor.charge + processed[k].charge <= MAX_CHARGE {
+                // `mergeWith`: the charge the kept one's, its delay the sooner.
+                processed[k].charge += cursor.charge
+                processed[k].update_delay = processed[k].update_delay.min(cursor.update_delay)
+            } else {
+                processed.push(cursor)
+                if cursor.charge < processed[k].charge {
+                    at[i] = processed.len() - 1
+                }
+            }
+        } else {
+            places.push(pos)
+            at.push(processed.len())
+            processed.push(cursor)
+        }
+    }
+    for (pos, charge) in charges.entries() {
+        var faces = -1
+        for i in 0..places.len() {
+            if places[i] == pos {
+                faces = processed[at[i]].facings
+            }
+        }
+        if charge > 0 and faces >= 0 {
+            let souls = i32.saturate(log1p(f64(charge)) / f64(2.3f32)) + 1
+            let (px, py, pz) = pos
+            level.level_event(3006, px, py, pz, (souls << 6) + faces)
+        }
+    }
+    level.keep_block_entity_value(x, y, z, "cursors", cursors_tag(processed))
+}
+
+// The catalyst's cursors as it loads them, `sizeLimitedListOf(32)`: none where it saves more.
+fn read_cursors<L: BlockAccess>(level: L, x: i32, y: i32, z: i32) -> List<Cursor> {
+    var out = List<Cursor>()
+    let saved = level.block_entity_tag(x, y, z) else return out
+    let Tag.Compound(tags) = saved else return out
+    if not tags.contains("cursors") {
+        return out
+    }
+    let Tag.List(items) = tags["cursors"].copy() else return out
+    if items.len() > MAX_CURSORS {
+        return out
+    }
+    for item in items {
+        let Tag.Compound(c) = item else continue
+        let pos = if c.contains("pos") { match c["pos"] { Tag.IntArray(v) => v.copy(), _ => List<i32>() } } else { List<i32>() }
+        if pos.len() != 3 {
+            continue
+        }
+        var facings = -1
+        if c.contains("facings") {
+            if let Tag.List(names) = c["facings"].copy() {
+                facings = 0
+                for name in names {
+                    let Tag.Str(s) = name else continue
+                    for d in 0..6 {
+                        if direction_property(d) == s {
+                            facings |= 1 << d
+                        }
+                    }
+                }
+            }
+        }
+        out.push(Cursor { x: pos[0], y: pos[1], z: pos[2], charge: int_or(c, "charge", 0), update_delay: int_or(c, "update_delay", 0), decay_delay: int_or(c, "decay_delay", 1), facings: facings })
+    }
+    return out
+}
+
+fn int_or(c: JavaHashMap<String, Tag>, key: str, otherwise: i32) -> i32 {
+    if not c.contains(key) {
+        return otherwise
+    }
+    return match c[key] {
+        Tag.Int(v) => v,
+        Tag.Short(v) => i32(v),
+        Tag.Byte(v) => i32(v),
+        _ => otherwise,
+    }
+}
+
+// The cursors as the catalyst saves them, `ChargeCursor.CODEC`: each field left out at its
+// default, the facings as their directions' names in order, where they're known.
+fn cursors_tag(cursors: List<Cursor>) -> Tag {
+    var list = List<Tag>()
+    for c in cursors {
+        var m = JavaHashMap<String, Tag>()
+        m.insert(String("pos"), Tag.IntArray([c.x, c.y, c.z]))
+        if c.charge != 0 {
+            m.insert(String("charge"), Tag.Int(c.charge))
+        }
+        if c.decay_delay != 1 {
+            m.insert(String("decay_delay"), Tag.Int(c.decay_delay))
+        }
+        if c.update_delay != 0 {
+            m.insert(String("update_delay"), Tag.Int(c.update_delay))
+        }
+        if c.facings >= 0 {
+            var names = List<Tag>()
+            for d in 0..6 {
+                if c.facings & (1 << d) != 0 {
+                    names.push(Tag.Str(direction_property(d)))
+                }
+            }
+            m.insert(String("facings"), Tag.List(names))
+        }
+        list.push(Tag.Compound(m))
+    }
+    return Tag.List(list)
+}
+
+// `ChargeCursor.update` out of world generation, its catalyst at `ox`, `oy`, `oz` and veins
+// spreading: where its delay's over, veins spread where it is, with the sculk spread sound, then
+// its charge used; spent, it's discharged, else it moves where it can, discharged where it was,
+// or stays.
+fn update<L: BlockAccess + FeatureAccess + BlockLevel + PushUps + RandomSource>(f: Facts, level: mut L, c: mut Cursor, ox: i32, oy: i32, oz: i32) ! Thrown {
+    if c.charge <= 0 {
+        return
+    }
+    if c.update_delay > 0 {
+        c.update_delay -= 1
+        return
+    }
+    var state = try level.state(f, c.x, c.y, c.z)
+    var kind = behaviour(f, state)
+    if try attempt_spread_vein(f, mut level, kind, state, c.x, c.y, c.z, c.facings) {
+        // `canChangeBlockStateOnSpread`: all but sculk.
+        if kind != SCULK {
+            state = try level.state(f, c.x, c.y, c.z)
+            kind = behaviour(f, state)
+        }
+        level.play_sound(c.x, c.y, c.z, String("block.sculk.spread"), 1.0f32, 1.0f32)
+    }
+    c.charge = try use_charge(f, mut level, kind, c, ox, oy, oz)
+    if c.charge <= 0 {
+        try on_discharged(f, mut level, kind, state, c.x, c.y, c.z)
+        return
+    }
+    if let (tx, ty, tz) = try movement_pos(f, mut level, c.x, c.y, c.z) {
+        try on_discharged(f, mut level, kind, state, c.x, c.y, c.z)
+        c.x = tx
+        c.y = ty
+        c.z = tz
+        state = try level.state(f, tx, ty, tz)
+    }
+    if behaviour(f, state) != DEFAULT {
+        c.facings = available_faces(f, state)
+    }
+    // `updateDecayDelay`: counting down for the default, else 1.
+    c.decay_delay = if kind == DEFAULT { (c.decay_delay - 1).max(0) } else { 1 }
+    c.update_delay = 1
+}
+
+// `MultifaceBlock.availableFaces`: the faces a multiface state has, none for another block.
+fn available_faces(f: Facts, state: u32) -> i32 {
+    if not f.is_a(f.block(state), "MultifaceBlock") {
+        return 0
+    }
+    var mask = 0
+    for d in 0..6 {
+        if f.get_bool(state, direction_property(d)) {
+            mask |= 1 << d
+        }
+    }
+    return mask
+}
+
+// `SculkBehaviour.attemptSpreadVein`, not after-processed as world generation is.
+fn attempt_spread_vein<L: BlockAccess + FeatureAccess + BlockLevel + PushUps + RandomSource>(f: Facts, level: mut L, kind: i32, state: u32, x: i32, y: i32, z: i32, facings: i32) -> bool ! Thrown {
+    let vein = f.ids.sculk_vein
+    if kind == DEFAULT {
+        if facings < 0 {
+            let here = try level.state(f, x, y, z)
+            return try spread_all(f, mut level, vein, here, x, y, z, true, false) > 0
+        }
+        if facings != 0 {
+            if not f.is_air(state) and f.fluid(state) != WATER_FLUID {
+                return false
+            }
+            return try regrow(f, mut level, state, x, y, z, facings)
+        }
+    }
+    return try spread_all(f, mut level, vein, state, x, y, z, false, false) > 0
+}
+
+// `SculkVeinBlock.regrow`: a vein with those of the faces it can cling to, if any.
+fn regrow<L: BlockAccess + FeatureAccess + BlockLevel + PushUps + RandomSource>(f: Facts, level: mut L, existing: u32, x: i32, y: i32, z: i32, faces: i32) -> bool ! Thrown {
+    var s = f.default_state(f.ids.sculk_vein)
+    var any = false
+    for d in 0..6 {
+        if faces & (1 << d) != 0 {
+            if attaches_state(f, try level.state(f, x + step_x(d), y + step_y(d), z + step_z(d)), d) {
+                s = try f.with_bool(s, direction_property(d), true)
+                any = true
+            }
+        }
+    }
+    if not any {
+        return false
+    }
+    if f.fluid(existing) != EMPTY_FLUID {
+        s = try f.with_bool(s, "waterlogged", true)
+    }
+    _ = level.set_block_limited(x, y, z, s, 3, UPDATE_LIMIT)
+    return true
+}
+
+// `SculkBehaviour.attemptUseCharge` of the level's spreader, which draws from the level's random.
+fn use_charge<L: BlockAccess + FeatureAccess + BlockLevel + PushUps + RandomSource>(f: Facts, level: mut L, kind: i32, c: Cursor, ox: i32, oy: i32, oz: i32) -> i32 ! Thrown {
+    let charge = c.charge
+    if kind == DEFAULT {
+        return if c.decay_delay > 0 { charge } else { 0 }
+    }
+    if kind == VEIN {
+        if try place_sculk(f, mut level, c.x, c.y, c.z) {
+            return charge - 1
+        }
+        if level.next_int_below(CHARGE_DECAY_RATE) == 0 {
+            return i32.saturate((f32.nearest(charge) * 0.5f32).floor())
+        }
+        return charge
+    }
+    // `SculkBlock.attemptUseCharge`: its growth sound where the cursor is, under it.
+    if charge == 0 or level.next_int_below(CHARGE_DECAY_RATE) != 0 {
+        return charge
+    }
+    let dx = c.x - ox
+    let dy = c.y - oy
+    let dz = c.z - oz
+    let dist_sqr = f64(dx * dx + dy * dy + dz * dz)
+    // `closerThan(origin, 4)`.
+    let close = dist_sqr < f64(NO_GROWTH_RADIUS * NO_GROWTH_RADIUS)
+    if not close and try can_place_growth(f, level, c.x, c.y, c.z) {
+        if level.next_int_below(GROWTH_SPAWN_COST) < charge {
+            let shrieker = level.next_int_below(11) == 0
+            var growth = f.default_state(try f.named_block(if shrieker { "sculk_shrieker" } else { "sculk_sensor" }))
+            if f.has(growth, "waterlogged") and f.fluid(try level.state(f, c.x, c.y + 1, c.z)) != EMPTY_FLUID {
+                growth = try f.with_bool(growth, "waterlogged", true)
+            }
+            _ = level.set_block_limited(c.x, c.y + 1, c.z, growth, 3, UPDATE_LIMIT)
+            level.play_sound(c.x, c.y, c.z, String(if shrieker { "block.sculk_shrieker.place" } else { "block.sculk_sensor.place" }), 1.0f32, 1.0f32)
+        }
+        return (charge - GROWTH_SPAWN_COST).max(0)
+    }
+    if level.next_int_below(ADDITIONAL_DECAY_RATE) != 0 {
+        return charge
+    }
+    if close {
+        return charge - 1
+    }
+    // `getDecayPenalty`.
+    let outer = f32.nearest(dist_sqr.sqrt()) - f32.nearest(NO_GROWTH_RADIUS)
+    let reach = 24 - NO_GROWTH_RADIUS
+    let factor = (outer * outer / f32.nearest(reach * reach)).min(1.0f32)
+    return charge - i32.saturate(f32.nearest(charge) * factor * 0.5f32).max(1)
+}
+
+// `SculkBlock.canPlaceGrowth`: air or source water above, and at most two inhibitors near.
+fn can_place_growth<L: BlockAccess>(f: Facts, level: L, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let above = try level.state(f, x, y + 1, z)
+    if not f.is_air(above) and not (f.is(above, f.ids.water) and f.fluid(above) == WATER_FLUID) {
+        return false
+    }
+    let inhibitors = f.tag("minecraft:sculk_growth_inhibitors")
+    var count = 0
+    for bz in z - 4..z + 5 {
+        for by in y..y + 3 {
+            for bx in x - 4..x + 5 {
+                if f.in_set(try level.state(f, bx, by, bz), inhibitors) {
+                    count += 1
+                    if count > 2 {
+                        return false
+                    }
+                }
+            }
+        }
+    }
+    return true
+}
+
+// `SculkVeinBlock.attemptPlaceSculk`: through the vein's faces in shuffled order, the first
+// block behind one that sculk replaces turned to sculk, what's on it pushed up, the spread sound
+// there, veins spread from it, and the veins beside it discharged.
+fn place_sculk<L: BlockAccess + FeatureAccess + BlockLevel + PushUps + RandomSource>(f: Facts, level: mut L, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    let state = try level.state(f, x, y, z)
+    let replaceable = f.tag("minecraft:sculk_replaceable")
+    for support in all_shuffled(mut level) {
+        if f.get_bool(state, direction_property(support)) {
+            let sx = x + step_x(support)
+            let sy = y + step_y(support)
+            let sz = z + step_z(support)
+            let old = try level.state(f, sx, sy, sz)
+            if f.in_set(old, replaceable) {
+                let sculk = f.default_state(f.ids.sculk)
+                _ = level.set_block_limited(sx, sy, sz, sculk, 3, UPDATE_LIMIT)
+                try push_up(f, mut level, old, sx, sy, sz)
+                level.play_sound(sx, sy, sz, String("block.sculk.spread"), 1.0f32, 1.0f32)
+                _ = try spread_all(f, mut level, f.ids.sculk_vein, sculk, sx, sy, sz, false, false)
+                let skip = opposite(support)
+                for d in 0..6 {
+                    if d != skip {
+                        let vx = sx + step_x(d)
+                        let vy = sy + step_y(d)
+                        let vz = sz + step_z(d)
+                        let possible = try level.state(f, vx, vy, vz)
+                        if f.is(possible, f.ids.sculk_vein) {
+                            try on_discharged(f, mut level, VEIN, possible, vx, vy, vz)
+                        }
+                    }
+                }
+                return true
+            }
+        }
+    }
+    return false
+}
+
+// `Block.pushEntitiesUp` of sculk where `old` was: nothing where that was a full block; the
+// blocks sculk replaces lower than that are mud and soul sand, 14 high, the rest of whose block
+// what's there is pushed onto.
+fn push_up<L: BlockAccess + FeatureAccess + BlockLevel + PushUps + RandomSource>(f: Facts, level: mut L, old: u32, x: i32, y: i32, z: i32) ! Thrown {
+    if f.collision_full_block(old) {
+        return
+    }
+    if f.is(old, try f.named_block("mud")) or f.is(old, try f.named_block("soul_sand")) {
+        level.add_push_up(Aabb { min_x: f64(x), min_y: f64(y) + 0.875, min_z: f64(z), max_x: f64(x) + 1.0, max_y: f64(y) + 1.0, max_z: f64(z) + 1.0 })
+        return
+    }
+    level.unimplemented(String("Sculk pushing up what's on a block it replaced lower than a full one, `pushEntitiesUp`"))
+}
+
+// `SculkBehaviour.onDischarged`: a vein loses the faces on sculk, and goes if none are left.
+fn on_discharged<L: BlockAccess + FeatureAccess + BlockLevel + PushUps + RandomSource>(f: Facts, level: mut L, kind: i32, state: u32, x: i32, y: i32, z: i32) ! Thrown {
+    if kind != VEIN or not f.is(state, f.ids.sculk_vein) {
+        return
+    }
+    var s = state
+    for d in 0..6 {
+        let name = direction_property(d)
+        if f.get_bool(s, name) and f.is(try level.state(f, x + step_x(d), y + step_y(d), z + step_z(d)), f.ids.sculk) {
+            s = try f.with_bool(s, name, false)
+        }
+    }
+    var any = false
+    for d in 0..6 {
+        if f.get_bool(s, direction_property(d)) {
+            any = true
+        }
+    }
+    if not any {
+        s = if f.fluid(try level.state(f, x, y, z)) == EMPTY_FLUID { f.ids.air_state } else { f.ids.water_state }
+    }
+    _ = level.set_block_limited(x, y, z, s, 3, UPDATE_LIMIT)
+}
+
+// `ChargeCursor.NON_CORNER_NEIGHBOURS`: the offsets within one, x fastest, then y, then z, but
+// the corners and the center.
+fn non_corner() -> List<i32> {
+    var out = List<i32>()
+    for dz in -1..2 {
+        for dy in -1..2 {
+            for dx in -1..2 {
+                if (dx == 0 or dy == 0 or dz == 0) and not (dx == 0 and dy == 0 and dz == 0) {
+                    out.push(dx)
+                    out.push(dy)
+                    out.push(dz)
+                }
+            }
+        }
+    }
+    return out
+}
+
+// `getValidMovementPos`, anywhere out of world generation: the neighbours in shuffled order; the
+// last sculk or vein the cursor can reach unobstructed, or the first vein with sculk-replaceable
+// blocks behind it.
+fn movement_pos<L: BlockAccess + FeatureAccess + BlockLevel + PushUps + RandomSource>(f: Facts, level: mut L, x: i32, y: i32, z: i32) -> (i32, i32, i32)? ! Thrown {
+    let offsets = non_corner()
+    var order = List<i32>()
+    for i in 0..18 {
+        order.push(i)
+    }
+    shuffle(mut order, mut level)
+    var px = x
+    var py = y
+    var pz = z
+    for i in order {
+        let k = usize.wrap(i * 3)
+        let nx = x + offsets[k]
+        let ny = y + offsets[k + 1]
+        let nz = z + offsets[k + 2]
+        let there = try level.state(f, nx, ny, nz)
+        if behaviour(f, there) != DEFAULT and try unobstructed(f, level, x, y, z, nx, ny, nz) {
+            px = nx
+            py = ny
+            pz = nz
+            if try substrate_access(f, level, there, nx, ny, nz) {
+                break
+            }
+        }
+    }
+    if px == x and py == y and pz == z {
+        return none
+    }
+    return some((px, py, pz))
+}
+
+// `isMovementUnobstructed`.
+fn unobstructed<L: BlockAccess>(f: Facts, level: L, x: i32, y: i32, z: i32, tx: i32, ty: i32, tz: i32) -> bool ! Thrown {
+    let dx = tx - x
+    let dy = ty - y
+    let dz = tz - z
+    if dx.abs() + dy.abs() + dz.abs() == 1 {
+        return true
+    }
+    let dir_x = if dx < 0 { WEST } else { EAST }
+    let dir_y = if dy < 0 { DOWN } else { UP }
+    let dir_z = if dz < 0 { NORTH } else { SOUTH }
+    if dx == 0 {
+        return try open_toward(f, level, x, y, z, dir_y) or try open_toward(f, level, x, y, z, dir_z)
+    }
+    if dy == 0 {
+        return try open_toward(f, level, x, y, z, dir_x) or try open_toward(f, level, x, y, z, dir_z)
+    }
+    return try open_toward(f, level, x, y, z, dir_x) or try open_toward(f, level, x, y, z, dir_y)
+}
+
+// `isUnobstructed`.
+fn open_toward<L: BlockAccess>(f: Facts, level: L, x: i32, y: i32, z: i32, d: i32) -> bool ! Thrown {
+    return not f.sturdy(try level.state(f, x + step_x(d), y + step_y(d), z + step_z(d)), opposite(d), FULL)
+}
+
+// `SculkVeinBlock.hasSubstrateAccess`.
+fn substrate_access<L: BlockAccess>(f: Facts, level: L, state: u32, x: i32, y: i32, z: i32) -> bool ! Thrown {
+    if not f.is(state, f.ids.sculk_vein) {
+        return false
+    }
+    let replaceable = f.tag("minecraft:sculk_replaceable")
+    for d in 0..6 {
+        if f.get_bool(state, direction_property(d)) and f.in_set(try level.state(f, x + step_x(d), y + step_y(d), z + step_z(d)), replaceable) {
+            return true
+        }
+    }
+    return false
+}
+
+// `updateCursors`'s `Object2IntOpenHashMap` of places, made with its defaults, room for 16 at a
+// load factor of 0.75, kept as fastutil keeps it, for the order its entries come out in: by open
+// addressing on each place's mixed `Vec3i.hashCode`, down the table.
+struct ChargeMap {
+    keys: List<(i32, i32, i32)?>
+    values: List<i32>
+    n: i32
+    mask: i32
+    max_fill: i32
+    size: i32
+}
+
+// `Vec3i.hashCode`.
+fn pos_hash(p: (i32, i32, i32)) -> i32 {
+    let (x, y, z) = p
+    return y.wrapping_add(z.wrapping_mul(31)).wrapping_mul(31).wrapping_add(x)
+}
+
+impl ChargeMap {
+    fn new() -> ChargeMap {
+        let n = array_size(16, 0.75f32)
+        return ChargeMap { keys: ChargeMap.empty_keys(n), values: ChargeMap.empty_values(n), n: n, mask: n - 1, max_fill: max_fill(n, 0.75f32), size: 0 }
+    }
+
+    fn empty_keys(n: i32) -> List<(i32, i32, i32)?> {
+        var keys = List<(i32, i32, i32)?>()
+        for _ in 0..n + 1 {
+            keys.push(none)
+        }
+        return keys
+    }
+
+    fn empty_values(n: i32) -> List<i32> {
+        var values = List<i32>()
+        for _ in 0..n + 1 {
+            values.push(0)
+        }
+        return values
+    }
+
+    // `computeInt` of `charge` more at `p`.
+    fn add(mut self, p: (i32, i32, i32), charge: i32) {
+        var pos = mix(pos_hash(p)) & self.mask
+        while let curr = self.keys[usize.wrap(pos)] {
+            if curr == p {
+                self.values[usize.wrap(pos)] += charge
+                return
+            }
+            pos = (pos + 1) & self.mask
+        }
+        self.keys[usize.wrap(pos)] = some(p)
+        self.values[usize.wrap(pos)] = charge
+        let before = self.size
+        self.size += 1
+        if before >= self.max_fill {
+            let grown = array_size(self.size + 1, 0.75f32)
+            self.rehash(grown)
+        }
+    }
+
+    // `rehash`: every entry, from the top of the table down, put in a table `n` long.
+    fn rehash(mut self, n: i32) {
+        let mask = n - 1
+        var keys = ChargeMap.empty_keys(n)
+        var values = ChargeMap.empty_values(n)
+        var i = self.n
+        for _ in 0..self.size {
+            i -= 1
+            while self.keys[usize.wrap(i)] == none {
+                i -= 1
+            }
+            let k = self.keys[usize.wrap(i)] ?? (0, 0, 0)
+            var pos = mix(pos_hash(k)) & mask
+            while keys[usize.wrap(pos)] != none {
+                pos = (pos + 1) & mask
+            }
+            keys[usize.wrap(pos)] = some(k)
+            values[usize.wrap(pos)] = self.values[usize.wrap(i)]
+        }
+        self.n = n
+        self.mask = mask
+        self.max_fill = max_fill(n, 0.75f32)
+        self.keys = keys
+        self.values = values
+    }
+
+    // The entries in the iterator's order, down the table.
+    fn entries(self) -> List<((i32, i32, i32), i32)> {
+        var out = List<((i32, i32, i32), i32)>()
+        var i = self.n
+        while i > 0 {
+            i -= 1
+            if let k = self.keys[usize.wrap(i)] {
+                out.push((k, self.values[usize.wrap(i)]))
+            }
+        }
+        return out
+    }
+}
