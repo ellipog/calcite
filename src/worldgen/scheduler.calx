@@ -48,7 +48,8 @@ import worldgen.beardifier.{Beardifier}
 import worldgen.generator.{BLOCK_SHIFT, DecorateJob, FinishJob, GenSetup, HEIGHT, Job, MIN_Y, Made, Parked, PlaceBack, PlaceJob, TerrainJob, Worker, rank_of, source_of, structures_tag}
 import worldgen.interval.{Thrown}
 import worldgen.locate.{Nearest, Reach, Wanted}
-import worldgen.pieces.{Start}
+import worldgen.pieces.{Start, start_of_tag}
+import nbt.tag.{Tag}
 import worldgen.references.{Refs, StartMap, beardifier_for, chunk_key, create_references}
 import worldgen.region.{RegionChunk}
 import worldgen.structures.{RING_REACH, RingSearch, Rings, StructureState, Structures, UNKNOWN_RING}
@@ -131,6 +132,9 @@ pub struct Scheduler {
     // The chunks whose starts a decoration changed, placing their pieces, which a scheduler
     // started again keeps rather than make them again (CAL-114).
     changed: Map<i64, bool> = Map<i64, bool>()
+    // The starts each chunk saved at `minecraft:structure_starts` or after has, as a look read
+    // them, its own in place of those made fresh (CAL-271), until its block's starts are made.
+    saved_starts: Map<i64, List<Start>> = Map<i64, List<Start>>()
     biomes: Map<i64, List<i32>>
     refs: Map<i64, List<Refs>>
     protos: Map<i64, RegionChunk>
@@ -328,6 +332,36 @@ impl Scheduler {
         return out
     }
 
+    /// Takes out each chunk whose starts a decoration changed but whose terrain it doesn't keep,
+    /// that has nothing saved with its terrain and isn't finished, to save at
+    /// `minecraft:structure_starts` with its starts as they are, as vanilla saves the
+    /// `ProtoChunk` that holds such a start (CAL-271). Its starts are kept no longer: a look
+    /// reads them back. Taken before `parked`, which takes the chunks with their terrain.
+    pub fn parked_starts(mut self) -> List<(i32, i32, Tag)> {
+        var keys = List<i64>()
+        for (k, _) in self.changed {
+            keys.push(k)
+        }
+        keys.sort()
+        var out = List<(i32, i32, Tag)>()
+        for k in keys {
+            let x = i32.wrap(k)
+            let z = i32.wrap(k >> 32)
+            let finish = node(FINISH, x, z)
+            let finished = self.nodes.contains(finish) and self.nodes[finish].state == DONE
+            if self.protos.contains(k) or finished or (self.seeds.get(k) ?? SAVED_NOTHING) != SAVED_NOTHING or not self.seeds.contains(k) {
+                continue
+            }
+            if not self.starts.chunks.contains(k) {
+                continue
+            }
+            let starts = self.starts.chunks[k].copy()
+            out.push((x, z, structures_tag(self.structures, List<Refs>(), starts)))
+            _ = self.changed.remove(k)
+        }
+        return out
+    }
+
     /// How many jobs are ready to go out.
     pub fn ready(self) -> usize {
         var n: usize = 0
@@ -484,9 +518,21 @@ impl Scheduler {
     /// a chunk stays as it was first found, so what each node needs only grows: another look,
     /// such as one a scheduler before this one asked for, changes nothing.
     pub fn peeked(mut self, x: i32, z: i32, saved: own Saved) {
+        self.peeked_with(x, z, saved, none)
+    }
+
+    /// `peeked`, with the starts the chunk saved, its `structures.starts`, where it was saved at
+    /// `minecraft:structure_starts` or after (CAL-271): read as `loadStaticStart` reads them,
+    /// they're its starts in place of those made fresh, as vanilla's chunk read back has what it
+    /// saved, what its pieces placed among it. Where they can't be read that's a problem, and
+    /// the fresh ones are its.
+    pub fn peeked_with(mut self, x: i32, z: i32, saved: own Saved, starts: own Tag?) {
         let key = chunk_key(x, z)
         if self.seeds.contains(key) {
             return
+        }
+        if let t = starts {
+            self.read_saved_starts(x, z, t)
         }
         var seed = SAVED_NOTHING
         match saved {
@@ -506,6 +552,30 @@ impl Scheduler {
         if self.nodes.contains(n) and self.nodes[n].state != DONE {
             self.complete(n)
         }
+    }
+
+    // The starts the chunk at `x`, `z` saved, `starts`, kept to be its own (CAL-271).
+    fn read_saved_starts(mut self, x: i32, z: i32, starts: Tag) {
+        let Tag.Compound(m) = starts else return
+        var list = List<Start>()
+        for (_, v) in m {
+            match start_of_tag(v) {
+                ok(read) => {
+                    if let s = read {
+                        if self.structures.structure_ids.contains(s.id) {
+                            list.push(s)
+                        } else {
+                            self.problems.push("Unknown structure start: {s.id}")
+                        }
+                    }
+                },
+                err(e) => {
+                    self.problems.push("Couldn't read the structure starts of chunk [{x}, {z}]: {e}")
+                    return
+                },
+            }
+        }
+        self.saved_starts.insert(chunk_key(x, z), list)
     }
 
     /// A terrain job that's ready for a chunk next to the one at `x`, `z`, along a side or across
@@ -554,9 +624,15 @@ impl Scheduler {
                 for z in bz << BLOCK_SHIFT..(bz + 1) << BLOCK_SHIFT {
                     for x in bx << BLOCK_SHIFT..(bx + 1) << BLOCK_SHIFT {
                         let list = rest.remove(0)
-                        // Those a scheduler before it changed are kept as they were (CAL-114).
-                        if not self.starts.chunks.contains(chunk_key(x, z)) {
-                            self.starts.chunks.insert(chunk_key(x, z), list)
+                        // Those a scheduler before it changed are kept as they were (CAL-114),
+                        // and those a chunk saved are its own (CAL-271).
+                        let key = chunk_key(x, z)
+                        if not self.starts.chunks.contains(key) {
+                            let own_starts = match self.saved_starts.remove(key) {
+                                some(saved) => in_fresh_order(list, saved),
+                                none => list,
+                            }
+                            self.starts.chunks.insert(key, own_starts)
                         }
                     }
                 }
@@ -806,6 +882,15 @@ impl Scheduler {
         let x = x_of(n)
         let z = z_of(n)
         var out = List<i64>()
+        if kind == STARTS {
+            // A look at each of its chunks, whose saved starts are their own (CAL-271).
+            for cz in z << BLOCK_SHIFT..(z + 1) << BLOCK_SHIFT {
+                for cx in x << BLOCK_SHIFT..(x + 1) << BLOCK_SHIFT {
+                    out.push(node(PEEK, cx, cz))
+                }
+            }
+            return out
+        }
         if kind == TERRAIN {
             out.push(node(PEEK, x, z))
             if not self.seeds.contains(chunk_key(x, z)) {
@@ -941,6 +1026,25 @@ impl Scheduler {
     }
 }
 
+// The starts a chunk saved, in the order those made fresh of the same structures came in, then
+// any of its own the fresh ones don't have (CAL-271).
+fn in_fresh_order(fresh: List<Start>, saved: own List<Start>) -> List<Start> {
+    var rest = saved
+    var out = List<Start>()
+    for f in fresh {
+        for i in 0..rest.len() {
+            if rest[i].id == f.id {
+                out.push(rest.remove(i))
+                break
+            }
+        }
+    }
+    for s in rest {
+        out.push(s.copy())
+    }
+    return out
+}
+
 /// The scheduler for a world as `setup` says, from vanilla's data in `zip`, made without a
 /// worker.
 pub fn scheduler_for(zip: Data, setup: GenSetup) -> Scheduler ! String {
@@ -975,6 +1079,7 @@ pub struct Generator {
     // What's saved of each chunk, as `give` has it, for a look to find: nothing where it has
     // none, as this thread reads no save (D334).
     given: Map<i64, Saved>
+    given_starts: Map<i64, Tag> = Map<i64, Tag>()
     /// What went wrong making chunks, to be logged, oldest first.
     pub problems: List<String>
 }
@@ -1001,6 +1106,14 @@ impl Generator {
     /// Has a look at what's saved of the chunk at `x`, `z` find `saved` (D334).
     pub fn give(mut self, x: i32, z: i32, saved: own Saved) {
         self.given.insert(chunk_key(x, z), saved)
+    }
+
+    /// `give`, with the starts it saved, as `Scheduler.peeked_with` takes them (CAL-271).
+    pub fn give_with(mut self, x: i32, z: i32, saved: own Saved, starts: own Tag?) {
+        self.given.insert(chunk_key(x, z), saved)
+        if let t = starts {
+            self.given_starts.insert(chunk_key(x, z), t)
+        }
     }
 
     /// The block states' table the chunks are made with.
@@ -1044,7 +1157,7 @@ impl Generator {
             while not self.s.is_finished(x, z) {
                 if let at = self.s.next_peek() {
                     let (px, pz) = at
-                    self.s.peeked(px, pz, self.given.remove(chunk_key(px, pz)) ?? Saved.Nothing)
+                    self.s.peeked_with(px, pz, self.given.remove(chunk_key(px, pz)) ?? Saved.Nothing, self.given_starts.remove(chunk_key(px, pz)))
                     continue
                 }
                 let job = self.s.next() else fail Thrown { exception: "IllegalStateException", message: "chunk {x}, {z} can't be finished" }

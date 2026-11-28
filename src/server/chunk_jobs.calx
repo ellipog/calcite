@@ -56,7 +56,7 @@ import world.collision.{CollisionStates}
 import world.light.{LightStates, SkySources}
 import world.pos.{BlockPos, ChunkPos}
 import world.spawn.{respawn_pos}
-import worldgen.generator.{GenSetup, Job, Made, Parked, PlaceBack, PlaceJob, Worker, parked_data, setup_data}
+import worldgen.generator.{GenSetup, Job, Made, Parked, PlaceBack, PlaceJob, Worker, parked_data, setup_data, started_data}
 import worldgen.locate.{Nearest, Reach, Wanted}
 import worldgen.references.{chunk_key}
 import worldgen.region.{Placing}
@@ -536,6 +536,7 @@ enum Ask {
     Write(ChunkPos, List<u8>)
     Save(ChunkPos, Whole, LightData?)
     Park(ChunkPos, Parked)
+    ParkStarts(ChunkPos, Tag)
     Saved(ChunkPos, List<u8>?)
     Close
 }
@@ -549,6 +550,7 @@ enum Work {
     Save(ChunkPos, Whole, LightData?)
     Peek(ChunkPos, Stored)
     Park(ChunkPos, Parked)
+    ParkStarts(ChunkPos, Tag)
 }
 
 // The IO thread: it owns the region files, and reads and writes what it's asked, in the order
@@ -622,6 +624,14 @@ impl Task for IoThread {
                         s.encoding.insert(key, (s.encoding.get(key) ?? 0) + 1)
                         s.parking.insert(key)
                         s.saves.send(Work.Park(pos, parked))
+                    }
+                },
+                Ask.ParkStarts(pos, structures) => {
+                    if not s.closed {
+                        let key = chunk_key(pos.x, pos.z)
+                        s.encoding.insert(key, (s.encoding.get(key) ?? 0) + 1)
+                        s.parking.insert(key)
+                        s.saves.send(Work.ParkStarts(pos, structures))
                     }
                 },
                 Ask.Saved(pos, bytes) => {
@@ -733,13 +743,13 @@ impl IoState {
                 self.write_out()
             }
         } else if self.pending.contains(key) or self.encoding.contains(key) {
-            self.gen.send(GenIn.Peeked(pos.x, pos.z, Saved.Full, none))
+            self.gen.send(GenIn.Peeked(pos.x, pos.z, Saved.Full, none, none))
             return
         }
         var logged = List<Entry>()
         match self.storage.read_chunk(pos, mut logged) {
             ChunkRead.Stored(stored) => self.work.send(Work.Peek(pos, stored)),
-            _ => self.gen.send(GenIn.Peeked(pos.x, pos.z, Saved.Nothing, none)),
+            _ => self.gen.send(GenIn.Peeked(pos.x, pos.z, Saved.Nothing, none, none)),
         }
     }
 
@@ -847,11 +857,12 @@ impl Task for ChunkWorker {
             match w {
                 Work.Save(pos, whole, light) => to_io.send(Ask.Saved(pos, saved_bytes(self.context, pos, whole.chunk.value, whole.rest.unpack(), light, whole.last_update, whole.inhabited, whole.spawn_due))),
                 Work.Park(pos, parked) => to_io.send(Ask.Saved(pos, encoded(self.context, parked_data(self.context.format, self.context.table, parked)))),
+                Work.ParkStarts(pos, structures) => to_io.send(Ask.Saved(pos, encoded(self.context, started_data(self.context.format, self.context.table, pos.x, pos.z, self.context.min_section, self.context.sections, structures)))),
                 Work.Peek(pos, stored) => {
                     if let held = generate.take() {
                         var g = held
-                        let saved = saved_of(self.context, pos, stored)
-                        g.send(GenIn.Peeked(pos.x, pos.z, saved, some(stored)))
+                        let (saved, starts) = saved_of(self.context, pos, stored)
+                        g.send(GenIn.Peeked(pos.x, pos.z, saved, starts, some(stored)))
                         generate = some(g)
                     }
                 },
@@ -901,40 +912,51 @@ impl Task for ChunkWorker {
 /// it, as vanilla lights one only once those have their light initialized, so after their
 /// features, and as a chunk Calcite finished is saved at `minecraft:light` while its mobs are
 /// still to spawn (D584); and the chunk as it was saved where it's part-way, unless it was saved
-/// at another position. What reading it logs isn't logged.
-pub fn saved_of(context: ChunkContext, pos: ChunkPos, stored: Stored) -> Saved {
+/// at another position. What reading it logs isn't logged. With it, the starts it saved, its
+/// `structures.starts`, where it was saved at `minecraft:structure_starts` or after and at its
+/// own position, which the scheduler reads as its own (CAL-271).
+pub fn saved_of(context: ChunkContext, pos: ChunkPos, stored: Stored) -> (Saved, Tag?) {
     var io = List<Entry>()
     let unpacked: List<u8>? = match unpack(pos, stored, mut io) {
         ok(b) => b,
-        err(_) => return Saved.Nothing,
+        err(_) => return (Saved.Nothing, none),
     }
-    let bytes = unpacked else return Saved.Nothing
+    let bytes = unpacked else return (Saved.Nothing, none)
     let fields = match read_root(bytes) {
         ok(Tag.Compound(f)) => f,
-        _ => return Saved.Nothing,
+        _ => return (Saved.Nothing, none),
     }
     if not this_version(fields) {
-        return Saved.Nothing
+        return (Saved.Nothing, none)
     }
     var lines = List<Entry>()
     let parsed: ChunkData? = match ChunkData.parse(context.format, context.min_section, context.sections, fields, mut lines) {
         ok(d) => d,
-        err(_) => return Saved.Nothing,
+        err(_) => return (Saved.Nothing, none),
     }
-    let data = parsed else return Saved.Nothing
+    let data = parsed else return (Saved.Nothing, none)
+    let own_place = data.pos.x == pos.x and data.pos.z == pos.z
+    let starts = if own_place and context.format.has_starts(data.status) { starts_in(data.structures) } else { none }
     if not context.format.has_terrain(data.status) {
-        return Saved.Nothing
+        return (Saved.Nothing, starts)
     }
     if context.format.has_light(data.status) {
-        return Saved.Full
+        return (Saved.Full, starts)
     }
-    if data.pos.x != pos.x or data.pos.z != pos.z {
-        return Saved.Nothing
+    if not own_place {
+        return (Saved.Nothing, none)
     }
     if context.format.has_features(data.status) {
-        return Saved.Decorated(data)
+        return (Saved.Decorated(data), starts)
     }
-    return Saved.Terrain(data)
+    return (Saved.Terrain(data), starts)
+}
+
+// The starts of a chunk's saved `structures`, its `starts` compound, none where there's none.
+fn starts_in(structures: Tag) -> Tag? {
+    let Tag.Compound(m) = structures else return none
+    let t = m.find("starts") else return none
+    return some(t.copy())
 }
 
 /// The chunk at `pos`, which the server holds whole, with `rest`, as its region file holds it:
@@ -1010,7 +1032,7 @@ enum GenIn {
     // What's saved of a chunk the scheduler asked to look at, with what was read of it, or none
     // where it's full and not yet written, for the server to record (CAL-114), and which chunks
     // a region's file has, by `chunk_key` of the region, for those looks (D334).
-    Peeked(i32, i32, Saved, Stored?)
+    Peeked(i32, i32, Saved, Tag?, Stored?)
     Presence(i64, List<u64>)
     // The server stops: once no chunk's out, what the scheduler keeps part-way is saved, and the
     // IO thread closes the region files after it (CAL-114).
@@ -1571,7 +1593,7 @@ impl GenOut {
                 s.spawn = some(SpawnFind { x: x, z: z, offsets: spiral(), at: 0, asked: false })
             },
             GenIn.Free => s.tasks_out -= 1,
-            GenIn.Peeked(x, z, saved, read) => {
+            GenIn.Peeked(x, z, saved, starts, read) => {
                 // A replay's generator finds what the first look did (CAL-114).
                 if s.record_looks and not s.looked.contains(chunk_key(x, z)) {
                     s.looked.insert(chunk_key(x, z), true)
@@ -1585,7 +1607,7 @@ impl GenOut {
                 }
                 if let g = s.sched.take() {
                     var sched = g
-                    sched.peeked(x, z, saved)
+                    sched.peeked_with(x, z, saved, starts)
                     s.sched = some(sched)
                 }
             },
@@ -1986,6 +2008,11 @@ fn settle(s: mut GenState) {
 // saver encode it and writes it; until it's written, a look at it asks the IO thread. Those saved
 // with their terrain alone are this run's, and decorated ones aren't any more.
 fn park(s: mut GenState, sched: mut Scheduler) {
+    // The chunks with only their starts first, whose starts a decoration changed (CAL-271).
+    for (x, z, structures) in sched.parked_starts() {
+        s.parking.insert(chunk_key(x, z), true)
+        s.to_io.send(Ask.ParkStarts(ChunkPos { x: x, z: z }, structures.copy()))
+    }
     var parked = sched.parked()
     while let p = parked.pop() {
         let key = chunk_key(p.x, p.z)
