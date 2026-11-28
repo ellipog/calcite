@@ -99,16 +99,18 @@ import world.random_ticks.{RandomTicks, TickPlace}
 import world.sources.{arrow_press, arrows_press, plate_entered, rail_entered, rod_struck, tripwire_entered}
 import world.implicit_components.{with_item_components}
 import world.block_entity_updates.{block_entity_ids, block_entity_infos, block_entity_map, kind_of, made_block_entity, place_of, saved_block_entities, sends_update_packet, slots_dropped, update_tag}
-import world.block_entity_ticks.{BELL_TICKER, SPAWNER_TICKER, BREWING_TICKER, FURNACE_TICKER, HOPPER_TICKER, GATEWAY_COOLDOWN, NO_TICKER, PISTON_TICKER, add_occupant, playing_song, song_changed, stop_song, tick_block_entity, ticker_of}
+import world.block_entity_ticks.{HeartState, CREAKING_HEART_TICKER, BELL_TICKER, SPAWNER_TICKER, BREWING_TICKER, FURNACE_TICKER, HOPPER_TICKER, GATEWAY_COOLDOWN, NO_TICKER, PISTON_TICKER, add_occupant, playing_song, song_changed, stop_song, tick_block_entity, ticker_of}
 import world.block_level.{BLOCK_BROKEN, BeaconPulse, BeaconState, BlockLevel, MovingPiston, Openers, Released, SHULKER_CLOSED, destroy_block, remove_block, update_or_destroy, update_output_signal}
 import world.digging.{decrease_eggs, interact_ore}
 import world.dispenser.{dispense_from}
+import world.uuids.{uuid_of}
 import world.drops.{DropLevel, award_experience, drop_block_resources, get_drops_at, pop_resource, spill_stack}
 import world.crafting.{Input as CraftInput, find as find_crafting, made_by, remaining as left_in_grid}
 import world.menu.{count_of}
 import world.recipes.{Recipes}
 import world.end_portal.{PortalMatch, exit_portal_match}
 import world.living.{Warding}
+import world.damage.{Damage}
 import world.maps.{MapData, MapLoan}
 import world.loot.{Drawless, Explored, ExploreAsk, Loot, LootParams, provider_draws, provider_enchanted, worn_amount, worn_immune}
 import world.random_sequences.{RandomSequences, SequenceRandom}
@@ -539,6 +541,9 @@ pub struct LevelParticles {
     /// Its options as the packet writes them where they're neither none nor a block state's, as
     /// `SpellParticleOption`'s colour and power (CAL-179).
     pub option: List<u8>? = none
+    /// Whether it overrides the limiter and is always shown, sent to all within 512, not 32,
+    /// `sendParticles(..., true, true, ...)` (CAL-412).
+    pub forced: bool = false
 }
 
 /// A sound played, `Level.playSound`, for the players near enough to hear it (CAL-125): the
@@ -663,6 +668,13 @@ pub enum Dropped {
     /// A removed shrieker's warden at the most warnings, `trySummonWarden`, its reply where none
     /// came, `playWardenReplySound` (CAL-207).
     Warden(i32, i32, i32)
+    /// A removed creaking heart's creaking, by UUID, torn down, `removeProtector(null)`
+    /// (CAL-412).
+    HeartGone((i64, i64))
+    /// A creaking heart's creaking, by UUID, dead of the attack of the player who broke the heart,
+    /// by entity ID, or of an explosion, `removeProtector(source)` (CAL-412).
+    HeartBroken((i64, i64), i32)
+    HeartBlown((i64, i64), Damage)
     /// A falling block, the block x, y, z falling as `state` (CAL-243), hurting what it lands on
     /// by so much a block fallen and at most, where it does, `setHurtsEntities`.
     Falling(i32, i32, i32, u32, (f32, i32)?)
@@ -997,6 +1009,9 @@ pub struct Level {
     pub sequences: RandomSequences? = none
     pub world_seed: i64 = 0
     pub block_drops: bool = true
+    /// The damage of the explosion breaking blocks, which a creaking heart's creaking dies of,
+    /// `getDamageSource` (CAL-412).
+    pub blast_damage: Damage? = none
     /// The game rule `tnt_explodes`, which TNT's priming asks (CAL-182).
     pub tnt_explodes: bool = true
     /// The game rule `spread_vines`, which vines' random ticks ask (CAL-380).
@@ -1051,6 +1066,10 @@ pub struct Level {
     // The spawners whose block entities ticked, in their order, for the server to tick with the
     // level's entities, `BaseSpawner.serverTick` (CAL-408).
     spawners_ticked: List<(i32, i32, i32)> = List<(i32, i32, i32)>()
+    // The creaking hearts that ticked, each with whether it was its first, which its level ticks
+    // after, and each heart's block entity as it runs, by its place (CAL-412).
+    hearts_ticked: List<((i32, i32, i32), bool)> = List<((i32, i32, i32), bool)>()
+    hearts: Map<i64, HeartState> = Map<i64, HeartState>()
     // Whether the network runs command blocks' commands as the block ticks stop for them, and the
     // one they stopped for (CAL-410).
     pub runs_commands: bool = false
@@ -4086,6 +4105,12 @@ impl Level {
                 self.bells_ticked.push((t.pos.x, t.pos.y, t.pos.z))
                 continue
             }
+            if ticker == CREAKING_HEART_TICKER {
+                // `CreakingHeartBlockEntity.serverTick` (CAL-412), apart as it needs the level's
+                // entities.
+                self.hearts_ticked.push(((t.pos.x, t.pos.y, t.pos.z), t.first))
+                continue
+            }
             if ticker == SPAWNER_TICKER {
                 self.spawners_ticked.push((t.pos.x, t.pos.y, t.pos.z))
                 continue
@@ -4195,6 +4220,63 @@ impl Level {
         let out = self.spawners_ticked.copy()
         self.spawners_ticked.clear()
         return out
+    }
+
+    /// The creaking hearts that ticked since this was last asked, each with whether it was its
+    /// first (CAL-412).
+    pub fn take_hearts_ticked(mut self) -> List<((i32, i32, i32), bool)> {
+        let out = self.hearts_ticked.copy()
+        self.hearts_ticked.clear()
+        return out
+    }
+
+    /// The block entity of the creaking heart at x, y, z as it runs, taken out, a new one's where
+    /// it's `first` ticked or there's none (CAL-412).
+    pub fn take_heart(mut self, x: i32, y: i32, z: i32, first: bool) -> HeartState {
+        let p = BlockPos { x: x, y: y, z: z }.pack()
+        let held = self.hearts.remove(p) ?? HeartState()
+        return if first { HeartState() } else { held }
+    }
+
+    /// The block entity `h` of the creaking heart at x, y, z put back (CAL-412).
+    pub fn put_heart(mut self, x: i32, y: i32, z: i32, h: own HeartState) {
+        self.hearts.insert(BlockPos { x: x, y: y, z: z }.pack(), h)
+    }
+
+    // The UUID of the creaking of the heart at x, y, z, `creakingInfo` (CAL-412).
+    fn heart_creaking_of(self, x: i32, y: i32, z: i32) -> (i64, i64)? {
+        let t = self.block_entity_tag(x, y, z) else return none
+        let Tag.Compound(m) = t else return none
+        return uuid_of(m, "creaking")
+    }
+
+    // `CreakingHeartBlock.tryAwardExperience`'s experience at x, y, z (CAL-412): 20 to 24, drawn,
+    // `popExperience`, where the game rule `block_drops` is on.
+    fn heart_experience(mut self, x: i32, y: i32, z: i32) {
+        let n = self.next_int_below(5) + 20
+        if self.block_drops {
+            award_experience(mut self, f64(x) + 0.5, f64(y) + 0.5, f64(z) + 0.5, n)
+        }
+    }
+
+    /// The trail particle, `TrailParticleOption`, from x, y, z to `target` in `color` for
+    /// `duration` ticks, sent to all within 512, `sendParticles` with the limiter overridden, as
+    /// a creaking heart's call sends it (CAL-412).
+    pub fn trail_particle(mut self, x: f64, y: f64, z: f64, target: (f64, f64, f64), color: i32, duration: i32) {
+        let (tx, ty, tz) = target
+        var w = Writer.new()
+        w.f64(tx)
+        w.f64(ty)
+        w.f64(tz)
+        w.i32(color)
+        w.varint(duration)
+        self.events.push(Heard.Particles(LevelParticles { particle: String("minecraft:trail"), x: x, y: y, z: z, count: 1, dx: 0.0f32, dy: 0.0f32, dz: 0.0f32, speed: 0.0f32, option: some(w.into_bytes()), forced: true }))
+    }
+
+    /// `ServerLevel.sendParticles` of `count` particles `particle` of the block `state`, as a
+    /// creaking's tear-down sends crumbling wood, spread so far each way at `speed` (CAL-412).
+    pub fn state_particles(mut self, particle: own String, state: i32, x: f64, y: f64, z: f64, count: i32, dx: f64, dy: f64, dz: f64, speed: f64) {
+        self.events.push(Heard.Particles(LevelParticles { particle: particle, state: state, x: x, y: y, z: z, count: count, dx: f32.nearest(dx), dy: f32.nearest(dy), dz: f32.nearest(dz), speed: f32.nearest(speed) }))
     }
 
     pub fn take_bells_ticked(mut self) -> List<(i32, i32, i32)> {
@@ -5111,8 +5193,12 @@ impl Level {
             return
         }
         if kind == "minecraft:creaking_heart" {
-            if tags.contains("creaking") {
-                self.report(String("A removed creaking heart's creaking torn down, `removeProtector`"))
+            // `CreakingHeartBlockEntity.preRemoveSideEffects` (CAL-412): its creaking torn down,
+            // `removeProtector(null)`, which its level does.
+            _ = self.hearts.remove(pos.pack())
+            if let u = uuid_of(tags, "creaking") {
+                self.dropped.push(Dropped.HeartGone(u))
+                self.dropped_heard.push(self.events.len())
             }
             return
         }
@@ -7883,6 +7969,33 @@ impl BlockLevel for Level {
         self.events.push(Heard.Event(LevelEvent { kind: kind, x: x, y: y, z: z, data: data, except: player }))
     }
 
+    fn heart_broken(mut self, x: i32, y: i32, z: i32, player: i32, xp: bool) {
+        if let u = self.heart_creaking_of(x, y, z) {
+            self.remove_block_entity_value(x, y, z, "creaking")
+            self.dropped.push(Dropped.HeartBroken(u, player))
+            self.dropped_heard.push(self.events.len())
+        }
+        if xp {
+            self.heart_experience(x, y, z)
+        }
+    }
+
+    fn heart_blown(mut self, x: i32, y: i32, z: i32, natural: bool) {
+        let blast = self.blast_damage else return
+        if let u = self.heart_creaking_of(x, y, z) {
+            self.remove_block_entity_value(x, y, z, "creaking")
+            self.dropped.push(Dropped.HeartBlown(u, blast))
+            self.dropped_heard.push(self.events.len())
+        }
+        let by_player = match blast.player {
+            some(_) => true,
+            none => false,
+        }
+        if natural and by_player and not blast.creative {
+            self.heart_experience(x, y, z)
+        }
+    }
+
     fn unimplemented(mut self, what: String) {
         self.report(what)
     }
@@ -9005,6 +9118,16 @@ impl BlockAccess for Level {
             }
         }
         return if n == 1 { found } else { none }
+    }
+
+    // `CREAKING_ACTIVE` at the block, by the noise biome there (CAL-412).
+    fn creaking_active_at(self, x: i32, y: i32, z: i32) -> bool {
+        return self.place.creaking_in(self.noise_biome(x >> 2, y >> 2, z >> 2))
+    }
+
+    fn heart_output(self, x: i32, y: i32, z: i32) -> i32 {
+        let p = BlockPos { x: x, y: y, z: z }.pack()
+        return if self.hearts.contains(p) { self.hearts[p].output } else { 0 }
     }
 
     fn detector_output(self, x: i32, y: i32, z: i32) -> i32 {
